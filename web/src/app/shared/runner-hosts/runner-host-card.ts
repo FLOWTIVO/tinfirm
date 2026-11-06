@@ -1,11 +1,6 @@
 import { ChangeDetectionStrategy, Component, computed, inject, input, output } from '@angular/core';
 import { NgIcon, provideIcons } from '@ng-icons/core';
-import {
-  lucideCircleAlert,
-  lucideClock,
-  lucideTrash2,
-  lucideTriangleAlert,
-} from '@ng-icons/lucide';
+import { lucideCircleAlert, lucideClock, lucideTrash2 } from '@ng-icons/lucide';
 import { HlmButton } from '@spartan-ng/helm/button';
 import type { RunnerCredential, RunnerHost } from '../../api/generated/models';
 import {
@@ -29,11 +24,10 @@ import {
   poolServed,
   poolZone,
 } from './pool-view';
-import { gatewayRunsNote } from './runner-host-view';
 
 /**
  * One runner host as a sheet (package 2): online or offline and since when, draining, its version
- * and machine, whether it is too old for turns paid by a budget (`gatewayRuns`), its slots (in use, effective, the machine's ceiling, the desired value Tinfirm sets
+ * and machine, its slots (in use, effective, the machine's ceiling, the desired value Tinfirm sets
  * and whether the host confirmed it), for a company host that keeps ready sandboxes its pool
  * (ADR-0099: the count now and next, the week, the host's last report), and for a personal host
  * the subscriptions it reported. Its page saves a capacity, edits the pool's schedule and confirms
@@ -42,7 +36,7 @@ import { gatewayRunsNote } from './runner-host-view';
 @Component({
   selector: 'app-runner-host-card',
   imports: [NgIcon, HlmButton, CapacitySelect, EditionBadge, Time],
-  providers: [provideIcons({ lucideCircleAlert, lucideClock, lucideTrash2, lucideTriangleAlert })],
+  providers: [provideIcons({ lucideCircleAlert, lucideClock, lucideTrash2 })],
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     class:
@@ -88,12 +82,6 @@ import { gatewayRunsNote } from './runner-host-view';
         </div>
         @if (meta(); as m) {
           <p class="text-muted-foreground font-mono text-xs break-all">{{ m }}</p>
-        }
-        @if (tooOld(); as note) {
-          <p class="text-warning flex items-start gap-1 text-xs" data-testid="host-too-old">
-            <ng-icon name="lucideTriangleAlert" class="mt-0.5 shrink-0" aria-hidden="true" />
-            <span>{{ note }}</span>
-          </p>
         }
       </div>
       @if (editable()) {
@@ -351,9 +339,6 @@ export class RunnerHostCard {
   protected readonly kindLabels = SUBSCRIPTION_KIND_LABELS;
   protected readonly statusLabels = SUBSCRIPTION_STATUS_LABELS;
   protected readonly statusTones = SUBSCRIPTION_STATUS_TONES;
-
-  /** Why it takes no turn paid by a budget, when it connected with a runner older than 0.2.0. */
-  protected readonly tooOld = computed(() => gatewayRunsNote(this.host()));
 
   /** "v0.2.0 · darwin/arm64 · my-laptop.local". */
   protected readonly meta = computed(() => {

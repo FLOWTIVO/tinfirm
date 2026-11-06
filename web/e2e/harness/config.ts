@@ -254,5 +254,5 @@ export const spareCompany = {
   name: env['E2E_SPARE_COMPANY_NAME'] ?? 'Beta',
 };
 
-/** The runner's version in hello: 0.2.0 is the first a budget's run is sent to (CONVENTIONS §15.4). */
+/** The runner's version in hello: shown on the host's card, and deciding nothing (ADR-0109). */
 export const runnerVersion = '0.2.0';

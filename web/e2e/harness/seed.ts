@@ -537,17 +537,16 @@ export async function seed(): Promise<SeedState> {
       );
     }
     await waitFor(
-      'the runner host online, configured and allowed budget runs',
+      'the runner host online and configured',
       async () => {
         const view = (
           await admin.all<{
             id: string;
             online: boolean;
-            gatewayRuns: boolean;
             configPending: boolean;
           }>(path('/runner-hosts'))
         ).find((entry) => entry.id === runnerHost!.id);
-        return view?.online && view.gatewayRuns && !view.configPending ? view : undefined;
+        return view?.online && !view.configPending ? view : undefined;
       },
       30_000,
     );

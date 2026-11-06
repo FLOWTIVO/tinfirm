@@ -46,11 +46,6 @@ import org.springframework.validation.annotation.Validated;
  *                                     ({@code TINFIRM_MODEL_RELAY_MAX_INFLIGHT_BYTES}, 256 MiB); a body beyond it is
  *                                     429, an answer beyond it is passed on unmetered. At least twice
  *                                     {@code relayMaxRequestBytes}, so that the largest body fits
- * @param relayRequireHostToken        whether the relay refuses a run's token without its host's own token
- *                                     ({@code X-Tinfirm-Runner-Token}) from every host, the older ones too
- *                                     ({@code TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN}, on by default: runner
- *                                     {@code 0.3.0} is the minimum); off, a host before runner {@code 0.3.0} may leave
- *                                     it out (the package 2 contract, open point 6), for an upgrade only
  * @param gatewayModelUrl              the bundled gateway's model port, which serves the model API alone
  *                                     ({@code TINFIRM_MODEL_GATEWAY_MODEL_URL}, or the older
  *                                     {@code TINFIRM_LITELLM_MODEL_URL}; ADR-0069): the model requests the server
@@ -83,7 +78,7 @@ record ModelProperties(@Nullable String gatewayAdminUrl, @Nullable String gatewa
         @NotNull @DefaultValue("PT10M") Duration keyRotationGrace,
         @NotNull @DefaultValue("PT1M") Duration keyRotationSettle,
         @Positive @DefaultValue("268435456") long relayMaxInflightBytes,
-        @DefaultValue("true") boolean relayRequireHostToken, @Nullable String gatewayModelUrl,
+        @Nullable String gatewayModelUrl,
         @NotNull @DefaultValue("PT30S") Duration relayBodyTimeout, @Nullable List<String> relayAnthropicBetas,
         @Nullable List<String> relayOpenaiBetas, @NotNull @DefaultValue("LITELLM") GatewayVendor gatewayVendor) {
 
@@ -198,8 +193,7 @@ record ModelProperties(@Nullable String gatewayAdminUrl, @Nullable String gatewa
                 + ", relayMaxRequestBytes=" + relayMaxRequestBytes + ", relayRunConcurrency=" + relayRunConcurrency
                 + ", relayHostConcurrencyPerSlot=" + relayHostConcurrencyPerSlot + ", keyRotationInterval="
                 + keyRotationInterval + ", keyRotationGrace=" + keyRotationGrace + ", keyRotationSettle="
-                + keyRotationSettle + ", relayMaxInflightBytes=" + relayMaxInflightBytes + ", relayRequireHostToken="
-                + relayRequireHostToken + ", gatewayModelUrl=" + gatewayModelUrl + ", relayBodyTimeout="
+                + keyRotationSettle + ", relayMaxInflightBytes=" + relayMaxInflightBytes + ", gatewayModelUrl=" + gatewayModelUrl + ", relayBodyTimeout="
                 + relayBodyTimeout + ", relayAnthropicBetas=" + relayAnthropicBetas + ", relayOpenaiBetas="
                 + relayOpenaiBetas + "]";
     }

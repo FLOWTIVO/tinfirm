@@ -94,9 +94,6 @@ tinfirm:
     # The tests reconcile on demand; the job itself does not run during a test run.
     reconcile-interval: PT1H
     reconcile-initial-delay: PT1H
-    # Off in the tests, so that ModelRelayTest can show a host of runner 0.2.x accepted without its own token while the
-    # operator allows it; on by default in production (ModelRelaySettingsTest runs with the default).
-    relay-require-host-token: false
     # A rotated-out key is deleted an hour after its block (a minute in production), so that no in-process wake runs a
     # rotation's step while a test drives it: the tests move the row's times back instead (ModelKeyRotationTest).
     key-rotation-settle: PT1H

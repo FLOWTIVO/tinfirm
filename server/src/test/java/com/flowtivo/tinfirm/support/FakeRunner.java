@@ -12,6 +12,7 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -87,6 +88,9 @@ public final class FakeRunner implements AutoCloseable {
 
     private final WebSocket socket;
 
+    /** The host token it connected with; null for {@link #connectWithHeader}. */
+    private String token;
+
     private FakeRunner(int port, String authorization) {
         HttpClient client = HttpClient.newHttpClient();
         WebSocket.Builder builder = client.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(10));
@@ -99,7 +103,17 @@ public final class FakeRunner implements AutoCloseable {
 
     /** Connects with {@code Authorization: Bearer <token>}; no frame is sent yet. */
     public static FakeRunner connect(int port, String token) {
-        return new FakeRunner(port, "Bearer " + token);
+        FakeRunner runner = new FakeRunner(port, "Bearer " + token);
+        runner.token = token;
+        return runner;
+    }
+
+    /**
+     * The host token it connected with, which a real host's model proxy sends to the model relay next to a run's token
+     * ({@code X-Tinfirm-Runner-Token}).
+     */
+    public String token() {
+        return Objects.requireNonNull(token, "connected with a raw header");
     }
 
     /** Connects with a raw Authorization header value, or none when null. */
@@ -154,7 +168,7 @@ public final class FakeRunner implements AutoCloseable {
 
     /**
      * A {@code hello} of protocol v2 from a runner host of this version with the given slots and the images of every
-     * runtime: from {@code 0.2.0} on, the server sends it runs paid by a budget (the package 2 contract, §7).
+     * runtime. The version is stored and shown, and decides nothing (ADR-0109).
      */
     public static Map<String, Object> helloV2(List<Map<String, Object>> credentials,
             List<Map<String, Object>> activeRuns, String runnerVersion, int maxConcurrentRuns) {

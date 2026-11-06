@@ -35,7 +35,8 @@ abstract class ConversationTestBench extends IntegrationTest {
 
     static final Duration WAIT = Duration.ofSeconds(20);
 
-    static final String GATEWAY_VERSION = "0.2.0";
+    /** The runner version its hosts say in {@code hello}: any, since it decides nothing (ADR-0109). */
+    static final String RUNNER_VERSION = "0.2.0";
 
     final FakeLiteLlm litellm = FakeLiteLlm.bundled();
 
@@ -76,7 +77,7 @@ abstract class ConversationTestBench extends IntegrationTest {
     FakeRunner companyHost(Bench bench, int slots) {
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.id(), unique("host"), "COMPANY");
         FakeRunner runner = FakeRunner.connect(port, host.token());
-        runner.helloV2AndWelcome(List.of(), List.of(), GATEWAY_VERSION, slots);
+        runner.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, slots);
         await().atMost(WAIT).until(() -> connections.isConfigured(host.id()));
         return runner;
     }
@@ -88,7 +89,7 @@ abstract class ConversationTestBench extends IntegrationTest {
     FakeRunner steeringHost(Bench bench, int slots) {
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.id(), unique("host"), "COMPANY");
         FakeRunner runner = FakeRunner.connect(port, host.token());
-        Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of(), GATEWAY_VERSION, slots);
+        Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of(), RUNNER_VERSION, slots);
         hello.put("features", List.of("run.steer"));
         runner.send(hello);
         runner.expect("welcome");

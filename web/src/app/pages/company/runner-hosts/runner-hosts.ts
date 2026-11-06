@@ -33,7 +33,7 @@ import { PageHeader } from '../../../shared/page-header';
 import { PoolScheduleDialog } from '../../../shared/runner-hosts/pool-schedule-dialog';
 import { RegisterRunnerHostDialog } from '../../../shared/runner-hosts/register-runner-host-dialog';
 import { RunnerHostCard } from '../../../shared/runner-hosts/runner-host-card';
-import { GATEWAY_RUNNER_VERSION, takesTurns } from '../../../shared/runner-hosts/runner-host-view';
+import { takesTurns } from '../../../shared/runner-hosts/runner-host-view';
 
 const REMOVE_ERRORS = {
   'status:403': 'Only owners and admins remove company runner hosts.',
@@ -89,7 +89,6 @@ export class RunnerHosts {
   private readonly notify = inject(Notify);
   protected readonly current = inject(CurrentCompany);
 
-  protected readonly gatewayVersion = GATEWAY_RUNNER_VERSION;
   protected readonly canManage = computed(() => can.manageRunnerHosts(this.current.access()));
   /** An admin who is also a member has hosts of their own, on Accounts. */
   protected readonly hasOwnHosts = computed(() => isMember(this.current.access()));
@@ -103,7 +102,7 @@ export class RunnerHosts {
   protected readonly companyHosts = computed(() =>
     this.hosts.items().filter((host) => host.scope === 'COMPANY'),
   );
-  /** Hosts are registered, and none takes a turn paid by a budget now. */
+  /** Hosts are registered, and none takes turns now. */
   protected readonly noneTakesTurns = computed(
     () => this.companyHosts().length > 0 && !this.companyHosts().some(takesTurns),
   );

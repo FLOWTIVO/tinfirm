@@ -215,7 +215,8 @@ class ModelKeyRotationTest extends IntegrationTest {
         ApiClient admin = loginAs(company.email("ADMIN"));
         FakeLiteLlm.Key first = setup.key();
         first.spend = 2.0;
-        UUID hostId = registerRunnerHost(setup.owner(), company.id(), unique("host"), "COMPANY").id();
+        RunnerHostRef host = registerRunnerHost(setup.owner(), company.id(), unique("host"), "COMPANY");
+        UUID hostId = host.id();
         UUID runId = UUID.randomUUID();
         TestRuns.running(company.id(), runId, 1, hostId, setup.bot());
         String token = transactions.inCompany(company.id(), () -> relay.open(new ModelRelay.RelayedRun(company.id(),
@@ -244,7 +245,7 @@ class ModelKeyRotationTest extends IntegrationTest {
                 Thread.currentThread().interrupt();
             }
         });
-        CompletableFuture<HttpResponse<String>> inFlight = http.sendAsync(relayed(token,
+        CompletableFuture<HttpResponse<String>> inFlight = http.sendAsync(relayed(token, host.token(),
                 message("claude-sonnet-4-5").replace("{", "{\"stream\":true,")), HttpResponse.BodyHandlers.ofString());
         assertThat(streaming.await(20, TimeUnit.SECONDS)).isTrue();
 
@@ -273,7 +274,7 @@ class ModelKeyRotationTest extends IntegrationTest {
         HttpResponse<String> streamed = inFlight.get(20, TimeUnit.SECONDS);
         assertThat(streamed.statusCode()).isEqualTo(200);
         assertThat(streamed.body()).contains("\"alias\":\"" + first.alias + "\"").contains("\"part\":2");
-        HttpResponse<String> next = http.send(relayed(token, message("claude-sonnet-4-5")),
+        HttpResponse<String> next = http.send(relayed(token, host.token(), message("claude-sonnet-4-5")),
                 HttpResponse.BodyHandlers.ofString());
         assertThat(next.statusCode()).as(next.body()).isEqualTo(200);
         assertThat(JSON.readTree(next.body()).get("alias").asString()).isEqualTo(second.alias);
@@ -512,10 +513,12 @@ class ModelKeyRotationTest extends IntegrationTest {
         return "{\"model\":\"" + model + "\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
     }
 
-    private HttpRequest relayed(String token, String body) {
+    /** A relayed request with the run's token and its host's own token, as the host's model proxy sends both. */
+    private HttpRequest relayed(String token, String hostToken, String body) {
         return HttpRequest.newBuilder(URI.create("http://localhost:" + port + MESSAGES))
             .timeout(Duration.ofSeconds(30))
             .header("Authorization", "Bearer " + token)
+            .header("X-Tinfirm-Runner-Token", hostToken)
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(body))
             .build();

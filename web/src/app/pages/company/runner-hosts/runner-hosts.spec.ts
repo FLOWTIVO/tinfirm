@@ -90,35 +90,31 @@ describe('RunnerHosts', () => {
     expect(q('host-remove')).not.toBeNull();
   });
 
-  it.each<[string, Partial<RunnerHost>, string, string | null]>([
-    ['online', {}, 'Online', null],
-    ['offline', { online: false, lastSeenAt: AT.earlier }, 'Offline · last seen', null],
+  it.each<[string, Partial<RunnerHost>, string, boolean]>([
+    ['online', {}, 'Online', true],
+    ['offline', { online: false, lastSeenAt: AT.earlier }, 'Offline · last seen', false],
     [
       'never connected',
-      { online: false, lastSeenAt: null, version: null, gatewayRuns: false },
+      { online: false, lastSeenAt: null, version: null },
       'Offline · never connected',
-      null,
+      false,
     ],
-    [
-      'too old for budget runs',
-      { gatewayRuns: false, version: '0.1.4' },
-      'Online',
-      'Runner 0.1.4 is too old for turns paid by a budget: upgrade it to 0.2.0 or later. Until then it runs nothing for the company.',
-    ],
-  ])('reads a host that is %s', async (_, overrides, state, tooOld) => {
+    // Its runner version decides nothing, low or high (ADR-0109).
+    ['online with runner 0.0.1', { version: '0.0.1' }, 'Online', true],
+    ['online with runner 9.9.9', { version: '9.9.9' }, 'Online', true],
+  ])('reads a host that is %s', async (_, overrides, state, takes) => {
     await open([aRunnerHost(overrides)]);
     expect(words(q('host-state', host('office')))).toContain(state);
-    expect(words(q('host-too-old', host('office'))) ?? null).toBe(tooOld);
+    expect(q('none-takes-turns') === null).toBe(takes);
   });
 
   it.each<[string, Partial<RunnerHost>]>([
     ['offline', { online: false, lastSeenAt: AT.earlier }],
     ['draining', { draining: true }],
-    ['too old', { gatewayRuns: false }],
   ])('warns when no host takes turns: the only one is %s', async (_, overrides) => {
     await open([aRunnerHost(overrides)]);
     expect(words(q('none-takes-turns'))).toBe(
-      'No company host takes turns now Turns paid by a budget wait until a host with runner 0.2.0 or later is online.',
+      'No company host takes turns now Turns paid by a budget wait until a company host is online and not draining.',
     );
   });
 

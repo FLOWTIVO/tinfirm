@@ -30,7 +30,7 @@ class RunRequestIntegrationTest extends RunTestBench {
     @Test
     void requestsReachTheConversationOnlyForTheActiveRunAndEachIsAnsweredOnce() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             TestTurns.Script script = TestTurns.conversation(turn.conversationId());
@@ -75,7 +75,7 @@ class RunRequestIntegrationTest extends RunTestBench {
     @Test
     void aToolCallRunsOutsideAnyTransactionAndARequestSentAgainReachesThePortAgain() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             runner.accepted(turn.runId(), 1);

@@ -96,7 +96,7 @@ class RunCancelIntegrationTest extends RunTestBench {
     void theOwnerCancelsARunningRunThroughItsHost() {
         Bench bench = bench(true);
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.companyId(), unique("host"), "COMPANY");
-        FakeRunner runner = connect(host, GATEWAY_VERSION, 4);
+        FakeRunner runner = connect(host, RUNNER_VERSION, 4);
         Turn turn = start(bench);
         expectAssign(runner, turn.runId());
         runner.accepted(turn.runId(), 1);
@@ -113,7 +113,7 @@ class RunCancelIntegrationTest extends RunTestBench {
         runner.abort();
         try (FakeRunner again = FakeRunner.connect(port, host.token())) {
             again.helloV2AndWelcome(List.of(), List.of(Map.of("runId", turn.runId().toString(), "epoch", 1,
-                    "lastSeq", 0)), GATEWAY_VERSION, 4);
+                    "lastSeq", 0)), RUNNER_VERSION, 4);
             assertThat(again.expect("run.cancel").get("runId").asString()).isEqualTo(turn.runId().toString());
             again.send(Map.of("type", "run.finished", "runId", turn.runId().toString(), "epoch", 1, "outcome",
                     "CANCELLED", "lastSeq", 0));
@@ -128,7 +128,7 @@ class RunCancelIntegrationTest extends RunTestBench {
     @Test
     void anAssignedRunCancelledBeforeItsHostAcceptedIsStoppedThere() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             assertThat(bench.person().post(bench.path("/runs/" + turn.runId() + "/cancel"), null).json()

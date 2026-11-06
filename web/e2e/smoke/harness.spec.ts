@@ -118,14 +118,14 @@ test.describe('the seed, through the API', () => {
       relayEnabled: true,
       defaultBudgetUsd: 50,
     });
-    const hosts: { id: string; scope: string; online: boolean; gatewayRuns: boolean }[] =
-      await admin.all(apiPath('/runner-hosts'));
+    const hosts: { id: string; scope: string; online: boolean }[] = await admin.all(
+      apiPath('/runner-hosts'),
+    );
     expect(hosts).toContainEqual(
       expect.objectContaining({
         id: seed.runnerHost.id,
         scope: 'COMPANY',
         online: true,
-        gatewayRuns: true,
       }),
     );
   });

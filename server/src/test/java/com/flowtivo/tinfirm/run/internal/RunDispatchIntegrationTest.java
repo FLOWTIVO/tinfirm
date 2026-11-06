@@ -59,7 +59,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
     @Test
     void aTurnRunsOnACompanyHostWithTheRelaysTokenAndEndsForItsConversation() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             JsonNode assign = expectAssign(runner, turn.runId());
 
@@ -94,16 +94,16 @@ class RunDispatchIntegrationTest extends RunTestBench {
             assertThat(queued.get("status").asString()).isEqualTo("QUEUED");
             assertThat(queued.get("queueReason").get("code").asString()).isEqualTo("ASSIGNED");
             assertThat(queued.get("runnerHostKind").asString()).isEqualTo("COMPANY");
-            assertThat(relay(token)).isEqualTo(401);
+            assertThat(relay(token, runner.token())).isEqualTo(401);
 
             runner.accepted(turn.runId(), 1);
             awaitRun(bench, turn.runId(), "RUNNING");
-            assertThat(relay(token)).isEqualTo(200);
+            assertThat(relay(token, runner.token())).isEqualTo(200);
             runner.event(turn.runId(), 1, 1, "AGENT_MESSAGE", Map.of("text", "Working."));
             runner.send(finished(turn.runId(), 1, "SUCCEEDED", 1, "Done.", "session-1"));
             awaitRun(bench, turn.runId(), "SUCCEEDED");
             // The run ended: its token is revoked and refused.
-            assertThat(relay(token)).isEqualTo(401);
+            assertThat(relay(token, runner.token())).isEqualTo(401);
 
             JsonNode run = getRun(bench, turn.runId());
             assertThat(run.get("conversationId").asString()).isEqualTo(turn.conversationId().toString());
@@ -142,7 +142,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
         TestTurns.Script script = TestTurns.conversation(conversationId);
         String message = "Tinfirm could not get a token for GitHub right now; the turn is tried again shortly.";
         script.content = turn -> new TurnSource.TurnContent.Later(message);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench, conversationId, TurnReason.FIRST, 1, ModelAccessChoice.BUDGET);
             await().atMost(WAIT).untilAsserted(() -> assertThat(getRun(bench, turn.runId()).path("queueReason")
                 .path("code").asString()).isEqualTo("OTHER"));
@@ -169,7 +169,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
         TestTurns.Script script = TestTurns.conversation(conversationId);
         script.content = turn -> TestTurns.content(turn, List.of(), List.of("registry.npmjs.org", "api.example.org",
                 "*.github.io"));
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench, conversationId, TurnReason.FIRST, 1, ModelAccessChoice.BUDGET);
             JsonNode assign = expectAssign(runner, turn.runId());
 
@@ -234,24 +234,21 @@ class RunDispatchIntegrationTest extends RunTestBench {
                 + "WHERE principal_id = ?", bench.personPrincipalId());
 
         // 4. The hosts: none at all; only another member's personal host (it may not carry the person's budget, M4);
-        // a company host of a runner version before the always-on model proxy; one that is not ready.
+        // one that is not ready.
         awaitQueueReason(bench, turn.runId(), "NO_RUNNER_HOST");
         registerRunnerHost(bench.owner(), bench.companyId(), unique("owners-own"), "PERSONAL");
         awaitQueueReason(bench, turn.runId(), "NO_HOST_FOR_CREDENTIALS");
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.companyId(), unique("company"), "COMPANY");
-        try (FakeRunner old = connect(host, "0.1.9", 1)) {
-            assertThat(awaitQueueReason(bench, turn.runId(), "NO_RUNNER_HOST").get("text").asString())
-                .contains("0.2.0");
-        }
-        // Connected with a current version, but it has not confirmed its capacity: it takes no run yet.
+        // Connected, but it has not confirmed its capacity: it takes no run yet.
         try (FakeRunner unconfigured = FakeRunner.connect(port, host.token()).manualConfig()) {
-            unconfigured.helloV2AndWelcome(List.of(), List.of(), GATEWAY_VERSION, 1);
+            unconfigured.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, 1);
             assertThat(awaitQueueReason(bench, turn.runId(), "RUNNER_HOST_OFFLINE").get("runnerHostId").asString())
                 .isEqualTo(host.id().toString());
         }
 
-        // 5. The slots: the host's only slot is taken by another conversation's run.
-        try (FakeRunner runner = connect(host, GATEWAY_VERSION, 1)) {
+        // 5. The slots: the host's only slot is taken by another conversation's run. The host says a low runner
+        // version, and takes the run all the same: the version decides nothing (ADR-0109).
+        try (FakeRunner runner = connect(host, "0.0.1", 1)) {
             expectAssign(runner, turn.runId());
             runner.accepted(turn.runId(), 1);
             awaitRun(bench, turn.runId(), "RUNNING");
@@ -296,7 +293,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
     @Test
     void aTurnWhoseModelTheGatewayDoesNotServeFailsSayingSoAndAnotherFailureKeepsItsClass() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             // The relay saw LiteLLM's "Invalid model name" for a request of the run (ModelRelayTest); the runner
             // classes the runtime's error PROTOCOL_ERROR.
             Turn turn = running(bench, runner);
@@ -346,7 +343,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
         script.content = turn -> {
             throw new IndexOutOfBoundsException("a name the mount cannot cut");
         };
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench, conversationId, TurnReason.FIRST, 1, ModelAccessChoice.BUDGET);
             dispatcher.dispatch();
             awaitRun(bench, turn.runId(), "FAILED");
@@ -368,7 +365,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
     @Test
     void conversationsRunInParallelAndEachOneRunAtATime() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn one = start(bench);
             Turn two = start(bench);
             Set<String> assigned = Set.of(runner.expect("run.assign").get("runId").asString(),
@@ -393,7 +390,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
     @Test
     void theNextTurnGoesToTheConversationsPreviousHostAndResumesItsSession() {
         Bench bench = bench(true);
-        try (FakeRunner previous = companyHost(bench, GATEWAY_VERSION, 2)) {
+        try (FakeRunner previous = companyHost(bench, RUNNER_VERSION, 2)) {
             Turn first = start(bench);
             expectAssign(previous, first.runId());
             previous.accepted(first.runId(), 1);
@@ -403,7 +400,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
 
             // Another host with more free slots: the conversation still goes back to its previous host (open point
             // 13), where its session is.
-            try (FakeRunner roomier = companyHost(bench, GATEWAY_VERSION, 4)) {
+            try (FakeRunner roomier = companyHost(bench, RUNNER_VERSION, 4)) {
                 for (int turn = 2; turn <= 3; turn++) {
                     UUID runId = startTurn(bench, first.conversationId(), first.key(), TurnReason.MESSAGE, turn,
                             ModelAccessChoice.BUDGET).orElseThrow();
@@ -432,7 +429,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
     @Test
     void aRejectedRunWaitsAndIsAssignedAgainWithANewEpochAndANewToken() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             String first = expectAssign(runner, turn.runId()).get("modelAccess").get("apiKey").asString();
             runner.send(Map.of("type", "run.rejected", "runId", turn.runId().toString(), "epoch", 1, "reason",
@@ -451,8 +448,8 @@ class RunDispatchIntegrationTest extends RunTestBench {
             assertThat(second).isNotEqualTo(first);
             runner.accepted(turn.runId(), 3);
             awaitRun(bench, turn.runId(), "RUNNING");
-            assertThat(relay(first)).isEqualTo(401);
-            assertThat(relay(second)).isEqualTo(200);
+            assertThat(relay(first, runner.token())).isEqualTo(401);
+            assertThat(relay(second, runner.token())).isEqualTo(200);
 
             // A frame of the old epoch is stale.
             runner.event(turn.runId(), 1, 1, "AGENT_MESSAGE", Map.of("text", "Old."));
@@ -465,7 +462,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
     void aStaleDeliveryLeavesTheTokenOfTheAssignmentThatRunsAlone(CapturedOutput output) throws Exception {
         Bench bench = bench(true);
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.companyId(), unique("host"), "COMPANY");
-        FakeRunner first = connect(host, GATEWAY_VERSION, 4);
+        FakeRunner first = connect(host, RUNNER_VERSION, 4);
         // The turn's first preparation is slow: it waits until the test lets it go on.
         UUID conversationId = UUID.randomUUID();
         CountDownLatch preparing = new CountDownLatch(1);
@@ -490,20 +487,20 @@ class RunDispatchIntegrationTest extends RunTestBench {
         // (epoch 3), and runs with the token of that assignment.
         first.abort();
         await().atMost(WAIT).until(() -> !connections.isConnected(host.id()));
-        try (FakeRunner again = connect(host, GATEWAY_VERSION, 4)) {
+        try (FakeRunner again = connect(host, RUNNER_VERSION, 4)) {
             JsonNode assign = expectAssign(again, turn.runId());
             assertThat(assign.get("epoch").asLong()).isEqualTo(3);
             String token = assign.get("modelAccess").get("apiKey").asString();
             again.accepted(turn.runId(), 3);
             awaitRun(bench, turn.runId(), "RUNNING");
-            assertThat(relay(token)).isEqualTo(200);
+            assertThat(relay(token, host.token())).isEqualTo(200);
 
             // The first preparation ends now, and finds its assignment stale: nothing is sent, the running
             // assignment's token still answers, and no token of the stale one is left unrevoked.
             goOn.countDown();
             await().atMost(WAIT).until(() -> output.getAll().contains("Run " + turn.runId()
                     + " is no longer assigned with epoch 1"));
-            assertThat(relay(token)).isEqualTo(200);
+            assertThat(relay(token, host.token())).isEqualTo(200);
             assertThat(query(bench.companyId(), "SELECT count(*) FROM run_model_token WHERE run_id = ? AND epoch = 1 "
                     + "AND revoked_at IS NULL", turn.runId())).isEqualTo(0L);
             assertThat(query(bench.companyId(), "SELECT count(*) FROM run_model_token WHERE run_id = ? AND epoch = 3 "
@@ -637,7 +634,7 @@ class RunDispatchIntegrationTest extends RunTestBench {
     @Test
     void aTurnThatHitsItsBudgetFailsWithTheResetAndThePayersOtherTurnsWait() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             runner.accepted(turn.runId(), 1);

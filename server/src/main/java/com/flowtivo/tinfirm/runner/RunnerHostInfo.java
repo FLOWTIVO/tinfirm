@@ -20,7 +20,8 @@ import org.jspecify.annotations.Nullable;
  * @param draining                 whether the host last reported that it drains (meaningful while connected)
  * @param runtimes                 the runtimes whose images the host reported in its latest {@code hello}; null when
  *                                 it has not reported them, which counts as every runtime
- * @param runnerVersion            the version of its latest {@code hello}; null before it connected
+ * @param runnerVersion            the version of its latest {@code hello}; null before it connected. Shown and logged
+ *                                 only: what a host can do is its protocol and its features (ADR-0109)
  * @param lastSeenAt               when the host was last connected, or null if it never was
  */
 public record RunnerHostInfo(UUID id, UUID companyId, String name, HostScope scope, @Nullable UUID ownerPrincipalId,
@@ -54,14 +55,6 @@ public record RunnerHostInfo(UUID id, UUID companyId, String name, HostScope sco
     /** Whether this is the personal host of the principal. */
     public boolean personalOf(UUID principalId) {
         return scope == HostScope.PERSONAL && principalId.equals(ownerPrincipalId);
-    }
-
-    /**
-     * Whether runs paid by a budget may go to the host: its version has the always-on model proxy
-     * ({@link RunnerVersions}).
-     */
-    public boolean gatewayRuns() {
-        return RunnerVersions.supportsGatewayRuns(runnerVersion);
     }
 
     /**

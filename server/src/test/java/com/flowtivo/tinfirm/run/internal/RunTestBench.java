@@ -55,7 +55,8 @@ abstract class RunTestBench extends IntegrationTest {
 
     static final Duration WAIT = Duration.ofSeconds(20);
 
-    static final String GATEWAY_VERSION = "0.2.0";
+    /** The runner version its hosts say in {@code hello}: any, since it decides nothing (ADR-0109). */
+    static final String RUNNER_VERSION = "0.2.0";
 
     static final String MESSAGES = "/api/runner/v1/model/anthropic/v1/messages";
 
@@ -230,12 +231,16 @@ abstract class RunTestBench extends IntegrationTest {
                 "lastSeq", lastSeq, "summary", summary, "sessionId", sessionId, "git", List.of());
     }
 
-    /** A request through the model relay with the run's token: 200 while the run is active, 401 otherwise. */
-    int relay(String token) {
+    /**
+     * A request through the model relay with the run's token and its host's own token, as the host's model proxy sends
+     * both: 200 while the run is active, 401 otherwise.
+     */
+    int relay(String token, String hostToken) {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + MESSAGES))
             .timeout(Duration.ofSeconds(30))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + token)
+            .header("X-Tinfirm-Runner-Token", hostToken)
             .POST(HttpRequest.BodyPublishers.ofString("{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,"
                     + "\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}"))
             .build();

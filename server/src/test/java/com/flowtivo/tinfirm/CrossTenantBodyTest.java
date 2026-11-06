@@ -54,7 +54,8 @@ class CrossTenantBodyTest extends IntegrationTest {
 
     private static final Duration WAIT = Duration.ofSeconds(20);
 
-    private static final String GATEWAY_VERSION = "0.2.0";
+    /** The runner version its hosts say in {@code hello}: any, since it decides nothing (ADR-0109). */
+    private static final String RUNNER_VERSION = "0.2.0";
 
     private static final String MESSAGES = "/api/runner/v1/model/anthropic/v1/messages";
 
@@ -137,7 +138,7 @@ class CrossTenantBodyTest extends IntegrationTest {
 
         int before = litellm.requests("/v1/messages").size();
         HttpResponse<String> relayed = relay(token, Map.of("x-litellm-tags", "run:" + b.runId(),
-                "x-tinfirm-run", b.runId().toString()));
+                "x-tinfirm-run", b.runId().toString(), "X-Tinfirm-Runner-Token", a.host().token()));
         assertThat(relayed.statusCode()).as(relayed.body()).isEqualTo(200);
         assertThat(litellm.requests("/v1/messages")).hasSize(before + 1);
         FakeLiteLlm.Request forwarded = litellm.requests("/v1/messages").getLast();
@@ -253,7 +254,7 @@ class CrossTenantBodyTest extends IntegrationTest {
         ModelGateways.awaitKey(litellm, a.company(), a.person());
         ModelGateways.awaitStatus(a.owner(), a.company(), a.person(), "OK");
         try (FakeRunner runner = FakeRunner.connect(port, a.host().token())) {
-            runner.helloV2AndWelcome(List.of(), List.of(), GATEWAY_VERSION, 2);
+            runner.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, 2);
             await().atMost(WAIT).until(() -> connections.isConfigured(a.host().id()));
 
             List<String> answers = new ArrayList<>();

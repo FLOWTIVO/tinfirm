@@ -217,7 +217,7 @@ test.describe('W2b: company setup', { tag: ['@app', '@phone'] }, () => {
     }
   });
 
-  test('runner hosts: the seeded host online, one too old for budget runs, one never connected @serial', async ({
+  test('runner hosts: the seeded host online, one of an old runner version, one never connected @serial', async ({
     page,
     appPath,
     api,
@@ -235,7 +235,6 @@ test.describe('W2b: company setup', { tag: ['@app', '@phone'] }, () => {
       const seeded = hostCard(page, seed.runnerHost.name);
       await expect(seeded.getByTestId('host-state')).toHaveText('Online');
       await expect(seeded).toContainText('v0.2.0');
-      await expect(seeded.getByTestId('host-too-old')).toHaveCount(0);
       await expect(page.getByTestId('none-takes-turns')).toHaveCount(0);
 
       // Register a company host: its token is shown once, with the commands of a company host.
@@ -255,13 +254,12 @@ test.describe('W2b: company setup', { tag: ['@app', '@phone'] }, () => {
       await expect(old.getByTestId('host-state')).toHaveText('Offline · never connected');
       made.push(oldName);
 
-      // An old runner connects with it: online, and too old for turns paid by a budget.
+      // A runner of an old version connects with it: online, its version shown, and nothing
+      // refused for it: compatibility is the protocol, never the version (ADR-0109).
       await oldRunner.connect(token);
       await page.reload();
       await expect(old.getByTestId('host-state')).toHaveText('Online');
-      await expect(old.getByTestId('host-too-old')).toHaveText(
-        'Runner 0.1.4 is too old for turns paid by a budget: upgrade it to 0.2.0 or later. Until then it runs nothing for the company.',
-      );
+      await expect(old).toContainText('v0.1.4');
 
       // A host that never connected keeps its number of runs until it does.
       const spare = await admin.post(apiPath('/runner-hosts'), {
