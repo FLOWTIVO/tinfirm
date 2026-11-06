@@ -31,7 +31,7 @@ class KeyRotationRulesTest {
     private static ModelProperties properties(Duration interval, Duration grace, Duration settle) {
         return new ModelProperties(null, null, Duration.ofSeconds(10), Duration.ofMinutes(5), Duration.ofMinutes(10),
                 67_108_864L, 16, 16, interval, grace, settle, 268_435_456L, false, null, Duration.ofSeconds(30), null,
-                null);
+                null, GatewayVendor.LITELLM);
     }
 
     @Test
@@ -97,7 +97,8 @@ class KeyRotationRulesTest {
         return new ModelKeyStore.KeyRow(KeyHolder.principal(COMPANY, PRINCIPAL), hasKey ? UUID.randomUUID() : null,
                 hasKey ? "a".repeat(64) : null, null, null, ModelKeyStore.KeyStatus.OK, null, null, null, null, null,
                 NOW, NOW, new ModelKeyStore.Rotation(0, keyCreatedAt, null, requestedAt, null, null, null, null, null,
-                        null));
+                        null),
+                null);
     }
 
     private static ModelKeyStore.Rotation retiring(BigDecimal spend, Instant resetsAt) {
@@ -105,7 +106,7 @@ class KeyRotationRulesTest {
                 null, spend, resetsAt);
     }
 
-    private static LiteLlm.KeyState state(double spend, Instant resetsAt) {
-        return new LiteLlm.KeyState("b".repeat(64), "alias", true, spend, 25.0, "30d", resetsAt, List.of());
+    private static GatewayAdapter.KeyState state(double spend, Instant resetsAt) {
+        return new GatewayAdapter.KeyState("b".repeat(64), "alias", true, spend, 25.0, "30d", resetsAt, List.of());
     }
 }

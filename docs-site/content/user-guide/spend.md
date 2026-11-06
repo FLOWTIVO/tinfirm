@@ -22,7 +22,7 @@ Open **Accounts** and its **Budget** tab. **Your budget** shows:
 - **Spent**, the **Period** (*Resets 1 Nov*), and the **Models** your budget may pay for: **Every model the gateway serves**, or a list;
 - when the gateway last reported your spend. Spend reaches Tinfirm a few minutes after a turn.
 
-Tinfirm keeps a key at the gateway for you, with your budget on it. You never see the key, and it never reaches a runner host or a sandbox. A note above the numbers says when something holds your budget up:
+Tinfirm keeps a key at the gateway for you, with your budget on it. You never see the key, unless your company's gateway team made it for you ([Your model key](#your-model-key)), and it never reaches a runner host or a sandbox. A note above the numbers says when something holds your budget up:
 
 | Note | Meaning |
 |---|---|
@@ -33,6 +33,12 @@ Tinfirm keeps a key at the gateway for you, with your budget on it. You never se
 | **Your budget cannot be used right now** | The gateway refused your key or cannot be reached. Turns it pays wait, and Tinfirm tries again by itself |
 
 Your budget can pay only for a model the gateway serves and your budget allows. Choose the model in your **My settings** for the agent: a budget needs one.
+
+### Your model key
+
+Some companies' gateway teams make each person's key themselves, with its budget and models ([A gateway whose team makes the keys](../admin-guide/model-access.md#a-gateway-whose-team-makes-the-keys)). Then, once a key is entered for you or where you may enter your own, the **Budget** tab also shows **Your model key**: who entered the key, its last four characters and when. Until a key is entered, your turns wait with **You have no key at the company's model gateway yet**.
+
+Where your company lets members enter their own key, paste the key the gateway team gave you and choose **Save key**. Tinfirm asks the gateway whether it knows the key before it keeps it, keeps it in the company's vault and never shows it again. **Remove** forgets it, and your turns wait until a key is entered again. A key an admin entered is theirs to change.
 
 ### Budget alerts
 

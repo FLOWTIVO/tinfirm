@@ -26,6 +26,8 @@ import com.flowtivo.tinfirm.vault.SecretWriter;
  * transaction ({@code model_key.deleted} with the cause), and the key in LiteLLM after the commit, with the key a
  * rotation replaced if it is still there; what fails there the reconciliation deletes.</li>
  * </ul>
+ * A key the company's gateway team provided (ADR-0094) is theirs to revoke: Tinfirm forgets it as any other, and asks
+ * them to ({@code model_key.revoke_requested}).
  */
 @Component
 class KeyLifecycle implements PrincipalDependents {
@@ -89,7 +91,15 @@ class KeyLifecycle implements PrincipalDependents {
             .audit(AuditRecord.company(companyId, AuditAction.MODEL_KEY_DELETED, CurrentActor.actor()))
             .detail("cause", cause)
             .build());
-        work.deleteAfterCommit(companyId, row.get().litellmKeyId(), alias);
+        if (row.get().provided() != null) {
+            auditLog.record(holder
+                .audit(AuditRecord.company(companyId, AuditAction.MODEL_KEY_REVOKE_REQUESTED, CurrentActor.actor()))
+                .detail("cause", cause)
+                .detail("hint", row.get().provided().hint())
+                .build());
+            return;
+        }
+        work.deleteAfterCommit(companyId, row.get().gatewayKeyId(), alias);
         String previous = row.get().rotation().retiringKeyId();
         if (previous != null) {
             // The key a rotation replaced, still in LiteLLM for its grace, goes with it.

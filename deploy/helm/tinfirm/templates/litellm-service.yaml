@@ -1,7 +1,7 @@
 {{- if .Values.litellm.enabled }}
 # LiteLLM inside the cluster (ADR-0069): port http, every route of LiteLLM, at the server's
-# admin URL (TINFIRM_LITELLM_ADMIN_URL), for the server only; port model, the model port's
-# routes alone, for the server's model requests (TINFIRM_LITELLM_MODEL_URL) and the company's
+# admin URL (TINFIRM_MODEL_GATEWAY_ADMIN_URL), for the server only; port model, the model port's
+# routes alone, for the server's model requests (TINFIRM_MODEL_GATEWAY_MODEL_URL) and the company's
 # services. Always ClusterIP, and the NetworkPolicy admits each port's callers only: LiteLLM
 # is never exposed outside the release.
 apiVersion: v1

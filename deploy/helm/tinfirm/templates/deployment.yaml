@@ -107,7 +107,7 @@ spec:
             # The bundled LiteLLM's master key, for its admin API. Optional, so that a missing
             # LiteLLM Secret stops only the LiteLLM pods: the server then starts without a
             # bundled gateway (Model access: "This deployment bundles none.").
-            - name: TINFIRM_LITELLM_MASTER_KEY
+            - name: TINFIRM_MODEL_GATEWAY_ADMIN_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.litellm.existingSecret }}

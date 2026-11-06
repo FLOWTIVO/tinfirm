@@ -112,6 +112,35 @@ class RelayUsageMeterTest {
         }
     }
 
+    /**
+     * Bifrost's stream (v2.3.2) ends with a {@code message_delta} whose usage reports {@code input_tokens: 0} beside
+     * the output: the running totals keep the input that {@code message_start} reported.
+     */
+    @Test
+    void anAnthropicStreamKeepsItsRunningTotalsWhenALaterEventReportsZero() {
+        String stream = """
+                event: message_start
+                data: {"type":"message_start","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":1000,\
+                "cache_creation_input_tokens":0,"cache_read_input_tokens":200,"output_tokens":1}}}
+
+                event: content_block_delta
+                data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}
+
+                event: message_delta
+                data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,\
+                "cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":500}}
+
+                """;
+        for (int size : new int[] {1, 13, 4096}) {
+            RelayUsageMeter.Answered answered = meter(RelayTokenStore.RelayFormat.ANTHROPIC, "ANTHROPIC_MESSAGES",
+                    stream, size, null);
+            assertThat(answered.model()).isEqualTo("claude-sonnet-4-5");
+            assertThat(answered.inputTokens()).isEqualTo(1000);
+            assertThat(answered.cachedInputTokens()).isEqualTo(200);
+            assertThat(answered.outputTokens()).isEqualTo(500);
+        }
+    }
+
     @Test
     void aPlainAnthropicAnswerAndOneWithoutUsage() {
         RelayUsageMeter.Answered plain = meter(RelayTokenStore.RelayFormat.ANTHROPIC, "ANTHROPIC_MESSAGES", """

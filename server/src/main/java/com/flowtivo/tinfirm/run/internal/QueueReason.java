@@ -75,6 +75,11 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
         return of(QueueReasonCode.KEY_ERROR).withMessage(message);
     }
 
+    /** The payer has no key at a gateway whose keys its team provides (ADR-0094). */
+    static QueueReason noModelKey(String message) {
+        return of(QueueReasonCode.NO_MODEL_KEY).withMessage(message);
+    }
+
     /** A subscription's personal host is not connected (package 2's {@code Wait(HOST_OFFLINE)}). */
     static QueueReason subscriptionHostOffline(@Nullable RunnerHostInfo host, @Nullable String label,
             String message) {
@@ -185,6 +190,8 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
                     + (retryAt != null ? "; the turn goes on once it resets." : ".");
             case KEY_ERROR -> "The model key that pays for this conversation cannot be used right now"
                     + (message != null ? ": " + message : "") + ".";
+            case NO_MODEL_KEY -> "Whoever pays for this conversation has no key at the company's model gateway yet: "
+                    + "an admin enters it, or they enter their own where the company allows it.";
             case HOST_OFFLINE -> "The personal runner host " + (runnerHostName != null ? runnerHostName + " " : "")
                     + "of the subscription is offline.";
             case MODEL_ACCESS_UNAVAILABLE -> message != null ? message : "The conversation's model access is not "

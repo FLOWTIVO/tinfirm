@@ -277,10 +277,11 @@ tags:
       is always on.
   - name: ModelSettings
     description: |
-      The company's model gateway (the package 2 contract, §3.1, §6, §8; ADR-0059): LiteLLM, the one bundled with the
-      deployment or the company's own, which Tinfirm manages through its admin API, and the defaults of every key: a
-      budget per period and the models a key may use. The company is a LiteLLM team; its provider keys and models live
-      in LiteLLM. Runs paid by a budget may start only once LiteLLM answered the admin test (`relayEnabled`). OWNER and
+      The company's model gateway (the package 2 contract, §3.1, §6, §8; ADR-0059, ADR-0094): the LiteLLM bundled
+      with the deployment or the company's own, which Tinfirm manages through its admin API, or the company's own
+      gateway whose keys its gateway team provides (`PROVIDED`); and the defaults of every key: a budget per period
+      and the models a key may use. At a gateway Tinfirm manages, the company is a team; its provider keys and models
+      live there. Runs paid by a budget may start only once the gateway answered the test (`relayEnabled`). OWNER and
       ADMIN read and change the settings (`MANAGE_MODEL_ACCESS`); every member lists the models the gateway serves.
   - name: ModelAccess
     description: |
@@ -4166,8 +4167,9 @@ paths:
       summary: Store a new version of the value and optionally a new description (OWNER, ADMIN)
       description: |
         Problems: 400 VALIDATION_FAILED (a managed secret: its value is maintained by Tinfirm); 409 SECRET_MANAGED
-        for `LITELLM_ADMIN_KEY` while the model settings keep it (the detail names where): a new admin key is entered
-        in the model settings, which turn the relay off until the gateway passes its test again.
+        for `MODEL_GATEWAY_ADMIN_KEY` (`LITELLM_ADMIN_KEY` when entered before) while the model settings keep it (the
+        detail names where): a new admin key is entered in the model settings, which turn the relay off until the
+        gateway passes its test again.
       requestBody:
         required: true
         content:
@@ -4585,8 +4587,9 @@ paths:
       description: |
         `BUNDLED` uses the LiteLLM the deployment bundles (400 VALIDATION_FAILED when it bundles none). `EXTERNAL` needs
         the admin URL (https unless the operator allows http; private addresses only where the operator allows them:
-        400 INVALID_BASE_URL) and a master or admin key, which is kept as a company secret (`LITELLM_ADMIN_KEY`, which
-        the Secrets API neither replaces nor deletes while the settings keep it: 409 SECRET_MANAGED) and never returned;
+        400 INVALID_BASE_URL) and a master or admin key, which is kept as a company secret
+        (`MODEL_GATEWAY_ADMIN_KEY`, which the Secrets API neither replaces nor deletes while the settings keep it: 409
+        SECRET_MANAGED) and never returned;
         a new URL needs the key again, so that a key is sent only where it was entered. Back to `BUNDLED`, the secret
         goes. A change of the gateway, its URL or its key turns `relayEnabled` off until the next successful test, as
         before a first test, and clears `lastError`. A change of the defaults reaches every key without an override
@@ -4624,10 +4627,13 @@ paths:
       description: |
         A test that passes turns `relayEnabled` on, and Tinfirm then creates the keys of the principals that have none.
         A test that fails turns it off: 502 GATEWAY_UNREACHABLE, with LiteLLM's reason when it answered (never a key).
-        409 GATEWAY_NOT_CONFIGURED without settings. Audited as `model_settings.changed` with the outcome.
+        At a `PROVIDED` gateway (ADR-0094) the test asks the model URL for its model list with a key no gateway
+        issues: it passes when the gateway answers 401, 403 or a list, `models` is empty, and no key is created: each
+        is entered (`putPrincipalModelKey`, `putCompanyModelKey`, `putMyModelKey`). 409 GATEWAY_NOT_CONFIGURED
+        without settings. Audited as `model_settings.changed` with the outcome.
       responses:
         '200':
-          description: LiteLLM answered
+          description: The gateway answered
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ModelSettingsTestResult' }
@@ -4646,7 +4652,7 @@ paths:
       summary: The models the company's gateway serves, for settings and triggers (any member)
       description: |
         409 GATEWAY_NOT_CONFIGURED until the gateway passed its test; 502 GATEWAY_UNREACHABLE when LiteLLM does not
-        answer.
+        answer. Empty at a `PROVIDED` gateway, whose keys each serve the models their gateway team allows.
       responses:
         '200':
           description: The models
@@ -4672,7 +4678,8 @@ paths:
         that was still in its grace. The keys are rotated after the commit, one after the other; each principal's model
         access shows its request (`keyRotationRequestedAt`) until its new key is in place, and a request that LiteLLM
         fails stays until the reconciliation carries it out. 409 GATEWAY_NOT_CONFIGURED until the gateway passed its
-        test. Audited as `model_key.rotation_requested` per key (`scope` `company`), then `model_key.rotated` and
+        test; 409 MODEL_KEYS_MANAGED at a `PROVIDED` gateway, whose team makes and rotates its keys (ADR-0094).
+        Audited as `model_key.rotation_requested` per key (`scope` `company`), then `model_key.rotated` and
         `model_key.retired` as each key is replaced; never a key.
       responses:
         '202':
@@ -4703,6 +4710,58 @@ paths:
               schema: { $ref: '#/components/schemas/ModelAccessView' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/companies/{companyId}/me/model-access/key:
+    parameters:
+      - $ref: '#/components/parameters/CompanyId'
+    put:
+      tags: [ModelAccess]
+      operationId: putMyModelKey
+      summary: Enter the caller's own key at the company's gateway (a member, where the company allows it)
+      description: |
+        Only for a `PROVIDED` gateway (ADR-0094): 409 MODEL_KEYS_MANAGED while Tinfirm makes the company's keys
+        itself. The key is the one the company's gateway team made for the holder, with its budget and models; it is
+        checked with the gateway's model list before it is kept (400 MODEL_KEY_REFUSED when the gateway refuses it, 502
+        GATEWAY_UNREACHABLE when it does not answer), kept as an internal secret and never shown again: the view shows
+        its last four characters (`keyHint`). A key entered again replaces the one before. Audited as
+        `model_key.provided`; never the key. 409 MODEL_KEYS_MANAGED also while the company's settings do not let
+        members enter their own key (`memberKeys`), and while the caller's key is one an admin entered. 404 for a
+        caller without a principal.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelKeyRequest' }
+      responses:
+        '200':
+          description: The key is kept; the caller's model access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelAccessView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+    delete:
+      tags: [ModelAccess]
+      operationId: deleteMyModelKey
+      summary: Remove the caller's own key (a member, where the company allows it)
+      description: |
+        Tinfirm forgets the key the caller entered: their work waits (`NO_MODEL_KEY`) until a key is entered again.
+        The key stays at the gateway, its team's to revoke. 409 MODEL_KEYS_MANAGED as for `putMyModelKey`. Audited as
+        `model_key.removed`.
+      responses:
+        '200':
+          description: The key is gone; the caller's model access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelAccessView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /api/companies/{companyId}/principals/{principalId}/model-access:
     parameters:
@@ -4768,9 +4827,10 @@ paths:
         another server replica is working on the key, which carries the rotation out in a moment; 502
         GATEWAY_UNREACHABLE when LiteLLM failed a step, with its reason: the reconciliation carries out what is left
         (the new key while `keyRotationRequestedAt` shows the request, else the old key's block; the current key keeps
-        working). 409 GATEWAY_NOT_CONFIGURED until the gateway passed its test; 404 for an
-        unknown principal and one that left. Audited as `model_key.rotation_requested` (`scope` `principal`), then
-        `model_key.rotated` and `model_key.retired`; never a key.
+        working). 409 GATEWAY_NOT_CONFIGURED until the gateway passed its test, 409 MODEL_KEYS_MANAGED at a
+        `PROVIDED` gateway, whose team makes and rotates its keys (ADR-0094); 404 for an unknown principal and one
+        that left. Audited as `model_key.rotation_requested` (`scope` `principal`), then `model_key.rotated` and
+        `model_key.retired`; never a key.
       responses:
         '200':
           description: Rotated; the previous key is refused
@@ -4788,6 +4848,57 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/BadGateway' }
 
+
+  /api/companies/{companyId}/principals/{principalId}/model-access/key:
+    parameters:
+      - $ref: '#/components/parameters/CompanyId'
+      - $ref: '#/components/parameters/PrincipalId'
+    put:
+      tags: [ModelAccess]
+      operationId: putPrincipalModelKey
+      summary: Enter a principal's key at the company's gateway, a member's or a service account's (OWNER and ADMIN)
+      description: |
+        Only for a `PROVIDED` gateway (ADR-0094): 409 MODEL_KEYS_MANAGED while Tinfirm makes the company's keys
+        itself. The key is the one the company's gateway team made for the holder, with its budget and models; it is
+        checked with the gateway's model list before it is kept (400 MODEL_KEY_REFUSED when the gateway refuses it, 502
+        GATEWAY_UNREACHABLE when it does not answer), kept as an internal secret and never shown again: the view shows
+        its last four characters (`keyHint`). A key entered again replaces the one before. Audited as
+        `model_key.provided`; never the key. 404 for an unknown principal and one that left.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelKeyRequest' }
+      responses:
+        '200':
+          description: The key is kept; the principal's model access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelAccessView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+    delete:
+      tags: [ModelAccess]
+      operationId: deletePrincipalModelKey
+      summary: Remove a principal's key (OWNER and ADMIN)
+      description: |
+        Tinfirm forgets the key: the principal's work waits (`NO_MODEL_KEY`) until a key is entered again. The key
+        stays at the gateway, its team's to revoke. 409 MODEL_KEYS_MANAGED while Tinfirm makes the company's keys.
+        Audited as `model_key.removed`.
+      responses:
+        '200':
+          description: The key is gone; the principal's model access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelAccessView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /api/companies/{companyId}/model-access/company-key:
     parameters:
@@ -4843,8 +4954,9 @@ paths:
       description: |
         As `rotatePrincipalModelKey`, for the company's own key: 200 once the next key is in place, 202 while another
         server replica works on it, 502 GATEWAY_UNREACHABLE when LiteLLM failed a step, 409 GATEWAY_NOT_CONFIGURED
-        until the gateway passed its test. Audited as `model_key.rotation_requested` (`scope` `company_key`), then
-        `model_key.rotated` and `model_key.retired`; never a key.
+        until the gateway passed its test, 409 MODEL_KEYS_MANAGED at a `PROVIDED` gateway. Audited as
+        `model_key.rotation_requested` (`scope` `company_key`), then `model_key.rotated` and `model_key.retired`;
+        never a key.
       responses:
         '200':
           description: Rotated; the previous key is refused
@@ -4861,6 +4973,53 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '502': { $ref: '#/components/responses/BadGateway' }
+
+  /api/companies/{companyId}/model-access/company-key/key:
+    parameters:
+      - $ref: '#/components/parameters/CompanyId'
+    put:
+      tags: [ModelAccess]
+      operationId: putCompanyModelKey
+      summary: Enter the company's own key at its gateway, for Tinfirm's own requests (OWNER and ADMIN)
+      description: |
+        Only for a `PROVIDED` gateway (ADR-0094): 409 MODEL_KEYS_MANAGED while Tinfirm makes the company's keys
+        itself. The key is the one the company's gateway team made for the holder, with its budget and models; it is
+        checked with the gateway's model list before it is kept (400 MODEL_KEY_REFUSED when the gateway refuses it, 502
+        GATEWAY_UNREACHABLE when it does not answer), kept as an internal secret and never shown again: the view shows
+        its last four characters (`keyHint`). A key entered again replaces the one before. Audited as
+        `model_key.provided`; never the key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelKeyRequest' }
+      responses:
+        '200':
+          description: The key is kept; the company key's model access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelAccessView' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+    delete:
+      tags: [ModelAccess]
+      operationId: deleteCompanyModelKey
+      summary: Remove the company's own key (OWNER and ADMIN)
+      description: |
+        Tinfirm forgets the key; its own requests wait for a new one. 409 MODEL_KEYS_MANAGED while Tinfirm makes the
+        company's keys. Audited as `model_key.removed`.
+      responses:
+        '200':
+          description: The key is gone; the company key's model access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelAccessView' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /api/companies/{companyId}/memory-settings:
     parameters:
@@ -9631,7 +9790,7 @@ components:
           type: string
           nullable: true
           description: |
-            `BUDGET_SPENT`, `KEY_ERROR`, `HOST_OFFLINE` while waiting; `GATEWAY_NOT_CONFIGURED`,
+            `BUDGET_SPENT`, `KEY_ERROR`, `NO_MODEL_KEY`, `HOST_OFFLINE` while waiting; `GATEWAY_NOT_CONFIGURED`,
             `PRINCIPAL_INACTIVE`, `SUBSCRIPTION_GONE`, `PERSONAL_HOST_CREDENTIAL_ONLY` when refused, and for a budget
             `MODEL_REQUIRED` (the settings name no model) or `MODEL_NOT_ALLOWED` (one the key does not allow)
         detail: { type: string, nullable: true }
@@ -10180,9 +10339,18 @@ components:
     ModelGateway:
       type: string
       description: |
-        `BUNDLED`: the LiteLLM the deployment bundles (`TINFIRM_LITELLM_ADMIN_URL`). `EXTERNAL`: the company's own
-        LiteLLM, by its admin URL and a master or admin key.
-      enum: [BUNDLED, EXTERNAL]
+        `BUNDLED`: the gateway the deployment bundles (`TINFIRM_MODEL_GATEWAY_ADMIN_URL`). `EXTERNAL`: the company's own
+        LiteLLM, by its admin URL and a master or admin key. `PROVIDED` (ADR-0094): the company's own gateway by its
+        model URL alone, whose keys the company's gateway team makes and hands to Tinfirm (`putPrincipalModelKey`,
+        `putCompanyModelKey`, `putMyModelKey`); Tinfirm holds no admin key and makes, rotates and deletes no key there.
+      enum: [BUNDLED, EXTERNAL, PROVIDED]
+    ModelGatewayVendor:
+      type: string
+      description: |
+        The product the company's gateway is, whose words Tinfirm reads in its refusals (ADR-0094). `LITELLM` for every
+        `BUNDLED` and `EXTERNAL` gateway; `GENERIC`, for a `PROVIDED` gateway only, one of no vendor Tinfirm knows: a
+        spent budget is a `402`, or a `429` whose error speaks of a budget or a quota.
+      enum: [LITELLM, GENERIC]
     MemorySettings:
       type: object
       description: The company's settings of agents' memory (ADR-0063, ADR-0065)
@@ -10225,12 +10393,20 @@ components:
       description: |
         The company's model gateway and the defaults of its keys (the package 2 contract, §3.1). Runner hosts never
         reach LiteLLM: they reach the server's model relay, `relayBaseUrl`.
-      required: [configured, gateway, bundledAvailable, adminKeySet, relayEnabled, relayBaseUrl, defaultBudgetUsd, budgetPeriod, defaultModels, keyRotationInterval, keyRotationGrace]
+      required: [configured, gateway, vendor, memberKeys, bundledAvailable, adminKeySet, relayEnabled, relayBaseUrl, defaultBudgetUsd, budgetPeriod, defaultModels, keyRotationInterval, keyRotationGrace]
       properties:
         configured:
           type: boolean
           description: Whether an admin configured a gateway; false shows the defaults a configuration starts from
         gateway: { $ref: '#/components/schemas/ModelGateway' }
+        vendor: { $ref: '#/components/schemas/ModelGatewayVendor' }
+        modelUrl:
+          type: string
+          nullable: true
+          description: A `PROVIDED` gateway's root for model requests; null for the others
+        memberKeys:
+          type: boolean
+          description: Whether members may enter their own key (`PROVIDED` only; `putMyModelKey`)
         bundledAvailable:
           type: boolean
           description: Whether the deployment bundles a LiteLLM, which `BUNDLED` uses
@@ -10257,7 +10433,9 @@ components:
         budgetPeriod:
           type: string
           example: 30d
-          description: How often a key's budget resets, in LiteLLM's terms (a number and `h`, `d`, `w` or `mo`)
+          description: >-
+            How often a key's budget resets: a number and `h`, `d`, `w` or `mo`, which Tinfirm writes in the
+            gateway's own terms
         defaultModels:
           type: array
           items: { type: string }
@@ -10299,10 +10477,15 @@ components:
       type: object
       description: |
         Absent optional fields keep their stored value (`budgetPeriod` is `30d` and `defaultModels` empty at first).
-        `adminUrl` and `adminKey` are for `EXTERNAL` only.
+        `adminUrl` and `adminKey` are for `EXTERNAL` only; `modelUrl` and `memberKeys` for `PROVIDED` only (`modelUrl`
+        required at first). `vendor` is `LITELLM` but for `PROVIDED`, where it is as sent, else as stored when the
+        gateway was `PROVIDED` already, else `GENERIC`; `GENERIC` at another gateway is 400 VALIDATION_FAILED.
       required: [gateway, defaultBudgetUsd]
       properties:
         gateway: { $ref: '#/components/schemas/ModelGateway' }
+        vendor: { $ref: '#/components/schemas/ModelGatewayVendor' }
+        modelUrl: { type: string, maxLength: 500, example: 'https://ai-gateway.example.com' }
+        memberKeys: { type: boolean }
         adminUrl: { type: string, maxLength: 500, example: 'https://litellm.example.com' }
         adminKey:
           type: string
@@ -10362,13 +10545,23 @@ components:
           items: { type: string, enum: [CLAUDE_CODE, CODEX, PI, OPENCODE] }
         status: { type: string, enum: [AVAILABLE, COOLDOWN, INVALID, OFFLINE] }
         reported: { type: boolean }
+    ModelKeyRequest:
+      type: object
+      required: [key]
+      properties:
+        key:
+          type: string
+          writeOnly: true
+          minLength: 8
+          maxLength: 1000
+          description: The key the company's gateway team made; kept as an internal secret, never returned
     ModelAccessView:
       type: object
       description: |
         A principal's model access (the package 2 contract, §3.2), or the company's own key's (ADR-0065): the budget and
         models of its LiteLLM key (its own or the company's default), what LiteLLM last said of its spend, and its
         status. The key itself is never shown.
-      required: [gatewayConfigured, budgetUsd, budgetOverridden, budgetPeriod, models, modelsOverridden, subscriptions]
+      required: [gatewayConfigured, budgetUsd, budgetOverridden, budgetPeriod, models, modelsOverridden, subscriptions, keyProvided, keyProvidedBySelf, canEnterOwnKey]
       properties:
         principalId:
           type: string
@@ -10402,11 +10595,27 @@ components:
           description: |
             When LiteLLM last confirmed the key and said its spend (`spentUsd`): every reconciliation reads every key
             again (every 5 minutes by default), so the page can say how old the figure is
+        keyProvided:
+          type: boolean
+          description: Whether the key is one the company's gateway team made and someone entered (`PROVIDED`, ADR-0094)
+        keyHint:
+          type: string
+          nullable: true
+          description: A provided key's last four characters, as it was entered; null for a key Tinfirm made
+        keyProvidedAt: { type: string, format: date-time, nullable: true }
+        keyProvidedBySelf:
+          type: boolean
+          description: Whether the principal entered its own key; false for one an admin or the API entered
+        canEnterOwnKey:
+          type: boolean
+          description: "For the caller's own view: whether they may enter or remove their own key now (`putMyModelKey`)"
         keyCreatedAt:
           type: string
           format: date-time
           nullable: true
-          description: When LiteLLM created the current key; null while the principal has none
+          description: |
+            When LiteLLM created the current key, or when a provided key was entered; null while the principal has
+            none
         keyAgeDays:
           type: integer
           format: int32
@@ -10774,8 +10983,9 @@ components:
         (the company's runs are stopped, package 6) and SYSTEM_PAUSED (the workspace holds a repository of a paused
         system, `message` names it); AGENT_PAUSED
         (until the agent is resumed); ACCOUNT_REQUIRED (an account of the workspace waits for a person); BUDGET_SPENT
-        (until `retryAt`), KEY_ERROR,
-        HOST_OFFLINE (a subscription's personal host is offline) and MODEL_ACCESS_UNAVAILABLE (`reason`: the model
+        (until `retryAt`), KEY_ERROR, NO_MODEL_KEY (ADR-0094: the company's gateway team provides the keys, and the
+        payer has none yet), HOST_OFFLINE (a subscription's personal host is offline) and MODEL_ACCESS_UNAVAILABLE
+        (`reason`: the model
         access module's refusal, such as PRINCIPAL_INACTIVE or SUBSCRIPTION_GONE); NO_HOST_FOR_CREDENTIALS (the
         company has hosts for the runtime, but none may carry the run's credentials), NO_RUNNER_HOST,
         RUNNER_HOST_OFFLINE and RUNNER_HOST_DRAINING; CREDENTIAL_POOL_FULL (a subscription's pool) and
@@ -10786,7 +10996,7 @@ components:
         RETRY_SCHEDULED (ADR-0073), before every check: an automatic retry of a turn that failed for a reason that may
         pass waits until `retryAt`, the `used`th of at most `limit` in a row (`AgentSettings.autoRetry`).
         OTHER: anything else, in `message`.
-      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, RETRY_SCHEDULED, OTHER]
+      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, RETRY_SCHEDULED, OTHER]
     QueueReason:
       type: object
       description: |

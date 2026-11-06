@@ -60,7 +60,7 @@ public abstract class IntegrationTest {
         // certificate (an https system, GitLab's API at the system's origin).
         GitLabStub.server();
         // The deployment's bundled LiteLLM (the package 2 contract, §6): the fake, shared by every test.
-        registry.add("tinfirm.model.litellm-admin-url", () -> FakeLiteLlm.bundled().url());
+        registry.add("tinfirm.model.gateway-admin-url", () -> FakeLiteLlm.bundled().url());
         // Slack and the Bot Framework (the package 5 contract): their fixed endpoints are the stubs'.
         registry.add("tinfirm.chat.endpoints.slack-api", FakeSlack::apiUrl);
         registry.add("tinfirm.chat.endpoints.slack-files", FakeSlack::filesUrl);

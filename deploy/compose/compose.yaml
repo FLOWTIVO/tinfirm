@@ -255,9 +255,10 @@ services:
       TINFIRM_ERROR_REPORTS_PROXY: ${TINFIRM_ERROR_REPORTS_PROXY:-}
       # The bundled LiteLLM (CONVENTIONS §4): its admin API on the gateway network with its
       # master key, and the model requests the server relays and its own at the model port.
-      TINFIRM_LITELLM_ADMIN_URL: http://litellm:4000
-      TINFIRM_LITELLM_MODEL_URL: http://model-api:4001
-      TINFIRM_LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?is not set in deploy/compose/.env}
+      TINFIRM_MODEL_GATEWAY_VENDOR: LITELLM
+      TINFIRM_MODEL_GATEWAY_ADMIN_URL: http://litellm:4000
+      TINFIRM_MODEL_GATEWAY_MODEL_URL: http://model-api:4001
+      TINFIRM_MODEL_GATEWAY_ADMIN_KEY: ${LITELLM_MASTER_KEY:?is not set in deploy/compose/.env}
       # The model relay requires every runner host's own token (runner host 0.3.0 is the minimum);
       # false only while a host older than 0.3.0 is being upgraded.
       TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN: ${TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN:-true}

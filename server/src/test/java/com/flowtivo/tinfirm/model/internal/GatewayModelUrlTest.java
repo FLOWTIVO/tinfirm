@@ -11,16 +11,18 @@ import org.junit.jupiter.api.Test;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 
 /**
- * The bundled gateway's two addresses (ADR-0069): the admin API at {@code TINFIRM_LITELLM_ADMIN_URL}, the model
- * requests at the model port {@code TINFIRM_LITELLM_MODEL_URL}, or at the admin URL without one; a company's own gateway
- * has one URL for both. Neither shows the admin key. A model URL the keys could not safely go to stops the server.
+ * The bundled gateway's two addresses (ADR-0069): the admin API at {@code TINFIRM_MODEL_GATEWAY_ADMIN_URL}, the
+ * model requests at the model port {@code TINFIRM_MODEL_GATEWAY_MODEL_URL}, or at the admin URL without one; a
+ * company's own gateway has one URL for both. Neither shows the admin key. A model URL the keys could not safely go to
+ * stops the server.
  */
 class GatewayModelUrlTest {
 
     private static ModelProperties properties(String adminUrl, String modelUrl) {
         return new ModelProperties(adminUrl, "sk-TEST-ONLY-master-key", Duration.ofSeconds(10), Duration.ofMinutes(5),
                 Duration.ofMinutes(10), 67_108_864L, 16, 16, Duration.ofDays(30), Duration.ofMinutes(10),
-                Duration.ofMinutes(1), 268_435_456L, false, modelUrl, Duration.ofSeconds(30), null, null);
+                Duration.ofMinutes(1), 268_435_456L, false, modelUrl, Duration.ofSeconds(30), null, null,
+                GatewayVendor.LITELLM);
     }
 
     private static Gateway bundled(ModelProperties properties) {
@@ -49,9 +51,9 @@ class GatewayModelUrlTest {
                 "http://model-api:4001#f", "ftp://model-api:4001", "model-api:4001", "http://", "http://a b" }) {
             assertThatThrownBy(() -> properties("http://litellm:4000", url)).as(url)
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("TINFIRM_LITELLM_MODEL_URL");
+                .hasMessageContaining("TINFIRM_MODEL_GATEWAY_MODEL_URL");
         }
-        assertThat(properties("http://litellm:4000", "https://gateway.example.com/models").litellmModelUrl())
+        assertThat(properties("http://litellm:4000", "https://gateway.example.com/models").gatewayModelUrl())
             .isEqualTo("https://gateway.example.com/models");
     }
 

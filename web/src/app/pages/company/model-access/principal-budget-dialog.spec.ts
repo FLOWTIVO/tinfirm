@@ -27,7 +27,11 @@ describe('PrincipalBudgetDialog', () => {
   let http: HttpTestingController;
   let saved: ModelAccessView[];
 
-  async function open(view: ModelAccessView, served = ['claude-sonnet-4-5', 'gpt-5.4']) {
+  async function open(
+    view: ModelAccessView,
+    served = ['claude-sonnet-4-5', 'gpt-5.4'],
+    provided = false,
+  ) {
     TestBed.configureTestingModule({
       imports: [PrincipalBudgetDialog],
       providers: [...provideTestHttp(), fakeNotify().provider],
@@ -39,6 +43,7 @@ describe('PrincipalBudgetDialog', () => {
     fixture.componentRef.setInput('view', view);
     fixture.componentRef.setInput('defaults', { budgetUsd: 50, period: '30d', models: [] });
     fixture.componentRef.setInput('served', served);
+    fixture.componentRef.setInput('provided', provided);
     saved = [];
     fixture.componentInstance.saved.subscribe((v) => saved.push(v));
     fixture.componentInstance.open.set(true);
@@ -163,5 +168,58 @@ describe('PrincipalBudgetDialog', () => {
     expect(words($('#models-own')!.closest('label'))).toBe(
       'Only these The gateway lists its models once it passes its test.',
     );
+  });
+
+  it('enters the key the gateway team made, and says when the gateway refuses it', async () => {
+    await open(aModelAccess({ principalId: IDS.svcReader, keyStatus: 'ERROR' }), [], true);
+    const dialog = () => words($('hlm-dialog-content'));
+    expect(dialog()).toContain('Key of svc-reader');
+    expect(words($('[data-testid=provided-key-state]'))).toBe(
+      'No key yet: until one is entered, the work it pays for waits.',
+    );
+    // The gateway sets the budget: none to choose here.
+    expect($('[data-testid=spent-now]')).toBeNull();
+    expect($('#budget-own')!.closest('fieldset')!.classList).toContain('hidden');
+    expect($('[data-testid=remove-key]')).toBeNull();
+
+    typeInto($('#provided-key'), 'sk-wrong-key-0000');
+    await settle();
+    await fixture.whenStable();
+    await click('[data-testid=save-key]');
+    const refused = http.expectOne({ method: 'PUT', url: `${URL}/key` });
+    expect(refused.request.body).toEqual({ key: 'sk-wrong-key-0000' });
+    refused.flush(problem(400, 'MODEL_KEY_REFUSED'), { status: 400, statusText: 'Bad Request' });
+    await settle();
+    await fixture.whenStable();
+    expect(words($('#provided-key-error'))).toBe(
+      'The gateway refused this key. Check it with your gateway team.',
+    );
+
+    typeInto($('#provided-key'), 'sk-team-made-key-a1b2');
+    await settle();
+    await fixture.whenStable();
+    await click('[data-testid=save-key]');
+    const entered = http.expectOne({ method: 'PUT', url: `${URL}/key` });
+    entered.flush(aModelAccess({ principalId: IDS.svcReader, keyProvided: true, keyHint: 'a1b2' }));
+    await settle();
+    expect(saved.map((v) => v.keyHint)).toEqual(['a1b2']);
+    expect($<HTMLInputElement>('#provided-key')!.value).toBe('');
+  });
+
+  it('removes a provided key', async () => {
+    await open(
+      aModelAccess({ principalId: IDS.svcReader, keyProvided: true, keyHint: 'a1b2' }),
+      [],
+      true,
+    );
+    expect(words($('[data-testid=provided-key-state]'))).toContain(
+      'Entered by an admin · ends in …a1b2',
+    );
+    await click('[data-testid=remove-key]');
+    http
+      .expectOne({ method: 'DELETE', url: `${URL}/key` })
+      .flush(aModelAccess({ principalId: IDS.svcReader, keyProvided: false }));
+    await settle();
+    expect(saved.map((v) => v.keyProvided)).toEqual([false]);
   });
 });
