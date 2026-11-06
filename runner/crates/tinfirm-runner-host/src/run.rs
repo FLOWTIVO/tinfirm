@@ -800,6 +800,7 @@ pub async fn execute(
                     new_home,
                     client_version: shared.opts.runner_version.clone(),
                     mcp_url: access.mcp.as_ref().map(|m| m.url().to_string()),
+                    session_meta: crate::runtime_env::session_meta(assign.agent.runtime, model),
                     steering: steering.clone(),
                     thought_level: if effort_in_env(assign.agent.runtime) {
                         ThoughtLevel::Untouched
