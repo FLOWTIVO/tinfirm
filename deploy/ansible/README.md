@@ -64,7 +64,7 @@ tinfirm_runner_hosts:
   vars:
     tinfirm_runner_host_server_url: https://tinfirm.internal
     tinfirm_runner_host_token: "{{ vault_tinfirm_runner_token }}"   # Runner hosts → Register a runner host
-    # The runner host 0.3.0 or later (below); <version> as in the release's asset names.
+    # Any runner host release (below); <version> as in the release's asset names.
     tinfirm_runner_host_binary_url: https://nexus.internal/repository/tinfirm/tinfirm-runner-host-<version>-x86_64-unknown-linux-musl.tar.gz
     # SHA256SUMS and SHA256SUMS.sig beside it: the role checks the signature, then the archive.
     tinfirm_runner_host_kata_download_url: https://nexus.internal/repository/kata-releases
@@ -96,8 +96,8 @@ The main ones:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `tinfirm_runner_host_binary_src` / `_binary_url` | — | The runner host binary: a file on the control node, or a release archive to download. Set exactly one. Runs paid by a budget go only to runner hosts 0.2.0 or later, and 0.3.0 also sends the host's own token to the server's model relay: use 0.3.0, the current version, or later. No version is released yet: take the archive of the `rolling` prerelease, whose `<version>` is `rolling-<short sha>` ([docs/operations/auto-deploy.md](../../docs/operations/auto-deploy.md#1-what-ci-publishes)) |
-| `tinfirm_runner_host_server_url`, `tinfirm_runner_host_token` | — | Login, done once; `tinfirm_runner_host_relogin: true` repeats it. Use the server's public URL (`TINFIRM_PUBLIC_URL`): the model proxy sends the host's token only to that origin, and the relay refuses the model requests of a 0.3.0 host without it |
+| `tinfirm_runner_host_binary_src` / `_binary_url` | — | The runner host binary: a file on the control node, or a release archive to download. Set exactly one. Any release works with a server that speaks its protocol ([runner/README.md](../../runner/README.md#compatibility-with-the-server)). No version is released yet: take the archive of the `rolling` prerelease, whose `<version>` is `rolling-<short sha>` ([docs/operations/auto-deploy.md](../../docs/operations/auto-deploy.md#1-what-ci-publishes)) |
+| `tinfirm_runner_host_server_url`, `tinfirm_runner_host_token` | — | Login, done once; `tinfirm_runner_host_relogin: true` repeats it. Use the server's public URL (`TINFIRM_PUBLIC_URL`): the model proxy sends the host's token only to that origin, and the relay refuses the model requests of a host without it |
 | `tinfirm_runner_host_kata_version` | `4.2.0` | Kata Containers static release |
 | `tinfirm_runner_host_kata_runtime_name` | `kata` | Docker runtime name; must start with `kata` |
 | `tinfirm_runner_host_sandbox_docker` | `true` | `run --sandbox-docker` |

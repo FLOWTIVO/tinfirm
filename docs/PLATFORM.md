@@ -263,7 +263,7 @@ Built on a fresh schema with no data migration, package by package.
 | # | Package | Gives | State |
 |---|---|---|---|
 | 0 | This design, ADR-0058, ADR-0059, the archive of the previous design | The decision | Done |
-| — | The runner's model proxy | No key in the sandbox | Built; always on since runner host 0.2.0 |
+| — | The runner's model proxy | No key in the sandbox | Built; always on, part of runner protocol 2 (ADR-0109) |
 | 1 | Principals and systems: three roles, service accounts, systems and their Sign-in apps, accounts, grants, personal MCP servers, the binding rule ([contract](reviews/2026-10-12-package-1-contract.md)) | Who acts, and with what | Built, on `main` ([CONVENTIONS §15.1](CONVENTIONS.md#151-principals) to §15.3) |
 | 2 | Model access: LiteLLM bundled and managed, a key and budget per principal, subscriptions on their owner's host, company and personal runner hosts, the model relay ([contract](reviews/2026-10-12-package-2-contract.md)) | Who pays | Built, on `main` ([CONVENTIONS §15.4](CONVENTIONS.md#154-model-access-and-runner-hosts)) |
 | 3 | Agents, settings and conversations in the app: tools in three layers, questions, approvals, the runner mapping ([contract](reviews/2026-10-12-package-3-contract.md)) | Two people use one agent with their own accounts and budgets | Built, on `main` ([CONVENTIONS §15.5](CONVENTIONS.md#155-agents-and-settings) to §15.7) |

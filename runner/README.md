@@ -173,7 +173,7 @@ the server sends it differs:
    tinfirm-runner-host run                     # --max-concurrent-runs 2 by default
    ```
    The host appears online on its page in the web app. A company host takes turns paid by a
-   budget (runner 0.2.0 or later). A personal host's card lists the subscriptions it reported;
+   budget. A personal host's card lists the subscriptions it reported;
    its owner picks one under **Who pays** in **My settings** of an agent, and a trigger's
    author in the trigger's settings. Agents name no credential, and there are no tasks: work
    starts as a conversation (**Conversations** → **New conversation**) or from a trigger.
@@ -257,18 +257,16 @@ server pays from a budget is such a run: its gateway is the server's model relay
 one-run token ([Model access](#model-access)). Model access without a base URL, which the server
 never sends, is refused; this host's own credentials keep the key in the sandbox's environment. The runner protocol did not change for the proxy.
 
-**Always on**, since runner host **0.2.0** (`tinfirm-runner-host --version`, and
-`hello.runnerVersion` for the server): no option turns it off. The server cannot tell from the
-protocol whether a host proxies, so no host may be able to put a gateway's key into the sandbox
-([ADR-0059](../docs/adr/0059-litellm-budgets-and-the-model-proxy.md), decision 5), and the server
-sends runs paid by a budget only to hosts of 0.2.0 or later
-([package 2](../docs/reviews/2026-10-12-package-2-contract.md) §7; the host's page in the web app says
-when a host is too old). `--model-proxy`
-(`TINFIRM_RUNNER_MODEL_PROXY`), the opt-in of 0.1.0, is still accepted by 0.2.0 and 0.3.0 so that
+**Always on**: no option turns it off. The always-on proxy is part of runner protocol 2, so no
+host of protocol 2 can put a gateway's key into the sandbox
+([ADR-0059](../docs/adr/0059-litellm-budgets-and-the-model-proxy.md), decision 5;
+[ADR-0109](../docs/adr/0109-runner-version-is-the-release-version.md)), and the server sends runs
+paid by a budget to any host of protocol 2, whatever its version. `--model-proxy`
+(`TINFIRM_RUNNER_MODEL_PROXY`), a former opt-in, is still accepted so that
 service files keep working: it does nothing, not even with `0` or `false`, and `run` logs a warning
 at start. It goes in a later release, which will refuse it as an unknown option, so remove it.
 
-**The host's own token, since 0.3.0.** The gateway of a Tinfirm server is the server's model relay,
+**The host's own token.** The gateway of a Tinfirm server is the server's model relay,
 and the run's key is a one-run token. So that a copied run token is worth nothing away from this
 host, the proxy also sends this host's runner token (the one of `login`) in the header
 `x-tinfirm-runner-token`, and the relay takes the run's token only with the token of the host the
@@ -278,9 +276,8 @@ port of `login --server`, `wss` counting as `https`), where the WebSocket alread
 gateway never gets it, the sandbox never sees it, and a header of that name from the sandbox is
 dropped like every other credential. A server's relay therefore needs the host logged in with the
 server's public URL (`TINFIRM_PUBLIC_URL`): a relay at another origin gets no host token, the run's
-log says so, and the server refuses the model requests of a host of 0.3.0 or later without it
-(`401`). Hosts of 0.2.x send none; the server refuses them too, unless its operator turns
-`TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN` off while they are upgraded.
+log says so, and the server refuses the run's model requests without it (`401`). Sending it is part
+of runner protocol 2 ([Compatibility with the server](#compatibility-with-the-server)).
 
 ```sh
 tinfirm-runner-host run                          # a public gateway
@@ -590,7 +587,7 @@ run is Pro's and Enterprise's too ([ADR-0100](../docs/adr/0100-elastic-runners-i
   fails its run with `INFRA` and is deleted.
 - **The VM image's build.** The VM image holds its own copy of this binary, which runs the bridge and
   built the runner images there. When a VM's bridge connects, it names that build (the version and a
-  digest of the images' definitions, such as `0.3.0+images.1a2b3c4d5e6f`), and this host compares it
+  digest of the images' definitions, such as `1.0.0+images.1a2b3c4d5e6f`), and this host compares it
   with its own: `--vm-image-version warn` logs the difference once for each build, `refuse` deletes
   the VM and fails its run. Rebuild the VM image with this host's binary after every upgrade; this
   host's build is in its start's log line (`runner_build`).
@@ -698,7 +695,7 @@ the same as below; the firewall lets in the cluster's addresses.
    ```sh
    export DIGITALOCEAN_TOKEN=...   # may create Droplets and snapshots; not the driver's token
    packer init ee/runner/images/vm/digitalocean.pkr.hcl
-   packer build -var binary=./tinfirm-runner-host -var version=0.3.0 -var region=fra1 \
+   packer build -var binary=./tinfirm-runner-host -var version=1.0.0 -var region=fra1 \
      ee/runner/images/vm/digitalocean.pkr.hcl
    ```
 
@@ -834,6 +831,32 @@ The host speaks one runner protocol version per connection and names it in
 
 Switching a fleet: [docs/operations/runner-protocol-v2.md](../docs/operations/runner-protocol-v2.md).
 
+## Compatibility with the server
+
+Three numbers, each moved by something else
+([ADR-0109](../docs/adr/0109-runner-version-is-the-release-version.md)):
+
+| Number | Where | What moves it | What the server does with it |
+|---|---|---|---|
+| The product version | `--version`, `hello.runnerVersion`, the release assets (`tinfirm-runner-host-<version>-<target>`) and the image (`ghcr.io/flowtivo/tinfirm-runner-host:v<version>`) | Every release: the workspace's `version` in `Cargo.toml` is the release's (`0.1.0-SNAPSHOT` between releases) | Stores and shows it on the host's page; decides nothing from it |
+| The protocol version | `hello.protocolVersion` | A breaking change of the wire | Accepts 1 and 2 ([Protocol versions](#protocol-versions)); gives turns to hosts of 2 only |
+| The features | `hello.features` | A new optional capability within protocol 2, whatever release ships it | Sends a feature's frames only to a host that lists it |
+
+**This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
+It uses the features `run.steer`, `run.skills`, `session.bundle`, `sandbox.pool` and
+`sandbox.bridge` (the last two only with elastic runners, Pro and Enterprise). A host that lists none of them
+still takes turns; it only misses what they add.
+
+**Every host of protocol 2** has the always-on [model proxy](#model-proxy) and sends its own
+token to the server's model relay (`X-Tinfirm-Runner-Token`). These are part of protocol 2, not
+features: the server sends a run paid by a budget to any host of protocol 2, and the relay
+refuses a model request without the host's token.
+
+So **any runner host release that speaks a protocol the server supports works with it**: upgrade
+hosts and server in either order. A build from `main` or the `rolling` prerelease reports the
+development version (`0.1.0-SNAPSHOT`) in `hello`; its `--version` adds what it was published
+as, such as `0.1.0-SNAPSHOT (rolling-abc1234)` (`TINFIRM_RUNNER_BUILD` at build time).
+
 ## Directories
 
 - **Config:** `$XDG_CONFIG_HOME/tinfirm-runner` (default `~/.config/tinfirm-runner`, also on
@@ -912,8 +935,8 @@ models: [docs/operations/litellm.md](../docs/operations/litellm.md).
 Nothing of this is stored on this machine, and no `credential` command is needed. On this host a
 run with `modelAccess` always goes through the [model proxy](#model-proxy): the runtime gets the
 run's listener and a dummy key (`tinfirm-model-proxy-dummy-key`), and the proxy sends the run's
-token, with this host's own token since 0.3.0, to the relay; neither reaches the sandbox. The
-server sends runs paid by a budget only to hosts of runner 0.2.0 or later: a company host takes
+token, with this host's own token, to the relay; neither reaches the sandbox. The
+server sends runs paid by a budget to any host of protocol 2: a company host takes
 any member's, a personal host its owner's whose accounts are all the owner's own. A host that
 takes them must reach the server's public URL over https.
 

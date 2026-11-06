@@ -204,7 +204,7 @@ Loopback and link-local addresses, cloud metadata among them, are always refused
 
 ## The model proxy
 
-A run paid by a budget gets the address of the server's model relay and a token for that run alone. The host never puts that token into the sandbox: it starts a listener for the run that holds it, and the agent gets the listener's address and a dummy key. The listener forwards only the model API's paths, adds the token and the host's own token, and refuses everything else. This is always on, since runner host 0.2.0; the server sends runs paid by a budget only to hosts of 0.2.0 or later. `--model-proxy` is a former option that does nothing; remove it from service files.
+A run paid by a budget gets the address of the server's model relay and a token for that run alone. The host never puts that token into the sandbox: it starts a listener for the run that holds it, and the agent gets the listener's address and a dummy key. The listener forwards only the model API's paths, adds the token and the host's own token, and refuses everything else. This is always on in every runner host that speaks runner protocol 2, so the server sends runs paid by a budget to any of them. `--model-proxy` is a former option that does nothing; remove it from service files.
 
 The listeners bind the address of the host's git proxy, each on a port the system picks:
 

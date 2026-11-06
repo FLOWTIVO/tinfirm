@@ -2,6 +2,18 @@
 
 Every command and option of `tinfirm-runner-host`, every `TINFIRM_RUNNER_*` environment variable, the host's directories, and the settings of the sandboxes. How to install and run a host: [Install and run runner hosts](../operator-guide/runner-hosts.md).
 
+## Compatibility
+
+A runner host and the server agree on the **runner protocol**, never on a version number. Any runner host release that speaks a protocol the server supports works with it, so hosts and server can be upgraded in either order.
+
+| Number | Where you see it | What it means |
+|---|---|---|
+| The release version | `tinfirm-runner-host --version`, the host's card (such as `v1.0.0`), the release's file names and the image tag `v1.0.0` | Which release the host runs, for support. Tinfirm decides nothing from it |
+| The protocol version | The `protocol_version` of the host's `runner host starting` log line | Version 2 takes turns. A host on version 1 connects but takes none |
+| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), and with elastic runners ready sandboxes (`sandbox.pool`) and the sandbox bridge (`sandbox.bridge`). A host without one still takes turns |
+
+The server accepts protocol versions 1 and 2. Every host of protocol 2 keeps a run's model token out of the sandbox (its model proxy is always on) and sends its own token with the run's model requests, so turns paid by a budget go to any host of protocol 2. A build from the `rolling` prerelease shows what it was built from after its version, such as `0.1.0-SNAPSHOT (rolling-abc1234)`.
+
 ## Global options
 
 These go with any command.
