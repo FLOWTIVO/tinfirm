@@ -45,17 +45,17 @@ class LiteLlmRequestsTest {
     }
 
     @Test
-    void theModelPortPassesTheCallersDropParamsAndTheRelayForcesThem() throws LiteLlmRequests.Refused {
+    void theCallersDropParamsPassAsTheyCameUnlessTheyAreForced() throws LiteLlmRequests.Refused {
         byte[] body = ("{\"model\":\"text-embedding-3-small\",\"input\":[\"a\"],\"api_base\":\"https://evil.example\","
                 + "\"drop_params\":false,\"metadata\":{\"x\":1}}").getBytes(StandardCharsets.UTF_8);
 
-        LiteLlmRequests.Cleaned port = LiteLlmRequests.clean(JSON, body, false);
-        assertThat(new String(port.bytes(), StandardCharsets.UTF_8))
+        LiteLlmRequests.Cleaned asCame = LiteLlmRequests.clean(JSON, body, false);
+        assertThat(new String(asCame.bytes(), StandardCharsets.UTF_8))
             .isEqualTo("{\"model\":\"text-embedding-3-small\",\"input\":[\"a\"],\"drop_params\":false}");
-        assertThat(port.model()).isEqualTo("text-embedding-3-small");
+        assertThat(asCame.model()).isEqualTo("text-embedding-3-small");
 
-        LiteLlmRequests.Cleaned relay = LiteLlmRequests.clean(JSON, body, true);
-        assertThat(new String(relay.bytes(), StandardCharsets.UTF_8))
+        LiteLlmRequests.Cleaned forced = LiteLlmRequests.clean(JSON, body, true);
+        assertThat(new String(forced.bytes(), StandardCharsets.UTF_8))
             .isEqualTo("{\"model\":\"text-embedding-3-small\",\"input\":[\"a\"],\"drop_params\":true}");
     }
 

@@ -3,8 +3,7 @@
 # Tinfirm that follows main. The guide is docs/operations/auto-deploy.md.
 #
 # For every commit on main that passes CI (.github/workflows/ci.yml), CI publishes
-#   - the server image ghcr.io/flowtivo/tinfirm-server:sha-<rev>,
-#   - the model port's image ghcr.io/flowtivo/tinfirm-model-api:sha-<rev>, and
+#   - the server image ghcr.io/flowtivo/tinfirm-server:sha-<rev>, and
 #   - the GitHub prerelease `rolling` with the assets REVISION (<rev>), SHA256SUMS,
 #     tinfirm-compose-<version>.tar.gz and tinfirm-runner-host-<version>-<target>.tar.gz.
 #
@@ -13,11 +12,11 @@
 # files, and the runner host binary for this machine only if a runner host is installed),
 # checks the signature of SHA256SUMS (SHA256SUMS.sig) against the public key install.sh put
 # in the settings directory, then each file against SHA256SUMS and REVISION again
-# afterwards, pulls the server image and the model port's image by sha-<rev>, backs up the
-# database, copies the Compose files (never .env), points TINFIRM_SERVER_IMAGE and
-# TINFIRM_MODEL_API_IMAGE at sha-<rev> (and adds LiteLLM's secrets to .env when they are
-# missing), restarts the stack, waits until the server answers, and installs the new runner
-# host binary (the runner drains; systemd starts it again with the new binary).
+# afterwards, pulls the server image by sha-<rev>, backs up the database, copies the Compose
+# files (never .env), points TINFIRM_SERVER_IMAGE at sha-<rev> (and adds LiteLLM's secrets
+# to .env when they are missing), restarts the stack, waits until the server answers, and
+# installs the new runner host binary (the runner drains; systemd starts it again with the
+# new binary).
 # A failed deploy is retried at most 3 times. It never rolls back by itself.
 #
 # Runner mode (AUTO_DEPLOY_MODE=runner) is for a host that runs only a runner host, while the
@@ -68,7 +67,6 @@ fi
 : "${AUTO_DEPLOY_RELEASE:=rolling}"                  # a release tag, or `latest`
 : "${AUTO_DEPLOY_TOKEN_FILE:=$CONFIG_DIR/github-token}"
 : "${AUTO_DEPLOY_SERVER_IMAGE:=ghcr.io/flowtivo/tinfirm-server}"
-: "${AUTO_DEPLOY_MODEL_API_IMAGE:=ghcr.io/flowtivo/tinfirm-model-api}"
 : "${AUTO_DEPLOY_COMPOSE_DIR:=$HOME/tinfirm/deploy/compose}"
 : "${AUTO_DEPLOY_PROJECT:=tinfirm}"
 : "${AUTO_DEPLOY_POSTGRES_CONTAINER:=$AUTO_DEPLOY_PROJECT-postgres-1}"
@@ -708,15 +706,13 @@ runner_update() {
 }
 
 prune() { # rev [previous revision]
-  local keep image tag dir
+  local keep image="$AUTO_DEPLOY_SERVER_IMAGE" tag dir
   keep="$(keep_revisions "$1" "${2:-}")"
-  for image in "$AUTO_DEPLOY_SERVER_IMAGE" "$AUTO_DEPLOY_MODEL_API_IMAGE"; do
-    while IFS= read -r tag; do
-      [[ $tag =~ ^sha-[0-9a-f]{40}$ ]] || continue
-      grep -qxF "${tag#sha-}" <<<"$keep" && continue
-      act -q docker image rm "$image:$tag" || warn "could not remove $image:$tag"
-    done < <(docker image ls --format '{{.Tag}}' "$image")
-  done
+  while IFS= read -r tag; do
+    [[ $tag =~ ^sha-[0-9a-f]{40}$ ]] || continue
+    grep -qxF "${tag#sha-}" <<<"$keep" && continue
+    act -q docker image rm "$image:$tag" || warn "could not remove $image:$tag"
+  done < <(docker image ls --format '{{.Tag}}' "$image")
   if [ -d "$STATE_CACHE" ]; then
     for dir in "$STATE_CACHE"/*/; do
       [ -d "$dir" ] || continue
@@ -839,7 +835,7 @@ detect_runner() {
 }
 
 deploy_revision() { # rev auto|manual
-  local rev="$1" mode="$2" deployed server_ref model_ref subject running started=$SECONDS status=0
+  local rev="$1" mode="$2" deployed server_ref subject running started=$SECONDS status=0
   detect_runner
   if runner_mode; then
     deploy_runner_revision "$rev" "$mode"
@@ -847,7 +843,6 @@ deploy_revision() { # rev auto|manual
   fi
   deployed="$(previous_revision)"
   server_ref="$AUTO_DEPLOY_SERVER_IMAGE:sha-$rev"
-  model_ref="$AUTO_DEPLOY_MODEL_API_IMAGE:sha-$rev"
 
   # 1. Everything this host needs, before anything changes.
   STEP="download"
@@ -866,20 +861,6 @@ deploy_revision() { # rev auto|manual
     [ "$(label "$server_ref" org.opencontainers.image.revision)" = "$rev" ] ||
       die "$server_ref is labelled revision '$(label "$server_ref" org.opencontainers.image.revision)', not $rev"
     subject="$(label "$server_ref" dev.tinfirm.commit-subject)"
-  fi
-  # The model port's image is published by `publish-services`, which `rolling` does not
-  # wait for, so it may not be there yet when REVISION already names $rev. The server's pull
-  # just succeeded from the same registry, so a failure here is most likely that: as with the
-  # assets, not now, and the next pass tries again. Nothing changed yet, so it is not an
-  # attempt.
-  if ! pull "$model_ref"; then
-    if [ "$mode" = manual ]; then die "cannot pull $model_ref (not published yet? publish-services runs beside rolling; docs/operations/auto-deploy.md, section 1)"; fi
-    log "not deploying $rev now: $model_ref is not available yet (publish-services may still run); the next pass tries again"
-    exit 0
-  fi
-  if docker image inspect "$model_ref" >/dev/null 2>&1; then
-    [ "$(label "$model_ref" org.opencontainers.image.revision)" = "$rev" ] ||
-      die "$model_ref is labelled revision '$(label "$model_ref" org.opencontainers.image.revision)', not $rev"
   fi
   running="$(docker container inspect -f '{{.Config.Image}}' "$AUTO_DEPLOY_SERVER_CONTAINER" 2>/dev/null || true)"
   if [ -n "$running" ] && [ "$running" != "$AUTO_DEPLOY_SERVER_IMAGE:sha-$deployed" ]; then
@@ -900,7 +881,6 @@ deploy_revision() { # rev auto|manual
   install_compose_files
   STEP=".env"
   set_env_value TINFIRM_SERVER_IMAGE "$server_ref"
-  set_env_value TINFIRM_MODEL_API_IMAGE "$model_ref"
   litellm_secrets
   company_name
   STEP="compose up"
@@ -922,7 +902,7 @@ deploy_revision() { # rev auto|manual
   if dry_run; then
     log "dry run of $rev done; nothing was changed"
   else
-    log "deployed $rev${subject:+ \"$subject\"} in $((SECONDS - started))s: server $server_ref; model port $model_ref; runner host: $RUNNER_RESULT; backup: $BACKUP_RESULT"
+    log "deployed $rev${subject:+ \"$subject\"} in $((SECONDS - started))s: server $server_ref; runner host: $RUNNER_RESULT; backup: $BACKUP_RESULT"
   fi
 }
 

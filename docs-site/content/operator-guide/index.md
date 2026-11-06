@@ -8,10 +8,10 @@ This guide is for the people who install Tinfirm and keep it running. It assumes
 |---|---|
 | **Server** | One container image, `ghcr.io/flowtivo/tinfirm-server`, that serves the web app, the REST API and the MCP endpoints. It listens on port 8080, and on 8081 for its health probes. |
 | **PostgreSQL 18** | Tinfirm's only database. It also holds the queue of work, so there is no message broker. |
-| **LiteLLM** | The model gateway. Every model call an agent makes goes through it, with the key and budget of whoever pays. It ships with the Compose stack and the Helm chart, with the **model port** beside it, and only the server and the model port reach it. |
+| **LiteLLM** | The model gateway. Every model call an agent makes goes through it, with the key and budget of whoever pays. It ships with the Compose stack and the Helm chart, and only the server reaches it, unless you admit the company's own services too. |
 | **Runner hosts** | Machines with Docker that run agents' turns, each in its own sandbox. A runner host connects out to the server, so it needs no inbound port. Company runner hosts are yours to run; members may connect personal ones. |
 
-The model port serves LiteLLM's model routes alone: the server sends its model requests through it, and the company's other services can call it with LiteLLM keys of their own.
+The company's other services can call the bundled LiteLLM with LiteLLM keys of their own, where you admit them: [The company's own services](model-gateway.md#the-companys-own-services).
 
 [Architecture](architecture.md) shows how the parts connect, with a diagram, and [Requirements](requirements.md) says how much hardware each needs.
 

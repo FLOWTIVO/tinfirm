@@ -45,11 +45,15 @@ LiteLLM {{ .Values.litellm.image.tag }} (the bundled model gateway): {{ include 
 {{- else }}
   Its database: {{ $ldb.name }} as {{ $ldb.user }} on {{ include "tinfirm.litellm.databaseHost" . }} (external-database.md, section 4).
 {{- end }}
-  Admin API, for the server and the operator only: {{ include "tinfirm.litellm.adminUrl" . }}
+  Admin API and model API, for the server and the operator: {{ include "tinfirm.litellm.adminUrl" . }}
     kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "tinfirm.litellm.fullname" . }} 4000:4000
-  Model port, LiteLLM's model routes alone, for the company's services with LiteLLM keys of
-  their own (ADR-0069): {{ include "tinfirm.litellm.modelApiBaseUrl" . }}
-  Nothing exposes either outside the release: runner hosts reach only the server, which relays
+{{- if .Values.litellm.from }}
+  For the company's services litellm.from admits, each with a LiteLLM key of its own made
+  with key_type llm_api: {{ include "tinfirm.litellm.openAiBaseUrl" . }}
+  They reach the admin API too, where only their keys stop them, and LiteLLM's pass-through
+  routes to the providers' APIs; LiteLLM's own request fields are not filtered for them.
+{{- end }}
+  Nothing exposes it outside the release: runner hosts reach only the server, which relays
   their model requests. docs/operations/litellm.md.
 {{- end }}
 {{- with .Values.companies }}

@@ -11,7 +11,7 @@ After a push to `main`, when the gate jobs of `ci.yml` pass (the security scans 
 | Job | After | Publishes |
 |---|---|---|
 | `publish` | server, web, deploy lint, image, runner | The server image `ghcr.io/flowtivo/tinfirm-server:sha-<full sha>`, and the tag `main` on it; the Helm chart `oci://ghcr.io/flowtivo/charts/tinfirm:0.0.0-sha-<full sha>`, with `appVersion: sha-<full sha>`, so its default images are this commit's ([ADR-0080](../adr/0080-helm-chart-published-to-ghcr.md), [ADR-0090](../adr/0090-a-chart-for-any-cluster.md)) |
-| `publish-services` | model API, deploy lint, image, runner | The model port's image `ghcr.io/flowtivo/tinfirm-model-api` and the runner pod's `ghcr.io/flowtivo/tinfirm-runner-host`, as `sha-<full sha>` and `main` |
+| `publish-services` | deploy lint, image, runner | The runner pod's image `ghcr.io/flowtivo/tinfirm-runner-host`, as `sha-<full sha>` and `main` |
 | `rolling` | `publish` | The GitHub prerelease `rolling`, through the reusable workflow `runner-artifacts.yml` |
 | `main-complete` | `publish`, `publish-services`, `rolling` | The tag `main-complete` on the server image `ghcr.io/flowtivo/tinfirm-server:sha-<full sha>`, in the same package: the newest commit of `main` whose images and prerelease `rolling` are all published. A deployment repository reads it to keep an environment on `main` ([ADR-0107](../adr/0107-a-deployment-repository-follows-the-registry.md)) |
 
@@ -58,7 +58,7 @@ No image with Claude Code is ever published. The runner host binary only embeds 
 
 Ordering and races:
 
-- `rolling` runs after `publish`, so the server image `sha-<sha>` exists before a host can see the new `REVISION`. `publish-services` runs beside them and waits for neither, so a `REVISION` may name a commit whose model port image is not published yet: a Compose host then ends its pass without an attempt and pulls it at a later pass (section 2, step 3). `main-complete` waits for `publish`, `publish-services` and `rolling`, so an environment that follows that tag never pulls a model port image that does not exist yet, and a failed `publish-services` leaves the tag, and the environment, where they are.
+- `rolling` runs after `publish`, so the server image `sha-<sha>` exists before a host can see the new `REVISION`; a Compose host pulls no other image. `publish-services` runs beside them and waits for neither. `main-complete` waits for `publish`, `publish-services` and `rolling`, so an environment that follows that tag never pulls a runner pod image that does not exist yet, and a failed `publish-services` leaves the tag, and the environment, where they are.
 - Each job has a concurrency group that never cancels a running job, so consecutive pushes publish one after the other. GitHub keeps one waiting run per group: with three quick pushes, the middle one may be skipped, and the last one publishes.
 - The jobs move `main`, `rolling` and `main-complete` only while their commit is still the tip of `main`. A re-run of an older run publishes `sha-<sha>` but never moves them back.
 - The release update replaces the assets in this order: the new versioned assets, `SHA256SUMS`, its signature (or, unsigned, the removal of the previous one), the tag and the release page, `REVISION`, then deletes the previous commit's assets. A host that reads `REVISION` and `SHA256SUMS` in between finds that they disagree, and tries again at its next pass.
@@ -70,18 +70,16 @@ Ordering and races:
 
 1. Reads `REVISION` of the release `rolling`. If it is the deployed revision, the pass ends. If it is a revision that was deployed before (after a manual rollback, for example), it logs a warning and does nothing: auto-deploy never goes back. If the revision failed 3 times, it logs an error and does nothing.
 2. Downloads `SHA256SUMS` and checks that it lists `REVISION` with the same checksum. Downloads `SHA256SUMS.sig` and checks it against the public key (section 1.1): a signature that does not verify stops the pass with an error and nothing is installed; a release without a signature (not signed yet) ends the pass with a warning, and the next pass looks again, unless `TINFIRM_AUTO_DEPLOY_ALLOW_UNSIGNED=1`. Downloads the Compose tarball, and the runner host tarball for this machine (`uname -m` → `x86_64` or `aarch64` musl) only if a runner host is installed. Checks each file against `SHA256SUMS`. Then reads `REVISION` again: if `rolling` moved during the download, the pass ends and the next pass starts over.
-3. Pulls `ghcr.io/flowtivo/tinfirm-server:sha-<rev>` and `ghcr.io/flowtivo/tinfirm-model-api:sha-<rev>` and checks their revision labels. When the model port's image cannot be pulled, the pass ends without an attempt, as it does for a release that is being updated: `publish-services` may still be running. The next pass tries again.
+3. Pulls `ghcr.io/flowtivo/tinfirm-server:sha-<rev>` and checks its revision label.
 4. From here on, a failure counts as an attempt on this revision.
 5. Unpacks the files. If the runner host binary differs from the installed one, runs the new binary with `--version`; a binary that cannot run stops the deploy here, before anything changed.
 6. Backs up the database: `pg_dump -Fc` in `tinfirm-postgres-1` to `~/backups/tinfirm-auto-<UTC time>-<previous revision>.dump`, mode 600. It keeps the newest 10 of these dumps and never touches other files in the directory. A database container that exists but does not run stops the deploy; without any database container (a first deployment) there is nothing to back up.
-7. Copies the Compose files over `~/tinfirm/deploy/compose`. It never writes `.env` from the tarball. It sets two lines in `.env`, `TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server:sha-<rev>` and `TINFIRM_MODEL_API_IMAGE=ghcr.io/flowtivo/tinfirm-model-api:sha-<rev>`, adds LiteLLM's secrets (`LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, `LITELLM_DB_PASSWORD`) with random values when they are missing, without logging them, and leaves the other lines as they are ([litellm.md, section 4.1](litellm.md#41-docker-compose)).
+7. Copies the Compose files over `~/tinfirm/deploy/compose`. It never writes `.env` from the tarball. It sets the line `TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server:sha-<rev>` in `.env`, adds LiteLLM's secrets (`LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, `LITELLM_DB_PASSWORD`) with random values when they are missing, without logging them, and leaves the other lines as they are ([litellm.md, section 4.1](litellm.md#41-docker-compose)).
 8. `docker compose -f compose.yaml --env-file .env up -d --no-build --remove-orphans`.
 9. Waits up to 300 s until `http://127.0.0.1:<TINFIRM_HTTP_HOST_PORT>/api/system/info` answers. It fails at once when the server container exits or restarts.
 10. Runner host, only if a runner host is installed (a binary at `~/.local/bin/tinfirm-runner-host`) and its checksum changed: keeps the old binary as `tinfirm-runner-host.prev`, installs the new one atomically (`.new`, `chmod 755`, rename), and asks for `systemctl reload tinfirm-runner`: it writes `~/.local/share/tinfirm-auto-deploy/runner-reload-request`, and the root path unit `tinfirm-auto-deploy-reload.path` reloads the unit. The runner drains: active runs finish, `run` exits, and systemd (`Restart=always`) starts the new binary ([runner/README.md, Drain and upgrades](../../runner/README.md#drain-and-upgrades)). A unit that is not active only gets the new binary for its next start.
-11. Records the revision as deployed, keeps the downloaded assets in `~/.local/share/tinfirm-auto-deploy/revisions/<rev>/`, and prunes: the images and cached assets of the deployed revision and the 2 before it stay; older `sha-*` tags of the server image and of the model port's image are removed.
+11. Records the revision as deployed, keeps the downloaded assets in `~/.local/share/tinfirm-auto-deploy/revisions/<rev>/`, and prunes: the images and cached assets of the deployed revision and the 2 before it stay; older `sha-*` tags of the server image are removed.
 12. Logs one summary line: the revision, the commit subject (the server image's `dev.tinfirm.commit-subject` label; for a merge commit, the pull request's title), whether the runner host changed, and the backup.
-
-**The model port's image follows the server's.** `compose.yaml` takes it from `TINFIRM_MODEL_API_IMAGE`, `tinfirm-model-api:local` by default, and `up --no-build` builds nothing, so the script sets that line with `TINFIRM_SERVER_IMAGE` (step 7), and `make deploy-host` sets it to the image it built and shipped ([litellm.md, section 4.1](litellm.md#41-docker-compose)). A value you set by hand is overwritten on the next deploy, like `TINFIRM_SERVER_IMAGE`. To keep an image of your own, such as `ghcr.io/flowtivo/tinfirm-model-api:dev` from `make model-api-image` loaded on the host, pause the timer first (section 5).
 
 Everything goes to the journal: `journalctl -u tinfirm-auto-deploy`. Failures have the priority `err`, so `journalctl -u tinfirm-auto-deploy -p warning` shows only the problems. A pass with nothing to do logs nothing.
 
@@ -89,7 +87,7 @@ Everything goes to the journal: `journalctl -u tinfirm-auto-deploy`. Failures ha
 
 ## 3. Install
 
-Requirements on the host: Linux, Docker Engine with Compose v2, `curl`, `jq`, `flock` (util-linux), `cmp` (diffutils), `openssl`, systemd. The server image is published for `linux/amd64` only. The stack must already run: deploy it once with `make deploy-host` ([deploy/compose/deploy-host.sh](../../deploy/compose/deploy-host.sh)), which generates `.env` with random secrets. It builds and ships the server image and the model port's image, and sets both in that `.env`.
+Requirements on the host: Linux, Docker Engine with Compose v2, `curl`, `jq`, `flock` (util-linux), `cmp` (diffutils), `openssl`, systemd. The server image is published for `linux/amd64` only. The stack must already run: deploy it once with `make deploy-host` ([deploy/compose/deploy-host.sh](../../deploy/compose/deploy-host.sh)), which generates `.env` with random secrets. It builds and ships the server image, and sets it in that `.env`.
 
 1. Bring `deploy/compose/auto-deploy/` to the host. `make deploy-host` copies it with the rest of `deploy/compose`, or download a Compose tarball from a release.
 2. Install, as root:
@@ -132,7 +130,6 @@ Settings are in `~/.config/tinfirm-auto-deploy/env`, which the script reads with
 | `AUTO_DEPLOY_REPO` | `FLOWTIVO/tinfirm` | Repository of the releases |
 | `AUTO_DEPLOY_TOKEN_FILE` | `~/.config/tinfirm-auto-deploy/github-token` | The release assets token |
 | `AUTO_DEPLOY_SERVER_IMAGE` | `ghcr.io/flowtivo/tinfirm-server` | Server image repository; the tag is `sha-<rev>` |
-| `AUTO_DEPLOY_MODEL_API_IMAGE` | `ghcr.io/flowtivo/tinfirm-model-api` | The model port's image repository; the tag is `sha-<rev>` |
 | `AUTO_DEPLOY_COMPOSE_DIR` | `~/tinfirm/deploy/compose` | The Compose install, with its `.env` |
 | `AUTO_DEPLOY_PROJECT` | `tinfirm` | Compose project; the containers are `<project>-postgres-1` and `<project>-server-1` |
 | `AUTO_DEPLOY_DATABASE` | `tinfirm` | Database to back up |
@@ -143,7 +140,7 @@ Settings are in `~/.config/tinfirm-auto-deploy/env`, which the script reads with
 | `TINFIRM_AUTO_DEPLOY_ALLOW_UNSIGNED` | `0` | `1` deploys a release whose `SHA256SUMS` has no signature, or with no key to check it, with a warning: a `rolling` published while the environment `rolling` holds no key. A signature that does not verify is refused anyway. |
 | `AUTO_DEPLOY_READY_TIMEOUT` | `300` | Seconds to wait for the server |
 | `AUTO_DEPLOY_MAX_ATTEMPTS` | `3` | Attempts per revision |
-| `AUTO_DEPLOY_KEEP_REVISIONS` | `3` | Revisions whose images (the server's and the model port's) and assets stay: the deployed one and the ones before it |
+| `AUTO_DEPLOY_KEEP_REVISIONS` | `3` | Revisions whose server images and assets stay: the deployed one and the ones before it |
 
 State, in `~/.local/share/tinfirm-auto-deploy/`: `deployed`, `history` (the last 50 deployed revisions), `failures` (revision and failed attempts), `runner-reload-pending`, `runner-reload-request`, `revisions/<rev>/` (with the signature; a revision cached without one is used only while unsigned assets are allowed) and `lock`. One pass runs at a time (`flock` on `lock`).
 
@@ -180,7 +177,7 @@ sudo systemctl start tinfirm-auto-deploy.timer     # resume (it is still enabled
 sudo systemctl disable --now tinfirm-auto-deploy.timer   # off, also after a reboot
 ```
 
-Pause before you deploy by hand with `make deploy-host`, or set an image of your own in `.env`: both write `TINFIRM_SERVER_IMAGE` and `TINFIRM_MODEL_API_IMAGE`, and the timer would otherwise keep your images only until the next commit on `main`.
+Pause before you deploy by hand with `make deploy-host`, or set an image of your own in `.env`: both write `TINFIRM_SERVER_IMAGE`, and the timer would otherwise keep your image only until the next commit on `main`.
 
 To uninstall: disable the timer and `tinfirm-auto-deploy-reload.path`, then delete `/etc/systemd/system/tinfirm-auto-deploy.{service,timer}`, `/etc/systemd/system/tinfirm-auto-deploy-reload.{path,service}`, `/usr/local/bin/tinfirm-auto-deploy` and, if present, `/etc/sudoers.d/tinfirm-auto-deploy`, and run `sudo systemctl daemon-reload`.
 
@@ -200,7 +197,7 @@ Auto-deploy never rolls back. To go back to an earlier revision:
    ```
 
    `--create` creates the database again with its owner `tinfirm_owner` and its grants, from the dump.
-4. Deploy the earlier revision: `tinfirm-auto-deploy deploy <full sha>`. It takes a new backup, puts back that revision's Compose files and images, and the runner host binary if it differs. Without the cached assets (an older revision), set `TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server:sha-<full sha>` and `TINFIRM_MODEL_API_IMAGE=ghcr.io/flowtivo/tinfirm-model-api:sha-<full sha>` in `.env` and run `docker compose -f compose.yaml --env-file .env up -d --no-build`; the previous runner host binary is `~/.local/bin/tinfirm-runner-host.prev`.
+4. Deploy the earlier revision: `tinfirm-auto-deploy deploy <full sha>`. It takes a new backup, puts back that revision's Compose files and images, and the runner host binary if it differs. Without the cached assets (an older revision), set `TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server:sha-<full sha>` in `.env` and run `docker compose -f compose.yaml --env-file .env up -d --no-build`; the previous runner host binary is `~/.local/bin/tinfirm-runner-host.prev`.
 5. Resume the timer once `main` has a fix. Until then, the revision you left is held back anyway: auto-deploy does not deploy a revision that was deployed before, and does not retry one that failed 3 times.
 
 ## 7. Troubleshooting
@@ -216,7 +213,6 @@ Auto-deploy never rolls back. To go back to an earlier revision:
 | `no public key at …` | install.sh has not copied the keys yet, or the key file is a placeholder: run install.sh again, or set `TINFIRM_AUTO_DEPLOY_ALLOW_UNSIGNED=1` for `rolling` |
 | `not deploying <rev>: it failed 3 times` | Push a fix, roll back (section 6), or `tinfirm-auto-deploy retry` |
 | `<rev> was deployed before` | `rolling` points at an older revision than the deployed one; deploy it by hand if you mean it |
-| `not deploying <rev> now: ghcr.io/…/tinfirm-model-api:sha-<rev> is not available yet` | `publish-services` has not published the model port's image of that commit yet, or it failed. The next pass tries again; check that commit's run in Actions when it does not pass |
 
 ## 8. Runner-only hosts
 

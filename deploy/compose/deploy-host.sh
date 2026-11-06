@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Deploys the Compose stack to one Linux host over SSH (single-host installs, e.g. a small VM
-# behind a reverse proxy or a tunnel). Builds the server image and the model port's image
-# locally for the host's architecture, ships them with `docker save | ssh docker load`,
-# copies deploy/compose/, and restarts the stack.
+# behind a reverse proxy or a tunnel). Builds the server image locally for the host's
+# architecture, ships it with `docker save | ssh docker load`, copies deploy/compose/, and
+# restarts the stack.
 #
 #   deploy/compose/deploy-host.sh <user@host> [public-url] [http-port]
 #
 # First run on a host: generates <remote>/deploy/compose/.env with random secrets (mode 600).
-# Later runs keep that .env, switch TINFIRM_SERVER_IMAGE and TINFIRM_MODEL_API_IMAGE to the
-# new images, and add LiteLLM's secrets if they are missing. Expose only the server's
-# http-port: LiteLLM stays on the host's loopback, and runner hosts reach only the server
-# (docs/operations/litellm.md).
+# Later runs keep that .env, switch TINFIRM_SERVER_IMAGE to the new image, and add
+# LiteLLM's secrets if they are missing. Expose only the server's http-port: LiteLLM stays
+# on the host's loopback, and runner hosts reach only the server (docs/operations/litellm.md).
 # Requires on the host: Docker Engine + Compose v2, passwordless sudo for docker.
 # To deploy every commit on main from then on, without this script: auto-deploy/ and
 # docs/operations/auto-deploy.md. Pause its timer before a manual deploy with this script.
@@ -34,22 +33,19 @@ revision="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$ROOT" diff --quiet 2>/dev/null || revision="${revision}-dirty"
 suffix="$(date -u +%Y%m%d%H%M)-${revision}"
 tag="tinfirm-server:$suffix"
-model_tag="tinfirm-model-api:$suffix"
 
 echo "==> building $tag for $platform"
 docker buildx build --platform "$platform" --build-arg REVISION="$revision" -t "$tag" --load "$ROOT"
-echo "==> building $model_tag for $platform"
-docker buildx build --platform "$platform" --build-arg REVISION="$revision" -f "$ROOT/model-api/Dockerfile" -t "$model_tag" --load "$ROOT"
 
-echo "==> shipping the images to $TARGET"
-docker save --platform "$platform" "$tag" "$model_tag" | gzip -1 | "${SSH[@]}" 'gunzip | sudo -n docker load'
+echo "==> shipping the image to $TARGET"
+docker save --platform "$platform" "$tag" | gzip -1 | "${SSH[@]}" 'gunzip | sudo -n docker load'
 
 echo "==> copying deploy/compose"
 "${SSH[@]}" "mkdir -p ~/$REMOTE_DIR/deploy/compose && chmod 700 ~/$REMOTE_DIR"
 rsync -a --exclude .env "$ROOT/deploy/compose/" "$TARGET:$REMOTE_DIR/deploy/compose/"
 
 echo "==> configuring and restarting"
-"${SSH[@]}" TAG="$tag" MODEL_TAG="$model_tag" PUBLIC_URL="$PUBLIC_URL" HTTP_PORT="$HTTP_PORT" REMOTE_DIR="$REMOTE_DIR" bash -s <<'REMOTE'
+"${SSH[@]}" TAG="$tag" PUBLIC_URL="$PUBLIC_URL" HTTP_PORT="$HTTP_PORT" REMOTE_DIR="$REMOTE_DIR" bash -s <<'REMOTE'
 set -euo pipefail
 cd ~/"$REMOTE_DIR"/deploy/compose
 set_image() { # key value: replaces the line in .env, or appends it to a .env without one
@@ -79,7 +75,6 @@ TINFIRM_BOOTSTRAP_ADMIN_EMAIL=admin@example.com
 TINFIRM_BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
 TINFIRM_COMPANY_NAME=My Company
 TINFIRM_SERVER_IMAGE=$TAG
-TINFIRM_MODEL_API_IMAGE=$MODEL_TAG
 TINFIRM_SERVER_MEM_LIMIT=1g
 TINFIRM_JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=60.0 -XX:+ExitOnOutOfMemoryError
 KEYCLOAK_ADMIN_PASSWORD=$(hex 16)
@@ -90,7 +85,6 @@ ENV
   echo "generated .env (edit TINFIRM_BOOTSTRAP_* and TINFIRM_COMPANY_* before the first start if needed)"
 else
   set_image TINFIRM_SERVER_IMAGE "$TAG"
-  set_image TINFIRM_MODEL_API_IMAGE "$MODEL_TAG"
 fi
 # LiteLLM's secrets (docs/operations/litellm.md), for a new .env and for a kept one that
 # lacks them. Added only when missing: a new salt key would make the stored provider keys
@@ -121,4 +115,4 @@ echo "server did not become ready; see: sudo docker logs tinfirm-server-1" >&2
 exit 1
 REMOTE
 
-echo "==> done: $tag, $model_tag"
+echo "==> done: $tag"

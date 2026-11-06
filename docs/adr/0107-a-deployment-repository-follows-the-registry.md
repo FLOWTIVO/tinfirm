@@ -5,6 +5,7 @@
 - Decided by: the owner, 2026-11-03
 - Sources: [ADR-0080](0080-helm-chart-published-to-ghcr.md) (the chart published with the images, and a deployment repository's one pin); [ADR-0091](0091-image-tag-alone.md) (`image.tag`, the one pin); [ADR-0106](0106-reusable-workflows-and-pinned-actions.md) (the release's workflows in this repository); [the security review of 2026-10-27](../reviews/2026-10-27-security-review-fixed.md), H3 (the deploy keys in environments); [auto-deploy.md](../operations/auto-deploy.md), sections 1 and 8; the [threat model](../threat-model.md), R53
 - Amends: [ADR-0080](0080-helm-chart-published-to-ghcr.md), decision 2 (which tag a deployment repository pins, once the chart is published); [ADR-0091](0091-image-tag-alone.md), decision 2 (where a deployment repository takes `image.tag` from)
+- Amended by: [ADR-0110](0110-no-model-port.md), under which the model port's image is gone: `publish-services` publishes the runner host's image (decision 1), and `main-complete` names the newest commit of `main` whose server and runner host images and rolling prerelease are all published (decision 2)
 - Changes: `ci.yml`: the job `main-complete` is added; `publish-docs` runs in no environment and labels its image with its revision; `reusable-release.yml` and `release.yml`: the release changes no environment; `README.md`; CONTRIBUTING §5; CONVENTIONS §12; the threat model; `docs/operations/auto-deploy.md` and `helm.md`; `docs-site/README.md`; §3 and §4 of [the fix round's record](../reviews/2026-10-27-security-review-fixed.md)
 
 ## Context

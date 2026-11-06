@@ -34,6 +34,8 @@ What happens:
 
 A change to the chart's non-secret configuration rolls the pods by itself: the pod template carries a checksum of the server's ConfigMap. A change to a Secret does not ([Rotate a Secret](#rotate-a-secret)).
 
+From a chart with the model port (`model-api`, before chart 0.9.0), Helm refuses a values file that still sets `litellm.modelApi`: move its `from` to `litellm.from` and drop the rest. The services those peers run then call `http://<release>-litellm.<namespace>.svc:4000/v1` instead of port 4001, and reach LiteLLM's admin API there too: give each a key made with `key_type` `llm_api` before it moves ([The company's own services](model-gateway.md#the-companys-own-services)). `litellm.modelApi.providerTools` no longer holds back a company's choice: a company that allows the providers' web search (`providerTools: WEB_SEARCH`) now gets it on the bundled gateway.
+
 ### Roll back
 
 `helm rollback` puts back the previous chart and image, but not the database: the older server may not start on a schema the newer one migrated. To go back after a migration:
@@ -46,7 +48,7 @@ When you can, fix forward with the next version instead.
 
 ### Upgrade LiteLLM
 
-The chart pins LiteLLM's image by tag and digest, and a Tinfirm release moves the pin: the server and the model port are checked against that version of LiteLLM. Keep the pinned version unless a release changes it.
+The chart pins LiteLLM's image by tag and digest, and a Tinfirm release moves the pin: the server is checked against that version of LiteLLM. Keep the pinned version unless a release changes it.
 
 LiteLLM migrates its own database when it starts with a new image, and does not start when the migration fails. Back up the `litellm` database before an upgrade that changes `litellm.image`. Its startup probe allows 10 minutes. The server keeps working while LiteLLM restarts, but model requests fail until LiteLLM is ready again: upgrade it when few turns run.
 
@@ -183,27 +185,27 @@ git pull
 make up
 ```
 
-`make up` builds the server and the model port from the checkout, under the names `tinfirm-server:local` and `tinfirm-model-api:local`, and recreates the containers that changed.
+`make up` builds the server from the checkout, under the name `tinfirm-server:local`, and recreates the containers that changed.
 
-To run published images instead, pull them by digest, name them in `.env`, and start without building:
+To run a published image instead, pull it by digest, name it in `.env`, and start without building:
 
 ```sh
 docker pull ghcr.io/flowtivo/tinfirm-server@sha256:<digest>
-docker pull ghcr.io/flowtivo/tinfirm-model-api@sha256:<digest>
 ```
 
 ```sh title="deploy/compose/.env"
 TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server@sha256:<digest>
-TINFIRM_MODEL_API_IMAGE=ghcr.io/flowtivo/tinfirm-model-api@sha256:<digest>
 ```
 
 ```sh
 docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env up -d --no-build --remove-orphans
 ```
 
-Set both images: without `TINFIRM_MODEL_API_IMAGE`, the stack looks for a local build of the model port and cannot start it. Do not mix the two ways: `make up` builds and tags whatever images `.env` names.
+Do not mix the two ways: `make up` builds and tags whatever image `.env` names.
 
-Use the Compose files of the same version as the images, and keep your `.env`. When Compose stops with `required variable … is missing a value`, the new version needs a setting your `.env` lacks: copy it from `.env.example`, with a value of your own for every secret.
+A stack that ran a version with the model port (`model-api`) keeps that container running after `make up`: remove it with `--remove-orphans`, as in the command above. Nothing reads the `TINFIRM_MODEL_API_*` lines of `.env` any more, so `TINFIRM_MODEL_API_PROVIDER_TOOLS` no longer holds back a company's choice: a company that allows the providers' web search (`providerTools: WEB_SEARCH`) now gets it on the bundled gateway.
+
+Use the Compose files of the same version as the image, and keep your `.env`. When Compose stops with `required variable … is missing a value`, the new version needs a setting your `.env` lacks: copy it from `.env.example`, with a value of your own for every secret.
 
 The server migrates the database when it starts, as on Kubernetes. Nothing rolls back by itself. To go back to an older version after a migration, restore the dump you took before the upgrade, then start the older version:
 

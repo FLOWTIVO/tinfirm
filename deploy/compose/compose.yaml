@@ -5,13 +5,20 @@
 #   make dev-db    postgres only, for a server run from the IDE and `npm start`
 #   make down      stop everything; the database volume is kept
 #
-# LiteLLM, the company's model gateway (ADR-0059, ADR-0069, docs/operations/litellm.md):
-# `litellm` with its own database on the same PostgreSQL (`litellm-db` creates it). Its own
-# port, the admin API with the model API, sits on the `gateway` network, which only the
-# server and the model port join; it is published on http://127.0.0.1:4000 for the operator.
-# The model port, `model-api` on 4001, serves its model routes alone to the company's
-# services (such as a script or an internal application) with LiteLLM keys of their own.
-# Runner hosts never reach either: the server relays their model traffic.
+# LiteLLM, the company's model gateway (ADR-0059, ADR-0110, docs/operations/litellm.md):
+# `litellm` with its own database on the same PostgreSQL (`litellm-db` creates it). Its one
+# port, 4000, the admin API with the model API, sits on the `gateway` network, which the
+# server joins; it is published on http://127.0.0.1:4000 for the operator. Another service
+# of the company (a script, an internal application) may use it with a LiteLLM key of its
+# own where the operator adds that service to the `gateway` network: it calls
+# http://litellm:4000. It then reaches LiteLLM's admin API too, so that only its key stops
+# it: give it a key that LiteLLM refuses on its management routes (`key_type: llm_api`),
+# with its budget and models. Such a key still serves LiteLLM's pass-through routes to the
+# providers' own APIs. LiteLLM's own request fields are not filtered for it, as they are
+# for Tinfirm's requests: add only a service trusted with the company's provider keys. The
+# `gateway` network carries the stack's PostgreSQL too (Tinfirm's database and LiteLLM's),
+# which such a service then reaches behind the roles' passwords.
+# Runner hosts never reach LiteLLM: the server relays their model traffic.
 #
 # Without make, from the repository root (after `cp deploy/compose/.env.example deploy/compose/.env`):
 #   docker compose -f deploy/compose/compose.yaml up -d --build
@@ -104,7 +111,7 @@ services:
       - no-new-privileges:true
 
   # The model gateway (ADR-0059). Tinfirm manages its teams and keys through the admin API
-  # with the master key, and relays the runs' model requests to it through the model port;
+  # with the master key, and relays the runs' model requests to it on the same port;
   # provider keys and models live in its database, added by the operator. Settings that keep
   # prompts out of its database and turn its admin UI off: litellm/config.yaml.
   litellm:
@@ -116,8 +123,8 @@ services:
       litellm-db:
         condition: service_completed_successfully
     command: ["--port", "4000", "--config", "/etc/litellm/config.yaml"]
-    # The gateway network only: the server and the model port reach it, nothing else of the
-    # deployment does (ADR-0069).
+    # The gateway network only: the server reaches it, and the services the operator adds
+    # to that network (header); nothing else of the deployment does.
     networks: [gateway]
     # Explicit, like the server's: LiteLLM gets its own secrets and nothing else from .env.
     environment:
@@ -167,45 +174,6 @@ services:
       - no-new-privileges:true
     mem_limit: ${TINFIRM_LITELLM_MEM_LIMIT:-2g}
 
-  # The model port (ADR-0069; model-api/README.md): LiteLLM's model routes alone, each by its
-  # exact path, with LiteLLM's own fields removed from every body. The company's services call
-  # it with LiteLLM keys of their own; the server sends its model requests here too.
-  model-api:
-    build:
-      context: ../..
-      dockerfile: model-api/Dockerfile
-    image: ${TINFIRM_MODEL_API_IMAGE:-tinfirm-model-api:local}
-    restart: unless-stopped
-    depends_on:
-      litellm:
-        condition: service_healthy
-    networks: [default, gateway]
-    environment:
-      MODEL_API_UPSTREAM: http://litellm:4000
-    ports:
-      # Loopback only, for a service run from the IDE. On the Compose network, the company's
-      # services reach it as http://model-api:4001.
-      - "127.0.0.1:${TINFIRM_MODEL_API_HOST_PORT:-4001}:4001"
-    healthcheck:
-      # The image has no curl; bash asks the health port over a plain TCP socket.
-      test:
-        - CMD
-        - bash
-        - -c
-        - "exec 3<>/dev/tcp/127.0.0.1/4002 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-    read_only: true
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    mem_limit: ${TINFIRM_MODEL_API_MEM_LIMIT:-512m}
-
   server:
     build:
       context: ../..
@@ -215,7 +183,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    # The gateway network for LiteLLM's admin API.
+    # The gateway network for LiteLLM: its admin API and the model requests.
     networks: [default, gateway]
     # Explicit, not `env_file: .env`: the container gets exactly the §4 variables, and
     # not the Postgres superuser or Keycloak admin passwords that also live in .env.
@@ -252,10 +220,9 @@ services:
       TINFIRM_ERROR_REPORTS_LABEL: ${TINFIRM_ERROR_REPORTS_LABEL:-}
       TINFIRM_ERROR_REPORTS_PROXY: ${TINFIRM_ERROR_REPORTS_PROXY:-}
       # The bundled LiteLLM (CONVENTIONS §4): its admin API on the gateway network with its
-      # master key, and the model requests the server relays and its own at the model port.
+      # master key; the model requests the server relays, and its own, go to the same URL.
       TINFIRM_MODEL_GATEWAY_VENDOR: LITELLM
       TINFIRM_MODEL_GATEWAY_ADMIN_URL: http://litellm:4000
-      TINFIRM_MODEL_GATEWAY_MODEL_URL: http://model-api:4001
       TINFIRM_MODEL_GATEWAY_ADMIN_KEY: ${LITELLM_MASTER_KEY:?is not set in deploy/compose/.env}
       # Session bundles (ADR-0097, docs/operations/session-bundles.md), part of elastic runners
       # (Pro, ADR-0100): off unless .env sets the store. `filesystem` keeps them in the
@@ -338,7 +305,8 @@ services:
       - no-new-privileges:true
 
 networks:
-  # LiteLLM's own port and its database: the server and the model port only (ADR-0069).
+  # LiteLLM's port and its database: the server, and the services the operator adds to use
+  # LiteLLM (header).
   gateway:
 
 volumes:

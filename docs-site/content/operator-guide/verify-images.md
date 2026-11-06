@@ -7,7 +7,6 @@ You verify offline, with FLOWTIVO's public key alone. Nothing calls out to FLOWT
 | Image | What it is |
 |---|---|
 | `ghcr.io/flowtivo/tinfirm-server` | The server: the web app, the REST API and the MCP endpoints |
-| `ghcr.io/flowtivo/tinfirm-model-api` | The model port, beside LiteLLM |
 | `ghcr.io/flowtivo/tinfirm-runner-host` | The runner host, for the Helm chart's runner pod; it holds no agent runtime |
 | `oci://ghcr.io/flowtivo/charts/tinfirm` | The Helm chart, an OCI artifact; signed, without an SBOM |
 
@@ -103,7 +102,7 @@ Copy each image with its signatures and attestations, and verify it again inside
       registry.example.internal/tinfirm/tinfirm-server@sha256:<digest>
     ```
 
-Then point the Helm chart or the Compose file at your registry, by digest. Do the same for `tinfirm-model-api`, and for `tinfirm-runner-host` with the runner pod. An offline bundle of every image and update, for Enterprise, is planned; until it exists, copy the images this way.
+Then point the Helm chart or the Compose file at your registry, by digest. Do the same for `tinfirm-runner-host` with the runner pod. An offline bundle of every image and update, for Enterprise, is planned; until it exists, copy the images this way.
 
 An admission controller that verifies cosign signatures, such as Sigstore's policy-controller or Kyverno, can enforce the check in your cluster: give it `cosign.pub` as the key, and turn off its transparency log and certificate checks.
 

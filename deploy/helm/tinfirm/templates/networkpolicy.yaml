@@ -67,8 +67,8 @@ spec:
         - protocol: TCP
           port: {{ $np.egress.database.port | default .Values.database.port }}
     {{- if .Values.litellm.enabled }}
-    # The bundled LiteLLM: its admin API (TINFIRM_MODEL_GATEWAY_ADMIN_URL), and the model port
-    # (TINFIRM_MODEL_GATEWAY_MODEL_URL) for the model requests the server relays and its own.
+    # The bundled LiteLLM (TINFIRM_MODEL_GATEWAY_ADMIN_URL): its admin API, and the model
+    # requests the server relays and its own.
     - to:
         - podSelector:
             matchLabels:
@@ -76,8 +76,6 @@ spec:
       ports:
         - protocol: TCP
           port: 4000
-        - protocol: TCP
-          port: 4001
     {{- end }}
     {{- if .Values.auth.oidc.providers }}
     # OIDC issuers.

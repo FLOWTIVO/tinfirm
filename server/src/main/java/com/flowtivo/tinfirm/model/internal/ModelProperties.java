@@ -46,11 +46,12 @@ import org.springframework.validation.annotation.Validated;
  *                                     ({@code TINFIRM_MODEL_RELAY_MAX_INFLIGHT_BYTES}, 256 MiB); a body beyond it is
  *                                     429, an answer beyond it is passed on unmetered. At least twice
  *                                     {@code relayMaxRequestBytes}, so that the largest body fits
- * @param gatewayModelUrl              the bundled gateway's model port, which serves the model API alone
+ * @param gatewayModelUrl              an optional other address of the bundled gateway for model requests
  *                                     ({@code TINFIRM_MODEL_GATEWAY_MODEL_URL}, or the older
- *                                     {@code TINFIRM_LITELLM_MODEL_URL}; ADR-0069): the model requests the server
- *                                     relays and its own go there, its admin API to {@code gatewayAdminUrl}; blank,
- *                                     both go to {@code gatewayAdminUrl}. A company's own gateway has one URL for
+ *                                     {@code TINFIRM_LITELLM_MODEL_URL}; ADR-0110): set, the model requests the
+ *                                     server relays and its own go there, its admin calls to {@code gatewayAdminUrl};
+ *                                     blank, the default (the chart and Compose leave it unset), both go to
+ *                                     {@code gatewayAdminUrl}, as for a company's own gateway, which has one URL for
  *                                     both
  * @param relayBodyTimeout             the longest the relay waits for a request's whole body
  *                                     ({@code TINFIRM_MODEL_RELAY_BODY_TIMEOUT}, 30 s); a body still arriving then is
@@ -152,7 +153,7 @@ record ModelProperties(@Nullable String gatewayAdminUrl, @Nullable String gatewa
         }
         if (gatewayModelUrl != null && !gatewayModelUrl.isBlank() && !modelUrl(gatewayModelUrl.trim())) {
             throw new IllegalArgumentException("TINFIRM_MODEL_GATEWAY_MODEL_URL must be an http(s) URL without "
-                    + "credentials, a query or a fragment, e.g. http://model-api:4001");
+                    + "credentials, a query or a fragment, e.g. http://litellm:4000");
         }
         if (gatewayVendor == GatewayVendor.GENERIC) {
             throw new IllegalArgumentException("TINFIRM_MODEL_GATEWAY_VENDOR must be LITELLM: Tinfirm manages the "
@@ -173,7 +174,7 @@ record ModelProperties(@Nullable String gatewayAdminUrl, @Nullable String gatewa
         }
     }
 
-    /** Where the server sends model requests to the bundled gateway: its model port, or else its admin URL. */
+    /** Where the server sends model requests to the bundled gateway: the model URL if set, else its admin URL. */
     @Nullable String bundledModelUrl() {
         return gatewayModelUrl != null && !gatewayModelUrl.isBlank() ? gatewayModelUrl.trim() : gatewayAdminUrl;
     }

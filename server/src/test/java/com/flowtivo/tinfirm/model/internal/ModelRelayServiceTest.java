@@ -22,10 +22,10 @@ import com.flowtivo.tinfirm.shared.net.InflightBytes;
 
 /**
  * Parts of the model relay without a server: what a request's plan prints, the settings that bound the bytes of request
- * bodies a replica holds ({@code InflightBytes}, tested in {@code libs/net}), LiteLLM's own fields and those of its
- * guardrails removed from a body and its {@code drop_params} put on for a LiteLLM; the settings' defaults (the host's
- * own token required, the body deadline, the beta values passed on), a body's share taken as its bytes arrive whatever
- * its declared length, a body past its deadline 408, and a provider's tool refused unless the company allows it.
+ * bodies a replica holds ({@code InflightBytes}, tested on its own), LiteLLM's own fields and those of its guardrails
+ * removed from a body and its {@code drop_params} put on for a LiteLLM; the settings' defaults (the host's own token
+ * required, the body deadline, the beta values passed on), a body's share taken as its bytes arrive whatever its
+ * declared length, a body past its deadline 408, and a provider's tool refused unless the company allows it.
  */
 class ModelRelayServiceTest {
 

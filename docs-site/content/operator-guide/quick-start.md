@@ -1,6 +1,6 @@
 # Try Tinfirm with Docker Compose
 
-This page starts Tinfirm on one machine from a checkout of its repository: the server, PostgreSQL and the bundled LiteLLM with its model port in Docker Compose, then a model and a runner host, so that you can talk to a first agent.
+This page starts Tinfirm on one machine from a checkout of its repository: the server, PostgreSQL and the bundled LiteLLM in Docker Compose, then a model and a runner host, so that you can talk to a first agent.
 
 !!! danger "For your own machine only"
 
@@ -18,7 +18,7 @@ From the root of the repository:
 make up
 ```
 
-The first time, `make up` copies `deploy/compose/.env.example` to `deploy/compose/.env`; change a value in `.env`, not in the example. It builds the images of the server and the model port, and starts PostgreSQL, LiteLLM, the model port and the server. The first build takes several minutes.
+The first time, `make up` copies `deploy/compose/.env.example` to `deploy/compose/.env`; change a value in `.env`, not in the example. It builds the server's image, and starts PostgreSQL, LiteLLM and the server. The first build takes several minutes.
 
 ## 2. Sign in
 

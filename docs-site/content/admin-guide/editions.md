@@ -14,7 +14,7 @@ Everything is recorded in the audit log in every edition. Proving it to an audit
 | Every system and trigger: Jira Data Center and Cloud, GitHub, GitLab, git hosts, MCP servers, Slack, Teams, webhooks, schedules | :lucide-check: | :lucide-check: | :lucide-check: |
 | The MCP endpoint for people's AI clients, personal access tokens | :lucide-check: | :lucide-check: | :lucide-check: |
 | The Outlook add-in and the Gmail add-on | – | :lucide-check: | :lucide-check: |
-| Model access: LiteLLM, per-person budgets, spend views and alerts, the company's key, the model port | :lucide-check: | :lucide-check: | :lucide-check: |
+| Model access: LiteLLM, per-person budgets, spend views and alerts, the company's key | :lucide-check: | :lucide-check: | :lucide-check: |
 | Safety: sandboxes, the outbound guard, kill switches, suspension | :lucide-check: | :lucide-check: | :lucide-check: |
 | Elastic runners: a fresh VM per run, ready VMs on a schedule, sessions that resume on any company host | – | :lucide-check: | :lucide-check: |
 | Groups, service accounts, credentials lent to them | :lucide-check: | :lucide-check: | :lucide-check: |

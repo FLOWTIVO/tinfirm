@@ -6,6 +6,7 @@
 - Sources: [ADR-0080](0080-helm-chart-published-to-ghcr.md) (a deployment repository pins one key); [ADR-0090](0090-a-chart-for-any-cluster.md) (the tag under both names); [helm.md](../operations/helm.md), sections 2.1 and 6
 - Amends: [ADR-0080](0080-helm-chart-published-to-ghcr.md), decision 2 (the pin is `imageTag`); [ADR-0090](0090-a-chart-for-any-cluster.md), decision 7 (the tag under both names) and its alternative "`image.tag` only"
 - Amended by: [ADR-0107](0107-a-deployment-repository-follows-the-registry.md), under which a deployment repository sets `image.tag` from the tag `main-complete` in the registry, and a release's version by hand (decision 2)
+- Amended by: [ADR-0110](0110-no-model-port.md), under which the model port, whose tag decision 1 defaults to the server's, is gone
 - Changes: in `deploy/helm/tinfirm`, the value `imageTag` goes from `values.yaml` and `values.schema.json`, the helper `tinfirm.imageTag` reads `image.tag` alone, `ci/*.yaml` set `image.tag`, and the chart's version is 0.7.0
 
 ## Context

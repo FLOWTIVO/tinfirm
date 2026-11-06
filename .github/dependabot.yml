@@ -1,10 +1,10 @@
 # Keeps the pins and the dependencies current. Third-party actions are pinned to commit
 # SHAs and base images to tag@digest, and neither updates itself. Dependabot bumps both,
-# and keeps the `# vX.Y.Z` comment next to each action SHA in step. The server's and the
-# model port's Maven dependencies, the web app's npm packages and the runner's crates are
-# here too (L30 of the security review of 2026-10-27): server/pom.xml and ADR-0045 count on
-# Dependabot for the MCP security library, and a dependency with a published fix should
-# arrive as a pull request, not wait for the weekly trivy sweep to fail.
+# and keeps the `# vX.Y.Z` comment next to each action SHA in step. The server's Maven
+# dependencies, the web app's npm packages and the runner's crates are here too (L30 of the
+# security review of 2026-10-27): server/pom.xml and ADR-0045 count on Dependabot for the
+# MCP security library, and a dependency with a published fix should arrive as a pull
+# request, not wait for the weekly trivy sweep to fail.
 # The pr-agent image digest in .github/workflows/pr_agent.yml is outside this: see
 # the comment there.
 version: 2
@@ -22,11 +22,9 @@ updates:
     # The server image, the build environment of the static runner host binaries
     # (deploy/release/runner-musl.Dockerfile; its zig and cargo-zigbuild pins are by hand),
     # the runner's CI checks (runner/ci.Dockerfile, the same Rust image: one group, so
-    # both move in one pull request), the model port (model-api/Dockerfile, the server's
-    # Temurin images, in the same group), and the docs
-    # site's Python and nginx images (docs-site/Dockerfile; its Zensical lock moves by hand,
-    # `make docs-lock`).
-    directories: [/, /deploy/release, /runner, /model-api, /docs-site]
+    # both move in one pull request), and the docs site's Python and nginx images
+    # (docs-site/Dockerfile; its Zensical lock moves by hand, `make docs-lock`).
+    directories: [/, /deploy/release, /runner, /docs-site]
     schedule:
       interval: weekly
     groups:
@@ -55,7 +53,7 @@ updates:
       runner-images:
         patterns: ['*']
   - package-ecosystem: maven
-    directories: [/server, /model-api]
+    directory: /server
     schedule:
       interval: weekly
     open-pull-requests-limit: 10

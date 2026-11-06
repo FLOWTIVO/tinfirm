@@ -6,6 +6,7 @@
 - Sources: [ADR-0080](0080-helm-chart-published-to-ghcr.md) (the published chart); the public guide [Install on Kubernetes with Helm](../../docs-site/content/operator-guide/helm.md); [helm.md](../operations/helm.md); the [threat model](../threat-model.md), 1.5, 4.5 and 8.8; Kubernetes' Pod Security Standards; the Gateway API `v1`; the Prometheus Operator's `PodMonitor`
 - Amends: [ADR-0080](0080-helm-chart-published-to-ghcr.md), its consequence that a chart published for `main` defaults to an image that does not exist
 - Amended by: [ADR-0091](0091-image-tag-alone.md), under which `image.tag` is the image tag's one name (decision 7)
+- Amended by: [ADR-0110](0110-no-model-port.md), under which the model port is gone, with its fixed user and, in decision 1, its rule
 - Changes: in `deploy/helm/tinfirm`, the values `image.tag`, `httpRoute.*`, `metrics.podMonitor.*`, `openshift`, `networkPolicy.egress.systems` and `litellm.tmpVolume`, the templates `httproute.yaml` and `podmonitor.yaml`, the defaults of `networkPolicy.ingress.controller`, `trustedProxies` and `litellm.image`, `litellm.podSecurityContext` and `litellm.securityContext`, the helpers `tinfirm.imageTag`, `tinfirm.openshift`, `tinfirm.securityContext` and `tinfirm.networkPolicy.dnsEgress`, and `ci/gateway-api-values.yaml` and `ci/openshift-values.yaml`; Compose's `litellm` service; `ci.yml`'s `publish` (`app-version`) and its LiteLLM pin check
 
 ## Context

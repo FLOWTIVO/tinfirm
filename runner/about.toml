@@ -3,9 +3,9 @@
 # THIRD-PARTY-LICENSES.txt, which every runner host archive holds (ADR-0082).
 #
 # `accepted` is the policy of ADR-0082 for the licences crates use, in the order cargo-about
-# prefers them when a crate offers a choice. server/pom.xml, model-api/pom.xml and
-# web/scripts/licences.mjs hold the same accepted licences: change them together. A crate whose
-# licence expression no choice of these satisfies fails the check.
+# prefers them when a crate offers a choice. server/pom.xml and web/scripts/licences.mjs hold the
+# same accepted licences: change them together. A crate whose licence expression no choice of
+# these satisfies fails the check.
 #
 # Their EDL-1.0 is not here: cargo-about takes SPDX identifiers only, and refuses EDL-1.0 as an
 # unknown term. SPDX has no identifier for the Eclipse Distribution License 1.0, whose text is
