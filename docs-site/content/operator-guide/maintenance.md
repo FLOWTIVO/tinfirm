@@ -34,7 +34,7 @@ What happens:
 
 A change to the chart's non-secret configuration rolls the pods by itself: the pod template carries a checksum of the server's ConfigMap. A change to a Secret does not ([Rotate a Secret](#rotate-a-secret)).
 
-From a chart with the model port (`model-api`, before chart 0.9.0), Helm refuses a values file that still sets `litellm.modelApi`: move its `from` to `litellm.from` and drop the rest. The services those peers run then call `http://<release>-litellm.<namespace>.svc:4000/v1` instead of port 4001, and reach LiteLLM's admin API there too: give each a key made with `key_type` `llm_api` before it moves ([The company's own services](model-gateway.md#the-companys-own-services)). `litellm.modelApi.providerTools` no longer holds back a company's choice: a company that allows the providers' web search (`providerTools: WEB_SEARCH`) now gets it on the bundled gateway.
+From a chart with the model port (`model-api`, before chart 0.9.0), Helm refuses a values file that still sets `litellm.modelApi`: move its `from` to `litellm.from` and drop the rest. The services those peers run then call `http://<release>-litellm.<namespace>.svc:4000/v1` instead of port 4001, and reach LiteLLM's admin API there too: give each a key made with `key_type` `llm_api` before it moves ([The company's own services](model-gateway.md#the-companys-own-services)).
 
 ### Roll back
 
@@ -203,7 +203,7 @@ docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env up 
 
 Do not mix the two ways: `make up` builds and tags whatever image `.env` names.
 
-A stack that ran a version with the model port (`model-api`) keeps that container running after `make up`: remove it with `--remove-orphans`, as in the command above. Nothing reads the `TINFIRM_MODEL_API_*` lines of `.env` any more, so `TINFIRM_MODEL_API_PROVIDER_TOOLS` no longer holds back a company's choice: a company that allows the providers' web search (`providerTools: WEB_SEARCH`) now gets it on the bundled gateway.
+A stack that ran a version with the model port (`model-api`) keeps that container running after `make up`: remove it with `--remove-orphans`, as in the command above. Nothing reads the `TINFIRM_MODEL_API_*` lines of `.env` any more: remove them.
 
 Use the Compose files of the same version as the image, and keep your `.env`. When Compose stops with `required variable … is missing a value`, the new version needs a setting your `.env` lacks: copy it from `.env.example`, with a value of your own for every secret.
 
