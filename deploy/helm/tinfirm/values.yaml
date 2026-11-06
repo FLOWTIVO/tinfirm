@@ -349,7 +349,7 @@ httpRoute:
 # Deployment and a ClusterIP Service, with its own database on the external PostgreSQL. Only
 # the server reaches its own port (networkPolicy.litellm); nothing exposes it outside the
 # release, and runner hosts reach only the server, which relays their model requests. The
-# server gets its admin URL, its model port's URL and its master key (TINFIRM_LITELLM_*);
+# server gets its admin URL, its model port's URL and its master key (TINFIRM_MODEL_GATEWAY_*);
 # without the master key in the Secret, the server bundles no gateway. The operator adds the
 # provider keys and models through LiteLLM's admin API; Tinfirm adds none. `enabled: false`
 # for a company that brings its own LiteLLM: an admin then enters its URL and key on
@@ -377,7 +377,7 @@ litellm:
   # litellm.database.existingSecret is set.
   existingSecret: tinfirm-litellm
   secretKeys:
-    # LITELLM_MASTER_KEY, `sk-...`; the server gets it as TINFIRM_LITELLM_MASTER_KEY.
+    # LITELLM_MASTER_KEY, `sk-...`; the server gets it as TINFIRM_MODEL_GATEWAY_ADMIN_KEY.
     masterKey: master-key
     # LITELLM_SALT_KEY: encrypts the provider keys LiteLLM stores. Never change it once
     # keys are stored.
@@ -435,7 +435,7 @@ litellm:
   # serves LiteLLM's model routes alone, each by its exact path, with LiteLLM's own fields
   # removed from every body, on the Service's port `model`. The company's services call it with
   # LiteLLM keys of their own (docs/operations/litellm.md); the server sends its model requests
-  # here too (TINFIRM_LITELLM_MODEL_URL).
+  # here too (TINFIRM_MODEL_GATEWAY_MODEL_URL).
   modelApi:
     image:
       repository: ghcr.io/flowtivo/tinfirm-model-api

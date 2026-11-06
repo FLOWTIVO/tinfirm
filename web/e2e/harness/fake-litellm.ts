@@ -7,7 +7,7 @@
  * spent budget (429 `budget_exceeded`) and a model the key does not allow (401), answer a canned completion, and add
  * `costPerRequestUsd` to the key's spend. The spend of a key can be set from the control API (V7: a spent budget).
  *
- * The server reaches it as the deployment's bundled gateway (TINFIRM_LITELLM_ADMIN_URL). TEST FIXTURE ONLY.
+ * The server reaches it as the deployment's bundled gateway (TINFIRM_MODEL_GATEWAY_ADMIN_URL). TEST FIXTURE ONLY.
  */
 import { createHash, randomBytes } from 'node:crypto';
 import type { Server, ServerResponse } from 'node:http';

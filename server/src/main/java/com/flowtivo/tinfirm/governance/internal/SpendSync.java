@@ -65,7 +65,8 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  * <li>Otherwise it is tried again 2, 4, 8… minutes later; once {@code relayAfter} passed since its end, the relay's
  * own count settles it ({@link ModelRelay#usageByModel}), a {@code RELAY} row per model at LiteLLM's prices
  * ({@link SpendLogs#prices}; no cost for a model without one). With {@code tinfirm.spend.source} {@code RELAY} every
- * run settles from the relay at once.</li>
+ * run settles from the relay at once, and so does every run of a company whose gateway keeps no spend logs Tinfirm
+ * reads ({@link SpendLogs#recorded}: one whose keys its gateway team provides, ADR-0094).</li>
  * </ol>
  * Each settlement's rows are written in one transaction that locks it under the worker's lease again; a row is
  * written once ({@code ON CONFLICT DO NOTHING}). The sandbox's report never sets a cost. After a settlement with a
@@ -269,8 +270,10 @@ public class SpendSync {
                 log.warn("Settling the spend of run {} failed; it is tried again", settlement.runId(), ex);
             }
         }
-        Logs read = properties.source() == SpendProperties.Source.RELAY ? Logs.NONE
-                : readLogs(companyId, ready, counted);
+        // A gateway whose keys its team provides keeps no records Tinfirm reads (ADR-0094): the relay's count settles.
+        boolean relayOnly = properties.source() == SpendProperties.Source.RELAY
+                || !ready.isEmpty() && !logs.recorded(companyId);
+        Logs read = relayOnly ? Logs.NONE : readLogs(companyId, ready, counted);
         int settled = 0;
         for (SpendStore.Settlement settlement : ready) {
             List<ModelRelay.ModelUsage> usage = counted.get(settlement.runId());
@@ -283,7 +286,7 @@ public class SpendSync {
                 if (fromLogs) {
                     settled += settleFromLogs(companyId, settlement, lease, entries) ? 1 : 0;
                 }
-                else if (properties.source() == SpendProperties.Source.RELAY || late) {
+                else if (relayOnly || late) {
                     settled += settleFromRelay(companyId, settlement, lease, usage) ? 1 : 0;
                 }
                 else {

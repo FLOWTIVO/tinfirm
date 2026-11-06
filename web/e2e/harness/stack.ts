@@ -288,8 +288,8 @@ async function startServer(webRoot: string | null): Promise<void> {
     // A spec reads an MCP server's catalogue twice in a row; the limiter (one a minute, M9) is off, as in the tests.
     TINFIRM_SYSTEM_CATALOGUE_REFRESH_INTERVAL: 'PT0S',
     // The bundled gateway is the fake LiteLLM.
-    TINFIRM_LITELLM_ADMIN_URL: urls.litellm,
-    TINFIRM_LITELLM_MASTER_KEY: litellmMasterKey,
+    TINFIRM_MODEL_GATEWAY_ADMIN_URL: urls.litellm,
+    TINFIRM_MODEL_GATEWAY_ADMIN_KEY: litellmMasterKey,
     // Every persona logs in per run; the default per-IP throttle (30 a minute) is for people.
     TINFIRM_AUTH_LOGINTHROTTLE_PERIP_CAPACITY: '10000',
     TINFIRM_AUTH_LOGINTHROTTLE_PEREMAIL_CAPACITY: '1000',

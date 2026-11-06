@@ -36,11 +36,14 @@ pub fn is_usage_limit_text(text: &str) -> bool {
         || is_gateway_budget_text(&normalized)
 }
 
-/// A model gateway refused the request because a budget is spent (ADR-0027). LiteLLM answers
-/// with the error type `"budget_exceeded"` and the message `Budget has been exceeded! …` (the
-/// key's, team's or user's budget) or `ExceededBudget: Key over 1d budget. …` (a budget
-/// window). The run cannot go on until the budget resets or is raised, like after a usage
-/// limit. The bare word `budget_exceeded` is not enough: an agent may name a variable so.
+/// A model gateway refused the request because a budget is spent (ADR-0027). Since ADR-0094 the
+/// server's model relay answers a spent budget itself, whatever the gateway, with the error type
+/// `"budget_exceeded"` and the message `Budget has been exceeded: the model budget that pays for
+/// this run is spent…`. Servers before it passed on LiteLLM's own answer: the same type and
+/// `Budget has been exceeded! …` (the key's, team's or user's budget) or `ExceededBudget: Key
+/// over 1d budget. …` (a budget window). The run cannot go on until the budget resets or is
+/// raised, like after a usage limit. The bare word `budget_exceeded` is not enough: an agent may
+/// name a variable so.
 fn is_gateway_budget_text(text: &str) -> bool {
     text.to_ascii_lowercase()
         .contains("budget has been exceeded")
@@ -316,6 +319,14 @@ mod tests {
         ));
         assert!(is_usage_limit_text(
             r#"{"type":"error","error":{"type":"budget_exceeded","message":"over budget"}}"#
+        ));
+        // The server's relay's own answer (ADR-0094), whatever the gateway, as Claude Code and
+        // Codex show it.
+        assert!(is_usage_limit_text(
+            r#"API Error: 429 {"type":"error","error":{"type":"budget_exceeded","message":"Budget has been exceeded: the model budget that pays for this run is spent; it resets at 2026-11-01T00:00:00Z."}}"#
+        ));
+        assert!(is_usage_limit_text(
+            "Budget has been exceeded: the model budget that pays for this run is spent."
         ));
         assert!(!is_usage_limit_text("I raised the budget of the project."));
         assert!(!is_usage_limit_text(

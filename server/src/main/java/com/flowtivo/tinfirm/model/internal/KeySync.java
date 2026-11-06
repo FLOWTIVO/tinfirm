@@ -59,6 +59,12 @@ class KeySync {
     /** How long a sync may hold a key's row; a replica that died lets go after it. */
     static final Duration LEASE = Duration.ofMinutes(2);
 
+    /**
+     * How long a provided key whose budget the gateway reported spent, without saying when it resets, waits before the
+     * relay tries it again (ADR-0094): its next refusal makes it spent again.
+     */
+    static final Duration PROVIDED_RETRY = Duration.ofMinutes(15);
+
     /** The kind the metadata of the company's own key names. */
     static final String COMPANY_KIND = "COMPANY";
 
@@ -76,7 +82,7 @@ class KeySync {
 
     private final Gateways gateways;
 
-    private final LiteLlm litellm;
+    private final GatewayAdapter adapter;
 
     private final SecretWriter secrets;
 
@@ -89,7 +95,7 @@ class KeySync {
     private final BudgetAlertStore alerts;
 
     KeySync(SystemTransactions transactions, ModelSettingsStore settingsStore, ModelKeyStore keys,
-            Principals principals, CompanyDirectory companies, Gateways gateways, LiteLlm litellm,
+            Principals principals, CompanyDirectory companies, Gateways gateways, GatewayAdapter adapter,
             SecretWriter secrets, AuditLog auditLog, ApplicationEventPublisher events, TimeSource time,
             BudgetAlertStore alerts) {
         this.alerts = alerts;
@@ -99,7 +105,7 @@ class KeySync {
         this.principals = principals;
         this.companies = companies;
         this.gateways = gateways;
-        this.litellm = litellm;
+        this.adapter = adapter;
         this.secrets = secrets;
         this.auditLog = auditLog;
         this.events = events;
@@ -124,8 +130,8 @@ class KeySync {
      * What LiteLLM's admin is to show of a key's holder, beside the ids that identify it: the company's name (the
      * team's alias, {@code tinfirm_company_name}) and, for a principal's key, the principal's display name
      * ({@code tinfirm_principal_name}; null when it has none, as a deleted user's member). The names as they were
-     * when the key was made: a key's metadata is never changed ({@link LiteLlm}), a rotation's next key carries the
-     * current ones.
+     * when the key was made: a key's metadata is never changed ({@link GatewayAdapter}), a rotation's next key carries
+     * the current ones.
      */
     record Names(String company, @Nullable String principal) {
     }
@@ -146,14 +152,14 @@ class KeySync {
         if (plan == null) {
             return busyOrNothing(holder);
         }
-        LiteLlm.CreatedKey created = null;
-        LiteLlm.KeyState state;
+        GatewayAdapter.CreatedKey created = null;
+        GatewayAdapter.KeyState state;
         try {
             ensureTeam(plan.gateway(), plan.teamId(), companyId, plan.names().company());
-            state = plan.keyId() != null ? litellm.info(plan.gateway(), plan.keyId()).orElse(null) : null;
+            state = plan.keyId() != null ? adapter.info(plan.gateway(), plan.keyId()).orElse(null) : null;
             if (state == null) {
                 created = create(plan, holder);
-                state = litellm.info(plan.gateway(), created.keyId()).orElse(null);
+                state = adapter.info(plan.gateway(), created.keyId()).orElse(null);
                 if (state == null) {
                     throw new LiteLlmException(404, "LiteLLM does not know the key it just created");
                 }
@@ -163,7 +169,7 @@ class KeySync {
             }
         }
         catch (LiteLlmException ex) {
-            LiteLlm.CreatedKey made = created;
+            GatewayAdapter.CreatedKey made = created;
             if (made != null) {
                 // The key exists in LiteLLM: keep it, with the error, so that the next sync does not create another.
                 if (!recordCreated(holder, plan, made, null, ex.getMessage())) {
@@ -175,7 +181,7 @@ class KeySync {
             }
             return Result.DONE;
         }
-        LiteLlm.KeyState confirmed = state;
+        GatewayAdapter.KeyState confirmed = state;
         try {
             if (created != null) {
                 if (!recordCreated(holder, plan, created, confirmed, null)) {
@@ -215,6 +221,10 @@ class KeySync {
         }
         Instant now = time.now();
         keys.insertPending(holder, now);
+        if (settings.get().gateway() == ModelSettingsStore.GatewayKind.PROVIDED) {
+            provided(holder, principal.orElse(null), now);
+            return null;
+        }
         if (!keys.claim(holder, now, now.plus(LEASE))) {
             return null;
         }
@@ -229,8 +239,52 @@ class KeySync {
         // A key made again (LiteLLM lost it) keeps the alias of its generation: the alias of a later one may still be
         // the previous key's, which serves the grace of a rotation (KeyRotation).
         return new Plan(gateway.get(), connection(settings.get()), Gateway.teamId(companyId),
-                holder.alias(row.rotation().generation()), row.hasKey() ? row.litellmKeyId() : null, row.secretId(),
+                holder.alias(row.rotation().generation()), row.hasKey() ? row.gatewayKeyId() : null, row.secretId(),
                 desired, kind(principal.orElse(null)), names(companyId, principal.orElse(null)), row.status());
+    }
+
+    /**
+     * The sync of a key its gateway team provides (ADR-0094), in the company's transaction, without a call to the
+     * gateway: Tinfirm holds no admin key there. A holder without a key waits for one; a suspended principal's key is
+     * {@code BLOCKED} here, since the relay is the only way Tinfirm's runs reach the gateway, and its team is asked to
+     * revoke it there ({@code model_key.revoke_requested}); a resumed one's is {@code OK} again; a spent budget whose
+     * reset the gateway did not tell is tried again after {@link #PROVIDED_RETRY}, one past its reset at once.
+     */
+    private void provided(KeyHolder holder, @Nullable PrincipalInfo principal, Instant now) {
+        ModelKeyStore.KeyRow row = keys.lock(holder).orElseThrow();
+        ModelKeyStore.KeyStatus status = row.status();
+        String error = row.lastError();
+        if (!row.hasKey()) {
+            status = ModelKeyStore.KeyStatus.ERROR;
+            error = ModelKeyStore.NOT_PROVIDED;
+        }
+        else if (principal != null && principal.status() == PrincipalStatus.SUSPENDED) {
+            if (status != ModelKeyStore.KeyStatus.BLOCKED) {
+                auditLog.record(holder
+                    .audit(AuditRecord.company(holder.companyId(), AuditAction.MODEL_KEY_REVOKE_REQUESTED,
+                            CurrentActor.actor()))
+                    .detail("cause", "principal.suspended")
+                    .detail("hint", row.provided() != null ? row.provided().hint() : null)
+                    .build());
+            }
+            status = ModelKeyStore.KeyStatus.BLOCKED;
+            error = null;
+        }
+        else if (status == ModelKeyStore.KeyStatus.BLOCKED) {
+            status = ModelKeyStore.KeyStatus.OK;
+        }
+        else if (status == ModelKeyStore.KeyStatus.BUDGET_SPENT) {
+            Instant resetsAt = row.budgetResetsAt();
+            boolean due = resetsAt != null ? !resetsAt.isAfter(now)
+                    : !row.updatedAt().plus(PROVIDED_RETRY).isAfter(now);
+            if (due) {
+                status = ModelKeyStore.KeyStatus.OK;
+            }
+        }
+        if (status != row.status() || !Objects.equals(error, row.lastError())) {
+            keys.recordStatus(holder, status, error, null, now);
+            statusChanged(holder, row.status(), status);
+        }
     }
 
     /** What the key's metadata names as its holder's kind. */
@@ -293,11 +347,11 @@ class KeySync {
      */
     private void ensureTeam(Gateway gateway, String teamId, UUID companyId, String companyName) {
         gateways.ensureTeam(gateway, teamId, companyName,
-                () -> litellm.ensureTeam(gateway, teamId, companyId, companyName));
+                () -> adapter.ensureTeam(gateway, teamId, companyId, companyName));
     }
 
 
-    private LiteLlm.CreatedKey create(Plan plan, KeyHolder holder) {
+    private GatewayAdapter.CreatedKey create(Plan plan, KeyHolder holder) {
         return generate(plan.gateway(),
                 keySpec(plan.alias(), plan.teamId(), holder, plan.kind(), plan.names(), plan.desired(), null),
                 holder.companyId(), plan.names().company());
@@ -309,7 +363,7 @@ class KeySync {
      * name, the holder's kind), blocked for a suspended principal, and the spend it starts with (a rotation's next
      * key; null for none).
      */
-    static LiteLlm.KeySpec keySpec(String alias, String teamId, KeyHolder holder, String kind, Names names,
+    static GatewayAdapter.KeySpec keySpec(String alias, String teamId, KeyHolder holder, String kind, Names names,
             Desired desired, @Nullable BigDecimal spend) {
         Map<String, String> metadata = new LinkedHashMap<>();
         metadata.put("tinfirm_company", holder.companyId().toString());
@@ -321,8 +375,8 @@ class KeySync {
             }
         }
         metadata.put("tinfirm_kind", kind);
-        return new LiteLlm.KeySpec(alias, teamId, desired.budgetUsd(), desired.period(), desired.models(), metadata,
-                desired.blocked(), spend);
+        return new GatewayAdapter.KeySpec(alias, teamId, desired.budgetUsd(), desired.period(), desired.models(),
+                metadata, desired.blocked(), spend);
     }
 
     /**
@@ -330,45 +384,46 @@ class KeySync {
      * it (the alias is unique in LiteLLM), or a team LiteLLM lost: both are cleared and the key is asked for once more.
      * The alias is never the one of a key a row holds.
      */
-    LiteLlm.CreatedKey generate(Gateway gateway, LiteLlm.KeySpec spec, UUID companyId, String companyName) {
+    GatewayAdapter.CreatedKey generate(Gateway gateway, GatewayAdapter.KeySpec spec, UUID companyId,
+            String companyName) {
         ensureTeam(gateway, spec.teamId(), companyId, companyName);
         try {
-            return litellm.generate(gateway, spec);
+            return adapter.generate(gateway, spec);
         }
         catch (LiteLlmException ex) {
             if (ex.status() == 400) {
                 deleteAliasQuietly(gateway, spec.alias());
                 gateways.teamUnknown(gateway, spec.teamId());
                 ensureTeam(gateway, spec.teamId(), companyId, companyName);
-                return litellm.generate(gateway, spec);
+                return adapter.generate(gateway, spec);
             }
             throw ex;
         }
     }
 
     /** Changes what differs from the plan in LiteLLM; the key's state as LiteLLM then knows it. */
-    private LiteLlm.KeyState converge(Plan plan, LiteLlm.KeyState state) {
+    private GatewayAdapter.KeyState converge(Plan plan, GatewayAdapter.KeyState state) {
         Desired desired = plan.desired();
         String keyId = Objects.requireNonNull(plan.keyId());
         BigDecimal budget = state.maxBudget() == null
                 || Math.abs(state.maxBudget() - desired.budgetUsd().doubleValue()) > EPSILON ? desired.budgetUsd()
                         : null;
         // A new period restarts it in LiteLLM, so it is sent only when it changed.
-        String period = desired.period().equals(state.budgetDuration()) ? null : desired.period();
+        String period = desired.period().equals(state.period()) ? null : desired.period();
         List<String> models = new HashSet<>(desired.models()).equals(new HashSet<>(state.models())) ? null
                 : desired.models();
-        LiteLlm.KeyUpdate update = new LiteLlm.KeyUpdate(budget, period, models);
+        GatewayAdapter.KeyUpdate update = new GatewayAdapter.KeyUpdate(budget, period, models);
         boolean changed = !update.empty();
-        litellm.update(plan.gateway(), keyId, update);
+        adapter.update(plan.gateway(), keyId, update);
         if (desired.blocked() && !state.blocked()) {
-            litellm.block(plan.gateway(), keyId);
+            adapter.block(plan.gateway(), keyId);
             changed = true;
         }
         else if (!desired.blocked() && state.blocked()) {
-            litellm.unblock(plan.gateway(), keyId);
+            adapter.unblock(plan.gateway(), keyId);
             changed = true;
         }
-        return changed ? litellm.info(plan.gateway(), keyId)
+        return changed ? adapter.info(plan.gateway(), keyId)
             .orElseThrow(() -> new LiteLlmException(404, "LiteLLM lost the key while it was changed")) : state;
     }
 
@@ -376,8 +431,8 @@ class KeySync {
      * Keeps the key LiteLLM created in an internal secret, with its state; false when the key's row is gone (its
      * principal left or was deleted meanwhile), so that the caller deletes the key again, outside the transaction.
      */
-    private boolean recordCreated(KeyHolder holder, Plan plan, LiteLlm.CreatedKey created,
-            LiteLlm.@Nullable KeyState state, @Nullable String error) {
+    private boolean recordCreated(KeyHolder holder, Plan plan, GatewayAdapter.CreatedKey created,
+            GatewayAdapter.@Nullable KeyState state, @Nullable String error) {
         UUID companyId = holder.companyId();
         return transactions.inCompany(companyId, () -> {
             Optional<ModelKeyStore.KeyRow> row = lock(holder);
@@ -429,7 +484,7 @@ class KeySync {
      * Records the key's state; runs in a transaction of the company. A status recorded since the plan (the relay's)
      * stays, and the sync records nothing else: the sync the relay asked for reads the key again.
      */
-    private void recordState(KeyHolder holder, Plan plan, LiteLlm.KeyState state, @Nullable String error) {
+    private void recordState(KeyHolder holder, Plan plan, GatewayAdapter.KeyState state, @Nullable String error) {
         Optional<ModelKeyStore.KeyRow> current = lock(holder);
         if (current.isEmpty()) {
             return;
@@ -465,7 +520,7 @@ class KeySync {
      * The status that follows from LiteLLM's state: {@code BLOCKED} while the principal is suspended,
      * {@code BUDGET_SPENT} when the period's spend reached the budget, else {@code OK}.
      */
-    static ModelKeyStore.KeyStatus status(Desired desired, LiteLlm.KeyState state) {
+    static ModelKeyStore.KeyStatus status(Desired desired, GatewayAdapter.KeyState state) {
         if (desired.blocked()) {
             return ModelKeyStore.KeyStatus.BLOCKED;
         }
@@ -526,7 +581,7 @@ class KeySync {
 
     private void deleteQuietly(Gateway gateway, String keyId) {
         try {
-            litellm.delete(gateway, keyId);
+            adapter.delete(gateway, keyId);
         }
         catch (LiteLlmException ex) {
             log.warn("A LiteLLM key Tinfirm could not keep was not deleted ({}); the reconciliation deletes it",
@@ -536,7 +591,7 @@ class KeySync {
 
     private void deleteAliasQuietly(Gateway gateway, String alias) {
         try {
-            litellm.deleteByAlias(gateway, alias);
+            adapter.deleteByAlias(gateway, alias);
         }
         catch (LiteLlmException ex) {
             log.debug("No key of the alias was deleted: {}", ex.getMessage());

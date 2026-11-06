@@ -37,6 +37,7 @@ const RUNNER_REASONS: Record<string, string> = {
   ACCOUNT_REQUIRED: 'Account needed',
   BUDGET_SPENT: 'Budget spent',
   KEY_ERROR: 'Budget unavailable',
+  NO_MODEL_KEY: 'No model key',
   HOST_OFFLINE: 'Host offline',
   MODEL_ACCESS_UNAVAILABLE: 'Nobody can pay',
   NO_HOST_FOR_CREDENTIALS: 'No host may run it',

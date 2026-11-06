@@ -127,9 +127,15 @@ A member's personal MCP server never gets the exceptions of the first three.
 
 | Variable | Default | Meaning | Helm value |
 |---|---|---|---|
-| `TINFIRM_LITELLM_ADMIN_URL` | unset | The bundled LiteLLM's own port, inside the deployment, for its admin API. Without it, or without the master key, no gateway is bundled, and each company brings its own. | Set by the chart with `litellm.enabled` |
-| `TINFIRM_LITELLM_MODEL_URL` | unset: the admin URL | The bundled LiteLLM's model port, where the server sends the model requests it relays for runs, and its own | Set by the chart with `litellm.enabled` |
-| `TINFIRM_LITELLM_MASTER_KEY` | unset | **Secret.** The bundled LiteLLM's master key | `litellm.existingSecret`, key `litellm.secretKeys.masterKey` |
+| `TINFIRM_MODEL_GATEWAY_VENDOR` | `LITELLM` | The product the bundled gateway is: `LITELLM`, the only value the server accepts. It does not start with `GENERIC`, which is for a company's own gateway whose keys its team provides | Set by the chart with `litellm.enabled` |
+| `TINFIRM_MODEL_GATEWAY_ADMIN_URL` | unset | The bundled LiteLLM's own port, inside the deployment, for its admin API. Without it, or without the master key, no gateway is bundled, and each company brings its own. | Set by the chart with `litellm.enabled` |
+| `TINFIRM_MODEL_GATEWAY_MODEL_URL` | unset: the admin URL | The bundled LiteLLM's model port, where the server sends the model requests it relays for runs, and its own | Set by the chart with `litellm.enabled` |
+| `TINFIRM_MODEL_GATEWAY_ADMIN_KEY` | unset | **Secret.** The bundled LiteLLM's master key | `litellm.existingSecret`, key `litellm.secretKeys.masterKey` |
+
+The bundled gateway's variables were called `TINFIRM_LITELLM_ADMIN_URL`, `TINFIRM_LITELLM_MODEL_URL` and `TINFIRM_LITELLM_MASTER_KEY` before Tinfirm could speak to more than one gateway. The server still reads each old name when its new name is unset.
+
+| Variable | Default | Meaning | Helm value |
+|---|---|---|---|
 | `TINFIRM_MODEL_KEY_ROTATION_INTERVAL` | `P30D` | How long after its creation each member's, service account's and company's LiteLLM key is rotated; at least `P1D` | `extraConfig` |
 | `TINFIRM_MODEL_KEY_ROTATION_GRACE` | `PT10M` | How long a key replaced on schedule still serves the requests that hold it; `PT0S` to `PT1H` | `extraConfig` |
 | `TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN` | `true` | Refuse a run's model requests without its runner host's own token from every host: runner host 0.3.0 is the minimum. Set `false` only while a host older than 0.3.0 is being upgraded; such a host is then accepted with a warning. | `extraConfig` |
@@ -284,7 +290,7 @@ Other properties of the server are internal schedules and are not part of this c
 | `POSTGRES_PASSWORD` | development value | **Secret.** The superuser of the bundled PostgreSQL |
 | `TINFIRM_OWNER_PASSWORD`, `TINFIRM_APP_PASSWORD` | development values | **Secret.** The passwords of `tinfirm_owner` and `tinfirm_app`, set when the database volume is created |
 | `TINFIRM_COMPANY_NAME`, `TINFIRM_COMPANY_OWNER` | `My Company`, empty | The company `main`: `TINFIRM_COMPANIES_MAIN_NAME` and `_OWNER` |
-| `LITELLM_MASTER_KEY` | development value | **Secret.** LiteLLM's master key, also the server's `TINFIRM_LITELLM_MASTER_KEY` |
+| `LITELLM_MASTER_KEY` | development value | **Secret.** LiteLLM's master key, also the server's `TINFIRM_MODEL_GATEWAY_ADMIN_KEY` |
 | `LITELLM_SALT_KEY` | development value | **Secret.** Encrypts the provider keys in LiteLLM's database. Never change it once keys are stored. |
 | `LITELLM_DB_PASSWORD` | development value | **Secret.** The password of LiteLLM's database role |
 | `TINFIRM_HTTP_BIND`, `TINFIRM_HTTP_HOST_PORT` | `127.0.0.1`, `8080` | Where the server's port is published on the host |

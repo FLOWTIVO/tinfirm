@@ -274,7 +274,7 @@ function changeRequestText(output: Output): string {
 
 /** Where a settled turn's cost comes from, for the cost's title. */
 const SETTLED_FROM: Record<string, string> = {
-  GATEWAY: 'LiteLLM’s records',
+  GATEWAY: 'the gateway’s records',
   RELAY: 'Tinfirm’s own count',
 };
 
@@ -403,7 +403,7 @@ export function liveRun(run: Run | null | undefined): boolean {
 
 /**
  * What a conversation cost so far: the settled spend and tokens of its turns (`Conversation.cost`,
- * from LiteLLM's records or Tinfirm's own count, as the reader sees spend), and the runtime's
+ * from the gateway's records or Tinfirm's own count, as the reader sees spend), and the runtime's
  * estimate and reported tokens of its finished turns on a budget whose spend has not settled yet,
  * which settles minutes after a turn ends. A subscription's turns cost nothing; their tokens count
  * in the tokens, and are told apart too.

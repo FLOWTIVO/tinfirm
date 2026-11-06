@@ -16,8 +16,8 @@ import com.flowtivo.tinfirm.shared.config.TinfirmProperties;
 class ModelConfiguration {
 
     ModelConfiguration(ModelProperties properties, TinfirmProperties tinfirm) {
-        if (PublishedDevSecrets.isPublishedLiteLlmMasterKey(properties.litellmMasterKey())) {
-            PublishedDevSecrets.refuseOffLocalhost(tinfirm.publicUrl(), "TINFIRM_LITELLM_MASTER_KEY",
+        if (PublishedDevSecrets.isPublishedLiteLlmMasterKey(properties.gatewayAdminKey())) {
+            PublishedDevSecrets.refuseOffLocalhost(tinfirm.publicUrl(), "TINFIRM_MODEL_GATEWAY_ADMIN_KEY",
                     "Generate a key of your own (`echo \"sk-$(openssl rand -hex 32)\"`) and give it to LiteLLM and "
                             + "the server alike.");
         }

@@ -204,6 +204,21 @@ describe('ModelAccess', () => {
     }
   });
 
+  it('names no models at a gateway whose team provides the keys: each key has its own', async () => {
+    await open(
+      aModelSettings({
+        gateway: 'PROVIDED',
+        vendor: 'GENERIC',
+        adminKeySet: false,
+        modelUrl: 'https://ai-gateway.acme.test',
+      }),
+      { served: [] },
+    );
+    expect(q('gateway-status')!.getAttribute('data-state')).toBe('READY');
+    expect(text(q('served'))).toBe('Serves Each key serves the models its gateway team allows.');
+    expect(text(q('models-note'))).toBe('Each key serves the models its gateway team allows.');
+  });
+
   it('sets up a company that has no gateway yet: Test waits for the first save', async () => {
     await open(aModelSettings({ configured: false, relayEnabled: false, testedAt: null }), {
       served: 'unconfigured',
@@ -361,7 +376,7 @@ describe('ModelAccess', () => {
       'passes',
       (req) => req.flush({ ok: true, models: SERVED }),
       { testedAt: AT.start },
-      'LiteLLM answered and serves 3 models. Turns paid by a budget may start.',
+      'The gateway answered and serves 3 models. Turns paid by a budget may start.',
     ],
     [
       'fails',

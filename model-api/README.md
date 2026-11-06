@@ -6,7 +6,7 @@ The bundled LiteLLM's model API and nothing else, for the company's services: [A
 - **Bodies without LiteLLM's fields**: the shared filter of the server's model relay (`../libs/litellm`, `LiteLlmRequests`). `drop_params` passes as it came. A request that asks the model's provider to run a tool itself is `400`, naming what it asked for: `mcp_servers`, `container`, `web_search_options`, a tool the runtime does not run (web search or fetch of any version, code execution, MCP), one of Gemini's built-in tools. Always: no setting lets a provider's tool through ([ADR-0108](../docs/adr/0108-no-provider-run-tools.md), [litellm.md](../docs/operations/litellm.md#2-how-it-is-secured)). The bodies held at once stay within `MODEL_API_MAX_INFLIGHT_BYTES` (`../libs/net`, `InflightBytes`, as the relay's).
 - **The caller's key and the formats' headers**: `Authorization`, `x-api-key`, `api-key`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `Accept`, `User-Agent` and `x-litellm-tags`. LiteLLM checks the key: each service has a LiteLLM key of its own, with its budget and models.
 
-The answer streams back part by part; of its headers, the type, the request ids and the rate limits. Tinfirm's server sends its model requests here too (`TINFIRM_LITELLM_MODEL_URL`); its admin API calls go to LiteLLM's own port, which only the server reaches.
+The answer streams back part by part; of its headers, the type, the request ids and the rate limits. Tinfirm's server sends its model requests here too (`TINFIRM_MODEL_GATEWAY_MODEL_URL`); its admin API calls go to LiteLLM's own port, which only the server reaches.
 
 Java 25 and Spring Boot 4.1, as the server.
 
