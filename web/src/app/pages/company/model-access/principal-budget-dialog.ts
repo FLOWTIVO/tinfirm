@@ -19,11 +19,15 @@ import { HlmInput } from '@spartan-ng/helm/input';
 import { HlmSpinner } from '@spartan-ng/helm/spinner';
 import { Api } from '../../../api/generated/api';
 import {
+  deleteCompanyModelKey,
+  deletePrincipalModelKey,
+  putCompanyModelKey,
+  putPrincipalModelKey,
   updateCompanyKeyModelAccess,
   updatePrincipalModelAccess,
 } from '../../../api/generated/functions';
 import type { ModelAccessView } from '../../../api/generated/models';
-import { problemMessage } from '../../../api/problem';
+import { hasProblemCode, problemMessage } from '../../../api/problem';
 import { Notify } from '../../../core/notify';
 import { formatDay, formatUsd } from '../../../shared/labels';
 import {
@@ -36,6 +40,7 @@ import {
   modelsPhrase,
   parseUsd,
   periodPhrase,
+  providedKeyState,
 } from './model-access-view';
 
 /**
@@ -81,11 +86,19 @@ const ERRORS = {
         class="max-h-[92svh] overflow-y-auto sm:max-w-lg"
       >
         <hlm-dialog-header>
-          <h2 hlmDialogTitle>Budget of {{ principal()?.name }}</h2>
-          <p hlmDialogDescription>
-            What {{ principal()?.name }} may spend through the gateway per {{ periodWords() }}, and
-            on which models. The key in LiteLLM follows when you save.
-          </p>
+          @if (provided()) {
+            <h2 hlmDialogTitle>Key of {{ principal()?.name }}</h2>
+            <p hlmDialogDescription>
+              The key your gateway team made for {{ principal()?.name }}: its budget and models are
+              set at the gateway. Tinfirm keeps the key in the vault and never shows it again.
+            </p>
+          } @else {
+            <h2 hlmDialogTitle>Budget of {{ principal()?.name }}</h2>
+            <p hlmDialogDescription>
+              What {{ principal()?.name }} may spend through the gateway per {{ periodWords() }},
+              and on which models. The key at the gateway follows when you save.
+            </p>
+          }
         </hlm-dialog-header>
 
         <form
@@ -101,8 +114,66 @@ const ERRORS = {
             </div>
           }
 
+          @if (provided()) {
+            <!-- The key the gateway team made (ADR-0094) -->
+            <div class="flex flex-col gap-2" data-testid="provided-key">
+              <div class="text-sm font-semibold" id="provided-key-label">Key</div>
+              <p
+                class="text-muted-foreground m-0 text-[0.8125rem]"
+                data-testid="provided-key-state"
+              >
+                {{ keyState() }}
+              </p>
+              <div class="flex flex-wrap items-center gap-2">
+                <input
+                  hlmInput
+                  id="provided-key"
+                  type="password"
+                  class="min-w-0 flex-1 font-mono"
+                  autocomplete="new-password"
+                  spellcheck="false"
+                  aria-labelledby="provided-key-label"
+                  aria-describedby="provided-key-error"
+                  [placeholder]="view()?.keyProvided ? 'Type to replace' : 'Paste the key'"
+                  [value]="key()"
+                  [attr.aria-invalid]="keyError() ? 'true' : null"
+                  (input)="key.set($any($event.target).value)"
+                />
+                <button
+                  hlmBtn
+                  type="button"
+                  variant="outline"
+                  data-testid="save-key"
+                  [disabled]="busy() || !key().trim()"
+                  (click)="saveKey()"
+                >
+                  Save key
+                </button>
+                @if (view()?.keyProvided) {
+                  <button
+                    hlmBtn
+                    type="button"
+                    variant="ghost"
+                    data-testid="remove-key"
+                    [disabled]="busy()"
+                    (click)="removeKey()"
+                  >
+                    Remove
+                  </button>
+                }
+              </div>
+              <p
+                id="provided-key-error"
+                class="text-destructive m-0 text-xs font-medium empty:hidden"
+                role="alert"
+              >
+                {{ keyError() ?? '' }}
+              </p>
+            </div>
+          }
+
           <!-- What is spent now, against the budget as chosen -->
-          @if (meter(); as m) {
+          @if (!provided() && meter(); as m) {
             <div
               class="bg-muted flex flex-col gap-1.5 rounded-xl px-3.5 py-3"
               data-testid="spent-now"
@@ -130,7 +201,10 @@ const ERRORS = {
             </div>
           }
 
-          <fieldset class="m-0 flex min-w-0 flex-col gap-2 border-0 p-0">
+          <fieldset
+            class="m-0 flex min-w-0 flex-col gap-2 border-0 p-0"
+            [class.hidden]="provided()"
+          >
             <legend class="mb-2 p-0 text-sm font-semibold">Budget</legend>
             <label [class]="option">
               <input
@@ -226,9 +300,11 @@ const ERRORS = {
               <span class="flex min-w-0 flex-col">
                 <span class="font-semibold">Only these</span>
                 @if (choices().length === 0) {
-                  <span class="text-muted-foreground text-[0.8125rem]"
-                    >The gateway lists its models once it passes its test.</span
-                  >
+                  <span class="text-muted-foreground text-[0.8125rem]">{{
+                    provided()
+                      ? 'Its gateway team sets the models of each key.'
+                      : 'The gateway lists its models once it passes its test.'
+                  }}</span>
                 }
               </span>
             </label>
@@ -291,6 +367,8 @@ export class PrincipalBudgetDialog {
   readonly defaults = input.required<BudgetDefaults>();
   /** The models the gateway serves; empty while it has not passed its test. */
   readonly served = input<readonly string[]>([]);
+  /** The company's gateway team provides the keys (ADR-0094): a key to enter, no budget to set. */
+  readonly provided = input(false);
   readonly saved = output<ModelAccessView>();
 
   protected readonly form = signal<BudgetForm>({
@@ -301,6 +379,11 @@ export class PrincipalBudgetDialog {
   });
   protected readonly error = signal<string | null>(null);
   protected readonly busy = signal(false);
+  /** A provided key as typed; never shown back. */
+  protected readonly key = signal('');
+  protected readonly keyError = signal<string | null>(null);
+  /** Where the provided key stands: none yet, or who entered it, its end and when. */
+  protected readonly keyState = computed(() => providedKeyState(this.view()));
   private readonly submitted = signal(false);
 
   protected readonly ownWords = computed(() =>
@@ -358,6 +441,8 @@ export class PrincipalBudgetDialog {
           this.form.set(budgetForm(view));
           this.error.set(null);
           this.submitted.set(false);
+          this.key.set('');
+          this.keyError.set(null);
         });
       }
     });
@@ -374,6 +459,63 @@ export class PrincipalBudgetDialog {
         ? [...f.models.filter((m) => m !== name), name]
         : f.models.filter((m) => m !== name),
     }));
+  }
+
+  /** Enters the key the gateway team made: the server checks it with the gateway first. */
+  protected async saveKey(): Promise<void> {
+    const principal = this.principal();
+    const key = this.key().trim();
+    if (!principal || !key || this.busy()) return;
+    this.busy.set(true);
+    this.keyError.set(null);
+    try {
+      const updated = principal.company
+        ? await this.api.invoke(putCompanyModelKey, {
+            companyId: this.companyId(),
+            body: { key },
+          })
+        : await this.api.invoke(putPrincipalModelKey, {
+            companyId: this.companyId(),
+            principalId: principal.id,
+            body: { key },
+          });
+      this.key.set('');
+      this.saved.emit(updated);
+      this.notify.success(`Key of ${principal.name} saved`, 'The gateway accepted it.');
+    } catch (error) {
+      this.keyError.set(
+        hasProblemCode(error, 'MODEL_KEY_REFUSED')
+          ? 'The gateway refused this key. Check it with your gateway team.'
+          : problemMessage(error, ERRORS),
+      );
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /** Forgets the key here; it stays at the gateway, its team's to revoke. */
+  protected async removeKey(): Promise<void> {
+    const principal = this.principal();
+    if (!principal || this.busy()) return;
+    this.busy.set(true);
+    this.keyError.set(null);
+    try {
+      const updated = principal.company
+        ? await this.api.invoke(deleteCompanyModelKey, { companyId: this.companyId() })
+        : await this.api.invoke(deletePrincipalModelKey, {
+            companyId: this.companyId(),
+            principalId: principal.id,
+          });
+      this.saved.emit(updated);
+      this.notify.success(
+        `Key of ${principal.name} removed`,
+        'Ask your gateway team to revoke it at the gateway.',
+      );
+    } catch (error) {
+      this.keyError.set(problemMessage(error, ERRORS));
+    } finally {
+      this.busy.set(false);
+    }
   }
 
   protected async onSubmit(event: Event): Promise<void> {

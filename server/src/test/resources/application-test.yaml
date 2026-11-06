@@ -90,7 +90,7 @@ tinfirm:
   model:
     # The bundled LiteLLM of the tests is the fake of support/FakeLiteLlm, whose URL IntegrationTest registers. TEST
     # FIXTURE: the master key the fake expects.
-    litellm-master-key: sk-test-master-key-fixture
+    gateway-admin-key: sk-test-master-key-fixture
     # The tests reconcile on demand; the job itself does not run during a test run.
     reconcile-interval: PT1H
     reconcile-initial-delay: PT1H

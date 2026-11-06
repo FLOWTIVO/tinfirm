@@ -18,6 +18,7 @@ import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -31,7 +32,6 @@ import com.flowtivo.tinfirm.shared.net.BoundedBodies;
 import com.flowtivo.tinfirm.shared.net.GuardedHosts;
 import com.flowtivo.tinfirm.shared.tx.NoTransaction;
 
-import tools.jackson.core.JacksonException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.node.ArrayNode;
@@ -73,16 +73,14 @@ import tools.jackson.databind.node.ObjectNode;
  * </ul>
  * Errors come back as {@code {"error": {"message", "type", "code"}}} or {@code {"detail": ...}}; their message is
  * passed on, cut short, without what it echoes of a key ({@link #redact}). Keys are never logged. An answer is read
- * within a limit ({@link #MAX_ADMIN_ANSWER_BYTES}, {@link #MAX_CHAT_ANSWER_BYTES}; {@link BoundedBodies}) and within
- * the call's timeout, body included: a company's own gateway is an address an admin entered, and one that answers
- * more, or does not end its answer in time, fails the call as LiteLLM's errors do.
+ * within a limit ({@link #MAX_ADMIN_ANSWER_BYTES}, {@link GatewayAnswers#MAX_MODEL_ANSWER_BYTES};
+ * {@link BoundedBodies}) and within the call's timeout, body included: a company's own gateway is an address an admin
+ * entered, and one that answers more, or does not end its answer in time, fails the call as LiteLLM's errors do.
  */
 @Component
-class LiteLlm {
+class LiteLlm implements GatewayAdapter {
 
     private static final JsonMapper JSON = JsonMapper.builder().build();
-
-    private static final int MAX_REASON = 300;
 
     private static final int PAGE_SIZE = 100;
 
@@ -97,16 +95,11 @@ class LiteLlm {
      */
     static final int MAX_ADMIN_ANSWER_BYTES = 64 * 1024 * 1024;
 
-    /**
-     * The most bytes of a chat completion's answer the server reads ({@link #chat}): 1 MiB. The platform's requests ask
-     * for a few thousand tokens at most (a memory's compaction 4000, some 16 KiB of text), and LiteLLM's answer of that
-     * many, with its envelope and a reasoning model's thinking, stays under 100 KiB.
-     */
-    static final int MAX_CHAT_ANSWER_BYTES = 1024 * 1024;
+    /** LiteLLM's words, in either format, for a model it does not serve (a 400), in lower case. */
+    private static final String NOT_SERVED = "invalid model name passed in model=";
 
-    private static final Pattern KEY = Pattern.compile("sk-[^\\s,;\"'`)\\]}]*");
-
-    private static final Pattern HEX_64 = Pattern.compile("(?i)\\b[0-9a-f]{64}\\b");
+    /** Tinfirm's budget period ({@code model_settings_period_ck}). */
+    private static final Pattern PERIOD = Pattern.compile("[1-9][0-9]{0,3}(h|d|w|mo)");
 
     private final GatewayHttp http;
 
@@ -117,39 +110,18 @@ class LiteLlm {
         this.timeout = properties.adminTimeout();
     }
 
-    /** What a new key should be; {@code spend} what it starts with (null: nothing, a principal's first key). */
-    record KeySpec(String alias, String teamId, BigDecimal maxBudget, String budgetDuration, List<String> models,
-            Map<String, String> metadata, boolean blocked, @Nullable BigDecimal spend) {
+    @Override
+    public GatewayVendor vendor() {
+        return GatewayVendor.LITELLM;
     }
 
-    /** A key LiteLLM created; {@link #toString()} never shows it. */
-    record CreatedKey(String key, String keyId) {
-
-        @Override
-        public String toString() {
-            return "CreatedKey[keyId=" + keyId + ", key=***]";
-        }
-    }
-
-    /** A key as LiteLLM knows it. */
-    record KeyState(String keyId, @Nullable String alias, boolean blocked, double spend, @Nullable Double maxBudget,
-            @Nullable String budgetDuration, @Nullable Instant budgetResetAt, List<String> models) {
-    }
-
-    /** A change of a key; null fields stay as they are. */
-    record KeyUpdate(@Nullable BigDecimal maxBudget, @Nullable String budgetDuration, @Nullable List<String> models) {
-
-        boolean empty() {
-            return maxBudget == null && budgetDuration == null && models == null;
-        }
-    }
-
-    CreatedKey generate(Gateway gateway, KeySpec spec) {
+    @Override
+    public CreatedKey generate(Gateway gateway, KeySpec spec) {
         ObjectNode body = JSON.createObjectNode();
         body.put("key_alias", spec.alias());
         body.put("team_id", spec.teamId());
         body.put("max_budget", spec.maxBudget());
-        body.put("budget_duration", spec.budgetDuration());
+        body.put("budget_duration", duration(spec.period()));
         ArrayNode models = body.putArray("models");
         spec.models().forEach(models::add);
         ObjectNode metadata = body.putObject("metadata");
@@ -168,7 +140,8 @@ class LiteLlm {
         return new CreatedKey(key, keyId);
     }
 
-    void update(Gateway gateway, String keyId, KeyUpdate update) {
+    @Override
+    public void update(Gateway gateway, String keyId, KeyUpdate update) {
         if (update.empty()) {
             return;
         }
@@ -177,8 +150,8 @@ class LiteLlm {
         if (update.maxBudget() != null) {
             body.put("max_budget", update.maxBudget());
         }
-        if (update.budgetDuration() != null) {
-            body.put("budget_duration", update.budgetDuration());
+        if (update.period() != null) {
+            body.put("budget_duration", duration(update.period()));
         }
         if (update.models() != null) {
             ArrayNode models = body.putArray("models");
@@ -188,30 +161,35 @@ class LiteLlm {
     }
 
     /** Sets the key's spend in its current period. */
-    void setSpend(Gateway gateway, String keyId, BigDecimal spend) {
+    @Override
+    public void setSpend(Gateway gateway, String keyId, BigDecimal spend) {
         ObjectNode body = JSON.createObjectNode();
         body.put("key", keyId);
         body.put("spend", spend);
         call(gateway, "POST", "/key/update", body);
     }
 
-    void block(Gateway gateway, String keyId) {
+    @Override
+    public void block(Gateway gateway, String keyId) {
         call(gateway, "POST", "/key/block", JSON.createObjectNode().put("key", keyId));
     }
 
-    void unblock(Gateway gateway, String keyId) {
+    @Override
+    public void unblock(Gateway gateway, String keyId) {
         call(gateway, "POST", "/key/unblock", JSON.createObjectNode().put("key", keyId));
     }
 
     /** Deletes the key by its id; false when LiteLLM knows no such key. */
-    boolean delete(Gateway gateway, String keyId) {
+    @Override
+    public boolean delete(Gateway gateway, String keyId) {
         ObjectNode body = JSON.createObjectNode();
         body.putArray("keys").add(keyId);
         return deleteKeys(gateway, body);
     }
 
     /** Deletes the key of the alias; false when LiteLLM knows none. */
-    boolean deleteByAlias(Gateway gateway, String alias) {
+    @Override
+    public boolean deleteByAlias(Gateway gateway, String alias) {
         ObjectNode body = JSON.createObjectNode();
         body.putArray("key_aliases").add(alias);
         return deleteKeys(gateway, body);
@@ -231,7 +209,8 @@ class LiteLlm {
     }
 
     /** The key as LiteLLM knows it; empty when it knows no such key, or deleted it. */
-    Optional<KeyState> info(Gateway gateway, String keyId) {
+    @Override
+    public Optional<KeyState> info(Gateway gateway, String keyId) {
         JsonNode answer;
         try {
             answer = call(gateway, "GET", "/key/info?key=" + encode(keyId), null);
@@ -250,7 +229,8 @@ class LiteLlm {
     }
 
     /** Every key of the team, page by page. */
-    List<KeyState> teamKeys(Gateway gateway, String teamId) {
+    @Override
+    public List<KeyState> teamKeys(Gateway gateway, String teamId) {
         List<KeyState> keys = new ArrayList<>();
         for (int page = 1;; page++) {
             JsonNode answer = call(gateway, "GET", "/key/list?team_id=" + encode(teamId)
@@ -280,7 +260,8 @@ class LiteLlm {
      * (it was renamed, the team is from before Tinfirm named them, or another replica created it at the same moment
      * with the name it had planned with) is given the name.
      */
-    void ensureTeam(Gateway gateway, String teamId, UUID companyId, String companyName) {
+    @Override
+    public void ensureTeam(Gateway gateway, String teamId, UUID companyId, String companyName) {
         Optional<String> alias = teamAlias(gateway, teamId);
         if (alias.isEmpty()) {
             ObjectNode body = JSON.createObjectNode();
@@ -329,7 +310,8 @@ class LiteLlm {
     }
 
     /** The model names the gateway serves, sorted, without duplicates. */
-    List<String> models(Gateway gateway) {
+    @Override
+    public List<String> models(Gateway gateway) {
         JsonNode answer = call(gateway, "GET", "/v1/models", null);
         JsonNode data = answer.get("data");
         LinkedHashSet<String> names = new LinkedHashSet<>();
@@ -354,7 +336,8 @@ class LiteLlm {
      * or its JSON text) and {@code metadata.usage_object} (the cache's tokens). The dates are whole days, the end day
      * included, so the caller narrows by time and tag. Prompts are not read.
      */
-    List<SpendLogs.Entry> spendLogs(Gateway gateway, String keyId, LocalDate from, LocalDate to) {
+    @Override
+    public List<SpendLogs.Entry> spendLogs(Gateway gateway, String keyId, LocalDate from, LocalDate to) {
         JsonNode answer = call(gateway, "GET", "/spend/logs?api_key=" + encode(keyId) + "&start_date="
                 + from + "&end_date=" + to.plusDays(1) + "&summarize=false", null);
         JsonNode rows = answer.isArray() ? answer : answer.get("data");
@@ -393,7 +376,8 @@ class LiteLlm {
      * {@code cache_read_input_token_cost}, {@code cache_creation_input_token_cost}), by the model's name in the gateway,
      * its provider's name, and that name without the provider's prefix.
      */
-    Map<String, SpendLogs.Price> prices(Gateway gateway) {
+    @Override
+    public Map<String, SpendLogs.Price> prices(Gateway gateway) {
         JsonNode data = call(gateway, "GET", "/model/info", null).get("data");
         Map<String, SpendLogs.Price> prices = new java.util.HashMap<>();
         if (data == null || !data.isArray()) {
@@ -427,7 +411,7 @@ class LiteLlm {
     private static List<String> tags(@Nullable JsonNode node) {
         JsonNode list = node;
         if (node != null && node.isString()) {
-            list = parse(node.stringValue());
+            list = GatewayAnswers.parse(node.stringValue());
         }
         List<String> tags = new ArrayList<>();
         if (list != null && list.isArray()) {
@@ -456,42 +440,18 @@ class LiteLlm {
      * One chat completion with a key (OpenAI's format, which LiteLLM serves for every model), for the server's own
      * requests on the company's own key ({@link PlatformModelService}, ADR-0065): never a run's. The key
      * goes only in the request's header; the answer's errors are redacted as the admin API's are; an answer larger than
-     * {@link #MAX_CHAT_ANSWER_BYTES} fails as they do.
+     * {@link GatewayAnswers#MAX_MODEL_ANSWER_BYTES}, or one whose body has not ended within {@code chatTimeout}, fails
+     * as they do.
      */
-    JsonNode chat(Gateway gateway, String key, String tags, JsonNode body, Duration chatTimeout) {
-        NoTransaction.require("A model request to LiteLLM");
-        HttpRequest request = HttpRequest.newBuilder(URI.create(gateway.modelUrl() + "/v1/chat/completions"))
-            .timeout(chatTimeout)
-            .header("Authorization", "Bearer " + key)
-            .header("Accept", "application/json")
-            .header("User-Agent", "Tinfirm")
-            .header("x-litellm-tags", tags)
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body)))
-            .build();
-        HttpResponse<@Nullable String> response;
-        try (GuardedHosts.Registration guard = http.guard(gateway)) {
-            response = http.client().send(request, BoundedBodies.ofString(MAX_CHAT_ANSWER_BYTES, chatTimeout));
-        }
-        catch (HttpTimeoutException ex) {
-            throw LiteLlmException.unreachable("LiteLLM did not answer in time");
-        }
-        catch (IOException ex) {
-            throw LiteLlmException.unreachable("LiteLLM cannot be reached");
-        }
-        catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            throw LiteLlmException.unreachable("Interrupted while calling LiteLLM");
-        }
-        JsonNode answer = parse(within(response, MAX_CHAT_ANSWER_BYTES));
-        if (response.statusCode() < 200 || response.statusCode() > 299) {
-            throw new LiteLlmException(response.statusCode(), redact("LiteLLM answered " + response.statusCode() + ": "
-                    + reason(answer)));
-        }
-        if (answer == null) {
-            throw new LiteLlmException(response.statusCode(), "LiteLLM's answer is not JSON");
-        }
-        return answer;
+    @Override
+    public JsonNode chat(Gateway gateway, String key, String tags, JsonNode body, Duration chatTimeout) {
+        return GatewayAnswers.chat(http, gateway, key, tagHeaders(gateway, tags), body, chatTimeout, "LiteLLM");
+    }
+
+    /** LiteLLM's tags of a request, for its spend logs: {@code x-litellm-tags}. */
+    @Override
+    public Map<String, String> tagHeaders(Gateway gateway, String tags) {
+        return Map.of("x-litellm-tags", tags);
     }
 
     private JsonNode call(Gateway gateway, String method, String pathAndQuery, @Nullable JsonNode body) {
@@ -522,10 +482,10 @@ class LiteLlm {
             Thread.currentThread().interrupt();
             throw LiteLlmException.unreachable("Interrupted while calling LiteLLM");
         }
-        JsonNode answer = parse(within(response, MAX_ADMIN_ANSWER_BYTES));
+        JsonNode answer = GatewayAnswers.parse(GatewayAnswers.within(response, MAX_ADMIN_ANSWER_BYTES, "LiteLLM"));
         if (response.statusCode() < 200 || response.statusCode() > 299) {
             throw new LiteLlmException(response.statusCode(), "LiteLLM answered " + response.statusCode() + ": "
-                    + reason(answer));
+                    + GatewayAnswers.reason(answer));
         }
         if (answer == null) {
             throw new LiteLlmException(response.statusCode(), "LiteLLM's answer is not JSON");
@@ -534,54 +494,36 @@ class LiteLlm {
     }
 
     /**
-     * The answer's body, read within its limit ({@link BoundedBodies}); a larger one fails the call as an error of
-     * LiteLLM's, with its status.
+     * LiteLLM's refusals of a model request: a spent budget is 429 with the type {@code budget_exceeded} (the bundled
+     * configuration's {@code budget_exceeded_status_code}); a 401 or 403 of another type refuses the key, but a model
+     * the key may not use ({@code *_model_access_denied}); a 400 that names an invalid model is one LiteLLM does not
+     * serve.
      */
-    private static String within(HttpResponse<@Nullable String> response, int maxBytes) {
-        String body = response.body();
-        if (body == null) {
-            throw new LiteLlmException(response.statusCode(), "LiteLLM's answer (" + response.statusCode()
-                    + ") is larger than the " + maxBytes / (1024 * 1024) + " MiB Tinfirm reads");
+    @Override
+    public Refused classify(Gateway gateway, int status, String body) {
+        String type = errorType(body);
+        if (status == 429 && "budget_exceeded".equals(type)) {
+            return Refused.BUDGET_SPENT;
         }
-        return body;
+        if ((status == 401 || status == 403) && !"budget_exceeded".equals(type)
+                && (type == null || !type.endsWith("_model_access_denied"))) {
+            return Refused.KEY_REFUSED;
+        }
+        if (status == 400 && body.toLowerCase(Locale.ROOT).contains(NOT_SERVED)) {
+            return Refused.MODEL_NOT_SERVED;
+        }
+        return Refused.OTHER;
     }
 
-    private static @Nullable JsonNode parse(@Nullable String body) {
-        if (body == null || body.isBlank()) {
-            return JSON.createObjectNode();
-        }
-        try {
-            return JSON.readTree(body);
-        }
-        catch (JacksonException ex) {
-            return null;
-        }
+    private static @Nullable String errorType(String body) {
+        JsonNode answer = GatewayAnswers.parse(body);
+        JsonNode type = answer != null ? answer.path("error").path("type") : null;
+        return type != null && type.isString() ? type.stringValue() : null;
     }
 
-    /** LiteLLM's reason for an error: {@code error.message}, {@code detail.error} or {@code detail}, cut short. */
-    private static String reason(@Nullable JsonNode answer) {
-        if (answer == null) {
-            return "no reason given";
-        }
-        JsonNode error = answer.get("error");
-        String reason = null;
-        if (error != null && error.isObject()) {
-            reason = text(error, "message");
-        }
-        else if (error != null && error.isString()) {
-            reason = error.stringValue();
-        }
-        JsonNode detail = answer.get("detail");
-        if (reason == null && detail != null) {
-            reason = detail.isString() ? detail.stringValue()
-                    : detail.isObject() && text(detail, "error") != null ? text(detail, "error")
-                            : detail.isObject() && text(detail, "message") != null ? text(detail, "message") : null;
-        }
-        if (reason == null) {
-            return "no reason given";
-        }
-        String oneLine = redact(reason).replaceAll("\\s+", " ").strip();
-        return oneLine.length() <= MAX_REASON ? oneLine : oneLine.substring(0, MAX_REASON - 1) + "…";
+    @Override
+    public String redact(Gateway gateway, String text) {
+        return redact(text);
     }
 
     /**
@@ -590,7 +532,7 @@ class LiteLlm {
      * {@code auth_utils.abbreviate_api_key}).
      */
     static String redact(String reason) {
-        return HEX_64.matcher(KEY.matcher(reason).replaceAll("sk-***")).replaceAll("***");
+        return GatewayAnswers.redact(reason);
     }
 
     private static KeyState state(String keyId, JsonNode info) {
@@ -609,8 +551,21 @@ class LiteLlm {
         return new KeyState(keyId, text(info, "key_alias"),
                 blocked != null && blocked.isBoolean() && blocked.booleanValue(),
                 spend != null && spend.isNumber() ? spend.asDouble() : 0.0,
-                maxBudget != null && maxBudget.isNumber() ? maxBudget.asDouble() : null, text(info, "budget_duration"),
-                instant(text(info, "budget_reset_at")), List.copyOf(models));
+                maxBudget != null && maxBudget.isNumber() ? maxBudget.asDouble() : null,
+                period(text(info, "budget_duration")), instant(text(info, "budget_reset_at")), List.copyOf(models));
+    }
+
+    /**
+     * LiteLLM's {@code budget_duration} of Tinfirm's budget period: the same words, since Tinfirm's periods were
+     * LiteLLM's before ADR-0094 (a number and {@code h}, {@code d}, {@code w} or {@code mo}).
+     */
+    static String duration(String period) {
+        return period;
+    }
+
+    /** Tinfirm's budget period of LiteLLM's {@code budget_duration}; null for none or one in other units. */
+    static @Nullable String period(@Nullable String duration) {
+        return duration != null && PERIOD.matcher(duration).matches() ? duration : null;
     }
 
     private static @Nullable Instant instant(@Nullable String value) {

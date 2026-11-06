@@ -100,8 +100,18 @@ class ModelAccessService {
         AuthenticatedUser user = CurrentActor.requireUser();
         PrincipalInfo principal = principals.ofMember(companyId, user.id())
             .orElseThrow(() -> ApiException.notFound("You have no model access in this company"));
-        return view(KeyHolder.principal(companyId, principal.id()))
+        ModelAccessView view = view(KeyHolder.principal(companyId, principal.id()))
             .subscriptions(subscriptions(companyId, principal.id()));
+        // A member enters or removes their own key where the company lets them, unless an admin entered it (ADR-0094).
+        boolean memberKeys = settingsStore.find(companyId)
+            .filter(row -> row.gateway() == ModelSettingsStore.GatewayKind.PROVIDED)
+            .map(ModelSettingsStore.SettingsRow::memberKeys)
+            .orElse(false);
+        boolean adminEntered = keys.find(KeyHolder.principal(companyId, principal.id()))
+            .map(ModelKeyStore.KeyRow::provided)
+            .map(provided -> !provided.bySelf())
+            .orElse(false);
+        return view.canEnterOwnKey(memberKeys && !adminEntered);
     }
 
     /** A principal's model access (OWNER and ADMIN); 404 for an unknown principal or one that left. */
@@ -211,13 +221,22 @@ class ModelAccessService {
             .budgetPeriod(settings.map(ModelSettingsStore.SettingsRow::budgetPeriod).orElse(DEFAULT_PERIOD))
             .models(new ArrayList<>(models != null ? models : defaultModels))
             .modelsOverridden(models != null)
-            .subscriptions(new ArrayList<>());
+            .subscriptions(new ArrayList<>())
+            .keyProvided(false)
+            .keyProvidedBySelf(false)
+            .canEnterOwnKey(false);
         row.ifPresent(key -> view.keyStatus(ModelKeyStatus.fromValue(key.status().name()))
             .spentUsd(key.spentUsd())
             .budgetResetsAt(ts(key.budgetResetsAt()))
             .lastError(key.lastError())
             .syncedAt(ts(key.syncedAt())));
         row.ifPresent(key -> rotation(view, key));
+        row.map(ModelKeyStore.KeyRow::provided).ifPresent(provided -> view.keyProvided(true)
+            .keyHint(provided.hint())
+            .keyProvidedAt(ts(provided.at()))
+            .keyProvidedBySelf(provided.bySelf())
+            // Its gateway team rotates a key they made.
+            .nextKeyRotationAt(null));
         return view;
     }
 

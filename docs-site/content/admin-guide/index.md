@@ -26,7 +26,7 @@ On the **Work** pages, Owners and Admins also see and edit every agent, skill an
 
 A new company can do nothing until it has a way to pay for models, a machine to run on, and systems to work with. In order:
 
-1. **Model access**: under **Which LiteLLM**, check the gateway the company uses, and under **Default budget**, set the budget and models of every member and service account without their own. [Model access and budgets](model-access.md)
+1. **Model access**: under **Which model gateway**, check the gateway the company uses, and under **Default budget**, set the budget and models of every member and service account without their own. [Model access and budgets](model-access.md)
 2. **Runner hosts**: register at least one company runner host. Without one, no turn paid by a budget runs. [Company runner hosts](runner-hosts.md)
 3. **Systems**: register the systems agents should work with, add the company's credentials, and lend them to groups or service accounts. [Register systems and lend their credentials](systems.md)
 4. **Members**: add people by the email of their Tinfirm user, give each a role, and put them in groups. [Members and groups](members.md)

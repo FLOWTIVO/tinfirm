@@ -148,10 +148,14 @@ class ModelKeyRotationService {
     }
 
     private void requireTested(UUID companyId) {
-        settingsStore.find(companyId)
+        ModelSettingsStore.SettingsRow settings = settingsStore.find(companyId)
             .filter(ModelSettingsStore.SettingsRow::relayEnabled)
             .orElseThrow(() -> ApiException.conflict(ProblemCode.GATEWAY_NOT_CONFIGURED,
                     "The company's model gateway is not configured, or has not passed its test"));
+        if (settings.gateway() == ModelSettingsStore.GatewayKind.PROVIDED) {
+            throw ApiException.conflict(ProblemCode.MODEL_KEYS_MANAGED,
+                    "The company's gateway team makes and rotates its keys: enter a new key instead");
+        }
     }
 
     private void audit(KeyHolder holder, String scope) {

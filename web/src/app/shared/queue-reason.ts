@@ -125,6 +125,7 @@ function fixFor(
       };
     case 'BUDGET_SPENT':
     case 'KEY_ERROR':
+    case 'NO_MODEL_KEY':
     case 'MODEL_ACCESS_UNAVAILABLE':
       return reader.member
         ? { label: 'Your budget', commands: ['accounts'], queryParams: { tab: 'budget' } }

@@ -65,6 +65,9 @@ class Gateways {
         if (settings.gateway() == ModelSettingsStore.GatewayKind.BUNDLED) {
             return bundled();
         }
+        if (settings.gateway() == ModelSettingsStore.GatewayKind.PROVIDED) {
+            return Optional.of(Gateway.provided(Objects.requireNonNull(settings.modelUrl()), settings.vendor()));
+        }
         UUID secretId = settings.adminKeySecretId();
         String url = settings.adminUrl();
         if (secretId == null || url == null) {
@@ -77,7 +80,7 @@ class Gateways {
             return Optional.of(cached.gateway());
         }
         try (RevealedSecret key = vault.reveal(settings.companyId(), secretId, PURPOSE)) {
-            Gateway gateway = new Gateway(url, key.asString(), false);
+            Gateway gateway = new Gateway(url, key.asString(), false, url, settings.vendor());
             external.put(settings.companyId(), new Cached(settings.updatedAt(), secretId, gateway, now.plus(KEEP)));
             return Optional.of(gateway);
         }
@@ -88,9 +91,9 @@ class Gateways {
         if (!properties.bundled()) {
             return Optional.empty();
         }
-        return Optional.of(new Gateway(Objects.requireNonNull(properties.litellmAdminUrl()).trim(),
-                Objects.requireNonNull(properties.litellmMasterKey()).trim(), true,
-                Objects.requireNonNull(properties.bundledModelUrl()).trim()));
+        return Optional.of(new Gateway(Objects.requireNonNull(properties.gatewayAdminUrl()).trim(),
+                Objects.requireNonNull(properties.gatewayAdminKey()).trim(), true,
+                Objects.requireNonNull(properties.bundledModelUrl()).trim(), properties.gatewayVendor()));
     }
 
     /** Forgets what this process knows of the company's gateway (its settings changed, or it refused the key). */

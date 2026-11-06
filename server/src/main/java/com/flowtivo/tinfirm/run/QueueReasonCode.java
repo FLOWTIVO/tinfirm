@@ -8,7 +8,8 @@ package com.flowtivo.tinfirm.run;
  * <li>the agent: {@code AGENT_PAUSED} (I18, until it is resumed);</li>
  * <li>the conversation: {@code ACCOUNT_REQUIRED} (a workspace binding waits for its person or an admin);</li>
  * <li>the payer's model access (package 2): {@code BUDGET_SPENT} (until {@code retryAt}, the budget's reset),
- * {@code KEY_ERROR} (LiteLLM refused the key or is unreachable, or the key is being made),
+ * {@code KEY_ERROR} (LiteLLM refused the key or is unreachable, or the key is being made), {@code NO_MODEL_KEY}
+ * (ADR-0094: the company's gateway team provides the keys, and the payer has none yet),
  * {@code HOST_OFFLINE} (a subscription's personal host is not connected), {@code MODEL_ACCESS_UNAVAILABLE} (no
  * gateway, an inactive payer, a subscription gone: package 2's refusals);</li>
  * <li>the hosts: {@code NO_HOST_FOR_CREDENTIALS} (the company has hosts for the runtime, but none may carry the run's
@@ -27,7 +28,8 @@ package com.flowtivo.tinfirm.run;
  * {@code limit}; the dispatcher does not look at it before.
  */
 public enum QueueReasonCode {
-    COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE,
+    COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE,
+    MODEL_ACCESS_UNAVAILABLE,
     NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL,
     PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, RETRY_SCHEDULED,
     OTHER

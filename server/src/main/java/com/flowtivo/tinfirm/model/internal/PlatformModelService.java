@@ -45,7 +45,7 @@ class PlatformModelService implements PlatformModel {
 
     private final Gateways gateways;
 
-    private final LiteLlm liteLlm;
+    private final GatewayAdapter adapter;
 
     private final VaultService vault;
 
@@ -53,12 +53,12 @@ class PlatformModelService implements PlatformModel {
 
     private final SystemTransactions transactions;
 
-    PlatformModelService(ModelSettingsStore settings, ModelKeyStore keys, Gateways gateways, LiteLlm liteLlm,
+    PlatformModelService(ModelSettingsStore settings, ModelKeyStore keys, Gateways gateways, GatewayAdapter adapter,
             VaultService vault, KeyWork work, SystemTransactions transactions) {
         this.settings = settings;
         this.keys = keys;
         this.gateways = gateways;
-        this.liteLlm = liteLlm;
+        this.adapter = adapter;
         this.vault = vault;
         this.work = work;
         this.transactions = transactions;
@@ -101,7 +101,7 @@ class PlatformModelService implements PlatformModel {
             .add(JSON.createObjectNode().put("role", "user").put("content", user));
         JsonNode answer;
         try (RevealedSecret key = vault.reveal(companyId, plan.secretId(), "platform:" + purpose)) {
-            answer = liteLlm.chat(plan.gateway(), key.asString(), "tinfirm-task:" + purpose, body, REQUEST_TIMEOUT);
+            answer = adapter.chat(plan.gateway(), key.asString(), "tinfirm-task:" + purpose, body, REQUEST_TIMEOUT);
         }
         catch (LiteLlmException ex) {
             return new Completion.Unavailable("FAILED", ex.getMessage());

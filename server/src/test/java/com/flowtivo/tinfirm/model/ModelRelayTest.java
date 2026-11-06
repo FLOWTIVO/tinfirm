@@ -755,19 +755,98 @@ class ModelRelayTest extends IntegrationTest {
         assertThat(post(MESSAGES, token, message("claude-sonnet-4-5")).statusCode()).isEqualTo(200);
     }
 
+    /**
+     * A key the company's gateway team provided (ADR-0094) pays through the relay as one Tinfirm made: the request goes
+     * to the gateway's model URL with that key and the tags in the vendor's header, the gateway's spent budget is the
+     * relay's own refusal, and the key waits; a GENERIC gateway's 402 is the same refusal, its tags in
+     * {@code x-tinfirm-tags}, its bodies without LiteLLM's {@code drop_params}.
+     */
+    @Test
+    void aProvidedKeyPaysThroughTheRelayAndItsSpentBudgetIsTheRelaysRefusal() {
+        TestCompany company = companyWithRoles();
+        ApiClient owner = loginAs(company.email("OWNER"));
+        try (FakeLiteLlm gateway = FakeLiteLlm.start("sk-provided-gateway-master-not-tinfirms")) {
+            assertThat(owner.put(company.path("/model-settings"), Map.of("gateway", "PROVIDED", "defaultBudgetUsd", 0,
+                    "modelUrl", gateway.url(), "vendor", "LITELLM")).status()).isEqualTo(200);
+            assertThat(owner.post(company.path("/model-settings/test"), null).status()).isEqualTo(200);
+            UUID payer = createServiceIdentity(owner, company, unique("bot"));
+            FakeLiteLlm.Key key = gateway.addKey("bot", "gateway-team");
+            key.maxBudget = 10;
+            assertThat(owner.put(company.path("/principals/" + payer + "/model-access/key"), Map.of("key", key.key))
+                .status()).isEqualTo(200);
+            RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("host"), "COMPANY");
+            Setup setup = new Setup(company, owner, payer, key, host.id(), host.token());
+            UUID runId = UUID.randomUUID();
+            String token = running(setup, runId);
+
+            HttpResponse<String> answered = post(MESSAGES, token, message("claude-sonnet-4-5"));
+            assertThat(answered.statusCode()).as("%s", answered.body()).isEqualTo(200);
+            FakeLiteLlm.Request forwarded = gateway.requests("/v1/messages").getLast();
+            assertThat(forwarded.header("authorization")).isEqualTo("Bearer " + key.key);
+            assertThat(forwarded.header("x-litellm-tags")).startsWith("run:" + runId);
+            assertThat(forwarded.json().get("drop_params").asBoolean()).isTrue();
+
+            key.spend = 10;
+            HttpResponse<String> spent = post(MESSAGES, token, message("claude-sonnet-4-5"));
+            assertThat(spent.statusCode()).isEqualTo(429);
+            assertThat(json(spent).get("error").get("message").asString())
+                .startsWith("Budget has been exceeded: the model budget that pays for this run is spent");
+            ModelGateways.awaitStatus(owner, company, payer, "BUDGET_SPENT");
+            assertThat(forRun(company, payer)).isInstanceOfSatisfying(RunModelAccess.Wait.class,
+                    wait -> assertThat(wait.reason()).isEqualTo(RunModelAccess.WaitReason.BUDGET_SPENT));
+
+            // A gateway of no vendor Tinfirm knows: its 402 is a spent budget, its tags Tinfirm's own header.
+            assertThat(owner.put(company.path("/model-settings"), Map.of("gateway", "PROVIDED", "defaultBudgetUsd", 0,
+                    "vendor", "GENERIC")).status()).isEqualTo(200);
+            key.spend = 0;
+            assertThat(owner.put(company.path("/principals/" + payer + "/model-access/key"), Map.of("key", key.key))
+                .json().get("keyStatus").asString()).isEqualTo("OK");
+            gateway.onModel((exchange, request, held) -> FakeLiteLlm.json(exchange, 402, JSON.readTree(
+                    "{\"type\":\"budget_exceeded\",\"error\":{\"message\":\"Budget exceeded\"}}")));
+            String again = running(setup, UUID.randomUUID());
+            HttpResponse<String> generic = post(MESSAGES, again, message("claude-sonnet-4-5"));
+            assertThat(generic.statusCode()).isEqualTo(429);
+            assertThat(json(generic).get("error").get("type").asString()).isEqualTo("budget_exceeded");
+            FakeLiteLlm.Request toGeneric = gateway.requests("/v1/messages").getLast();
+            assertThat(toGeneric.header("x-tinfirm-tags")).startsWith("run:");
+            // LiteLLM's own control is not sent to a gateway that may pass the body on to the provider as it came.
+            assertThat(toGeneric.json().has("drop_params")).isFalse();
+            assertThat(gateway.requests("/key/")).isEmpty();
+        }
+    }
+
     @Test
     void aSpentBudgetOrARefusedKeyChangesTheKeysStatusAndNoKeyGoesBack() {
         Setup setup = setUp();
-        String token = running(setup, UUID.randomUUID());
+        UUID runId = UUID.randomUUID();
+        String token = running(setup, runId);
         String body = message("claude-sonnet-4-5");
 
-        // LiteLLM refuses the spent budget: the key is BUDGET_SPENT, once audited.
+        // LiteLLM refuses the spent budget: the key is BUDGET_SPENT, once audited, and the relay answers with its own
+        // refusal (ADR-0094), in the request's format, which the runner host recognises whatever the gateway.
         setup.key().spend = setup.key().maxBudget;
         HttpResponse<String> spent = post(MESSAGES, token, body);
         assertThat(spent.statusCode()).isEqualTo(429);
+        assertThat(json(spent).get("type").asString()).isEqualTo("error");
         assertThat(json(spent).get("error").get("type").asString()).isEqualTo("budget_exceeded");
+        assertThat(json(spent).get("error").get("message").asString())
+            .startsWith("Budget has been exceeded: the model budget that pays for this run is spent")
+            .doesNotContain("Current cost");
         ModelGateways.awaitStatus(setup.owner(), setup.company(), setup.payer(), "BUDGET_SPENT");
-        assertThat(post(MESSAGES, token, body).statusCode()).isEqualTo(429);
+        HttpResponse<String> again = post(MESSAGES, token, body);
+        assertThat(again.statusCode()).isEqualTo(429);
+        assertThat(json(again).get("error").get("message").asString()).contains("; it resets at ");
+        String openAi = open(setup, run(setup, runId, 1, setup.hostId()), RunnerMessages.ModelAccessFormat.OPENAI)
+            .apiKey();
+        HttpResponse<String> spentOpenAi = post(RESPONSES, openAi,
+                "{\"model\":\"claude-sonnet-4-5\",\"input\":\"Hi\"}");
+        assertThat(spentOpenAi.statusCode()).isEqualTo(429);
+        assertThat(json(spentOpenAi).get("error").get("type").asString()).isEqualTo("budget_exceeded");
+        assertThat(json(spentOpenAi).get("error").get("code").asString()).isEqualTo("429");
+        assertThat(json(spentOpenAi).get("error").get("message").asString())
+            .startsWith("Budget has been exceeded: the model budget that pays for this run is spent");
+        // Opening the run's relay again replaced its token.
+        token = open(setup, run(setup, runId, 1, setup.hostId()), RunnerMessages.ModelAccessFormat.ANTHROPIC).apiKey();
         assertThat(auditEvents(setup.owner(), setup.company(), "model_key.budget_spent")).hasSize(1);
         setup.key().spend = 0;
         assertThat(post(MESSAGES, token, body).statusCode()).isEqualTo(200);
@@ -891,8 +970,9 @@ class ModelRelayTest extends IntegrationTest {
         String firstKey = "sk-test-first-admin-" + UUID.randomUUID();
         String secondKey = "sk-test-second-admin-" + UUID.randomUUID();
         String pasted = "sk-test-pasted-admin-" + UUID.randomUUID();
-        // A secret made by hand under the name is an ordinary one: the settings keep their own, LITELLM_ADMIN_KEY_2.
-        UUID handMade = createSecret(admin, company.id(), "LITELLM_ADMIN_KEY", "test-hand-made-value");
+        // A secret made by hand under the name is an ordinary one: the settings keep their own,
+        // MODEL_GATEWAY_ADMIN_KEY_2.
+        UUID handMade = createSecret(admin, company.id(), "MODEL_GATEWAY_ADMIN_KEY", "test-hand-made-value");
         try (FakeLiteLlm own = FakeLiteLlm.start(firstKey)) {
             ApiResponse configured = admin.put(company.path("/model-settings"), Map.of("gateway", "EXTERNAL",
                     "defaultBudgetUsd", 25, "adminUrl", own.url(), "adminKey", firstKey));
@@ -911,11 +991,11 @@ class ModelRelayTest extends IntegrationTest {
             assertThat(forRun(company, payer)).isInstanceOf(RunModelAccess.Budget.class);
 
             // The Secrets API neither replaces nor deletes the key the settings keep, and points to them.
-            UUID kept = secretId(admin, company, "LITELLM_ADMIN_KEY_2");
+            UUID kept = secretId(admin, company, "MODEL_GATEWAY_ADMIN_KEY_2");
             ApiResponse replaced = admin.put(company.path("/secrets/" + kept), Map.of("value", pasted));
             assertThat(replaced.status()).as("%s", replaced).isEqualTo(409);
             assertThat(replaced.problemCode()).isEqualTo("SECRET_MANAGED");
-            assertThat(replaced.json().get("detail").asString()).contains("`LITELLM_ADMIN_KEY_2`")
+            assertThat(replaced.json().get("detail").asString()).contains("`MODEL_GATEWAY_ADMIN_KEY_2`")
                 .contains("model settings");
             assertThat(replaced.body()).doesNotContain(pasted);
             ApiResponse deleted = admin.delete(company.path("/secrets/" + kept));
@@ -925,7 +1005,7 @@ class ModelRelayTest extends IntegrationTest {
             // Nothing changed: the same key, the relay on, and no secret.updated but the hand-made one's.
             assertThat(admin.put(company.path("/secrets/" + handMade), Map.of("value", "test-hand-made-rotated"))
                 .status()).isEqualTo(200);
-            assertThat(secretVersion(admin, company, "LITELLM_ADMIN_KEY_2")).isEqualTo(1);
+            assertThat(secretVersion(admin, company, "MODEL_GATEWAY_ADMIN_KEY_2")).isEqualTo(1);
             assertThat(admin.get(company.path("/model-settings")).json().get("relayEnabled").asBoolean()).isTrue();
             assertThat(post(MESSAGES, token, body).statusCode()).isEqualTo(200);
             assertThat(auditEvents(owner, company, "secret.updated"))
@@ -946,7 +1026,7 @@ class ModelRelayTest extends IntegrationTest {
             assertThat(untested.get("relayEnabled").asBoolean()).isFalse();
             assertThat(untested.has("testedAt")).as("%s", untested).isTrue();
             assertThat(untested.has("lastError")).as("%s", untested).isFalse();
-            assertThat(secretVersion(admin, company, "LITELLM_ADMIN_KEY_2")).isEqualTo(2);
+            assertThat(secretVersion(admin, company, "MODEL_GATEWAY_ADMIN_KEY_2")).isEqualTo(2);
             // Runs paid by a budget are refused, the relay serves none, and members list no models.
             assertThat(forRun(company, payer)).isInstanceOfSatisfying(RunModelAccess.Refuse.class, refuse -> assertThat(
                     refuse.reason()).isEqualTo(RunModelAccess.RefuseReason.GATEWAY_NOT_CONFIGURED));
@@ -992,7 +1072,7 @@ class ModelRelayTest extends IntegrationTest {
             assertThat(rekey.get("details").get("relayEnabled").asBoolean()).isFalse();
             JsonNode updated = auditEvents(owner, company, "secret.updated").getFirst();
             assertThat(updated.get("targetId").asString()).isEqualTo(kept.toString());
-            assertThat(updated.get("details").get("name").asString()).isEqualTo("LITELLM_ADMIN_KEY_2");
+            assertThat(updated.get("details").get("name").asString()).isEqualTo("MODEL_GATEWAY_ADMIN_KEY_2");
             assertThat(updated.get("details").get("version").asInt()).isEqualTo(2);
             auditEvents(owner, company).forEach(event -> assertThat(event.toString()).doesNotContain(firstKey)
                 .doesNotContain(secondKey)

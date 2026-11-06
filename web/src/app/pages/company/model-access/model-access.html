@@ -71,7 +71,7 @@
         @if (form(); as f) {
           @let st = status()!;
           <form id="model-settings-form" class="contents" novalidate (submit)="save($event)">
-            <!-- Gateway: where it stands, then which LiteLLM -->
+            <!-- Gateway: where it stands, then which gateway -->
             <div
               class="flex flex-col gap-5"
               data-panel="gateway"
@@ -271,10 +271,10 @@
                 data-testid="gateway"
               >
                 <div class="px-4 pt-4 pb-3.5 sm:px-5">
-                  <h2 id="gateway-title" class="text-base font-bold">Which LiteLLM</h2>
+                  <h2 id="gateway-title" class="text-base font-bold">Which model gateway</h2>
                   <p class="text-muted-foreground mt-0.5 text-sm text-pretty">
-                    Agents reach the models through LiteLLM, which holds a key and a budget for
-                    every member and service account.
+                    Agents reach the models through the model gateway, which holds a key and a
+                    budget for every member and service account.
                   </p>
                 </div>
                 <app-setting-row rowId="gateway" label="Gateway">
@@ -306,7 +306,7 @@
                     label="Admin URL"
                     for="gateway-admin-url"
                   >
-                    <span help>Where Tinfirm reaches LiteLLM’s admin API.</span>
+                    <span help>Where Tinfirm reaches the gateway’s admin API.</span>
                     <input
                       hlmInput
                       id="gateway-admin-url"
@@ -376,6 +376,87 @@
                         }}
                       </p>
                     }
+                  </app-setting-row>
+                }
+
+                @if (f.gateway === 'PROVIDED') {
+                  <app-setting-row
+                    rowId="gateway-model-url"
+                    label="Model URL"
+                    for="gateway-model-url"
+                  >
+                    <span help
+                      >Where the relay sends the model requests, each with the key of whoever
+                      pays.</span
+                    >
+                    <input
+                      hlmInput
+                      id="gateway-model-url"
+                      type="url"
+                      class="w-full font-mono sm:max-w-md"
+                      spellcheck="false"
+                      autocomplete="off"
+                      placeholder="https://ai-gateway.example.com"
+                      [value]="f.modelUrl"
+                      [attr.aria-invalid]="errors().modelUrl ? 'true' : null"
+                      aria-describedby="gateway-model-url-help gateway-model-url-error"
+                      (input)="patch({ modelUrl: $any($event.target).value })"
+                    />
+                    @if (errors().modelUrl; as message) {
+                      <p
+                        id="gateway-model-url-error"
+                        class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                        role="alert"
+                      >
+                        <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{
+                          message
+                        }}
+                      </p>
+                    }
+                  </app-setting-row>
+                  <app-setting-row rowId="gateway-vendor" label="Gateway product">
+                    <span help
+                      >Tinfirm reads a spent budget in the gateway’s own words: LiteLLM’s, or a 402
+                      or a 429 that speaks of a budget.</span
+                    >
+                    <div class="flex w-full flex-wrap items-center gap-2.5 sm:w-auto">
+                      <app-segmented
+                        inputId="gateway-vendor"
+                        labelledBy="gateway-vendor-label"
+                        [options]="vendorOptions"
+                        [value]="f.vendor"
+                        (valueChange)="setVendor($event)"
+                      />
+                      @if (was().vendor; as w) {
+                        <span class="text-muted-foreground text-xs" data-testid="was"
+                          >was {{ w }}</span
+                        >
+                      }
+                    </div>
+                  </app-setting-row>
+                  <app-setting-row
+                    rowId="gateway-member-keys"
+                    label="Members’ own keys"
+                    kind="switch"
+                  >
+                    <span help
+                      >Members may enter the key the gateway team gave them, on their own budget
+                      page. Admins always may.</span
+                    >
+                    <div class="flex items-center gap-2.5">
+                      <hlm-switch
+                        inputId="gateway-member-keys-switch"
+                        aria-label="Members’ own keys"
+                        aria-describedby="gateway-member-keys-help"
+                        [checked]="f.memberKeys"
+                        (checkedChange)="patch({ memberKeys: $event })"
+                      />
+                      @if (was().memberKeys; as w) {
+                        <span class="text-muted-foreground text-xs" data-testid="was"
+                          >was {{ w }}</span
+                        >
+                      }
+                    </div>
                   </app-setting-row>
                 }
 
@@ -799,6 +880,7 @@
     [view]="budgetView()"
     [defaults]="defaults()"
     [served]="servedModels()"
+    [provided]="loaded()?.gateway === 'PROVIDED'"
     (saved)="onBudgetSaved($event)"
   />
 }

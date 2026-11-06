@@ -161,11 +161,11 @@ class ModelSettingsIntegrationTest extends IntegrationTest {
             ModelGateways.awaitStatus(owner, company, member, "OK");
             // The admin key is a company secret that the audit and the settings never show.
             ApiResponse secrets = owner.get(company.path("/secrets"));
-            assertThat(secrets.body()).contains("LITELLM_ADMIN_KEY").doesNotContain(externalKey);
+            assertThat(secrets.body()).contains("MODEL_GATEWAY_ADMIN_KEY").doesNotContain(externalKey);
             // The Secrets API does not delete it while the settings keep it.
             String adminKeyId = null;
             for (JsonNode secret : secrets.json().get("items")) {
-                if (secret.get("name").asString().equals("LITELLM_ADMIN_KEY")) {
+                if (secret.get("name").asString().equals("MODEL_GATEWAY_ADMIN_KEY")) {
                     adminKeyId = secret.get("id").asString();
                 }
             }
@@ -186,7 +186,7 @@ class ModelSettingsIntegrationTest extends IntegrationTest {
                     "defaultBudgetUsd", 25));
             assertThat(back.status()).isEqualTo(200);
             assertThat(back.json().has("adminUrl")).isFalse();
-            assertThat(owner.get(company.path("/secrets")).body()).doesNotContain("LITELLM_ADMIN_KEY");
+            assertThat(owner.get(company.path("/secrets")).body()).doesNotContain("MODEL_GATEWAY_ADMIN_KEY");
             await().atMost(ModelGateways.WAIT).until(() -> own.key(ownKey.token).isEmpty());
         }
     }

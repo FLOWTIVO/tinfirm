@@ -373,6 +373,7 @@ class RunDispatcher {
                 return waiting(run, switch (wait.reason()) {
                     case BUDGET_SPENT -> QueueReason.budgetSpent(wait.until(), wait.detail());
                     case KEY_ERROR -> QueueReason.keyError(wait.detail());
+                    case NO_MODEL_KEY -> QueueReason.noModelKey(wait.detail());
                     case HOST_OFFLINE -> QueueReason.subscriptionHostOffline(subscriptionHost(run),
                             run.subscriptionLabel(), wait.detail());
                 }, now);

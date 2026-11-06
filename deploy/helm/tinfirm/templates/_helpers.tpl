@@ -190,7 +190,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 {{- end }}
 
-{{/* TINFIRM_LITELLM_ADMIN_URL: LiteLLM's Service inside the cluster, plain http (admin API and relayed model requests). */}}
+{{/* TINFIRM_MODEL_GATEWAY_ADMIN_URL: LiteLLM's Service inside the cluster, plain http (admin API and relayed model requests). */}}
 {{- define "tinfirm.litellm.adminUrl" -}}
 {{- printf "http://%s.%s.svc:%v" (include "tinfirm.litellm.fullname" .) .Release.Namespace .Values.litellm.service.port }}
 {{- end }}
@@ -301,7 +301,7 @@ ingress.traefik.redirectHttps put first in traefik.ingress.kubernetes.io/router.
 {{- end }}
 {{- end }}
 
-{{/* TINFIRM_LITELLM_MODEL_URL: the model port on LiteLLM's Service, for the server's model requests (ADR-0069). */}}
+{{/* TINFIRM_MODEL_GATEWAY_MODEL_URL: the model port on LiteLLM's Service, for the server's model requests (ADR-0069). */}}
 {{- define "tinfirm.litellm.modelUrl" -}}
 {{- printf "http://%s.%s.svc:%v" (include "tinfirm.litellm.fullname" .) .Release.Namespace .Values.litellm.modelApi.port }}
 {{- end }}

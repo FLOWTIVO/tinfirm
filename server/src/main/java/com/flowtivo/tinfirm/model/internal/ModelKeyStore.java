@@ -27,16 +27,19 @@ import org.springframework.stereotype.Repository;
 class ModelKeyStore {
 
     private static final String STATE = """
-            secret_id, litellm_key_id, budget_usd, models, status, last_error, spent_usd, budget_resets_at, synced_at,
+            secret_id, gateway_key_id, budget_usd, models, status, last_error, spent_usd, budget_resets_at, synced_at,
             sync_lease_until, created_at, updated_at, key_generation, key_created_at, key_rotated_at,
             rotation_requested_at, rotation_error, retiring_key_id, retiring_until, retiring_blocked_at,
-            retiring_spend_usd, retiring_resets_at""";
+            retiring_spend_usd, retiring_resets_at, provided_at, provided_by, provided_by_self, key_hint""";
 
     private static final String PRINCIPAL_COLUMNS = "company_id, principal_id, " + STATE;
 
     private static final String COMPANY_COLUMNS = "company_id, NULL::uuid AS principal_id, " + STATE;
 
     private static final String NOT_CREATED = "The key is not created yet";
+
+    /** The status's reason of a holder without a key at a gateway whose keys its team provides (ADR-0094). */
+    static final String NOT_PROVIDED = "No key has been entered yet: the company's gateway team provides it";
 
     private final JdbcClient jdbc;
 
@@ -50,10 +53,11 @@ class ModelKeyStore {
     }
 
     /** A key row: a principal's, or the company's own. */
-    record KeyRow(KeyHolder holder, @Nullable UUID secretId, @Nullable String litellmKeyId,
+    record KeyRow(KeyHolder holder, @Nullable UUID secretId, @Nullable String gatewayKeyId,
             @Nullable BigDecimal budgetUsd, @Nullable List<String> models, KeyStatus status, @Nullable String lastError,
             @Nullable BigDecimal spentUsd, @Nullable Instant budgetResetsAt, @Nullable Instant syncedAt,
-            @Nullable Instant syncLeaseUntil, Instant createdAt, Instant updatedAt, Rotation rotation) {
+            @Nullable Instant syncLeaseUntil, Instant createdAt, Instant updatedAt, Rotation rotation,
+            @Nullable Provided provided) {
 
         UUID companyId() {
             return holder.companyId();
@@ -61,8 +65,15 @@ class ModelKeyStore {
 
         /** Whether the key exists in LiteLLM, as far as Tinfirm knows. */
         boolean hasKey() {
-            return secretId != null && litellmKeyId != null;
+            return secretId != null && gatewayKeyId != null;
         }
+    }
+
+    /**
+     * A key the company's gateway team made and someone entered (V082, ADR-0094): when, by which user (null for a
+     * service account's token or a user since deleted), whether by its own principal, and its last four characters.
+     */
+    record Provided(Instant at, @Nullable UUID by, boolean bySelf, @Nullable String hint) {
     }
 
     /**
@@ -148,11 +159,11 @@ class ModelKeyStore {
      * The key LiteLLM created for the holder (its first, or again after LiteLLM lost one), kept in its secret: a new
      * key, whose age counts from now, and which answers an admin's request to rotate the key made before it.
      */
-    void recordKey(KeyHolder holder, UUID secretId, String litellmKeyId, Instant now) {
+    void recordKey(KeyHolder holder, UUID secretId, String gatewayKeyId, Instant now) {
         update(holder, """
-                secret_id = ?, litellm_key_id = ?, key_created_at = ?, rotation_error = NULL,
+                secret_id = ?, gateway_key_id = ?, key_created_at = ?, rotation_error = NULL,
                 rotation_requested_at = CASE WHEN rotation_requested_at <= ? THEN NULL ELSE rotation_requested_at END,
-                updated_at = ?""", null, values(secretId, litellmKeyId, ts(now), ts(now), ts(now)), List.of());
+                updated_at = ?""", null, values(secretId, gatewayKeyId, ts(now), ts(now), ts(now)), List.of());
     }
 
     // ---- rotation (V014) -------------------------------------------------------------------------------------
@@ -178,13 +189,13 @@ class ModelKeyStore {
      * retiring until {@code retiringUntil}, with the spend and reset time the next key was created with. Answers any
      * request made before.
      */
-    void switchKey(KeyHolder holder, UUID secretId, String litellmKeyId, int generation, String retiringKeyId,
+    void switchKey(KeyHolder holder, UUID secretId, String gatewayKeyId, int generation, String retiringKeyId,
             Instant retiringUntil, BigDecimal retiringSpendUsd, @Nullable Instant retiringResetsAt, Instant now) {
         update(holder, """
-                secret_id = ?, litellm_key_id = ?, key_generation = ?, key_created_at = ?, key_rotated_at = ?,
+                secret_id = ?, gateway_key_id = ?, key_generation = ?, key_created_at = ?, key_rotated_at = ?,
                 rotation_requested_at = NULL, rotation_error = NULL, retiring_key_id = ?, retiring_until = ?,
                 retiring_blocked_at = NULL, retiring_spend_usd = ?, retiring_resets_at = ?, updated_at = ?""", null,
-                values(secretId, litellmKeyId, generation, ts(now), ts(now), retiringKeyId, ts(retiringUntil),
+                values(secretId, gatewayKeyId, generation, ts(now), ts(now), retiringKeyId, ts(retiringUntil),
                         retiringSpendUsd, ts(retiringResetsAt), ts(now)),
                 List.of());
     }
@@ -231,6 +242,31 @@ class ModelKeyStore {
                 values(status.name(), lastError, ts(budgetResetsAt), ts(now)), List.of());
     }
 
+    /**
+     * A key the company's gateway team made, entered for the holder (ADR-0094): kept in its secret, known by
+     * {@code gatewayKeyId} (its SHA-256), with who entered it, and the status it starts with. A new key: its age counts
+     * from now.
+     */
+    void recordProvided(KeyHolder holder, UUID secretId, String gatewayKeyId, String hint, @Nullable UUID by,
+            boolean bySelf, KeyStatus status, Instant now) {
+        update(holder, """
+                secret_id = ?, gateway_key_id = ?, status = ?, last_error = NULL, spent_usd = NULL,
+                budget_resets_at = NULL, synced_at = ?, key_created_at = ?, key_rotated_at = NULL,
+                rotation_requested_at = NULL, rotation_error = NULL, provided_at = ?, provided_by = ?,
+                provided_by_self = ?, key_hint = ?, updated_at = ?""", null,
+                values(secretId, gatewayKeyId, status.name(), ts(now), ts(now), ts(now), by, bySelf, hint, ts(now)),
+                List.of());
+    }
+
+    /** Forgets the holder's provided key: no key, until one is entered again (ADR-0094). */
+    void removeProvided(KeyHolder holder, Instant now) {
+        update(holder, """
+                secret_id = NULL, gateway_key_id = NULL, status = 'ERROR', last_error = ?, spent_usd = NULL,
+                budget_resets_at = NULL, synced_at = NULL, key_created_at = NULL, provided_at = NULL,
+                provided_by = NULL, provided_by_self = false, key_hint = NULL, updated_at = ?""", null,
+                values(NOT_PROVIDED, ts(now)), List.of());
+    }
+
     /** Sets the holder's overrides; null takes the company's default. */
     void setOverrides(KeyHolder holder, @Nullable BigDecimal budgetUsd, @Nullable List<String> models, Instant now) {
         update(holder, "budget_usd = ?, models = CAST(? AS jsonb), updated_at = ?", null,
@@ -259,10 +295,11 @@ class ModelKeyStore {
     /** Forgets the key of the row and the one it replaced (its gateway changed); the overrides stay. */
     void forgetKey(KeyHolder holder, Instant now) {
         update(holder, """
-                secret_id = NULL, litellm_key_id = NULL, status = 'ERROR', last_error = ?, spent_usd = NULL,
+                secret_id = NULL, gateway_key_id = NULL, status = 'ERROR', last_error = ?, spent_usd = NULL,
                 budget_resets_at = NULL, synced_at = NULL, key_created_at = NULL, rotation_requested_at = NULL,
                 rotation_error = NULL, retiring_key_id = NULL, retiring_until = NULL, retiring_blocked_at = NULL,
-                retiring_spend_usd = NULL, retiring_resets_at = NULL, updated_at = ?""", null,
+                retiring_spend_usd = NULL, retiring_resets_at = NULL, provided_at = NULL, provided_by = NULL,
+                provided_by_self = false, key_hint = NULL, updated_at = ?""", null,
                 values(NOT_CREATED, ts(now)), List.of());
     }
 
@@ -309,7 +346,7 @@ class ModelKeyStore {
         UUID companyId = rs.getObject("company_id", UUID.class);
         UUID principalId = rs.getObject("principal_id", UUID.class);
         return new KeyRow(new KeyHolder(companyId, principalId), rs.getObject("secret_id", UUID.class),
-                rs.getString("litellm_key_id"), rs.getBigDecimal("budget_usd"),
+                rs.getString("gateway_key_id"), rs.getBigDecimal("budget_usd"),
                 ModelJson.nullableStrings(rs.getString("models")), KeyStatus.valueOf(rs.getString("status")),
                 rs.getString("last_error"), rs.getBigDecimal("spent_usd"), instant(rs, "budget_resets_at"),
                 instant(rs, "synced_at"), instant(rs, "sync_lease_until"),
@@ -319,7 +356,14 @@ class ModelKeyStore {
                         instant(rs, "rotation_requested_at"), rs.getString("rotation_error"),
                         rs.getString("retiring_key_id"), instant(rs, "retiring_until"),
                         instant(rs, "retiring_blocked_at"), rs.getBigDecimal("retiring_spend_usd"),
-                        instant(rs, "retiring_resets_at")));
+                        instant(rs, "retiring_resets_at")),
+                provided(rs));
+    }
+
+    private static @Nullable Provided provided(ResultSet rs) throws SQLException {
+        Instant at = instant(rs, "provided_at");
+        return at != null ? new Provided(at, rs.getObject("provided_by", UUID.class), rs.getBoolean("provided_by_self"),
+                rs.getString("key_hint")) : null;
     }
 
     private static @Nullable Instant instant(ResultSet rs, String column) throws SQLException {

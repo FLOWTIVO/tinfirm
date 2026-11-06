@@ -47,7 +47,7 @@ public class KeyReconciliation {
 
     private final Gateways gateways;
 
-    private final LiteLlm litellm;
+    private final GatewayAdapter adapter;
 
     private final KeyWork work;
 
@@ -58,14 +58,14 @@ public class KeyReconciliation {
     private final TimeSource time;
 
     KeyReconciliation(SystemTransactions transactions, ModelSettingsStore settings, ModelKeyStore keys,
-            Principals principals, Gateways gateways, LiteLlm litellm, KeyWork work, ObjectProvider<CompanyCleanup> cleanups,
-            TinfirmProperties tinfirm, TimeSource time) {
+            Principals principals, Gateways gateways, GatewayAdapter adapter, KeyWork work,
+            ObjectProvider<CompanyCleanup> cleanups, TinfirmProperties tinfirm, TimeSource time) {
         this.transactions = transactions;
         this.settings = settings;
         this.keys = keys;
         this.principals = principals;
         this.gateways = gateways;
-        this.litellm = litellm;
+        this.adapter = adapter;
         this.work = work;
         this.cleanups = cleanups;
         this.tinfirm = tinfirm;
@@ -114,13 +114,14 @@ public class KeyReconciliation {
     private void sweep(UUID companyId) {
         Optional<Gateway> gateway = transactions.inCompany(companyId, () -> settings.find(companyId)
             .filter(ModelSettingsStore.SettingsRow::relayEnabled)
-            .flatMap(gateways::of));
+            .flatMap(gateways::of)
+            .filter(Gateway::managed));
         if (gateway.isEmpty()) {
             return;
         }
-        List<LiteLlm.KeyState> inLiteLlm;
+        List<GatewayAdapter.KeyState> atGateway;
         try {
-            inLiteLlm = litellm.teamKeys(gateway.get(), Gateway.teamId(companyId));
+            atGateway = adapter.teamKeys(gateway.get(), Gateway.teamId(companyId));
         }
         catch (LiteLlmException ex) {
             log.warn("The keys of company {} could not be listed in LiteLLM: {}", companyId, ex.getMessage());
@@ -137,8 +138,8 @@ public class KeyReconciliation {
             else {
                 byPrincipal.put(row.holder().requirePrincipal(), row);
             }
-            if (row.litellmKeyId() != null) {
-                held.add(row.litellmKeyId());
+            if (row.gatewayKeyId() != null) {
+                held.add(row.gatewayKeyId());
             }
             if (row.rotation().retiringKeyId() != null) {
                 held.add(row.rotation().retiringKeyId());
@@ -146,7 +147,7 @@ public class KeyReconciliation {
         }
         String prefix = Gateway.aliasPrefix(companyId);
         Instant now = time.now();
-        for (LiteLlm.KeyState key : inLiteLlm) {
+        for (GatewayAdapter.KeyState key : atGateway) {
             String alias = key.alias();
             if (alias == null || !alias.startsWith(prefix) || held.contains(key.keyId())) {
                 continue;

@@ -2,7 +2,7 @@
 
 The public guides are [Run the model gateway](../../docs-site/content/operator-guide/model-gateway.md) (https://docs.tinfirm.com/operator-guide/model-gateway/), for operators, and [Model access and budgets](../../docs-site/content/admin-guide/model-access.md) (https://docs.tinfirm.com/admin-guide/model-access/), for a company's Owners and Admins. This page keeps what the people who build Tinfirm need beyond them: the decisions behind the gateway with their ADRs and review rows, how the bundled gateway, the model port and the relay are secured in detail, the admin routes and key aliases Tinfirm uses, the API, error codes and audit events of **Model access**, the Compose hosts deployed by script, and the keys of the company's own services.
 
-[LiteLLM](https://github.com/BerriAI/litellm) is the model gateway of every Tinfirm company ([ADR-0059](../adr/0059-litellm-budgets-and-the-model-proxy.md), [PLATFORM.md §11.2](../PLATFORM.md#112-model-access)). Every principal, member or service account, has one LiteLLM key with a budget, which Tinfirm creates and keeps in its vault, and every model request of a run paid by a budget goes through the server's model relay to LiteLLM with the paying principal's key. The bundled LiteLLM is the company's gateway, not only Tinfirm's ([ADR-0069](../adr/0069-company-model-gateway.md)): its model port serves the company's other services too, such as a company's own reporting service (section 8). The one exception to the budget is a member's subscription on their own personal runner host, which LiteLLM does not meter ([runner/README.md](../../runner/README.md)).
+[LiteLLM](https://github.com/BerriAI/litellm) is the model gateway Tinfirm manages ([ADR-0059](../adr/0059-litellm-budgets-and-the-model-proxy.md), [PLATFORM.md §11.2](../PLATFORM.md#112-model-access)). A company may instead use a gateway whose keys its own gateway team provides, which Tinfirm reaches by its model URL alone ([ADR-0094](../adr/0094-more-than-one-model-gateway.md); the public guide's [A gateway whose team makes the keys](../../docs-site/content/operator-guide/model-gateway.md#a-gateway-whose-team-makes-the-keys)); this page is about LiteLLM. Every principal, member or service account, has one LiteLLM key with a budget, which Tinfirm creates and keeps in its vault, and every model request of a run paid by a budget goes through the server's model relay to LiteLLM with the paying principal's key. The bundled LiteLLM is the company's gateway, not only Tinfirm's ([ADR-0069](../adr/0069-company-model-gateway.md)): its model port serves the company's other services too, such as a company's own reporting service (section 8). The one exception to the budget is a member's subscription on their own personal runner host, which LiteLLM does not meter ([runner/README.md](../../runner/README.md)).
 
 ## 1. The bundled gateway
 
@@ -16,11 +16,11 @@ The server gets three variables ([CONVENTIONS §4](../CONVENTIONS.md#4-runtime-c
 
 | Variable | Compose | Helm |
 |---|---|---|
-| `TINFIRM_LITELLM_ADMIN_URL` | `http://litellm:4000` | `http://<release>-litellm.<namespace>.svc:4000` |
-| `TINFIRM_LITELLM_MODEL_URL` | `http://model-api:4001` | `http://<release>-litellm.<namespace>.svc:4001` |
-| `TINFIRM_LITELLM_MASTER_KEY` | `LITELLM_MASTER_KEY` of `.env` | `master-key` of the Secret |
+| `TINFIRM_MODEL_GATEWAY_ADMIN_URL` | `http://litellm:4000` | `http://<release>-litellm.<namespace>.svc:4000` |
+| `TINFIRM_MODEL_GATEWAY_MODEL_URL` | `http://model-api:4001` | `http://<release>-litellm.<namespace>.svc:4001` |
+| `TINFIRM_MODEL_GATEWAY_ADMIN_KEY` | `LITELLM_MASTER_KEY` of `.env` | `master-key` of the Secret |
 
-The deployment bundles a LiteLLM only when both the admin URL and the master key are set; without `TINFIRM_LITELLM_MODEL_URL`, the model requests go to the admin URL.
+The deployment bundles a LiteLLM only when both the admin URL and the master key are set; without `TINFIRM_MODEL_GATEWAY_MODEL_URL`, the model requests go to the admin URL. Compose and the chart also set `TINFIRM_MODEL_GATEWAY_VENDOR` to `LITELLM`, its default and the only value the server accepts. The variables' older names, `TINFIRM_LITELLM_ADMIN_URL`, `TINFIRM_LITELLM_MODEL_URL` and `TINFIRM_LITELLM_MASTER_KEY`, are still read when the new ones are unset ([ADR-0094](../adr/0094-more-than-one-model-gateway.md)).
 
 ## 2. How it is secured
 
@@ -84,7 +84,7 @@ The page **Model access** is in the public guide [Model access and budgets](../.
 
 ### 5.2 Budgets
 
-- **Period** is LiteLLM's `budget_duration`: a number and `h`, `d`, `w` or `mo`.
+- **Period** is Tinfirm's own, in the words of LiteLLM's `budget_duration`: a number and `h`, `d`, `w` or `mo`, which the LiteLLM adapter writes as they are ([ADR-0094](../adr/0094-more-than-one-model-gateway.md)).
 - A key's own budget and models are saved with `PATCH /principals/{principalId}/model-access`, audited as `model_key.budget_changed`.
 - The statuses behind the notes of **Members' budgets** are `OK`, `BUDGET_SPENT`, `BLOCKED` and `ERROR`.
 - A trigger's payer, and the author's subscription where the company allows it: [ADR-0085](../adr/0085-claude-login-on-the-runner-host.md) and [triggers.md](triggers.md).
@@ -106,7 +106,7 @@ What the operator does is in the public guide's [Let runs reach the relay](../..
 
 How a company uses its own LiteLLM, and how to configure it, is in the public guide's [An external LiteLLM](../../docs-site/content/operator-guide/model-gateway.md#an-external-litellm). Beyond it:
 
-- Tinfirm keeps the admin key as the company secret `LITELLM_ADMIN_KEY`, and manages only the team and the keys it creates (alias prefix `tinfirm-{companyId}-`).
+- Tinfirm keeps the admin key as the company secret `MODEL_GATEWAY_ADMIN_KEY` (`LITELLM_ADMIN_KEY` for a key entered before ADR-0094), and manages only the team and the keys it creates (alias prefix `tinfirm-{companyId}-`).
 - The admin URL is held to the outbound guard of the company's systems; a refused one is `400 INVALID_BASE_URL`. `TINFIRM_CONNECTION_INTERNAL_HOSTS` does not apply to it ([ADR-0066](../adr/0066-internal-hosts.md)).
 - The settings to copy are those of `deploy/compose/litellm/config.yaml`. `budget_exceeded_status_code: 429` is needed because from v1.105.1 LiteLLM answers a spent budget with 422, which the server's relay does not take for a spent key.
 

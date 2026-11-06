@@ -150,7 +150,7 @@ class ModelKeyRotationTest extends IntegrationTest {
         assertThat(callWith(first.key)).isEqualTo(200);
         assertThat(callWith(second.key)).isEqualTo(200);
         Map<String, Object> row = row(company, setup.bot());
-        assertThat(row.get("litellm_key_id")).isEqualTo(second.token);
+        assertThat(row.get("gateway_key_id")).isEqualTo(second.token);
         assertThat(row.get("retiring_key_id")).isEqualTo(first.token);
         assertThat(row.get("key_generation")).isEqualTo(1);
         assertThat(secrets(company, setup.bot())).isEqualTo(1);
@@ -331,7 +331,7 @@ class ModelKeyRotationTest extends IntegrationTest {
         Map<UUID, FakeLiteLlm.Key> before = new HashMap<>();
         for (UUID principal : principals) {
             ModelGateways.awaitStatus(owner, company, principal, principal.equals(suspended) ? "BLOCKED" : "OK");
-            before.put(principal, litellm.key((String) row(company, principal).get("litellm_key_id")).orElseThrow());
+            before.put(principal, litellm.key((String) row(company, principal).get("gateway_key_id")).orElseThrow());
         }
 
         ApiClient member = loginAs(company.email("MEMBER"));
@@ -350,7 +350,7 @@ class ModelKeyRotationTest extends IntegrationTest {
             });
             FakeLiteLlm.Key old = before.get(principal);
             assertThat(callWith(old.key)).isEqualTo(401);
-            FakeLiteLlm.Key now = litellm.key((String) row(company, principal).get("litellm_key_id")).orElseThrow();
+            FakeLiteLlm.Key now = litellm.key((String) row(company, principal).get("gateway_key_id")).orElseThrow();
             assertThat(now.token).isNotEqualTo(old.token);
             assertThat(now.blocked).isEqualTo(principal.equals(suspended));
         }
@@ -444,7 +444,7 @@ class ModelKeyRotationTest extends IntegrationTest {
             .isInstanceOf(KeyRotation.SimulatedCrash.class);
 
         // Whatever the step, the principal has a working key: the row's current one.
-        FakeLiteLlm.Key current = litellm.key((String) row(company, bot).get("litellm_key_id")).orElseThrow();
+        FakeLiteLlm.Key current = litellm.key((String) row(company, bot).get("gateway_key_id")).orElseThrow();
         assertThat(current.blocked).isFalse();
         assertThat(callWith(current.key)).isEqualTo(200);
         if (step == KeyRotation.Step.GENERATED) {
@@ -454,7 +454,7 @@ class ModelKeyRotationTest extends IntegrationTest {
         }
         // While the lease holds, nothing moves.
         reconciliation.reconcile(company.id());
-        assertThat(row(company, bot).get("litellm_key_id")).isEqualTo(current.token);
+        assertThat(row(company, bot).get("gateway_key_id")).isEqualTo(current.token);
 
         // The lease expires; the reconciliation finishes what the crash left, as time passes.
         for (int round = 0; round < 4 && row(company, bot).get("retiring_key_id") != null
@@ -468,7 +468,7 @@ class ModelKeyRotationTest extends IntegrationTest {
         // No run keeps the lease: the crashed run's expired, and every run since let go of its own. (Awaited, not read
         // once: a sync of the key may hold it for a moment, which is no leak; a leaked one would hold it two minutes.)
         await().atMost(ModelGateways.WAIT).until(() -> row(company, bot).get("sync_lease_until") == null);
-        FakeLiteLlm.Key last = litellm.key((String) row.get("litellm_key_id")).orElseThrow();
+        FakeLiteLlm.Key last = litellm.key((String) row.get("gateway_key_id")).orElseThrow();
         assertThat(last.alias).isEqualTo(ModelGateways.alias(company, bot, 1));
         assertThat(ModelGateways.keysOf(litellm, company, bot)).containsExactly(last);
         assertThat(last.blocked).isFalse();

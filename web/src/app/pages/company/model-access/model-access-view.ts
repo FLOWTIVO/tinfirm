@@ -2,6 +2,7 @@ import type {
   ModelAccessUpdateRequest,
   ModelAccessView,
   ModelGateway,
+  ModelGatewayVendor,
   ModelKeyStatus,
   ModelSettings,
   ModelSettingsRequest,
@@ -71,7 +72,7 @@ export function gatewayStatus(settings: ModelSettings): GatewayStatusView {
         tone: 'failed',
         chip: 'Test failed',
         title: 'The last test failed',
-        text: failedText(settings.lastError ?? 'LiteLLM did not answer as expected'),
+        text: failedText(settings.lastError ?? 'The gateway did not answer as expected'),
       };
     case 'READY':
       return {
@@ -98,7 +99,12 @@ function sentence(text: string): string {
 export function gatewayRailDetail(settings: ModelSettings): string {
   const state = gatewayState(settings);
   if (state === 'NOT_CONFIGURED') return 'Not set up';
-  const which = settings.gateway === 'EXTERNAL' ? 'Your own' : 'Bundled';
+  const which =
+    settings.gateway === 'PROVIDED'
+      ? 'Your gateway'
+      : settings.gateway === 'EXTERNAL'
+        ? 'Your own'
+        : 'Bundled';
   const how = state === 'READY' ? 'ready' : state === 'FAILED' ? 'test failed' : 'not tested';
   return `${which} · ${how}`;
 }
@@ -119,7 +125,7 @@ export function gatewaySteps(
   const configured = state !== 'NOT_CONFIGURED';
   return [
     {
-      title: 'Choose which LiteLLM',
+      title: 'Choose the model gateway',
       detail: `${GATEWAY_LABELS[gateway]}, below`,
       state: 'done',
     },
@@ -130,7 +136,10 @@ export function gatewaySteps(
     },
     {
       title: 'Test it',
-      detail: 'Then every member and service account gets a key, and conversations may start',
+      detail:
+        gateway === 'PROVIDED'
+          ? 'Then enter the key your gateway team made for each member and service account'
+          : 'Then every member and service account gets a key, and conversations may start',
       state: !configured ? 'todo' : state === 'FAILED' ? 'failed' : 'now',
     },
   ];
@@ -139,22 +148,46 @@ export function gatewaySteps(
 export const GATEWAY_LABELS: Record<ModelGateway, string> = {
   BUNDLED: 'Bundled',
   EXTERNAL: 'Your own LiteLLM',
+  PROVIDED: 'Keys from your gateway',
 };
 
 /** The gateway as the status card names it. */
 export const GATEWAY_NAMES: Record<ModelGateway, string> = {
   BUNDLED: 'Bundled LiteLLM',
   EXTERNAL: 'Your own LiteLLM',
+  PROVIDED: 'Your own gateway, keys from its team',
+};
+
+/** A provided gateway's product, as the form names it (ADR-0094). */
+export const VENDOR_LABELS: Record<ModelGatewayVendor, string> = {
+  LITELLM: 'LiteLLM',
+  GENERIC: 'Another gateway',
 };
 
 export const GATEWAY_DESCRIPTIONS: Record<ModelGateway, string> = {
   BUNDLED: 'The LiteLLM that comes with this Tinfirm deployment. Nothing to enter.',
   EXTERNAL: 'Your company’s own LiteLLM, by its admin URL and a master or admin key.',
+  PROVIDED:
+    'Your company’s own gateway, by its model URL. Its team makes a key for each person, which you enter here.',
 };
+
+/**
+ * Where a key the gateway team made stands (ADR-0094): "No key yet: …", or "Entered by an admin ·
+ * ends in …abcd · 3 Oct 2026".
+ */
+export function providedKeyState(view: ModelAccessView | null | undefined): string {
+  if (!view?.keyProvided) {
+    return 'No key yet: until one is entered, the work it pays for waits.';
+  }
+  const who = view.keyProvidedBySelf ? 'Entered by its holder' : 'Entered by an admin';
+  const end = view.keyHint ? ` · ends in …${view.keyHint}` : '';
+  const day = view.keyProvidedAt ? ` · ${formatDay(view.keyProvidedAt)}` : '';
+  return `${who}${end}${day}`;
+}
 
 // --- The budget period ---------------------------------------------------------------------------
 
-/** LiteLLM's units of a budget period. */
+/** The units of Tinfirm's budget period, which the gateway's adapter writes in its own terms. */
 export type PeriodUnit = 'h' | 'd' | 'w' | 'mo';
 
 export const PERIOD_UNITS: readonly { value: PeriodUnit; one: string; many: string }[] = [
@@ -166,7 +199,7 @@ export const PERIOD_UNITS: readonly { value: PeriodUnit; one: string; many: stri
 
 const PERIOD = /^([1-9][0-9]{0,3})(h|d|w|mo)$/;
 
-/** `30d` → 30 days; null for what LiteLLM would not take. */
+/** `30d` → 30 days; null for what is no budget period. */
 export function parsePeriod(value: string): { count: number; unit: PeriodUnit } | null {
   const match = PERIOD.exec(value.trim());
   return match ? { count: Number(match[1]), unit: match[2] as PeriodUnit } : null;
@@ -199,6 +232,10 @@ export interface SettingsForm {
   adminUrl: string;
   /** Write-only: empty keeps the stored key. */
   adminKey: string;
+  /** A gateway whose keys its team provides (ADR-0094): its model URL, its product, members' own keys. */
+  modelUrl: string;
+  vendor: ModelGatewayVendor;
+  memberKeys: boolean;
   budget: string;
   periodCount: string;
   periodUnit: PeriodUnit;
@@ -217,6 +254,9 @@ export function settingsForm(settings: ModelSettings): SettingsForm {
     gateway: settings.configured || settings.bundledAvailable ? settings.gateway : 'EXTERNAL',
     adminUrl: settings.adminUrl ?? '',
     adminKey: '',
+    modelUrl: settings.modelUrl ?? '',
+    vendor: settings.gateway === 'PROVIDED' ? settings.vendor : 'GENERIC',
+    memberKeys: settings.memberKeys,
     budget: String(settings.defaultBudgetUsd),
     periodCount: String(period.count),
     periodUnit: period.unit,
@@ -260,6 +300,13 @@ export function settingsErrors(
       errors.adminKey = 'Enter the master or admin key: it goes with the URL.';
     }
   }
+  if (form.gateway === 'PROVIDED') {
+    const url = form.modelUrl.trim();
+    if (!url) errors.modelUrl = 'Enter the model URL of your gateway.';
+    else if (!/^https?:\/\/[^\s/]+\S*$/.test(url) || url.length > 500) {
+      errors.modelUrl = 'Enter an https URL, such as https://ai-gateway.example.com.';
+    }
+  }
   if (parseUsd(form.budget) === null) {
     errors.budget = 'Enter an amount from 0 to 1,000,000, such as 50 or 12.50.';
   }
@@ -280,7 +327,14 @@ export function settingsErrors(
 
 /** The fields the settings form checks. */
 export type SettingsField =
-  'adminUrl' | 'adminKey' | 'budget' | 'period' | 'models' | 'thresholds' | 'monthlyAlert';
+  | 'adminUrl'
+  | 'adminKey'
+  | 'modelUrl'
+  | 'budget'
+  | 'period'
+  | 'models'
+  | 'thresholds'
+  | 'monthlyAlert';
 
 /** The company's monthly alert in USD as typed: 0 to 1 000 000 000, at most two decimals, or null. */
 export function parseAlertUsd(value: string): number | null {
@@ -323,6 +377,11 @@ export function settingsRequest(form: SettingsForm, stored?: ModelSettings): Mod
     request.adminUrl = form.adminUrl.trim();
     if (form.adminKey.trim()) request.adminKey = form.adminKey.trim();
   }
+  if (form.gateway === 'PROVIDED') {
+    request.modelUrl = form.modelUrl.trim();
+    request.vendor = form.vendor;
+    request.memberKeys = form.memberKeys;
+  }
   return request;
 }
 
@@ -333,6 +392,9 @@ export type SettingsChange =
   | 'gateway'
   | 'adminUrl'
   | 'adminKey'
+  | 'modelUrl'
+  | 'vendor'
+  | 'memberKeys'
   | 'budget'
   | 'period'
   | 'models'
@@ -344,6 +406,9 @@ export const CHANGE_NAMES: Record<SettingsChange, string> = {
   gateway: 'Gateway',
   adminUrl: 'Admin URL',
   adminKey: 'Admin key',
+  modelUrl: 'Model URL',
+  vendor: 'Gateway product',
+  memberKeys: 'Members’ own keys',
   budget: 'Default budget',
   period: 'Budget period',
   models: 'Default models',
@@ -356,12 +421,16 @@ export const GATEWAY_FIELDS: readonly (SettingsChange | SettingsField)[] = [
   'gateway',
   'adminUrl',
   'adminKey',
+  'modelUrl',
+  'vendor',
+  'memberKeys',
 ];
 
 /** What the form changes from the stored settings, in the page's order. */
 export function settingsChanges(form: SettingsForm, settings: ModelSettings): SettingsChange[] {
   const stored = settingsForm(settings);
   const external = form.gateway === 'EXTERNAL';
+  const provided = form.gateway === 'PROVIDED';
   const budget = parseUsd(form.budget);
   const period = `${Number(form.periodCount.trim())}${form.periodUnit}`;
   const sameModels =
@@ -374,6 +443,9 @@ export function settingsChanges(form: SettingsForm, settings: ModelSettings): Se
     gateway: form.gateway !== stored.gateway,
     adminUrl: external && form.adminUrl.trim() !== stored.adminUrl,
     adminKey: external && !!form.adminKey.trim(),
+    modelUrl: provided && form.modelUrl.trim() !== stored.modelUrl,
+    vendor: provided && form.vendor !== stored.vendor,
+    memberKeys: provided && form.memberKeys !== stored.memberKeys,
     budget:
       budget === null ? form.budget.trim() !== stored.budget : budget !== settings.defaultBudgetUsd,
     period: !/^[1-9][0-9]{0,3}$/.test(form.periodCount.trim()) || period !== settings.budgetPeriod,
@@ -400,7 +472,17 @@ export function settingsWas(
   for (const change of changes) {
     switch (change) {
       case 'gateway':
-        was.gateway = settings.gateway === 'EXTERNAL' ? 'your own LiteLLM' : 'Bundled';
+        was.gateway = {
+          BUNDLED: 'Bundled',
+          EXTERNAL: 'your own LiteLLM',
+          PROVIDED: 'keys from your gateway',
+        }[settings.gateway];
+        break;
+      case 'vendor':
+        was.vendor = VENDOR_LABELS[settings.vendor];
+        break;
+      case 'memberKeys':
+        was.memberKeys = settings.memberKeys ? 'allowed' : 'not allowed';
         break;
       case 'budget':
         was.budget = formatUsd(settings.defaultBudgetUsd);
@@ -560,7 +642,7 @@ export interface BudgetMeter {
 
 /**
  * A budget's spend bar (`spentUsd` against `budgetUsd`): neutral below 80 %, warning from 80 %,
- * destructive once spent, when LiteLLM refuses new turns until the reset. `budgetUsd` overrides
+ * destructive once spent, when the gateway refuses new turns until the reset. `budgetUsd` overrides
  * the budget, for a dialog that shows the one being typed.
  */
 export function budgetMeter(view: ModelAccessView, budgetUsd = view.budgetUsd): BudgetMeter {
