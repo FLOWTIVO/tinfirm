@@ -30,7 +30,7 @@ class KeyRotationRulesTest {
 
     private static ModelProperties properties(Duration interval, Duration grace, Duration settle) {
         return new ModelProperties(null, null, Duration.ofSeconds(10), Duration.ofMinutes(5), Duration.ofMinutes(10),
-                67_108_864L, 16, 16, interval, grace, settle, 268_435_456L, false, null, Duration.ofSeconds(30), null,
+                67_108_864L, 16, 16, interval, grace, settle, 268_435_456L, null, Duration.ofSeconds(30), null,
                 null, GatewayVendor.LITELLM);
     }
 

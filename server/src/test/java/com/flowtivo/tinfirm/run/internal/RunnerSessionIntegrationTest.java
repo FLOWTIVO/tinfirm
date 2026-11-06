@@ -46,7 +46,7 @@ class RunnerSessionIntegrationTest extends RunTestBench {
     @Test
     void aRunsToolCallsBeyondThoseInFlightAreRefused() throws Exception {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = running(bench, runner);
             TestTurns.Script script = TestTurns.conversation(turn.conversationId());
             CountDownLatch release = new CountDownLatch(1);
@@ -92,7 +92,7 @@ class RunnerSessionIntegrationTest extends RunTestBench {
     @Test
     void aHostsRequestsBeyondItsRateAreRefused() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = running(bench, runner);
             TestTurns.Script script = TestTurns.conversation(turn.conversationId());
             AtomicInteger asked = new AtomicInteger();
@@ -130,7 +130,7 @@ class RunnerSessionIntegrationTest extends RunTestBench {
     @Test
     void aRunsEventsBeyondItsRateAreRefusedAndItsLogEventsDropped() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = running(bench, runner);
             long start = System.nanoTime();
             for (int seq = 1; seq <= 25; seq++) {
@@ -158,7 +158,7 @@ class RunnerSessionIntegrationTest extends RunTestBench {
     @Test
     void anEventOverTheSchemasSizesIsRefused() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = running(bench, runner);
             runner.event(turn.runId(), 1, 1, "AGENT_MESSAGE", Map.of("text", "a".repeat(32 * 1024)));
             runner.event(turn.runId(), 1, 2, "AGENT_MESSAGE", Map.of("text", "a".repeat(32 * 1024 + 1)));
@@ -180,7 +180,7 @@ class RunnerSessionIntegrationTest extends RunTestBench {
     @Test
     void pastItsByteBudgetARunsEventsAreDroppedOrRefusedAfterOneWarning() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = running(bench, runner);
             // Five LOG events of 200 KiB fit 1 MiB; the sixth does not, and its place holds the warning.
             for (int seq = 1; seq <= 6; seq++) {

@@ -32,7 +32,7 @@ class RunAgentIntegrationTest extends RunTestBench {
     @Test
     void pausingHoldsTheAgentsTurnsAndStopRunningCancelsThem() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn running = start(bench);
             expectAssign(runner, running.runId());
             runner.accepted(running.runId(), 1);
@@ -84,7 +84,7 @@ class RunAgentIntegrationTest extends RunTestBench {
     void aTurnOfADeletedAgentNeverRuns() {
         Bench bench = bench(true);
         assertThat(bench.person().delete(bench.agentPath("")).status()).isEqualTo(204);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             UUID conversationId = UUID.randomUUID();
             UUID runId = startTurn(bench, conversationId, "late-1", TurnReason.FIRST, 1, ModelAccessChoice.BUDGET)
                 .orElseThrow();

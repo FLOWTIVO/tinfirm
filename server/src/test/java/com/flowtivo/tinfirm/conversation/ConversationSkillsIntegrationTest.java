@@ -114,7 +114,7 @@ class ConversationSkillsIntegrationTest extends ConversationTestBench {
     /** A company host whose {@code hello} lists {@code run.skills}. */
     private FakeRunner skillsHost(RunnerHostRef host) {
         FakeRunner runner = FakeRunner.connect(port, host.token());
-        Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of(), GATEWAY_VERSION, 4);
+        Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of(), RUNNER_VERSION, 4);
         hello.put("features", List.of("run.skills"));
         runner.send(hello);
         runner.expect("welcome");

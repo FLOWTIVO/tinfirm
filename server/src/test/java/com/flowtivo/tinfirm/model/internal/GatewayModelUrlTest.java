@@ -21,7 +21,7 @@ class GatewayModelUrlTest {
     private static ModelProperties properties(String adminUrl, String modelUrl) {
         return new ModelProperties(adminUrl, "sk-TEST-ONLY-master-key", Duration.ofSeconds(10), Duration.ofMinutes(5),
                 Duration.ofMinutes(10), 67_108_864L, 16, 16, Duration.ofDays(30), Duration.ofMinutes(10),
-                Duration.ofMinutes(1), 268_435_456L, false, modelUrl, Duration.ofSeconds(30), null, null,
+                Duration.ofMinutes(1), 268_435_456L, modelUrl, Duration.ofSeconds(30), null, null,
                 GatewayVendor.LITELLM);
     }
 

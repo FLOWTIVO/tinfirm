@@ -68,7 +68,7 @@ class ConversationLockOrderTest extends ConversationTestBench {
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.id(), unique("host"), "COMPANY");
         ExecutorService threads = Executors.newFixedThreadPool(3);
         try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-            runner.helloV2AndWelcome(List.of(), List.of(), GATEWAY_VERSION, 4);
+            runner.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, 4);
             await().atMost(WAIT).until(() -> connections.isConfigured(host.id()));
             for (int round = 0; round < ROUNDS; round++) {
                 String id = start(bench.member(), bench, agentId, "Round " + round).get("id").asString();

@@ -26,9 +26,8 @@ public interface Hosts {
      * <li>{@code Subscription(...)} with a workspace account that is not the owner's: {@link Eligibility.Nowhere}
      * ({@code CANNOT_RUN_ANYWHERE}), to be shown before the conversation starts.</li>
      * </ul>
-     * A run paid by a budget goes only to hosts whose runner version has the always-on model proxy
-     * ({@link com.flowtivo.tinfirm.runner.RunnerVersions}); the list leaves the others out and says so in
-     * {@link Eligibility.Eligible#whyNone()} when none is left.
+     * A host's runner version decides nothing (ADR-0109): every host of runner protocol 2 has the always-on model
+     * proxy, and dispatch takes only such hosts.
      */
     Eligibility eligible(RunModelContext context);
 

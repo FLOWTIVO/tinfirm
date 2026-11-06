@@ -41,7 +41,6 @@ import com.flowtivo.tinfirm.runner.RunnerConnections;
 import com.flowtivo.tinfirm.runner.RunnerDirectory;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
-import com.flowtivo.tinfirm.runner.RunnerVersions;
 import com.flowtivo.tinfirm.shared.config.TinfirmProperties;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
@@ -73,8 +72,8 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  * <li>a subscription's label still reported by its host; then, with the eligible hosts locked in the order of their
  * ids so that concurrent dispatchers count one at a time, on every replica, a subscription's pool on its host
  * ({@code CREDENTIAL_POOL_FULL}) and the host ({@link HostSelection}): connected and configured, of protocol v2, not
- * draining, with a free slot, the conversation's previous host first (open point 13); a budget's run only on a host
- * of the minimum runner version ({@link RunnerVersions});</li>
+ * draining, with a free slot, the conversation's previous host first (open point 13). A host's runner version decides
+ * nothing (ADR-0109): every host of protocol v2 has the always-on model proxy;</li>
  * <li>assign: a new epoch, the host and its kind, {@code ASSIGNED}; the assignment is delivered after the commit
  * ({@link RunDelivery}), outside any transaction.</li>
  * </ol>
@@ -422,14 +421,9 @@ class RunDispatcher {
                         "The host no longer reports the subscription " + label), now);
             }
         }
-        boolean budget = choice instanceof ModelAccessChoice.Budget;
         // Concurrent dispatchers, on any replica, lock the hosts in the order of their ids and count only under these
         // locks: one that waited here sees the run the other one assigned, in the subscription's pool as on the host.
-        List<RunnerHostInfo> locked = runners.lockHostsForDispatch(eligible.stream().map(RunnerHostInfo::id).toList())
-            .stream()
-            // The minimum runner version again, as the host's latest hello says now (package 2, §7).
-            .filter(host -> !budget || host.gatewayRuns())
-            .toList();
+        List<RunnerHostInfo> locked = runners.lockHostsForDispatch(eligible.stream().map(RunnerHostInfo::id).toList());
         if (credential != null) {
             RunnerHostInfo subscriptionHost = eligible.getFirst();
             // A machine's pool is one across its presences in every company (ADR-0092).
@@ -441,8 +435,9 @@ class RunDispatcher {
             }
         }
         if (locked.isEmpty()) {
+            // The eligible hosts were removed since they were listed.
             return waiting(run, QueueReason.noRunnerHost(run.runtime(), "No runner host that may run this "
-                    + "conversation has runner version " + RunnerVersions.MODEL_PROXY_ALWAYS_ON + " or later."), now);
+                    + "conversation is registered."), now);
         }
         Map<UUID, Integer> used = runs.occupyingByHosts(locked.stream().map(RunnerHostInfo::id).toList());
         // A machine's slots are one across its presences in every company (ADR-0092): its runs elsewhere count.

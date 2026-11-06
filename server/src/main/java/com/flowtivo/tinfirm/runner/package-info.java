@@ -8,8 +8,8 @@
  * API: {@link com.flowtivo.tinfirm.runner.RunnerMessages} (the protocol types of v1 and v2, hand-written after
  * {@code protocol/runner-v1.schema.json} and {@code protocol/runner-v2.schema.json}; each connection speaks the version
  * of its host's {@code hello}, CONVENTIONS §14.10), {@link com.flowtivo.tinfirm.runner.RunnerDirectory} (hosts with
- * their scope, owner and version, and personal hosts' credentials), {@link com.flowtivo.tinfirm.runner.RunnerVersions}
- * (the minimum version of a gateway's runs), {@link com.flowtivo.tinfirm.runner.RunnerConnections} and
+ * their scope, owner and version, and personal hosts' credentials; the version is shown and decides nothing,
+ * ADR-0109), {@link com.flowtivo.tinfirm.runner.RunnerConnections} and
  * {@link com.flowtivo.tinfirm.runner.RunnerAuthentication} (runner host requests outside the WebSocket). Ports that the
  * run module implements (package 3 of the platform redesign): {@link com.flowtivo.tinfirm.runner.RunnerSessionListener}
  * (run messages of connected hosts, confirmed capacity, the liveness of a connection and its end) and

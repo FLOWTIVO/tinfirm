@@ -269,10 +269,6 @@ javaToolOptions: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
 
 # More non-secret variables for the ConfigMap, e.g.
 #   SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "10"
-# The model relay requires every runner host's own token with a run's model requests
-# (TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN, "true" by default): runner host 0.3.0 is the
-# minimum. Only while a host older than 0.3.0 is being upgraded:
-#   TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN: "false"
 extraConfig: {}
 
 # More container env entries (name/value or name/valueFrom), e.g. further secretKeyRefs.

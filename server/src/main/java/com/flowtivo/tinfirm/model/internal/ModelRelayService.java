@@ -55,7 +55,6 @@ import com.flowtivo.tinfirm.runner.ConnectedHost;
 import com.flowtivo.tinfirm.runner.RunnerAuthentication;
 import com.flowtivo.tinfirm.runner.RunnerDirectory;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
-import com.flowtivo.tinfirm.runner.RunnerVersions;
 import com.flowtivo.tinfirm.shared.litellm.LiteLlmRequests;
 import com.flowtivo.tinfirm.shared.net.GuardedHosts;
 import com.flowtivo.tinfirm.shared.net.InflightBytes;
@@ -81,10 +80,8 @@ import tools.jackson.databind.node.ObjectNode;
  * token is.</li>
  * <li>The runner host (the package 2 contract, open point 6): the host's own token in {@code X-Tinfirm-Runner-Token},
  * authenticated as on the runner's other endpoints ({@link RunnerAuthentication}), must be the token's host's, so that
- * a copied run token works only from its own host. Without the header, a host whose latest {@code hello.runnerVersion}
- * is {@link RunnerVersions#HOST_TOKEN_TO_RELAY} or later, which always sends it, is refused, and so is every host while
- * {@code tinfirm.model.relay-require-host-token} is on; an older host is accepted as before, with a warning once a day
- * per host and replica. Each refusal is the same 401.</li>
+ * a copied run token works only from its own host. A request without the header is refused from every host: sending
+ * it is part of runner protocol 2 (ADR-0109), whatever the host's version. Each refusal is the same 401.</li>
  * <li>The paying principal's key: the company's gateway passed its test (else 503), the paying principal is
  * {@code ACTIVE} as the principal module has it now (else 403, whether or not LiteLLM has blocked its key yet: a block
  * that failed leaves the key {@code ERROR} until the reconciliation), the key exists (else 503, and it is synced), and
@@ -162,9 +159,6 @@ class ModelRelayService {
     /** The runner host's own token ({@code tfr_…}), which its model proxy sends next to the run's token. */
     static final String HOST_TOKEN_HEADER = "X-Tinfirm-Runner-Token";
 
-    /** How often a host that leaves out its own token is warned about, per replica. */
-    private static final Duration WARN_WITHOUT_HOST_TOKEN = Duration.ofDays(1);
-
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
     private final SystemTransactions transactions;
@@ -210,9 +204,6 @@ class ModelRelayService {
     private final Map<UUID, Integer> perHost = new ConcurrentHashMap<>();
 
     private final InflightBytes inflight;
-
-    /** When each host that left out its own token was last warned about, on this replica. */
-    private final Map<UUID, Instant> warnedWithoutHostToken = new ConcurrentHashMap<>();
 
     private final CompanySwitches companySwitches;
 
@@ -305,32 +296,16 @@ class ModelRelayService {
     }
 
     /**
-     * How the relay takes a request's runner host (the package 2 contract, open point 6): {@code BOUND}, the host's own
-     * token is the run token's host's; {@code LEGACY}, no host token from a host older than
-     * {@link RunnerVersions#HOST_TOKEN_TO_RELAY}, accepted while the flag allows; {@code REFUSED}, anything else.
-     */
-    enum HostCheck {
-        BOUND, LEGACY, REFUSED
-    }
-
-    /**
-     * The runner host check of a request whose run token is valid.
+     * The runner host check of a request whose run token is valid (the package 2 contract, open point 6): whether the
+     * host's own token it sent is the run token's host's. Every host of runner protocol 2 sends it (ADR-0109), so a
+     * request without it is refused, whatever the host's version.
      *
-     * @param tokenHost        the host the run token was made for (and its run is {@code RUNNING} on)
-     * @param presentedHost    the host of the {@code X-Tinfirm-Runner-Token} the request sent, authenticated; null
-     *                         when it sent none
-     * @param hostVersion      the token's host's latest {@code hello.runnerVersion}
-     * @param requireHostToken {@code tinfirm.model.relay-require-host-token}
+     * @param tokenHost     the host the run token was made for (and its run is {@code RUNNING} on)
+     * @param presentedHost the host of the {@code X-Tinfirm-Runner-Token} the request sent, authenticated; null when it
+     *                      sent none
      */
-    static HostCheck hostCheck(UUID tokenHost, @Nullable UUID presentedHost, @Nullable String hostVersion,
-            boolean requireHostToken) {
-        if (presentedHost != null) {
-            return presentedHost.equals(tokenHost) ? HostCheck.BOUND : HostCheck.REFUSED;
-        }
-        if (requireHostToken || RunnerVersions.sendsHostTokenToRelay(hostVersion)) {
-            return HostCheck.REFUSED;
-        }
-        return HostCheck.LEGACY;
+    static boolean hostBound(UUID tokenHost, @Nullable UUID presentedHost) {
+        return presentedHost != null && presentedHost.equals(tokenHost);
     }
 
     /**
@@ -494,44 +469,21 @@ class ModelRelayService {
         });
     }
 
-    /** The runner host check ({@link #hostCheck}): refuses with 401, or warns about a host without its token. */
+    /** The runner host check ({@link #hostBound}): refuses with 401 a request that is not its host's. */
     private void checkHost(RelayTokenStore.TokenRow row, RunnerHostInfo host, @Nullable UUID presented) {
-        boolean required = properties.relayRequireHostToken();
-        switch (hostCheck(row.runnerHostId(), presented, host.runnerVersion(), required)) {
-            case BOUND -> {
-            }
-            case LEGACY -> warnWithoutHostToken(row, host);
-            case REFUSED -> {
-                if (presented != null) {
-                    log.warn("Refused a model request with the token of run {}, made for runner host {}, from runner "
-                            + "host {}", row.runId(), row.runnerHostId(), presented);
-                }
-                else {
-                    log.info("Refused a model request with the token of run {} without its runner host's own token "
-                            + "(host {}, runner {}{})", row.runId(), host.id(), host.runnerVersion(),
-                            required ? "; the relay requires it from every host" : "");
-                }
-                throw Refusal.unauthorized();
-            }
+        if (hostBound(row.runnerHostId(), presented)) {
+            return;
         }
-    }
-
-    /** Warns once a day per host and replica that a host older than 0.3.0 leaves out its own token. */
-    private void warnWithoutHostToken(RelayTokenStore.TokenRow row, RunnerHostInfo host) {
-        Instant now = time.now();
-        boolean[] due = { false };
-        warnedWithoutHostToken.compute(host.id(), (id, last) -> {
-            if (last != null && last.plus(WARN_WITHOUT_HOST_TOKEN).isAfter(now)) {
-                return last;
-            }
-            due[0] = true;
-            return now;
-        });
-        if (due[0]) {
-            log.warn("Runner host {} (runner {}) sends the model requests of its runs without its own token (run {}): "
-                    + "accepted from hosts before runner {} until TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN is on; upgrade "
-                    + "the host", host.id(), host.runnerVersion(), row.runId(), RunnerVersions.HOST_TOKEN_TO_RELAY);
+        if (presented != null) {
+            log.warn("Refused a model request with the token of run {}, made for runner host {}, from runner host {}",
+                    row.runId(), row.runnerHostId(), presented);
         }
+        else {
+            log.info("Refused a model request with the token of run {} without its runner host's own token (host {}, "
+                    + "runner {}); every host of runner protocol 2 sends it", row.runId(), host.id(),
+                    host.runnerVersion());
+        }
+        throw Refusal.unauthorized();
     }
 
     /** The key of the token's run, revealed once per token while its secret is the same. */

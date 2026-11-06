@@ -1,9 +1,9 @@
 /**
  * A runner host of protocol v2 in Node: a port of the server's test FakeRunner
  * (server/src/test/java/.../support/FakeRunner.java) that a test drives instead of a sandbox. It connects to
- * `/api/runner/v1/connect` with a company host's token, sends `hello` as runner 0.2.0 (the first version a budget's
- * run is sent to; its model requests carry the host's token all the same, as 0.3.0's do, since the relay requires
- * it by default), answers every `host.config` with `host.config.applied`, sends heartbeats for its running runs,
+ * `/api/runner/v1/connect` with a company host's token, sends `hello` as runner 0.2.0 (any version: it decides
+ * nothing, ADR-0109; its model requests carry the host's token, as every host of protocol 2 sends it, since the relay
+ * requires it), answers every `host.config` with `host.config.applied`, sends heartbeats for its running runs,
  * reconnects with its active runs after a dropped connection, and accepts every `run.assign` at once.
  *
  * What a run then does is scripted, by a marker in the person's message (the prompt's `# Request`) or by the
@@ -792,8 +792,8 @@ export class ScriptedRunner {
 
   /**
    * One model request through the server's relay with the run's token, as the runtime would send it, and with this
-   * host's own token in `X-Tinfirm-Runner-Token`, as the model proxy of runner host 0.3.0 and later sends it: the
-   * relay requires it by default (`TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN`), whatever version the host said in `hello`.
+   * host's own token in `X-Tinfirm-Runner-Token`, as the model proxy of every host of protocol 2 sends it: the relay
+   * requires it, whatever version the host said in `hello` (ADR-0109).
    */
   async callModel(runId: string, body?: Json): Promise<{ status: number; body: unknown }> {
     const run = this.active(runId);

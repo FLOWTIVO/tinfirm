@@ -29,7 +29,6 @@ import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.FakeLiteLlm;
-import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 import com.flowtivo.tinfirm.support.ModelGateways;
 import com.flowtivo.tinfirm.support.TestRuns;
@@ -40,9 +39,6 @@ import tools.jackson.databind.json.JsonMapper;
  * The model relay under an operator's settings other than the defaults, set through their properties in a context of
  * its own ({@link ModelRelayTest} has the defaults):
  * <ul>
- * <li>{@code TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN} on (the package 2 contract, open point 6): a run's token without
- * its runner host's own token is refused from every host, an older one that does not send it and one that never said
- * its version included;</li>
  * <li>{@code TINFIRM_MODEL_RELAY_MAX_INFLIGHT_BYTES} of 3 MiB with bodies of at most 1 MiB: a body beyond what the
  * replica may hold while others are relayed is 429 with {@code Retry-After}, declared or streamed, and the bytes come
  * back when those requests end;</li>
@@ -51,8 +47,7 @@ import tools.jackson.databind.json.JsonMapper;
  * and a body still arriving after the deadline is 408.</li>
  * </ul>
  */
-@TestPropertySource(properties = { "tinfirm.model.relay-require-host-token=true",
-        "tinfirm.model.relay-max-request-bytes=1048576", "tinfirm.model.relay-max-inflight-bytes=3145728",
+@TestPropertySource(properties = { "tinfirm.model.relay-max-request-bytes=1048576", "tinfirm.model.relay-max-inflight-bytes=3145728",
         "tinfirm.model.relay-body-timeout=PT3S" })
 class ModelRelaySettingsTest extends IntegrationTest {
 
@@ -90,28 +85,6 @@ class ModelRelaySettingsTest extends IntegrationTest {
         ModelGateways.awaitKey(litellm, company, payer);
         ModelGateways.awaitStatus(owner, company, payer, "OK");
         return new Setup(company, owner, payer);
-    }
-
-    @Test
-    void everyHostMustSendItsOwnToken() {
-        Setup setup = setUp();
-        RunnerHostRef older = registerRunnerHost(setup.owner(), setup.company().id(), unique("older"), "COMPANY");
-        try (FakeRunner runner = FakeRunner.connect(port, older.token())) {
-            runner.helloV2AndWelcome(List.of(), List.of(), "0.2.0", 2);
-        }
-        RunnerHostRef silent = registerRunnerHost(setup.owner(), setup.company().id(), unique("silent"), "COMPANY");
-        int before = litellm.requests("/v1/messages").size();
-
-        // A host of 0.2.0, which does not send its token: refused without it, through with it.
-        String token = running(setup, older.id());
-        assertThat(post(token, null, BODY).statusCode()).isEqualTo(401);
-        assertThat(post(token, older.token(), BODY).statusCode()).isEqualTo(200);
-        assertThat(post(token, silent.token(), BODY).statusCode()).isEqualTo(401);
-        // A host that never said its version: the same.
-        String unknown = running(setup, silent.id());
-        assertThat(post(unknown, null, BODY).statusCode()).isEqualTo(401);
-        assertThat(post(unknown, silent.token(), BODY).statusCode()).isEqualTo(200);
-        assertThat(litellm.requests("/v1/messages")).hasSize(before + 2);
     }
 
     @Test

@@ -114,6 +114,8 @@ pub struct HostOptions {
     /// `run --upload-max-bytes`, by default the server's own default limit (25 MiB). A larger
     /// file is refused on its size before it is read.
     pub upload_max_bytes: u64,
+    /// `hello.runnerVersion`: the release's version ([`crate::version::RUNNER_VERSION`]),
+    /// which the server shows and decides nothing from (ADR-0109).
     pub runner_version: String,
 }
 
@@ -148,7 +150,7 @@ impl HostOptions {
             bridge: None,
             pool: crate::pool::PoolOptions::default(),
             upload_max_bytes: crate::attachments::DEFAULT_UPLOAD_MAX_BYTES,
-            runner_version: env!("CARGO_PKG_VERSION").to_string(),
+            runner_version: crate::version::RUNNER_VERSION.to_string(),
         }
     }
 
@@ -2837,6 +2839,15 @@ mod tests {
         let v2 = Shared::new(opts, config.clone());
         let hello = v2.hello().await;
         assert_eq!(hello.protocol_version, 2);
+        // The release's version, the workspace's: a semantic version alone, never the build
+        // label that `--version` adds (ADR-0109).
+        assert_eq!(hello.runner_version, crate::version::RUNNER_VERSION);
+        assert_eq!(hello.runner_version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            !hello.runner_version.contains(' '),
+            "{}",
+            hello.runner_version
+        );
         assert_eq!(hello.isolation_tiers, vec![IsolationTier::Microvm]);
         assert!(v2.speaks_v2());
         let runtimes: Vec<Runtime> = hello.runtimes.iter().map(|r| r.runtime).collect();

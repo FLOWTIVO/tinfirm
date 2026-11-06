@@ -56,7 +56,7 @@ class RunLeaseIntegrationTest extends RunTestBench {
     private Running running() {
         Bench bench = bench(true);
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.companyId(), unique("host"), "COMPANY");
-        FakeRunner runner = connect(host, GATEWAY_VERSION, 4);
+        FakeRunner runner = connect(host, RUNNER_VERSION, 4);
         Turn turn = start(bench);
         String token = expectAssign(runner, turn.runId()).get("modelAccess").get("apiKey").asString();
         runner.accepted(turn.runId(), 1);
@@ -77,7 +77,7 @@ class RunLeaseIntegrationTest extends RunTestBench {
     void aLostRunIsResumedWhenItsHostComesBackWithItAndItsTokenAnswersAgain() {
         Running run = running();
         Bench bench = run.bench();
-        assertThat(relay(run.token())).isEqualTo(200);
+        assertThat(relay(run.token(), run.host().token())).isEqualTo(200);
 
         // The host goes away for longer than the grace: the run is lost (LEASE_EXPIRED), the conversation told.
         run.runner().abort();
@@ -92,23 +92,23 @@ class RunLeaseIntegrationTest extends RunTestBench {
         assertThat(TestTurns.conversation(run.turn().conversationId()).ends).singleElement()
             .satisfies(end -> assertThat(end.status()).isEqualTo(RunStatus.LOST));
         // Its token is inactive while it is lost, but not revoked: the run may come back.
-        assertThat(relay(run.token())).isEqualTo(401);
+        assertThat(relay(run.token(), run.host().token())).isEqualTo(401);
         assertThat(query(bench.companyId(), "SELECT count(*) FROM run_model_token WHERE run_id = ? "
                 + "AND revoked_at IS NULL", run.turn().runId())).isEqualTo(1L);
 
         // The host reconnects within the resume window and still runs it: the conversation takes it back.
         try (FakeRunner again = FakeRunner.connect(port, run.host().token())) {
             again.helloV2AndWelcome(List.of(), List.of(Map.of("runId", run.turn().runId().toString(), "epoch", 1,
-                    "lastSeq", 0)), GATEWAY_VERSION, 4);
+                    "lastSeq", 0)), RUNNER_VERSION, 4);
             awaitRun(bench, run.turn().runId(), "RUNNING");
             again.expectNone("run.cancel", Duration.ofSeconds(1));
             assertThat(TestTurns.conversation(run.turn().conversationId()).resumed).hasSize(1);
-            assertThat(relay(run.token())).isEqualTo(200);
+            assertThat(relay(run.token(), run.host().token())).isEqualTo(200);
             assertThat(auditEvents(bench.owner(), bench.company(), "run.resumed")).hasSize(1);
 
             again.send(finished(run.turn().runId(), 1, "SUCCEEDED", 0, "Done after all.", "session-r"));
             awaitRun(bench, run.turn().runId(), "SUCCEEDED");
-            assertThat(relay(run.token())).isEqualTo(401);
+            assertThat(relay(run.token(), run.host().token())).isEqualTo(401);
             again.assertFramesValid();
         }
     }
@@ -126,7 +126,7 @@ class RunLeaseIntegrationTest extends RunTestBench {
 
         try (FakeRunner again = FakeRunner.connect(port, run.host().token())) {
             again.helloV2AndWelcome(List.of(), List.of(Map.of("runId", run.turn().runId().toString(), "epoch", 1,
-                    "lastSeq", 0)), GATEWAY_VERSION, 4);
+                    "lastSeq", 0)), RUNNER_VERSION, 4);
             assertThat(again.expect("run.cancel").get("runId").asString()).isEqualTo(run.turn().runId().toString());
             assertThat(getRun(bench, run.turn().runId()).get("status").asString()).isEqualTo("LOST");
         }
@@ -175,7 +175,7 @@ class RunLeaseIntegrationTest extends RunTestBench {
             // ... while the host comes back with the lost run: the hello's reconciliation waits for that turn.
             try (FakeRunner again = FakeRunner.connect(port, run.host().token())) {
                 again.helloV2AndWelcome(List.of(), List.of(Map.of("runId", lostId.toString(), "epoch", 1, "lastSeq",
-                        0)), GATEWAY_VERSION, 4);
+                        0)), RUNNER_VERSION, 4);
                 await().atMost(WAIT).until(() -> blockedBy(bench.companyId(), turnPid.get()) > 0);
                 commit.countDown();
                 UUID nextId = next.get(30, TimeUnit.SECONDS).orElseThrow();
@@ -211,7 +211,7 @@ class RunLeaseIntegrationTest extends RunTestBench {
         // The host still holds the finished run: it lists it in hello and sends its end again.
         try (FakeRunner again = FakeRunner.connect(port, run.host().token())) {
             again.helloV2AndWelcome(List.of(), List.of(Map.of("runId", runId.toString(), "epoch", 1, "lastSeq", 0)),
-                    GATEWAY_VERSION, 4);
+                    RUNNER_VERSION, 4);
             again.send(finished(runId, 1, "SUCCEEDED", 0, "Done before the restart.", "session-f"));
             awaitRun(bench, runId, "SUCCEEDED");
             assertThat(getRun(bench, runId).get("summary").asString()).isEqualTo("Done before the restart.");
@@ -236,12 +236,12 @@ class RunLeaseIntegrationTest extends RunTestBench {
 
         // The host comes back without the run: it restarted, the run is lost and cancelled on it.
         try (FakeRunner again = FakeRunner.connect(port, run.host().token())) {
-            again.helloV2AndWelcome(List.of(), List.of(), GATEWAY_VERSION, 4);
+            again.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, 4);
             awaitRun(bench, run.turn().runId(), "LOST");
             assertThat(query(bench.companyId(), "SELECT lost_cause FROM run WHERE id = ?", run.turn().runId()))
                 .isEqualTo("HOST_RESTARTED");
             assertThat(again.expect("run.cancel").get("runId").asString()).isEqualTo(run.turn().runId().toString());
-            assertThat(relay(run.token())).isEqualTo(401);
+            assertThat(relay(run.token(), run.host().token())).isEqualTo(401);
             again.assertFramesValid();
         }
     }
@@ -276,7 +276,7 @@ class RunLeaseIntegrationTest extends RunTestBench {
             assertThat(runner.expect("error").get("code").asString()).isEqualTo("UNKNOWN_RUN");
 
             // Another host of the company may not speak for the run.
-            try (FakeRunner other = companyHost(bench, GATEWAY_VERSION, 1)) {
+            try (FakeRunner other = companyHost(bench, RUNNER_VERSION, 1)) {
                 other.event(run.turn().runId(), 1, 2, "AGENT_MESSAGE", Map.of("text", "Not mine."));
                 assertThat(other.expect("error").get("code").asString()).isEqualTo("UNKNOWN_RUN");
                 other.assertFramesValid();

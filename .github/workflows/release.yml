@@ -160,6 +160,9 @@ jobs:
         pom:server/pom.xml:tinfirm-server
         pom:model-api/pom.xml:tinfirm-model-api
         npm:web
+        # The runner host's workspace (ADR-0109): its --version and hello.runnerVersion are
+        # the release's version, as are its assets' names and its image's tag.
+        cargo:runner
       # The model port (ADR-0069) and the runner host's image (ADR-0101, decision 8) are
       # released with the server, under the same version: the chart's
       # litellm.modelApi.image.tag and runner.image.tag default to the server's.

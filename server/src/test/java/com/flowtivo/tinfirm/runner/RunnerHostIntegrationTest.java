@@ -59,7 +59,7 @@ class RunnerHostIntegrationTest extends IntegrationTest {
         assertThat(host.get("ownerPrincipalId").asString()).isEqualTo(memberPrincipal.toString());
         assertThat(host.get("ownerDisplay").asString()).startsWith("User ");
         assertThat(host.get("online").asBoolean()).isFalse();
-        assertThat(host.get("gatewayRuns").asBoolean()).isFalse();
+        assertThat(host.has("gatewayRuns")).isFalse();
         assertThat(host.get("activeRuns").asInt()).isZero();
         assertThat(host.get("credentials")).isEmpty();
 
@@ -138,7 +138,6 @@ class RunnerHostIntegrationTest extends IntegrationTest {
             JsonNode listed = owner.get(company.path("/runner-hosts")).json().get("items").get(0);
             assertThat(listed.get("online").asBoolean()).isTrue();
             assertThat(listed.get("version").asString()).isEqualTo("0.1.0-test");
-            assertThat(listed.get("gatewayRuns").asBoolean()).isFalse();
             assertThat(listed.get("hostname").asString()).isEqualTo("test-host");
             assertThat(listed.get("os").asString()).isEqualTo("linux");
             assertThat(listed.get("arch").asString()).isEqualTo("x86_64");
@@ -213,7 +212,7 @@ class RunnerHostIntegrationTest extends IntegrationTest {
 
         try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
             Map<String, Object> hello = FakeRunner.hello(List.of(FakeRunner.claudeCredential("claude-max")), List.of());
-            hello.put("runnerVersion", "0.2.0");
+            hello.put("runnerVersion", "9.9.9");
             runner.send(hello);
             runner.expect("welcome");
             runner.expect("host.config");
@@ -225,9 +224,8 @@ class RunnerHostIntegrationTest extends IntegrationTest {
             JsonNode listed = admin.get(company.path("/runner-hosts")).json().get("items").get(0);
             assertThat(listed.get("online").asBoolean()).isTrue();
             assertThat(listed.get("credentials")).isEmpty();
-            // 0.2.0 has the always-on model proxy: runs paid by a budget may go to it.
-            assertThat(listed.get("version").asString()).isEqualTo("0.2.0");
-            assertThat(listed.get("gatewayRuns").asBoolean()).isTrue();
+            // The version is stored and shown as the host said it, and decides nothing (ADR-0109).
+            assertThat(listed.get("version").asString()).isEqualTo("9.9.9");
             runner.assertFramesValid();
         }
     }

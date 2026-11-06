@@ -93,7 +93,7 @@ The Helm chart `deploy/helm/tinfirm` deploys the server through GitOps, on an ex
 
 A single Compose host can instead follow `main`: CI publishes every commit that passes the gate, and a timer on the host deploys it ([docs/operations/auto-deploy.md](docs/operations/auto-deploy.md)).
 
-Runner hosts run on your own machines or VMs ([runner/README.md](runner/README.md); with Kata Containers, [deploy/ansible/README.md](deploy/ansible/README.md)). They speak runner protocol v2 by default. The server accepts a v1 host's connection but runs conversations on v2 hosts only ([docs/operations/runner-protocol-v2.md](docs/operations/runner-protocol-v2.md)). A run paid from a LiteLLM budget goes only to a runner host of version 0.2.0 or later, whose model proxy is always on ([runner/README.md](runner/README.md#model-proxy)).
+Runner hosts run on your own machines or VMs ([runner/README.md](runner/README.md); with Kata Containers, [deploy/ansible/README.md](deploy/ansible/README.md)). They speak runner protocol v2 by default. The server accepts a v1 host's connection but runs conversations on v2 hosts only ([docs/operations/runner-protocol-v2.md](docs/operations/runner-protocol-v2.md)). Every host of protocol 2 keeps a run's model token out of the sandbox: its model proxy is always on ([runner/README.md](runner/README.md#model-proxy)). Any runner host release that speaks a protocol the server supports works with it ([runner/README.md](runner/README.md#compatibility-with-the-server)).
 
 Read the [threat model](docs/threat-model.md) before you expose an instance. To report a vulnerability, follow [SECURITY.md](SECURITY.md).
 

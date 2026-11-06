@@ -40,7 +40,7 @@ class RunEventIntegrationTest extends RunTestBench {
     @Test
     void eventsAreStoredPagedAndStreamedLiveToWhoSeesTheRun() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             runner.accepted(turn.runId(), 1);
@@ -123,7 +123,7 @@ class RunEventIntegrationTest extends RunTestBench {
         String demotedEmail = uniqueEmail("demoted-owner");
         UUID demotedId = createUser(admin(), demotedEmail, false);
         addMember(bench.owner(), bench.companyId(), demotedEmail, "OWNER");
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             runner.accepted(turn.runId(), 1);
@@ -153,7 +153,7 @@ class RunEventIntegrationTest extends RunTestBench {
         // L1: logout deletes the HTTP session; the stream opened with it ends at its next check, with no frame more,
         // while the run goes on and another person's stream (OWNER's, on its own session) is unaffected.
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             runner.accepted(turn.runId(), 1);
@@ -178,7 +178,7 @@ class RunEventIntegrationTest extends RunTestBench {
     @Test
     void anEventOfARunThatEndedIsDropped() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 4)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 4)) {
             Turn turn = start(bench);
             expectAssign(runner, turn.runId());
             runner.accepted(turn.runId(), 1);

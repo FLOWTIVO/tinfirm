@@ -13,12 +13,12 @@ import com.flowtivo.tinfirm.model.RunModelAccess;
 import com.flowtivo.tinfirm.model.RunModelContext;
 import com.flowtivo.tinfirm.runner.RunnerDirectory;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
-import com.flowtivo.tinfirm.runner.RunnerVersions;
 
 /**
  * {@link Hosts#eligible} (the package 2 contract, §5.2; M4, M5): a personal host takes only its owner's work (their
  * budget or subscription, and only their own workspace accounts); a company host takes any budget-paid run and no
- * subscription. A budget-paid run also needs the always-on model proxy ({@link RunnerVersions}).
+ * subscription. Every host that speaks runner protocol 2 has the always-on model proxy (ADR-0109), and dispatch takes
+ * only such hosts, so no version is asked here.
  */
 @Component
 class HostsImpl implements Hosts {
@@ -47,17 +47,12 @@ class HostsImpl implements Hosts {
             .filter(host -> host.serves(context.runtime()))
             .filter(host -> host.company() || ownWorkspace && host.personalOf(payer))
             .toList();
-        List<RunnerHostInfo> eligible = candidates.stream().filter(RunnerHostInfo::gatewayRuns).toList();
-        if (!eligible.isEmpty()) {
-            return new Eligibility.Eligible(eligible, null);
+        if (!candidates.isEmpty()) {
+            return new Eligibility.Eligible(candidates, null);
         }
         String which = ownWorkspace ? "No company runner host, and no personal host of the paying principal,"
                 : "No company runner host";
-        String whyNone = candidates.isEmpty() ? which + " can run the runtime " + context.runtime()
-                : "No runner host that can run the runtime " + context.runtime() + " has runner version "
-                        + RunnerVersions.MODEL_PROXY_ALWAYS_ON + " or later, whose model proxy keeps the run's "
-                        + "token out of the sandbox";
-        return new Eligibility.Eligible(List.of(), whyNone);
+        return new Eligibility.Eligible(List.of(), which + " can run the runtime " + context.runtime());
     }
 
     private static Eligibility subscription(RunModelContext context, UUID payer,

@@ -73,7 +73,6 @@ export function aRunnerHost(overrides: Partial<RunnerHost> = {}): RunnerHost {
     ownerDisplay: null,
     online: true,
     draining: false,
-    gatewayRuns: true,
     version: '0.2.0',
     os: 'linux',
     arch: 'amd64',

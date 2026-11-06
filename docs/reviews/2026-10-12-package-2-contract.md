@@ -114,6 +114,8 @@ Package 6's replica work covers relayed streams like the run's other in-flight s
 
 ## 7. The model proxy, always on
 
+*Note, 2026-11-06: [ADR-0109](../adr/0109-runner-version-is-the-release-version.md) replaced the minimum runner version below: the always-on proxy and the host's own token at the relay are part of runner protocol 2, and the server reads no runner version.*
+
 The runner host's model proxy (ADR-0059) is always on for a run whose `modelAccess` is a gateway, with no option to turn it off. The protocol does not change, so the server cannot tell a host that proxies from an older one: gateway keys are sent only once the company's hosts run a version with the always-on proxy (the minimum runner version is checked from `hello.runnerVersion`, which the protocol already carries). The proxy's gateway is the server's relay (§6.1), so a runner host on the same machine as the server names the server's https origin with `--model-proxy-local-gateway`, and one that reaches the server at a private address needs `--egress-allow-private`.
 
 ## 8. API

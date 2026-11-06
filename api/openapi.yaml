@@ -273,8 +273,8 @@ tags:
       their own accounts) and is the only kind that holds credentials of its own, its owner's subscriptions. The scope
       is chosen at registration and never changes. A member sees and manages only their own personal hosts; OWNER and
       ADMIN see the company hosts and their own personal hosts, and another member's personal host is 404 to them as to
-      anyone. Runs paid by a budget go only to hosts of runner version 0.2.0 or later (`gatewayRuns`), whose model proxy
-      is always on.
+      anyone. A host's runner version (`version`) is shown and decides nothing: every host that speaks runner protocol 2
+      has the always-on model proxy and may take runs paid by a budget (ADR-0109).
   - name: ModelSettings
     description: |
       The company's model gateway (the package 2 contract, §3.1, §6, §8; ADR-0059, ADR-0094): the LiteLLM bundled
@@ -10691,7 +10691,7 @@ components:
       description: |
         A runner host with its live status and capacity (CONVENTIONS §15.4, ADR-0016), company or personal (the package
         2 contract, §2).
-      required: [id, name, scope, online, draining, gatewayRuns, maxConcurrentRuns, maxConcurrentRunsCeiling, configPending, activeRuns, credentials, createdAt]
+      required: [id, name, scope, online, draining, maxConcurrentRuns, maxConcurrentRunsCeiling, configPending, activeRuns, credentials, createdAt]
       properties:
         id: { type: string, format: uuid }
         name: { type: string, example: my-laptop }
@@ -10712,12 +10712,12 @@ components:
             True while the connected host finishes its active runs before it exits (SIGHUP or
             `tinfirm-runner-host drain`, e.g. for an upgrade). It takes no new runs. False when the host is offline.
         lastSeenAt: { type: string, format: date-time, nullable: true }
-        version: { type: string, nullable: true }
-        gatewayRuns:
-          type: boolean
+        version:
+          type: string
+          nullable: true
           description: |
-            Whether the host's runner version (0.2.0 or later, as last reported) has the always-on model proxy, so that
-            runs paid by a budget may go to it (the package 2 contract, §7)
+            The runner host's release version, as its latest `hello.runnerVersion` said; null before it first connects.
+            Shown only: compatibility is the runner protocol and its features, never this version (ADR-0109)
         hostname: { type: string, nullable: true }
         os: { type: string, nullable: true }
         arch: { type: string, nullable: true }

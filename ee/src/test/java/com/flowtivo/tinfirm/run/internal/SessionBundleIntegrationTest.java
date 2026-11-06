@@ -478,7 +478,7 @@ class SessionBundleIntegrationTest extends RunTestBench {
     @Test
     void aHostWithoutTheFeatureGetsNoSessionBundle() {
         Bench bench = bench(true);
-        try (FakeRunner runner = companyHost(bench, GATEWAY_VERSION, 2)) {
+        try (FakeRunner runner = companyHost(bench, RUNNER_VERSION, 2)) {
             Turn first = start(bench);
             JsonNode assign = expectAssign(runner, first.runId());
             assertThat(assign.has("sessionBundle")).isFalse();
@@ -615,7 +615,7 @@ class SessionBundleIntegrationTest extends RunTestBench {
     /** A company host whose {@code hello} lists {@code session.bundle}. */
     private FakeRunner bundleHost(RunnerHostRef host) {
         FakeRunner runner = FakeRunner.connect(port, host.token());
-        Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of(), GATEWAY_VERSION, 4);
+        Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of(), RUNNER_VERSION, 4);
         hello.put("features", List.of("session.bundle"));
         runner.send(hello);
         runner.expect("welcome");

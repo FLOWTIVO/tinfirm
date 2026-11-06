@@ -208,7 +208,7 @@ class ConversationOutputsEndToEndTest extends ConversationTestBench {
 
     private FakeRunner connect(RunnerHostRef host) {
         FakeRunner runner = FakeRunner.connect(port, host.token());
-        runner.helloV2AndWelcome(List.of(), List.of(), GATEWAY_VERSION, 4);
+        runner.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, 4);
         await().atMost(WAIT).until(() -> connections.isConfigured(host.id()));
         return runner;
     }

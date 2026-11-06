@@ -28,8 +28,8 @@ import com.flowtivo.tinfirm.support.TenantSql;
 /**
  * The two rules package 3 asks before it dispatches, as tables (the package 2 contract, §5, §11): who pays for a run
  * ({@link ModelAccess#forRun}: M2, M3, the redesign's V7, nobody else pays) and where it may run
- * ({@link Hosts#eligible}: M4, M5, V8, a personal host runs only its owner's work; the minimum runner version of a
- * gateway's runs). Also which models a key's list allows ({@link RunModelAccess#allows}), the one matcher of the
+ * ({@link Hosts#eligible}: M4, M5, V8, a personal host runs only its owner's work; no runner version is asked,
+ * ADR-0109). Also which models a key's list allows ({@link RunModelAccess#allows}), the one matcher of the
  * relay, of settings and of turns.
  */
 class ModelAccessRulesTest extends IntegrationTest {
@@ -184,18 +184,21 @@ class ModelAccessRulesTest extends IntegrationTest {
         UUID q = memberPrincipal(company, company.userId("ADMIN"));
         UUID service = createServiceIdentity(owner, company, unique("bot"));
         RunnerHostRef company1 = registerRunnerHost(owner, company.id(), unique("company-new"), "COMPANY");
-        RunnerHostRef companyOld = registerRunnerHost(owner, company.id(), unique("company-old"), "COMPANY");
+        RunnerHostRef companyLow = registerRunnerHost(owner, company.id(), unique("company-low"), "COMPANY");
         RunnerHostRef companyCodex = registerRunnerHost(owner, company.id(), unique("company-codex"), "COMPANY");
         RunnerHostRef pHost = registerRunnerHost(member, company.id(), unique("p-laptop"));
         RunnerHostRef qHost = registerRunnerHost(admin, company.id(), unique("q-laptop"));
-        // Before any host said hello, none has a version with the always-on model proxy: none takes a budget's run.
+        // Before any host said hello, its version is unknown, and that decides nothing (ADR-0109): every host may
+        // take a budget's run, and dispatch then takes only those connected over protocol v2.
         Hosts.Eligibility.Eligible before = (Hosts.Eligibility.Eligible) eligible(company, p,
                 ModelAccessChoice.BUDGET, CLAUDE, Set.of());
-        assertThat(before.hosts()).isEmpty();
-        assertThat(before.whyNone()).contains("0.2.0");
+        assertThat(before.hosts()).extracting(RunnerHostInfo::id)
+            .containsExactlyInAnyOrder(company1.id(), companyLow.id(), companyCodex.id(), pHost.id());
+        assertThat(before.whyNone()).isNull();
+        // Any valid version, low or high, is neither refused nor limited.
         hello(company1, "0.2.0", List.of("CLAUDE_CODE", "CODEX"), List.of());
-        hello(companyOld, "0.1.9", List.of("CLAUDE_CODE", "CODEX"), List.of());
-        hello(companyCodex, "0.3.0", List.of("CODEX"), List.of());
+        hello(companyLow, "0.0.1", List.of("CLAUDE_CODE", "CODEX"), List.of());
+        hello(companyCodex, "9.9.9", List.of("CODEX"), List.of());
         hello(pHost, "0.2.1", List.of("CLAUDE_CODE"), List.of(FakeRunner.claudeCredential("claude-max")));
         hello(qHost, "0.2.0", List.of("CLAUDE_CODE"), List.of(FakeRunner.claudeCredential("claude-max")));
 
@@ -205,17 +208,17 @@ class ModelAccessRulesTest extends IntegrationTest {
         ModelAccessChoice pSubscription = new ModelAccessChoice.Subscription(pHost.id(), "claude-max");
         List<Row> rows = List.of(
                 new Row("budget, no workspace: company hosts and the payer's own", p, ModelAccessChoice.BUDGET,
-                        CLAUDE, Set.of(), Set.of(company1.id(), pHost.id())),
+                        CLAUDE, Set.of(), Set.of(company1.id(), companyLow.id(), pHost.id())),
                 new Row("budget, every account the payer's", p, ModelAccessChoice.BUDGET, CLAUDE, Set.of(p),
-                        Set.of(company1.id(), pHost.id())),
+                        Set.of(company1.id(), companyLow.id(), pHost.id())),
                 new Row("budget, a service identity's account", p, ModelAccessChoice.BUDGET, CLAUDE, Set.of(service),
-                        Set.of(company1.id())),
+                        Set.of(company1.id(), companyLow.id())),
                 new Row("budget, another member's account (a grant)", p, ModelAccessChoice.BUDGET, CLAUDE,
-                        Set.of(p, q), Set.of(company1.id())),
+                        Set.of(p, q), Set.of(company1.id(), companyLow.id())),
                 new Row("budget, another runtime", p, ModelAccessChoice.BUDGET, RuntimeKind.CODEX, Set.of(),
-                        Set.of(company1.id(), companyCodex.id())),
+                        Set.of(company1.id(), companyLow.id(), companyCodex.id())),
                 new Row("a service identity's budget", service, ModelAccessChoice.BUDGET, CLAUDE, Set.of(service),
-                        Set.of(company1.id())),
+                        Set.of(company1.id(), companyLow.id())),
                 new Row("subscription, every account the owner's", p, pSubscription, CLAUDE, Set.of(p),
                         Set.of(pHost.id())),
                 new Row("subscription, no workspace", p, pSubscription, CLAUDE, Set.of(), Set.of(pHost.id())));

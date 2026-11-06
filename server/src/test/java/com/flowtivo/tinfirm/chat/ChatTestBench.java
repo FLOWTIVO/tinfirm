@@ -45,7 +45,8 @@ public abstract class ChatTestBench extends IntegrationTest {
 
     public static final Duration WAIT = Duration.ofSeconds(20);
 
-    static final String GATEWAY_VERSION = "0.2.0";
+    /** The runner version its hosts say in {@code hello}: any, since it decides nothing (ADR-0109). */
+    static final String RUNNER_VERSION = "0.2.0";
 
     private static final Pattern LINK = Pattern.compile("/link/([0-9a-f-]{36})#([A-Za-z0-9_-]+)");
 
@@ -94,7 +95,7 @@ public abstract class ChatTestBench extends IntegrationTest {
     protected FakeRunner companyHost(Bench bench, int slots) {
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.id(), unique("host"), "COMPANY");
         FakeRunner runner = FakeRunner.connect(port, host.token());
-        runner.helloV2AndWelcome(List.of(), List.of(), GATEWAY_VERSION, slots);
+        runner.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, slots);
         await().atMost(WAIT).until(() -> connections.isConfigured(host.id()));
         return runner;
     }

@@ -138,7 +138,6 @@ The bundled gateway's variables were called `TINFIRM_LITELLM_ADMIN_URL`, `TINFIR
 |---|---|---|---|
 | `TINFIRM_MODEL_KEY_ROTATION_INTERVAL` | `P30D` | How long after its creation each member's, service account's and company's LiteLLM key is rotated; at least `P1D` | `extraConfig` |
 | `TINFIRM_MODEL_KEY_ROTATION_GRACE` | `PT10M` | How long a key replaced on schedule still serves the requests that hold it; `PT0S` to `PT1H` | `extraConfig` |
-| `TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN` | `true` | Refuse a run's model requests without its runner host's own token from every host: runner host 0.3.0 is the minimum. Set `false` only while a host older than 0.3.0 is being upgraded; such a host is then accepted with a warning. | `extraConfig` |
 | `TINFIRM_MODEL_RELAY_MAX_INFLIGHT_BYTES` | `268435456` (256 MiB) | The most bytes of request bodies the model relay holds at once, counted as they arrive; beyond, `429`. At least twice the largest request, 64 MiB. | `extraConfig` |
 | `TINFIRM_MODEL_RELAY_BODY_TIMEOUT` | `PT30S` | How long the model relay waits for a request's whole body; beyond, `408`. | `extraConfig` |
 | `TINFIRM_MODEL_RELAY_ANTHROPIC_BETAS`, `TINFIRM_MODEL_RELAY_OPENAI_BETAS` | the pinned runtimes' | The `anthropic-beta` and `OpenAI-Beta` values the model relay passes on, comma-separated; any other is dropped. Never add one that lets the provider act for a request (MCP connector, code execution, web fetch). | `extraConfig` |

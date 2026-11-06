@@ -68,7 +68,7 @@ class PublicSuffixPushIntegrationTest extends RunTestBench {
 
     private static Map<String, Object> hello(int protocolVersion, @Nullable String sha256) {
         Map<String, Object> hello = new LinkedHashMap<>(protocolVersion == 2
-                ? FakeRunner.helloV2(List.of(), List.of(), GATEWAY_VERSION, 1) : FakeRunner.hello(List.of(), List.of()));
+                ? FakeRunner.helloV2(List.of(), List.of(), RUNNER_VERSION, 1) : FakeRunner.hello(List.of(), List.of()));
         if (sha256 != null) {
             hello.put("publicSuffixList", Map.of("sha256", sha256));
         }

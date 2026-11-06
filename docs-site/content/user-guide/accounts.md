@@ -124,7 +124,6 @@ Each host shows whether it is **Online**, or **Offline** and when it was last se
 
 - **{n} of {m} slots in use**, and **Up to {k} on this machine**: the ceiling set on the machine. **Runs at a time** lets Tinfirm run fewer, from 1 up to that ceiling, or **Use the machine's limit**. A change applies without a restart and never stops a running run; until the host applies it, the card says so.
 - Its subscriptions as the host reported them, each with its runtimes and its state: **Available**, **Cooling down** (with when it is usable again), **Invalid** or **Host offline**. A subscription the host did not report when it last connected cannot pay for runs.
-- A warning when the host's runner is too old for turns paid by a budget.
 
 ### Remove one
 

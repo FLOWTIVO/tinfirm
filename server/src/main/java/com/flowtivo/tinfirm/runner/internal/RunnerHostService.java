@@ -25,7 +25,6 @@ import com.flowtivo.tinfirm.runner.HostCredentialInfo;
 import com.flowtivo.tinfirm.runner.HostScope;
 import com.flowtivo.tinfirm.runner.RunnerActivity;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
-import com.flowtivo.tinfirm.runner.RunnerVersions;
 import com.flowtivo.tinfirm.shared.access.CompanyAccess;
 import com.flowtivo.tinfirm.shared.access.CompanyAccessGuard;
 import com.flowtivo.tinfirm.shared.access.CompanyPermission;
@@ -440,8 +439,8 @@ class RunnerHostService {
                 .toList();
             return new RunnerViews.HostDetails(host.id(), host.name(), host.scope().name(), owner,
                     owner != null ? owners.getOrDefault(owner, DELETED_USER) : null, online,
-                    online && host.draining(), host.lastSeenAt(), host.runnerVersion(),
-                    RunnerVersions.supportsGatewayRuns(host.runnerVersion()), host.hostname(), host.os(), host.arch(),
+                    online && host.draining(), host.lastSeenAt(), host.runnerVersion(), host.hostname(), host.os(),
+                    host.arch(),
                     host.maxConcurrentRuns(), host.maxConcurrentRunsCeiling(), host.desiredMaxConcurrentRuns(),
                     host.configPending(), activeRuns.getOrDefault(host.id(), 0), hostCredentials, host.createdAt(),
                     host.scope() == HostScope.COMPANY ? poolDetails.get(host.id()) : null);

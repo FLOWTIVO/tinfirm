@@ -19,7 +19,7 @@ final class RunnerViews {
      */
     record HostDetails(UUID id, String name, String scope, @Nullable UUID ownerPrincipalId,
             @Nullable String ownerDisplay, boolean online, boolean draining, @Nullable Instant lastSeenAt,
-            @Nullable String version, boolean gatewayRuns, @Nullable String hostname, @Nullable String os,
+            @Nullable String version, @Nullable String hostname, @Nullable String os,
             @Nullable String arch, int maxConcurrentRuns, int maxConcurrentRunsCeiling,
             @Nullable Integer desiredMaxConcurrentRuns, boolean configPending, int activeRuns,
             List<CredentialDetails> credentials, Instant createdAt, @Nullable PoolDetails pool) {

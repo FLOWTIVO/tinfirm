@@ -96,12 +96,14 @@ class ModelRelayServiceTest {
         assertThat(new String(result.bytes())).isEqualTo("{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":1}");
     }
 
-    /** The defaults an operator gets without a variable (M1, M3 and I8 of the security review of 2026-10-27). */
+    /**
+     * The defaults an operator gets without a variable (M1 and M3 of the security review of 2026-10-27). The host's own
+     * token is required with no setting at all (I8; ADR-0109).
+     */
     @Test
-    void theDefaultsRequireTheHostsTokenBoundTheBodyAndPassOnlyKnownBetas() {
+    void theDefaultsBoundTheBodyAndPassOnlyKnownBetas() {
         ModelProperties defaults = new Binder(new MapConfigurationPropertySource(Map.of()))
             .bindOrCreate("tinfirm.model", Bindable.of(ModelProperties.class));
-        assertThat(defaults.relayRequireHostToken()).isTrue();
         assertThat(defaults.relayBodyTimeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(defaults.relayAnthropicBetas()).isEqualTo(ModelProperties.ANTHROPIC_BETAS)
             .contains("claude-code-20250219", "interleaved-thinking-2025-05-14",
@@ -207,6 +209,6 @@ class ModelRelayServiceTest {
     private static ModelProperties properties(long maxRequestBytes, long maxInflightBytes) {
         return new ModelProperties(null, null, Duration.ofSeconds(10), Duration.ofMinutes(5), Duration.ofMinutes(10),
                 maxRequestBytes, 16, 16, Duration.ofDays(30), Duration.ofMinutes(10), Duration.ofMinutes(1),
-                maxInflightBytes, false, null, Duration.ofSeconds(30), null, null, GatewayVendor.LITELLM);
+                maxInflightBytes, null, Duration.ofSeconds(30), null, null, GatewayVendor.LITELLM);
     }
 }

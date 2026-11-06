@@ -41,11 +41,11 @@ The page updates every 10 seconds. Each host's card shows:
 | **Offline · last seen** and a time | Not connected; its turns wait or go to another host |
 | **Offline · never connected** | Registered, but never logged in and started |
 | **Draining** | Finishing its turns before it restarts, usually for an upgrade. It takes no new turn: **Finishing** so many runs **before it stops; it takes no new runs.** |
-| The version, platform and machine name | Such as `v0.3.0 · linux/x86_64 · build-01` |
+| The version, platform and machine name | Such as `v1.0.0 · linux/x86_64 · build-01` |
 | **… of … slots in use** | The turns running now, of the slots it has |
 | **Up to … on this machine** | Its ceiling: the most turns at a time the machine's owner allows |
 
-A host whose runner is older than 0.2.0 says that it **is too old for turns paid by a budget**, and runs nothing for the company until it is upgraded. When hosts are registered but none takes turns, because none is online, new enough and not draining, the page warns **No company host takes turns now**.
+The version is the runner host's release, shown for support: any release that speaks runner protocol 2 takes turns ([Runner host reference](../reference/runner-host.md#compatibility)). When hosts are registered but none takes turns, because none is online and not draining, the page warns **No company host takes turns now**.
 
 ## Runs at a time
 

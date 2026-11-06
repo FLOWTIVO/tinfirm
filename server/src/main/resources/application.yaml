@@ -269,10 +269,6 @@ tinfirm:
     # rotation an admin asks for gives the old key no grace (CONVENTIONS §15.4).
     key-rotation-interval: ${TINFIRM_MODEL_KEY_ROTATION_INTERVAL:P30D}
     key-rotation-grace: ${TINFIRM_MODEL_KEY_ROTATION_GRACE:PT10M}
-    # The model relay refuses a run's token without its runner host's own token from every host (the package 2
-    # contract, open point 6): on by default, runner 0.3.0 is the minimum (I8 of the security review of 2026-10-27).
-    # Off, a host before runner 0.3.0 may leave it out: only while such a host is being upgraded.
-    relay-require-host-token: ${TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN:true}
     # The most bytes of request bodies the model relay holds at once on a replica (each counted twice while it is read
     # and written anew, as its bytes arrive); a body beyond it is 429. At least twice relay-max-request-bytes (64 MiB).
     relay-max-inflight-bytes: ${TINFIRM_MODEL_RELAY_MAX_INFLIGHT_BYTES:268435456}

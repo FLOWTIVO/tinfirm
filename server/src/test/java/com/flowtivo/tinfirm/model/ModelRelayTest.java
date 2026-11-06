@@ -15,6 +15,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -52,8 +53,9 @@ import tools.jackson.databind.json.JsonMapper;
  * does not allow refused; the answer streamed through as it arrives; the size and concurrency limits; what LiteLLM's
  * refusals do to the key; and a new admin key of a company's own gateway, which turns the relay off until the gateway
  * passes its test again; and the runner host's own token next to the run's (open point 6): only the run's own host's,
- * required from a host of runner 0.3.0, and left out by an older one. The runs are rows written by {@link TestRuns},
- * which the run module's {@code RunModelTokens} answers for.
+ * required from every host whatever its runner version (ADR-0109). Every request sends its setup's host's token, as
+ * that host's model proxy does, unless a test says otherwise. The runs are rows written by {@link TestRuns}, which the
+ * run module's {@code RunModelTokens} answers for.
  */
 @ExtendWith(OutputCaptureExtension.class)
 class ModelRelayTest extends IntegrationTest {
@@ -64,7 +66,7 @@ class ModelRelayTest extends IntegrationTest {
 
     private static final String RESPONSES = "/api/runner/v1/model/openai/v1/responses";
 
-    /** The runner host's own token, which its model proxy sends from runner 0.3.0 on. */
+    /** The runner host's own token, which the model proxy of every host of runner protocol 2 sends (ADR-0109). */
     static final String HOST_TOKEN = "X-Tinfirm-Runner-Token";
 
     private final HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
@@ -73,6 +75,9 @@ class ModelRelayTest extends IntegrationTest {
 
     @Autowired
     private ModelRelay relay;
+
+    /** The host token {@link #post} sends unless its headers name one: the latest setup's host's. */
+    private String hostToken;
 
     @Autowired
     private SystemTransactions transactions;
@@ -99,6 +104,7 @@ class ModelRelayTest extends IntegrationTest {
         FakeLiteLlm.Key key = ModelGateways.awaitKey(litellm, company, payer);
         ModelGateways.awaitStatus(owner, company, payer, "OK");
         RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("host"), "COMPANY");
+        hostToken = host.token();
         return new Setup(company, owner, payer, key, host.id(), host.token());
     }
 
@@ -121,6 +127,7 @@ class ModelRelayTest extends IntegrationTest {
 
     /** Opens the relay for a new run on the setup's host, running there with epoch 1. */
     private String running(Setup setup, UUID runId) {
+        hostToken = setup.hostToken();
         TestRuns.running(setup.company().id(), runId, 1, setup.hostId(), setup.payer());
         return open(setup, run(setup, runId, 1, setup.hostId()), RunnerMessages.ModelAccessFormat.ANTHROPIC).apiKey();
     }
@@ -133,7 +140,22 @@ class ModelRelayTest extends IntegrationTest {
         return post(path, token, body, Map.of());
     }
 
+    /** A request with the setup's host's token, or the one {@code headers} names. */
     private HttpResponse<String> post(String path, String token, String body, Map<String, String> headers) {
+        if (hostToken == null || headers.containsKey(HOST_TOKEN)) {
+            return send(path, token, body, headers);
+        }
+        Map<String, String> withHostToken = new HashMap<>(headers);
+        withHostToken.put(HOST_TOKEN, hostToken);
+        return send(path, token, body, withHostToken);
+    }
+
+    /** A request without any host token, as a copied run token would be sent. */
+    private HttpResponse<String> postWithoutHostToken(String path, String token, String body) {
+        return send(path, token, body, Map.of());
+    }
+
+    private HttpResponse<String> send(String path, String token, String body, Map<String, String> headers) {
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
             .timeout(Duration.ofSeconds(30))
             .header("Content-Type", "application/json")
@@ -161,8 +183,13 @@ class ModelRelayTest extends IntegrationTest {
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + token)
             .POST(HttpRequest.BodyPublishers.ofString(body));
+        boolean namesHostToken = false;
         for (int i = 0; i < headers.length; i += 2) {
             request.header(headers[i], headers[i + 1]);
+            namesHostToken |= HOST_TOKEN.equalsIgnoreCase(headers[i]);
+        }
+        if (!namesHostToken && hostToken != null) {
+            request.header(HOST_TOKEN, hostToken);
         }
         try {
             return http.send(request.build(), HttpResponse.BodyHandlers.ofString());
@@ -350,6 +377,7 @@ class ModelRelayTest extends IntegrationTest {
     private HttpResponse<String> get(String path, String token) {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
             .header("Authorization", "Bearer " + token)
+            .header(HOST_TOKEN, hostToken)
             .GET()
             .build();
         try {
@@ -415,7 +443,6 @@ class ModelRelayTest extends IntegrationTest {
     @Test
     void aRunsTokenPassesWithItsOwnHostsTokenAndNeverWithAnotherHosts(CapturedOutput output) {
         Setup setup = setUp();
-        hello(setup.hostToken(), "0.3.0");
         RunnerHostRef other = registerRunnerHost(setup.owner(), setup.company().id(), unique("other"), "COMPANY");
         TestCompany elsewhere = companyWithRoles();
         RunnerHostRef foreign = registerRunnerHost(loginAs(elsewhere.email("OWNER")), elsewhere.id(), unique("foreign"),
@@ -462,46 +489,35 @@ class ModelRelayTest extends IntegrationTest {
             .doesNotContain(foreign.token());
     }
 
+    /**
+     * Every host must send its own token, whatever runner version its latest {@code hello} said, low or high, or before
+     * it said any: the relay asks no version (ADR-0109).
+     */
     @Test
-    void withoutItsHostsTokenANewHostsRunIsRefusedAndAnOlderHostsIsAccepted(CapturedOutput output) {
+    void everyHostMustSendItsOwnTokenWhateverItsVersion(CapturedOutput output) {
         Setup setup = setUp();
         String body = message("claude-sonnet-4-5");
-        // A host of runner 0.3.0 always sends its token: a run's token without it is a copy, from anywhere.
-        hello(setup.hostToken(), "0.3.0");
-        String token = running(setup, UUID.randomUUID());
-        HttpResponse<String> refused = post(MESSAGES, token, body);
-        assertThat(refused.statusCode()).isEqualTo(401);
-        assertThat(json(refused).get("error").get("type").asString()).isEqualTo("authentication_error");
-        assertThat(post(MESSAGES, token, body, Map.of(HOST_TOKEN, setup.hostToken())).statusCode()).isEqualTo(200);
+        int before = litellm.requests("/v1/messages").size();
+        for (String version : Arrays.asList("0.0.1", "9.9.9", null)) {
+            RunnerHostRef host = registerRunnerHost(setup.owner(), setup.company().id(), unique("host"), "COMPANY");
+            if (version != null) {
+                hello(host.token(), version);
+            }
+            UUID runId = UUID.randomUUID();
+            TestRuns.running(setup.company().id(), runId, 1, host.id(), setup.payer());
+            String token = open(setup, run(setup, runId, 1, host.id()), RunnerMessages.ModelAccessFormat.ANTHROPIC)
+                .apiKey();
 
-        // An older host, of 0.2.0 (gateway runs, no host token): accepted without it, as before, and warned about once
-        // a day; with its own token it is checked all the same.
-        RunnerHostRef older = registerRunnerHost(setup.owner(), setup.company().id(), unique("older"), "COMPANY");
-        hello(older.token(), "0.2.0");
-        UUID olderRun = UUID.randomUUID();
-        TestRuns.running(setup.company().id(), olderRun, 1, older.id(), setup.payer());
-        String olderToken = open(setup, run(setup, olderRun, 1, older.id()), RunnerMessages.ModelAccessFormat.ANTHROPIC)
-            .apiKey();
-        assertThat(post(MESSAGES, olderToken, body).statusCode()).isEqualTo(200);
-        assertThat(post(MESSAGES, olderToken, body).statusCode()).isEqualTo(200);
-        assertThat(post(MESSAGES, olderToken, body, Map.of(HOST_TOKEN, older.token())).statusCode()).isEqualTo(200);
-        assertThat(post(MESSAGES, olderToken, body, Map.of(HOST_TOKEN, setup.hostToken())).statusCode())
-            .isEqualTo(401);
-        String warning = "Runner host " + older.id() + " (runner 0.2.0) sends the model requests of its runs without "
-                + "its own token";
-        assertThat(output.getAll().split(java.util.regex.Pattern.quote(warning), -1)).hasSize(2);
-        assertThat(output.getAll()).doesNotContain("Runner host " + setup.hostId() + " (runner")
-            .doesNotContain(olderToken)
-            .doesNotContain(older.token());
-
-        // The latest hello decides: once the host runs 0.3.0, its runs need its token.
-        hello(older.token(), "0.3.0");
-        UUID upgradedRun = UUID.randomUUID();
-        TestRuns.running(setup.company().id(), upgradedRun, 1, older.id(), setup.payer());
-        String upgraded = open(setup, run(setup, upgradedRun, 1, older.id()),
-                RunnerMessages.ModelAccessFormat.ANTHROPIC).apiKey();
-        assertThat(post(MESSAGES, upgraded, body).statusCode()).isEqualTo(401);
-        assertThat(post(MESSAGES, upgraded, body, Map.of(HOST_TOKEN, older.token())).statusCode()).isEqualTo(200);
+            HttpResponse<String> refused = postWithoutHostToken(MESSAGES, token, body);
+            assertThat(refused.statusCode()).as(version).isEqualTo(401);
+            assertThat(json(refused).get("error").get("type").asString()).isEqualTo("authentication_error");
+            assertThat(post(MESSAGES, token, body, Map.of(HOST_TOKEN, setup.hostToken())).statusCode()).as(version)
+                .isEqualTo(401);
+            assertThat(post(MESSAGES, token, body, Map.of(HOST_TOKEN, host.token())).statusCode()).as(version)
+                .isEqualTo(200);
+        }
+        assertThat(litellm.requests("/v1/messages")).hasSize(before + 3);
+        assertThat(output.getAll()).contains("without its runner host's own token");
     }
 
     @Test
@@ -658,6 +674,7 @@ class ModelRelayTest extends IntegrationTest {
         });
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + MESSAGES))
             .header("Authorization", "Bearer " + token)
+            .header(HOST_TOKEN, hostToken)
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(message("claude-sonnet-4-5").replace("{", "{\"stream\":true,")))
             .build();
@@ -689,6 +706,7 @@ class ModelRelayTest extends IntegrationTest {
         // Without a length, as a stream: the relay reads up to the limit and refuses.
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + MESSAGES))
             .header("Authorization", "Bearer " + token)
+            .header(HOST_TOKEN, hostToken)
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.fromPublisher(HttpRequest.BodyPublishers.ofByteArray(body)))
             .build();
@@ -703,6 +721,7 @@ class ModelRelayTest extends IntegrationTest {
         System.arraycopy(json, 0, atLimit, 0, json.length);
         HttpRequest passes = HttpRequest.newBuilder(URI.create("http://localhost:" + port + MESSAGES))
             .header("Authorization", "Bearer " + token)
+            .header(HOST_TOKEN, hostToken)
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofByteArray(atLimit))
             .build();
@@ -731,6 +750,7 @@ class ModelRelayTest extends IntegrationTest {
         for (int i = 0; i < 16; i++) {
             held.add(http.sendAsync(HttpRequest.newBuilder(URI.create("http://localhost:" + port + MESSAGES))
                 .header("Authorization", "Bearer " + token)
+                .header(HOST_TOKEN, hostToken)
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(message("claude-sonnet-4-5")))
                 .build(), HttpResponse.BodyHandlers.ofString()));

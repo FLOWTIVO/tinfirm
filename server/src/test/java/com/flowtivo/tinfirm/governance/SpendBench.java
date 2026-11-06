@@ -14,7 +14,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.junit.jupiter.api.AfterEach;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -48,6 +50,9 @@ abstract class SpendBench extends IntegrationTest {
 
     private final HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
 
+    /** The host token of each run token {@link #running} opened, which {@link #post} sends with it. */
+    private final Map<String, String> hostTokens = new ConcurrentHashMap<>();
+
     final FakeLiteLlm litellm = FakeLiteLlm.bundled();
 
     @Autowired
@@ -62,7 +67,8 @@ abstract class SpendBench extends IntegrationTest {
     @Autowired
     SpendSync sync;
 
-    record Setup(TestCompany company, ApiClient owner, UUID payer, FakeLiteLlm.Key key, UUID hostId) {
+    record Setup(TestCompany company, ApiClient owner, UUID payer, FakeLiteLlm.Key key, UUID hostId,
+            String hostToken) {
 
         UUID companyId() {
             return company.id();
@@ -85,8 +91,8 @@ abstract class SpendBench extends IntegrationTest {
         UUID payer = createServiceIdentity(owner, company, unique("bot"));
         FakeLiteLlm.Key key = ModelGateways.awaitKey(litellm, company, payer);
         ModelGateways.awaitStatus(owner, company, payer, "OK");
-        UUID hostId = registerRunnerHost(owner, company.id(), unique("host"), "COMPANY").id();
-        return new Setup(company, owner, payer, key, hostId);
+        RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("host"), "COMPANY");
+        return new Setup(company, owner, payer, key, host.id(), host.token());
     }
 
     /** A new run RUNNING on the setup's host, its relay opened in the format. */
@@ -96,6 +102,7 @@ abstract class SpendBench extends IntegrationTest {
         ModelRelay.RelayedRun run = new ModelRelay.RelayedRun(setup.companyId(), runId, 1, setup.hostId(),
                 setup.payer(), null, null);
         String token = transactions.inCompany(setup.companyId(), () -> relay.open(run, format)).apiKey();
+        hostTokens.put(token, setup.hostToken());
         return new Relayed(runId, token);
     }
 
@@ -128,11 +135,14 @@ abstract class SpendBench extends IntegrationTest {
                     + ",\"prompt_tokens_details\":{\"cached_tokens\":" + cached + "}}}")));
     }
 
+    /** A relayed request with the run's token and its host's own token, as the host's model proxy sends both. */
     HttpResponse<String> post(String path, String token, String model) {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
             .timeout(Duration.ofSeconds(30))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + token)
+            .header("X-Tinfirm-Runner-Token", Objects.requireNonNull(hostTokens.get(token),
+                    "a token that running() opened"))
             .POST(HttpRequest.BodyPublishers.ofString("{\"model\":\"" + model
                     + "\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}"))
             .build();

@@ -134,7 +134,7 @@ The company is Acme, which the stack declares (`TINFIRM_COMPANIES_ACME_NAME`, AD
 - the systems Jira (`JIRA_DC`) and GitHub (`GITHUB`), on the stubs, with the repository `acme/shop`;
 - the service account `svc-dev` and, on both systems, a credential named `svc-dev` ([ADR-0072](../../docs/adr/0072-system-credentials-lent-to-groups-and-service-accounts.md)), lent to Analysts read-only and to the service account `svc-dev` with writes;
 - model access: the bundled gateway, which is the fake LiteLLM. It is tested, with a default budget of $50 per 30 days;
-- the company runner host `e2e-runner`, which the scripted runner connects to as version 0.2.0;
+- the company runner host `e2e-runner`, which the scripted runner connects to as version 0.2.0 (shown, and deciding nothing);
 - the agent Analyst (`@analyst`):
   - the tools of both systems (reads run, writes ask first);
   - `acme/shop` with `WRITE`;

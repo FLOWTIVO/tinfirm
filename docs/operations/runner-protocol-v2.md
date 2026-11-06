@@ -26,6 +26,27 @@ Epochs, leases, events, heartbeats, capacity settings, drain and reconnects are 
 turn. A conversation that only v1 hosts may run waits with "Runner host … speaks runner protocol 1;
 conversations run on hosts of protocol 2."
 
+## What every v2 host does, whatever its release
+
+A host's runner version (`hello.runnerVersion`, the release it was built from: `1.0.0`, or
+`0.1.0-SNAPSHOT` between releases) is shown on its page and decides nothing
+([ADR-0109](../adr/0109-runner-version-is-the-release-version.md)). Compatibility is the protocol
+version and the features in `hello.features`. Two duties belong to protocol 2 itself, and no
+feature names them, since no host of protocol 2 lacks them:
+
+- **The model proxy is always on.** For a run whose model access is a gateway (the server's
+  model relay, or a company's own gateway) the sandbox gets the proxy's address and a dummy key;
+  the run's one-run token stays on the host. A run paid by a budget therefore goes to any v2 host.
+- **The host sends its own token to the model relay.** Every request of the proxy to its
+  server's origin carries the host's runner token in `X-Tinfirm-Runner-Token`, next to the run's
+  token. The relay refuses a request without it, or with another host's, with `401`. Log the host
+  in at the URL the runs reach (`--server`, the public URL): the proxy sends the token to that
+  origin only.
+
+So any runner release that speaks protocol 2 works with this server. A breaking change of the
+wire would be protocol 3, and a new optional capability is a new feature name, whatever release
+ships it.
+
 ## Choosing the version on a host
 
 - `config.json` in the host's config directory holds `protocolVersion`; `login` writes 2, and
