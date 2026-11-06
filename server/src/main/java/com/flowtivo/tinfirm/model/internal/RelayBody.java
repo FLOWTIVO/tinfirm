@@ -14,8 +14,9 @@ import tools.jackson.databind.json.JsonMapper;
  * failing the turn; v1.105.1 does so by itself only for Claude Code and Codex, by their {@code User-Agent}. A run's
  * own {@code drop_params} and {@code additional_drop_params} do not count. The body must be one JSON object without a
  * repeated top-level name (LiteLLM would take the last {@code model}, Tinfirm checks one); its {@code model} is read
- * for the check. Without {@code mcp_servers} and {@code container}, and refused when it names a tool the provider would
- * run that the company's {@code providerTools} does not allow (M1 of the security review of 2026-10-27).
+ * for the check. Refused when it asks the model's provider to run a tool itself: an MCP server, code execution, a web
+ * search, any tool the runtime does not run (M1 of the security review of 2026-10-27; ADR-0108). No company setting
+ * lets one through.
  */
 final class RelayBody {
 
@@ -41,25 +42,18 @@ final class RelayBody {
         return LiteLlmRequests.mapper(maxBytes);
     }
 
-    /**
-     * Whether a top-level name is removed: one of LiteLLM's own fields, {@code mcp_servers} or {@code container}, or
-     * the run's own {@code drop_params}.
-     */
+    /** Whether a top-level name is removed: one of LiteLLM's own fields, or the run's own {@code drop_params}. */
     static boolean removed(String name) {
-        return LiteLlmRequests.liteLlmField(name) || LiteLlmRequests.providerAction(name)
-                || LiteLlmRequests.dropControl(name);
+        return LiteLlmRequests.liteLlmField(name) || LiteLlmRequests.dropControl(name);
     }
 
-    /** The body without LiteLLM's fields, with {@code "drop_params": true}; no tool of the provider's allowed. */
+    /**
+     * The body without LiteLLM's fields, with {@code "drop_params": true}; refused when it asks the provider to run a
+     * tool itself.
+     */
     static Result transform(JsonMapper mapper, byte[] body) throws Refused {
-        return transform(mapper, body, LiteLlmRequests.ProviderTools.OFF);
-    }
-
-    /** The body without LiteLLM's fields, with {@code "drop_params": true}; the provider's tools as chosen. */
-    static Result transform(JsonMapper mapper, byte[] body, LiteLlmRequests.ProviderTools providerTools)
-            throws Refused {
         try {
-            LiteLlmRequests.Cleaned cleaned = LiteLlmRequests.clean(mapper, body, true, providerTools);
+            LiteLlmRequests.Cleaned cleaned = LiteLlmRequests.clean(mapper, body, true);
             return new Result(cleaned.bytes(), cleaned.model());
         }
         catch (LiteLlmRequests.Refused ex) {

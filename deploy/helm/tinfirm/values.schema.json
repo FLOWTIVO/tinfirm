@@ -662,7 +662,6 @@
             "maxRequestBytes": { "type": "integer", "minimum": 1024 },
             "maxInflightBytes": { "description": "At least twice maxRequestBytes", "type": "integer", "minimum": 2048 },
             "idleTimeout": { "$ref": "#/definitions/isoDuration" },
-            "providerTools": { "description": "Which tools the model's provider may run itself (MODEL_API_PROVIDER_TOOLS)", "type": "string", "enum": ["OFF", "WEB_SEARCH"] },
             "from": { "description": "More NetworkPolicyPeers that may call the model port", "$ref": "#/definitions/peers" },
             "javaToolOptions": { "type": "string" },
             "securityContext": { "type": "object" },

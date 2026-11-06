@@ -10,8 +10,6 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
-import com.flowtivo.tinfirm.shared.litellm.LiteLlmRequests;
-
 /**
  * The model port's settings (ADR-0069; the variables are in model-api/README.md), checked at startup.
  *
@@ -27,18 +25,12 @@ import com.flowtivo.tinfirm.shared.litellm.LiteLlmRequests;
  * @param connectTimeout  how long a connection to LiteLLM may take
  * @param idleTimeout     the longest wait for LiteLLM's answer to start, and between two of its parts
  *                        ({@code MODEL_API_IDLE_TIMEOUT}); a streaming answer has no total limit
- * @param providerTools   which tools the model's provider may run itself for a request
- *                        ({@code MODEL_API_PROVIDER_TOOLS}): {@code OFF} (the default), none, so that a request that
- *                        names one (web search or fetch, code execution, MCP) is {@code 400}; {@code WEB_SEARCH}, the
- *                        providers' web search. The server's relay applies each company's own choice before the port,
- *                        so that the stricter of the two holds for a run (M1 of the security review of 2026-10-27)
  */
 @Validated
 @ConfigurationProperties("model-api")
 public record ModelApiProperties(@NotNull URI upstream, @DefaultValue("67108864") long maxRequestBytes,
         @DefaultValue("134217728") long maxInflightBytes, @DefaultValue("PT10S") Duration connectTimeout,
-        @DefaultValue("PT10M") Duration idleTimeout,
-        @DefaultValue("OFF") LiteLlmRequests.ProviderTools providerTools) {
+        @DefaultValue("PT10M") Duration idleTimeout) {
 
     public ModelApiProperties {
         String scheme = upstream.getScheme() != null ? upstream.getScheme().toLowerCase(Locale.ROOT) : "";
