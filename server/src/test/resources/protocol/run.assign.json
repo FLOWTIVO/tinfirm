@@ -1,0 +1,43 @@
+{
+  "type": "run.assign",
+  "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f",
+  "epoch": 1,
+  "credentialLabel": "claude-max",
+  "agent": { "id": "01926f3e-5800-7a00-8b11-1c2d3e4f5a6b", "name": "Backend engineer", "runtime": "CLAUDE_CODE", "model": null },
+  "task": { "id": "01926f3e-4700-7900-8a11-0b1c2d3e4f5a", "key": "MYCO-12", "title": "Add a health endpoint" },
+  "prompt": "You are Backend engineer, an AI agent of the company \"My Company\", working through Tinfirm.\n\n# Task MYCO-12: Add a health endpoint\n\n(no description)\n\n# Repositories\nYour working directory is `/workspace`. Each repository of the task is checked out in its own directory, on branch `agent/MYCO-12`:\n- `/workspace/server`: server (https://github.com/FLOWTIVO/tinfirm.git), based on `main`\n- `/workspace/web-app`: Web app (https://github.com/my-company/web-app.git), based on `develop`\nYou can request these other repositories of the project: `docs`.\n\n# How to work\n- Make the change the task asks for, and keep it focused.\n",
+  "resumeSessionId": "0f6c1a9e-session",
+  "resumePrompt": "**Alice** · 2026-09-26T08:15:30Z\nPlease also add a test.\n\nContinue the task with this feedback. Finish with a short summary as before.",
+  "workspaces": [
+    {
+      "componentId": "01926f3e-3600-7800-8911-0a1b2c3d4e5f",
+      "dir": "server",
+      "name": "server",
+      "repoUrl": "https://github.com/FLOWTIVO/tinfirm.git",
+      "defaultBranch": "main",
+      "branch": "agent/MYCO-12",
+      "git": { "username": "x-access-token", "token": "sample-token-not-a-secret" },
+      "authorName": "Tinfirm agent Backend engineer",
+      "authorEmail": "agent+01926f3e-5800-7a00-8b11-1c2d3e4f5a6b@tinfirm.invalid"
+    },
+    {
+      "componentId": "01926f3e-3600-7800-8911-0a1b2c3d4e60",
+      "dir": "web-app",
+      "name": "Web app",
+      "repoUrl": "https://github.com/my-company/web-app.git",
+      "defaultBranch": "develop",
+      "branch": "agent/MYCO-12",
+      "git": null,
+      "authorName": "Tinfirm agent Backend engineer",
+      "authorEmail": "agent+01926f3e-5800-7a00-8b11-1c2d3e4f5a6b@tinfirm.invalid",
+      "readOnly": true
+    }
+  ],
+  "requestableRepositories": [
+    { "componentId": "01926f3e-3600-7800-8911-0a1b2c3d4e61", "name": "docs", "repoUrl": "https://github.com/my-company/docs.git", "pendingRequest": false }
+  ],
+  "limits": { "maxWallClockSeconds": 3600, "maxTurns": 200 },
+  "attachments": [
+    { "id": "01926f3e-9d00-7c00-8e11-2d3e4f5a6b7c", "fileName": "design notes.pdf", "sizeBytes": 18234, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }
+  ]
+}

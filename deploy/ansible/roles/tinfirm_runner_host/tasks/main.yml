@@ -1,0 +1,24 @@
+---
+# A Tinfirm runner host on a Linux VM with nested virtualisation: Docker Engine, Kata
+# Containers with Cloud Hypervisor as Docker's `kata` runtime, the runner host binary as a
+# systemd service with `--sandbox-runtime kata --sandbox-docker --egress-proxy
+# --sandbox-bridge` under systemd sandboxing, and the runner images.
+
+- name: Check the target and the variables
+  ansible.builtin.import_tasks: checks.yml
+
+- name: Install Docker Engine
+  ansible.builtin.import_tasks: docker.yml
+
+- name: Install Kata Containers and register its runtime with Docker
+  ansible.builtin.import_tasks: kata.yml
+
+- name: Install and register the runner host
+  ansible.builtin.import_tasks: runner.yml
+
+- name: Build the runner images
+  ansible.builtin.import_tasks: images.yml
+  when: tinfirm_runner_host_images_build | bool
+
+- name: Run the runner host as a systemd service
+  ansible.builtin.import_tasks: service.yml

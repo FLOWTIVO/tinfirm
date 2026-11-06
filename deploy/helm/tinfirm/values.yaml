@@ -1,0 +1,975 @@
+# Values for the tinfirm chart. values.schema.json validates them.
+#
+# The chart deploys the Tinfirm server and, unless `litellm.enabled` is false, the bundled
+# LiteLLM model gateway. It runs no database. Before installing, create in the release
+# namespace (the chart never creates a Secret and never inlines a secret value):
+#   - an external PostgreSQL 18 database with the roles tinfirm_owner and tinfirm_app, and
+#     LiteLLM's own database and role (docs/operations/external-database.md);
+#   - the Secrets named under `database`, `vault`, `bootstrap`, `auth.oidc.providers` and
+#     `litellm`.
+
+image:
+  repository: ghcr.io/flowtivo/tinfirm-server
+  # Empty = the chart's own image: `v<appVersion>` from Chart.yaml, or the appVersion itself
+  # when it is not a version number (a chart published for a commit of main: `sha-<commit>`).
+  tag: ""
+  # Optional `sha256:...`. When set, the image is pulled as tag@digest.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+# Server roles in this process (TINFIRM_ROLES): only a replica with `worker` runs the background work,
+# and every replica serves the API.
+serverRoles: api,worker
+
+# External base URL (TINFIRM_PUBLIC_URL), e.g. https://tinfirm.example.com. It drives the
+# OIDC redirect URIs and the Secure cookie flag. Empty = derived from the first ingress
+# host (https when ingress.tls is set); with ingress disabled, the server default applies.
+publicUrl: ""
+
+# PostgreSQL. The chart does not run a database. Prepare it and both roles first, as
+# docs/operations/external-database.md describes. The role names are fixed, because
+# migrations grant privileges to them: tinfirm_app (runtime, SPRING_DATASOURCE_USERNAME)
+# and tinfirm_owner (Flyway, SPRING_FLYWAY_USER).
+database:
+  host: postgres
+  port: 5432
+  name: tinfirm
+  # libpq sslmode in the JDBC URL: verify-full (recommended), verify-ca, require, ...
+  # Empty = the driver default (prefer).
+  sslMode: ""
+  # CA certificate for verify-ca/verify-full, from an existing Secret. Mounted read-only
+  # at /etc/tinfirm/database-ca/<key> and passed as sslrootcert. Set it with those modes:
+  # without sslrootcert the driver looks for ~/.postgresql/root.crt, and the image user
+  # has no home directory.
+  caCertSecret:
+    name: ""
+    key: ca.crt
+  # Further JDBC URL parameters, `k=v&k=v`.
+  params: ""
+  # A complete JDBC URL (SPRING_DATASOURCE_URL). When set, it replaces host, port, name,
+  # sslMode and params. caCertSecret is still mounted.
+  url: ""
+  # Existing Secret with both role passwords.
+  existingSecret: tinfirm-database
+  secretKeys:
+    appPassword: app-password      # SPRING_DATASOURCE_PASSWORD (tinfirm_app)
+    ownerPassword: owner-password  # SPRING_FLYWAY_PASSWORD (tinfirm_owner)
+
+# Credential vault master keys. Required: the server does not start without them.
+vault:
+  existingSecret: tinfirm-vault
+  secretKeys:
+    keys: keys             # TINFIRM_VAULT_KEYS, `keyId:base64(32 bytes)[,keyId:...]`
+    activeKey: active-key  # TINFIRM_VAULT_ACTIVE_KEY
+
+# First instance admin, created on startup while the user table is empty. The Secret is
+# referenced as optional: delete it after the first start (a company that names no `owner`
+# still takes the admin's email from it, so keep it while such a company has no OWNER).
+bootstrap:
+  existingSecret: tinfirm-bootstrap
+  secretKeys:
+    adminEmail: admin-email        # TINFIRM_BOOTSTRAP_ADMIN_EMAIL
+    adminPassword: admin-password  # TINFIRM_BOOTSTRAP_ADMIN_PASSWORD
+
+# Companies of this instance (ADR-0075; TINFIRM_COMPANIES_<KEY>_*). Companies are declared
+# here only: the app cannot create one. Each is created at the server's start when it does
+# not exist yet; none is ever deleted, also not when it is removed from this list.
+companies:
+  # key: lower-case letters and digits, starting with a letter. Never change it.
+  - key: main
+    # The name the company is created with. Renaming it later in the app is kept. A company
+    # from before keys with exactly this name is adopted instead of creating a new one.
+    name: My Company
+    # Becomes OWNER while the company has none (TINFIRM_COMPANIES_<KEY>_OWNER). Empty: the
+    # bootstrap admin's email.
+    owner: ""
+    # Adopt this existing company from before keys, by its id (TINFIRM_COMPANIES_<KEY>_ID),
+    # when its name differs. Usually empty.
+    id: ""
+    # SCIM 2.0 provisioning of the company's members by its identity provider (ADR-0087),
+    # Enterprise: the company's OWNER then issues the token in the app (Settings, Sign-in).
+    # Give the company's OIDC provider autoProvision: false, so that only people the
+    # identity provider assigned sign in.
+    # scim:
+    #   enabled: true                  # TINFIRM_COMPANIES_<KEY>_SCIM_ENABLED (default false)
+    #   role: MEMBER                   # ..._SCIM_ROLE: a new member's role when the request
+    #                                  # names none: ADMIN, MEMBER or VIEWER, never OWNER
+    #   roleSource: IDP                # ..._SCIM_ROLE_SOURCE: IDP (SCIM decides roles; the
+    #                                  # default) or APP (given once, the app decides after)
+
+auth:
+  localEnabled: true       # TINFIRM_AUTH_LOCAL_ENABLED
+  oidcAutoProvision: true  # TINFIRM_AUTH_OIDC_AUTO_PROVISION
+  oidc:
+    # One entry per OIDC provider. Each becomes a Spring Security client registration and
+    # a button on the login page. Register <publicUrl>/login/oauth2/code/<id> as the
+    # redirect URI at the provider, and allow PKCE (S256). <publicUrl>/login?provider=<id>
+    # is the direct sign-in link that offers this provider only.
+    providers: []
+    # - id: sso                        # lowercase letters and digits only
+    #   name: Company SSO              # button label
+    #   issuerUri: https://sso.example.com/realms/tinfirm
+    #   clientId: tinfirm
+    #   scope: openid,profile,email
+    #   existingSecret: tinfirm-oidc-sso
+    #   secretKeys:
+    #     clientSecret: client-secret  # SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_<ID>_CLIENT_SECRET
+    #   # How a new user's email is trusted (CONVENTIONS §5). Omit both for the default:
+    #   # email_verified=true required, email from the `email` claim. Entra ID sends no
+    #   # email_verified; see docs/operations/entra-id.md.
+    #   emailTrust: TRUST_ISSUER         # TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_EMAIL_TRUST
+    #   emailClaims: [email, preferred_username, verified_primary_email]  # ..._EMAIL_CLAIMS
+    #   # Who a new user from this provider becomes (ADR-0075). A known user just signs in.
+    #   company: main                    # ..._COMPANY: a key of `companies`. Empty with one
+    #                                    # company: that one; with several: no membership.
+    #   emailDomains: [example.com]      # ..._EMAIL_DOMAINS: only these emails get an account.
+    #                                    # Empty: any email the email trust accepts.
+    #   # Who decides a member's role (ADR-0088). With roleClaim, the provider does, at every
+    #   # sign-in: the claim's values map to a role (the highest wins), the app cannot change it,
+    #   # and a person it maps to no role cannot sign in (their membership and data are kept).
+    #   # OWNER is never the provider's. One provider per company may decide.
+    #   roleClaim: roles                 # ..._ROLE_CLAIM: e.g. Entra ID's app roles, or `groups`
+    #   roleMap:
+    #     admin: [Tinfirm.Admin]         # ..._ROLE_MAP_ADMIN
+    #     member: [Tinfirm.Member]       # ..._ROLE_MAP_MEMBER
+    #     viewer: [Tinfirm.Viewer]       # ..._ROLE_MAP_VIEWER
+    #   roleSource: IDP                  # ..._ROLE_SOURCE: IDP (the default with roleClaim) or APP,
+    #                                    # where the mapped role, else `role`, is a new user's once
+    #   role: MEMBER                     # ..._ROLE: under APP, MEMBER, ADMIN or VIEWER, never OWNER
+    #   # One provider for several companies (ADR-0089, Enterprise): the claim's values that give
+    #   # each role in further declared companies. Under IDP a person is a member of each company
+    #   # the claim names, with the role mapped there, at every sign-in: named in a new company,
+    #   # they join it; named no more, they leave it (OWNER excepted).
+    #   companies:
+    #     - key: globex                  # a key of `companies`, not the provider's own `company`
+    #       roleMap:                     # ..._COMPANIES_GLOBEX_ROLE_MAP_ADMIN, _MEMBER, _VIEWER
+    #         admin: [globex-admins]
+    #         member: [globex-users]
+    #   # A company provisioned by SCIM (ADR-0087): a user SCIM created is bound to their first
+    #   # sign-in by the IdP's externalId (OIDC's sub, Entra ID's oid).
+    #   autoProvision: false             # ..._AUTO_PROVISION: new users at sign-in; omitted =
+    #                                    # auth.oidcAutoProvision
+    #   scimMatch: EXTERNAL_ID           # ..._SCIM_MATCH: EXTERNAL_ID or EXTERNAL_ID_OR_EMAIL
+  saml:
+    # SAML 2.0 sign-in (ADR-0086), Enterprise; it keeps working after an Enterprise key
+    # expired. Needs an https publicUrl. The service provider's keys: each credential is a
+    # PKCS#8 PEM key (RSA 3072 or EC P-256) and its X.509 certificate (self-signed is fine) in
+    # existingSecret. Every credential is published in the SP metadata; activeCredential
+    # signs. Rollover: add the next one, let every IdP read the metadata again, make it
+    # active, remove the old one later (docs-site: operator-guide/saml).
+    sp:
+      existingSecret: ""
+      credentials: []
+      # - kid: k2026                     # TINFIRM_AUTH_SAML_SP_CREDENTIALS_<KID>_KEY and _CERT
+      #   keyKey: k2026.key              # the Secret's keys; default <kid>.key and <kid>.crt
+      #   certKey: k2026.crt
+      activeCredential: ""               # TINFIRM_AUTH_SAML_SP_ACTIVE_CREDENTIAL
+    # One entry per SAML identity provider, a button on the login page beside the OIDC ones.
+    # The id is unique across both kinds. At the IdP: the entity ID
+    # <publicUrl>/saml2/service-provider-metadata/<id> (also the SP metadata's URL), the
+    # reply (ACS) URL <publicUrl>/login/saml2/sso/<id>, and the sign-on URL
+    # <publicUrl>/saml2/authenticate/<id> for a portal's tile: sign-in always starts at
+    # Tinfirm. Settings -> Sign-in shows them for the company's Owners and Admins.
+    providers: []
+    # - id: entra                        # lower-case letters and digits
+    #   name: Microsoft                  # TINFIRM_AUTH_SAML_PROVIDERS_<ID>_NAME, the button
+    #   # The IdP's metadata, read at the start and every metadataRefresh by a worker:
+    #   metadataUrl: https://login.microsoftonline.com/<tenant>/federationmetadata/2007-06/federationmetadata.xml?appid=<app>
+    #   # ...or the document itself, mounted from a ConfigMap (instead of metadataUrl):
+    #   # metadata: |
+    #   #   <EntityDescriptor ...>
+    #   entityId: ""                     # ..._ENTITY_ID: the IdP to take from a document of several
+    #   company: acme                    # ..._COMPANY, ..._ROLE, ..._EMAIL_DOMAINS: as for OIDC
+    #   role: MEMBER
+    #   emailDomains: [acme.example]     # set them: SAML carries no email_verified
+    #   subject: http://schemas.microsoft.com/identity/claims/objectidentifier  # ..._SUBJECT;
+    #                                    # NAMEID (the default) or an attribute
+    #   emailAttributes: [email, mail]   # ..._EMAIL_ATTRIBUTES; omitted = ADR-0086's order
+    #   nameAttributes: [displayName]    # ..._NAME_ATTRIBUTES
+    #   roleClaim: http://schemas.microsoft.com/ws/2008/06/identity/claims/role  # ..._ROLE_CLAIM
+    #   roleMap:
+    #     admin: [Tinfirm.Admin]
+    #     member: [Tinfirm.Member]
+    #     viewer: [Tinfirm.Viewer]
+    #   roleSource: IDP                  # ..._ROLE_SOURCE
+    #   companies: []                    # ..._COMPANIES_<KEY>_ROLE_MAP_*, as an OIDC provider's (ADR-0089)
+    #   autoProvision: true              # ..._AUTO_PROVISION; false when SCIM provisions
+    #   requireEncryptedAssertions: false  # ..._REQUIRE_ENCRYPTED_ASSERTIONS
+    #   metadataRefresh: PT12H           # ..._METADATA_REFRESH, at least PT5M
+    #   scimMatch: EXTERNAL_ID           # ..._SCIM_MATCH
+
+session:
+  idleTimeout: PT8H  # TINFIRM_SESSION_IDLE_TIMEOUT (ISO-8601 duration)
+  maxAge: P7D        # TINFIRM_SESSION_MAX_AGE
+
+# Calls to the company's systems (Jira, GitHub, GitLab; CONVENTIONS §14.4): https only, never to loopback,
+# link-local or private addresses, never following redirects. Allow http or private addresses only for a
+# system that really lives inside your network, such as a Jira Data Center on a private address.
+connection:
+  allowHttp: false              # TINFIRM_CONNECTION_ALLOW_HTTP
+  allowPrivateAddresses: false  # TINFIRM_CONNECTION_ALLOW_PRIVATE_ADDRESSES
+  timeout: PT20S                # TINFIRM_CONNECTION_TIMEOUT (ISO-8601 duration)
+  # TINFIRM_CONNECTION_INTERNAL_HOSTS (ADR-0066): host names of services on the cluster's own
+  # network that company systems may reach at a private address and over http, e.g. a
+  # company MCP server in another namespace. The server's NetworkPolicy must let it reach
+  # them too (networkPolicy.egress.extra).
+  internalHosts: []
+
+# Error reports (ADR-0070, docs/operations/error-reports.md): the server's and the web app's
+# errors, scrubbed and grouped, on the instance admins' page Errors, and delivered to the
+# vendor's error tracker in Sentry's protocol only while the mode is automatic.
+errorReports:
+  # TINFIRM_ERROR_REPORTS: off, local or automatic. Empty: an instance admin chooses local or
+  # automatic on the page (local until they do).
+  mode: ""
+  # TINFIRM_ERROR_REPORTS_DSN, the destination's DSN, from this Secret's key. No name: nothing
+  # is delivered. Optional: a missing Secret or key only leaves the DSN unset.
+  dsnSecret:
+    name: ""
+    key: dsn
+  # TINFIRM_ERROR_REPORTS_LABEL: the installation's name in its reports, e.g. acme-prod.
+  label: ""
+  # TINFIRM_ERROR_REPORTS_PROXY: http://host:port of an HTTP proxy for the delivery.
+  proxy: ""
+
+# Proxies whose X-Forwarded-For the server trusts (SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES,
+# a Java regex matched against the connecting IP). The per-IP login throttle and the audit
+# trail key on the client IP this yields.
+#
+# Default: loopback only, so the server trusts no proxy, and no pod can set the client IP
+# with an X-Forwarded-For of its own. Behind an ingress controller or Gateway, every client
+# then has the controller's address until you SET THIS to the controller's pod CIDR, as a
+# regex, e.g. for a pod network 10.244.0.0/16 (a common default; `kubectl get nodes
+# -o jsonpath='{.items[*].spec.podCIDR}'` shows yours):
+#   trustedProxies: '10\.244\.\d{1,3}\.\d{1,3}'
+# and name the controller in networkPolicy.ingress.controller, so that only it reaches port
+# 8080 (the install notes warn while either is missing). Pods with global IPv6 addresses
+# (EKS IPv6) need their range. The client IP is only as good as the X-Forwarded-For the
+# controller sends: behind a cloud load balancer, preserve the source IP
+# (externalTrafficPolicy: Local or the PROXY protocol).
+#
+# Up to chart 0.7.0 the default matched every private range pods get (RFC 1918,
+# 100.64.0.0/10, fc00::/7): with any pod able to reach port 8080 that let it choose the
+# client IP. The notes warn while a release still sets that value.
+#
+# Empty = the variable is not set, and Tomcat's default (all private ranges, loopback and
+# link-local too) applies. The chart never renders it empty, because an empty value makes
+# Spring Boot trust every peer.
+trustedProxies: '127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0:0:0:0:0:0:0:1'
+
+# JVM options (JAVA_TOOL_OPTIONS). Replaces the image default, which is the same value.
+# Heap = 75% of the memory limit.
+javaToolOptions: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+
+# More non-secret variables for the ConfigMap, e.g.
+#   SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "10"
+# The model relay requires every runner host's own token with a run's model requests
+# (TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN, "true" by default): runner host 0.3.0 is the
+# minimum. Only while a host older than 0.3.0 is being upgraded:
+#   TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN: "false"
+extraConfig: {}
+
+# More container env entries (name/value or name/valueFrom), e.g. further secretKeyRefs.
+extraEnv: []
+
+# More volumes of the server's pod, their mounts in the server container, and more containers
+# in the pod, as Kubernetes takes them: for example a log shipper that tails a file the server
+# also writes (the server logs ECS JSON to stdout; with LOGGING_FILE_NAME and
+# LOGGING_STRUCTURED_FORMAT_FILE=ecs in extraConfig it writes the same to a file on an
+# extraVolume). The root filesystem is read-only: a container writes only to its volumes. Each
+# extra container sets its own securityContext; the pod's (podSecurityContext) applies to all.
+extraVolumes: []
+extraVolumeMounts: []
+extraContainers: []
+
+service:
+  type: ClusterIP
+  # The application port only. Management (8081) is never exposed by the Service or the
+  # Ingress.
+  port: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: tinfirm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: tinfirm-tls
+  #   hosts:
+  #     - tinfirm.example.com
+  traefik:
+    # Traefik only. Traefik serves an Ingress on its http and https entrypoints alike, so
+    # without a redirect the login can run over plain http, where the browser drops the
+    # Secure session cookie. true renders a Middleware `<fullname>-redirect-https`
+    # (traefik.io/v1alpha1, so Traefik's CRDs must exist) and adds it to the Ingress's
+    # traefik.ingress.kubernetes.io/router.middlewares annotation, before any middlewares
+    # you list there. Leave it false when Traefik redirects globally, or for other
+    # controllers.
+    redirectHttps: false
+
+# Gateway API (gateway.networking.k8s.io/v1), instead of or beside the Ingress: an HTTPRoute
+# from a Gateway the cluster runs (Envoy Gateway, Istio, Cilium, NGINX Gateway Fabric,
+# Traefik, a cloud provider's, ...) to port 8080. Needs the Gateway API CRDs. With publicUrl
+# empty and the Ingress off, the public URL is https://<first hostname>.
+httpRoute:
+  enabled: false
+  annotations: {}
+  # The Gateway listeners the route attaches to: the https listener, e.g.
+  #   - name: public
+  #     namespace: gateway-system
+  #     sectionName: https
+  # The Gateway's listener must allow routes from the release namespace (allowedRoutes).
+  parentRefs: []
+  hostnames:
+    - tinfirm.example.com
+  # Matches of the route's one rule. Default: every path.
+  matches:
+    - path:
+        type: PathPrefix
+        value: /
+  # Plain http -> https: a second HTTPRoute `<fullname>-redirect-https` on these listeners
+  # (usually the Gateway's http listener, by sectionName) answers every request with a 301
+  # to https. The session cookie is Secure, so a login over plain http fails. Empty: none,
+  # for a Gateway that redirects on its own or listens on https only. The route above must
+  # not attach to the same listener: give its parentRefs the https listener's sectionName.
+  redirectParentRefs: []
+
+# LiteLLM, the model gateway (ADR-0059; docs/operations/litellm.md). Bundled by default: a
+# Deployment and a ClusterIP Service, with its own database on the external PostgreSQL. Only
+# the server reaches its own port (networkPolicy.litellm); nothing exposes it outside the
+# release, and runner hosts reach only the server, which relays their model requests. The
+# server gets its admin URL, its model port's URL and its master key (TINFIRM_LITELLM_*);
+# without the master key in the Secret, the server bundles no gateway. The operator adds the
+# provider keys and models through LiteLLM's admin API; Tinfirm adds none. `enabled: false`
+# for a company that brings its own LiteLLM: an admin then enters its URL and key on
+# Tinfirm's Model access page, and networkPolicy.egress.systems (on the internet) or
+# networkPolicy.egress.extra (inside your network) lets the server reach it.
+litellm:
+  enabled: true
+  image:
+    # LiteLLM's non-root image: the same release as ghcr.io/berriai/litellm, run as user
+    # 65534, with nothing written outside /tmp. It runs under the restricted Pod Security
+    # Standard and OpenShift's restricted-v2 SCC.
+    repository: ghcr.io/berriai/litellm-non_root
+    # Pinned; bump tag and digest together (and deploy/compose/compose.yaml).
+    tag: v1.106.6
+    digest: sha256:6363e53f135dafbf4a68fac25f77aec3f2b99be37665e8c5f623a952637c220b
+    pullPolicy: IfNotPresent
+  # One replica: without a shared Redis, which the chart does not run, several LiteLLM
+  # replicas count request limits and recent spend each on their own.
+  replicaCount: 1
+  # LiteLLM's admin UI (/ui, DISABLE_ADMIN_UI). Off: the server needs the admin API only, which
+  # stays either way. On, it is reached like the admin API, from inside the cluster
+  # (`kubectl port-forward`): the Service is never exposed (docs/operations/litellm.md).
+  adminUi: false
+  # Existing Secret with LiteLLM's master key and salt key, and its database password unless
+  # litellm.database.existingSecret is set.
+  existingSecret: tinfirm-litellm
+  secretKeys:
+    # LITELLM_MASTER_KEY, `sk-...`; the server gets it as TINFIRM_LITELLM_MASTER_KEY.
+    masterKey: master-key
+    # LITELLM_SALT_KEY: encrypts the provider keys LiteLLM stores. Never change it once
+    # keys are stored.
+    saltKey: salt-key
+    # DATABASE_PASSWORD of the role litellm.database.user. Not read when
+    # litellm.database.existingSecret is set.
+    databasePassword: database-password
+  # LiteLLM's own database and role on the external PostgreSQL
+  # (docs/operations/external-database.md, section 4). LiteLLM migrates it at startup.
+  database:
+    # Empty = the same as Tinfirm's: database.host, database.port, database.sslMode,
+    # database.caCertSecret.
+    host: ""
+    # With secretKeys.url: the port in that URL, which the NetworkPolicy opens. Required
+    # then (with networkPolicy.egress.enabled): the chart cannot read the URL.
+    port: ""
+    name: litellm
+    user: litellm
+    # libpq sslmode (DATABASE_SSLMODE): verify-full (recommended), verify-ca, require, ...
+    sslMode: ""
+    # CA certificate for verify-ca/verify-full, from an existing Secret (only this key is
+    # mounted). Mounted read-only at /etc/litellm/database-ca/<key> (DATABASE_SSLROOTCERT).
+    caCertSecret:
+      name: ""
+      key: ca.crt
+    # Further connection parameters, `k=v&k=v`: Prisma's, such as connection_limit,
+    # pool_timeout, connect_timeout, socket_timeout, statement_cache_size, pgbouncer.
+    # LiteLLM adds them to its connection URL over its own defaults (connection_limit 10,
+    # pool_timeout 60): general_settings.database_extra_connection_params in its ConfigMap,
+    # so never a secret here. Taken literally, without %-escapes. Set TLS with sslMode and
+    # caCertSecret, not here.
+    params: ""
+    # Existing Secret with the database credentials, such as one a database operator or an
+    # external-secrets tool creates (CloudNativePG's `<cluster>-app`: username, password,
+    # uri). In the release namespace. Empty = the password from litellm.existingSecret
+    # (secretKeys.databasePassword) and the user litellm.database.user.
+    existingSecret: ""
+    secretKeys:
+      # DATABASE_PASSWORD.
+      password: password
+      # DATABASE_USERNAME. Empty = litellm.database.user.
+      username: ""
+      # DATABASE_URL: a complete postgresql:// URL, with the password percent-encoded in
+      # it; from this Secret only, never as a plain value. When set, it replaces host,
+      # name, user, sslMode, params and the password (port: see above). Put
+      # sslmode=verify-full&sslrootcert=/etc/litellm/database-ca/<key> into it yourself;
+      # caCertSecret is still mounted.
+      url: ""
+  # Always ClusterIP: LiteLLM is never exposed outside the release.
+  service:
+    # LiteLLM itself, every route: the server's admin URL. Only the server reaches it.
+    port: 4000
+    annotations: {}
+  # The model port (ADR-0069; model-api/README.md): a container beside LiteLLM in its pod that
+  # serves LiteLLM's model routes alone, each by its exact path, with LiteLLM's own fields
+  # removed from every body, on the Service's port `model`. The company's services call it with
+  # LiteLLM keys of their own (docs/operations/litellm.md); the server sends its model requests
+  # here too (TINFIRM_LITELLM_MODEL_URL).
+  modelApi:
+    image:
+      repository: ghcr.io/flowtivo/tinfirm-model-api
+      # Empty = the server's tag (image.tag, else v<appVersion>): both are released together.
+      tag: ""
+      digest: ""
+      pullPolicy: IfNotPresent
+    # The Service's port of the model routes.
+    port: 4001
+    # The largest request body passed on (MODEL_API_MAX_REQUEST_BYTES); a larger one is 413.
+    maxRequestBytes: 67108864
+    # The most bytes of request bodies held at once (MODEL_API_MAX_INFLIGHT_BYTES), counted as they
+    # arrive, at least twice maxRequestBytes: LiteLLM checks a key only once its body is read, so a
+    # request that would pass it is 429. Keep it well within resources.limits.memory.
+    maxInflightBytes: 134217728
+    # The longest wait for LiteLLM's answer to start, and between two of its parts.
+    idleTimeout: PT10M
+    # Which tools the model's provider may run itself for a request (MODEL_API_PROVIDER_TOOLS):
+    # "OFF", none, so that a request that names web search or fetch, code execution or an MCP
+    # server is 400; "WEB_SEARCH", the providers' web search too. The server's relay applies
+    # each company's own choice (Model access page) before the port: the stricter holds, so a
+    # company's WEB_SEARCH takes effect on the bundled gateway only with WEB_SEARCH here.
+    providerTools: "OFF"
+    # Who else may call the model port, as NetworkPolicyPeers (networkPolicy.enabled): the
+    # server always may. E.g. a namespace of your services that call models:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: tools
+    from: []
+    javaToolOptions: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+    # The model port's own user, 10001, as in its image; on OpenShift the SCC's.
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+      runAsUser: 10001
+      runAsGroup: 10001
+      capabilities:
+        drop:
+          - ALL
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        memory: 384Mi
+    # More container env entries (name/value or name/valueFrom).
+    extraEnv: []
+  # The non-root image's user, 65534, with a read-only root filesystem: LiteLLM writes only
+  # to /tmp (tmpVolume), its caches included (XDG_CACHE_HOME). On OpenShift the chart leaves
+  # the user to the SCC.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+  # /tmp of the LiteLLM container, its only writable path.
+  tmpVolume:
+    sizeLimit: 256Mi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  probes:
+    # The first start migrates an empty database: up to 10 minutes.
+    startup:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 120
+    liveness:
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+  # More container env entries (name/value or name/valueFrom).
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# The runner host as a pod of the release (ADR-0101, decision 8): a company runner host of one
+# declared company, which the server registers at its start with the token in
+# runner.existingSecret, so nobody registers it in the app. Its sandboxes are VMs that it
+# creates and deletes through its VM driver (`run --executor vm`, ADR-0096), on DigitalOcean a
+# Droplet per run from the VM image you build first (runner/README.md, "A VM per run"): the
+# pod needs no Docker and no privilege. VMs are Pro's and Enterprise's (elastic runners,
+# ADR-0100): without such a key the server refuses the host, which then stops.
+#
+# One pod, which serves many runs at once (maxConcurrentRuns), each in a VM of its own. It
+# connects to the server's public URL, as any runner host, and keeps its runs' records and
+# its mirrors on a volume, so that a pod that restarts takes its runs back (ADR-0101,
+# decision 7). On an upgrade the pod drains first: it takes no new runs and lets the active
+# ones finish, for up to terminationGracePeriodSeconds.
+runner:
+  enabled: false
+  image:
+    repository: ghcr.io/flowtivo/tinfirm-runner-host
+    # Empty = the server's tag (image.tag, else v<appVersion>): both are released together.
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # The key of the company in `companies` whose runner host the pod is.
+  company: main
+  # The host's name in that company (TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_NAME): letters,
+  # digits, `.`, `_` and `-`. A company host of this name registered in the app stops the
+  # server's start: the server never takes one over.
+  name: kubernetes
+  # Existing Secret with the host's token: `tfr_` and 43 base64url characters, e.g.
+  #   kubectl create secret generic tinfirm-runner \
+  #     --from-literal=token="tfr_$(openssl rand 32 | basenc --base64url | tr -d '=')"
+  # The server gets it as TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_TOKEN and keeps its hash; the
+  # pod reads it from a file. After a new token, restart the server, then the pod: the old
+  # token stops working at the server's start.
+  existingSecret: tinfirm-runner
+  secretKeys:
+    token: token
+  # The server's URL that the pod connects to, https only. Empty = the public URL
+  # (TINFIRM_PUBLIC_URL, see publicUrl).
+  serverUrl: ""
+  # The most runs at once (run --max-concurrent-runs), up to 1000: each run is a VM of its
+  # own, so the provider's quota bounds it. Admins can lower it in the app, never raise it.
+  maxConcurrentRuns: 4
+  # The log filter (TINFIRM_RUNNER_LOG).
+  log: info
+  vm:
+    # The VM driver (run --vm-driver): `digitalocean`, the runner host's own.
+    driver: digitalocean
+    # The template every VM is created from (run --vm-template): a key of
+    # vm.digitalocean.templates.
+    template: sandbox
+    # The port where the sandbox's bridge listens in the VM (run --vm-port), which the
+    # template's firewall opens to this pod alone.
+    port: 7443
+    # Seconds from a VM's creation to its bridge's first connection (run --vm-start-timeout).
+    startTimeout: 900
+    # A VM whose image another build of the runner host made (run --vm-image-version): warn,
+    # or refuse. Rebuild the VM image with the new release's binary after every upgrade.
+    imageVersion: warn
+    # More checks of what a VM must not reach (run --vm-probe): tcp:HOST:PORT, dns:NAME or
+    # http://HOST[:PORT]/PATH, e.g. your database.
+    probes: []
+    # The DigitalOcean driver (runner/README.md): its API token from a Secret, and its
+    # templates, as its configuration file (TINFIRM_DO_CONFIG) takes them.
+    digitalocean:
+      # Existing Secret with a DigitalOcean API token that may create, read and delete
+      # Droplets and read firewalls and VPCs. The driver holds it; the runner host never reads it.
+      existingSecret: tinfirm-digitalocean
+      secretKeys:
+        token: token
+      # How the pod reaches the VMs: `private`, on their VPC addresses (the sandboxes' VPC
+      # peered with the cluster's), or `public`, on their public addresses, which the
+      # firewall opens to the cluster's egress addresses alone.
+      connect: private
+      templates: {}
+      # sandbox:
+      #   region: fra1
+      #   size: s-4vcpu-8gb
+      #   image: "123456789"         # the VM image's snapshot id, never a public image
+      #   vpc: VPC_UUID              # the sandboxes' own VPC
+      #   firewall: FIREWALL_ID      # the Cloud Firewall on the tag tinfirm-sandbox
+      #   bridgePort: 7443           # optional; vm.port
+  # Ready VMs (ADR-0098): the most that Tinfirm's admins may keep waiting (run
+  # --pool-max-ready; 0 turns them off), and the image they start (`any`: the multi-runtime
+  # image, so that they serve every runtime).
+  pool:
+    maxReady: 4
+    runtime: claude
+    headroom: 0
+    maxAge: 360
+    coolDown: 10
+    leadTimeMax: 30
+  # More `run` settings as TINFIRM_RUNNER_* variables, e.g. TINFIRM_RUNNER_EGRESS_ALLOW (one
+  # host per line) or TINFIRM_RUNNER_SANDBOX_ENV. Never credentials: the sandboxes see some.
+  extraConfig: {}
+  # More container env entries (name/value or name/valueFrom).
+  extraEnv: []
+  # The data directory (/var/lib/tinfirm-runner): the records of the runs that a restarted pod
+  # takes back, the bridge listener's identity, the repository mirrors and the runs' outputs.
+  # Disabled, an emptyDir: a restart loses the runs that were in progress.
+  persistence:
+    enabled: true
+    # An existing PersistentVolumeClaim instead of the chart's.
+    existingClaim: ""
+    size: 20Gi
+    # Empty = the cluster's default storage class.
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+  # How long an upgrade waits for the active runs to finish (the pod drains first). After it,
+  # the pod is stopped, and the next one takes its runs back: their work is saved, and they
+  # end as failed (INFRA).
+  terminationGracePeriodSeconds: 3600
+  # The image's user, 10001. On OpenShift the SCC's.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+  # /tmp, for the git operations' and the uploads' temporary files.
+  tmpVolume:
+    sizeLimit: 2Gi
+  # The runs' git operations, their egress and model proxies, and the bundles it packs.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# OpenShift. Its restricted-v2 SCC gives each namespace's pods a UID and an fsGroup from the
+# namespace's own range and refuses any other, and its DNS answers on port 5353 in namespace
+# openshift-dns. auto: on when the cluster serves security.openshift.io/v1, which `helm
+# install` and Argo CD see; `helm template` sees no cluster unless given --api-versions. On,
+# the chart sets no runAsUser, runAsGroup or fsGroup in the security contexts it renders
+# (not in extraContainers: those are yours), and the NetworkPolicies' DNS rule also admits
+# OpenShift's DNS. true or false sets it. OpenShift turns an Ingress into a Route.
+openshift: auto
+
+serviceAccount:
+  create: true
+  # Empty = the release full name.
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# Prometheus metrics: /actuator/prometheus on the management port 8081, which no Service
+# exposes. Either way, also let the scraper in with networkPolicy.ingress.metrics.
+metrics:
+  # prometheus.io/scrape annotations on the pods, for scrapers that discover pods by them
+  # (Prometheus's kubernetes_sd example configuration, VictoriaMetrics, Datadog, ...).
+  scrapeAnnotations: false
+  # A PodMonitor (monitoring.coreos.com/v1) for the Prometheus Operator, which ignores the
+  # annotations. Needs its CRD. A ServiceMonitor cannot select port 8081, which is on no
+  # Service. The VictoriaMetrics operator converts PodMonitors too.
+  podMonitor:
+    enabled: false
+    # Labels the Prometheus's podMonitorSelector matches, e.g. `release: kube-prometheus-stack`.
+    labels: {}
+    annotations: {}
+    # Empty = the release namespace. Another namespace (where the Prometheus looks for
+    # PodMonitors) gets a namespaceSelector for the release namespace.
+    namespace: ""
+    # Empty = the Prometheus's own scrape interval and timeout.
+    interval: ""
+    scrapeTimeout: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# /tmp, the only writable path (Tomcat work directory, java.io.tmpdir).
+tmpVolume:
+  sizeLimit: 512Mi
+  # "Memory" makes it a tmpfs, which counts against the memory limit.
+  medium: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+  limits:
+    memory: 1Gi
+
+# All probes use the management port 8081.
+probes:
+  # Covers the first start, when Flyway migrates an empty database: up to 5 minutes.
+  startup:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 60
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# Spring Boot's graceful shutdown waits up to 30 s for in-flight requests.
+terminationGracePeriodSeconds: 45
+# Seconds a terminating pod keeps serving while the ingress controller drops it from the
+# endpoints, before SIGTERM reaches the JVM. 0 disables the preStop hook.
+preStopSleepSeconds: 5
+
+# With type Recreate the chart drops rollingUpdate, which a Recreate Deployment must not
+# carry: `strategy: {type: Recreate}` is enough.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+podDisruptionBudget:
+  enabled: true
+  # Never blocks a node drain, even with one replica.
+  maxUnavailable: 1
+  # When set (a number or a percentage), used instead of maxUnavailable.
+  minAvailable: ""
+
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+networkPolicy:
+  enabled: true
+  ingress:
+    # Who reaches the application port 8080: the pods of your ingress controller or Gateway.
+    # Empty (the default, as the chart cannot know your controller): any source, so that the
+    # chart works with every controller, Gateway and load balancer. Name yours to close the
+    # port to everything else: then only it can set the client IP behind trustedProxies.
+    # With ingress.enabled or httpRoute.enabled, set it (or extraFrom): the install notes
+    # warn while neither is set, since any pod in the cluster then reaches the server.
+    # https://docs.tinfirm.com/operator-guide/helm/#ingress-to-the-server has the values for
+    # common controllers, e.g. Traefik:
+    #   namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: traefik}}
+    #   podSelector: {matchLabels: {app.kubernetes.io/name: traefik}}
+    # An empty podSelector admits the whole namespace.
+    controller: {}
+    # More NetworkPolicyPeers for port 8080. With controller empty, these alone are admitted.
+    extraFrom: []
+    # The metrics scraper, for port 8081 (/actuator/prometheus). Kubelet probes are not
+    # subject to NetworkPolicy.
+    metrics:
+      enabled: false
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+      podSelector: {}
+  egress:
+    enabled: true
+    # Cluster DNS. With NodeLocal DNSCache, add its address in `extra`. On OpenShift (the
+    # `openshift` value) the chart adds a rule for its DNS, in namespace openshift-dns.
+    dns:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    # PostgreSQL. Default: any address on the database port, for a managed database
+    # outside the cluster. Narrow it to the database CIDR, or to a namespace/pod selector
+    # for an in-cluster database (e.g. CloudNativePG).
+    database:
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
+      # Empty = database.port.
+      port: ""
+    # OIDC issuers (discovery, JWKS, token and userinfo calls from the server). Rendered
+    # only when auth.oidc.providers is not empty. Narrow `to` when the issuer has a
+    # stable address range.
+    oidc:
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
+      ports:
+        - 443
+    # The SAML providers' metadata URLs (auth.saml.providers[].metadataUrl), which a worker
+    # reads. Rendered only when one has a metadataUrl; a mounted document needs none.
+    saml:
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
+      ports:
+        - 443
+    # Services on the internet over https: the company's systems (Jira Cloud, GitHub,
+    # GitLab, MCP servers), Slack and Teams, AI clients' metadata documents, the error
+    # tracker, a company's own LiteLLM (https://docs.tinfirm.com/operator-guide/helm/, "What
+    # the server calls out to"). Default: port
+    # 443 on every public IPv4 and IPv6 address, none of the private, local, multicast or
+    # reserved ranges; the server refuses the private ones on its own too unless connection.allowPrivateAddresses or connection.internalHosts
+    # allow them: a system inside your network needs a rule in `extra`. Narrow `to` to an
+    # egress proxy if you have one; `to: []` drops the rule. A cluster without IPv6 ignores
+    # the IPv6 peers of this and the rules above.
+    systems:
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            # Private, shared (carrier-grade NAT), loopback, link-local (cloud metadata),
+            # unspecified, multicast and reserved addresses (240.0.0.0/4, which some clouds
+            # let a VPC use privately), and the special-use ranges no internet host is in,
+            # which a private network may route (RFC 6890: IETF protocol assignments, the
+            # documentation ranges, benchmarking).
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.0.0.0/24
+              - 192.0.2.0/24
+              - 192.168.0.0/16
+              - 198.18.0.0/15
+              - 198.51.100.0/24
+              - 203.0.113.0/24
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+        - ipBlock:
+            cidr: ::/0
+            # Unique local, site-local (deprecated), link-local, loopback, unspecified and
+            # multicast addresses, the discard-only and documentation ranges, and the
+            # local-use translation prefix 64:ff9b:1::/48 (RFC 8215), which may translate to
+            # private IPv4. NAT64's well-known 64:ff9b::/96
+            # stays open: it never carries a private IPv4 address (RFC 6052), and an
+            # IPv6-only cluster reaches IPv4 hosts through it.
+            except:
+              - fc00::/7
+              - fec0::/10
+              - fe80::/10
+              - ::1/128
+              - ::/128
+              - ff00::/8
+              - 64:ff9b:1::/48
+              - 100::/64
+              - 2001:db8::/32
+      ports:
+        - 443
+    # More raw NetworkPolicyEgressRules: a system inside your network (a Jira Data Center on
+    # a private address, an MCP server in another namespace, a service behind this cluster's
+    # own ingress controller), NodeLocal DNSCache.
+    extra: []
+  # The LiteLLM pods (litellm.enabled), a policy of their own. Ingress: LiteLLM's port 4000
+  # (every route) from the server pods only, and from nothing else: there is no value to
+  # admit more. Egress: DNS and the database as above (port: litellm.database.port, else as
+  # above; with litellm.database.secretKeys.url litellm.database.port only), the model
+  # providers, and litellm.egress.extra (not egress.extra: add NodeLocal DNSCache here too).
+  litellm:
+    egress:
+      # The providers' APIs (Anthropic, OpenAI, Bedrock, ...) and LiteLLM's model price list
+      # (raw.githubusercontent.com): https anywhere by default. Narrow it if your providers
+      # sit behind a proxy or a private endpoint.
+      providers:
+        to:
+          - ipBlock:
+              cidr: 0.0.0.0/0
+          - ipBlock:
+              cidr: ::/0
+        ports:
+          - 443
+      # More raw NetworkPolicyEgressRules.
+      extra: []
+  # The runner pod (runner.enabled), a policy of its own. Ingress: none, since nothing connects
+  # to it: it dials the server and the VMs' bridges, whose tunnels carry the sandboxes' traffic.
+  # Egress: DNS as above, https (the server's public URL, the VM provider's API, git hosts,
+  # model gateways and what runner.extraConfig's TINFIRM_RUNNER_EGRESS_ALLOW allows the
+  # sandboxes), the VMs' bridge port, and runner.egress.extra (not egress.extra).
+  runner:
+    egress:
+      # https anywhere by default, private addresses included: the server's public URL may
+      # resolve to the cluster's own load balancer. An ingress controller in the cluster
+      # whose pods listen on another port (8443) needs a rule for them in `extra`.
+      https:
+        to:
+          - ipBlock:
+              cidr: 0.0.0.0/0
+          - ipBlock:
+              cidr: ::/0
+        ports:
+          - 443
+      # The VMs, on runner.vm.port: their VPC (connect: private) or anywhere (public).
+      vms:
+        to:
+          - ipBlock:
+              cidr: 0.0.0.0/0
+          - ipBlock:
+              cidr: ::/0
+      # More raw NetworkPolicyEgressRules, e.g. hosts the sandboxes reach on other ports.
+      extra: []

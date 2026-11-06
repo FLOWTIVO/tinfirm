@@ -1,0 +1,25 @@
+# `helm lint` / `helm template` for OpenShift (CI and `make helm-lint`): `openshift: true`, as auto
+# finds it on a real cluster, so no security context names a UID or fsGroup and the NetworkPolicies
+# admit OpenShift's DNS; an Ingress, which OpenShift turns into a Route; the router as the
+# NetworkPolicy's ingress peer.
+image:
+  tag: v0.1.0
+openshift: true
+ingress:
+  enabled: true
+  annotations:
+    route.openshift.io/termination: edge
+  hosts:
+    - host: tinfirm.apps.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts:
+        - tinfirm.apps.example.com
+networkPolicy:
+  ingress:
+    controller:
+      namespaceSelector:
+        matchLabels:
+          policy-group.network.openshift.io/ingress: ""

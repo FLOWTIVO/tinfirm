@@ -1,0 +1,50 @@
+{
+  "type": "run.assign",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 1,
+  "credentialLabel": "claude-main",
+  "agent": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000a", "name": "Backend engineer", "runtime": "CLAUDE_CODE", "model": null},
+  "workItem": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000b", "key": "MYCO-12", "title": "Add a health endpoint"},
+  "job": {"id": "0192f1a4-7c1e-7b3a-9d2e-0000000000a1"},
+  "prompt": "You are Backend engineer, an AI agent of the company \"My Company\", working through Tinfirm.\n\n# Work item MYCO-12: Add a health endpoint\n",
+  "resumeSessionId": null,
+  "workspaces": [
+    {
+      "componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000010",
+      "dir": "server",
+      "name": "server",
+      "repoUrl": "https://github.com/flowtivo/tinfirm.git",
+      "defaultBranch": "main",
+      "branch": "agent/MYCO-12",
+      "git": {"username": "x-access-token", "token": "github_pat_EXAMPLE_NOT_A_REAL_TOKEN"},
+      "authorName": "Tinfirm agent Backend engineer",
+      "authorEmail": "agent@tinfirm.invalid"
+    },
+    {
+      "componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000011",
+      "dir": "web-app",
+      "name": "Web app",
+      "repoUrl": "https://github.com/my-company/web-app.git",
+      "defaultBranch": "develop",
+      "branch": "agent/MYCO-12",
+      "git": null,
+      "authorName": "Tinfirm agent Backend engineer",
+      "authorEmail": "agent@tinfirm.invalid",
+      "readOnly": true
+    }
+  ],
+  "requestableRepositories": [
+    {"componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000012", "name": "docs", "repoUrl": "https://github.com/my-company/docs.git", "pendingRequest": false}
+  ],
+  "limits": {"maxWallClockSeconds": 3600, "maxTurns": 200},
+  "resumePrompt": null,
+  "attachments": [
+    {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000c", "fileName": "design notes.pdf", "sizeBytes": 18234, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+  ],
+  "allowedHosts": ["registry.example.com", "*.cdn.example.com:8443"],
+  "platformTools": ["ask", "finish", "request_access", "request_network_access", "save_artifact", "list_repositories"],
+  "tools": [
+    {"name": "jira_get", "description": "Reads one issue of the Jira connection `Jira` by key: its key, title, status, labels, assignees, description and newest comments.", "inputSchema": {"type": "object", "properties": {"key": {"type": "string", "description": "The issue key, e.g. SHOP-241"}}, "required": ["key"]}, "replay": "SAFE"},
+    {"name": "jira_search", "description": "Searches the issues of the Jira connection `Jira` with JQL and returns at most `limit` of them (key, title, status, assignees).", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "description": "A JQL query"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}}, "required": ["query"]}}
+  ]
+}

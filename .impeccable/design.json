@@ -1,0 +1,906 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-26T12:33:55+00:00",
+  "title": "Design System: Tinfirm",
+  "extensions": {
+    "colorMeta": {
+      "sage-ground": {
+        "role": "neutral",
+        "displayName": "Sage Ground",
+        "canonical": "#edf1ea",
+        "tonalRamp": [
+          "#252e1f",
+          "#435337",
+          "#617750",
+          "#7e9b69",
+          "#9eb48e",
+          "#bdccb3",
+          "#dae2d4",
+          "#f2f5f0"
+        ],
+        "theme": "light",
+        "cssVar": "--background"
+      },
+      "sheet": {
+        "role": "neutral",
+        "displayName": "Sheet",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#262626",
+          "#454545",
+          "#636363",
+          "#828282",
+          "#a1a1a1",
+          "#bfbfbf",
+          "#dbdbdb",
+          "#f2f2f2"
+        ],
+        "theme": "light",
+        "cssVar": "--card"
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#1b221c",
+        "tonalRamp": [
+          "#222b23",
+          "#3d4d3f",
+          "#586f5b",
+          "#749078",
+          "#96ab99",
+          "#b8c7ba",
+          "#d7dfd8",
+          "#f1f4f1"
+        ],
+        "theme": "light",
+        "cssVar": "--foreground"
+      },
+      "moss-muted-text": {
+        "role": "neutral",
+        "displayName": "Moss Muted Text",
+        "canonical": "#56635a",
+        "tonalRamp": [
+          "#242925",
+          "#404a43",
+          "#5c6a61",
+          "#798b7f",
+          "#9aa79e",
+          "#bbc4be",
+          "#d9deda",
+          "#f1f3f2"
+        ],
+        "theme": "light",
+        "cssVar": "--muted-foreground"
+      },
+      "agent-green": {
+        "role": "primary",
+        "displayName": "Agent Green",
+        "canonical": "#1d6a4d",
+        "tonalRamp": [
+          "#103c2c",
+          "#1e6c4f",
+          "#2b9c71",
+          "#3bc994",
+          "#6bd6ae",
+          "#9be4c8",
+          "#c7f0e0",
+          "#ebfaf4"
+        ],
+        "theme": "light",
+        "cssVar": "--primary"
+      },
+      "agent-green-foreground": {
+        "role": "primary",
+        "displayName": "On Agent Green",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#262626",
+          "#454545",
+          "#636363",
+          "#828282",
+          "#a1a1a1",
+          "#bfbfbf",
+          "#dbdbdb",
+          "#f2f2f2"
+        ],
+        "theme": "light",
+        "cssVar": "--primary-foreground"
+      },
+      "human-orange": {
+        "role": "secondary",
+        "displayName": "Needs-a-Human Orange",
+        "canonical": "#b8430d",
+        "tonalRamp": [
+          "#471a05",
+          "#812f09",
+          "#ba440d",
+          "#ef5a16",
+          "#f3824f",
+          "#f7ab88",
+          "#fad0bc",
+          "#fdeee7"
+        ],
+        "theme": "light",
+        "cssVar": "--human"
+      },
+      "human-orange-foreground": {
+        "role": "secondary",
+        "displayName": "On Human Orange",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#262626",
+          "#454545",
+          "#636363",
+          "#828282",
+          "#a1a1a1",
+          "#bfbfbf",
+          "#dbdbdb",
+          "#f2f2f2"
+        ],
+        "theme": "light",
+        "cssVar": "--human-foreground"
+      },
+      "human-soft": {
+        "role": "secondary",
+        "displayName": "Human Soft",
+        "canonical": "#fdeadf",
+        "tonalRamp": [
+          "#481d04",
+          "#823508",
+          "#bb4c0c",
+          "#f06514",
+          "#f48a4d",
+          "#f8b087",
+          "#fbd3bc",
+          "#feefe7"
+        ],
+        "theme": "light",
+        "cssVar": "--human-soft"
+      },
+      "bubble-me": {
+        "role": "primary",
+        "displayName": "My Bubble",
+        "canonical": "#1d6a4d",
+        "tonalRamp": [
+          "#103c2c",
+          "#1e6c4f",
+          "#2b9c71",
+          "#3bc994",
+          "#6bd6ae",
+          "#9be4c8",
+          "#c7f0e0",
+          "#ebfaf4"
+        ],
+        "theme": "light",
+        "cssVar": "--bubble-me"
+      },
+      "bubble-me-foreground": {
+        "role": "primary",
+        "displayName": "On My Bubble",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "#262626",
+          "#454545",
+          "#636363",
+          "#828282",
+          "#a1a1a1",
+          "#bfbfbf",
+          "#dbdbdb",
+          "#f2f2f2"
+        ],
+        "theme": "light",
+        "cssVar": "--bubble-me-foreground"
+      },
+      "sage-secondary": {
+        "role": "neutral",
+        "displayName": "Sage Secondary",
+        "canonical": "#e3eadf",
+        "tonalRamp": [
+          "#242e1e",
+          "#415337",
+          "#5e784f",
+          "#7b9c68",
+          "#9bb48d",
+          "#bcccb2",
+          "#d9e3d4",
+          "#f2f5f0"
+        ],
+        "theme": "light",
+        "cssVar": "--secondary"
+      },
+      "sage-muted": {
+        "role": "neutral",
+        "displayName": "Sage Muted",
+        "canonical": "#f1f4ee",
+        "tonalRamp": [
+          "#262e1e",
+          "#455436",
+          "#63794e",
+          "#829d67",
+          "#a1b58c",
+          "#bfcdb2",
+          "#dbe3d4",
+          "#f2f5f0"
+        ],
+        "theme": "light",
+        "cssVar": "--muted"
+      },
+      "sage-accent": {
+        "role": "neutral",
+        "displayName": "Sage Accent",
+        "canonical": "#e8eee4",
+        "tonalRamp": [
+          "#252f1e",
+          "#425435",
+          "#5f7a4d",
+          "#7c9e66",
+          "#9cb68b",
+          "#bcceb1",
+          "#dae3d3",
+          "#f2f5ef"
+        ],
+        "theme": "light",
+        "cssVar": "--accent"
+      },
+      "sidebar-accent": {
+        "role": "neutral",
+        "displayName": "Sidebar Accent",
+        "canonical": "#dfe7da",
+        "tonalRamp": [
+          "#242e1e",
+          "#415436",
+          "#5f794e",
+          "#7c9d67",
+          "#9cb58d",
+          "#bccdb2",
+          "#dae3d4",
+          "#f2f5f0"
+        ],
+        "theme": "light",
+        "cssVar": "--sidebar-accent"
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#dae2d6",
+        "tonalRamp": [
+          "#242d20",
+          "#415139",
+          "#5e7452",
+          "#7b976d",
+          "#9bb190",
+          "#bccab4",
+          "#d9e1d5",
+          "#f2f4f0"
+        ],
+        "theme": "light",
+        "cssVar": "--border"
+      },
+      "field-stroke": {
+        "role": "neutral",
+        "displayName": "Field Stroke",
+        "canonical": "#ccd6c8",
+        "tonalRamp": [
+          "#242c21",
+          "#414f3b",
+          "#5d7255",
+          "#7a9470",
+          "#9bae93",
+          "#bbc9b6",
+          "#d9e1d6",
+          "#f1f4f0"
+        ],
+        "theme": "light",
+        "cssVar": "--input"
+      },
+      "success": {
+        "role": "status",
+        "displayName": "Success",
+        "canonical": "#1f7a45",
+        "tonalRamp": [
+          "#0f3d22",
+          "#1c6e3e",
+          "#289f5a",
+          "#38cc76",
+          "#69d997",
+          "#99e5b9",
+          "#c6f1d8",
+          "#ebfaf1"
+        ],
+        "theme": "light",
+        "cssVar": "--success"
+      },
+      "warning": {
+        "role": "status",
+        "displayName": "Warning",
+        "canonical": "#9a5a00",
+        "tonalRamp": [
+          "#4c2d00",
+          "#8a5000",
+          "#c77400",
+          "#ff9705",
+          "#ffb142",
+          "#ffca80",
+          "#ffe1b8",
+          "#fff4e5"
+        ],
+        "theme": "light",
+        "cssVar": "--warning"
+      },
+      "destructive": {
+        "role": "status",
+        "displayName": "Destructive",
+        "canonical": "#b42318",
+        "tonalRamp": [
+          "#440d09",
+          "#7a1810",
+          "#b02217",
+          "#e23022",
+          "#e96358",
+          "#f0958f",
+          "#f7c4c0",
+          "#fceae8"
+        ],
+        "theme": "light",
+        "cssVar": "--destructive"
+      },
+      "night-ground": {
+        "role": "neutral",
+        "displayName": "Night ground",
+        "canonical": "#111511",
+        "tonalRamp": [
+          "#222a22",
+          "#3e4c3e",
+          "#596e59",
+          "#758f75",
+          "#97ab97",
+          "#b9c6b9",
+          "#d8dfd8",
+          "#f1f4f1"
+        ],
+        "theme": "dark",
+        "cssVar": "--ground"
+      },
+      "night-sheet": {
+        "role": "neutral",
+        "displayName": "Night Sheet",
+        "canonical": "#1a1f1a",
+        "tonalRamp": [
+          "#232a23",
+          "#3f4b3f",
+          "#5b6c5b",
+          "#778d77",
+          "#98a998",
+          "#bac5ba",
+          "#d8ded8",
+          "#f1f3f1"
+        ],
+        "theme": "dark",
+        "cssVar": "--card"
+      },
+      "night-popover": {
+        "role": "neutral",
+        "displayName": "Night Popover",
+        "canonical": "#1f251f",
+        "tonalRamp": [
+          "#232a23",
+          "#3f4b3f",
+          "#5b6c5b",
+          "#778d77",
+          "#98a998",
+          "#bac5ba",
+          "#d8ded8",
+          "#f1f3f1"
+        ],
+        "theme": "dark",
+        "cssVar": "--popover"
+      },
+      "night-ink": {
+        "role": "neutral",
+        "displayName": "Night Ink",
+        "canonical": "#e5ebe4",
+        "tonalRamp": [
+          "#222c21",
+          "#3e4f3b",
+          "#597255",
+          "#75956f",
+          "#97af93",
+          "#b8c9b6",
+          "#d8e1d6",
+          "#f1f4f0"
+        ],
+        "theme": "dark",
+        "cssVar": "--foreground"
+      },
+      "night-muted-text": {
+        "role": "neutral",
+        "displayName": "Night muted-text",
+        "canonical": "#9aa79b",
+        "tonalRamp": [
+          "#242924",
+          "#404a41",
+          "#5d6a5e",
+          "#798b7b",
+          "#9aa79b",
+          "#bbc4bc",
+          "#d9ded9",
+          "#f1f3f2"
+        ],
+        "theme": "dark",
+        "cssVar": "--muted-text"
+      },
+      "night-agent-green": {
+        "role": "primary",
+        "displayName": "Night Agent Green",
+        "canonical": "#72d3a8",
+        "tonalRamp": [
+          "#123a29",
+          "#216949",
+          "#2f9869",
+          "#41c489",
+          "#6fd2a6",
+          "#9ee1c3",
+          "#c9eedd",
+          "#ecf9f3"
+        ],
+        "theme": "dark",
+        "cssVar": "--primary"
+      },
+      "night-agent-green-foreground": {
+        "role": "primary",
+        "displayName": "Night On Agent Green",
+        "canonical": "#0b1f16",
+        "tonalRamp": [
+          "#143828",
+          "#246648",
+          "#349368",
+          "#47be88",
+          "#74cea5",
+          "#a1dec2",
+          "#caecdd",
+          "#ecf8f3"
+        ],
+        "theme": "dark",
+        "cssVar": "--primary-foreground"
+      },
+      "night-human-orange": {
+        "role": "secondary",
+        "displayName": "Night Needs-a-Human Orange",
+        "canonical": "#ff9f6b",
+        "tonalRamp": [
+          "#4c1b00",
+          "#8a3000",
+          "#c74600",
+          "#ff5d05",
+          "#ff8542",
+          "#ffac80",
+          "#ffd1b8",
+          "#ffeee5"
+        ],
+        "theme": "dark",
+        "cssVar": "--human"
+      },
+      "night-human-orange-foreground": {
+        "role": "secondary",
+        "displayName": "Night On Human Orange",
+        "canonical": "#2a1206",
+        "tonalRamp": [
+          "#431d0a",
+          "#783411",
+          "#ae4b19",
+          "#e06324",
+          "#e7895a",
+          "#efaf8f",
+          "#f6d2c1",
+          "#fcefe9"
+        ],
+        "theme": "dark",
+        "cssVar": "--human-foreground"
+      },
+      "night-human-soft": {
+        "role": "secondary",
+        "displayName": "Night Human Soft",
+        "canonical": "#3a2418",
+        "tonalRamp": [
+          "#362216",
+          "#613c28",
+          "#8d573a",
+          "#b6734e",
+          "#c8957a",
+          "#dab7a5",
+          "#ead7cc",
+          "#f8f1ed"
+        ],
+        "theme": "dark",
+        "cssVar": "--human-soft"
+      },
+      "night-bubble-me": {
+        "role": "primary",
+        "displayName": "Night My Bubble",
+        "canonical": "#244a3a",
+        "tonalRamp": [
+          "#193328",
+          "#2d5d49",
+          "#418669",
+          "#57ad89",
+          "#80c1a6",
+          "#a9d5c3",
+          "#cfe8dd",
+          "#eef7f3"
+        ],
+        "theme": "dark",
+        "cssVar": "--bubble-me"
+      },
+      "night-bubble-me-foreground": {
+        "role": "primary",
+        "displayName": "Night On My Bubble",
+        "canonical": "#e6f5ec",
+        "tonalRamp": [
+          "#163723",
+          "#27623f",
+          "#398e5b",
+          "#4cb877",
+          "#78c999",
+          "#a4dbba",
+          "#ccebd8",
+          "#edf8f1"
+        ],
+        "theme": "dark",
+        "cssVar": "--bubble-me-foreground"
+      },
+      "night-hairline": {
+        "role": "neutral",
+        "displayName": "Night Hairline",
+        "canonical": "#29312a",
+        "tonalRamp": [
+          "#232a24",
+          "#3f4b40",
+          "#5b6c5d",
+          "#778d7a",
+          "#98a99a",
+          "#bac5bb",
+          "#d8ded9",
+          "#f1f3f1"
+        ],
+        "theme": "dark",
+        "cssVar": "--border"
+      },
+      "night-field-stroke": {
+        "role": "neutral",
+        "displayName": "Night Field Stroke",
+        "canonical": "#354036",
+        "tonalRamp": [
+          "#232a23",
+          "#3e4b40",
+          "#5a6d5c",
+          "#768e78",
+          "#98aa99",
+          "#b9c5ba",
+          "#d8dfd9",
+          "#f1f3f1"
+        ],
+        "theme": "dark",
+        "cssVar": "--input"
+      },
+      "night-success": {
+        "role": "status",
+        "displayName": "Night Success",
+        "canonical": "#6cc592",
+        "tonalRamp": [
+          "#163724",
+          "#276340",
+          "#388f5d",
+          "#4cb87a",
+          "#78ca9b",
+          "#a4dbbb",
+          "#ccebd9",
+          "#edf8f1"
+        ],
+        "theme": "dark",
+        "cssVar": "--success"
+      },
+      "night-warning": {
+        "role": "status",
+        "displayName": "Night Warning",
+        "canonical": "#f2b24c",
+        "tonalRamp": [
+          "#472e05",
+          "#805209",
+          "#b9770d",
+          "#ee9b16",
+          "#f2b34f",
+          "#f6cc88",
+          "#fae2bc",
+          "#fdf5e7"
+        ],
+        "theme": "dark",
+        "cssVar": "--warning"
+      },
+      "night-destructive": {
+        "role": "status",
+        "displayName": "Night Destructive",
+        "canonical": "#f28b80",
+        "tonalRamp": [
+          "#450d07",
+          "#7d180d",
+          "#b42212",
+          "#e8301c",
+          "#ed6354",
+          "#f3958b",
+          "#f8c4be",
+          "#fdeae8"
+        ],
+        "theme": "dark",
+        "cssVar": "--destructive"
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Page titles and the task title (1.25rem below sm, 1.5rem from sm)."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Section headings (Run, Conversation) and card headers; card titles use weight 500."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Markdown, bubble text, table cells."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Field labels, chips, progress pills, author lines. Sentence case."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Task keys, branches, SHAs, token counts, costs, timers, keyboard hints. Tabular numbers."
+      }
+    },
+    "radiusBase": {
+      "value": "0.625rem",
+      "note": "spartan preset scales from --radius: md 0.8x (8px), lg 1x (10px), xl 1.4x (14px), 2xl 1.8x (18px), 4xl 2.6x (badges). Bubbles use a literal 1rem with an 8px tail corner."
+    },
+    "shadows": [
+      {
+        "name": "bubble-lift",
+        "value": "0 1px 2px rgb(0 0 0 / 0.06)",
+        "purpose": "Agent bubbles and the typing bubble on the thread ground."
+      },
+      {
+        "name": "button-press",
+        "value": "0 1px 2px rgb(0 0 0 / 0.08)",
+        "purpose": "Primary buttons only."
+      },
+      {
+        "name": "nav-active",
+        "value": "0 1px 3px rgb(0 0 0 / 0.08)",
+        "purpose": "Active sidebar item."
+      },
+      {
+        "name": "floating-control",
+        "value": "0 6px 16px -4px rgb(0 0 0 / 0.2)",
+        "purpose": "Jump-to-latest button over the transcript."
+      },
+      {
+        "name": "composer-float",
+        "value": "0 10px 30px -12px rgb(0 0 0 / 0.3)",
+        "purpose": "Sticky composer over the thread."
+      },
+      {
+        "name": "entry-sheet",
+        "value": "0 12px 32px -12px rgb(0 0 0 / 0.15)",
+        "purpose": "Login card."
+      },
+      {
+        "name": "menu",
+        "value": "0 12px 32px -8px rgb(0 0 0 / 0.18)",
+        "purpose": "Dropdown menus."
+      },
+      {
+        "name": "dialog",
+        "value": "0 24px 48px -12px rgb(0 0 0 / 0.25)",
+        "purpose": "Dialogs and alert dialogs."
+      }
+    ],
+    "motion": [
+      {
+        "name": "thread-dot",
+        "value": "1.2s ease-in-out infinite, 0.15s stagger, 3px rise",
+        "purpose": "Typing dots while a run is live."
+      },
+      {
+        "name": "live-ping",
+        "value": "Tailwind animate-ping on a green dot, hidden under reduced motion",
+        "purpose": "Live and queued run indicators."
+      },
+      {
+        "name": "overlay-enter",
+        "value": "fade + zoom 95%, 100ms",
+        "purpose": "Dialogs and menus."
+      },
+      {
+        "name": "sidebar-collapse",
+        "value": "200ms linear (left, right, width)",
+        "purpose": "Sidebar open and collapse."
+      },
+      {
+        "name": "press",
+        "value": "translateY(1px)",
+        "purpose": "Button active state."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "animation and transition durations 0.01ms",
+        "purpose": "Global prefers-reduced-motion override."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "md",
+        "value": "768px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      },
+      {
+        "name": "xl",
+        "value": "1280px"
+      }
+    ],
+    "fonts": {
+      "sans": "Figtree Variable via @fontsource-variable/figtree (self-hosted)",
+      "mono": "DM Mono 400/500 via @fontsource/dm-mono (self-hosted)"
+    },
+    "icons": "Lucide via ng-icons",
+    "rasterAssets": "None ship. Avatars are initials on colour tiles.",
+    "themes": {
+      "default": "light",
+      "dark": "`.dark` class on <html>, set by ThemeService from the stored preference or the OS setting"
+    }
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The primary action (Run now, Save, New task): a green pill.",
+      "html": "<button class=\"ds-btn-primary\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polygon points=\"6 3 20 12 6 21 6 3\"/></svg> Run now</button>",
+      "css": ".ds-btn-primary { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 16px 0 12px; border-radius: 9999px; border: 1px solid transparent; background: var(--primary, #1d6a4d); color: var(--primary-foreground, #fff); font-size: 14px; font-weight: 600; box-shadow: 0 1px 2px rgb(0 0 0 / 0.08); cursor: pointer; transition: all .15s; outline: none; } .ds-btn-primary:hover { background: color-mix(in srgb, var(--primary, #1d6a4d) 90%, transparent); } .ds-btn-primary:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring, #1d6a4d) 50%, transparent); } .ds-btn-primary:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Outline Button",
+      "kind": "button",
+      "refersTo": "button-outline",
+      "description": "Secondary action on a sheet (Cancel): white pill with a hairline.",
+      "html": "<button class=\"ds-btn-outline\">Cancel</button>",
+      "css": ".ds-btn-outline { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); height: 36px; padding: 0 16px; border-radius: 9999px; border: 1px solid var(--border, #dae2d6); background: var(--card, #fff); color: var(--foreground, #1b221c); font-size: 14px; font-weight: 600; cursor: pointer; transition: all .15s; outline: none; } .ds-btn-outline:hover { background: var(--accent, #e8eee4); } .ds-btn-outline:focus-visible { border-color: var(--ring, #1d6a4d); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring, #1d6a4d) 50%, transparent); } .ds-btn-outline:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Destructive Button",
+      "kind": "button",
+      "refersTo": "button-destructive",
+      "description": "Cancel run and other destructive actions: destructive text on a 10% tint, never solid red.",
+      "html": "<button class=\"ds-btn-destructive\">Cancel run</button>",
+      "css": ".ds-btn-destructive { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); height: 32px; padding: 0 12px; border-radius: 9999px; border: 1px solid transparent; background: color-mix(in srgb, var(--destructive, #b42318) 10%, transparent); color: var(--destructive, #b42318); font-size: 12.8px; font-weight: 600; cursor: pointer; transition: all .15s; outline: none; } .ds-btn-destructive:hover { background: color-mix(in srgb, var(--destructive, #b42318) 20%, transparent); } .ds-btn-destructive:focus-visible { box-shadow: 0 0 0 3px color-mix(in srgb, var(--destructive, #b42318) 20%, transparent); }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Inputs, textareas and native selects: white sheet, field-stroke border, 10px radius.",
+      "html": "<input class=\"ds-input\" placeholder=\"Task title\" />",
+      "css": ".ds-input { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); height: 36px; width: 260px; padding: 4px 12px; border-radius: 10px; border: 1px solid var(--input, #ccd6c8); background: var(--card, #fff); color: var(--foreground, #1b221c); font-size: 14px; outline: none; transition: border-color .15s, box-shadow .15s; } .ds-input::placeholder { color: var(--muted-foreground, #56635a); } .ds-input:focus-visible { border-color: var(--ring, #1d6a4d); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring, #1d6a4d) 50%, transparent); }"
+    },
+    {
+      "name": "Sidebar Navigation",
+      "kind": "nav",
+      "refersTo": "nav-item-active",
+      "description": "Sidebar on the sage ground; the active item becomes a white sheet with a green icon.",
+      "html": "<nav class=\"ds-nav\"><a class=\"ds-nav-item\" href=\"#\">Overview</a><a class=\"ds-nav-item is-active\" href=\"#\" aria-current=\"page\"><span class=\"ds-nav-dot\"></span>Projects</a><a class=\"ds-nav-item\" href=\"#\">Agents</a></nav>",
+      "css": ".ds-nav { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); display: flex; flex-direction: column; gap: 2px; width: 220px; padding: 8px; background: var(--sidebar, #edf1ea); } .ds-nav-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 10px; color: var(--foreground, #1b221c); font-size: 14px; text-decoration: none; outline: none; } .ds-nav-item:hover { background: var(--sidebar-accent, #dfe7da); } .ds-nav-item:focus-visible { box-shadow: 0 0 0 2px var(--sidebar-ring, #1d6a4d); } .ds-nav-item.is-active { background: var(--card, #fff); font-weight: 600; box-shadow: 0 1px 3px rgb(0 0 0 / 0.08); } .ds-nav-dot { width: 8px; height: 8px; border-radius: 9999px; background: var(--primary, #1d6a4d); }"
+    },
+    {
+      "name": "Status and Needs-a-Human Chips",
+      "kind": "chip",
+      "refersTo": "chip-needs-human",
+      "description": "Pill chips: run status on a tint, the live pill, and the orange needs-review chip.",
+      "html": "<div class=\"ds-chips\"><span class=\"ds-chip ds-chip-ok\">Succeeded</span><span class=\"ds-chip ds-chip-live\"><span class=\"ds-live\"></span>Working <span class=\"ds-mono\">2:14</span></span><span class=\"ds-chip ds-chip-human\">Needs review</span></div>",
+      "css": ".ds-chips { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); display: flex; gap: 8px; align-items: center; } .ds-chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; border: 1px solid transparent; } .ds-chip-ok { color: var(--success, #1f7a45); border-color: color-mix(in srgb, var(--success, #1f7a45) 40%, transparent); background: color-mix(in srgb, var(--success, #1f7a45) 10%, transparent); } .ds-chip-live { color: var(--primary, #1d6a4d); background: color-mix(in srgb, var(--primary, #1d6a4d) 10%, transparent); } .ds-chip-human { color: var(--human, #b8430d); background: var(--human-soft, #fdeadf); } .ds-live { width: 8px; height: 8px; border-radius: 9999px; background: var(--primary, #1d6a4d); } .ds-mono { font-family: var(--font-mono, 'DM Mono', ui-monospace, monospace); font-weight: 500; font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Task Progress Pills",
+      "kind": "custom",
+      "refersTo": "progress-pill-human",
+      "description": "Task header progress: done steps muted with a check, current step green, In review orange.",
+      "html": "<ol class=\"ds-progress\"><li class=\"ds-step ds-done\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M20 6 9 17l-5-5\"/></svg> Todo</li><li class=\"ds-step ds-done\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M20 6 9 17l-5-5\"/></svg> In progress</li><li class=\"ds-step ds-human\" aria-current=\"step\">In review</li><li class=\"ds-step ds-todo\">Done</li></ol>",
+      "css": ".ds-progress { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); display: flex; flex-wrap: wrap; gap: 6px; list-style: none; margin: 0; padding: 0; } .ds-step { display: inline-flex; align-items: center; gap: 4px; height: 28px; padding: 0 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; } .ds-done { background: var(--muted, #f1f4ee); color: var(--primary, #1d6a4d); } .ds-now { background: var(--primary, #1d6a4d); color: var(--primary-foreground, #fff); } .ds-human { background: var(--human, #b8430d); color: var(--human-foreground, #fff); } .ds-todo { color: var(--muted-foreground, #56635a); border: 1px solid var(--border, #dae2d6); }"
+    },
+    {
+      "name": "Sheet Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Every container: a white 14px sheet with a hairline on the sage ground, no shadow at rest.",
+      "html": "<section class=\"ds-ground\"><div class=\"ds-card\"><h3 class=\"ds-card-title\">Runs</h3><p class=\"ds-card-meta\"><span class=\"ds-mono\">120 in · 45 out</span> · 2 commits</p></div></section>",
+      "css": ".ds-ground { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); background: var(--background, #edf1ea); padding: 20px; } .ds-card { background: var(--card, #fff); color: var(--card-foreground, #1b221c); border: 1px solid var(--border, #dae2d6); border-radius: 14px; padding: 16px; font-size: 14px; max-width: 320px; } .ds-card-title { margin: 0 0 6px; font-size: 16px; font-weight: 500; } .ds-card-meta { margin: 0; color: var(--muted-foreground, #56635a); font-size: 12px; } .ds-mono { font-family: var(--font-mono, 'DM Mono', ui-monospace, monospace); font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Thread Bubbles",
+      "kind": "custom",
+      "refersTo": "bubble-agent",
+      "description": "The signature thread: agent speaks left in white bubbles with a bottom-left tail, you answer right in green with a bottom-right tail, typing dots while live.",
+      "html": "<div class=\"ds-thread\"><div class=\"ds-row\"><span class=\"ds-avatar\">EA</span><div class=\"ds-bubble ds-agent\">Done. I created hello.txt and committed it.</div></div><div class=\"ds-note\">Pushing</div><div class=\"ds-bubble ds-me\">Great, open the PR.</div><div class=\"ds-row\"><div class=\"ds-bubble ds-agent ds-typing\"><span></span><span></span><span></span></div></div></div>",
+      "css": ".ds-thread { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); display: flex; flex-direction: column; gap: 12px; padding: 20px; background: var(--background, #edf1ea); font-size: 14px; line-height: 1.625; max-width: 520px; } .ds-row { display: flex; align-items: flex-end; gap: 10px; } .ds-avatar { display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; flex-shrink: 0; border-radius: 10px; background: var(--primary, #1d6a4d); color: var(--primary-foreground, #fff); font-size: 12px; font-weight: 700; } .ds-bubble { width: fit-content; max-width: 80%; padding: 12px 16px; border-radius: 16px; } .ds-agent { background: var(--card, #fff); color: var(--card-foreground, #1b221c); border-bottom-left-radius: 8px; box-shadow: 0 1px 2px rgb(0 0 0 / 0.06); } .ds-me { align-self: flex-end; background: var(--bubble-me, #1d6a4d); color: var(--bubble-me-foreground, #fff); border-bottom-right-radius: 8px; } .ds-note { align-self: center; font-size: 12px; font-weight: 600; } .ds-typing { display: inline-flex; gap: 4px; padding: 14px 16px; } .ds-typing span { width: 6px; height: 6px; border-radius: 9999px; background: var(--muted-foreground, #56635a); animation: ds-dot 1.2s ease-in-out infinite; } .ds-typing span:nth-child(2) { animation-delay: .15s; } .ds-typing span:nth-child(3) { animation-delay: .3s; } @keyframes ds-dot { 0%, 60%, 100% { transform: none; opacity: .5; } 30% { transform: translateY(-3px); opacity: 1; } } @media (prefers-reduced-motion: reduce) { .ds-typing span { animation: none; } }"
+    },
+    {
+      "name": "Composer",
+      "kind": "input",
+      "refersTo": "bubble-me",
+      "description": "Sticky comment composer: an 18px white sheet floating over the thread with a round green send button.",
+      "html": "<form class=\"ds-composer\" onsubmit=\"return false\"><div class=\"ds-composer-row\"><textarea class=\"ds-composer-text\" rows=\"1\" placeholder=\"Write a comment...\"></textarea><button class=\"ds-send\" aria-label=\"Comment\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m5 12 7-7 7 7\"/><path d=\"M12 19V5\"/></svg></button></div><div class=\"ds-composer-foot\">Markdown is supported.</div></form>",
+      "css": ".ds-composer { font-family: var(--font-sans, 'Figtree Variable', system-ui, sans-serif); width: 480px; background: var(--card, #fff); border: 1px solid var(--border, #dae2d6); border-radius: 18px; box-shadow: 0 10px 30px -12px rgb(0 0 0 / 0.3); transition: box-shadow .15s; } .ds-composer:focus-within { border-color: var(--ring, #1d6a4d); box-shadow: 0 10px 30px -12px rgb(0 0 0 / 0.3), 0 0 0 3px color-mix(in srgb, var(--ring, #1d6a4d) 40%, transparent); } .ds-composer-row { display: flex; align-items: flex-end; gap: 8px; padding: 6px 6px 6px 16px; } .ds-composer-text { flex: 1; resize: none; border: 0; background: transparent; padding: 8px 0; font: inherit; font-size: 14px; line-height: 1.625; color: var(--foreground, #1b221c); outline: none; } .ds-send { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 9999px; border: 0; background: var(--primary, #1d6a4d); color: var(--primary-foreground, #fff); cursor: pointer; } .ds-send:hover { background: color-mix(in srgb, var(--primary, #1d6a4d) 90%, transparent); } .ds-send:focus-visible { outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring, #1d6a4d) 50%, transparent); } .ds-composer-foot { border-top: 1px solid var(--border, #dae2d6); padding: 6px 16px; font-size: 12px; color: var(--muted-foreground, #56635a); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Thread",
+    "overview": "**Creative North Star: \"The Thread\"**\n\nA task is a conversation with the agent doing the work. The app sits on a soft sage ground, and every piece of content is a white rounded sheet laid on it: header, brief, details, runs, the agent's messages. The run transcript and the human conversation read like a messaging thread: the agent speaks from the left in white bubbles, you answer from the right in green bubbles, and the machinery in between (tool calls, thoughts, log lines, phase changes, git notes) collapses into small pill chips and centred notes so it never outshouts what was said.\n\nDensity is moderate and calm: 14px body text, 20px gaps between sheets, soft hairlines instead of rules. Colour is scarce and semantic. Deep green is the agent and the primary action; warm orange is reserved for the one thing a human must act on. Everything else is sage-tinted neutral. The system explicitly refuses the category default: a dark zinc sidebar dashboard of dense tables and status badges.\n\nLight is the default theme; dark (`.dark` on `<html>`) is a full parallel palette on a near-black green ground, not an inversion.",
+    "keyCharacteristics": [
+      "Sage ground under white rounded sheets; sheets separate by tone, with only a hairline in the border tone.",
+      "Deep green for the agent and primary actions; orange only for \"needs a human\".",
+      "Pills everywhere a thing is a status, a phase or an action; 16px bubbles for speech; 14px sheets for containers.",
+      "Figtree for all UI text, DM Mono only for code, paths, keys and numbers.",
+      "Lucide line icons, never glyphs or emoji.",
+      "No raster imagery: the app ships no images; avatars are initials on colour tiles."
+    ],
+    "rules": [
+      {
+        "name": "The Two Voices Rule",
+        "body": "Green belongs to the agent and to \"do it\"; orange belongs to \"a human must decide\". No third accent. Task status maps accordingly: In progress is primary green (with a 3px green halo on its dot), In review is human orange, Done is success green; Backlog, Todo and Cancelled stay neutral.",
+        "section": "colors"
+      },
+      {
+        "name": "The Scarce Orange Rule",
+        "body": "Orange appears only where a human is waited on. If nothing on the screen needs a person, no orange is visible.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mono Is Machine Text Rule",
+        "body": "DM Mono is for code, paths, keys and numbers only. Never for headings, labels or decoration.",
+        "section": "typography"
+      },
+      {
+        "name": "The Sentence Case Rule",
+        "body": "Labels and chips are sentence case at 0.75rem semibold. No uppercase tracked micro-labels above headings.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tone Before Shadow Rule",
+        "body": "A sheet on the ground separates by colour and a hairline; it does not get a shadow at rest. Shadow is for speech and for things floating over other content.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do put content on white sheets (14px radius, 1px hairline) over the sage ground; keep the run thread itself on the ground.",
+      "Do use agent green for the agent, the primary action and the live state, and nothing decorative.",
+      "Do reserve orange for \"needs a human\": In review, Needs review, and future human-decision states.",
+      "Do make statuses, phases, chips and buttons full pills.",
+      "Do give speech 16px bubbles with an 8px tail corner on the speaker's side.",
+      "Do set code, paths, task keys, SHAs, counts, costs and timers in DM Mono with tabular numbers.",
+      "Do use Lucide line icons at 16px (12-14px inside small pills).",
+      "Do honour `prefers-reduced-motion`: the global rule collapses animations and hides the live ping."
+    ],
+    "donts": [
+      "Don't fall into the category default: a dark zinc sidebar dashboard of dense tables and status badges.",
+      "Don't introduce a third accent or use orange for decoration, branding or \"you\" chrome.",
+      "Don't draw dark or high-contrast borders around sheets; the hairline tone is the only border colour.",
+      "Don't fill destructive buttons with solid red; use the 10% tint.",
+      "Don't set UI labels or headings in DM Mono, and don't add uppercase tracked eyebrow labels above headings.",
+      "Don't use raw Tailwind palette colours or hard-coded hex in components; every colour comes from a token in `web/src/styles.css`.",
+      "Don't give sheets a shadow at rest."
+    ]
+  }
+}

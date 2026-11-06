@@ -1,0 +1,24 @@
+{
+  "type": "hello",
+  "protocolVersion": 2,
+  "runnerVersion": "0.1.0",
+  "hostname": "dev-mac",
+  "os": "macos",
+  "arch": "aarch64",
+  "executors": ["docker"],
+  "isolationTiers": ["microvm"],
+  "maxConcurrentRuns": 2,
+  "credentials": [
+    {"label": "claude-main", "kind": "CLAUDE_LOGIN", "runtimes": ["CLAUDE_CODE"], "poolSize": 3},
+    {"label": "codex-main", "kind": "CODEX_CHATGPT_AUTH", "runtimes": ["CODEX"], "poolSize": 1},
+    {"label": "anthropic-key", "kind": "ANTHROPIC_API_KEY", "runtimes": ["CLAUDE_CODE"], "poolSize": 3},
+    {"label": "openai-key", "kind": "OPENAI_API_KEY", "runtimes": ["CODEX"], "poolSize": 3}
+  ],
+  "runtimes": [
+    {"runtime": "CLAUDE_CODE", "image": "tinfirm-runner-claude:local", "version": "claude-code 2.1.280 / claude-agent-acp 0.81.2"},
+    {"runtime": "CODEX", "image": "tinfirm-runner-codex:local", "version": "codex 0.156.1 / codex-acp 1.13.1"}
+  ],
+  "activeRuns": [],
+  "publicSuffixList": {"sha256": "9f2b7c1d4e6a8b3057d1e9c4a2f6b8d0e3c5a7918b4d6f0e2c4a6b8d0f1e3a5c"},
+  "features": ["run.steer"]
+}

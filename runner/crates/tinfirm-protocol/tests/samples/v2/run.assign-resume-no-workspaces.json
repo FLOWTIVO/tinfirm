@@ -1,0 +1,17 @@
+{
+  "type": "run.assign",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6f",
+  "epoch": 3,
+  "credentialLabel": "codex-main",
+  "agent": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000c", "name": "Writer", "runtime": "CODEX", "model": "gpt-5.5", "effort": "HIGH"},
+  "workItem": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000d", "key": "MYCO-13", "title": "Draft release notes"},
+  "job": {"id": "0192f1a4-7c1e-7b3a-9d2e-0000000000a1"},
+  "prompt": "Full prompt",
+  "resumeSessionId": "019a0000-0000-7000-8000-000000000123",
+  "workspaces": [],
+  "requestableRepositories": [
+    {"componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000010", "name": "server", "repoUrl": "https://github.com/flowtivo/tinfirm.git", "pendingRequest": true}
+  ],
+  "limits": {"maxWallClockSeconds": 60, "maxTurns": 1},
+  "resumePrompt": "New comments.\n\nContinue with this feedback."
+}

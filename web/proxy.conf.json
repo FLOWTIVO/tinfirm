@@ -1,0 +1,20 @@
+{
+  "/api": {
+    "target": "http://localhost:8080",
+    "secure": false,
+    "changeOrigin": false,
+    "logLevel": "warn"
+  },
+  "/oauth2": {
+    "target": "http://localhost:8080",
+    "secure": false,
+    "changeOrigin": false,
+    "logLevel": "warn"
+  },
+  "/login/oauth2": {
+    "target": "http://localhost:8080",
+    "secure": false,
+    "changeOrigin": false,
+    "logLevel": "warn"
+  }
+}

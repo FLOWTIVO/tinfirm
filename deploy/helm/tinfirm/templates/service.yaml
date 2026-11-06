@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tinfirm.fullname" . }}
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  # The application port only. Management (8081) is deliberately not part of any Service.
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+  selector:
+    {{- include "tinfirm.selectorLabels" . | nindent 4 }}

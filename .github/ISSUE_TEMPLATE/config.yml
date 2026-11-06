@@ -1,0 +1,11 @@
+# The issue chooser. Blank issues stay enabled: a question, a documentation fix or anything
+# else that is neither a bug nor a feature request has no other place, as the repository has
+# no discussions.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/FLOWTIVO/tinfirm/security/policy
+    about: Privately, as SECURITY.md says. Never in a public issue.
+  - name: Documentation
+    url: https://docs.tinfirm.com
+    about: How to use, set up and run Tinfirm.

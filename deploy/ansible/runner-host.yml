@@ -1,0 +1,11 @@
+---
+# Tinfirm runner hosts: Linux VMs with nested virtualisation that run every sandbox as a
+# Kata Containers microVM, with the agent's own Docker inside (deploy/ansible/README.md).
+#
+#   ansible-playbook -i inventory.yml deploy/ansible/runner-host.yml --ask-vault-pass
+
+- name: Tinfirm runner hosts with Kata Containers
+  hosts: tinfirm_runner_hosts
+  become: true
+  roles:
+    - role: tinfirm_runner_host

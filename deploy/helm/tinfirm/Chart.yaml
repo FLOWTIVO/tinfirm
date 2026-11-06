@@ -1,0 +1,24 @@
+apiVersion: v2
+name: tinfirm
+description: Tinfirm server (API, worker and web UI in one image) and the bundled LiteLLM model gateway, on an external PostgreSQL 18
+type: application
+# Chart version. Bump it when the chart itself changes. It names a chart packaged from this
+# directory by hand; the charts CI publishes to oci://ghcr.io/flowtivo/charts/tinfirm carry
+# their own (ADR-0080): a release's version, or 0.0.0-sha-<commit> for each push to main.
+version: 0.8.0
+# The image the chart deploys unless `image.tag` names another: `v<appVersion>`.
+# A published chart carries its own: a release's version, whose images are `v<version>`, or
+# for a push to main `sha-<commit>`, which names that commit's images as it is (ADR-0090).
+appVersion: "0.1.0"
+kubeVersion: ">=1.29.0-0"
+keywords:
+  - tinfirm
+  - agents
+# First: helm makes it the package's org.opencontainers.image.source, which links the GHCR
+# package to this repository (.github/actions/helm-publish checks it).
+sources:
+  - https://github.com/FLOWTIVO/tinfirm
+# The chart is under MIT, as everything outside ee/ is; its LICENSE is a copy of the
+# repository's root LICENSE, which CI keeps identical (ADR-0082).
+annotations:
+  artifacthub.io/license: MIT

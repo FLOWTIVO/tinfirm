@@ -1,0 +1,34 @@
+# OIDC login against the dev Keycloak. DEVELOPMENT ONLY. Layer it on compose.yaml
+# together with the `oidc` profile; `make up-oidc` does exactly this:
+#
+#   docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.oidc.yaml \
+#     --profile oidc up -d --build
+#
+# Why a second file rather than more variables in compose.yaml: with an issuer-uri set,
+# Spring Security fetches the issuer's discovery document when the server starts. These
+# settings in the default stack, where Keycloak is not running, would stop the server
+# from starting. Compose has no way to set a variable only when a profile is active.
+
+services:
+  server:
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      # Registration id `keycloak`: the redirect URI is
+      # http://localhost:8080/login/oauth2/code/keycloak, as registered in the realm.
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_CLIENT_ID: tinfirm
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_CLIENT_SECRET: ${TINFIRM_OIDC_CLIENT_SECRET:?is not set in deploy/compose/.env}
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_CLIENT_NAME: Keycloak (dev)
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_AUTHORIZATION_GRANT_TYPE: authorization_code
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_KEYCLOAK_SCOPE: openid,profile,email
+      # The same URL the browser uses: see "Keycloak issuer" in compose.yaml.
+      SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_KEYCLOAK_ISSUER_URI: http://keycloak.localhost:8180/realms/tinfirm
+      # A new user from Keycloak joins the company `main` of compose.yaml (ADR-0075).
+      TINFIRM_AUTH_OIDC_PROVIDERS_KEYCLOAK_COMPANY: main
+      # Keycloak decides the role at every sign-in (ADR-0088), from the realm's groups:
+      # alice is in tinfirm-users. Move her to tinfirm-admins in Keycloak's admin console
+      # (http://keycloak.localhost:8180) and sign in again to see her become an Admin.
+      TINFIRM_AUTH_OIDC_PROVIDERS_KEYCLOAK_ROLE_CLAIM: groups
+      TINFIRM_AUTH_OIDC_PROVIDERS_KEYCLOAK_ROLE_MAP_ADMIN: tinfirm-admins
+      TINFIRM_AUTH_OIDC_PROVIDERS_KEYCLOAK_ROLE_MAP_MEMBER: tinfirm-users

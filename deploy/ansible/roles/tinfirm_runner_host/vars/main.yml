@@ -1,0 +1,94 @@
+---
+# Values the role derives from defaults/main.yml and the facts. Sites set defaults/main.yml.
+
+_tinfirm_runner_host_kata_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+# The Go runtime's shim from the static release, and the configuration the role writes.
+_tinfirm_runner_host_kata_shim: /opt/kata/bin/containerd-shim-kata-v2
+_tinfirm_runner_host_kata_runtime_cli: /opt/kata/bin/kata-runtime
+_tinfirm_runner_host_kata_config: /etc/kata-containers/configuration.toml
+_tinfirm_runner_host_kata_marker: "/opt/kata/.tinfirm-kata-{{ tinfirm_runner_host_kata_version }}"
+_tinfirm_runner_host_cache_dir: /var/cache/tinfirm
+
+# The SHA-256 of each pinned Kata release's tarball, by version and architecture, from the
+# release's assets. Those of kata-go-static-4.2.0-amd64.tar.zst and -arm64.tar.zst
+# (https://github.com/kata-containers/kata-containers/releases/tag/4.2.0) are not filled in
+# here: the entries are empty, and the role stops unless tinfirm_runner_host_kata_checksum
+# is set.
+_tinfirm_runner_host_kata_known_checksums:
+  "4.2.0":
+    amd64: ""
+    arm64: ""
+# The checksum the download is checked against: the site's, else the known one; empty when
+# neither exists (checks.yml stops the role then).
+_tinfirm_runner_host_kata_known_checksum: >-
+  {{ (_tinfirm_runner_host_kata_known_checksums[tinfirm_runner_host_kata_version] | default({}))[_tinfirm_runner_host_kata_arch] | default('') }}
+_tinfirm_runner_host_kata_checksum: >-
+  {{ tinfirm_runner_host_kata_checksum if tinfirm_runner_host_kata_checksum | length > 0
+     else ('sha256:' ~ _tinfirm_runner_host_kata_known_checksum) if _tinfirm_runner_host_kata_known_checksum | length > 0
+     else '' }}
+
+_tinfirm_runner_host_docker_os: >-
+  {{ 'ubuntu' if ansible_facts['distribution'] == 'Ubuntu'
+     else 'debian' if ansible_facts['distribution'] == 'Debian'
+     else 'rhel' if ansible_facts['distribution'] == 'RedHat'
+     else 'centos' }}
+_tinfirm_runner_host_docker_repo: "{{ tinfirm_runner_host_docker_repo_url or ('https://download.docker.com/linux/' ~ _tinfirm_runner_host_docker_os) }}"
+_tinfirm_runner_host_docker_packages_apt:
+  - "docker-ce{{ ('=5:' ~ tinfirm_runner_host_docker_version ~ '*') if tinfirm_runner_host_docker_version else '' }}"
+  - "docker-ce-cli{{ ('=5:' ~ tinfirm_runner_host_docker_version ~ '*') if tinfirm_runner_host_docker_version else '' }}"
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+_tinfirm_runner_host_docker_packages_dnf:
+  - "docker-ce{{ ('-' ~ tinfirm_runner_host_docker_version) if tinfirm_runner_host_docker_version else '' }}"
+  - "docker-ce-cli{{ ('-' ~ tinfirm_runner_host_docker_version) if tinfirm_runner_host_docker_version else '' }}"
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# /etc/docker/daemon.json: the Kata runtime (Docker 23 or newer takes a shim by its path),
+# the mirrors of this machine's dockerd, and the site's extra keys.
+_tinfirm_runner_host_docker_daemon: >-
+  {{ {
+       'runtimes': {
+         tinfirm_runner_host_kata_runtime_name: {
+           'runtimeType': _tinfirm_runner_host_kata_shim,
+           'options': {'ConfigPath': _tinfirm_runner_host_kata_config}
+         }
+       },
+       'registry-mirrors': tinfirm_runner_host_docker_registry_mirrors,
+       'insecure-registries': tinfirm_runner_host_docker_insecure_registries
+     } | combine(tinfirm_runner_host_docker_daemon_extra, recursive=True) }}
+
+# `run --sandbox-env`: the mirror settings that are set, then the site's extra variables.
+_tinfirm_runner_host_sandbox_env: >-
+  {{ ({
+        'TINFIRM_SANDBOX_REGISTRY_MIRRORS': tinfirm_runner_host_sandbox_registry_mirrors | join(','),
+        'TINFIRM_SANDBOX_INSECURE_REGISTRIES': tinfirm_runner_host_sandbox_insecure_registries | join(','),
+        'TINFIRM_SANDBOX_MAVEN_MIRROR': tinfirm_runner_host_sandbox_maven_mirror,
+        'TINFIRM_SANDBOX_MAVEN_MIRROR_OF': tinfirm_runner_host_sandbox_maven_mirror_of,
+        'TINFIRM_SANDBOX_NPM_REGISTRY': tinfirm_runner_host_sandbox_npm_registry,
+        'TINFIRM_SANDBOX_PIP_INDEX': tinfirm_runner_host_sandbox_pip_index,
+        'TINFIRM_SANDBOX_DOCKER_DISK': tinfirm_runner_host_sandbox_docker_disk
+      } | dict2items | rejectattr('value', 'equalto', '') | items2dict)
+     | combine(tinfirm_runner_host_sandbox_env_extra) }}
+
+# `run --egress-allow`, one per entry.
+_tinfirm_runner_host_egress_allow: "{{ tinfirm_runner_host_egress_allow }}"
+
+# The environment of every runner host command the role runs as the runner host's user.
+_tinfirm_runner_host_env:
+  TINFIRM_RUNNER_CONFIG_DIR: "{{ tinfirm_runner_host_config_dir }}"
+  TINFIRM_RUNNER_DATA_DIR: "{{ tinfirm_runner_host_data_dir }}"
+  TINFIRM_RUNNER_LOG: "{{ tinfirm_runner_host_log }}"
+
+_tinfirm_runner_host_images: >-
+  {{ ['tinfirm-runner-base:local']
+     + (['tinfirm-runner-claude:local'] if tinfirm_runner_host_images_runtime in ['claude', 'all'] else [])
+     + (['tinfirm-runner-codex:local'] if tinfirm_runner_host_images_runtime in ['codex', 'all'] else [])
+     + (['tinfirm-runner-pi:local'] if tinfirm_runner_host_images_runtime in ['pi', 'all'] else [])
+     + (['tinfirm-runner-opencode:local'] if tinfirm_runner_host_images_runtime in ['opencode', 'all'] else []) }}
+_tinfirm_runner_host_images_build_argv: >-
+  {{ [tinfirm_runner_host_binary_path, 'images', 'build', '--runtime', tinfirm_runner_host_images_runtime]
+     + (tinfirm_runner_host_images_build_args.items() | map('join', '=')
+        | map('regex_replace', '^', '--build-arg=') | list) }}

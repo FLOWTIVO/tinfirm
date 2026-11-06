@@ -1,0 +1,17 @@
+# `helm lint` / `helm template` with the ingress on (CI and `make helm-lint`).
+image:
+  tag: v0.1.0
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+  hosts:
+    - host: tinfirm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: tinfirm-tls
+      hosts:
+        - tinfirm.example.com

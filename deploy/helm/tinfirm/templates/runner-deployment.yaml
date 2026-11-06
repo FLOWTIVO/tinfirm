@@ -1,0 +1,135 @@
+{{- if .Values.runner.enabled }}
+{{- include "tinfirm.runner.validate" . }}
+{{- $r := .Values.runner }}
+# The runner pod (ADR-0101, decision 8): the declared company's runner host, whose sandboxes are
+# VMs. One replica, recreated, never two: a second process with the same token would replace
+# the first one's connection, and both would use the same records.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tinfirm.runner.fullname" . }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "tinfirm.runner.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pod when its settings change. The Secrets are not tracked: restart the pod
+        # after rotating one.
+        checksum/config: {{ include (print $.Template.BasePath "/runner-configmap.yaml") . | sha256sum }}
+        {{- with $r.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "tinfirm.runner.labels" . | nindent 8 }}
+        {{- with $r.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "tinfirm.serviceAccountName" . }}
+      # The runner host never calls the Kubernetes API.
+      automountServiceAccountToken: false
+      # No docker-link style variables, which would add TINFIRM_* names to the environment.
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $r.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- include "tinfirm.securityContext" (dict "context" $r.podSecurityContext "root" $) | nindent 8 }}
+      containers:
+        - name: runner
+          image: {{ include "tinfirm.runner.image" . | quote }}
+          imagePullPolicy: {{ $r.image.pullPolicy }}
+          args:
+            - run
+            - --max-concurrent-runs
+            - {{ $r.maxConcurrentRuns | toString | quote }}
+          securityContext:
+            {{- include "tinfirm.securityContext" (dict "context" $r.securityContext "root" $) | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "tinfirm.runner.fullname" . }}
+          {{- with $r.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          lifecycle:
+            # Drain: no new runs, the active ones finish, then `run` exits. When the grace
+            # period ends first, the pod is stopped, and the next one takes its runs back.
+            preStop:
+              exec:
+                command: ["/usr/local/bin/tinfirm-runner-host", "drain"]
+          resources:
+            {{- toYaml $r.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/tinfirm-runner
+            - name: tmp
+              mountPath: /tmp
+            - name: token
+              mountPath: {{ include "tinfirm.runner.tokenDir" . }}
+              readOnly: true
+            {{- if eq $r.vm.driver "digitalocean" }}
+            - name: digitalocean-token
+              mountPath: {{ include "tinfirm.runner.digitaloceanTokenDir" . }}
+              readOnly: true
+            - name: digitalocean-config
+              mountPath: {{ include "tinfirm.runner.digitaloceanConfigDir" . }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: data
+          {{- if $r.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $r.persistence.existingClaim | default (include "tinfirm.runner.fullname" .) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ $r.tmpVolume.sizeLimit }}
+        # The host's token, readable by the pod's group (fsGroup) only.
+        - name: token
+          secret:
+            secretName: {{ $r.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ $r.secretKeys.token }}
+                path: {{ $r.secretKeys.token }}
+        {{- if eq $r.vm.driver "digitalocean" }}
+        - name: digitalocean-token
+          secret:
+            secretName: {{ $r.vm.digitalocean.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ $r.vm.digitalocean.secretKeys.token }}
+                path: {{ $r.vm.digitalocean.secretKeys.token }}
+        - name: digitalocean-config
+          configMap:
+            name: {{ include "tinfirm.runner.fullname" . }}-digitalocean
+        {{- end }}
+      {{- with $r.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $r.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $r.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

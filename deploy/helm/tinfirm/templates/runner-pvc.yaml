@@ -1,0 +1,21 @@
+{{- with .Values.runner }}
+{{- if and .enabled .persistence.enabled (not .persistence.existingClaim) }}
+# The runner pod's data directory (ADR-0101, decision 7): the records of its runs, which a
+# restarted pod takes back, the bridge listener's identity, the mirrors and the outputs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "tinfirm.runner.fullname" $ }}
+  labels:
+    {{- include "tinfirm.runner.labels" $ | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .persistence.accessModes | nindent 4 }}
+  {{- with .persistence.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .persistence.size | quote }}
+{{- end }}
+{{- end }}

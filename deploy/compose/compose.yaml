@@ -1,0 +1,351 @@
+# Tinfirm local stack. DEVELOPMENT ONLY.
+#
+#   make up        postgres + LiteLLM + server         http://localhost:8080
+#   make up-oidc   ... + Keycloak (profile oidc)       http://keycloak.localhost:8180
+#   make dev-db    postgres only, for a server run from the IDE and `npm start`
+#   make down      stop everything; the database volume is kept
+#
+# LiteLLM, the company's model gateway (ADR-0059, ADR-0069, docs/operations/litellm.md):
+# `litellm` with its own database on the same PostgreSQL (`litellm-db` creates it). Its own
+# port, the admin API with the model API, sits on the `gateway` network, which only the
+# server and the model port join; it is published on http://127.0.0.1:4000 for the operator.
+# The model port, `model-api` on 4001, serves its model routes alone to the company's
+# services (such as a script or an internal application) with LiteLLM keys of their own.
+# Runner hosts never reach either: the server relays their model traffic.
+#
+# Without make, from the repository root (after `cp deploy/compose/.env.example deploy/compose/.env`):
+#   docker compose -f deploy/compose/compose.yaml up -d --build
+#   docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.oidc.yaml --profile oidc up -d --build
+#
+# Values come from deploy/compose/.env. .env.example holds public development defaults.
+#
+# Keycloak issuer (profile oidc)
+# ------------------------------
+# An OIDC issuer URL has to be the same string for every party: the browser follows it
+# to log in, and the server fetches discovery, keys and tokens from it and checks the
+# `iss` claim against it. `http://localhost:8180` works in the browser but, inside the
+# server container, localhost is the container itself. Instead of splitting the
+# endpoints (which turns off Spring's issuer check) or remapping host.docker.internal
+# (which needs /etc/hosts edits for the browser), the stack uses one name that resolves
+# everywhere:
+#
+#   http://keycloak.localhost:8180
+#
+#   - browser: *.localhost is loopback (RFC 6761; Chrome, Firefox, Edge; Safari and
+#     other clients via the macOS resolver) -> the port published on 127.0.0.1:8180.
+#   - server container: `keycloak.localhost` is a network alias of the keycloak service,
+#     and Keycloak listens on 8180 inside the container too, so the same URL reaches it
+#     directly over the compose network. No host-gateway, no firewall dependency.
+#   - server run from the IDE: the same loopback path as the browser.
+#
+# KC_HOSTNAME pins the issuer to that URL whichever way a request arrives. If a Linux
+# client does not resolve *.localhost (no systemd-resolved), add
+# `127.0.0.1 keycloak.localhost` to /etc/hosts.
+
+name: tinfirm
+
+services:
+  postgres:
+    # Digest-pinned like the Dockerfile's base images; bump tag and digest together.
+    image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    restart: unless-stopped
+    # On the gateway network too, for LiteLLM's database.
+    networks: [default, gateway]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?is not set; copy deploy/compose/.env.example to deploy/compose/.env}
+      # Read by postgres/init.sql (psql \getenv) to create the application roles.
+      TINFIRM_OWNER_PASSWORD: ${TINFIRM_OWNER_PASSWORD:?is not set in deploy/compose/.env}
+      TINFIRM_APP_PASSWORD: ${TINFIRM_APP_PASSWORD:?is not set in deploy/compose/.env}
+    volumes:
+      # PostgreSQL 18 images keep data in /var/lib/postgresql/18/docker and declare the
+      # volume one level up. Mounting the pre-18 path /var/lib/postgresql/data fails.
+      - postgres-data:/var/lib/postgresql
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/10-tinfirm.sql:ro
+    ports:
+      # Loopback only (the dev passwords are public). 5432 so that a server run from the
+      # IDE and the tests reach it at the default jdbc:postgresql://localhost:5432/tinfirm.
+      - "127.0.0.1:${TINFIRM_DB_HOST_PORT:-5432}:5432"
+    healthcheck:
+      # Over TCP on purpose. During first-time init the entrypoint's temporary server
+      # listens on the Unix socket only, so a socket check would pass before init.sql ran.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-d", "tinfirm"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  # LiteLLM's database and role on this PostgreSQL (postgres/litellm.sql), created or brought
+  # up to date on every `up`, also on a data volume that is not empty (init.sql runs only on
+  # an empty one). Exits when done; LiteLLM waits for it.
+  litellm-db:
+    image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    user: postgres
+    command: ["psql", "--no-psqlrc", "--quiet", "--file", "/litellm.sql"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:?is not set; copy deploy/compose/.env.example to deploy/compose/.env}
+      # Read by postgres/litellm.sql (psql \getenv).
+      LITELLM_DB_PASSWORD: ${LITELLM_DB_PASSWORD:?is not set in deploy/compose/.env}
+    volumes:
+      - ./postgres/litellm.sql:/litellm.sql:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # The model gateway (ADR-0059). Tinfirm manages its teams and keys through the admin API
+  # with the master key, and relays the runs' model requests to it through the model port;
+  # provider keys and models live in its database, added by the operator. Settings that keep
+  # prompts out of its database and turn its admin UI off: litellm/config.yaml.
+  litellm:
+    # LiteLLM's non-root image (user 65534), the same release as ghcr.io/berriai/litellm.
+    # Digest-pinned; bump tag and digest together (and values.yaml of the Helm chart).
+    image: ghcr.io/berriai/litellm-non_root:v1.106.6@sha256:6363e53f135dafbf4a68fac25f77aec3f2b99be37665e8c5f623a952637c220b
+    restart: unless-stopped
+    depends_on:
+      litellm-db:
+        condition: service_completed_successfully
+    command: ["--port", "4000", "--config", "/etc/litellm/config.yaml"]
+    # The gateway network only: the server and the model port reach it, nothing else of the
+    # deployment does (ADR-0069).
+    networks: [gateway]
+    # Explicit, like the server's: LiteLLM gets its own secrets and nothing else from .env.
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?is not set in deploy/compose/.env}
+      # Encrypts the provider keys LiteLLM stores. Never change it once keys are stored.
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?is not set in deploy/compose/.env}
+      # LiteLLM builds DATABASE_URL from these, URL-encoding the password. The port goes into
+      # DATABASE_HOST: this version's proxy ignores DATABASE_PORT.
+      DATABASE_HOST: postgres:5432
+      DATABASE_NAME: litellm
+      DATABASE_USERNAME: litellm
+      DATABASE_PASSWORD: ${LITELLM_DB_PASSWORD:?is not set in deploy/compose/.env}
+      # The admin UI is off; the admin API stays (Tinfirm and the operator use it).
+      DISABLE_ADMIN_UI: "True"
+      # Belt and braces with config.yaml: prompts and answers never go to the spend logs.
+      STORE_PROMPTS_IN_SPEND_LOGS: "False"
+      # Read no .env file from the working directory.
+      LITELLM_MODE: PRODUCTION
+      # Caches (Hugging Face tokenizers, ...) under /tmp, the only writable path.
+      XDG_CACHE_HOME: /tmp/.cache
+    volumes:
+      - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
+    ports:
+      # Loopback only, for the operator: the admin API (master key) and the model API. Never
+      # expose this port: LiteLLM stays inside the deployment, and runner hosts reach only the
+      # server (security review 2026-10-12, row 21).
+      - "127.0.0.1:${TINFIRM_LITELLM_HOST_PORT:-4000}:4000"
+    healthcheck:
+      # The image has no curl; its Python asks the readiness endpoint (database connected).
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/readiness', timeout=4)"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # The first start migrates an empty database.
+      start_period: 60s
+    # The image's own user, 65534, writing only to /tmp; it needs no capabilities.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${TINFIRM_LITELLM_MEM_LIMIT:-2g}
+
+  # The model port (ADR-0069; model-api/README.md): LiteLLM's model routes alone, each by its
+  # exact path, with LiteLLM's own fields removed from every body. The company's services call
+  # it with LiteLLM keys of their own; the server sends its model requests here too.
+  model-api:
+    build:
+      context: ../..
+      dockerfile: model-api/Dockerfile
+    image: ${TINFIRM_MODEL_API_IMAGE:-tinfirm-model-api:local}
+    restart: unless-stopped
+    depends_on:
+      litellm:
+        condition: service_healthy
+    networks: [default, gateway]
+    environment:
+      MODEL_API_UPSTREAM: http://litellm:4000
+      # Which tools the model's provider may run itself: OFF (none) or WEB_SEARCH (model-api/README.md).
+      MODEL_API_PROVIDER_TOOLS: ${TINFIRM_MODEL_API_PROVIDER_TOOLS:-OFF}
+    ports:
+      # Loopback only, for a service run from the IDE. On the Compose network, the company's
+      # services reach it as http://model-api:4001.
+      - "127.0.0.1:${TINFIRM_MODEL_API_HOST_PORT:-4001}:4001"
+    healthcheck:
+      # The image has no curl; bash asks the health port over a plain TCP socket.
+      test:
+        - CMD
+        - bash
+        - -c
+        - "exec 3<>/dev/tcp/127.0.0.1/4002 && printf 'GET /actuator/health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${TINFIRM_MODEL_API_MEM_LIMIT:-512m}
+
+  server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${TINFIRM_SERVER_IMAGE:-tinfirm-server:local}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # The gateway network for LiteLLM's admin API.
+    networks: [default, gateway]
+    # Explicit, not `env_file: .env`: the container gets exactly the §4 variables, and
+    # not the Postgres superuser or Keycloak admin passwords that also live in .env.
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/tinfirm
+      SPRING_DATASOURCE_USERNAME: tinfirm_app
+      SPRING_DATASOURCE_PASSWORD: ${TINFIRM_APP_PASSWORD:?is not set in deploy/compose/.env}
+      SPRING_FLYWAY_USER: tinfirm_owner
+      SPRING_FLYWAY_PASSWORD: ${TINFIRM_OWNER_PASSWORD:?is not set in deploy/compose/.env}
+      TINFIRM_PUBLIC_URL: ${TINFIRM_PUBLIC_URL:-http://localhost:8080}
+      TINFIRM_VAULT_KEYS: ${TINFIRM_VAULT_KEYS:?is not set in deploy/compose/.env}
+      TINFIRM_VAULT_ACTIVE_KEY: ${TINFIRM_VAULT_ACTIVE_KEY:?is not set in deploy/compose/.env}
+      TINFIRM_BOOTSTRAP_ADMIN_EMAIL: ${TINFIRM_BOOTSTRAP_ADMIN_EMAIL:?is not set in deploy/compose/.env}
+      TINFIRM_BOOTSTRAP_ADMIN_PASSWORD: ${TINFIRM_BOOTSTRAP_ADMIN_PASSWORD:?is not set in deploy/compose/.env}
+      # The instance's companies (ADR-0075): declared here, never created in the app. One,
+      # key `main`; an overlay adds more (compose.companies.example.yaml). Created at the
+      # server's start when it does not exist yet; the owner (empty: the bootstrap admin)
+      # becomes OWNER while the company has none.
+      TINFIRM_COMPANIES_MAIN_NAME: ${TINFIRM_COMPANY_NAME:-My Company}
+      TINFIRM_COMPANIES_MAIN_OWNER: ${TINFIRM_COMPANY_OWNER:-}
+      # SCIM provisioning of its members by its identity provider (ADR-0087), Enterprise.
+      TINFIRM_COMPANIES_MAIN_SCIM_ENABLED: ${TINFIRM_COMPANY_SCIM_ENABLED:-false}
+      # Company systems on this Compose network (ADR-0066), such as a company's own MCP server.
+      TINFIRM_CONNECTION_INTERNAL_HOSTS: ${TINFIRM_CONNECTION_INTERNAL_HOSTS:-}
+      TINFIRM_AUTH_LOCAL_ENABLED: ${TINFIRM_AUTH_LOCAL_ENABLED:-true}
+      TINFIRM_AUTH_OIDC_AUTO_PROVISION: ${TINFIRM_AUTH_OIDC_AUTO_PROVISION:-true}
+      TINFIRM_SESSION_IDLE_TIMEOUT: ${TINFIRM_SESSION_IDLE_TIMEOUT:-PT8H}
+      TINFIRM_SESSION_MAX_AGE: ${TINFIRM_SESSION_MAX_AGE:-P7D}
+      TINFIRM_ROLES: ${TINFIRM_ROLES:-api,worker}
+      # Error reports (ADR-0070, docs/operations/error-reports.md): empty lets the instance
+      # admins choose on the page Errors; nothing is sent without a DSN.
+      TINFIRM_ERROR_REPORTS: ${TINFIRM_ERROR_REPORTS:-}
+      TINFIRM_ERROR_REPORTS_DSN: ${TINFIRM_ERROR_REPORTS_DSN:-}
+      TINFIRM_ERROR_REPORTS_LABEL: ${TINFIRM_ERROR_REPORTS_LABEL:-}
+      TINFIRM_ERROR_REPORTS_PROXY: ${TINFIRM_ERROR_REPORTS_PROXY:-}
+      # The bundled LiteLLM (CONVENTIONS §4): its admin API on the gateway network with its
+      # master key, and the model requests the server relays and its own at the model port.
+      TINFIRM_LITELLM_ADMIN_URL: http://litellm:4000
+      TINFIRM_LITELLM_MODEL_URL: http://model-api:4001
+      TINFIRM_LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?is not set in deploy/compose/.env}
+      # The model relay requires every runner host's own token (runner host 0.3.0 is the minimum);
+      # false only while a host older than 0.3.0 is being upgraded.
+      TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN: ${TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN:-true}
+      # Session bundles (ADR-0097, docs/operations/session-bundles.md), part of elastic runners
+      # (Pro, ADR-0100): off unless .env sets the store. `filesystem` keeps them in the
+      # session-bundles volume below; `s3` in a bucket of its own.
+      TINFIRM_SESSION_BUNDLES_STORE: ${TINFIRM_SESSION_BUNDLES_STORE:-none}
+      TINFIRM_SESSION_BUNDLES_DIRECTORY: /var/lib/tinfirm/session-bundles
+      TINFIRM_SESSION_BUNDLES_S3_ENDPOINT: ${TINFIRM_SESSION_BUNDLES_S3_ENDPOINT:-}
+      TINFIRM_SESSION_BUNDLES_S3_REGION: ${TINFIRM_SESSION_BUNDLES_S3_REGION:-us-east-1}
+      TINFIRM_SESSION_BUNDLES_S3_BUCKET: ${TINFIRM_SESSION_BUNDLES_S3_BUCKET:-}
+      TINFIRM_SESSION_BUNDLES_S3_PATH_STYLE: ${TINFIRM_SESSION_BUNDLES_S3_PATH_STYLE:-false}
+      TINFIRM_SESSION_BUNDLES_S3_PREFIX: ${TINFIRM_SESSION_BUNDLES_S3_PREFIX:-session-bundles/}
+      TINFIRM_SESSION_BUNDLES_S3_ACCESS_KEY_ID: ${TINFIRM_SESSION_BUNDLES_S3_ACCESS_KEY_ID:-}
+      TINFIRM_SESSION_BUNDLES_S3_SECRET_ACCESS_KEY: ${TINFIRM_SESSION_BUNDLES_S3_SECRET_ACCESS_KEY:-}
+      TINFIRM_SESSION_BUNDLES_RETENTION: ${TINFIRM_SESSION_BUNDLES_RETENTION:-P30D}
+      JAVA_TOOL_OPTIONS: ${TINFIRM_JAVA_TOOL_OPTIONS:--XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError}
+      # SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES is deliberately not set: no proxy sits in
+      # front of the server here, and Tomcat's default (private ranges) is harmless on a
+      # loopback-only port. Never set it to an empty string: Spring Boot then trusts
+      # X-Forwarded-For from EVERY peer.
+    ports:
+      # The application port only, on loopback. Management (8081: health, prometheus)
+      # stays inside the compose network: it is never exposed through an ingress either.
+      - "${TINFIRM_HTTP_BIND:-127.0.0.1}:${TINFIRM_HTTP_HOST_PORT:-8080}:8080"
+    # The same posture as the Helm chart: read-only root, /tmp the only writable path,
+    # no capabilities.
+    mem_limit: ${TINFIRM_SERVER_MEM_LIMIT:-2g}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,mode=1777,size=512m
+    volumes:
+      # The `filesystem` store of the session bundles; unused while the store is `none`.
+      - session-bundles:/var/lib/tinfirm/session-bundles
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Spring Boot's graceful shutdown waits up to 30 s for in-flight requests.
+    stop_grace_period: 40s
+
+  keycloak:
+    profiles: [oidc]
+    image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+    # Dev mode: HTTP, an in-container H2 database, and the realm imported on each start
+    # (skipped when it exists; `make down` discards it).
+    command: ["start-dev", "--import-realm"]
+    restart: unless-stopped
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?is not set in deploy/compose/.env}
+      # One issuer for browser, IDE and containers: see "Keycloak issuer" above.
+      KC_HOSTNAME: http://keycloak.localhost:8180
+      KC_HTTP_PORT: "8180"
+      KC_HEALTH_ENABLED: "true"
+      # Substituted into keycloak/tinfirm-realm.json at import.
+      TINFIRM_OIDC_CLIENT_SECRET: ${TINFIRM_OIDC_CLIENT_SECRET:?is not set in deploy/compose/.env}
+      TINFIRM_OIDC_TEST_USER_PASSWORD: ${TINFIRM_OIDC_TEST_USER_PASSWORD:?is not set in deploy/compose/.env}
+      # The client's redirect URI follows the server's public URL (port changes included).
+      TINFIRM_PUBLIC_URL: ${TINFIRM_PUBLIC_URL:-http://localhost:8080}
+    volumes:
+      - ./keycloak/tinfirm-realm.json:/opt/keycloak/data/import/tinfirm-realm.json:ro
+    ports:
+      - "127.0.0.1:8180:8180"
+    networks:
+      default:
+        aliases:
+          - keycloak.localhost
+    healthcheck:
+      # The image has no curl; bash's /dev/tcp asks the management port (9000) directly.
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          head -n 1 <&3 | grep -q ' 200 '
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # LiteLLM's own port and its database: the server and the model port only (ADR-0069).
+  gateway:
+
+volumes:
+  postgres-data:
+  # Ciphertext only (ADR-0097); the image's directory is the server user's, so a new volume is too.
+  session-bundles:

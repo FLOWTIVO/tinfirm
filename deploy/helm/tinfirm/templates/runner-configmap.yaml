@@ -1,0 +1,51 @@
+{{- if .Values.runner.enabled }}
+{{- include "tinfirm.runner.validate" . }}
+{{- $r := .Values.runner }}
+# The runner pod's settings (ADR-0101, decision 8): `run`'s, as its TINFIRM_RUNNER_* variables.
+# No secret: the token files are mounted from their Secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tinfirm.runner.fullname" . }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+data:
+  TINFIRM_RUNNER_SERVER: {{ include "tinfirm.runner.serverUrl" . | quote }}
+  TINFIRM_RUNNER_TOKEN_FILE: {{ printf "%s/%s" (include "tinfirm.runner.tokenDir" .) $r.secretKeys.token | quote }}
+  TINFIRM_RUNNER_LOG: {{ $r.log | quote }}
+  TINFIRM_RUNNER_EXECUTOR: vm
+  TINFIRM_RUNNER_VM_DRIVER: {{ $r.vm.driver | quote }}
+  TINFIRM_RUNNER_VM_TEMPLATE: {{ $r.vm.template | quote }}
+  TINFIRM_RUNNER_VM_PORT: {{ $r.vm.port | toString | quote }}
+  TINFIRM_RUNNER_VM_START_TIMEOUT: {{ $r.vm.startTimeout | toString | quote }}
+  TINFIRM_RUNNER_VM_IMAGE_VERSION: {{ $r.vm.imageVersion | quote }}
+  {{- with $r.vm.probes }}
+  TINFIRM_RUNNER_VM_PROBE: {{ join "\n" . | quote }}
+  {{- end }}
+  TINFIRM_RUNNER_POOL_MAX_READY: {{ $r.pool.maxReady | toString | quote }}
+  TINFIRM_RUNNER_POOL_RUNTIME: {{ $r.pool.runtime | quote }}
+  TINFIRM_RUNNER_POOL_HEADROOM: {{ $r.pool.headroom | toString | quote }}
+  TINFIRM_RUNNER_POOL_MAX_AGE: {{ $r.pool.maxAge | toString | quote }}
+  TINFIRM_RUNNER_POOL_COOL_DOWN: {{ $r.pool.coolDown | toString | quote }}
+  TINFIRM_RUNNER_POOL_LEAD_TIME_MAX: {{ $r.pool.leadTimeMax | toString | quote }}
+  {{- if eq $r.vm.driver "digitalocean" }}
+  TINFIRM_DO_CONFIG: {{ printf "%s/digitalocean.json" (include "tinfirm.runner.digitaloceanConfigDir" .) | quote }}
+  {{- end }}
+  {{- range $name, $value := $r.extraConfig }}
+  {{ $name }}: {{ $value | toString | quote }}
+  {{- end }}
+{{- if eq $r.vm.driver "digitalocean" }}
+---
+# The DigitalOcean driver's configuration file (TINFIRM_DO_CONFIG): its templates, and the file
+# of its API token, mounted from runner.vm.digitalocean.existingSecret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tinfirm.runner.fullname" . }}-digitalocean
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+data:
+  digitalocean.json: |
+    {{- include "tinfirm.runner.digitaloceanConfig" . | nindent 4 }}
+{{- end }}
+{{- end }}

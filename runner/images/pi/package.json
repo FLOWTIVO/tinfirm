@@ -1,0 +1,11 @@
+{
+  "name": "tinfirm-runner-image-pi",
+  "private": true,
+  "description": "The npm packages of the PI runner image, installed with npm ci --ignore-scripts from package-lock.json.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.4"
+  },
+  "overrides": {
+    "undici": "8.12.3"
+  }
+}

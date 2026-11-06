@@ -1,0 +1,101 @@
+---
+- name: Check the operating system and the architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] in ['Debian', 'RedHat']
+      - ansible_facts['architecture'] in ['x86_64', 'aarch64']
+    fail_msg: >-
+      The role supports Ubuntu, Debian and the RHEL family on x86_64 or aarch64, not
+      {{ ansible_facts['distribution'] }} on {{ ansible_facts['architecture'] }}.
+    quiet: true
+
+- name: Check the runner host binary source
+  ansible.builtin.assert:
+    that:
+      - (tinfirm_runner_host_binary_src | length > 0) != (tinfirm_runner_host_binary_url | length > 0)
+    fail_msg: Set exactly one of tinfirm_runner_host_binary_src and tinfirm_runner_host_binary_url.
+    quiet: true
+
+- name: Check the runtime name
+  ansible.builtin.assert:
+    that:
+      - tinfirm_runner_host_kata_runtime_name is match('kata')
+    fail_msg: >-
+      tinfirm_runner_host_kata_runtime_name must start with `kata`: `run --sandbox-docker` refuses any
+      other runtime.
+    quiet: true
+
+- name: Look for /dev/kvm
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: _tinfirm_runner_host_kvm
+
+- name: Check that the VM can run VMs (nested virtualisation)
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_runner_host_kvm.stat.exists
+      - _tinfirm_runner_host_kvm.stat.ischr
+    fail_msg: >-
+      /dev/kvm does not exist: this VM has no nested virtualisation, so Kata Containers cannot
+      start a VM per sandbox. Enable nested virtualisation for the VM in the hypervisor
+      (deploy/ansible/README.md); without it, Kata and `--sandbox-docker` are out.
+    quiet: true
+
+# L27 of the security review of 2026-10-27: nothing the role downloads is trusted on TLS alone.
+- name: Check the checksum of the runner host's release archive
+  ansible.builtin.assert:
+    that:
+      - >-
+        tinfirm_runner_host_binary_checksum | length == 0
+        or tinfirm_runner_host_binary_checksum is match('^sha256:[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      tinfirm_runner_host_binary_checksum is "sha256:<hex>", the archive's line of the release's
+      SHA256SUMS, or empty: the role then takes that line from SHA256SUMS once its signature verifies.
+    quiet: true
+  when: tinfirm_runner_host_binary_url | length > 0
+
+- name: Check the checksum of the Kata Containers release
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_runner_host_kata_checksum is match('^sha256:[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      No checksum for {{ tinfirm_runner_host_kata_tarball }}: set tinfirm_runner_host_kata_checksum to
+      "sha256:<hex>" from the Kata release's assets. The role knows no checksum for Kata
+      {{ tinfirm_runner_host_kata_version }} on {{ _tinfirm_runner_host_kata_arch }}, and downloads the
+      release only against one.
+    quiet: true
+
+- name: Check the fingerprint of Docker's key
+  ansible.builtin.assert:
+    that:
+      - tinfirm_runner_host_docker_key_fingerprint is match('^[0-9A-F]{40}$')
+    fail_msg: >-
+      tinfirm_runner_host_docker_key_fingerprint must be the 40 hex digits (upper case, no spaces) of
+      the key that signs Docker's packages.
+    quiet: true
+
+- name: Check the user's uid against the sandbox bridge
+  ansible.builtin.assert:
+    that:
+      - (tinfirm_runner_host_sandbox_bridge | bool) or (tinfirm_runner_host_uid | int == 1000)
+    fail_msg: >-
+      Without the sandbox bridge (tinfirm_runner_host_sandbox_bridge: false) the workspaces are bind
+      mounts that the sandbox writes as uid 1000: set tinfirm_runner_host_uid to 1000, or keep the
+      bridge on.
+    quiet: true
+  when: tinfirm_runner_host_create_user | bool
+
+# The unit's ProtectHome hides /home, /root and /run/user from the service.
+- name: Check that the runner host's directories are outside the hidden homes
+  ansible.builtin.assert:
+    that:
+      - item is not match('^/(home|root|run/user)(/|$)')
+    fail_msg: >-
+      {{ item }} is under /home, /root or /run/user, which the unit hides from the service
+      (ProtectHome=yes): keep tinfirm_runner_host_home and its directories elsewhere, such as
+      /var/lib/tinfirm.
+    quiet: true
+  loop:
+    - "{{ tinfirm_runner_host_home }}"
+    - "{{ tinfirm_runner_host_config_dir }}"
+    - "{{ tinfirm_runner_host_data_dir }}"

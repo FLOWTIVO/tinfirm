@@ -1,0 +1,45 @@
+# A composite action of this repository (ADR-0106). Third-party actions are pinned by
+# commit SHA, with their release in the comment; Dependabot keeps them current.
+name: Report scanner findings
+description: >-
+  Put a scanner's findings where a reviewer will see them: annotations on the
+  diff, a table in the job summary, or one sticky pull-request comment.
+
+inputs:
+  mode:
+    description: '`annotate` (diff markers + job summary) or `comment` (sticky PR comment).'
+    required: true
+  reports:
+    description: |
+      Newline-separated `tool=path` pairs. Tool is semgrep, gitleaks or trivy.
+      A missing or unparseable file is treated as "no findings" — the scanner's
+      own job already fails on a crash, and the reporter must not fail twice.
+    required: true
+  token:
+    description: 'Token for the comment mode. Needs `pull-requests: write`.'
+    required: false
+    default: ''
+  pr-number:
+    description: 'Pull request to comment on. Empty = not a PR, comment skipped.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        REPORTS: ${{ inputs.reports }}
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        args=()
+        while IFS= read -r line; do
+          line="$(echo "$line" | xargs)" || true
+          [ -n "$line" ] && args+=("$line")
+        done <<< "$REPORTS"
+        python3 "$ACTION_PATH/report.py" "$MODE" "${args[@]}"

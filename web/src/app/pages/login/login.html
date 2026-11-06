@@ -1,0 +1,139 @@
+<div class="bg-background flex min-h-svh flex-col items-center justify-center px-4 py-10">
+  <div class="w-full max-w-sm">
+    <div class="mb-6 flex flex-col items-center gap-3 text-center">
+      <app-logo class="h-12" />
+      <div>
+        <h1 class="text-2xl font-bold tracking-tight">Sign in to Tinfirm</h1>
+        @if (authorizing()) {
+          <p class="text-muted-foreground mt-1 text-sm" data-testid="authorizing-note">
+            An app asks to connect to Tinfirm. Sign in, then decide what it may do.
+          </p>
+        } @else {
+          <p class="text-muted-foreground mt-1 text-sm">
+            One platform for AI agents in every system you work in.
+          </p>
+        }
+      </div>
+    </div>
+
+    <section
+      hlmCard
+      class="rounded-xl shadow-[0_12px_32px_-12px_rgb(0_0_0/0.15)] [--card-spacing:--spacing(6)]"
+      aria-label="Sign in"
+    >
+      <div hlmCardContent class="flex flex-col gap-4">
+        @if (providers.isLoading()) {
+          <div class="flex flex-col gap-3" aria-busy="true">
+            <span class="sr-only" role="status">Loading sign-in options…</span>
+            <hlm-skeleton class="h-4 w-16" />
+            <hlm-skeleton class="h-8 w-full" />
+            <hlm-skeleton class="h-4 w-20" />
+            <hlm-skeleton class="h-8 w-full" />
+            <hlm-skeleton class="h-8 w-full" />
+          </div>
+        } @else if (providers.error()) {
+          <app-error-state
+            [error]="providers.error()"
+            heading="Can't load sign-in options"
+            class="[&>[data-slot=empty]]:border-0 [&>[data-slot=empty]]:p-2"
+            (retry)="providers.reload()"
+          />
+        } @else {
+          @if (ssoError(); as sso) {
+            <div hlmAlert variant="destructive" data-testid="sso-error">
+              <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+              <h2 hlmAlertTitle>{{ sso.title }}</h2>
+              <p hlmAlertDescription>{{ sso.message }}</p>
+            </div>
+          }
+
+          @if (formError(); as message) {
+            <div hlmAlert variant="destructive">
+              <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+              <p hlmAlertDescription>{{ message }}</p>
+            </div>
+          }
+
+          @if (localEnabled()) {
+            <form class="flex flex-col gap-4" novalidate (submit)="onSubmit($event)">
+              <div hlmField>
+                <label hlmFieldLabel for="login-email">Email</label>
+                <input
+                  hlmInput
+                  id="login-email"
+                  type="email"
+                  autocomplete="username"
+                  inputmode="email"
+                  spellcheck="false"
+                  [formField]="loginForm.email"
+                />
+                <hlm-field-error>{{ firstError(loginForm.email) }}</hlm-field-error>
+              </div>
+
+              <div hlmField>
+                <label hlmFieldLabel for="login-password">Password</label>
+                <input
+                  hlmInput
+                  id="login-password"
+                  type="password"
+                  autocomplete="current-password"
+                  [formField]="loginForm.password"
+                />
+                <hlm-field-error>{{ firstError(loginForm.password) }}</hlm-field-error>
+              </div>
+
+              <button hlmBtn type="submit" class="w-full" [disabled]="loginForm().submitting()">
+                @if (loginForm().submitting()) {
+                  <hlm-spinner aria-hidden="true" />
+                  Signing in…
+                } @else {
+                  Sign in
+                }
+              </button>
+            </form>
+          }
+
+          @if (localEnabled() && anySso()) {
+            <div class="text-muted-foreground flex items-center gap-3 text-xs" role="separator">
+              <span class="bg-border h-px flex-1"></span>
+              or
+              <span class="bg-border h-px flex-1"></span>
+            </div>
+          }
+
+          @if (ssoProviders().length > 0) {
+            <div class="flex flex-col gap-2">
+              @for (provider of ssoProviders(); track provider.id) {
+                <a hlmBtn variant="outline" class="w-full" [href]="provider.loginUrl">
+                  <ng-icon name="lucideKeyRound" aria-hidden="true" />
+                  Continue with {{ provider.name }}
+                </a>
+              }
+            </div>
+          }
+
+          @if (!localEnabled() && !anySso()) {
+            <p class="text-muted-foreground text-sm">
+              No sign-in method is configured on this instance. Ask the person who runs it.
+            </p>
+          }
+        }
+      </div>
+    </section>
+
+    <div class="text-muted-foreground mt-6 flex items-center justify-center gap-3 text-xs">
+      @if (systemInfo.hasValue()) {
+        <span>Tinfirm {{ systemInfo.value().version }}</span>
+        <span aria-hidden="true">·</span>
+      }
+      <button
+        type="button"
+        class="hover:text-foreground focus-visible:ring-ring/50 inline-flex items-center gap-1 rounded outline-none focus-visible:ring-2"
+        (click)="theme.toggle()"
+      >
+        <ng-icon [name]="theme.isDark() ? 'lucideSun' : 'lucideMoon'" aria-hidden="true" />
+        {{ theme.isDark() ? 'Light theme' : 'Dark theme' }}
+      </button>
+    </div>
+  </div>
+</div>

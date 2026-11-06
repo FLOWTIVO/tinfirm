@@ -1,0 +1,371 @@
+@if (backText(); as outcome) {
+  <div
+    class="bg-card flex items-start gap-3 rounded-xl border px-3.5 py-2.5 text-sm"
+    data-testid="sign-in-result"
+    [attr.data-connected]="outcome.ok"
+    [attr.role]="outcome.ok ? 'status' : 'alert'"
+    [class.border-success]="outcome.ok"
+  >
+    <ng-icon
+      class="mt-0.5 shrink-0"
+      aria-hidden="true"
+      [name]="outcome.ok ? 'lucideCircleCheck' : 'lucideCircleAlert'"
+      [class]="outcome.ok ? 'text-success' : 'text-muted-foreground'"
+    />
+    <p class="min-w-0 flex-1 text-pretty">{{ outcome.text }}</p>
+    <button
+      hlmBtn
+      variant="ghost"
+      size="icon-xs"
+      type="button"
+      class="-me-1 shrink-0"
+      aria-label="Dismiss"
+      title="Dismiss"
+      (click)="back.dismiss()"
+    >
+      <ng-icon name="lucideX" aria-hidden="true" />
+    </button>
+  </div>
+}
+
+<ng-template #accountRow let-row>
+  @let v = row.view;
+  @let item = row.item;
+  <li
+    class="bg-card focus-visible:ring-ring/50 flex flex-col gap-3 rounded-xl border p-4 outline-none focus-visible:ring-3"
+    tabindex="-1"
+    data-testid="account"
+    [id]="'system-' + v.key"
+    [attr.data-binding]="item.binding"
+    [attr.aria-labelledby]="'system-' + v.key + '-name'"
+  >
+    <div class="flex items-start gap-3">
+      <span
+        class="bg-muted text-muted-foreground hidden size-10 shrink-0 items-center justify-center rounded-xl sm:flex"
+        aria-hidden="true"
+      >
+        <ng-icon [name]="kindIcon(item.system.kind)" size="18" />
+      </span>
+      <div class="flex min-w-0 flex-1 flex-col gap-1">
+        <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <h3 class="font-semibold break-words" [id]="'system-' + v.key + '-name'">
+            {{ v.name }}
+          </h3>
+          @if (v.kind !== v.name) {
+            <span class="text-muted-foreground text-xs">{{ v.kind }}</span>
+          }
+          <span class="sr-only">: </span>
+          <span
+            class="inline-flex h-6 items-center rounded-full border px-2.5 text-xs font-semibold whitespace-nowrap"
+            data-testid="account-chip"
+            [attr.data-tone]="v.tone"
+            [class]="toneChip(v.tone)"
+            >{{ v.chip }}</span
+          >
+        </div>
+        <p class="text-sm text-pretty" data-testid="account-says">{{ v.says }}</p>
+        @if (v.error) {
+          <p class="text-destructive text-xs break-words" data-testid="account-error">
+            {{ v.error }}
+          </p>
+        }
+        @if (v.grants.length) {
+          <ul
+            class="text-muted-foreground flex flex-col gap-0.5 text-xs"
+            [attr.aria-label]="'Grants for ' + v.name"
+          >
+            @for (grant of v.grants; track grant) {
+              <li>{{ grant }}</li>
+            }
+          </ul>
+        }
+        @if (item.account; as account) {
+          <p class="text-muted-foreground text-xs" data-testid="account-meta">
+            Connected {{ accountKind(account.kind) }}
+            <app-time [value]="account.connectedAt" />
+            @if (account.lastUsedAt; as used) {
+              · last used <app-time [value]="used" />
+            } @else {
+              · not used yet
+            }
+          </p>
+        }
+      </div>
+    </div>
+
+    @if (v.connect || v.disconnect || item.system.personal) {
+      <div class="flex flex-wrap items-center gap-2 sm:ps-13">
+        @if (v.connect) {
+          @let first = v.connect === 'connect' || v.tone === 'you';
+          @if (item.oauthAvailable) {
+            <button
+              hlmBtn
+              size="sm"
+              type="button"
+              data-testid="account-sign-in"
+              [variant]="first ? 'default' : 'outline'"
+              [disabled]="signingIn() !== null"
+              (click)="signIn(item)"
+            >
+              @if (signingIn() === v.key) {
+                <hlm-spinner aria-hidden="true" />
+              } @else {
+                <ng-icon name="lucideLogIn" aria-hidden="true" />
+              }
+              {{ v.connect === 'again' ? 'Sign in again' : 'Sign in with ' + v.name }}
+            </button>
+          }
+          <button
+            hlmBtn
+            size="sm"
+            type="button"
+            data-testid="account-paste-token"
+            [variant]="first && !item.oauthAvailable ? 'default' : 'outline'"
+            [attr.aria-label]="
+              (v.connect === 'again' ? 'Paste a new token for ' : 'Paste a token for ') + v.name
+            "
+            (click)="openToken(item)"
+          >
+            <ng-icon name="lucideClipboardPaste" aria-hidden="true" />
+            {{ v.connect === 'again' ? 'Paste a new token' : 'Paste a token' }}
+          </button>
+        }
+        @if (item.system.personal) {
+          <a
+            hlmBtn
+            variant="ghost"
+            size="sm"
+            data-testid="account-system-page"
+            [routerLink]="['/c', current.id(), 'systems', item.system.id]"
+            [attr.aria-label]="'Settings and tools of ' + v.name"
+          >
+            <ng-icon name="lucideSettings2" aria-hidden="true" />
+            Settings and tools
+          </a>
+        }
+        @if (v.disconnect) {
+          <button
+            hlmBtn
+            variant="ghost"
+            size="sm"
+            type="button"
+            data-testid="account-disconnect"
+            [attr.aria-label]="'Disconnect your ' + v.name + ' account'"
+            (click)="askDisconnect(item)"
+          >
+            <ng-icon name="lucideUnplug" aria-hidden="true" />
+            Disconnect
+          </button>
+        }
+      </div>
+    }
+  </li>
+</ng-template>
+
+@if (firstLoad()) {
+  <app-list-skeleton [rows]="3" />
+} @else if (accounts.error() && !accounts.hasValue()) {
+  <app-error-state
+    [error]="accounts.error()"
+    heading="Couldn't load your accounts"
+    (retry)="accounts.reload()"
+  />
+} @else {
+  <section class="flex flex-col gap-3" aria-labelledby="company-systems-heading">
+    <div class="flex flex-col gap-0.5">
+      <h2 id="company-systems-heading" class="text-base font-bold">The company’s systems</h2>
+      <p class="text-muted-foreground text-sm text-pretty">
+        An agent holds no account of its own: on each system it acts as whoever uses it, with that
+        person’s account or a grant of their group.
+      </p>
+    </div>
+    @if (companyRows().length) {
+      <ul class="flex flex-col gap-3" aria-labelledby="company-systems-heading">
+        @for (r of companyRows(); track r.view.key) {
+          <ng-container *ngTemplateOutlet="accountRow; context: { $implicit: r }" />
+        }
+      </ul>
+    } @else {
+      <div
+        class="bg-card text-muted-foreground rounded-xl border border-dashed p-5 text-sm text-pretty"
+        data-testid="systems-empty"
+      >
+        <p class="text-foreground font-semibold">No systems yet</p>
+        <p class="mt-1">
+          Owners and admins register the company’s Jira, GitHub, GitLab and MCP servers. Each then
+          appears here, with how agents act on it for you.
+          @if (admin()) {
+            <a
+              class="text-primary font-semibold underline-offset-2 hover:underline"
+              [routerLink]="['/c', current.id(), 'systems']"
+              >Register a system</a
+            >
+          }
+        </p>
+      </div>
+    }
+  </section>
+
+  @if (chatItems().length) {
+    <app-my-chat-links
+      [companyId]="current.id()!"
+      [items]="chatItems()"
+      [signingIn]="signingIn()"
+      (unlinked)="accounts.reload()"
+      (signIn)="signIn($event)"
+    />
+  }
+
+  <section class="flex flex-col gap-3" aria-labelledby="personal-systems-heading">
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <div class="flex min-w-0 flex-col gap-0.5">
+        <h2 id="personal-systems-heading" class="text-base font-bold">Your MCP servers</h2>
+        <p class="text-muted-foreground text-sm text-pretty">
+          Servers of your own, which only you see and only your conversations use.
+        </p>
+      </div>
+      @if (personalOn()) {
+        <button
+          hlmBtn
+          variant="outline"
+          size="sm"
+          type="button"
+          class="sm:shrink-0"
+          data-testid="add-mcp-server"
+          (click)="addOpen.set(true)"
+        >
+          <ng-icon name="lucidePlus" aria-hidden="true" />
+          Add your MCP server
+        </button>
+      }
+    </div>
+    @if (!personalOn()) {
+      <p
+        class="bg-muted/60 text-muted-foreground rounded-xl px-4 py-3 text-sm text-pretty"
+        data-testid="personal-off"
+      >
+        Personal MCP servers are switched off in this company. Servers you added stay, but agents
+        use them again only once an admin switches them on.
+      </p>
+    }
+    @if (personalRows().length) {
+      <ul class="flex flex-col gap-3" aria-labelledby="personal-systems-heading">
+        @for (r of personalRows(); track r.view.key) {
+          <ng-container *ngTemplateOutlet="accountRow; context: { $implicit: r }" />
+        }
+      </ul>
+    } @else if (personalOn()) {
+      <p
+        class="text-muted-foreground rounded-xl border border-dashed px-4 py-3 text-sm text-pretty"
+        data-testid="personal-empty"
+      >
+        None yet. Add the address of an MCP server you use, and agents can call its tools as you, in
+        your own conversations.
+      </p>
+    }
+  </section>
+}
+
+<hlm-dialog [state]="tokenOpen() ? 'open' : 'closed'" (closed)="closeToken()">
+  <hlm-dialog-content *hlmDialogPortal="let ctx" class="sm:max-w-md">
+    <hlm-dialog-header>
+      <h2 hlmDialogTitle>Paste a token for {{ tokenFor()?.system.name }}</h2>
+      <p hlmDialogDescription>
+        Tinfirm checks it with {{ tokenFor()?.system.name }} before it keeps it, keeps it in its
+        vault as yours, and never shows it again.
+      </p>
+    </hlm-dialog-header>
+
+    <form
+      id="account-token-form"
+      class="flex flex-col gap-4"
+      novalidate
+      (submit)="onTokenSubmit($event)"
+    >
+      @if (tokenError(); as message) {
+        <div hlmAlert variant="destructive" data-testid="token-error">
+          <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+          <p hlmAlertDescription class="break-words">{{ message }}</p>
+        </div>
+      }
+      <div hlmField>
+        <label hlmFieldLabel for="account-token">{{ hint().label }}</label>
+        <input
+          hlmInput
+          id="account-token"
+          type="password"
+          class="font-mono"
+          autocomplete="off"
+          spellcheck="false"
+          [placeholder]="hint().placeholder"
+          [formField]="tokenForm.token"
+        />
+        <p hlmFieldDescription data-testid="token-hint">{{ hint().hint }}</p>
+        <hlm-field-error>{{ firstError(tokenForm.token) }}</hlm-field-error>
+      </div>
+    </form>
+
+    <hlm-dialog-footer>
+      <button hlmBtn variant="outline" type="button" hlmDialogClose>Cancel</button>
+      <button
+        hlmBtn
+        type="submit"
+        form="account-token-form"
+        data-testid="save-token"
+        [disabled]="tokenForm().submitting()"
+      >
+        @if (tokenForm().submitting()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Check and connect
+      </button>
+    </hlm-dialog-footer>
+  </hlm-dialog-content>
+</hlm-dialog>
+
+<hlm-alert-dialog
+  [state]="disconnectOpen() ? 'open' : 'closed'"
+  (closed)="disconnectOpen.set(false)"
+>
+  <hlm-alert-dialog-content *hlmAlertDialogPortal="let ctx">
+    <hlm-alert-dialog-header>
+      <h2 hlmAlertDialogTitle>Disconnect your {{ disconnecting()?.system.name }} account?</h2>
+      <p hlmAlertDialogDescription>
+        Tinfirm deletes your credential, and revokes a sign-in at the system where it can.
+        Conversations that act as you there wait until you connect again.
+        @if (disconnecting()?.grants.length) {
+          New ones act through the grant of your group instead.
+        }
+      </p>
+    </hlm-alert-dialog-header>
+    @if (disconnectError(); as message) {
+      <div hlmAlert variant="destructive" data-testid="disconnect-error">
+        <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+        <p hlmAlertDescription>{{ message }}</p>
+      </div>
+    }
+    <hlm-alert-dialog-footer>
+      <button hlmAlertDialogCancel [disabled]="disconnectBusy()">Cancel</button>
+      <button
+        hlmAlertDialogAction
+        variant="destructive"
+        data-testid="confirm-disconnect"
+        [disabled]="disconnectBusy()"
+        (click)="confirmDisconnect()"
+      >
+        @if (disconnectBusy()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Disconnect
+      </button>
+    </hlm-alert-dialog-footer>
+  </hlm-alert-dialog-content>
+</hlm-alert-dialog>
+
+@if (current.id(); as companyId) {
+  <app-add-mcp-server-dialog
+    [(open)]="addOpen"
+    [companyId]="companyId"
+    (created)="onServerAdded($event)"
+  />
+}

@@ -1,0 +1,411 @@
+<div class="flex flex-col gap-6">
+  <app-page-header
+    title="Retention"
+    description="How long this company keeps what its conversations said and made. The audit log is kept for good."
+  />
+
+  @if (settings.isLoading() && !loaded()) {
+    <div class="flex flex-col gap-3" aria-busy="true">
+      <span class="sr-only" role="status">Loading retention…</span>
+      <hlm-skeleton class="h-64 w-full rounded-xl" />
+    </div>
+  } @else if (settings.error()) {
+    <app-error-state
+      [error]="settings.error()"
+      heading="Couldn't load retention"
+      (retry)="settings.reload()"
+    />
+  } @else if (loaded(); as s) {
+    @if (isOwner()) {
+      <div class="grid gap-5 lg:grid-cols-[15rem_minmax(0,1fr)] lg:items-start lg:gap-8">
+        <!-- The sections, each with its state; on a phone, a row of pills. -->
+        <div
+          #rail
+          class="-mx-4 flex gap-1.5 overflow-x-auto px-4 pb-1 md:-mx-8 md:px-8 lg:sticky lg:top-18 lg:mx-0 lg:flex-col lg:gap-1 lg:overflow-visible lg:p-0"
+          role="tablist"
+          aria-label="Sections of retention"
+          data-testid="retention-sections"
+        >
+          @for (tab of tabs(); track tab.id) {
+            <button
+              type="button"
+              role="tab"
+              class="focus-visible:ring-ring/50 flex min-h-11 shrink-0 items-center gap-2.5 rounded-full border px-3.5 py-2.5 text-start outline-none focus-visible:ring-3 lg:items-start lg:rounded-xl lg:px-3"
+              [class]="
+                tab.open
+                  ? 'bg-card border-border shadow-[0_1px_3px_rgb(0_0_0/0.08)]'
+                  : 'hover:bg-accent border-transparent'
+              "
+              [id]="'retention-tab-' + tab.id"
+              [attr.aria-selected]="tab.open"
+              [attr.aria-controls]="'retention-panel-' + tab.id"
+              [tabIndex]="tab.open ? 0 : -1"
+              [attr.data-section]="tab.id"
+              (click)="openSection(tab.id)"
+              (keydown)="onTabKeys($event)"
+            >
+              <ng-icon
+                [name]="tab.icon"
+                size="16"
+                class="shrink-0 lg:mt-0.5"
+                [class.text-primary]="tab.open"
+                [class.text-muted-foreground]="!tab.open"
+                aria-hidden="true"
+              />
+              <span class="flex min-w-0 flex-col">
+                <span
+                  class="text-sm font-semibold whitespace-nowrap"
+                  [id]="'retention-tab-' + tab.id + '-label'"
+                  >{{ tab.label }}</span
+                >
+                <span
+                  class="text-muted-foreground hidden text-xs leading-snug text-pretty lg:block"
+                  [id]="'retention-tab-' + tab.id + '-detail'"
+                  data-testid="section-detail"
+                >
+                  @if (tab.detail.mono) {
+                    <span class="font-mono tabular-nums">{{ tab.detail.mono }}</span>
+                  }
+                  {{ tab.detail.text }}</span
+                >
+              </span>
+              @if (tab.count) {
+                <span
+                  class="bg-secondary inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 font-mono text-[11px] font-medium lg:hidden"
+                  aria-hidden="true"
+                  >{{ tab.count }}</span
+                >
+              }
+            </button>
+          }
+        </div>
+
+        <div class="min-w-0">
+          <div
+            role="tabpanel"
+            id="retention-panel-periods"
+            aria-labelledby="retention-tab-periods-label"
+            [hidden]="section() !== 'periods'"
+          >
+            <ng-container *ngTemplateOutlet="periods; context: { $implicit: s }" />
+          </div>
+          <div
+            role="tabpanel"
+            id="retention-panel-holds"
+            aria-labelledby="retention-tab-holds-label"
+            [hidden]="section() !== 'holds'"
+          >
+            @if (holds.error()) {
+              <app-error-state
+                [error]="holds.error()"
+                heading="Couldn't load the legal holds"
+                (retry)="holds.reload()"
+              />
+            } @else {
+              <app-holds-panel
+                [canSet]="holdsLicensed()"
+                [holds]="holdItems()"
+                [people]="people()"
+                [names]="names()"
+                (changed)="holdsChanged()"
+              />
+            }
+          </div>
+          <div
+            role="tabpanel"
+            id="retention-panel-erase"
+            aria-labelledby="retention-tab-erase-label"
+            [hidden]="section() !== 'erase'"
+          >
+            <app-erasure-panel
+              [holds]="holdItems()"
+              [people]="people()"
+              [names]="names()"
+              [preselect]="preselect()"
+              (toHolds)="showHolds()"
+              (refusedForHold)="holdsChanged()"
+            />
+          </div>
+        </div>
+      </div>
+    } @else {
+      <div class="max-w-5xl">
+        <ng-container *ngTemplateOutlet="periods; context: { $implicit: s }" />
+      </div>
+    }
+  }
+</div>
+
+<ng-template #periods let-s>
+  <div class="flex flex-col gap-5">
+    <form id="periods-form" novalidate (submit)="save($event)">
+      <section
+        class="bg-card rounded-xl border"
+        aria-labelledby="periods-title"
+        data-testid="periods"
+      >
+        <div class="px-4 pt-4 pb-3.5 sm:px-5">
+          <h2 class="text-base font-bold" id="periods-title">Periods</h2>
+          <p class="text-muted-foreground mt-0.5 text-sm text-pretty">
+            Once a conversation has ended, its content is removed after these periods. What each
+            conversation was, its spend and the audit log stay.
+            @if (s.defaults) {
+              These are the defaults.
+            }
+          </p>
+          @if (!isOwner()) {
+            <p class="text-muted-foreground mt-1 text-[0.8125rem]">
+              Only the Owner changes retention, sets legal holds and erases content.
+            </p>
+          }
+          @if (!periodsLicensed()) {
+            <p
+              class="text-muted-foreground mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.8125rem]"
+              data-testid="periods-edition"
+            >
+              <app-edition-badge feature="RETENTION_SETTINGS" />
+              <span class="min-w-0 flex-1 text-pretty">{{ periodsEditionText() }}</span>
+            </p>
+          }
+        </div>
+        @let f = form()!;
+        @for (field of fields; track field) {
+          @let rule = rules[field];
+          <app-setting-row
+            [rowId]="'period-' + field"
+            [label]="rule.label"
+            [for]="editsPeriods() ? 'period-' + field : ''"
+          >
+            <span help>{{ rule.what }}</span>
+            @if (editsPeriods()) {
+              <div class="flex w-full flex-wrap items-center gap-x-2.5 gap-y-1">
+                <input
+                  hlmInput
+                  class="w-28 shrink-0 text-right font-mono tabular-nums max-sm:h-11"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  [id]="'period-' + field"
+                  [placeholder]="rule.keepable ? 'Keep' : ''"
+                  [attr.aria-describedby]="'period-' + field + '-help'"
+                  [attr.aria-invalid]="errors()[field] ? 'true' : null"
+                  [value]="f[field]"
+                  (input)="patch(field, $any($event.target).value)"
+                />
+                <span
+                  class="text-muted-foreground min-w-0 flex-1 text-[0.8125rem] leading-snug sm:flex-none sm:text-sm"
+                  >{{ unitOf(field) }}</span
+                >
+                @if (wasOf(field); as was) {
+                  <span
+                    class="text-muted-foreground basis-full text-xs sm:basis-auto"
+                    data-testid="period-was"
+                    >was <span class="font-mono tabular-nums">{{ was }}</span></span
+                  >
+                }
+              </div>
+              @if (errors()[field]; as message) {
+                <p
+                  class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                  role="alert"
+                >
+                  <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />
+                  {{ message }}
+                </p>
+              } @else if (rule.keepable) {
+                <p class="text-muted-foreground m-0 text-xs">Empty keeps it for good.</p>
+              }
+            } @else {
+              @let days = stored(s, field);
+              <p class="m-0 text-sm" [id]="'period-' + field">
+                {{ phrase(days) }}
+                <span class="text-muted-foreground">{{ days === null ? '' : rule.from }}</span>
+              </p>
+            }
+          </app-setting-row>
+        }
+
+        <!--
+          What the next sweep removes, as the server counts it: for the periods as typed while they
+          are changed (the preview, once the typing pauses), else for the saved ones.
+        -->
+        <div
+          class="bg-muted/50 flex items-start gap-2.5 rounded-b-xl border-t px-4 py-3 sm:px-5"
+          role="status"
+          data-testid="due"
+        >
+          @if (counting()) {
+            <hlm-spinner class="text-muted-foreground mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          } @else {
+            <ng-icon
+              [name]="dueWarns() ? 'lucideTriangleAlert' : 'lucideClock'"
+              size="16"
+              class="mt-0.5 shrink-0"
+              [class.text-warning]="dueWarns()"
+              [class.text-muted-foreground]="!dueWarns()"
+              aria-hidden="true"
+            />
+          }
+          <p class="m-0 min-w-0 flex-1 text-sm text-pretty">
+            @if (forecast(); as f) {
+              <span class="font-semibold" data-testid="due-proposed">{{ f.proposed }}</span>
+              <span class="text-muted-foreground"> {{ f.current }}</span>
+              @if (f.held) {
+                <span class="text-muted-foreground" data-testid="due-held"> {{ f.held }}</span>
+              }
+            } @else if (counting()) {
+              <span class="font-semibold"
+                >Counting what the next sweep deletes with these periods…</span
+              >
+            } @else {
+              <span class="font-semibold">{{ due() }}</span>
+              @if (previewFailed()) {
+                <span class="text-muted-foreground" data-testid="due-preview-failed">
+                  Counted for the saved periods: what the new ones delete couldn’t be counted.
+                  <button
+                    type="button"
+                    class="text-primary font-medium underline-offset-4 hover:underline"
+                    data-testid="due-preview-retry"
+                    (click)="preview.reload()"
+                  >
+                    Count again</button
+                  >.</span
+                >
+              } @else if (dirty()) {
+                <span class="text-muted-foreground"> Counted for the saved periods.</span>
+              }
+            }
+            @if (s.lastSweptAt) {
+              <span class="text-muted-foreground">
+                Last swept <app-time [value]="s.lastSweptAt" />.</span
+              >
+            }
+          </p>
+          @if (savedNote()) {
+            <span
+              class="text-success inline-flex items-center gap-1 text-xs font-semibold whitespace-nowrap"
+              data-testid="periods-saved"
+            >
+              <ng-icon name="lucideCheck" size="14" aria-hidden="true" />
+              Saved
+            </span>
+          }
+        </div>
+      </section>
+    </form>
+
+    <!-- Open conversations, which retention never removes: by key and age, never by title. -->
+    <div
+      class="bg-card text-muted-foreground flex items-start gap-2.5 rounded-xl border px-4 py-3 text-[0.8125rem] leading-normal sm:px-5"
+      data-testid="open-conversations"
+    >
+      <ng-icon name="lucideInfo" size="16" class="mt-0.5 shrink-0" aria-hidden="true" />
+      <div class="min-w-0 flex-1 text-pretty">
+        @if (s.openOlder === 0) {
+          <p class="m-0">
+            No open conversation is older than its period. Retention removes nothing of a
+            conversation until it ends.
+          </p>
+        } @else {
+          @let one = s.openOlder === 1;
+          <p class="m-0">
+            <span class="text-foreground font-semibold"
+              >{{ plural(s.openOlder, 'open conversation is', 'open conversations are') }} older
+              than {{ one ? 'its' : 'their' }} period.</span
+            >
+            Retention removes nothing of a conversation until it ends; end
+            {{ one ? 'it' : 'them' }} on {{ one ? 'its' : 'their' }} page to let retention apply.
+          </p>
+          @if (isOwner() && openItems().length) {
+            <ul
+              class="m-0 mt-1.5 flex list-none flex-col gap-0.5 p-0"
+              aria-label="Open conversations older than their period, oldest first"
+            >
+              @for (c of openItems(); track c.id) {
+                <li>
+                  <a
+                    class="text-primary font-mono underline-offset-4 hover:underline"
+                    [routerLink]="['/c', companyId(), 'conversations', c.id]"
+                    >{{ c.key }}</a
+                  >, {{ placeOf(c) }}, open for
+                  <span class="font-mono tabular-nums">{{ c.ageDays }}</span>
+                  {{ c.ageDays === 1 ? 'day' : 'days' }}
+                </li>
+              }
+              @if (s.openOlder > openItems().length) {
+                <li>and {{ s.openOlder - openItems().length }} more</li>
+              }
+            </ul>
+            <p class="m-0 mt-1.5">
+              Listed by key only: opening one reads it, and the Owner’s read is shown to its person.
+            </p>
+          }
+        }
+      </div>
+    </div>
+
+    @if (saveError(); as message) {
+      <div hlmAlert variant="destructive" role="alert" data-testid="periods-error">
+        <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+        <p hlmAlertDescription>{{ message }}</p>
+      </div>
+    }
+
+    @if (editsPeriods() && dirty()) {
+      <app-unsaved-changes-bar
+        form="periods-form"
+        saveTestId="save-retention"
+        saveLabel="Save the periods"
+        [changes]="changes()"
+        [saving]="saving()"
+        [blocked]="invalid() ? 'Fix the marked period first.' : null"
+        (discard)="discard()"
+      />
+    }
+  </div>
+</ng-template>
+
+<hlm-alert-dialog [state]="confirmOpen() ? 'open' : 'closed'" (closed)="confirmOpen.set(false)">
+  <hlm-alert-dialog-content *hlmAlertDialogPortal="let ctx" data-testid="shorter-periods-dialog">
+    <hlm-alert-dialog-header>
+      <h2 hlmAlertDialogTitle>Save the shorter periods?</h2>
+      <p hlmAlertDialogDescription>
+        The next daily sweep removes what has passed the new periods. What it removes cannot be
+        brought back; what a legal hold covers stays.
+      </p>
+    </hlm-alert-dialog-header>
+    <ul class="m-0 flex list-disc flex-col gap-1 ps-5 text-sm" data-testid="shorter-periods">
+      @for (line of shortenings(); track line) {
+        <li>{{ line }}</li>
+      }
+    </ul>
+    <p class="m-0 text-sm text-pretty" role="status" data-testid="shorter-periods-count">
+      @if (forecast(); as f) {
+        <span class="font-semibold">{{ f.proposed }}</span>
+        @if (f.held) {
+          <span class="text-muted-foreground"> {{ f.held }}</span>
+        }
+      } @else if (counting()) {
+        <span class="text-muted-foreground">Counting what the next sweep deletes…</span>
+      } @else {
+        <span class="text-muted-foreground"
+          >What goes couldn’t be counted now; the line under the periods says it once they are
+          saved.</span
+        >
+      }
+    </p>
+    <hlm-alert-dialog-footer>
+      <button hlmAlertDialogCancel [disabled]="saving()">Cancel</button>
+      <button
+        hlmAlertDialogAction
+        data-testid="confirm-save-retention"
+        [disabled]="saving()"
+        (click)="commit()"
+      >
+        @if (saving()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Save the periods
+      </button>
+    </hlm-alert-dialog-footer>
+  </hlm-alert-dialog-content>
+</hlm-alert-dialog>

@@ -1,0 +1,32 @@
+name: Security (weekly)
+
+# The scheduled sweep. ci.yml runs the same scan (reusable-security.yml) on every pull
+# request, push to main and release; this run exists because a NEW CVE against code nobody
+# touched is invisible to a pull-request scan.
+#
+# What the scanners skip is in .semgrepignore, .gitleaks.toml and .trivyignore at the
+# repository root.
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays 04:30 UTC.
+    - cron: '30 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    # Required at startup even though a scheduled run never comments on a pull request:
+    # the reusable workflow's comment job declares pull-requests: write, and a called
+    # workflow cannot exceed the permissions of the job that calls it.
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/reusable-security.yml
+    with:
+      runner: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+      # The SAME exclusions as ci.yml's security job, where the reason is recorded.
+      # Keep the two lists in lockstep.
+      semgrep_exclude_rules: |
+        javascript.express.security.audit.xss.mustache.explicit-unescape.template-explicit-unescape

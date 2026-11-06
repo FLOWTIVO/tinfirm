@@ -1,0 +1,122 @@
+name: PR Agent
+
+# AI review of every pull request (PR-Agent, github.com/the-pr-agent/pr-agent). On open,
+# `/review` posts one "PR Reviewer Guide" issue comment and `/improve` posts inline,
+# committable suggestions as review threads; a later push gets an incremental `/review -i`
+# over the new commits only. The repository settings (model, thresholds, context files,
+# ignored paths) are in .pr_agent.toml at the repository root. A collaborator runs a tool
+# by hand by commenting `/review`, `/improve` or `/describe` on the pull request.
+#
+# Needs the `OPENAI_KEY` secret, as a repository secret or an organization secret that
+# this repository can read.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  # `created` only. The default is EVERY activity type, and the runner acts on
+  # `edited` as well (github_action_runner.py gates on
+  # `action in ["created", "edited"]`), so editing a comment that carries a
+  # command re-runs it — a duplicate review and a second paid model call.
+  issue_comment:
+    types: [created]
+jobs:
+  pr_agent_job:
+    # issue_comment fires with this repo's write token on ANY commenter's text, and that
+    # text is untrusted LLM input (a comment can try to prompt-inject the runner config
+    # above) — so on issue_comment, require the commenter to be OWNER/MEMBER/COLLABORATOR
+    # before the job runs at all. pull_request events carry no attacker-controlled comment
+    # body, so they are unaffected.
+    #
+    # `github.event.issue.pull_request` keeps it to PRs. issue_comment also fires on
+    # ordinary issues, and the runner does NOT bail out there — it falls through to
+    # `handle_request(issue_url, body)` and spends a run on a pull request that does
+    # not exist.
+    #
+    # On pull_request, require the head branch to be in this repository. A pull_request
+    # event from a fork gets no secrets, so without `OPENAI_KEY` the job could only fail,
+    # on every outside contribution. A collaborator still reviews a fork's pull request by
+    # commenting `/review`: issue_comment runs in this repository, with its secrets.
+    if: ${{ github.event.sender.type != 'Bot' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'issue_comment' || (github.event.issue.pull_request && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))) }}
+    # The action is a Docker container action, which runs on the runner's Docker daemon. The
+    # image is pinned by digest, so a self-hosted runner's daemon keeps it after the first
+    # pull. vars.CI_RUNNER, else GitHub-hosted, as ci.yml's jobs.
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      # Declaring ANY permissions block sets every unlisted scope to `none`, so
+      # `contents: read` is not optional here: the provider reads `.pr_agent.toml`
+      # and every `repo_context_files` entry through the contents API
+      # (github_provider `get_repo_settings` / `get_repo_file_content`). Without it
+      # the config silently fails to load — the calls are wrapped in try/except,
+      # so the job still goes green while running on defaults.
+      #
+      # `read`, not `write`: only the tools that push commits (`/add_docs`,
+      # `/update_changelog`) need write, and none of them run here. A committable
+      # suggestion is a review comment; applying it is the reviewer's own commit.
+      contents: read
+      issues: write
+      pull-requests: write
+      # No `checks: write`. The only thing that consumes it is
+      # `github.publish_as_check_run`, which is off; add it if that is ever
+      # turned on.
+    name: Run pr agent on every pull request, respond to user comments
+    steps:
+      - name: PR Agent action step
+        id: pragent
+        # Pinned to the IMAGE DIGEST, as upstream documents, not to a ref of the
+        # action repo. A ref pins only `action.yaml` and a one-line Dockerfile,
+        # `FROM pragent/pr-agent:github_action`: a floating Docker Hub tag that
+        # upstream moves to each release's image, so with a ref the code that runs
+        # is whatever the tag holds on the day, whatever the ref says. The digest is
+        # immutable and names the code. The image's own entrypoint runs the
+        # GitHub Action runner, the same as through `action.yaml`; the only
+        # thing lost is that manifest's `artifact_path` inputs, unused here.
+        #
+        # To bump: pick a release, resolve its digest with
+        #   docker buildx imagetools inspect pragent/pr-agent:<version>-github_action --format '{{.Manifest.Digest}}'
+        # check that upstream built it with
+        #   gh attestation verify oci://index.docker.io/pragent/pr-agent@sha256:<digest> --repo The-PR-Agent/pr-agent
+        # then replace the digest and the version comment below. Dependabot
+        # may not propose bumps for a `docker://` reference, so expect this to
+        # be a manual bump. A model that only a newer release knows (see
+        # .pr_agent.toml) needs the bump first.
+        uses: docker://pragent/pr-agent@sha256:31b9aac6ab067bada9a0c1b001d30ebc500ea4487e00a93c18c59b9ef5fa66db # 0.47.0-github_action
+        env:
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # On PR open (and reopen/ready-for-review): review + improve. The
+          # flags must stay explicit — the runner invokes ALL THREE tools when
+          # a flag is unset, and an unasked-for /describe would then rewrite
+          # a PR body. That is why /describe stays off; run it on demand by
+          # commenting `/describe`.
+          #
+          # /improve is on because of placement, not volume: `/review`
+          # publishes its findings ONLY inside its own summary comment — it has
+          # no inline mode, the old `inline_code_comments` option is gone — so a
+          # finding sits away from the diff and a reviewer reading review
+          # threads never sees it. `/improve` is the only tool that can anchor
+          # findings to the code, and `.pr_agent.toml` sets
+          # `commitable_code_suggestions` so they arrive as resolvable review
+          # threads rather than a second summary table.
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "false"
+          github_action_config.auto_improve: "true"
+          # Pushes to an open PR go through the dedicated push branch instead
+          # of pr_actions: `/review -i` is PR-Agent's INCREMENTAL review — it
+          # reviews only the commits added since the last review, so a push
+          # can't re-litigate the whole diff into fresh noise. Bot pushes and
+          # merge commits are skipped by the runner's defaults; the
+          # pr_reviewer.minimal_{commits,minutes}_for_incremental_review
+          # settings can gate it further if even that is too chatty.
+          #
+          # Deliberately NOT `/improve` as well: inline suggestions are posted
+          # once, on open, over the whole diff. Re-running it per push would
+          # re-comment on code already answered. Ask for a fresh pass by
+          # commenting `/improve` when a push warrants one.
+          github_action_config.handle_push_trigger: "true"
+          github_action_config.push_commands: '["/review -i"]'
+          # OpenAI flex processing: same model, ~half the price, slower — and
+          # nobody waits on a CI review comment. Passed through litellm's
+          # extra_body (pr-agent allowlists exactly `service_tier` /
+          # `processing_mode` there). If OpenAI ever rejects flex for the
+          # configured model, the job fails visibly — drop this line to revert.
+          LITELLM.EXTRA_BODY: '{"service_tier": "flex"}'

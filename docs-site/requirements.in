@@ -1,0 +1,3 @@
+# The docs site's direct dependency. requirements.txt is its lock, with hashes:
+# make docs-lock regenerates it after a change here.
+zensical==0.0.71

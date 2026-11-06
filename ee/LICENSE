@@ -1,0 +1,58 @@
+The Tinfirm Enterprise license (the "EE License")
+Copyright (c) 2026-present FLOWTIVO s.r.o.
+
+With regard to the Tinfirm Software:
+
+This software and associated documentation files (the "Software") may only be
+used in production, if you (and any entity that you represent) have agreed to,
+and are in compliance with, the subscription terms of FLOWTIVO s.r.o. ("FLOWTIVO")
+for Tinfirm, or another agreement governing the use of the Software, as agreed
+by you and FLOWTIVO (the "Subscription Terms"), and otherwise have a valid
+Tinfirm Pro or Tinfirm Enterprise subscription for the correct number of user
+seats. One subscription covers one production installation of the Software;
+you may also use the Software on your own staging and test installations.
+Without a valid licence key the Software runs as Tinfirm Community, with
+every paid feature inactive, and you may use it so in production without a
+subscription. You may not move, change, disable, work around or circumvent
+the licence key functionality of the Software, remove, alter or obscure any
+check that keeps a paid feature inactive without a valid licence key, or use
+the Software with any such modification. A paid feature is in force only
+under a valid licence key that names it; putting one in force by any other
+means is use of the Software outside this licence.
+
+Subject to the foregoing, you are free to modify this Software and publish
+patches to the Software. You agree that FLOWTIVO and/or its licensors (as
+applicable) retain all right, title and interest in and to all such
+modifications and/or patches, and all such modifications and/or patches may
+only be used, copied, modified, displayed, distributed, or otherwise exploited
+with a valid Tinfirm Pro or Tinfirm Enterprise subscription for the correct
+number of user seats. Notwithstanding the foregoing, you may copy and modify
+the Software for development and testing purposes, without requiring a
+subscription, and you may copy the unmodified Software, as FLOWTIVO
+distributes it in its images and release assets, to the systems and
+registries you use for the installations this EE License allows. You agree
+that FLOWTIVO and/or its licensors (as applicable) retain all right, title and
+interest in and to all such modifications. You are not granted any other
+rights beyond what is expressly stated herein. Subject to the foregoing, it is
+forbidden to copy, merge, publish, distribute, sublicense, and/or sell the
+Software.
+
+This EE License applies only to the part of this Software that resides under
+the "ee/" directory of the Tinfirm repository. Any part of this Software that
+is served to the browser, directly or after being compiled, arranged,
+augmented, or combined into client-side code, in whole or in part, is
+licensed under the MIT Expat license of the repository's root "LICENSE"
+file. The full text of this EE License shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+For all third-party components incorporated into the Tinfirm Software, those
+components are licensed under the original license provided by the owner of
+the applicable component.

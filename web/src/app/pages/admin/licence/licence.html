@@ -1,0 +1,224 @@
+<div class="flex flex-col gap-6">
+  <app-page-header
+    title="Licence"
+    description="The edition this instance runs as, unlocked by the keys FLOWTIVO signs. One licence covers every company here; it is checked on this server, and nothing is sent anywhere."
+  />
+
+  <app-licence-banner [licence]="licence()" [instanceAdmin]="true" [link]="false" />
+
+  <section hlmCard aria-labelledby="licence-title" data-testid="licence-summary">
+    <div hlmCardHeader>
+      <h2 hlmCardTitle id="licence-title">This instance</h2>
+      <p hlmCardDescription>
+        Owners and admins of each company see the edition, the seats and the end in their company’s
+        settings.
+      </p>
+    </div>
+    <div hlmCardContent>
+      @if (state.licence.error() && !licence()) {
+        <app-error-state
+          [error]="state.licence.error()"
+          heading="Couldn't load the licence"
+          (retry)="state.reload()"
+        />
+      } @else if (licence(); as l) {
+        <dl class="grid grid-cols-[max-content_minmax(0,1fr)] gap-x-6 gap-y-2 text-sm">
+          <dt class="text-muted-foreground">Edition</dt>
+          <dd class="flex flex-wrap items-center gap-2">
+            <span class="font-semibold" data-testid="licence-edition">{{
+              editionLabels[l.edition]
+            }}</span>
+            <span
+              class="inline-flex h-[22px] items-center rounded-full border px-2.5 text-xs font-semibold"
+              [class]="stateTones[l.state]"
+              data-testid="licence-state"
+              >{{ stateLabels[l.state] }}</span
+            >
+          </dd>
+          @if (l.customer) {
+            <dt class="text-muted-foreground">Customer</dt>
+            <dd class="min-w-0 break-words" data-testid="licence-customer">{{ l.customer }}</dd>
+          }
+          @if (l.endsAt) {
+            <dt class="text-muted-foreground">Ends</dt>
+            <dd data-testid="licence-ends">{{ day(l.endsAt) }}</dd>
+          }
+          @if (l.graceEndsAt) {
+            <dt class="text-muted-foreground">Grace ends</dt>
+            <dd data-testid="licence-grace">
+              {{ day(l.graceEndsAt) }}
+              <span class="text-muted-foreground"
+                >· everything keeps working until then, then Community</span
+              >
+            </dd>
+          }
+          @if (l.auditExportUntil) {
+            <dt class="text-muted-foreground">Audit export</dt>
+            <dd>until {{ day(l.auditExportUntil) }}</dd>
+          }
+          <dt class="text-muted-foreground">Seats</dt>
+          <dd data-testid="licence-seats">
+            {{ seats() }}
+            <span class="text-muted-foreground block text-xs text-pretty"
+              >Each person who is an Owner, Admin or Member of a company holds one, however many
+              companies; Viewers and service accounts hold none.</span
+            >
+          </dd>
+          @if (l.companiesLicensed; as most) {
+            <dt class="text-muted-foreground">Companies</dt>
+            <dd>up to {{ most }}</dd>
+          }
+          <dt class="text-muted-foreground">Paid features</dt>
+          <dd>
+            @if (l.features.length === 0) {
+              <span class="text-muted-foreground">None: Community holds everything else.</span>
+            } @else {
+              <ul class="m-0 flex list-none flex-wrap gap-1.5 p-0" data-testid="licence-features">
+                @for (f of l.features; track f) {
+                  <li
+                    class="bg-secondary inline-flex min-h-[22px] items-center rounded-full px-2.5 py-0.5 text-xs leading-tight font-semibold"
+                  >
+                    {{ featureLabels[f] }}
+                  </li>
+                }
+              </ul>
+            }
+          </dd>
+        </dl>
+      } @else {
+        <div class="flex flex-col gap-3" aria-busy="true">
+          <span class="sr-only" role="status">Loading…</span>
+          <hlm-skeleton class="h-4 w-1/2" />
+          <hlm-skeleton class="h-4 w-1/3" />
+          <hlm-skeleton class="h-4 w-2/5" />
+        </div>
+      }
+    </div>
+  </section>
+
+  <section class="flex flex-col gap-3" aria-labelledby="keys-title">
+    <h2 id="keys-title" class="text-base font-bold">Key</h2>
+    @if (keys.isLoading() && !keys.hasValue()) {
+      <div class="bg-card flex flex-col gap-3 rounded-xl border p-4" aria-busy="true">
+        <hlm-skeleton class="h-4 w-1/2" />
+        <hlm-skeleton class="h-4 w-1/3" />
+      </div>
+    } @else if (keys.error()) {
+      <app-error-state
+        [error]="keys.error()"
+        heading="Couldn't load the key"
+        (retry)="keys.reload()"
+      />
+    } @else {
+      @if (current(); as k) {
+        <ng-container *ngTemplateOutlet="keyCard; context: { $implicit: k, next: false }" />
+      } @else {
+        <div hlmEmpty class="border" data-testid="no-key">
+          <div hlmEmptyHeader>
+            <div hlmEmptyMedia variant="icon">
+              <ng-icon name="lucideKeyRound" aria-hidden="true" />
+            </div>
+            <div hlmEmptyTitle>No key in force</div>
+            <p hlmEmptyDescription>
+              The instance runs as Community: everything but the paid features, with no limit on
+              people. Paste a Pro or Enterprise key below to unlock them.
+            </p>
+          </div>
+        </div>
+      }
+      @if (next(); as k) {
+        <ng-container *ngTemplateOutlet="keyCard; context: { $implicit: k, next: true }" />
+      }
+    }
+  </section>
+
+  <section hlmCard aria-labelledby="enter-key-title">
+    <div hlmCardHeader>
+      <h2 hlmCardTitle id="enter-key-title">Paste a new key</h2>
+      <p hlmCardDescription>
+        One key is in force at a time. To add seats, or to renew, paste the new key FLOWTIVO sends:
+        one line of text starting {{ keyPrefix }} A key with more seats replaces the key in force at
+        once; a renewal’s key waits as the next key and takes over on its start date.
+      </p>
+    </div>
+    <div hlmCardContent>
+      <form id="enter-key-form" class="flex flex-col gap-3" novalidate (submit)="enter($event)">
+        @if (enterError(); as message) {
+          <div hlmAlert variant="destructive" data-testid="enter-key-error">
+            <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+            <p hlmAlertDescription>{{ message }}</p>
+          </div>
+        }
+        <div hlmField>
+          <label hlmFieldLabel for="licence-key">Licence key</label>
+          <textarea
+            hlmTextarea
+            id="licence-key"
+            class="min-h-28 font-mono text-xs break-all"
+            spellcheck="false"
+            autocomplete="off"
+            data-testid="licence-key-input"
+            [placeholder]="keyPrefix + '…'"
+            [value]="pasted()"
+            [attr.aria-invalid]="enterError() ? 'true' : null"
+            (input)="onPaste($event)"
+          ></textarea>
+        </div>
+        <div>
+          <button
+            hlmBtn
+            type="submit"
+            class="max-sm:h-11"
+            data-testid="enter-key"
+            [disabled]="entering() || !keys.hasValue()"
+          >
+            @if (entering()) {
+              <hlm-spinner aria-hidden="true" />
+            } @else {
+              <ng-icon name="lucideKeyRound" aria-hidden="true" />
+            }
+            Enter key
+          </button>
+        </div>
+      </form>
+    </div>
+  </section>
+</div>
+
+<!-- A key: the one in force, or the next one with the day it takes over. -->
+<ng-template #keyCard let-k let-next="next">
+  <div
+    class="bg-card flex flex-col gap-2 rounded-xl border p-4 text-sm"
+    [attr.data-testid]="next ? 'next-key' : 'current-key'"
+  >
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="font-semibold">{{ editionOf(k) }} · {{ k.customer }}</span>
+      <span
+        class="inline-flex h-[22px] items-center rounded-full border px-2.5 text-xs font-semibold"
+        [class]="
+          next ? 'bg-card text-muted-foreground' : 'border-success/40 bg-success/10 text-success'
+        "
+        >{{ next ? 'Next, from ' + day(k.startsAt) : 'In force' }}</span
+      >
+    </div>
+    <dl class="grid grid-cols-[max-content_minmax(0,1fr)] gap-x-6 gap-y-1">
+      <dt class="text-muted-foreground">Licence</dt>
+      <dd class="font-mono text-xs leading-5 break-all">{{ k.licenceId }}, revision {{ k.rev }}</dd>
+      <dt class="text-muted-foreground">Seats</dt>
+      <dd>{{ k.seats ?? 'Not counted' }}</dd>
+      @if (k.companies; as most) {
+        <dt class="text-muted-foreground">Companies</dt>
+        <dd>up to {{ most }}</dd>
+      }
+      <dt class="text-muted-foreground">Valid</dt>
+      <dd>{{ day(k.startsAt) }} to {{ day(k.endsAt) }}</dd>
+      <dt class="text-muted-foreground">Entered</dt>
+      <dd class="text-muted-foreground">
+        <app-time [value]="k.appliedAt" />
+        @if (k.appliedByName) {
+          by {{ k.appliedByName }}
+        }
+      </dd>
+    </dl>
+  </div>
+</ng-template>

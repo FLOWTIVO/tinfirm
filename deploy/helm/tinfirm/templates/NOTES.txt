@@ -1,0 +1,125 @@
+Tinfirm server {{ include "tinfirm.imageTag" . }} is deploying as {{ include "tinfirm.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+The pods start only when these Secrets exist in {{ .Release.Namespace }}. The chart never creates them:
+
+  {{ .Values.database.existingSecret }}  keys: {{ .Values.database.secretKeys.appPassword }} (role tinfirm_app), {{ .Values.database.secretKeys.ownerPassword }} (role tinfirm_owner)
+  {{ .Values.vault.existingSecret }}  keys: {{ .Values.vault.secretKeys.keys }} (keyId:base64(32 bytes)[,...]), {{ .Values.vault.secretKeys.activeKey }} (keyId)
+{{- range .Values.auth.oidc.providers }}
+  {{ .existingSecret }}  key: {{ dig "secretKeys" "clientSecret" "client-secret" . }} (OIDC client secret of provider "{{ .id }}")
+{{- end }}
+{{- with .Values.database.caCertSecret.name }}
+  {{ . }}  key: {{ $.Values.database.caCertSecret.key }} (CA certificate of the database server)
+{{- end }}
+{{- with .Values.bootstrap.existingSecret }}
+  {{ . }}  keys: {{ $.Values.bootstrap.secretKeys.adminEmail }}, {{ $.Values.bootstrap.secretKeys.adminPassword }}  (optional; first start only, delete it afterwards)
+{{- end }}
+{{- if .Values.litellm.enabled }}
+{{- $ldb := .Values.litellm.database }}
+{{- if $ldb.existingSecret }}
+  {{ .Values.litellm.existingSecret }}  keys: {{ .Values.litellm.secretKeys.masterKey }} (LiteLLM master key, sk-...), {{ .Values.litellm.secretKeys.saltKey }} (LiteLLM salt key; never change it)  (the LiteLLM pods wait for it)
+{{- if $ldb.secretKeys.url }}
+  {{ $ldb.existingSecret }}  key: {{ $ldb.secretKeys.url }} (LiteLLM's database URL, with the password)  (the LiteLLM pods wait for it)
+{{- else if $ldb.secretKeys.username }}
+  {{ $ldb.existingSecret }}  keys: {{ $ldb.secretKeys.username }} (LiteLLM's database role), {{ $ldb.secretKeys.password }} (its password)  (the LiteLLM pods wait for it)
+{{- else }}
+  {{ $ldb.existingSecret }}  key: {{ $ldb.secretKeys.password }} (password of LiteLLM's database role {{ $ldb.user }})  (the LiteLLM pods wait for it)
+{{- end }}
+{{- else }}
+  {{ .Values.litellm.existingSecret }}  keys: {{ .Values.litellm.secretKeys.masterKey }} (LiteLLM master key, sk-...), {{ .Values.litellm.secretKeys.saltKey }} (LiteLLM salt key; never change it), {{ .Values.litellm.secretKeys.databasePassword }} (role {{ $ldb.user }})  (the LiteLLM pods wait for it)
+{{- end }}
+{{- with $ldb.caCertSecret.name }}
+  {{ . }}  key: {{ $ldb.caCertSecret.key }} (CA certificate of LiteLLM's database server)
+{{- end }}
+{{- end }}
+
+Database: {{ include "tinfirm.jdbcUrl" . }}
+  Prepare it first: docs/operations/external-database.md.
+{{- if .Values.litellm.enabled }}
+
+LiteLLM {{ .Values.litellm.image.tag }} (the bundled model gateway): {{ include "tinfirm.litellm.fullname" . }}
+{{- $ldb := .Values.litellm.database }}
+{{- if $ldb.secretKeys.url }}
+  Its database: the URL in Secret {{ $ldb.existingSecret }}, key {{ $ldb.secretKeys.url }}{{ with $ldb.port }}, on port {{ . }}{{ end }} (external-database.md, section 4).
+{{- else if $ldb.secretKeys.username }}
+  Its database: {{ $ldb.name }} as the role in Secret {{ $ldb.existingSecret }}, key {{ $ldb.secretKeys.username }}, on {{ include "tinfirm.litellm.databaseHost" . }} (external-database.md, section 4).
+{{- else }}
+  Its database: {{ $ldb.name }} as {{ $ldb.user }} on {{ include "tinfirm.litellm.databaseHost" . }} (external-database.md, section 4).
+{{- end }}
+  Admin API, for the server and the operator only: {{ include "tinfirm.litellm.adminUrl" . }}
+    kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "tinfirm.litellm.fullname" . }} 4000:4000
+  Model port, LiteLLM's model routes alone, for the company's services with LiteLLM keys of
+  their own (ADR-0069): {{ include "tinfirm.litellm.modelApiBaseUrl" . }}
+  Nothing exposes either outside the release: runner hosts reach only the server, which relays
+  their model requests. docs/operations/litellm.md.
+{{- end }}
+{{- with .Values.companies }}
+
+Companies (ADR-0075), each created at the server's start when it does not exist yet, never deleted:
+{{- range . }}
+  {{ .key }}: {{ .name }}{{ with .owner }}  (OWNER while it has none: {{ . }}){{ end }}
+{{- end }}
+{{- end }}
+{{- $url := include "tinfirm.publicUrl" . }}
+{{- if $url }}
+
+Public URL: {{ $url }}
+{{- range .Values.auth.oidc.providers }}
+  OIDC redirect URI for "{{ .id }}": {{ $url }}/login/oauth2/code/{{ .id }}
+  Sign-in link for "{{ .id }}" (this provider only): {{ $url }}/login?provider={{ .id }}
+{{- end }}
+{{- else }}
+
+WARNING: neither publicUrl nor an ingress or HTTPRoute host is set, so the server falls back
+to http://localhost:8080 for OIDC redirects and the cookie Secure flag. Set publicUrl.
+{{- end }}
+{{- $np := .Values.networkPolicy }}
+{{- $exposed := or .Values.ingress.enabled .Values.httpRoute.enabled }}
+{{- if and $np.enabled (not $np.ingress.controller) (not $np.ingress.extraFrom) }}
+{{- if $exposed }}
+
+WARNING: the {{ if .Values.ingress.enabled }}Ingress{{ else }}HTTPRoute{{ end }} is on, but networkPolicy.ingress.controller is not set, so the
+NetworkPolicy admits port 8080 from any pod of the cluster, beside your controller. Name the
+pods of your ingress controller or Gateway there (or list them in extraFrom), so that only
+they reach the server and only they can set the client IP behind trustedProxies:
+https://docs.tinfirm.com/operator-guide/helm/#ingress-to-the-server
+{{- else }}
+
+NOTE: networkPolicy.ingress.controller is not set, so the NetworkPolicy admits port 8080 from
+any source. Name the pods of your ingress controller or Gateway there, which also keeps other
+pods from setting the client IP the login throttle sees:
+https://docs.tinfirm.com/operator-guide/helm/#ingress-to-the-server
+{{- end }}
+{{- end }}
+{{- /* Every private range pods get (RFC 1918, 100.64.0.0/10, fc00::/7): too broad for trustedProxies (L29). */}}
+{{- $broadProxies := `10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}|f[cdCD][0-9a-fA-F]{2}:.*` }}
+{{- $loopbackProxies := `127\.\d{1,3}\.\d{1,3}\.\d{1,3}|0:0:0:0:0:0:0:1` }}
+{{- $trustedProxies := .Values.trustedProxies | default "" }}
+{{- if or (eq $trustedProxies $broadProxies) (eq $trustedProxies "") }}
+
+WARNING: trustedProxies {{ if $trustedProxies }}is the list of every private range{{ else }}is empty, so Tomcat's default applies{{ end }}: every private
+address range is a trusted proxy, so any pod that reaches port 8080 from such an address can
+choose the client IP the login throttle and the audit trail see. Set it to your ingress
+controller's pod CIDR, e.g. '10\.244\.\d{1,3}\.\d{1,3}' for 10.244.0.0/16:
+https://docs.tinfirm.com/operator-guide/helm/#trusted-proxies
+{{- else if and $exposed (eq $trustedProxies $loopbackProxies) }}
+
+WARNING: trustedProxies is the default, loopback only, so the server trusts no proxy: every
+client has the address of your ingress controller or Gateway, and the login throttle counts
+them all as one. Set trustedProxies to the controller's pod CIDR, e.g.
+'10\.244\.\d{1,3}\.\d{1,3}' for 10.244.0.0/16:
+https://docs.tinfirm.com/operator-guide/helm/#trusted-proxies
+{{- end }}
+{{- if and $np.enabled (or .Values.metrics.scrapeAnnotations .Values.metrics.podMonitor.enabled) (not $np.ingress.metrics.enabled) }}
+
+WARNING: metrics are on, but networkPolicy.ingress.metrics is not, so the NetworkPolicy keeps
+the scraper from port 8081. Enable it with the scraper's namespace and pods.
+{{- end }}
+{{- if include "tinfirm.openshift" . }}
+
+OpenShift: the security contexts leave the UID and fsGroup to the SCC, and the NetworkPolicies
+admit OpenShift's DNS (openshift-dns, port 5353).
+{{- end }}
+
+Management port 8081 (health, prometheus) is not exposed by the Service or the Ingress. To check it:
+  kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "tinfirm.fullname" . }} 8081:8081
+  curl -s localhost:8081/actuator/health

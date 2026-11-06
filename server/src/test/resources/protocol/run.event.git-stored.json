@@ -1,0 +1,5 @@
+{
+  "type": "run.event", "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f", "epoch": 1, "seq": 3,
+  "eventType": "GIT", "at": "2026-09-25T08:20:00Z",
+  "payload": { "action": "cloned", "branch": "agent/MYCO-12", "headSha": "1a2b3c4", "commits": 0 }
+}

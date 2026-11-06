@@ -1,0 +1,5 @@
+# v2 design archive
+
+The design of Tinfirm from the restart of 2026-10-05 ([ADR-0037](../../adr/0037-restart-on-the-platform-design.md)): [PLATFORM.md](PLATFORM.md), as amended by [ADR-0049](../../adr/0049-agent-kinds-groups-and-personal-accounts.md) (agent kinds, groups with rights, people's own accounts) and [ADR-0052](../../adr/0052-shared-accounts.md) (shared accounts). The design of 2026-10-12 ([ADR-0058](../../adr/0058-authority-from-the-audience.md), [ADR-0059](../../adr/0059-litellm-budgets-and-the-model-proxy.md)) replaces it: the authority of the work comes from its audience instead of the agent's kind, and model spend is a LiteLLM budget per principal. The code does not implement this design. The design in force is [PLATFORM.md](../../PLATFORM.md), the rules in force are [CONVENTIONS.md](../../CONVENTIONS.md).
+
+[CONVENTIONS.md](CONVENTIONS.md) holds §14 of the conventions as it stood on 2026-10-19: the domain rules of this design, with their "Superseded by §15.x" markers. It binds no code; the parts that still bind it stay in [CONVENTIONS §14](../../CONVENTIONS.md#14-the-restarts-domain), under the same numbers.

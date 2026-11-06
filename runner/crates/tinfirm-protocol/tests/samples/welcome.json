@@ -1,0 +1,8 @@
+{
+  "type": "welcome",
+  "runnerHostId": "0192f1a4-7c1e-7b3a-9d2e-000000000001",
+  "companyId": "0192f1a4-7c1e-7b3a-9d2e-000000000002",
+  "serverVersion": "0.1.0-SNAPSHOT",
+  "heartbeatIntervalSeconds": 10,
+  "leaseTtlSeconds": 30
+}

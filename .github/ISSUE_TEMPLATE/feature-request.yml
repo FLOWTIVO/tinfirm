@@ -1,0 +1,60 @@
+# The issue form for a new feature or a change of behaviour (GitHub issue forms).
+name: Feature request
+description: Propose a new feature, or a change to how Tinfirm behaves.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search the [existing issues](https://github.com/FLOWTIVO/tinfirm/issues?q=is%3Aissue) first. Describe the problem before the solution: it is what the maintainers weigh a proposal against.
+
+        A change that makes a significant design decision gets an architecture decision record (`docs/adr/`) in its pull request. For a larger change, agree on the approach here before you write the code.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you want to do, who it is for, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What Tinfirm should do. Name the screens, API operations, settings or runner host options it touches, if you know them.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other ways to solve the problem, workarounds you use today, and why they fall short.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where the change would go, if you know.
+      multiple: true
+      options:
+        - Server (REST API, MCP endpoints, triggers, chats)
+        - Web app
+        - Runner host
+        - Model port or LiteLLM
+        - Outlook add-in or Gmail add-on
+        - Helm chart
+        - Compose stack
+        - Release assets or images
+        - Documentation or the docs site
+        - CI workflows
+        - Not sure
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that helps, such as links, screenshots or examples from other tools.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and none proposes this.
+          required: true

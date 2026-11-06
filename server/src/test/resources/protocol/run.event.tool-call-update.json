@@ -1,0 +1,8 @@
+{
+  "type": "run.event", "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f", "epoch": 1, "seq": 9,
+  "eventType": "TOOL_CALL_UPDATE", "at": "2026-09-26T08:15:33+02:00",
+  "payload": {
+    "toolCallId": "toolu_01", "status": "completed", "output": null,
+    "diffs": [ { "path": "src/main/java/HealthController.java", "oldText": null, "newText": "class HealthController {}" } ]
+  }
+}

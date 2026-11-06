@@ -1,0 +1,14 @@
+# `helm lint` / `helm template` (CI and `make helm-lint`): LiteLLM's database from a complete
+# URL in a Secret (CloudNativePG's `uri` key), with the port the NetworkPolicy opens and the
+# CA still mounted for the URL's sslrootcert.
+image:
+  tag: v0.1.0
+litellm:
+  database:
+    port: 5432
+    caCertSecret:
+      name: litellm-pg-ca
+      key: ca.crt
+    existingSecret: litellm-pg-app
+    secretKeys:
+      url: uri

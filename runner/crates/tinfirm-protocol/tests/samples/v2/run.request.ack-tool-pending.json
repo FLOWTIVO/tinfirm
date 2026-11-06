@@ -1,0 +1,9 @@
+{
+  "type": "run.request.ack",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000081",
+  "status": "PENDING",
+  "payload": {"decisionId": "0192f1a4-7c1e-7b3a-9d2e-000000000082"},
+  "code": null,
+  "message": "The call waits for a member's approval: it is posted on the work item, where a member approves or denies it. When you have nothing else to do, stop without writing a summary: Tinfirm wakes you with the decision, and with the call's result when it was approved."
+}

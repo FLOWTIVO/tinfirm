@@ -1,0 +1,324 @@
+name: Release
+
+# THE MANUAL RELEASE PIPELINE. Run it from the Actions tab (or `gh workflow run release.yml`)
+# on `main` for a normal release, or on a `hotfix/**` branch for a hotfix release.
+#
+# The steps of the release are reusable-release.yml (ADR-0106). This file is the
+# repository-specific half: the gate, the signing, the manifests to version, the images to
+# build and the assets.
+#
+# One run: gate (ci.yml) -> set version, commit, tag v<version> -> build and push
+# ghcr.io/flowtivo/tinfirm-server:v<version> and :sha-<sha> (and the model port's
+# ghcr.io/flowtivo/tinfirm-model-api and the runner host's ghcr.io/flowtivo/tinfirm-runner-host,
+# the same tags), and the chart oci://ghcr.io/flowtivo/charts/tinfirm:<version>
+# (ADR-0080) -> GitHub Release -> next -SNAPSHOT version on the branch -> the release assets
+# (runner-artifacts.yml) on the GitHub Release.
+#
+# A release changes no environment. A version runs in one once that environment's deployment
+# repository names `image.tag: v<version>`, an edit made there (ADR-0107).
+#
+# Signed artifacts (ADR-0081): `signing-key` checks the cosign key before anything is
+# published, `sign` signs the three images and the chart by digest after the push, and attests
+# an SBOM of each image, and `sign-assets` signs the assets' SHA256SUMS once they are on
+# the GitHub Release. All three run in the protected environment `release`, the only place
+# that holds COSIGN_PRIVATE_KEY and COSIGN_PASSWORD, so each waits for a required reviewer.
+# Without the key, or with a key that is not the one of docs-site/content/cosign.pub, the
+# release stops before reusable-release.yml pushes anything.
+#
+# Where the keys live and run (H3 of the security review of 2026-10-27):
+#   - The environment `release` (deployment branches `main` and `hotfix/**`, required
+#     reviewers) holds COSIGN_*; the environment `release-deploy` (the same deployment
+#     branches, no reviewers) holds RELEASE_APP_*. reusable-release.yml runs its `tag` and
+#     `next` jobs in `release-deploy` (input `environment`), so a workflow file on any other
+#     branch cannot read the App's key; repository or organisation secrets of the same names
+#     must not exist.
+#   - `signing-key`, `sign`, `sign-assets` and every job of reusable-release.yml but its
+#     `caller` check (the image build among them) run on the runner label in the
+#     repository variable CI_RELEASE_RUNNER, else on GitHub-hosted `ubuntu-latest`, a fresh
+#     VM for each job that shares nothing with a pull request's build.
+#   - A self-hosted label in CI_RELEASE_RUNNER names a runner group of its own, whose
+#     runners run no pull-request job, so that no pull request's build shares their Docker
+#     daemon, BuildKit cache or $HOME with the key; the repository must be in that group, or
+#     the jobs queue. Pointing it at the CI runners (CI_RELEASE_RUNNER = CI_RUNNER) gives
+#     that isolation up. The isolation is a setting of the group, not of this file, which a
+#     pull request can change: the group allows public repositories only with "Selected
+#     workflows" naming this file, reusable-release.yml and runner-artifacts.yml at
+#     refs/heads/main (ADR-0106). The two called files take the release runners only from
+#     this file's run of main or a hotfix branch, whoever calls them (their first job,
+#     `caller` and `check`).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, semver, no leading v (e.g. 0.1.0)'
+        required: true
+        type: string
+      next_version:
+        description: 'Development version after the release. Empty = derive (0.1.0 -> 0.1.1-SNAPSHOT)'
+        required: false
+        type: string
+      skip_checks:
+        description: 'Skip the CI gate. Only to re-run a release whose checks already passed on this exact commit.'
+        required: false
+        default: false
+        type: boolean
+
+# One release at a time, repo-wide, so that two releases from two branches never push their
+# tags, images, charts and next-version commits at the same time.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Release gate
+    if: ${{ !inputs.skip_checks }}
+    uses: ./.github/workflows/ci.yml
+    # GitHub validates every permission a nested job requests against this calling job
+    # BEFORE it evaluates any `if:`, so this grants what ci.yml's jobs request even where
+    # they never run here:
+    #   pull-requests: write  security (the findings comment; none is posted on a release)
+    #   packages: write       publish, publish-services, publish-docs, main-complete (the
+    #                         images and tags of a push to main)
+    #   contents: write       rolling (the rolling prerelease of main)
+    # The publishing jobs and rolling run only for a push to main and are skipped under this
+    # call, whose event is `workflow_dispatch`. The gate jobs themselves keep ci.yml's contents: read.
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: write
+
+  # Before anything is pushed: the signing key is set in the `release` environment, opens
+  # with its password, and is the key of docs-site/content/cosign.pub. A release that could
+  # not sign its images never publishes them.
+  signing-key:
+    name: Image signing key
+    needs: [checks]
+    if: ${{ always() && (needs.checks.result == 'success' || needs.checks.result == 'skipped') }}
+    runs-on: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cosign
+        run: deploy/release/sign-images.sh install "${RUNNER_TEMP}/signing" cosign
+      - name: Check the key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: deploy/release/sign-images.sh check-key
+
+  release:
+    needs: [checks, signing-key]
+    # `always()` so skip_checks (which makes `checks` skipped, not successful) does not
+    # cancel the release; a FAILED gate still stops it, and so does a signing key that is
+    # missing or wrong.
+    if: >-
+      ${{ always()
+        && (needs.checks.result == 'success' || needs.checks.result == 'skipped')
+        && needs.signing-key.result == 'success' }}
+    uses: ./.github/workflows/reusable-release.yml
+    permissions:
+      contents: write       # release commit, tag, next-version commit
+      packages: write       # GHCR push
+      pull-requests: write  # merge_back pull request from a hotfix branch
+    # Explicit, not `secrets: inherit`: reusable-release.yml declares exactly these two.
+    # RELEASE_APP_*: the release's GitHub App. `main`'s ruleset requires a pull request,
+    # which refuses the release's two pushes (`release: v<version>`, `chore: prepare
+    # <next>`) made with GITHUB_TOKEN; it lets this one app bypass it.
+    # Both are secrets of the environment `release-deploy`: this calling job has no
+    # environment, so these expressions read empty while no repository or organisation
+    # secret of these names exists, and the reusable workflow's jobs that name
+    # `environment` read the environment's values instead (a job's environment secret
+    # takes the place of a passed one). They are passed so that the reusable workflow's
+    # declared secrets match.
+    secrets:
+      RELEASE_APP_CLIENT_ID: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+      RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+    with:
+      # The environment of reusable-release.yml's `tag` and `next` jobs, which mint the release
+      # App's tokens: `release-deploy`, with the same deployment branches as `release` (`main`,
+      # `hotfix/**`) and no reviewers, holding RELEASE_APP_*. A dispatch from a branch it does
+      # not allow stops there; the reviewers of `release` approve a release once, at
+      # `signing-key`, not again at every job that pushes.
+      environment: release-deploy
+      version: ${{ inputs.version }}
+      next_version: ${{ inputs.next_version }}
+      product_name: Tinfirm
+      # Published as oci://ghcr.io/flowtivo/charts/tinfirm:<version>, appVersion <version>:
+      # a deployment repository deploys the chart of the version its `image.tag` names
+      # (ADR-0080).
+      # The release's `guard` packages it before anything is tagged, so a chart that does not
+      # package stops the release: no release ships without its chart.
+      charts: deploy/helm/tinfirm
+      manifests: |
+        pom:server/pom.xml:tinfirm-server
+        pom:model-api/pom.xml:tinfirm-model-api
+        npm:web
+      # The model port (ADR-0069) and the runner host's image (ADR-0101, decision 8) are
+      # released with the server, under the same version: the chart's
+      # litellm.modelApi.image.tag and runner.image.tag default to the server's.
+      # CACHE_SCOPE=main: the BuildKit cache mounts of builds from main and releases, never
+      # the ones pull-request builds write (`-pr`, the Dockerfiles' default).
+      components: >-
+        [{"component":"server","image":"ghcr.io/flowtivo/tinfirm-server",
+          "context":".","file":"./Dockerfile","build_args":"CACHE_SCOPE=main"},
+         {"component":"model-api","image":"ghcr.io/flowtivo/tinfirm-model-api",
+          "context":".","file":"./model-api/Dockerfile","build_args":"CACHE_SCOPE=main"},
+         {"component":"runner-host","image":"ghcr.io/flowtivo/tinfirm-runner-host",
+          "context":".","file":"./deploy/release/runner-musl.Dockerfile","build_args":"CACHE_SCOPE=main"}]
+      # Every job of reusable-release.yml but its `caller` check, the image build among them,
+      # on the release runners: vars.CI_RELEASE_RUNNER, else ubuntu-latest (header).
+      runner: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
+
+  # The images of the release by digest (every manifest of an index too), with an SPDX
+  # SBOM of each platform as a signed attestation, then the chart by digest, with no
+  # transparency log: customers verify offline against cosign.pub (docs-site
+  # operator-guide/verify-images.md). Only after a
+  # successful release: after a failed one, the version tag could still name an image of an
+  # earlier attempt, which this run did not push. A release that failed after its push
+  # leaves its images unsigned, so customers' verification fails: release a new version.
+  # A failure of this job alone: re-run it.
+  sign:
+    name: Sign the images and the chart
+    needs: [release]
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      packages: write       # the signatures and attestations, beside the images in GHCR
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ inputs.version }}
+          persist-credentials: false
+      - name: Install cosign and syft
+        run: deploy/release/sign-images.sh install "${RUNNER_TEMP}/signing" cosign syft
+      # As ci.yml's publish: a fresh DOCKER_CONFIG of this job, which cosign and syft read
+      # too, removed by the last step; the token on stdin only.
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          config="$(mktemp -d "${RUNNER_TEMP}/docker-config.XXXXXXXX")"
+          echo "DOCKER_CONFIG=${config}" >> "$GITHUB_ENV"
+          printf '%s' "$GITHUB_TOKEN" | docker --config "$config" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Sign and attest
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          deploy/release/sign-images.sh sign "${RUNNER_TEMP}/sbom" \
+            "ghcr.io/flowtivo/tinfirm-server:v${VERSION}" \
+            "ghcr.io/flowtivo/tinfirm-model-api:v${VERSION}" \
+            "ghcr.io/flowtivo/tinfirm-runner-host:v${VERSION}"
+      # The chart reusable-release.yml published (ADR-0080), signed by digest too: no SBOM,
+      # it is no image. Its version has no `v`.
+      - name: Sign the chart
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: deploy/release/sign-images.sh sign-chart "ghcr.io/flowtivo/charts/tinfirm:${VERSION}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-v${{ inputs.version }}
+          path: ${{ runner.temp }}/sbom/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Log out
+        if: always()
+        run: |
+          if [ -n "${DOCKER_CONFIG:-}" ]; then
+            docker logout ghcr.io || true
+            rm -rf "$DOCKER_CONFIG"
+          fi
+
+  # The downloadable assets of the release (runner host binaries, deploy/compose, REVISION,
+  # SHA256SUMS), built from the release tag and attached to the GitHub Release that the
+  # reusable release created; the same definition as `rolling` (runner-artifacts.yml). It
+  # also runs when a later part of the reusable release failed (the charts, the next version,
+  # the merge-back pull request), as long as the Release exists; otherwise re-run this job
+  # once it does, which builds on the release runners again. A dispatch of Actions -> Release
+  # assets builds on the CI runners: runner-artifacts.yml takes the release runners only from
+  # this job (its header).
+  assets:
+    needs: [release]
+    if: ${{ always() && (needs.release.result == 'success' || needs.release.result == 'failure') }}
+    uses: ./.github/workflows/runner-artifacts.yml
+    permissions:
+      contents: write
+    with:
+      release_tag: v${{ inputs.version }}
+      ref: v${{ inputs.version }}
+      # The Linux binaries on the release runners too (header), with the `main` cache scope
+      # (runner-artifacts.yml, whose `check` job allows vars.CI_RELEASE_RUNNER from release.yml
+      # only).
+      runner: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
+
+  # SHA256SUMS of the assets, signed with the release key (M13): hosts that follow a
+  # release (tinfirm-auto-deploy) and customers verify it against cosign.pub before they
+  # trust any checksum in it. The job downloads every asset of the Release, checks them
+  # against SHA256SUMS and REVISION against the tag, signs SHA256SUMS
+  # (deploy/release/assets.sh sign-sums: SHA256SUMS.sig, and the cosign bundle
+  # SHA256SUMS.sigstore.json), verifies the signature as a host does, and uploads both
+  # beside SHA256SUMS. A host that sees the release before this job finished waits for the
+  # signature. Re-running `assets` replaces SHA256SUMS: re-run this job after it.
+  sign-assets:
+    name: Sign the release assets
+    needs: [assets]
+    if: ${{ needs.assets.result == 'success' }}
+    runs-on: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write       # the signature, uploaded to the GitHub Release
+    env:
+      TAG: v${{ inputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      # As runner-artifacts.yml: gh is installed when missing, this pinned release.
+      GH_VERSION: 2.102.0
+      GH_SHA256_AMD64: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+      GH_SHA256_ARM64: 7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ inputs.version }}
+          persist-credentials: false
+      - name: Install cosign
+        run: deploy/release/sign-images.sh install "${RUNNER_TEMP}/signing" cosign
+      - name: Install gh if missing
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then gh --version | head -n 1; exit 0; fi
+          case "$(uname -m)" in
+            x86_64) arch=amd64; sum="$GH_SHA256_AMD64" ;;
+            aarch64) arch=arm64; sum="$GH_SHA256_ARM64" ;;
+            *) echo "::error::no pinned gh for $(uname -m)"; exit 1 ;;
+          esac
+          dir="${RUNNER_TEMP}/gh"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/gh.tar.gz" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${arch}.tar.gz"
+          echo "${sum}  $dir/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/gh.tar.gz" -C "$dir" --strip-components=1
+          echo "$dir/bin" >> "$GITHUB_PATH"
+      - name: Download and check the assets
+        run: deploy/release/assets.sh fetch "$TAG" "${RUNNER_TEMP}/assets"
+      - name: Sign SHA256SUMS
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: deploy/release/assets.sh sign-sums "${RUNNER_TEMP}/assets" docs-site/content/cosign.pub
+      - name: Upload the signature
+        run: deploy/release/assets.sh publish-signature "$TAG" "${RUNNER_TEMP}/assets"

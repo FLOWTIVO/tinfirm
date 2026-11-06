@@ -1,0 +1,9 @@
+{
+  "type": "run.repository_request",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 1,
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000030",
+  "componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000012",
+  "name": "docs",
+  "reason": "The health endpoint must be documented in the operator guide, which lives in docs."
+}

@@ -1,0 +1,59 @@
+{
+  "description": "Okta's SCIM 2.0 client in the sequence of Okta's 'Build a SCIM API service': the connector test, matching by userName, create with a password (Sync password off still sends one), the whole-user PUT of an update without a role mapping, the role pushed as a profile attribute, deactivate and reactivate with a PATCH; Okta never deletes.",
+  "query": "",
+  "steps": [
+    { "name": "the connector test", "method": "GET", "path": "/Users?startIndex=1&count=2", "status": 200, "expect": { "/startIndex": 1 } },
+    { "name": "matching by userName", "method": "GET", "path": "/Users?filter=userName%20eq%20%22{{userName}}%22&startIndex=1&count=100", "status": 200, "expect": { "/totalResults": 0 } },
+    { "name": "create", "method": "POST", "path": "/Users", "status": 201,
+      "body": {
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User", "urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User"],
+        "userName": "{{userName}}",
+        "name": { "givenName": "Katherine", "familyName": "Johnson" },
+        "emails": [{ "primary": true, "value": "{{userName}}", "type": "work" }],
+        "displayName": "Katherine Johnson",
+        "locale": "en-US",
+        "externalId": "{{externalId}}",
+        "groups": [],
+        "password": "1mz050nq",
+        "active": true,
+        "urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User": { "role": "admin" }
+      },
+      "capture": { "id": "/id" },
+      "expect": { "/active": true, "/urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User/role": "admin" } },
+    { "name": "get by id", "method": "GET", "path": "/Users/{{id}}", "status": 200, "expect": { "/userName": "{{userName}}" } },
+    { "name": "a profile update: the whole user, without a role mapping", "method": "PUT", "path": "/Users/{{id}}", "status": 200,
+      "body": {
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+        "id": "{{id}}",
+        "userName": "{{userName}}",
+        "name": { "givenName": "Katherine", "familyName": "Goble Johnson" },
+        "emails": [{ "primary": true, "value": "{{userName}}", "type": "work" }],
+        "displayName": "Katherine Goble Johnson",
+        "externalId": "{{externalId}}",
+        "active": true,
+        "groups": []
+      },
+      "expect": { "/displayName": "Katherine Goble Johnson", "/urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User/role": "admin" } },
+    { "name": "the role, pushed as a profile attribute", "method": "PUT", "path": "/Users/{{id}}", "status": 200,
+      "body": {
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User", "urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User"],
+        "id": "{{id}}",
+        "userName": "{{userName}}",
+        "name": { "givenName": "Katherine", "familyName": "Goble Johnson" },
+        "displayName": "Katherine Goble Johnson",
+        "externalId": "{{externalId}}",
+        "active": true,
+        "urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User": { "role": "viewer" }
+      },
+      "expect": { "/urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User/role": "viewer" } },
+    { "name": "deactivate", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "replace", "value": { "active": false } } ] },
+      "expect": { "/active": false } },
+    { "name": "reactivate", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "replace", "value": { "active": true } } ] },
+      "expect": { "/active": true } },
+    { "name": "the import lists every member", "method": "GET", "path": "/Users?startIndex=1&count=100", "status": 200, "expect": { "/totalResults": 4 } }
+  ]
+}

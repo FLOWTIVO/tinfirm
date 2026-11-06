@@ -1,0 +1,15 @@
+# Template: install.sh replaces @STATE_DIR@ with the deploy user's state directory and
+# installs it as /etc/systemd/system/tinfirm-auto-deploy-reload.path. When tinfirm-auto-deploy
+# has installed a new runner host binary it writes runner-reload-request there, and this
+# starts tinfirm-auto-deploy-reload.service, which reloads the runner host's unit as root.
+# It stands in for sudo: tinfirm-auto-deploy.service runs with NoNewPrivileges, under which
+# sudo cannot work.
+[Unit]
+Description=Tinfirm auto-deploy: reload the runner host when a deploy asks
+
+[Path]
+PathChanged=@STATE_DIR@/runner-reload-request
+Unit=tinfirm-auto-deploy-reload.service
+
+[Install]
+WantedBy=paths.target

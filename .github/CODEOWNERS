@@ -1,0 +1,41 @@
+# Code owners: a change to these paths needs their review, when branch protection on
+# `main` requires a review from code owners (Settings -> Branches). The trust anchors are
+# listed: a public key swapped here, or a release workflow changed, would let someone
+# else's key sign licences or images that verify. Per the security review of 2026-10-27
+# (H3, L30), so are every workflow and the deploy and build definitions: a workflow decides
+# which job reads which secret and on which runner, and a Dockerfile or deploy script
+# decides what the published images and assets contain. And the contracts everyone else
+# builds on, CONVENTIONS.md, PLATFORM.md and the runner protocol's schemas, which anyone,
+# agents included, may change in a pull request, so that every change to them passes their
+# code owner.
+
+# The licence's public keys (ADR-0077, decision 6): each trusted key id signs licences.
+/ee/src/main/resources/ee/licence-public-keys/ @JiriBalcar
+# The licence key tool and the code that verifies a key against them.
+/ee/tools/LicenceKeyTool.java @JiriBalcar
+/ee/src/main/java/com/flowtivo/tinfirm/ee/licence/LicenceTrust.java @JiriBalcar
+/ee/src/main/java/com/flowtivo/tinfirm/ee/licence/LicenceKeyFormat.java @JiriBalcar
+
+# The image signing key's public half, which customers verify against (ADR-0081).
+/docs-site/content/cosign.pub @JiriBalcar
+# The release, its signing and the pinned signing tools.
+/.github/workflows/release.yml @JiriBalcar
+/deploy/release/sign-images.sh @JiriBalcar
+# Every workflow and the GitHub configuration, Dependabot's included.
+/.github/** @JiriBalcar
+/.github/dependabot.yml @JiriBalcar
+# The deploy definitions: the chart, Compose, auto-deploy and its public keys, the release
+# assets.
+/deploy/** @JiriBalcar
+# The image builds.
+/Dockerfile @JiriBalcar
+/model-api/Dockerfile @JiriBalcar
+/docs-site/Dockerfile @JiriBalcar
+# The engineering contract and the platform design (CONVENTIONS §2 and §13): anyone, agents
+# included, may change them in a pull request, and the code owner reviews every change.
+/docs/CONVENTIONS.md @JiriBalcar
+/docs/PLATFORM.md @JiriBalcar
+# The runner WebSocket protocol, versions 1 and 2 (CONVENTIONS §2 and §13): the same rule.
+/protocol/ @JiriBalcar
+# This file.
+/.github/CODEOWNERS @JiriBalcar

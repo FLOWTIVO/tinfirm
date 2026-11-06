@@ -1,0 +1,17 @@
+{{- if include "tinfirm.samlMetadataFiles" . }}
+# The SAML providers' IdP metadata documents (ADR-0086, decision 3), mounted at /etc/tinfirm/saml/<id>.xml. A worker
+# reads them again at every refresh, so a changed document needs no restart.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tinfirm.fullname" . }}-saml-metadata
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+data:
+  {{- range .Values.auth.saml.providers }}
+  {{- if .metadata }}
+  {{ .id }}.xml: |
+    {{- .metadata | nindent 4 }}
+  {{- end }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,7 @@
+# actionlint configuration (`make deploy-lint`, and the helm job in ci.yml).
+self-hosted-runner:
+  # No workflow names a self-hosted label: each reads it from a repository variable
+  # (CI_RUNNER, CI_RELEASE_RUNNER, CI_RUNNER_MACOS, CI_RUNNER_WINDOWS), else runs on a
+  # GitHub-hosted label (runner-artifacts.yml's header). A label written into a workflow
+  # goes here.
+  labels: []

@@ -1,0 +1,40 @@
+{{- $pm := .Values.metrics.podMonitor }}
+{{- if $pm.enabled }}
+# The Prometheus Operator's scrape of /actuator/prometheus on the management port 8081, which
+# no Service exposes, so a PodMonitor and not a ServiceMonitor. The scraper reaches the port
+# only when networkPolicy.ingress.metrics admits it.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "tinfirm.fullname" . }}
+  {{- with $pm.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+    {{- with $pm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $pm.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if and $pm.namespace (ne $pm.namespace .Release.Namespace) }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tinfirm.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    - port: management
+      path: /actuator/prometheus
+      {{- with $pm.interval }}
+      interval: {{ . }}
+      {{- end }}
+      {{- with $pm.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+{{- end }}

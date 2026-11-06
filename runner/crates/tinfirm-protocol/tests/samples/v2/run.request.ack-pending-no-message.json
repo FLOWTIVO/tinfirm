@@ -1,0 +1,7 @@
+{
+  "type": "run.request.ack",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000060",
+  "status": "PENDING",
+  "payload": {"decisionId": "0192f1a4-7c1e-7b3a-9d2e-000000000062"}
+}

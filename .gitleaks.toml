@@ -1,0 +1,16 @@
+# Gitleaks, as .github/workflows/reusable-security.yml runs it over the working tree: the
+# default rules, and the fixtures below that have a secret's shape and are none. Each entry
+# names what it allows and why; a real secret is never allowed here, it is rotated
+# (CONTRIBUTING).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The SHA-256 of a published development value, kept to recognise that value (PublishedDevSecrets)"
+regexTarget = "line"
+regexes = ['''static final String [A-Z_]+_SHA256 = "[0-9a-f]{64}";''']
+
+[[allowlists]]
+description = "A GitLab token shape that was never issued: the redaction test's fixture (mapper.rs)"
+regexTarget = "line"
+regexes = ['''const LEAKED: &str = "glpat-TEST-ONLY-0123456789abcdefghij";''']

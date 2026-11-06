@@ -1,0 +1,1027 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "tinfirm chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "definitions": {
+    "secretKey": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[-._a-zA-Z0-9]+$"
+    },
+    "secretName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+    },
+    "labelSelector": {
+      "type": "object",
+      "properties": {
+        "matchLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "matchExpressions": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": false
+    },
+    "peers": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "parentRefs": {
+      "type": "array",
+      "items": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string", "minLength": 1 } } }
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "providerCompanies": {
+      "description": "TINFIRM_AUTH_<KIND>_PROVIDERS_<ID>_COMPANIES_<KEY>_ROLE_MAP_*: further declared companies the provider's role claim fills (ADR-0089, Enterprise), each by its key in `companies` with the claim's values that give each role there. Not the provider's own company. Needs roleClaim.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "roleMap"],
+        "properties": {
+          "key": { "type": "string", "pattern": "^[a-z][a-z0-9]{0,39}$" },
+          "roleMap": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "admin": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } },
+              "member": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } },
+              "viewer": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } }
+            }
+          }
+        }
+      }
+    },
+    "isoDuration": {
+      "type": "string",
+      "pattern": "^P(\\d+Y)?(\\d+M)?(\\d+W)?(\\d+D)?(T(\\d+H)?(\\d+M)?(\\d+(\\.\\d+)?S)?)?$"
+    }
+  },
+  "properties": {
+    "global": { "type": "object" },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": {
+          "description": "Image tag. Empty = the chart's own image (v<appVersion>).",
+          "type": "string",
+          "pattern": "^([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$"
+        },
+        "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array", "items": { "type": "object" } },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "replicaCount": { "type": "integer", "minimum": 0 },
+    "serverRoles": {
+      "description": "TINFIRM_ROLES",
+      "type": "string",
+      "pattern": "^(api|worker)(,(api|worker))*$"
+    },
+    "publicUrl": {
+      "description": "TINFIRM_PUBLIC_URL",
+      "type": "string",
+      "pattern": "^(https?://[^\\s/]+(/[^\\s]*)?)?$"
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port", "name", "existingSecret", "secretKeys"],
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "$ref": "#/definitions/port" },
+        "name": { "type": "string", "minLength": 1 },
+        "sslMode": {
+          "type": "string",
+          "enum": ["", "disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+        },
+        "caCertSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "$ref": "#/definitions/secretKey" }
+          }
+        },
+        "params": { "type": "string", "pattern": "^[^?\\s]*$" },
+        "url": { "type": "string", "pattern": "^(jdbc:postgresql://\\S+)?$" },
+        "existingSecret": { "$ref": "#/definitions/secretName" },
+        "secretKeys": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["appPassword", "ownerPassword"],
+          "properties": {
+            "appPassword": { "$ref": "#/definitions/secretKey" },
+            "ownerPassword": { "$ref": "#/definitions/secretKey" }
+          }
+        }
+      }
+    },
+    "vault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["existingSecret", "secretKeys"],
+      "properties": {
+        "existingSecret": { "$ref": "#/definitions/secretName" },
+        "secretKeys": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["keys", "activeKey"],
+          "properties": {
+            "keys": { "$ref": "#/definitions/secretKey" },
+            "activeKey": { "$ref": "#/definitions/secretKey" }
+          }
+        }
+      }
+    },
+    "bootstrap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "description": "Empty = no bootstrap variables at all.",
+          "anyOf": [{ "const": "" }, { "$ref": "#/definitions/secretName" }]
+        },
+        "secretKeys": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["adminEmail", "adminPassword"],
+          "properties": {
+            "adminEmail": { "$ref": "#/definitions/secretKey" },
+            "adminPassword": { "$ref": "#/definitions/secretKey" }
+          }
+        }
+      }
+    },
+    "companies": {
+      "description": "The companies of this instance (ADR-0075), each created at the server's start when it does not exist yet (TINFIRM_COMPANIES_<KEY>_*). None is ever deleted.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "name"],
+        "properties": {
+          "key": {
+            "description": "The company's stable key: lower-case letters and digits, starting with a letter. Never change it.",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]{0,39}$"
+          },
+          "name": {
+            "description": "TINFIRM_COMPANIES_<KEY>_NAME: the name the company is created with, and by which a company from before keys is adopted.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "\\S"
+          },
+          "owner": {
+            "description": "TINFIRM_COMPANIES_<KEY>_OWNER: the email of the user who becomes OWNER while the company has none. Empty = the bootstrap admin.",
+            "anyOf": [{ "const": "" }, { "type": "string", "maxLength": 320, "pattern": "^[^@\\s]+@[^@\\s]+$" }]
+          },
+          "id": {
+            "description": "TINFIRM_COMPANIES_<KEY>_ID: adopt this existing company (one from before keys) once. Usually empty.",
+            "anyOf": [{ "const": "" }, { "type": "string", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" }]
+          },
+          "scim": {
+            "description": "SCIM 2.0 provisioning of the company's members (ADR-0087), Enterprise.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "description": "TINFIRM_COMPANIES_<KEY>_SCIM_ENABLED: the company serves SCIM. Omitted = false.",
+                "type": "boolean"
+              },
+              "role": {
+                "description": "TINFIRM_COMPANIES_<KEY>_SCIM_ROLE: a new member's role when the request names none. Omitted = MEMBER. Never OWNER.",
+                "type": "string",
+                "enum": ["ADMIN", "MEMBER", "VIEWER"]
+              },
+              "roleSource": {
+                "description": "TINFIRM_COMPANIES_<KEY>_SCIM_ROLE_SOURCE (ADR-0088 decision 8): IDP, SCIM decides the role whenever a request carries it; APP, SCIM gives it once at creation. Omitted = IDP.",
+                "type": "string",
+                "enum": ["IDP", "APP"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "localEnabled": { "type": "boolean" },
+        "oidcAutoProvision": { "type": "boolean" },
+        "oidc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "issuerUri", "clientId", "existingSecret"],
+                "properties": {
+                  "id": {
+                    "description": "Registration id. Lowercase letters and digits, so that it maps cleanly onto SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_<ID>_*.",
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9]*$"
+                  },
+                  "name": { "type": "string" },
+                  "issuerUri": { "type": "string", "pattern": "^https?://\\S+$" },
+                  "clientId": { "type": "string", "minLength": 1 },
+                  "scope": { "type": "string" },
+                  "existingSecret": { "$ref": "#/definitions/secretName" },
+                  "secretKeys": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "clientSecret": { "$ref": "#/definitions/secretKey" }
+                    }
+                  },
+                  "emailTrust": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_EMAIL_TRUST. Omitted = the server default, REQUIRE_VERIFIED_CLAIM.",
+                    "type": "string",
+                    "enum": ["REQUIRE_VERIFIED_CLAIM", "TRUST_ISSUER"]
+                  },
+                  "emailClaims": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_EMAIL_CLAIMS: claims that may carry the email, in order. Claims other than email need emailTrust TRUST_ISSUER; the server refuses to start otherwise.",
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "pattern": "^[^,\\s]+$" }
+                  },
+                  "company": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_COMPANY: the key of the company in `companies` that a new user from this provider joins. Empty = the company, when exactly one is declared; otherwise none.",
+                    "anyOf": [{ "const": "" }, { "type": "string", "pattern": "^[a-z][a-z0-9]{0,39}$" }]
+                  },
+                  "role": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_ROLE: under roleSource APP, a new member's role when the claim maps none or no claim is set. Omitted = MEMBER. Never OWNER.",
+                    "type": "string",
+                    "enum": ["MEMBER", "ADMIN", "VIEWER"]
+                  },
+                  "autoProvision": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_AUTO_PROVISION (ADR-0087): whether an unknown identity that binds to no SCIM user gets a new user. Omitted = auth.oidcAutoProvision.",
+                    "type": "boolean"
+                  },
+                  "scimMatch": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_SCIM_MATCH (ADR-0087): how a first sign-in finds the user SCIM created: EXTERNAL_ID (the default), or EXTERNAL_ID_OR_EMAIL.",
+                    "type": "string",
+                    "enum": ["EXTERNAL_ID", "EXTERNAL_ID_OR_EMAIL"]
+                  },
+                  "roleSource": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_ROLE_SOURCE (ADR-0088): IDP, the provider decides the role at every sign-in; APP, it gives a new user a role once and the app decides after. Omitted = IDP when roleClaim is set, else APP. One IDP provider per company.",
+                    "type": "string",
+                    "enum": ["IDP", "APP"]
+                  },
+                  "roleClaim": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_ROLE_CLAIM: the claim of the ID token or userinfo that carries the role's values, a string or an array, such as roles or groups.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "roleMap": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_ROLE_MAP_*: the claim's values, matched exactly, that give each role; the highest wins. No value for OWNER. Needs roleClaim.",
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "admin": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } },
+                      "member": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } },
+                      "viewer": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } }
+                    }
+                  },
+                  "companies": { "$ref": "#/definitions/providerCompanies" },
+                  "emailDomains": {
+                    "description": "TINFIRM_AUTH_OIDC_PROVIDERS_<ID>_EMAIL_DOMAINS: only an email in one of these domains gets a new account through this provider. Empty = any email the email trust accepts.",
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "saml": {
+          "description": "SAML 2.0 sign-in (ADR-0086), Enterprise: the identity providers and the service provider's keys.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sp": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": {
+                  "description": "The Secret that holds each credential's PKCS#8 PEM key and its PEM certificate.",
+                  "anyOf": [{ "const": "" }, { "$ref": "#/definitions/secretName" }]
+                },
+                "credentials": {
+                  "description": "TINFIRM_AUTH_SAML_SP_CREDENTIALS_<KID>_KEY and _CERT: every credential is published in the SP metadata and tried to decrypt; add the next one before making it active.",
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["kid"],
+                    "properties": {
+                      "kid": { "type": "string", "pattern": "^[a-z0-9]{1,32}$" },
+                      "keyKey": { "$ref": "#/definitions/secretKey" },
+                      "certKey": { "$ref": "#/definitions/secretKey" }
+                    }
+                  }
+                },
+                "activeCredential": {
+                  "description": "TINFIRM_AUTH_SAML_SP_ACTIVE_CREDENTIAL: the kid of the credential that signs.",
+                  "type": "string"
+                }
+              }
+            },
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id"],
+                "oneOf": [{ "required": ["metadataUrl"] }, { "required": ["metadata"] }],
+                "properties": {
+                  "id": {
+                    "description": "Registration id, unique across the SAML and OIDC providers: lower-case letters and digits.",
+                    "type": "string",
+                    "pattern": "^[a-z0-9]{1,64}$"
+                  },
+                  "name": { "description": "TINFIRM_AUTH_SAML_PROVIDERS_<ID>_NAME: the login page's button.", "type": "string" },
+                  "metadataUrl": {
+                    "description": "TINFIRM_AUTH_SAML_PROVIDERS_<ID>_METADATA_LOCATION: the IdP's metadata URL, https only.",
+                    "type": "string",
+                    "pattern": "^https://\\S+$"
+                  },
+                  "metadata": {
+                    "description": "The IdP's metadata document itself, mounted from a ConfigMap and read again at every refresh.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "entityId": { "description": "TINFIRM_AUTH_SAML_PROVIDERS_<ID>_ENTITY_ID: the IdP to take from a document of several.", "type": "string" },
+                  "company": {
+                    "description": "TINFIRM_AUTH_SAML_PROVIDERS_<ID>_COMPANY: the key of the company in `companies` a new user joins.",
+                    "anyOf": [{ "const": "" }, { "type": "string", "pattern": "^[a-z][a-z0-9]{0,39}$" }]
+                  },
+                  "role": { "type": "string", "enum": ["MEMBER", "ADMIN", "VIEWER"] },
+                  "emailDomains": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$"
+                    }
+                  },
+                  "subject": {
+                    "description": "TINFIRM_AUTH_SAML_PROVIDERS_<ID>_SUBJECT: NAMEID (the default), or the attribute that identifies the person.",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "emailAttributes": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[^,\\s]+$" } },
+                  "nameAttributes": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[^,\\s]+$" } },
+                  "roleSource": { "type": "string", "enum": ["IDP", "APP"] },
+                  "roleClaim": { "description": "TINFIRM_AUTH_SAML_PROVIDERS_<ID>_ROLE_CLAIM: the attribute that carries the role's values.", "type": "string", "minLength": 1 },
+                  "roleMap": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "admin": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } },
+                      "member": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } },
+                      "viewer": { "type": "array", "items": { "type": "string", "pattern": "^[^,]*\\S[^,]*$" } }
+                    }
+                  },
+                  "companies": { "$ref": "#/definitions/providerCompanies" },
+                  "autoProvision": { "type": "boolean" },
+                  "requireEncryptedAssertions": { "type": "boolean" },
+                  "metadataRefresh": { "$ref": "#/definitions/isoDuration" },
+                  "scimMatch": { "type": "string", "enum": ["EXTERNAL_ID", "EXTERNAL_ID_OR_EMAIL"] }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "idleTimeout": { "$ref": "#/definitions/isoDuration" },
+        "maxAge": { "$ref": "#/definitions/isoDuration" }
+      }
+    },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowHttp": { "description": "TINFIRM_CONNECTION_ALLOW_HTTP", "type": "boolean" },
+        "allowPrivateAddresses": { "description": "TINFIRM_CONNECTION_ALLOW_PRIVATE_ADDRESSES", "type": "boolean" },
+        "timeout": { "description": "TINFIRM_CONNECTION_TIMEOUT", "$ref": "#/definitions/isoDuration" },
+        "internalHosts": {
+          "description": "TINFIRM_CONNECTION_INTERNAL_HOSTS (ADR-0066): host names or IPv4 literals, without a scheme, port or wildcard",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$" }
+        }
+      }
+    },
+    "errorReports": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "description": "TINFIRM_ERROR_REPORTS (ADR-0070); empty: the instance admin chooses", "enum": ["", "off", "local", "automatic"] },
+        "dsnSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "description": "The Secret holding TINFIRM_ERROR_REPORTS_DSN; empty: nothing is delivered", "type": "string" },
+            "key": { "type": "string", "minLength": 1 }
+          }
+        },
+        "label": { "description": "TINFIRM_ERROR_REPORTS_LABEL", "type": "string", "pattern": "^([A-Za-z0-9._-]{1,64})?$" },
+        "proxy": { "description": "TINFIRM_ERROR_REPORTS_PROXY: http://host:port", "type": "string", "pattern": "^(http://[^/:@]+:[0-9]{1,5}/?)?$" }
+      }
+    },
+    "trustedProxies": {
+      "description": "SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES regex. Empty = not set (Tomcat default).",
+      "type": "string"
+    },
+    "javaToolOptions": { "type": "string" },
+    "extraConfig": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+      "additionalProperties": { "type": ["string", "number", "boolean"] }
+    },
+    "extraEnv": { "type": "array", "items": { "type": "object", "required": ["name"] } },
+    "extraVolumes": { "type": "array", "items": { "type": "object", "required": ["name"] } },
+    "extraVolumeMounts": { "type": "array", "items": { "type": "object", "required": ["name", "mountPath"] } },
+    "extraContainers": { "type": "array", "items": { "type": "object", "required": ["name", "image"] } },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "$ref": "#/definitions/port" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object" },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["host", "paths"],
+            "properties": {
+              "host": { "type": "string", "minLength": 1 },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path"],
+                  "properties": {
+                    "path": { "type": "string", "pattern": "^/" },
+                    "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": { "type": "array", "items": { "type": "object" } },
+        "traefik": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "redirectHttps": {
+              "description": "Traefik only: a Middleware that redirects http to https, attached to the Ingress. Needs Traefik's CRDs (traefik.io/v1alpha1).",
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "httpRoute": {
+      "description": "A Gateway API HTTPRoute (gateway.networking.k8s.io/v1) to port 8080. Needs the Gateway API CRDs.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "annotations": { "type": "object" },
+        "parentRefs": { "$ref": "#/definitions/parentRefs" },
+        "hostnames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "^(\\*\\.)?[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" }
+        },
+        "matches": { "type": "array", "minItems": 1, "items": { "type": "object" } },
+        "redirectParentRefs": { "$ref": "#/definitions/parentRefs" }
+      }
+    },
+    "litellm": {
+      "description": "The bundled LiteLLM model gateway (ADR-0059). enabled=false for a company that brings its own.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "image", "existingSecret", "secretKeys", "database", "service", "probes"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "tag"],
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$" },
+            "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" },
+            "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "adminUi": { "description": "LiteLLM's admin UI (DISABLE_ADMIN_UI). Off by default; the admin API stays either way.", "type": "boolean" },
+        "existingSecret": { "$ref": "#/definitions/secretName" },
+        "secretKeys": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["masterKey", "saltKey", "databasePassword"],
+          "properties": {
+            "masterKey": { "$ref": "#/definitions/secretKey" },
+            "saltKey": { "$ref": "#/definitions/secretKey" },
+            "databasePassword": {
+              "description": "DATABASE_PASSWORD, unless litellm.database.existingSecret is set.",
+              "$ref": "#/definitions/secretKey"
+            }
+          }
+        },
+        "database": {
+          "description": "LiteLLM's database. No `url` value: a URL carries the password, so it comes from a Secret only (existingSecret and secretKeys.url).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "user"],
+          "properties": {
+            "host": { "description": "Empty = database.host.", "type": "string" },
+            "port": {
+              "description": "Empty = database.port. With secretKeys.url: the port in that URL, for the NetworkPolicy, and required while it renders the egress rule.",
+              "anyOf": [{ "const": "" }, { "$ref": "#/definitions/port" }]
+            },
+            "name": { "type": "string", "minLength": 1 },
+            "user": { "type": "string", "minLength": 1 },
+            "sslMode": {
+              "description": "DATABASE_SSLMODE. Empty = database.sslMode.",
+              "type": "string",
+              "enum": ["", "disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+            },
+            "caCertSecret": {
+              "description": "Empty name = database.caCertSecret.",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "$ref": "#/definitions/secretKey" }
+              }
+            },
+            "params": {
+              "description": "Further connection parameters, k=v&k=v, taken literally (no %-escapes): LiteLLM's general_settings.database_extra_connection_params. Ignored with secretKeys.url.",
+              "type": "string",
+              "pattern": "^([^=&?%\\s]+=[^&?%\\s]*(&[^=&?%\\s]+=[^&?%\\s]*)*)?$"
+            },
+            "existingSecret": {
+              "description": "Secret with the database credentials. Empty = the password from litellm.existingSecret (secretKeys.databasePassword) and the user litellm.database.user.",
+              "anyOf": [{ "const": "" }, { "$ref": "#/definitions/secretName" }]
+            },
+            "secretKeys": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["password"],
+              "properties": {
+                "password": { "description": "DATABASE_PASSWORD.", "$ref": "#/definitions/secretKey" },
+                "username": {
+                  "description": "DATABASE_USERNAME. Empty = litellm.database.user.",
+                  "anyOf": [{ "const": "" }, { "$ref": "#/definitions/secretKey" }]
+                },
+                "url": {
+                  "description": "DATABASE_URL, a complete postgresql:// URL with the password. Empty = the split settings. When set, it replaces host, name, user, sslMode, params and the password.",
+                  "anyOf": [{ "const": "" }, { "$ref": "#/definitions/secretKey" }]
+                }
+              }
+            }
+          }
+        },
+        "service": {
+          "description": "Always ClusterIP: LiteLLM is never exposed outside the release.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "port": { "$ref": "#/definitions/port" },
+            "annotations": { "type": "object" }
+          }
+        },
+        "modelApi": {
+          "description": "The model port beside LiteLLM (ADR-0069).",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["repository"],
+              "properties": {
+                "repository": { "type": "string", "minLength": 1 },
+                "tag": { "description": "Empty = the server's tag", "type": "string", "pattern": "^([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$" },
+                "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" },
+                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+              }
+            },
+            "port": { "$ref": "#/definitions/port" },
+            "maxRequestBytes": { "type": "integer", "minimum": 1024 },
+            "maxInflightBytes": { "description": "At least twice maxRequestBytes", "type": "integer", "minimum": 2048 },
+            "idleTimeout": { "$ref": "#/definitions/isoDuration" },
+            "providerTools": { "description": "Which tools the model's provider may run itself (MODEL_API_PROVIDER_TOOLS)", "type": "string", "enum": ["OFF", "WEB_SEARCH"] },
+            "from": { "description": "More NetworkPolicyPeers that may call the model port", "$ref": "#/definitions/peers" },
+            "javaToolOptions": { "type": "string" },
+            "securityContext": { "type": "object" },
+            "resources": { "type": "object" },
+            "extraEnv": { "type": "array", "items": { "type": "object", "required": ["name"] } }
+          }
+        },
+        "podSecurityContext": { "type": "object" },
+        "securityContext": { "type": "object" },
+        "tmpVolume": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "sizeLimit": { "type": "string" } }
+        },
+        "resources": { "type": "object" },
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["startup", "liveness", "readiness"],
+          "properties": {
+            "startup": { "$ref": "#/definitions/probe" },
+            "liveness": { "$ref": "#/definitions/probe" },
+            "readiness": { "$ref": "#/definitions/probe" }
+          }
+        },
+        "extraEnv": { "type": "array", "items": { "type": "object", "required": ["name"] } },
+        "podAnnotations": { "type": "object" },
+        "podLabels": { "type": "object" },
+        "nodeSelector": { "type": "object" },
+        "tolerations": { "type": "array" },
+        "affinity": { "type": "object" }
+      }
+    },
+    "runner": {
+      "description": "The runner host as a pod of the release (ADR-0101, decision 8): the declared company's runner host, whose sandboxes are VMs.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository"],
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "description": "Empty = the server's tag", "type": "string", "pattern": "^([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$" },
+            "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" },
+            "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "company": { "description": "A key of companies", "type": "string", "pattern": "^[a-z][a-z0-9]{0,39}$" },
+        "name": { "description": "The host's name in the company", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$" },
+        "existingSecret": { "$ref": "#/definitions/secretName" },
+        "secretKeys": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "token": { "$ref": "#/definitions/secretKey" } }
+        },
+        "serverUrl": { "description": "https only; empty = the public URL", "type": "string", "pattern": "^(https://.+)?$" },
+        "maxConcurrentRuns": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "log": { "type": "string", "minLength": 1 },
+        "vm": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "driver": { "type": "string", "enum": ["digitalocean"] },
+            "template": { "type": "string", "minLength": 1 },
+            "port": { "$ref": "#/definitions/port" },
+            "startTimeout": { "type": "integer", "minimum": 30, "maximum": 3600 },
+            "imageVersion": { "type": "string", "enum": ["warn", "refuse"] },
+            "probes": { "type": "array", "items": { "type": "string", "pattern": "^(tcp:|dns:|http://).+" } },
+            "digitalocean": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": { "$ref": "#/definitions/secretName" },
+                "secretKeys": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": { "token": { "$ref": "#/definitions/secretKey" } }
+                },
+                "connect": { "type": "string", "enum": ["private", "public"] },
+                "templates": {
+                  "description": "The driver's templates by name",
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["region", "size", "image", "vpc", "firewall"],
+                    "properties": {
+                      "region": { "type": "string", "minLength": 1 },
+                      "size": { "type": "string", "minLength": 1 },
+                      "image": { "description": "The VM image's snapshot id", "type": "string", "minLength": 1 },
+                      "vpc": { "type": "string", "minLength": 1 },
+                      "firewall": { "type": "string", "minLength": 1 },
+                      "bridgePort": { "$ref": "#/definitions/port" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "pool": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxReady": { "type": "integer", "minimum": 0, "maximum": 1000 },
+            "runtime": { "type": "string", "enum": ["claude", "codex", "pi", "opencode", "any"] },
+            "headroom": { "type": "integer", "minimum": 0 },
+            "maxAge": { "type": "integer", "minimum": 10, "maximum": 10080 },
+            "coolDown": { "type": "integer", "minimum": 0, "maximum": 1440 },
+            "leadTimeMax": { "type": "integer", "minimum": 0, "maximum": 240 }
+          }
+        },
+        "extraConfig": {
+          "description": "More TINFIRM_RUNNER_* variables; never credentials",
+          "type": "object",
+          "propertyNames": { "pattern": "^[A-Z][A-Z0-9_]*$" }
+        },
+        "extraEnv": { "type": "array", "items": { "type": "object", "required": ["name"] } },
+        "persistence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "existingClaim": { "type": "string" },
+            "size": { "type": "string", "minLength": 1 },
+            "storageClassName": { "type": "string" },
+            "accessModes": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+          }
+        },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+        "podSecurityContext": { "type": "object" },
+        "securityContext": { "type": "object" },
+        "tmpVolume": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "sizeLimit": { "type": "string" } }
+        },
+        "resources": { "type": "object" },
+        "podAnnotations": { "type": "object" },
+        "podLabels": { "type": "object" },
+        "nodeSelector": { "type": "object" },
+        "tolerations": { "type": "array" },
+        "affinity": { "type": "object" }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scrapeAnnotations": { "type": "boolean" },
+        "podMonitor": {
+          "description": "A PodMonitor (monitoring.coreos.com/v1) for the Prometheus Operator. Needs its CRD.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" } },
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" } },
+            "namespace": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$" },
+            "interval": { "type": "string", "pattern": "^(([0-9]+(ms|s|m|h))+)?$" },
+            "scrapeTimeout": { "type": "string", "pattern": "^(([0-9]+(ms|s|m|h))+)?$" }
+          }
+        }
+      }
+    },
+    "openshift": {
+      "description": "OpenShift's restricted-v2 SCC and DNS: auto (detected from security.openshift.io/v1), true or false.",
+      "enum": ["auto", true, false]
+    },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "tmpVolume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sizeLimit": { "type": "string" },
+        "medium": { "type": "string", "enum": ["", "Memory"] }
+      }
+    },
+    "resources": { "type": "object" },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startup", "liveness", "readiness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "preStopSleepSeconds": { "type": "integer", "minimum": 0 },
+    "strategy": { "type": "object" },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "maxUnavailable": { "type": ["integer", "string"] },
+        "minAvailable": { "type": ["integer", "string"] }
+      }
+    },
+    "priorityClassName": { "type": "string" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "controller": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "namespaceSelector": { "$ref": "#/definitions/labelSelector" },
+                "podSelector": { "$ref": "#/definitions/labelSelector" }
+              }
+            },
+            "extraFrom": { "$ref": "#/definitions/peers" },
+            "metrics": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "namespaceSelector": { "$ref": "#/definitions/labelSelector" },
+                "podSelector": { "$ref": "#/definitions/labelSelector" }
+              }
+            }
+          }
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "dns": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "namespaceSelector": { "$ref": "#/definitions/labelSelector" },
+                "podSelector": { "$ref": "#/definitions/labelSelector" }
+              }
+            },
+            "database": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to"],
+              "properties": {
+                "to": { "type": "array", "minItems": 1, "items": { "type": "object" } },
+                "port": { "anyOf": [{ "const": "" }, { "$ref": "#/definitions/port" }] }
+              }
+            },
+            "oidc": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "ports"],
+              "properties": {
+                "to": { "type": "array", "minItems": 1, "items": { "type": "object" } },
+                "ports": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/port" } }
+              }
+            },
+            "saml": {
+              "description": "The SAML providers' metadata URLs (auth.saml.providers[].metadataUrl).",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "ports"],
+              "properties": {
+                "to": { "type": "array", "minItems": 1, "items": { "type": "object" } },
+                "ports": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/port" } }
+              }
+            },
+            "systems": {
+              "description": "https to the internet: the company's systems and the other services the server calls. to: [] drops the rule.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["to", "ports"],
+              "properties": {
+                "to": { "type": "array", "items": { "type": "object" } },
+                "ports": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/port" } }
+              }
+            },
+            "extra": { "type": "array", "items": { "type": "object" } }
+          }
+        },
+        "litellm": {
+          "description": "The LiteLLM pods' policy. Ingress is the server pods only, with no value to widen it.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "egress": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "providers": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["to", "ports"],
+                  "properties": {
+                    "to": { "type": "array", "minItems": 1, "items": { "type": "object" } },
+                    "ports": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/port" } }
+                  }
+                },
+                "extra": { "type": "array", "items": { "type": "object" } }
+              }
+            }
+          }
+        },
+        "runner": {
+          "description": "The runner pod's policy (runner.enabled). Ingress is none, with no value to widen it.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "egress": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "https": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["to", "ports"],
+                  "properties": {
+                    "to": { "type": "array", "items": { "type": "object" } },
+                    "ports": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/port" } }
+                  }
+                },
+                "vms": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["to"],
+                  "properties": {
+                    "to": { "type": "array", "items": { "type": "object" } }
+                  }
+                },
+                "extra": { "type": "array", "items": { "type": "object" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

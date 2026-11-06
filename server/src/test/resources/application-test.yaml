@@ -1,0 +1,165 @@
+# Test profile. Every credential and key in this file is a TEST FIXTURE and must never be used elsewhere.
+tinfirm:
+  vault:
+    keys: "test-k1:PxSkP1mvubBl+d8MgfItJ40SBWYBBCdT04pfQ3YBdTw=,test-k2:2V13my98QUZBTxt9UKrFEP/FcaSrtY95Exs2YijTHzc="
+    active-key: test-k1
+  system:
+    # The tests read a server's catalogue again at once; RefreshLimiterTest proves the minute (the security
+    # review's M9).
+    catalogue-refresh-interval: PT0S
+  bootstrap:
+    admin-email: admin@tinfirm.test
+    admin-password: test-admin-password-1
+  # The deployment's one company (ADR-0075), whose owner is the bootstrap admin. The tests create the others they
+  # need through the company module.
+  companies:
+    bootstrap:
+      name: Bootstrap Co
+    # The SCIM tests' companies (ADR-0087, decision 2), declared for every test so that the SCIM tests need no context
+    # of their own: scim allowed, the role the IdP's (IDP); scimapp allowed, the role the app's after creation (APP),
+    # new members VIEWER; scimoff not allowed. A SCIM test takes one of these keys for a company of its own.
+    scim:
+      name: SCIM Co
+      scim:
+        enabled: true
+    scimapp:
+      name: SCIM App Co
+      scim:
+        enabled: true
+        role: VIEWER
+        role-source: APP
+    scimoff:
+      name: SCIM Off Co
+  # The SCIM tests send far more than a provider would in a minute.
+  scim:
+    requests-per-minute: 100000
+  connection:
+    # The stubs of the systems (WireMock) speak http on localhost.
+    allow-http: true
+    allow-private-addresses: true
+    # TEST ONLY, never in production (the server refuses to start with it outside the test profile): the stubs of
+    # company systems on localhost may resolve to a private address. A personal MCP server never reaches one, whatever
+    # this or allow-private-addresses says; the tests' personal servers reach their stubs on localhost through a bean
+    # only the tests define (support/TestOutbound), and every other private address stays refused for them (an IP
+    # literal such as 127.0.0.1), so the tests see the rule.
+    allowed-private-hosts: localhost
+    timeout: PT5S
+  chat:
+    # Socket Mode's connections are looked after every second (5 s in production), so that a test sees a reconnect.
+    socket-tick: PT1S
+  attachment:
+    # Small limits, so that the tests reach them (25 MB, 50 files and 250 MB in production).
+    max-file-size: 64KB
+    max-files-per-conversation: 5
+    max-conversation-size: 160KB
+  error-reports:
+    # The tests flush and deliver the error reports on demand; the jobs themselves do not run during a test run.
+    flush-tick: PT1H
+    delivery-tick: PT2H
+    delivery-initial-delay: PT2H
+  audit:
+    # The tests run the daily check on demand; the job itself does not run during a test run. A small export limit,
+    # so that a test reaches it (1 000 000 in production).
+    check-initial-delay: PT2H
+    export-max-events: 200
+  retention:
+    # The tests sweep on demand, as of a time they choose; the job itself does not run during a test run.
+    sweep-initial-delay: PT2H
+  conversation:
+    change-requests:
+      # The tests read the states of change requests on demand; the watch itself does not run during a test run.
+      state-tick: PT1H
+    call-recovery:
+      # The tests run the recovery's pass on demand; its schedule does not run during a test run.
+      initial-delay: PT1H
+      interval: PT1H
+    tool-journal:
+      # The tests sweep the call journal and the submission keys on demand, as of a time they choose.
+      sweep-interval: PT1H
+      # Within the tests' tool timeout, as 55 s is within 60 s in production.
+      answer-within: PT3S
+  trigger:
+    # The tests run polls and schedules on demand; the ticks themselves do not run during a test run.
+    poll-tick: PT1H
+    schedule-tick: PT1H
+  run:
+    # An idle event stream gets its keep-alive comment within a test's patience (15 s in production).
+    stream-keep-alive: PT1S
+    # A slow tool call gives up within a test's patience (60 s in production).
+    tool-timeout: PT4S
+  model:
+    # The bundled LiteLLM of the tests is the fake of support/FakeLiteLlm, whose URL IntegrationTest registers. TEST
+    # FIXTURE: the master key the fake expects.
+    litellm-master-key: sk-test-master-key-fixture
+    # The tests reconcile on demand; the job itself does not run during a test run.
+    reconcile-interval: PT1H
+    reconcile-initial-delay: PT1H
+    # Off in the tests, so that ModelRelayTest can show a host of runner 0.2.x accepted without its own token while the
+    # operator allows it; on by default in production (ModelRelaySettingsTest runs with the default).
+    relay-require-host-token: false
+    # A rotated-out key is deleted an hour after its block (a minute in production), so that no in-process wake runs a
+    # rotation's step while a test drives it: the tests move the row's times back instead (ModelKeyRotationTest).
+    key-rotation-settle: PT1H
+  spend:
+    # The tests settle spend on demand (SpendSync.syncDue); the job itself does not run during a test run.
+    sync-interval: PT1H
+    sync-initial-delay: PT1H
+  oauth:
+    cimd:
+      # TEST ONLY, never in production: the WireMock stub serves client metadata documents at http://localhost:<port>.
+      # Every other host stays guarded (an IP literal such as 127.0.0.1 is refused), so the tests see the guard.
+      allow-http: true
+      allowed-private-hosts: localhost
+      # The integration tests fetch many documents from one address (MockMvc's 127.0.0.1), and some serve a document
+      # at a URL that refused before: the limits of the security review's L11 are CimdDocumentFetcherTest's to prove.
+      fetches-per-address-minute: 100000
+      refusal-ttl: PT0S
+  auth:
+    login-throttle:
+      per-email:
+        capacity: 5
+        period: 1m
+      # A long period, so that the buckets do not refill while a test spends its attempts (greedy refill: 30 per
+      # 10 minutes is one attempt every 20 s; 30 per minute let a slow machine's 30th attempt refill one).
+      per-ip:
+        capacity: 30
+        period: 10m
+
+spring:
+  datasource:
+    hikari:
+      # Spring keeps every test context it has started, each with its pool, until the test JVM ends. A pool still
+      # grows to 10 connections when its tests need them, as in production, but one whose context is idle shrinks
+      # back to one connection, so that the cached contexts do not hold PostgreSQL's connections between them.
+      minimum-idle: 1
+      # Milliseconds, the least Hikari takes; its housekeeping looks every 30 seconds.
+      idle-timeout: 10000
+  security:
+    oauth2:
+      client:
+        registration:
+          test-idp:
+            client-id: tinfirm-test
+            client-secret: test-only-client-secret
+            client-name: Test IdP
+            authorization-grant-type: authorization_code
+            scope: openid,email,profile
+            provider: test-idp
+        provider:
+          # Its issuer-uri is the stub's (TestIdp): the server refuses a registration without one. The endpoints below
+          # take precedence over the stub's discovered ones.
+          test-idp:
+            authorization-uri: http://idp.test/authorize
+            token-uri: http://idp.test/token
+            jwk-set-uri: http://idp.test/jwks
+            user-info-uri: http://idp.test/userinfo
+            user-name-attribute: sub
+
+management:
+  server:
+    port: 0
+
+logging:
+  level:
+    root: WARN
+    com.flowtivo.tinfirm: INFO

@@ -1,0 +1,1 @@
+{"type": "run.event", "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e", "epoch": 1, "at": "2026-09-26T09:30:00.123Z", "seq": 7, "eventType": "USAGE", "payload": {"inputTokens": 1200, "outputTokens": 340, "cachedInputTokens": null, "contextUsed": 20000, "contextSize": 200000, "costUsd": 0.42, "totalTokens": 1540, "estimated": null}}

@@ -1,0 +1,8 @@
+{
+  "type": "run.repository_request.ack",
+  "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f",
+  "requestId": "01926f3e-9d00-7c00-8e11-1d2e3f4a5b6d",
+  "status": "REJECTED",
+  "code": "ALREADY_ON_TASK",
+  "message": "The repository `server` is already on the task, at /workspace/server."
+}

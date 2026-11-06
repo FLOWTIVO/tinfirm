@@ -1,0 +1,11 @@
+{
+  "type": "run.request.ack",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000080",
+  "status": "DONE",
+  "payload": {
+    "content": [{"type": "text", "text": "2 issues\n\nSHOP-241 Checkout fails for guests (Done; assignees: Ada)\nSHOP-250 Slow search (In Progress; assignees: none)"}],
+    "structuredContent": {"issues": [{"key": "SHOP-241", "title": "Checkout fails for guests", "status": "Done", "assignees": ["Ada"]}, {"key": "SHOP-250", "title": "Slow search", "status": "In Progress", "assignees": []}]},
+    "isError": false
+  }
+}

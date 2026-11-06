@@ -1,0 +1,133 @@
+---
+- name: Install Docker Engine (Ubuntu, Debian)
+  when: ansible_facts['os_family'] == 'Debian'
+  block:
+    - name: Install the prerequisites
+      ansible.builtin.apt:
+        name:
+          # For become_user to the runner host's user.
+          - acl
+          - ca-certificates
+          - curl
+          - git
+          # To check the fingerprint of Docker's key.
+          - gnupg
+          # To check the signature of a runner host release's SHA256SUMS.
+          - openssl
+          # For ansible.builtin.deb822_repository.
+          - python3-debian
+          - tar
+          - zstd
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create the apt key directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Create the download cache
+      ansible.builtin.file:
+        path: "{{ _tinfirm_runner_host_cache_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download Docker's repository key
+      ansible.builtin.get_url:
+        url: "{{ _tinfirm_runner_host_docker_repo }}/gpg"
+        dest: "{{ _tinfirm_runner_host_cache_dir }}/docker.asc"
+        mode: "0644"
+        force: true
+
+    # L27 of the security review of 2026-10-27: the key is trusted by its fingerprint, not by
+    # where it came from.
+    - name: Read the fingerprints of the downloaded key
+      ansible.builtin.command:
+        argv: [gpg, --show-keys, --with-colons, "{{ _tinfirm_runner_host_cache_dir }}/docker.asc"]
+      register: _tinfirm_runner_host_docker_key
+      changed_when: false
+
+    - name: Check the fingerprint of Docker's key
+      ansible.builtin.assert:
+        that:
+          - >-
+            (_tinfirm_runner_host_docker_key.stdout_lines | select('match', '^fpr:') | first
+             | default('') | split(':'))[9] | default('') == tinfirm_runner_host_docker_key_fingerprint
+        fail_msg: >-
+          The key at {{ _tinfirm_runner_host_docker_repo }}/gpg is not the one whose fingerprint is
+          {{ tinfirm_runner_host_docker_key_fingerprint }} (tinfirm_runner_host_docker_key_fingerprint).
+        quiet: true
+
+    - name: Install Docker's repository key
+      ansible.builtin.copy:
+        src: "{{ _tinfirm_runner_host_cache_dir }}/docker.asc"
+        dest: /etc/apt/keyrings/docker.asc
+        remote_src: true
+        mode: "0644"
+
+    - name: Add Docker's repository
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: [deb]
+        uris: "{{ _tinfirm_runner_host_docker_repo }}"
+        suites: "{{ ansible_facts['distribution_release'] }}"
+        components: [stable]
+        signed_by: /etc/apt/keyrings/docker.asc
+
+    - name: Install the Docker packages
+      ansible.builtin.apt:
+        name: "{{ _tinfirm_runner_host_docker_packages_apt }}"
+        update_cache: true
+
+- name: Install Docker Engine (RHEL family)
+  when: ansible_facts['os_family'] == 'RedHat'
+  block:
+    - name: Install the prerequisites
+      ansible.builtin.dnf:
+        name:
+          - acl
+          - curl
+          - git
+          - openssl
+          - tar
+          - zstd
+
+    # L27: imported only when its fingerprint is the expected one.
+    - name: Import Docker's repository key
+      ansible.builtin.rpm_key:
+        key: "{{ _tinfirm_runner_host_docker_repo }}/gpg"
+        fingerprint: "{{ tinfirm_runner_host_docker_key_fingerprint }}"
+        state: present
+
+    - name: Add Docker's repository
+      ansible.builtin.yum_repository:
+        name: docker-ce-stable
+        description: Docker CE Stable
+        baseurl: "{{ _tinfirm_runner_host_docker_repo }}/$releasever/$basearch/stable"
+        gpgkey: "{{ _tinfirm_runner_host_docker_repo }}/gpg"
+        gpgcheck: true
+
+    - name: Install the Docker packages
+      ansible.builtin.dnf:
+        name: "{{ _tinfirm_runner_host_docker_packages_dnf }}"
+
+- name: Create /etc/docker
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: "0755"
+
+# The role owns daemon.json: the Kata runtime, the mirrors, and tinfirm_runner_host_docker_daemon_extra.
+- name: Write /etc/docker/daemon.json
+  ansible.builtin.copy:
+    content: "{{ _tinfirm_runner_host_docker_daemon | to_nice_json }}\n"
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+  notify: Restart Docker
+
+- name: Start Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    enabled: true
+    state: started

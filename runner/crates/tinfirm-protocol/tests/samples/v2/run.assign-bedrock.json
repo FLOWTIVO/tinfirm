@@ -1,0 +1,34 @@
+{
+  "type": "run.assign",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d71",
+  "epoch": 1,
+  "modelAccess": {
+    "format": "bedrock",
+    "region": "eu-central-1",
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "apiKey": "wJalrXUtnFEMI-EXAMPLE-NOT-A-REAL-KEY"
+  },
+  "agent": {
+    "id": "0192f1a4-7c1e-7b3a-9d2e-00000000000f",
+    "name": "Analyst",
+    "runtime": "PI",
+    "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+  },
+  "workItem": {
+    "id": "0192f1a4-7c1e-7b3a-9d2e-00000000000e",
+    "key": "MYCO-14",
+    "title": "Add a health endpoint"
+  },
+  "job": {
+    "id": "0192f1a4-7c1e-7b3a-9d2e-0000000000a1"
+  },
+  "prompt": "You are Shared engineer, an AI agent of the company \"My Company\", working through Tinfirm.\n",
+  "resumeSessionId": null,
+  "workspaces": [],
+  "requestableRepositories": [],
+  "limits": {
+    "maxWallClockSeconds": 3600,
+    "maxTurns": 200
+  },
+  "resumePrompt": null
+}

@@ -1,0 +1,2799 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tinfirm.dev/protocol/runner-v2.schema.json",
+  "title": "Tinfirm runner protocol v2",
+  "description": "Messages on the WebSocket between a runner host and the server (GET /api/runner/v1/connect, header `Authorization: Bearer <runner host token>`). Every frame is one UTF-8 JSON text message that matches `Message`. Unknown fields must be ignored; unknown message types must be answered with an `error` and otherwise ignored. Protocol v2 (ADR-0039; CONVENTIONS §14.10) is v1 (runner-v1.schema.json) with one generic request pair, `run.request` and `run.request.ack`, in place of `run.ask`, `run.repository_request`, `run.task_create` and their acks; the server-executed tools of a run in `run.assign.tools`; `run.assign.workItem` and `job` in place of `task` (both name the run's conversation since the redesign of 2026-10-12); the writable `/output` folder of the sandbox, whose files the host saves as artifacts and lists in `run.finished.artifacts`; `microvm` among the isolation tiers; and `welcome.protocolVersion`. The host chooses the version with `hello.protocolVersion`; the server accepts both and answers with the version it speaks. Epochs, leases, events, capacity and everything else are as in v1. Optional features, which a host lists in `hello.features`, add frames to v2 without a new version: `run.steer` and `run.steer.ack` (feature `run.steer`), `run.assign.skills` (feature `run.skills`), `run.assign.sessionBundle` with `run.finished.sessionBundle` (feature `session.bundle`), and `hello.pool`, `host.config.pool`, `host.config.applied.pool` with `host.pool.status` (feature `sandbox.pool`, ADR-0099); the feature `sandbox.bridge` adds no frame (ADR-0100).",
+  "$ref": "#/$defs/Message",
+  "$defs": {
+    "Message": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Hello"
+        },
+        {
+          "$ref": "#/$defs/Welcome"
+        },
+        {
+          "$ref": "#/$defs/RunAssign"
+        },
+        {
+          "$ref": "#/$defs/RunAccepted"
+        },
+        {
+          "$ref": "#/$defs/RunRejected"
+        },
+        {
+          "$ref": "#/$defs/RunEvent"
+        },
+        {
+          "$ref": "#/$defs/RunHeartbeat"
+        },
+        {
+          "$ref": "#/$defs/RunFinished"
+        },
+        {
+          "$ref": "#/$defs/RunCancel"
+        },
+        {
+          "$ref": "#/$defs/RunRequest"
+        },
+        {
+          "$ref": "#/$defs/RunRequestAck"
+        },
+        {
+          "$ref": "#/$defs/RunSteer"
+        },
+        {
+          "$ref": "#/$defs/RunSteerAck"
+        },
+        {
+          "$ref": "#/$defs/CredentialStatus"
+        },
+        {
+          "$ref": "#/$defs/HostConfig"
+        },
+        {
+          "$ref": "#/$defs/HostConfigApplied"
+        },
+        {
+          "$ref": "#/$defs/HostPoolStatus"
+        },
+        {
+          "$ref": "#/$defs/PslUpdate"
+        },
+        {
+          "$ref": "#/$defs/Error"
+        }
+      ]
+    },
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "Instant": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Effort": {
+      "type": "string",
+      "enum": [
+        "LOW",
+        "MEDIUM",
+        "HIGH",
+        "XHIGH",
+        "MAX"
+      ],
+      "description": "How much the agent's runtime thinks, from the least to the most (`run.assign.agent.effort`)."
+    },
+    "Runtime": {
+      "type": "string",
+      "enum": [
+        "CLAUDE_CODE",
+        "CODEX",
+        "PI",
+        "OPENCODE"
+      ],
+      "description": "The agent CLI of a run: Claude Code, Codex, pi or OpenCode (ADR-0041). A host lists a runtime in `hello.runtimes` only when it found the runtime's image."
+    },
+    "CredentialKind": {
+      "type": "string",
+      "enum": [
+        "CLAUDE_LOGIN",
+        "CODEX_CHATGPT_AUTH",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY"
+      ]
+    },
+    "FailureClass": {
+      "type": "string",
+      "enum": [
+        "USAGE_LIMIT",
+        "SERVER_LIMITED",
+        "CONTEXT_OVERFLOW",
+        "LOGIN_EXPIRED",
+        "VENDOR_BLOCKED",
+        "CREDENTIAL_LEAK",
+        "PROTOCOL_ERROR",
+        "GUARD_STOPPED",
+        "TIME_LIMIT",
+        "GIT_ERROR",
+        "INFRA",
+        "RUNNER_UNAVAILABLE",
+        "MODEL_REFUSED"
+      ]
+    },
+    "Capacity": {
+      "description": "A credential's pool: how many runs use it at once. The same bound applies to ceilings, desired values and effective values (docs/archive/v1/CONVENTIONS.md §15.7).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16
+    },
+    "HostCapacity": {
+      "description": "A runner host's slots: how many runs it takes at once. The same bound applies to ceilings, desired values and effective values (CONVENTIONS §14.10). A host with Docker allows at most 16 (`run --max-concurrent-runs`); a host that creates a sandbox per run (`run --executor vm`) has no fixed maximum of its own (D12 of the Kubernetes runner analysis), and the protocol bounds it at 1000.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    },
+    "Hello": {
+      "description": "Runner host -> server, first frame after connect. `maxConcurrentRuns` and each credential's `poolSize` are the host's local ceilings, set by the machine owner (`run --max-concurrent-runs`, `credential add --pool`) and read when `run` starts. Desired values set in Tinfirm (host.config) can lower them, never raise them (docs/archive/v1/CONVENTIONS.md §15.7).",
+      "type": "object",
+      "required": [
+        "type",
+        "protocolVersion",
+        "runnerVersion",
+        "executors",
+        "isolationTiers",
+        "credentials",
+        "runtimes",
+        "maxConcurrentRuns"
+      ],
+      "properties": {
+        "type": {
+          "const": "hello"
+        },
+        "protocolVersion": {
+          "const": 2
+        },
+        "runnerVersion": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string",
+          "examples": [
+            "macos",
+            "linux"
+          ]
+        },
+        "arch": {
+          "type": "string",
+          "examples": [
+            "aarch64",
+            "x86_64"
+          ]
+        },
+        "executors": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "docker"
+            ]
+          },
+          "minItems": 1
+        },
+        "isolationTiers": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "container",
+              "gvisor",
+              "microvm"
+            ]
+          },
+          "minItems": 1,
+          "description": "The isolation of the host's sandboxes (ADR-0006): `container` (runc), `gvisor` (runsc) or `microvm` (Kata Containers, ADR-0025), as the host's sandbox runtime gives it."
+        },
+        "maxConcurrentRuns": {
+          "$ref": "#/$defs/HostCapacity",
+          "description": "The host's ceiling of concurrent runs (`run --max-concurrent-runs`: 1 to 16 with Docker, up to 1000 with a VM per run)."
+        },
+        "credentials": {
+          "description": "Metadata only. Secret values never leave the runner host except into the sandbox of a run.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "kind",
+              "runtimes",
+              "poolSize"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+              },
+              "kind": {
+                "$ref": "#/$defs/CredentialKind"
+              },
+              "runtimes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Runtime"
+                },
+                "minItems": 1
+              },
+              "poolSize": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The credential's ceiling of concurrent runs (`credential add --pool`, 1 to 16)."
+              }
+            }
+          }
+        },
+        "runtimes": {
+          "description": "The runtimes this host can run: one entry per runtime whose image it found when it built this hello. The server stores the list and sends a run only to a host that lists the run's runtime (the eligible hosts of CONVENTIONS §15.4); a runtime missing here means the image was missing, or Docker did not report it in time.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "runtime",
+              "image"
+            ],
+            "properties": {
+              "runtime": {
+                "$ref": "#/$defs/Runtime"
+              },
+              "image": {
+                "type": "string",
+                "examples": [
+                  "tinfirm-runner-claude:local"
+                ]
+              },
+              "version": {
+                "type": "string",
+                "description": "Pinned CLI and ACP adapter versions, e.g. `claude-code 2.1.287 / claude-agent-acp 0.87.0`"
+              }
+            }
+          }
+        },
+        "activeRuns": {
+          "description": "Runs still running in this runner host process when it reconnects after a network interruption. The server keeps a run whose epoch matches and whose lease has not expired, and answers run.cancel for any other. After a process restart the host sends an empty array.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "runId",
+              "epoch",
+              "lastSeq"
+            ],
+            "properties": {
+              "runId": {
+                "$ref": "#/$defs/Uuid"
+              },
+              "epoch": {
+                "type": "integer"
+              },
+              "lastSeq": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "publicSuffixList": {
+          "type": "object",
+          "required": [
+            "sha256"
+          ],
+          "properties": {
+            "sha256": {
+              "$ref": "#/$defs/Sha256"
+            }
+          },
+          "description": "The version of the Public Suffix List the host holds (the SHA-256 of its uncompressed bytes), sent when the host holds one and omitted when it holds none. The server may answer with a `psl.update` when its own list differs."
+        },
+        "features": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+          },
+          "description": "The optional features of protocol 2 the host implements; absent or empty for none. The server sends a feature's frames only to a host that lists it, and ignores names it does not know. `run.steer`: the host takes `run.steer` and answers each with `run.steer.ack`. `run.skills`: the host takes `run.assign.skills` (ADR-0064). `session.bundle`: the host takes `run.assign.sessionBundle` and reports `run.finished.sessionBundle` (ADR-0097). `sandbox.pool`: the host keeps ready sandboxes, sends `hello.pool`, takes `host.config.pool`, reports `host.config.applied.pool` and sends `host.pool.status` (ADR-0098, ADR-0099). `sandbox.bridge`: the host runs its agents over the sandbox bridge (ADR-0095), with `run --sandbox-bridge` or a VM per run (ADR-0096); it adds no frame, and a server whose licence does not hold elastic runners (ADR-0100) refuses the hello with an `error` `EDITION_REQUIRED` and close code 1008, as it does a hello that lists `sandbox.pool`, which only a VM per run implements."
+        },
+        "pool": {
+          "type": "object",
+          "required": [
+            "maxReady"
+          ],
+          "properties": {
+            "maxReady": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000,
+              "description": "The operator's ceiling of ready sandboxes (`run --pool-max-ready`); 0 turns them off. Tinfirm's count applies up to it."
+            }
+          },
+          "description": "v2, the optional feature `sandbox.pool` (ADR-0099): the host keeps ready sandboxes, which wait for runs created and probed (ADR-0098), and takes Tinfirm's count of them in `host.config.pool`. Present exactly when `features` lists `sandbox.pool`."
+        }
+      }
+    },
+    "Welcome": {
+      "description": "Server -> runner host, answer to hello. It carries the protocol version the server speaks. The server sends host.config right after it, and assigns runs to the host only after the host's first host.config.applied on this connection. Close codes: 4401 bad or revoked token (right after the upgrade), 4409 replaced by a newer connection of the same host, 1008 first frame not hello, invalid hello, or a hello that lists a feature the server's licence does not hold (after an `error` `EDITION_REQUIRED`, ADR-0100), 1002 unsupported protocolVersion, 1009 frame larger than 1 MiB, 1011 peer silent for 3 heartbeat intervals. The server sends WebSocket pings every heartbeat interval.",
+      "type": "object",
+      "required": [
+        "type",
+        "protocolVersion",
+        "runnerHostId",
+        "companyId",
+        "heartbeatIntervalSeconds",
+        "leaseTtlSeconds"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome"
+        },
+        "protocolVersion": {
+          "const": 2,
+          "description": "The protocol version the server speaks on this connection: the one of the host's hello. A host that asked for protocol 2 and gets a welcome without this field, or with another version, closes the connection with an error naming the mismatch; it never falls back to v1 within a session."
+        },
+        "runnerHostId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "companyId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "serverVersion": {
+          "type": "string"
+        },
+        "heartbeatIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "leaseTtlSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "RunAssign": {
+      "description": "Server -> runner host: start a run, one turn of a conversation (ADR-0058; CONVENTIONS §15.6). The host answers run.accepted or run.rejected within 10 s. Exactly one of `credentialLabel` (a subscription of this personal host) and `modelAccess` (the server's model relay, for a run paid by a budget, ADR-0059) is present.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "agent",
+        "workItem",
+        "job",
+        "prompt",
+        "workspaces",
+        "requestableRepositories",
+        "limits"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.assign"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "credentialLabel": {
+          "type": "string",
+          "description": "The label of the host credential the run uses (hello.credentials). Absent for a run with `modelAccess`."
+        },
+        "modelAccess": {
+          "$ref": "#/$defs/ModelAccess"
+        },
+        "agent": {
+          "type": "object",
+          "required": [
+            "id",
+            "name",
+            "runtime"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Uuid"
+            },
+            "name": {
+              "type": "string"
+            },
+            "runtime": {
+              "$ref": "#/$defs/Runtime"
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effort": {
+              "$ref": "#/$defs/Effort",
+              "description": "v2, optional: how much the runtime thinks. Absent leaves it to the runtime and its model. The host sets it the runtime's own way; a model that does not offer the level uses the nearest level it does."
+            }
+          }
+        },
+        "workItem": {
+          "description": "Was `task` in v1, and the work item in the design of 2026-10-05. The server sends the run's conversation: `id` the conversation's id, `key` its key, `title` its title.",
+          "type": "object",
+          "required": [
+            "id",
+            "key",
+            "title"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Uuid"
+            },
+            "key": {
+              "type": "string",
+              "description": "The conversation's key, `{base}-{n}`, e.g. `shop-123-dev-1`; its branch is `agent/{key}`"
+            },
+            "title": {
+              "type": "string"
+            }
+          }
+        },
+        "job": {
+          "description": "The job, in the design of 2026-10-05 a thread of the agent on a work item. The server sends the run's conversation: `id` the conversation's id, as `workItem.id`.",
+          "type": "object",
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Uuid"
+            }
+          }
+        },
+        "prompt": {
+          "type": "string",
+          "description": "The full prompt text, rendered by the server (CONVENTIONS §15.7). The host sends it unchanged as the ACP session/prompt text."
+        },
+        "resumeSessionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ACP session id of the conversation's previous run with a session; the host tries session/load and falls back to session/new."
+        },
+        "workspaces": {
+          "type": "array",
+          "description": "The repositories of the conversation's workspace, in the order the prompt lists them. Each is cloned into `/workspace/<dir>`; the agent's working directory is `/workspace`. Empty for work without repositories. The `dir` values are unique.",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/Workspace"
+          }
+        },
+        "requestableRepositories": {
+          "type": "array",
+          "description": "The other repositories the agent may ask for with the platform tool `request_access` (`run.request` kind ACCESS with `repository`). Not cloned. Empty when there are none.",
+          "items": {
+            "$ref": "#/$defs/RequestableRepository"
+          }
+        },
+        "limits": {
+          "type": "object",
+          "required": [
+            "maxWallClockSeconds",
+            "maxTurns"
+          ],
+          "properties": {
+            "maxWallClockSeconds": {
+              "type": "integer",
+              "minimum": 60
+            },
+            "maxTurns": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "resumePrompt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Short prompt with only what is new since the previous run (new comments). The host sends it instead of `prompt` when session/load of resumeSessionId succeeded."
+        },
+        "skills": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "v2, the optional feature `run.skills` (ADR-0064): the skills of the agent this run uses, each at the version the agent pins, already scanned for credentials by the server. Sent only to a host that lists `run.skills` in `hello.features`. Before it starts the sandbox, the host downloads each one with GET /api/runner/v1/runs/{runId}/skills/{skillId}/versions/{version}?epoch={epoch} (header `Authorization: Bearer <runner host token>`), checks sizeBytes and sha256, unpacks it (a zip; never a link, a device, an absolute path or `..`) into its cache, and bind-mounts it read-only into the sandbox at the runtime's user-level skill directory: /home/agent/.claude/skills/<name> for CLAUDE_CODE, /home/agent/.agents/skills/<name> for CODEX, OPENCODE and PI. A skill it cannot provide fails the run (an infrastructure failure naming the skill). Absent or empty: no skills.",
+          "items": {
+            "type": "object",
+            "required": [
+              "skillId",
+              "version",
+              "name",
+              "sha256",
+              "sizeBytes"
+            ],
+            "properties": {
+              "skillId": {
+                "$ref": "#/$defs/Uuid"
+              },
+              "version": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                "maxLength": 64,
+                "description": "The skill's folder name in the sandbox. Unique within the run."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "SHA-256 of the zip the download answers"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5242880,
+                "description": "The zip's size"
+              }
+            }
+          }
+        },
+        "sessionBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "v2, the optional feature `session.bundle` (ADR-0097): the server keeps the session folders of the conversation's agent between turns. Sent only to a company host that lists `session.bundle` in `hello.features`, and only while the server has a bundle store. Present: when the run ends, after the agent and before `run.finished`, the host packs the runtime's session folders of the session home (CLAUDE_CODE: `.claude/projects` and `.claude/todos`; CODEX: `.codex/sessions`; PI: `.pi/agent/sessions`; OPENCODE: `.local/share/opencode`, without `log` and `bin`), regular files and directories only, as a gzip-compressed tar of at most 64 MiB uncompressed and 32 MiB compressed, and uploads it with POST /api/runner/v1/runs/{runId}/session-bundle?epoch={epoch}&sessionId={sessionId} (header `Authorization: Bearer <runner host token>`, `Content-Type: application/gzip`), which answers `{status: STORED or REFUSED, message}`. With `sha256` and `sizeBytes`, the server holds a bundle of the session `resumeSessionId`: before the sandbox starts, the host downloads it with GET /api/runner/v1/runs/{runId}/session-bundle?epoch={epoch}, checks the size and the SHA-256, and unpacks it into the session home with the rules of `/output` (relative paths, no `..`, regular files and directories only, within caps), replacing only the runtime's session folders; a home that holds this bundle already is left as it is. A bundle that cannot be restored is a LOG event, never a failed run: the turn then starts a new session (NO_SESSION). Absent: the host keeps its homes as before.",
+          "properties": {
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "SHA-256 of the bundle the download answers"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 33554432,
+              "description": "The bundle's size"
+            }
+          },
+          "dependentRequired": {
+            "sha256": [
+              "sizeBytes"
+            ],
+            "sizeBytes": [
+              "sha256"
+            ]
+          }
+        },
+        "attachments": {
+          "type": "array",
+          "maxItems": 1000,
+          "description": "The conversation's files, those its person added and the documents its agent saved, already scanned for credentials by the server. Before it starts the sandbox, the host downloads each one with GET /api/runner/v1/runs/{runId}/attachments/{id}?epoch={epoch} (header `Authorization: Bearer <runner host token>`), checks sizeBytes and sha256, and mounts them read-only at /attachments/<fileName>. A 404 means the file was deleted meanwhile: the host skips it with a LOG event. Absent or empty: no attachments. Unchanged from v1.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "fileName",
+              "sizeBytes",
+              "sha256"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/Uuid"
+              },
+              "fileName": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "description": "A single path segment: no `/`, `\\` or control characters, never `.` or `..`. Unique within the run's files; a document saved from `/output` under a path is mounted under one segment."
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        },
+        "allowedHosts": {
+          "type": "array",
+          "maxItems": 200,
+          "description": "Network hosts the run may reach, as egress rules `HOST[:PORT]` (ADR-0044): the agent's, and those approved for the run's conversation (`run.request` kind NETWORK). The host adds each to the run's egress rules when it starts the run's egress proxy listener; an entry it cannot parse is logged and skipped. Absent or empty: none. Has an effect only on a host that runs with the egress proxy.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 259
+          }
+        },
+        "platformTools": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "description": "The platform tools the agent may use in this run, by name. The host lists a platform tool in the run's `tools/list` only when it is named here and the host offers it (`request_network_access` needs the egress proxy); `finish` and `list_repositories` are always named, and the host lists them even when they are not. A name the host does not know is ignored. Absent: every platform tool. The server leaves it out: the per-agent policies of platform tools (ADR-0046) went with ADR-0058.",
+          "items": {
+            "type": "string",
+            "enum": ["ask", "finish", "request_access", "request_network_access", "save_artifact", "list_repositories"]
+          }
+        },
+        "tools": {
+          "type": "array",
+          "maxItems": 200,
+          "description": "The server-executed tools of the run (CONVENTIONS §15.7): one per tool the agent may call on a system it lists, such as `jira_get`, `jira_search` and `github_label`, the MCP servers' tools included (ADR-0040), and `remember`, `forget` and `recall` while memory is in effect (ADR-0063); a tool under `ASK`, each call an approval (ADR-0058 decision 9), says so in its description. The host lists them in the MCP `tools/list` of the run next to the platform tools and forwards each call as `run.request` kind TOOL; the server executes it and answers with `run.request.ack`. Absent or empty: no server-executed tools. The names are unique and never those of the platform tools (`ask`, `finish`, `request_access`, `request_network_access`, `save_artifact`, `list_repositories`).",
+          "items": {
+            "$ref": "#/$defs/ToolSpec"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "credentialLabel"
+          ],
+          "not": {
+            "required": [
+              "modelAccess"
+            ]
+          }
+        },
+        {
+          "required": [
+            "modelAccess"
+          ],
+          "not": {
+            "required": [
+              "credentialLabel"
+            ]
+          }
+        }
+      ]
+    },
+    "ModelAccess": {
+      "description": "The run's model access when a budget pays for it (ADR-0059; CONVENTIONS §15.4): the server always sends the server's own model relay and a token for this run, never a provider's or a gateway's key (the company model credentials of ADR-0027 and ADR-0042 are gone). The token works only while the run is RUNNING on this host with this epoch, and from runner host 0.3.0 only beside the host's own token. The host keeps it: its model proxy sends the runtime's requests to `baseUrl` with it, and the runtime gets the proxy's own URL and a dummy key, so the token never enters the sandbox (runner/README.md, Model proxy). Never logged.",
+      "type": "object",
+      "required": [
+        "format",
+        "apiKey"
+      ],
+      "properties": {
+        "format": {
+          "enum": [
+            "anthropic",
+            "openai",
+            "bedrock",
+            "google",
+            "openrouter",
+            "mistral",
+            "groq",
+            "xai",
+            "deepseek"
+          ],
+          "description": "The API the access opens: the server sends `openai` for CODEX and `anthropic` (the Messages API) for every other runtime, which LiteLLM translates. `bedrock`, `google`, `openrouter`, `mistral`, `groq`, `xai` and `deepseek` were formats of the company model credentials; the server no longer sends them."
+        },
+        "baseUrl": {
+          "type": "string",
+          "pattern": "^https://[^\\s]+$",
+          "description": "The server's model relay, https, without user info, query or fragment: `{TINFIRM_PUBLIC_URL}/api/runner/v1/model/anthropic` for `anthropic`, `…/api/runner/v1/model/openai/v1` for `openai`; the token goes as a bearer token. The server always sends it."
+        },
+        "region": {
+          "type": "string",
+          "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]+$",
+          "description": "`bedrock` only, and required there: the AWS region of the Bedrock endpoint, e.g. `us-east-1`. The server no longer sends `bedrock`."
+        },
+        "accessKeyId": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]{16,128}$",
+          "description": "`bedrock` only: an AWS access key ID, whose secret access key is `apiKey`. The server no longer sends `bedrock`."
+        },
+        "apiKey": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The relay's token for this run, which only the server's relay takes."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "bedrock"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "region"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "region"
+                  ]
+                },
+                {
+                  "required": [
+                    "accessKeyId"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "anthropic",
+                  "openai"
+                ]
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "baseUrl"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "Workspace": {
+      "description": "One repository of the conversation's workspace. The runner host clones it into `/workspace/<dir>` and checks out `branch`.",
+      "type": "object",
+      "required": [
+        "componentId",
+        "dir",
+        "name",
+        "repoUrl",
+        "defaultBranch",
+        "branch"
+      ],
+      "properties": {
+        "componentId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "dir": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "maxLength": 64,
+          "description": "Directory name under `/workspace`, derived from the repository name by the server. Unique within the run.",
+          "examples": [
+            "server",
+            "web-app",
+            "web-app-2"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "description": "The repository name, as shown to the agent"
+        },
+        "repoUrl": {
+          "type": "string"
+        },
+        "defaultBranch": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string",
+          "description": "The conversation's branch `agent/<key>`, the same in every repository of the workspace",
+          "examples": [
+            "agent/MYCO-12"
+          ]
+        },
+        "git": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "HTTPS credentials for this repository (mirror, clone, the git proxy route and push). Used only by the runner host, never passed into the sandbox. Null for public repositories.",
+          "required": [
+            "username",
+            "token"
+          ],
+          "properties": {
+            "username": {
+              "type": "string",
+              "examples": [
+                "x-access-token"
+              ]
+            },
+            "token": {
+              "type": "string"
+            }
+          }
+        },
+        "authorName": {
+          "type": "string",
+          "description": "Git author for commits the host makes, e.g. `Tinfirm agent Backend engineer`"
+        },
+        "authorEmail": {
+          "type": "string"
+        },
+        "readOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "The agent may only read this repository (ADR-0017): the runner host clones it as usual but never pushes it, and reports `pushed: false`."
+        }
+      }
+    },
+    "RequestableRepository": {
+      "description": "A repository the agent may request: one of the company's repositories that the agent has access to and that is not in the workspace.",
+      "type": "object",
+      "required": [
+        "componentId",
+        "name",
+        "repoUrl",
+        "pendingRequest"
+      ],
+      "properties": {
+        "componentId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "name": {
+          "type": "string"
+        },
+        "repoUrl": {
+          "type": "string"
+        },
+        "pendingRequest": {
+          "type": "boolean",
+          "description": "True when the conversation already has an open approval for this repository"
+        }
+      }
+    },
+    "RunAccepted": {
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.accepted"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        }
+      }
+    },
+    "RunRejected": {
+      "description": "The host cannot take the run. The server puts the run back in the queue, dispatches it again after 10 s at the earliest, and shows the reason as the run's queue reason (CONVENTIONS §15.6).",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.rejected"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Text for humans, e.g. `no free slot (2 of 2 runs active)`. Never contains secrets."
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why, machine-readable. The server treats TASK_RUN_ACTIVE (another run of the same conversation, its previous turn, is still active on the host) specially, as the queue reason PREVIOUS_RUN_ACTIVE; every other code, and a missing one, is shown with `reason` (RUNNER_HOST_REJECTED).",
+          "examples": [
+            "DRAINING",
+            "STALE_EPOCH",
+            "UNKNOWN_CREDENTIAL",
+            "CREDENTIAL_UNAVAILABLE",
+            "INVALID_ASSIGNMENT",
+            "IMAGE_MISSING",
+            "DOCKER_UNAVAILABLE",
+            "TASK_RUN_ACTIVE",
+            "NO_FREE_SLOT",
+            "POOL_FULL"
+          ]
+        }
+      }
+    },
+    "RunEvent": {
+      "description": "Runner host -> server. `seq` starts at 1 per run and increases by 1. The server drops duplicates by (runId, seq) and rejects stale epochs. Size limits: the whole frame stays under 1 MiB; hosts cap a payload at 256 KiB, split long texts into chunks of at most 32 KiB, and cut each diff to 16 KiB. The server enforces them: a payload over 256 KiB, or an AGENT_MESSAGE or AGENT_THOUGHT `text` over 32 KiB (UTF-8), is not stored and answered `error PAYLOAD_TOO_LARGE` with the runId. It also rate-limits events per run, per host and per company (an event over the rate is answered `error TOO_MANY_REQUESTS`, a LOG event dropped without an answer), and bounds a run's stored payloads (64 MiB by default): the first event past the bound is stored as a LOG warning in its place, later LOG events are dropped and the others answered `error RUN_EVENTS_FULL`. A host never resends a refused event.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "seq",
+        "eventType",
+        "at",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.event"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "at": {
+          "$ref": "#/$defs/Instant"
+        },
+        "eventType": {
+          "enum": [
+            "AGENT_MESSAGE",
+            "AGENT_THOUGHT",
+            "TOOL_CALL",
+            "TOOL_CALL_UPDATE",
+            "PLAN",
+            "USAGE",
+            "RATE_LIMIT",
+            "STATUS",
+            "GIT",
+            "LOG",
+            "ERROR"
+          ]
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "AGENT_MESSAGE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadText"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "AGENT_THOUGHT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadText"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "TOOL_CALL"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadToolCall"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "TOOL_CALL_UPDATE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadToolCallUpdate"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "PLAN"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadPlan"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "USAGE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadUsage"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "RATE_LIMIT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadRateLimit"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "STATUS"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadStatus"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "GIT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadGit"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "LOG"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadLog"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "ERROR"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadError"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "EventPayloadText": {
+      "description": "AGENT_MESSAGE / AGENT_THOUGHT: text chunks. The host coalesces ACP chunks and flushes at least every 250 ms.",
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "EventPayloadToolCall": {
+      "type": "object",
+      "required": [
+        "toolCallId",
+        "title",
+        "kind",
+        "status"
+      ],
+      "properties": {
+        "toolCallId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "read",
+            "edit",
+            "delete",
+            "move",
+            "search",
+            "execute",
+            "think",
+            "fetch",
+            "switch_mode",
+            "other"
+          ]
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "failed"
+          ]
+        },
+        "input": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Raw tool input; strings longer than 4 KiB are truncated"
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "EventPayloadToolCallUpdate": {
+      "type": "object",
+      "required": [
+        "toolCallId"
+      ],
+      "properties": {
+        "toolCallId": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "failed"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "output": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Text output; truncated to 16 KiB with a trailing marker"
+        },
+        "diffs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "newText"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "oldText": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "newText": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Each diff text is cut to 16 KiB"
+        }
+      }
+    },
+    "EventPayloadPlan": {
+      "type": "object",
+      "required": [
+        "entries"
+      ],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "content",
+              "status"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed"
+                ]
+              },
+              "priority": {
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "EventPayloadUsage": {
+      "type": "object",
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "description": "Input tokens neither read from nor written to the prompt cache. A host older than `cacheWriteTokens` counts the cache writes here."
+        },
+        "outputTokens": {
+          "type": "integer"
+        },
+        "cachedInputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Input tokens read from the prompt cache"
+        },
+        "cacheWriteTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Input tokens written to the prompt cache, not part of `inputTokens`; 0 for Codex, which reports none. Absent from a host older than the field: `inputTokens` then include the cache writes."
+        },
+        "contextUsed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "contextSize": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "costUsd": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "totalTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Exact total for the run so far: inputTokens + cachedInputTokens + cacheWriteTokens + outputTokens"
+        },
+        "estimated": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "True when the input/output/cache split is estimated (Codex); totalTokens stays exact"
+        }
+      },
+      "description": "Cumulative totals for the whole run (docs/archive/v1/CONVENTIONS.md §14.5)."
+    },
+    "EventPayloadRateLimit": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "allowed",
+            "allowed_warning",
+            "rejected"
+          ]
+        },
+        "utilization": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "resetsAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "window": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "examples": [
+            "five_hour",
+            "weekly"
+          ]
+        }
+      }
+    },
+    "EventPayloadStatus": {
+      "type": "object",
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "preparing",
+            "cloning",
+            "starting",
+            "running",
+            "finalizing",
+            "pushing",
+            "cancelling"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "EventPayloadGit": {
+      "description": "A git step in one repository of the run. Hosts always set componentId and dir; events stored before multi-repository runs have neither.",
+      "type": "object",
+      "required": [
+        "action",
+        "branch"
+      ],
+      "properties": {
+        "componentId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "dir": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The repository's directory under `/workspace`"
+        },
+        "action": {
+          "enum": [
+            "cloned",
+            "committed",
+            "pushed",
+            "nothing_to_push"
+          ]
+        },
+        "branch": {
+          "type": "string"
+        },
+        "headSha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commits": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "EventPayloadLog": {
+      "type": "object",
+      "required": [
+        "level",
+        "message"
+      ],
+      "properties": {
+        "level": {
+          "enum": [
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "EventPayloadError": {
+      "type": "object",
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "failureClass": {
+          "$ref": "#/$defs/FailureClass"
+        }
+      }
+    },
+    "RunHeartbeat": {
+      "description": "Runner host -> server every heartbeatIntervalSeconds while at least one run is active. Renews the leases of the listed runs.",
+      "type": "object",
+      "required": [
+        "type",
+        "runs"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.heartbeat"
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "runId",
+              "epoch"
+            ],
+            "properties": {
+              "runId": {
+                "$ref": "#/$defs/Uuid"
+              },
+              "epoch": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    },
+    "RunFinished": {
+      "description": "Runner host -> server, exactly once per run, after the last run.event.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "outcome",
+        "lastSeq"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.finished"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "outcome": {
+          "enum": [
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLED"
+          ]
+        },
+        "lastSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failureClass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failureMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent's final message text (Markdown), at most 64 KiB"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the agent reported with the platform tool `finish`, the last call of the run; null or absent when it did not call it. `summary` stays the agent's last message either way."
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ACP session id for resuming this agent in this conversation"
+        },
+        "git": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "One result per repository the host cloned, in the order of `run.assign.workspaces`. Empty for a run without repositories; null when the host got no git result (e.g. the run failed before cloning).",
+          "items": {
+            "$ref": "#/$defs/GitResult"
+          }
+        },
+        "usage": {
+          "$ref": "#/$defs/EventPayloadUsage"
+        },
+        "artifacts": {
+          "type": "array",
+          "maxItems": 200,
+          "description": "The files the agent left in `/output`, which the host uploaded before it cleaned the workspace up (POST /api/runner/v1/runs/{runId}/attachments?epoch={epoch}&artifact=true, the relative path as the file name). Each file was scanned like an upload; a file that holds a credential, or is larger than the host's cap, is left out and named in a LOG event. Absent or empty: nothing to save. When the turn ends, the server makes each one a DOCUMENT output of the run's conversation.",
+          "items": {
+            "$ref": "#/$defs/ArtifactResult"
+          }
+        },
+        "resumed": {
+          "type": "boolean",
+          "description": "True when `session/load` of `run.assign.resumeSessionId` succeeded and the agent got `resumePrompt`; false when the run started a new session with the full `prompt`, or ended before it opened a session (CONVENTIONS §14.10). Absent from a host older than the field: not known."
+        },
+        "resumeOutcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResumeOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the run did not resume a session; null or absent when `resumed` is true, and when the run had a `resumeSessionId` but ended before the host tried `session/load`."
+        },
+        "sessionBundle": {
+          "enum": [
+            "STORED",
+            "TOO_LARGE",
+            "REFUSED",
+            "FAILED",
+            "NONE"
+          ],
+          "description": "v2, the feature `session.bundle`, for a run whose `run.assign` had `sessionBundle` (ADR-0097): what became of its bundle. STORED: the server stored it. TOO_LARGE: over the host's caps, not sent. REFUSED: the server refused it (a credential in it, or over the server's cap). FAILED: the upload failed. NONE: no session folders to pack. Absent: no bundle was asked for. When the run reports a `sessionId`, the server drops the conversation's bundle unless this run stored it, whatever this field says: an earlier bundle no longer holds the session as it is."
+        }
+      },
+      "if": {
+        "properties": {
+          "resumed": {
+            "const": true
+          }
+        },
+        "required": [
+          "resumed"
+        ]
+      },
+      "then": {
+        "properties": {
+          "resumeOutcome": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    "ResumeOutcome": {
+      "description": "Why a run did not resume a session. FIRST_RUN: `run.assign` had no `resumeSessionId`. NO_SESSION: the session files were not in the host's session home (the home was new for the run, or the agent did not know the id). LOAD_FAILED: `session/load` failed for another reason; its message is in a LOG event of the run. NOT_SUPPORTED: the agent does not offer `session/load` (`agentCapabilities.loadSession` false).",
+      "type": "string",
+      "enum": [
+        "FIRST_RUN",
+        "NO_SESSION",
+        "LOAD_FAILED",
+        "NOT_SUPPORTED"
+      ]
+    },
+    "GitResult": {
+      "description": "The end state of one repository of a run.",
+      "type": "object",
+      "required": [
+        "componentId",
+        "branch",
+        "pushed"
+      ],
+      "properties": {
+        "componentId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "pushed": {
+          "type": "boolean",
+          "description": "True when this run pushed the branch. The host pushes only repositories with commits ahead of the default branch."
+        },
+        "headSha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commits": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Commits on the branch that are not on the default branch"
+        }
+      }
+    },
+    "RunResult": {
+      "description": "The structured result of a run: the agent's last `finish` call. Every text is trimmed, redacted like everything that leaves the host, and cut to its length.",
+      "type": "object",
+      "required": [
+        "outcome",
+        "summary"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "COMPLETED",
+            "BLOCKED"
+          ],
+          "description": "COMPLETED: the work is done and ready for review. BLOCKED: the agent cannot continue without a person."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000,
+          "description": "Markdown for the reviewer: what the agent did, how it verified it, and why it is blocked when it is"
+        },
+        "nextSteps": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "description": "What should happen next, one step per entry; empty or absent for none"
+        },
+        "openQuestions": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "description": "Questions for a person, one per entry; empty or absent for none. For BLOCKED, the server makes each one a QUESTION decision."
+        }
+      }
+    },
+    "RunCancel": {
+      "description": "Server -> runner host. The host sends ACP session/cancel, waits up to 10 s, stops the sandbox, pushes WIP and answers run.finished with outcome CANCELLED.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.cancel"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        }
+      }
+    },
+    "RunSteer": {
+      "description": "Server -> runner host, only to a host whose hello lists the feature `run.steer`: a person wrote while the run works, and the agent should take it into the turn it is running instead of waiting for the next turn. The host answers exactly one run.steer.ack per steerId, and the same ack again for a steerId it already answered. Before the agent's prompt is sent, the host appends `text` to the prompt; while the prompt runs, it hands `text` to the agent session's steering (ACP `_session/steering`, which the agent advertises in `initialize`'s `_meta.steering.supported`), which delivers it after the agent's current step, before its next model request; otherwise it refuses.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "steerId",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.steer"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "steerId": {
+          "$ref": "#/$defs/Uuid",
+          "description": "Chosen by the server, one per message (the conversation message's id); the key the ack names"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 110000,
+          "description": "What the agent reads, rendered by the server: the person's words and how to take them"
+        }
+      }
+    },
+    "RunSteerAck": {
+      "description": "Runner host -> server: the answer to one run.steer, sent before the run's run.finished. DELIVERED: the agent has the text in the turn it runs (in its prompt, or taken by its steering), and it reads it before the turn ends. REFUSED: it does not, and the server lets the message wait for the next turn; `code` says why.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "steerId",
+        "status"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.steer.ack"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "steerId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "status": {
+          "enum": [
+            "DELIVERED",
+            "REFUSED"
+          ]
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the steer was refused; set when status is REFUSED. NOT_SUPPORTED: the agent has no steering. NOT_RUNNING: the host does not run this execution, or its agent's turn is over or ending. FAILED: the agent's steering answered with an error.",
+          "examples": [
+            "NOT_SUPPORTED",
+            "NOT_RUNNING",
+            "FAILED"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2000,
+          "description": "Details for the server's log"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REFUSED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CredentialStatus": {
+      "description": "Runner host -> server when a credential's state changes (usage limit hit, login expired, recovered).",
+      "type": "object",
+      "required": [
+        "type",
+        "label",
+        "status"
+      ],
+      "properties": {
+        "type": {
+          "const": "credential.status"
+        },
+        "label": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "AVAILABLE",
+            "COOLDOWN",
+            "INVALID"
+          ]
+        },
+        "cooldownUntil": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "HostConfig": {
+      "description": "Server -> runner host: the desired capacity settings of the host and its credentials, as set in Tinfirm (docs/archive/v1/CONVENTIONS.md §15.7). Always the full state, never a delta. Sent right after welcome and after every change. The host applies it at once (it never cancels a running run to do so) and answers host.config.applied.",
+      "type": "object",
+      "required": [
+        "type",
+        "version",
+        "credentials"
+      ],
+      "properties": {
+        "type": {
+          "const": "host.config"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The host's configuration version. It increases by 1 with every change of a desired value of the host or of one of its credentials; 0 when none was ever set. The host ignores a host.config whose version is lower than the last one it applied on the current connection."
+        },
+        "desiredMaxConcurrentRuns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "The desired number of concurrent runs on the host. Absent or null: none; the host uses its ceiling. A value above the ceiling is capped by the host."
+        },
+        "credentials": {
+          "type": "array",
+          "description": "The host's credentials that have a desired pool size, each label once. A credential that is not listed has none and uses its ceiling. The host ignores labels it does not know.",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "desiredPoolSize"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+              },
+              "desiredPoolSize": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The desired pool size. A value above the credential's ceiling is capped by the host."
+              }
+            }
+          }
+        },
+        "pool": {
+          "type": "object",
+          "required": [
+            "readyTarget"
+          ],
+          "properties": {
+            "readyTarget": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000,
+              "description": "How many ready sandboxes Tinfirm asks for now. The host applies at most its `maxReady`, and never more than its free slots."
+            },
+            "next": {
+              "type": "object",
+              "required": [
+                "readyTarget",
+                "at"
+              ],
+              "properties": {
+                "readyTarget": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1000
+                },
+                "at": {
+                  "$ref": "#/$defs/Instant"
+                }
+              },
+              "description": "The next change of the count, when the schedule has one in the next 7 days. The host fills a window early by its own measured cold start (at most its `leadTimeMax`), and follows this change by itself if it cannot reach the server at `at`."
+            }
+          },
+          "description": "v2, the feature `sandbox.pool` (ADR-0099): Tinfirm's count of ready sandboxes, which the server evaluates from the pool's schedule in its time zone. Sent only to a host that lists `sandbox.pool`; absent: 0. The host needs no time zone rules: it gets numbers, not the schedule. `version` increases with every change of the evaluated count, too."
+        }
+      }
+    },
+    "HostConfigApplied": {
+      "description": "Runner host -> server: the capacity the host uses now. It answers every host.config the host applies, and is sent unprompted, once the host has applied a host.config on the current connection, whenever an effective value, a ceiling or `draining` changes for a local reason (today: when the host starts to drain). The server stores these values and dispatches with them (CONVENTIONS §15.6; docs/archive/v1/CONVENTIONS.md §15.7).",
+      "type": "object",
+      "required": [
+        "type",
+        "version",
+        "draining",
+        "maxConcurrentRuns",
+        "maxConcurrentRunsCeiling",
+        "credentials"
+      ],
+      "properties": {
+        "type": {
+          "const": "host.config.applied"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The version of the latest host.config the host applied on the current connection; the values below are based on it."
+        },
+        "draining": {
+          "type": "boolean",
+          "description": "True after SIGHUP or `tinfirm-runner-host drain`: the host finishes its active runs, rejects new ones (run.rejected code DRAINING) and then exits (docs/archive/v1/CONVENTIONS.md §15.4 step 13)."
+        },
+        "maxConcurrentRuns": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000,
+          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining."
+        },
+        "maxConcurrentRunsCeiling": {
+          "$ref": "#/$defs/HostCapacity",
+          "description": "The host's ceiling, as in hello."
+        },
+        "credentials": {
+          "type": "array",
+          "description": "Every credential the host reported in hello, each label once.",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "poolSize",
+              "poolSizeCeiling"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+              },
+              "poolSize": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The effective pool: desiredPoolSize capped by the ceiling, or the ceiling without a desired value."
+              },
+              "poolSizeCeiling": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The credential's ceiling, as in hello."
+              }
+            }
+          }
+        },
+        "pool": {
+          "type": "object",
+          "required": [
+            "readyTarget",
+            "maxReadyCeiling"
+          ],
+          "properties": {
+            "readyTarget": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000,
+              "description": "The count the host aims at for Tinfirm: `host.config.pool.readyTarget` capped by `maxReadyCeiling`; 0 while it drains."
+            },
+            "maxReadyCeiling": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000,
+              "description": "The host's `maxReady`, as in hello."
+            }
+          },
+          "description": "v2, the feature `sandbox.pool` (ADR-0099): the pool's effective values. Present exactly for a host that lists `sandbox.pool`."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "draining": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "maxConcurrentRuns": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "draining": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "maxConcurrentRuns": {
+                "minimum": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "HostPoolStatus": {
+      "description": "v2, runner host -> server, the feature `sandbox.pool` (ADR-0099): the host's sandboxes now, sent when they change and at most every 10 seconds while the host is connected, and once after each host.config.applied. The server stores the latest for the host's page; it answers nothing.",
+      "type": "object",
+      "required": [
+        "type",
+        "ready",
+        "starting",
+        "busy",
+        "servedReady",
+        "servedCold"
+      ],
+      "properties": {
+        "type": {
+          "const": "host.pool.status"
+        },
+        "ready": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Sandboxes that wait for a run, created and probed."
+        },
+        "starting": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Sandboxes being created, for the pool or for a run that waits."
+        },
+        "busy": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Sandboxes that runs hold."
+        },
+        "coldStartP90Seconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "The 90th percentile of the host's last 20 cold starts, from the create to a ready sandbox, in seconds; absent or null before the first."
+        },
+        "servedReady": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Runs of the last 24 hours that took a ready sandbox."
+        },
+        "servedCold": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Runs of the last 24 hours that waited for one (a cold start)."
+        }
+      }
+    },
+    "PslUpdate": {
+      "description": "Server -> runner host: the Public Suffix List (publicsuffix.org, private section included) that the server holds. The host uses it to refuse network wildcards that would reach every site of a shared service (`*.com.sg`, `*.github.io`; ADR-0044), keeps it in its data directory and reports its `sha256` in `hello.publicSuffixList`. Sent when the host's version (`hello.publicSuffixList`) differs from the server's or the host holds none, and when the server's list changes. The host sends no answer: it verifies `sha256` over the decompressed bytes, decompresses at most 4 MiB, and keeps its current list when the frame is invalid, not a list of the Public Suffix List's shape (fewer than 1000 rules, or no `com`) or not decodable.",
+      "type": "object",
+      "required": [
+        "type",
+        "sha256",
+        "fetchedAt",
+        "ruleCount",
+        "content"
+      ],
+      "properties": {
+        "type": {
+          "const": "psl.update"
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256",
+          "description": "The SHA-256 of the UNCOMPRESSED list bytes."
+        },
+        "fetchedAt": {
+          "$ref": "#/$defs/Instant",
+          "description": "When the server fetched this list from publicsuffix.org."
+        },
+        "ruleCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The number of rules in the list, for the host's log."
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 1572864,
+          "description": "Base64 (standard alphabet, padded) of the gzip of the list's bytes (the `public_suffix_list.dat` text, UTF-8). At most 4 MiB uncompressed."
+        }
+      }
+    },
+    "Error": {
+      "description": "Either direction: a frame could not be processed. Never contains secrets.",
+      "type": "object",
+      "required": [
+        "type",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "code": {
+          "type": "string",
+          "examples": [
+            "BAD_MESSAGE",
+            "STALE_EPOCH",
+            "UNKNOWN_RUN",
+            "UNKNOWN_TYPE",
+            "UNKNOWN_CREDENTIAL",
+            "UNSUPPORTED_PROTOCOL",
+            "UNKNOWN_CREDENTIAL_KIND",
+            "PERSONAL_HOST_CREDENTIAL_ONLY",
+            "EDITION_REQUIRED",
+            "TOO_MANY_REQUESTS",
+            "PAYLOAD_TOO_LARGE",
+            "RUN_EVENTS_FULL",
+            "INTERNAL_ERROR"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer",
+          "description": "The epoch the error refers to, when it concerns one execution of a run"
+        }
+      }
+    },
+    "ToolSpec": {
+      "description": "A server-executed tool of a run, as MCP describes a tool.",
+      "type": "object",
+      "required": [
+        "name",
+        "description",
+        "inputSchema"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,99}$",
+          "description": "The tool name the agent calls, e.g. `jira_get`: the system's handle, an underscore and the tool, in lower case (CONVENTIONS §15.7); `remember`, `forget` and `recall` for memory"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "For the agent: which system the tool reads and what its query language is"
+        },
+        "inputSchema": {
+          "type": "object",
+          "description": "The JSON Schema of the tool's `arguments` (an object schema), as MCP `tools/list` carries it"
+        },
+        "replay": {
+          "type": "string",
+          "enum": [
+            "SAFE",
+            "UNSAFE"
+          ],
+          "description": "Optional (package R): whether the server may run the call again after it lost track of it. SAFE: the same call twice leaves the same state (a read, an idempotent write); UNSAFE: it may write twice, so the server never runs it again and answers an error result that tells the agent to check. For the runtime's information only: the server decides. Absent from older servers; then it follows the tool's effect"
+        }
+      }
+    },
+    "ArtifactResult": {
+      "description": "One file of `/output` that the host saved as an artifact.",
+      "type": "object",
+      "required": [
+        "name",
+        "attachmentId",
+        "sizeBytes"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "The file's path relative to `/output`, with `/` between the segments, e.g. `reports/q3.md`"
+        },
+        "attachmentId": {
+          "$ref": "#/$defs/Uuid",
+          "description": "The attachment the upload created (the upload answer's `attachmentId`)"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "RunRequest": {
+      "description": "Runner host -> server: a platform request of the agent (ADR-0039), one per tool call: ASK (`ask`), ACCESS (`request_access`), ARTIFACT (`save_artifact` with a link), NETWORK (`request_network_access`) or TOOL (a server-executed tool of `run.assign.tools`). The server answers with exactly one run.request.ack with the same requestId, also for a stale epoch or an unknown run. The host does not buffer this message while disconnected; it may send the same frame again after a reconnect while the tool call still waits, and a repeated requestId never creates a second decision, artifact or tool call. The host waits for the ack per kind: 30 s for ASK, ACCESS, NETWORK and ARTIFACT, and the server's tool timeout plus 5 s (65 s by default) for TOOL. The server rate-limits requests per host and per company (50 per second per host by default) and lets at most 4 TOOL requests of a run (by default) wait for their answer; one beyond either is answered REJECTED TOO_MANY_REQUESTS at once, and may be sent again later with a new requestId.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "requestId",
+        "kind",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.request"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid",
+          "description": "Generated by the host, one per tool call (the idempotency key of the request)."
+        },
+        "kind": {
+          "enum": [
+            "ASK",
+            "ACCESS",
+            "ARTIFACT",
+            "NETWORK",
+            "TOOL"
+          ]
+        },
+        "payload": {
+          "type": "object",
+          "description": "By kind: AskRequest, AccessRequest, ArtifactRequest, NetworkRequest or ToolRequest."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ASK"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/AskRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ACCESS"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/AccessRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ARTIFACT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/ArtifactRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "NETWORK"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/NetworkRequest"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "TOOL"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/ToolRequest"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "AskRequest": {
+      "description": "ASK: the agent called `ask` (ADR-0028, ADR-0033, ADR-0036). The server stores a QUESTION decision and answers PENDING with its id; the agent ends its turn after its questions, and the server wakes it with every answer at once.",
+      "type": "object",
+      "required": [
+        "question"
+      ],
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "The question for a person, Markdown: trimmed, redacted like every text that leaves the host, and cut to 2000 characters"
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "description": "Answers the person can pick, trimmed and redacted, without duplicates (ignoring case); empty or absent for a free answer"
+        }
+      }
+    },
+    "NetworkRequest": {
+      "description": "NETWORK: the agent called `request_network_access` for a network host its sandbox cannot reach (ADR-0044). The server stores an approval and answers PENDING with its id (`payload.decisionId`); the agent ends its turn, and the conversation's approver approves the host for the conversation, or for the agent for good when they may edit it, or denies it. The server wakes the agent with the decision; an approved host is in `run.assign.allowedHosts` of the next run.",
+      "type": "object",
+      "required": [
+        "host",
+        "reason"
+      ],
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 259,
+          "pattern": "^((\\*\\.)?[A-Za-z0-9][A-Za-z0-9._-]*|\\[[0-9A-Fa-f:.]+\\])(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$",
+          "description": "`HOST[:PORT]`: a name, `*.example.com` (the subdomains) or an IP address; the port is 1 to 65535 and 443 unless given (no `*` port). No scheme, user or path. At most 253 characters of host and 6 of port."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "Why the agent needs the host, trimmed, redacted like every text that leaves the host, and cut to 2000 characters"
+        }
+      }
+    },
+    "AccessRequest": {
+      "description": "ACCESS: the agent called `request_access`. Exactly one of `repository` and `tool` is set. For a repository the server stores an approval and answers PENDING with its id; the agent ends its turn, and the server wakes it with the decision. A `tool` is refused (TOOL_DENIED): a system's tools belong to the agent's definition.",
+      "type": "object",
+      "required": [
+        "reason"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "The repository name the agent asked for, trimmed (a name of `run.assign.requestableRepositories`, or any name the server looks up)"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "The name of a system whose tools the agent asked for, trimmed; the server refuses it (TOOL_DENIED)"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "Why the agent needs it, trimmed, redacted like every text that leaves the host, and cut to 2000 characters"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "repository"
+          ],
+          "not": {
+            "required": [
+              "tool"
+            ]
+          }
+        },
+        {
+          "required": [
+            "tool"
+          ],
+          "not": {
+            "required": [
+              "repository"
+            ]
+          }
+        }
+      ]
+    },
+    "ArtifactRequest": {
+      "description": "ARTIFACT: the agent called `save_artifact` with a link. The server stores a LINK output of the run's conversation and answers DONE with its id. Files go over HTTPS (the attachments endpoint with `artifact=true`), never in a frame.",
+      "type": "object",
+      "required": [
+        "url",
+        "title"
+      ],
+      "properties": {
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "pattern": "^https?://[^\\s]+$",
+          "description": "An http(s) URL without a user name or password"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "The link's title, trimmed, redacted and cut to 200 characters"
+        }
+      }
+    },
+    "ToolRequest": {
+      "description": "TOOL: the agent called a server-executed tool of `run.assign.tools`. The server checks that the agent may call it, executes the call on the system with what the conversation is bound to there (the person's own account, a credential lent through a grant, or the trigger's row) within its tool timeout (`tinfirm.run.tool-timeout`, 60 s by default), and answers DONE with a ToolResult, or REJECTED (an unknown tool; a tool the agent may not call, or a paused system: TOOL_DENIED; a system the conversation can no longer use: ACCOUNT_GONE; the system failed: TOOL_FAILED; a result above about 800 KiB: RESULT_TOO_LARGE with a message that asks the agent to narrow the query). A call on a system whose binding waits for a person (to connect an account, pick a grant, reconnect) is answered PENDING with the binding's id (`payload.decisionId`), and runs once the binding is resolved. A tool under `ASK` (ADR-0058 decision 9) is answered PENDING with the APPROVAL decision the call raised (`payload.decisionId`) and a message for the agent: the call runs once its approver approves it, the agent ends its turn, and the server wakes it with the outcome and the result.",
+      "type": "object",
+      "required": [
+        "tool",
+        "arguments"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "The tool's name, as `run.assign.tools` lists it"
+        },
+        "arguments": {
+          "type": "object",
+          "description": "The call's arguments, as the agent gave them (an object that matches the tool's inputSchema), with every string redacted like every text that leaves the host; at most 64 KiB as JSON"
+        }
+      }
+    },
+    "RunRequestAck": {
+      "description": "Server -> runner host: the answer to one run.request. PENDING: a decision was stored and waits for a person (ASK, ACCESS, NETWORK, and a TOOL call whose mode for the agent is ASK; `payload.decisionId`). DONE: the request was carried out (ARTIFACT: `payload.artifactId`; TOOL: `payload` is the ToolResult). REJECTED: nothing was stored or done; `code` says why. The host returns the result to the agent: for ASK, ACCESS and NETWORK `message` (or a text of its own when absent) as a normal result for PENDING and an error result for REJECTED; for ARTIFACT `message` or its own text; for TOOL the ToolResult's content as the MCP tool result for DONE, `message` (or its own text) as a normal result for PENDING, and `message` as an error result for REJECTED.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "requestId",
+        "status"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.request.ack"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "DONE",
+            "REJECTED"
+          ]
+        },
+        "payload": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "By status and kind: Decision for PENDING, Artifact or ToolResult for DONE; absent or null for REJECTED"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the request was rejected; set when status is REJECTED",
+          "examples": [
+            "INVALID_REQUEST",
+            "RUN_NOT_ACTIVE",
+            "CONVERSATION_ENDED",
+            "REQUEST_UNAVAILABLE",
+            "UNKNOWN_REPOSITORY",
+            "UNKNOWN_TOOL",
+            "TOOL_DENIED",
+            "ACCOUNT_GONE",
+            "ALREADY_IN_WORKSPACE",
+            "ALREADY_PENDING",
+            "ALREADY_ALLOWED",
+            "TOO_MANY_QUESTIONS",
+            "TOO_MANY_REQUESTS",
+            "RESULT_TOO_LARGE",
+            "TOOL_FAILED",
+            "MEMORY_OFF",
+            "UNKNOWN_NOTE",
+            "MEMORY_REFUSED",
+            "MEMORY_FULL",
+            "MEMORY_REVIEW_FULL"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Text for the agent, written by the server; required when status is REJECTED"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "PENDING"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "payload"
+            ],
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/Decision"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "DONE"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "payload"
+            ],
+            "properties": {
+              "payload": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ToolResult"
+                  },
+                  {
+                    "$ref": "#/$defs/Artifact"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REJECTED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Decision": {
+      "description": "The decision a PENDING ack stored (the API's Decision.id).",
+      "type": "object",
+      "required": [
+        "decisionId"
+      ],
+      "properties": {
+        "decisionId": {
+          "$ref": "#/$defs/Uuid"
+        }
+      }
+    },
+    "Artifact": {
+      "description": "The LINK artifact a DONE ack of an ARTIFACT request stored (the API's Artifact.id).",
+      "type": "object",
+      "required": [
+        "artifactId"
+      ],
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/Uuid"
+        }
+      }
+    },
+    "ToolResult": {
+      "description": "The result of a server-executed tool call, in the shape of an MCP `tools/call` result: the host returns it to the agent unchanged. The whole frame stays under 1 MiB; the server rejects a larger result with RESULT_TOO_LARGE instead.",
+      "type": "object",
+      "required": [
+        "content",
+        "isError"
+      ],
+      "properties": {
+        "content": {
+          "type": "array",
+          "description": "MCP content blocks; the server sends text blocks (the subject's key, title, status, labels, assignees, description and newest comments as text)",
+          "items": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "examples": [
+                  "text"
+                ]
+              },
+              "text": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "structuredContent": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "The same result as JSON, when the tool has one"
+        },
+        "isError": {
+          "type": "boolean",
+          "description": "True when the system answered with an error the agent should see (the content says what)"
+        }
+      }
+    },
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex of a SHA-256 digest."
+    }
+  }
+}

@@ -1,0 +1,321 @@
+# Tinfirm server configuration. Every value can be overridden with environment variables;
+# see docs/CONVENTIONS.md section 4 and server/README.md.
+
+spring:
+  application:
+    name: tinfirm-server
+  ai:
+    mcp:
+      server:
+        # The MCP endpoint of each company for people's clients (ADR-0045, the mcp module): stateless Streamable
+        # HTTP, synchronous tools, tools only. The endpoint's path, name, version and instructions are set by
+        # mcp.internal.McpEndpointConfiguration.
+        protocol: STATELESS
+        type: SYNC
+        request-timeout: PT60S
+        capabilities:
+          tool: true
+          resource: false
+          prompt: false
+          completion: false
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    # Runtime role tinfirm_app: it does not own the tables, so row-level security applies to it.
+    url: jdbc:postgresql://localhost:5432/tinfirm
+  flyway:
+    # Migrations run as the schema owner tinfirm_owner (SPRING_FLYWAY_USER / SPRING_FLYWAY_PASSWORD).
+    locations: classpath:db/migration
+    placeholders:
+      app_role: tinfirm_app
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none
+  session:
+    # Idle timeout; the absolute lifetime is tinfirm.session.max-age.
+    timeout: ${TINFIRM_SESSION_IDLE_TIMEOUT:PT8H}
+    jdbc:
+      # Flyway creates the session tables (V001__baseline.sql).
+      initialize-schema: never
+  servlet:
+    multipart:
+      # A conversation's files and a runner host's uploads of /output (ADR-0014): one file per request, buffered on
+      # disk. The same variable as tinfirm.attachment.max-file-size, so an oversized upload is refused before it is
+      # read completely (413 ATTACHMENT_TOO_LARGE).
+      max-file-size: ${TINFIRM_ATTACHMENT_MAX_FILE_SIZE:25MB}
+      max-request-size: ${TINFIRM_ATTACHMENT_MAX_REQUEST_SIZE:26MB}
+      # The body is parsed, and its parts written to disk, only when a handler first reads a parameter or a part, after
+      # it authenticated the request: an anonymous multipart to /api/runner/v1/** is refused 401 unread (the security
+      # review of 2026-10-27, L24).
+      resolve-lazily: true
+  jackson:
+    default-property-inclusion: non_null
+  mvc:
+    problemdetails:
+      enabled: true
+    # Nothing listens to ServletRequestHandledEvent, whose session id read the JDBC session (and wrote its last
+    # access back) for every request, the web app's files included.
+    publish-request-handled-events: false
+  web:
+    resources:
+      # The SPA resource handler is registered explicitly (shared.web.SpaConfiguration).
+      add-mappings: false
+
+server:
+  port: 8080
+  # Tomcat RemoteIpValve: X-Forwarded-* is honoured only from trusted proxies
+  # (server.tomcat.remoteip.internal-proxies / SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES).
+  forward-headers-strategy: native
+  error:
+    whitelabel:
+      enabled: false
+  tomcat:
+    # How long Tomcat waits for a request's line and headers, for each next part of a body, and for a keep-alive
+    # connection's next request (its own default is 60 s). With the model relay's own deadline for a whole body
+    # (tinfirm.model.relay-body-timeout, 30 s), a request that sends its body slowly holds its thread at most about
+    # 50 s (M3 of the security review of 2026-10-27). WebSockets, once upgraded, have no such timeout.
+    connection-timeout: 20s
+    # A file's part header carries its name. A runner host's path of /output has up to 1024 characters (runner
+    # protocol v2's ArtifactResult.name), which it sends in ASCII and percent-encoded UTF-8 (filename and filename*):
+    # up to about 14 KB. Tomcat allows 512 bytes by default, which refuses such a part as too large (413).
+    max-part-header-size: 16KB
+
+management:
+  server:
+    port: 8081
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      # Readiness includes the database: a replica that cannot reach PostgreSQL takes no traffic. Liveness keeps
+      # the probes' default (livenessState only), so a database outage never restarts the pods. databaseRole holds
+      # the replica out of traffic while its database role could bypass row-level security (shared.tenant
+      # .DatabaseRoleCheck, CONVENTIONS §7).
+      group:
+        readiness:
+          include: readinessState,db,databaseRole
+      show-details: never
+
+logging:
+  structured:
+    format:
+      console: ecs
+  level:
+    # The stateless MCP server has no handler for notifications/initialized, which every client sends once per
+    # connection, and warns each time; it is answered 202 as it should be (ADR-0045).
+    io.modelcontextprotocol.server.DefaultMcpStatelessServerHandler: ERROR
+
+tinfirm:
+  public-url: ${TINFIRM_PUBLIC_URL:http://localhost:8080}
+  roles: ${TINFIRM_ROLES:api,worker}
+  session:
+    max-age: ${TINFIRM_SESSION_MAX_AGE:P7D}
+  auth:
+    local-enabled: ${TINFIRM_AUTH_LOCAL_ENABLED:true}
+    oidc-auto-provision: ${TINFIRM_AUTH_OIDC_AUTO_PROVISION:true}
+    login-throttle:
+      per-email:
+        capacity: 5
+        period: 1m
+      per-ip:
+        capacity: 30
+        period: 1m
+  vault:
+    # Required. The server refuses to start without valid master keys.
+    keys: ${TINFIRM_VAULT_KEYS:}
+    active-key: ${TINFIRM_VAULT_ACTIVE_KEY:}
+  runner:
+    # Lease of a running run, renewed by heartbeats and the other frames of its host (CONVENTIONS §15.6).
+    lease-ttl: ${TINFIRM_RUNNER_LEASE_TTL:PT30S}
+    # At startup and when a host disconnects, runs keep a lease at least this long.
+    reconnect-grace: ${TINFIRM_RUNNER_RECONNECT_GRACE:PT2M}
+    # A run lost because its lease expired is resumed when its host reports it within this time; PT0S turns it off.
+    lost-resume-window: ${TINFIRM_RUNNER_LOST_RESUME_WINDOW:PT10M}
+    # Heartbeat interval announced in welcome; also the keep-alive ping interval of runner connections.
+    heartbeat-interval: ${TINFIRM_RUNNER_HEARTBEAT_INTERVAL:PT10S}
+    # Largest inbound runner frame; larger frames close the connection (1009).
+    max-message-bytes: 1048576
+    # Flood controls (the security review of 2026-10-27, M4; threat model 5.12), per replica: a host's run.request
+    # frames per second, and all the hosts of a company together; a run's run.event frames per second, its host's and
+    # its company's. Each bucket holds ten seconds' worth; 0 turns a limit off. A request beyond them is answered
+    # REJECTED TOO_MANY_REQUESTS, an event error TOO_MANY_REQUESTS (a LOG event is dropped).
+    requests-per-second: ${TINFIRM_RUNNER_REQUESTS_PER_SECOND:50}
+    company-requests-per-second: ${TINFIRM_RUNNER_COMPANY_REQUESTS_PER_SECOND:200}
+    events-per-second: ${TINFIRM_RUNNER_EVENTS_PER_SECOND:20}
+    host-events-per-second: ${TINFIRM_RUNNER_HOST_EVENTS_PER_SECOND:200}
+    company-events-per-second: ${TINFIRM_RUNNER_COMPANY_EVENTS_PER_SECOND:500}
+    # The TOOL requests of one run that wait for their answer at once; one more is REJECTED TOO_MANY_REQUESTS.
+    tool-calls-in-flight: ${TINFIRM_RUNNER_TOOL_CALLS_IN_FLIGHT:4}
+    # The event payloads one run stores; past them one LOG warning is stored, later LOG events are dropped and the
+    # others refused (error RUN_EVENTS_FULL). At least 1MB.
+    events-max-bytes: ${TINFIRM_RUNNER_EVENTS_MAX_BYTES:64MB}
+  run:
+    # Limits handed to the runner host with every assignment.
+    max-wall-clock: ${TINFIRM_RUN_MAX_WALL_CLOCK:PT60M}
+    max-turns: ${TINFIRM_RUN_MAX_TURNS:200}
+    # An assigned run without run.accepted goes back to the queue after this; a rejected run waits this long.
+    accept-timeout: ${TINFIRM_RUN_ACCEPT_TIMEOUT:PT10S}
+    reject-backoff: ${TINFIRM_RUN_REJECT_BACKOFF:PT10S}
+    # Stored events per run; LOG events are dropped first.
+    max-events-per-run: ${TINFIRM_RUN_MAX_EVENTS_PER_RUN:20000}
+    # Lifetime of one SSE stream of run events; the client reconnects with Last-Event-ID.
+    stream-timeout: ${TINFIRM_RUN_STREAM_TIMEOUT:PT30M}
+    # A server-executed tool call of a run not answered within this is TOOL_FAILED; the runner host waits 5 s longer.
+    # At most PT60S.
+    tool-timeout: ${TINFIRM_RUN_TOOL_TIMEOUT:PT60S}
+  # The Public Suffix List's settings (TINFIRM_PUBLIC_SUFFIX_*) and the sync module's (TINFIRM_SYNC_*) went with the
+  # old domain; their variables are not read (polls and schedules read TINFIRM_TRIGGER_*, below).
+  session-bundles:
+    # The session folders of a conversation's agent between turns (ADR-0097), so that a turn resumes its session on
+    # any company runner host: none (off: the hosts keep their homes), filesystem (a directory) or s3 (a private bucket
+    # of any S3-compatible storage, which holds nothing else; its key reaches that bucket only).
+    store: ${TINFIRM_SESSION_BUNDLES_STORE:none}
+    directory: ${TINFIRM_SESSION_BUNDLES_DIRECTORY:}
+    s3:
+      endpoint: ${TINFIRM_SESSION_BUNDLES_S3_ENDPOINT:}
+      region: ${TINFIRM_SESSION_BUNDLES_S3_REGION:us-east-1}
+      bucket: ${TINFIRM_SESSION_BUNDLES_S3_BUCKET:}
+      path-style: ${TINFIRM_SESSION_BUNDLES_S3_PATH_STYLE:false}
+      access-key-id: ${TINFIRM_SESSION_BUNDLES_S3_ACCESS_KEY_ID:}
+      secret-access-key: ${TINFIRM_SESSION_BUNDLES_S3_SECRET_ACCESS_KEY:}
+      prefix: ${TINFIRM_SESSION_BUNDLES_S3_PREFIX:session-bundles/}
+    # A bundle goes this long after its conversation's last turn, and when the conversation ends.
+    retention: ${TINFIRM_SESSION_BUNDLES_RETENTION:P30D}
+  attachment:
+    # The files of a conversation (ADR-0014, the package 3 contract §3.13): the largest file, and how many files and
+    # bytes one conversation holds in all, the documents of its outputs included.
+    max-file-size: ${TINFIRM_ATTACHMENT_MAX_FILE_SIZE:25MB}
+    max-files-per-conversation: ${TINFIRM_ATTACHMENT_MAX_FILES_PER_CONVERSATION:50}
+    max-conversation-size: ${TINFIRM_ATTACHMENT_MAX_CONVERSATION_SIZE:250MB}
+  conversation:
+    change-requests:
+      # The state of a watched change request (not MERGED) is read again this long after the last read; at least
+      # PT30S. The watch looks for due states every state-tick on worker replicas.
+      state-interval: ${TINFIRM_CHANGE_REQUEST_STATE_INTERVAL:PT5M}
+      state-tick: PT15S
+    call-recovery:
+      # The calls a restart left behind (an approved call, a parked one): worker replicas look for them this long
+      # after the start, then every interval, and run or settle each once.
+      initial-delay: PT20S
+      interval: PT2M
+    tool-journal:
+      # The journal of runs' tool calls (package R): a call's row is deleted this long after its run ended. Worker
+      # replicas settle the calls a stopped replica left running, and delete the expired rows, every sweep-interval.
+      retention: ${TINFIRM_TOOL_JOURNAL_RETENTION:P7D}
+      sweep-interval: PT1M
+      # A request sent again while its call runs elsewhere waits for it at most this long after the call's claim, and is
+      # then answered without its outcome (TOOL_INTERRUPTED; a SAFE call TOOL_FAILED): within the runner host's wait of
+      # 65 s from its first send, which a send after a reconnect does not restart.
+      answer-within: PT55S
+    # How long a submission's Idempotency-Key (REST) or requestId (MCP) is kept, after which worker replicas delete it
+    # (package R).
+    idempotency-key-ttl: ${TINFIRM_IDEMPOTENCY_KEY_TTL:PT24H}
+  memory:
+    # Agent memory (ADR-0063): the most characters a memory's active notes hold in all, 1000 to 100000. Only what a
+    # conversation touches is sent to its agent, so this bounds storage and a compaction's request, not each prompt.
+    max-characters: ${TINFIRM_MEMORY_MAX_CHARACTERS:20000}
+  trigger:
+    # The instance's firing limits of triggers (the package 4 contract, §11): a new trigger's max_firings_per_hour and
+    # the most one may set, until a company's admins set their own (PUT /settings).
+    firings-per-hour-default: ${TINFIRM_TRIGGER_FIRINGS_PER_HOUR_DEFAULT:30}
+    firings-per-hour-max: ${TINFIRM_TRIGGER_FIRINGS_PER_HOUR_MAX:300}
+    # Polls and schedules (the package 4 contract, §5.4, §5.10), on worker replicas: how often due polls and due
+    # schedules are looked for (each poll at its system's pollIntervalSeconds); a subject changed more recently than
+    # settle is left for the next pass (beyond the tool timeout); a change older than catch-up when first read fires
+    # nothing; a schedule's firing due longer ago than missed-after was missed, and its catch-up decides.
+    poll-tick: ${TINFIRM_TRIGGER_POLL_TICK:PT15S}
+    schedule-tick: ${TINFIRM_TRIGGER_SCHEDULE_TICK:PT30S}
+    settle: ${TINFIRM_TRIGGER_SETTLE:PT90S}
+    catch-up: ${TINFIRM_TRIGGER_CATCH_UP:PT24H}
+    missed-after: ${TINFIRM_TRIGGER_MISSED_AFTER:PT1H}
+  webhook:
+    # The instance's deliveries a minute per webhook system (the package 5 contract, §5.12): a system's when it names
+    # none, and the most one may name, until a company's admins set their own (PUT /settings).
+    deliveries-per-minute-default: ${TINFIRM_WEBHOOK_DELIVERIES_PER_MINUTE_DEFAULT:60}
+    deliveries-per-minute-max: ${TINFIRM_WEBHOOK_DELIVERIES_PER_MINUTE_MAX:600}
+  connection:
+    # Calls to the company's systems (the system module's outbound client): https only unless the operator allows
+    # http, never to loopback, link-local or private addresses unless the operator allows them for company systems
+    # (a member's personal MCP server never reaches them), never following redirects.
+    allow-http: ${TINFIRM_CONNECTION_ALLOW_HTTP:false}
+    allow-private-addresses: ${TINFIRM_CONNECTION_ALLOW_PRIVATE_ADDRESSES:false}
+    # The operator's internal hosts (ADR-0066), comma-separated: a company system on one of them may resolve to
+    # private addresses only (never public, loopback or link-local ones) and may use http. Never for a personal MCP
+    # server.
+    internal-hosts: ${TINFIRM_CONNECTION_INTERNAL_HOSTS:}
+    # Connect and request timeout of one call to a system.
+    timeout: ${TINFIRM_CONNECTION_TIMEOUT:PT20S}
+    # How long one tool call of a system (or a change request) may take in all, at most PT60S: the runner host waits
+    # 5 s longer for the answer.
+    tool-timeout: ${TINFIRM_RUN_TOOL_TIMEOUT:PT60S}
+  model:
+    # The LiteLLM bundled with the deployment (ADR-0059, CONVENTIONS §4): its address inside the deployment's network,
+    # for its admin API, and its master key. Unset, none is bundled, and a company configures its own (EXTERNAL).
+    # Runner hosts never reach it. The model requests the server relays and its own go to the model port (ADR-0069),
+    # which serves the model API alone; unset, to the admin URL.
+    litellm-admin-url: ${TINFIRM_LITELLM_ADMIN_URL:}
+    litellm-master-key: ${TINFIRM_LITELLM_MASTER_KEY:}
+    litellm-model-url: ${TINFIRM_LITELLM_MODEL_URL:}
+    # Each principal's LiteLLM key is rotated this long after its creation (at least P1D); the key it replaces keeps
+    # serving the requests that already hold it for the grace (at most PT1H), and is then blocked and deleted. A
+    # rotation an admin asks for gives the old key no grace (CONVENTIONS §15.4).
+    key-rotation-interval: ${TINFIRM_MODEL_KEY_ROTATION_INTERVAL:P30D}
+    key-rotation-grace: ${TINFIRM_MODEL_KEY_ROTATION_GRACE:PT10M}
+    # The model relay refuses a run's token without its runner host's own token from every host (the package 2
+    # contract, open point 6): on by default, runner 0.3.0 is the minimum (I8 of the security review of 2026-10-27).
+    # Off, a host before runner 0.3.0 may leave it out: only while such a host is being upgraded.
+    relay-require-host-token: ${TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN:true}
+    # The most bytes of request bodies the model relay holds at once on a replica (each counted twice while it is read
+    # and written anew, as its bytes arrive); a body beyond it is 429. At least twice relay-max-request-bytes (64 MiB).
+    relay-max-inflight-bytes: ${TINFIRM_MODEL_RELAY_MAX_INFLIGHT_BYTES:268435456}
+    # The longest the model relay waits for a request's whole body; a body still arriving then is 408 (M3).
+    relay-body-timeout: ${TINFIRM_MODEL_RELAY_BODY_TIMEOUT:PT30S}
+    # The anthropic-beta and OpenAI-Beta values the relay passes on, comma-separated; others are dropped (M1). Unset,
+    # the pinned runtimes' (ModelProperties.ANTHROPIC_BETAS, OPENAI_BETAS). Never add a beta that lets the provider
+    # act for the request (mcp-client-*, code-execution-*, web-fetch-*, skills-*, files-api-*).
+    # relay-anthropic-betas: ${TINFIRM_MODEL_RELAY_ANTHROPIC_BETAS}
+    # relay-openai-betas: ${TINFIRM_MODEL_RELAY_OPENAI_BETAS}
+  mcp:
+    # The MCP endpoint of each company (ADR-0045): requests per minute per credential (a personal access token or an
+    # OAuth grant), a token bucket with a burst of the same size, in memory per replica; 0 turns the limit off.
+    rate-limit-per-minute: ${TINFIRM_MCP_RATE_LIMIT_PER_MINUTE:120}
+    # Conversations one member may start through AI clients per hour in a company, counted in the database (package 6,
+    # open point 14); 0 turns the limit off.
+    starts-per-hour: ${TINFIRM_MCP_STARTS_PER_HOUR:30}
+  outlook:
+    # The hosts that may frame the Outlook add-in's task pane beside Tinfirm itself (ADR-0074): https origins,
+    # comma-separated. Outlook on the web and the new Outlook for Windows; classic Outlook does not frame the pane.
+    frame-ancestors: ${TINFIRM_OUTLOOK_FRAME_ANCESTORS:https://outlook.office.com,https://outlook.office365.com,https://outlook.live.com,https://outlook.cloud.microsoft}
+  gmail:
+    # The Gmail add-on (ADR-0083): the Google Cloud project's names that `gcloud workspace-add-ons get-authorization`
+    # gives, its service account (serviceAccountEmail) and its OAuth client (oauthClientId). Unset, the add-on's
+    # endpoints answer 404.
+    service-account: ${TINFIRM_GMAIL_SERVICE_ACCOUNT:}
+    client-id: ${TINFIRM_GMAIL_CLIENT_ID:}
+  chat:
+    # Slack and Teams (the package 5 contract, §5.2, open point 11). The largest request a platform may send (413
+    # beyond), the operator's; the rates seed each company's own, which its admins change (/chat-settings).
+    max-body: ${TINFIRM_CHAT_MAX_BODY:1MB}
+    messages-per-user-minute: ${TINFIRM_CHAT_MESSAGES_PER_USER_MINUTE:20}
+    messages-per-user-day: ${TINFIRM_CHAT_MESSAGES_PER_USER_DAY:200}
+    events-per-system-minute: ${TINFIRM_CHAT_EVENTS_PER_SYSTEM_MINUTE:600}
+    # Socket Mode connections per Slack system across all worker replicas (Slack allows 10 per app).
+    sockets-per-system: ${TINFIRM_CHAT_SOCKETS_PER_SYSTEM:2}
+  # Error reports (ADR-0070): the server's and the web app's errors, scrubbed and grouped. off, local or automatic;
+  # unset, an instance admin chooses local or automatic on the page (local until then). Automatic delivery sends them in
+  # Sentry's protocol to the DSN, through the proxy when one is set, naming the installation by a random id and the
+  # label.
+  error-reports:
+    mode: ${TINFIRM_ERROR_REPORTS:}
+    dsn: ${TINFIRM_ERROR_REPORTS_DSN:}
+    label: ${TINFIRM_ERROR_REPORTS_LABEL:}
+    proxy: ${TINFIRM_ERROR_REPORTS_PROXY:}
+  bootstrap:
+    admin-email: ${TINFIRM_BOOTSTRAP_ADMIN_EMAIL:}
+    admin-password: ${TINFIRM_BOOTSTRAP_ADMIN_PASSWORD:}

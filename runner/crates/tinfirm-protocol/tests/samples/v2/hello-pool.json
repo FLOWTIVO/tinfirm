@@ -1,0 +1,17 @@
+{
+  "type": "hello",
+  "protocolVersion": 2,
+  "runnerVersion": "0.3.0",
+  "hostname": "runner-pod",
+  "os": "linux",
+  "arch": "x86_64",
+  "executors": ["docker"],
+  "isolationTiers": ["microvm"],
+  "maxConcurrentRuns": 32,
+  "credentials": [],
+  "runtimes": [
+    {"runtime": "CLAUDE_CODE", "image": "tinfirm-runner-claude:local", "version": "VM template sandbox-4c8g"}
+  ],
+  "features": ["run.steer", "run.skills", "session.bundle", "sandbox.pool"],
+  "pool": {"maxReady": 4}
+}

@@ -1,0 +1,31 @@
+# ADR-0106: The release, hotfix and security workflows are reusable workflows with local, pinned actions
+
+- Status: Accepted
+- Date: 2026-11-03
+- Decided by: the owner, 2026-11-03
+- Sources: [ADR-0080](0080-helm-chart-published-to-ghcr.md) (the chart's publishing); [ADR-0081](0081-signed-release-images.md) (the signed release); [the security review of 2026-10-27](../reviews/2026-10-27-security-review-fixed.md), H3 (the deploy keys in environments) and M18 (every action pinned)
+- Amends: [ADR-0080](0080-helm-chart-published-to-ghcr.md) and [ADR-0081](0081-signed-release-images.md), on the files that hold the release and the chart's publishing
+- Changes: `.github/workflows/reusable-release.yml`, `reusable-security.yml` and `reusable-hotfix-branch.yml`; `.github/actions/` (`set-version`, `helm-publish`, `docker-login`, `report-findings`); `.github/check-pins.sh`; the callers `release.yml`, `ci.yml` (`security`, `publish`, `publish-docs`), `security.yml` and `hotfix-branch.yml`; the `helm` job and `make deploy-lint`; `dependabot.yml`; the comments of `.gitleaks.toml`, `.semgrepignore`, `.trivyignore`, the chart's `Chart.yaml` and `deploy/release/assets.sh`; `runner-artifacts.yml` (its comments, its `check` job and the dispatch's choice of runner) and section 1 of `docs/operations/auto-deploy.md`; CONTRIBUTING §5; `.gitignore`; CONVENTIONS §12
+
+## Context
+
+- A contributor must be able to read the release, the hotfix cut and the scan that gates their pull request.
+
+## Decision
+
+**The release, hotfix and security workflows, and the composite actions they and `ci.yml` use, are files of this repository.**
+
+1. **The files.** The release, hotfix and security workflows as `reusable-release.yml`, `reusable-hotfix-branch.yml` and `reusable-security.yml`, called by `release.yml`, `hotfix-branch.yml`, `ci.yml` and `security.yml` as `./.github/workflows/…`; the actions `set-version`, `helm-publish`, `docker-login` and `report-findings` under `.github/actions/`, called as `./.github/actions/…`.
+2. **What they do.** `reusable-release.yml` takes an `environment`, in which its `tag` and `next` jobs run, so they read the release App's key from the environment `release-deploy` and only from the branches it allows (H3); a component may pass `build_args` (`release.yml`: `CACHE_SCOPE=main`); every third-party action is pinned by commit SHA with its release in a comment, every scanner image by digest, and semgrep's rule against mutable action tags is not excluded (M18). The `run:` scripts pass this repository's shellcheck (through actionlint). The hotfix cut keeps the commit's actions across its switch to the release tag. The commits of the hotfix cut are authored as `github-actions[bot]`. Two hardenings: `set-version` runs `npm version` with `--ignore-scripts`, since `tag` and `next` hold a token that may push past `main`'s ruleset and a package's lifecycle script would run with it; and `next` checks out the commit `tag` pushed, not the branch's moving head, so the actions it runs are the released ones (its push still rebases onto the branch). The hotfix cut versions the same manifests as the release, `model-api/pom.xml` among them.
+3. **Local actions need the workspace.** GitHub reads a local action from the job's checked-out workspace when its step runs. Every job that uses one checks this repository out first, with a plain checkout: a sparse one makes the repository a blob-less partial clone, and on a self-hosted runner whose workspace later jobs share, a later job's `git merge-tree` or `git log -p` would then need to fetch blobs it cannot.
+4. **The pins are checked.** `.github/check-pins.sh` fails on any `uses:`, in the workflows or in any `action.y*ml` of the repository and in any spelling YAML allows on one line, that is not a local path, a third-party action at a 40-character commit SHA, or a `docker://` image at a digest, and on a scanner image without a digest. CI's `helm` job and `make deploy-lint` run it. Dependabot bumps the actions of the workflows and of `.github/actions/*`; the scanner images move by hand.
+
+## Consequences
+
+- A release runs with the release App's key in `release-deploy`, one of the environments that §4 of the security review asks for.
+- Nothing outside this repository is needed to read, review or change what CI runs.
+- The release's jobs are defined in this repository's own files, which a pull request can change, and a fork's pull request runs the workflow files of its own head, so nothing in the code keeps it off a self-hosted runner group that allows public repositories. The release's jobs run on GitHub-hosted `ubuntu-latest`, a fresh VM for each job, unless the repository variable `CI_RELEASE_RUNNER` names a runner group of their own, as the other jobs take `CI_RUNNER`. With such a group, the isolation of the release runners rests on settings: this repository in that group, with "Allow public repositories" only together with "Workflow access: Selected workflows" naming `release.yml`, `reusable-release.yml` and `runner-artifacts.yml` at `refs/heads/main` (and a hotfix branch's ref for its release); on the repository, "Require approval for all outside collaborators" for fork pull requests. The group admits the jobs defined in a selected workflow also when another workflow calls it, so allowing `reusable-release.yml` and `runner-artifacts.yml` would let a workflow on any branch, or a fork's pull request, call them at `main` with the release runners as their `runner`. Their first job therefore settles the label before any other job takes it (`caller` in `reusable-release.yml`, `check` in `runner-artifacts.yml`): the release runners only for `release.yml`'s run from `main` or a hotfix branch, a CI runner for any run, and no other label. `runner-artifacts.yml` builds a versioned release from its own tag only, and a dispatch by hand takes only a CI runner's label or `ubuntu-latest`, so what it runs there is a release tag's commit, created by the release alone under a tag ruleset on `v*`.
+
+## Alternatives considered
+
+- **Inline the steps into this repository's own workflow files.** No reusable workflows at all, but the release alone is about 600 lines; keeping it a separate called workflow keeps `release.yml` to the gate, the signing and the inputs.

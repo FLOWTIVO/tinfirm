@@ -1,0 +1,1 @@
+{"type": "run.rejected", "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e", "epoch": 3, "reason": "an earlier run of task MYCO-12 is still ending on this host", "code": "TASK_RUN_ACTIVE"}

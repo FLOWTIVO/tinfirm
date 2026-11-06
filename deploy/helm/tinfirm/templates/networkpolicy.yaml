@@ -1,0 +1,118 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Ingress: the application port from the ingress controller and the configured extra peers
+# (from any source while neither is set), and optionally the management port from the
+# metrics scraper. Nothing else.
+# Egress (when enabled): DNS, PostgreSQL, the bundled LiteLLM, the OIDC issuers, https to
+# public addresses (the company's systems), plus configured extras (such as a company MCP
+# server in another namespace). The LiteLLM pods have a policy of their own
+# (litellm-networkpolicy.yaml).
+# Vanilla NetworkPolicy is L3/L4: it cannot pin host names, so the database, issuer and
+# systems rules are port-scoped; narrow their `to` peers where the addresses are stable.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tinfirm.fullname" . }}
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tinfirm.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    {{- if or $np.ingress.controller $np.ingress.extraFrom }}
+    - from:
+        {{- with $np.ingress.controller }}
+        - namespaceSelector:
+            {{- toYaml (.namespaceSelector | default dict) | nindent 12 }}
+          {{- with .podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+        {{- with $np.ingress.extraFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+    {{- else }}
+    # No controller named (networkPolicy.ingress.controller): any source, on this port only.
+    - ports:
+    {{- end }}
+        - protocol: TCP
+          port: 8080
+    {{- if $np.ingress.metrics.enabled }}
+    - from:
+        - namespaceSelector:
+            {{- toYaml ($np.ingress.metrics.namespaceSelector | default dict) | nindent 12 }}
+          {{- with $np.ingress.metrics.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      ports:
+        - protocol: TCP
+          port: 8081
+    {{- end }}
+  {{- if $np.egress.enabled }}
+  egress:
+    {{- include "tinfirm.networkPolicy.dnsEgress" . | nindent 4 }}
+    # PostgreSQL.
+    - to:
+        {{- toYaml $np.egress.database.to | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $np.egress.database.port | default .Values.database.port }}
+    {{- if .Values.litellm.enabled }}
+    # The bundled LiteLLM: its admin API (TINFIRM_LITELLM_ADMIN_URL), and the model port
+    # (TINFIRM_LITELLM_MODEL_URL) for the model requests the server relays and its own.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "tinfirm.litellm.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4000
+        - protocol: TCP
+          port: 4001
+    {{- end }}
+    {{- if .Values.auth.oidc.providers }}
+    # OIDC issuers.
+    - to:
+        {{- toYaml $np.egress.oidc.to | nindent 8 }}
+      ports:
+        {{- range $np.egress.oidc.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- if include "tinfirm.samlMetadataUrls" . }}
+    # SAML providers' metadata URLs.
+    - to:
+        {{- toYaml $np.egress.saml.to | nindent 8 }}
+      ports:
+        {{- range $np.egress.saml.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- with $np.egress.systems }}
+    {{- if .to }}
+    # The company's systems and the other services on the internet, over https.
+    - to:
+        {{- toYaml .to | nindent 8 }}
+      ports:
+        {{- range .ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- with $np.egress.extra }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

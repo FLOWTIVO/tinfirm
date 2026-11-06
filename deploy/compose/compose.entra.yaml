@@ -1,0 +1,52 @@
+# OIDC login with Microsoft Entra ID. An example for a single-host deployment; layer it on
+# compose.yaml (no profile needed, Entra ID is not a local container):
+#
+#   docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.entra.yaml up -d
+#
+# Set these in deploy/compose/.env (docs/operations/entra-id.md shows where each value
+# comes from in the Entra admin center):
+#   TINFIRM_ENTRA_TENANT_ID       Directory (tenant) ID
+#   TINFIRM_ENTRA_CLIENT_ID       Application (client) ID of the app registration
+#   TINFIRM_ENTRA_CLIENT_SECRET   Client secret value
+# and, optionally (ADR-0075):
+#   TINFIRM_ENTRA_EMAIL_DOMAINS   Comma-separated email domains; only these get an account.
+#                                 Empty: any email of the tenant.
+#   TINFIRM_ENTRA_ROLE_CLAIM      `roles`: Entra ID then decides each member's role at every
+#                                 sign-in from the app roles below (ADR-0088). Empty: the app
+#                                 decides, and a new member gets TINFIRM_ENTRA_ROLE once.
+#   TINFIRM_ENTRA_ROLE_MAP_ADMIN, _MEMBER, _VIEWER
+#                                 The app role values for each role, e.g. Tinfirm.Admin,
+#                                 Tinfirm.Member and Tinfirm.Viewer. Only with the claim.
+#   TINFIRM_ENTRA_ROLE            MEMBER (default), ADMIN or VIEWER: without the claim, the
+#                                 role of a new member
+# Register ${TINFIRM_PUBLIC_URL}/login/oauth2/code/entra as a Web redirect URI.
+#
+# As with compose.oidc.yaml, the server fetches the issuer's discovery document at startup:
+# it does not start while login.microsoftonline.com is unreachable.
+
+services:
+  server:
+    environment:
+      # Registration id `entra`. Use lowercase letters and digits only: Spring Boot maps
+      # these variables to the registration id in lower case.
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ENTRA_CLIENT_ID: ${TINFIRM_ENTRA_CLIENT_ID:?is not set in deploy/compose/.env}
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ENTRA_CLIENT_SECRET: ${TINFIRM_ENTRA_CLIENT_SECRET:?is not set in deploy/compose/.env}
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ENTRA_CLIENT_NAME: Microsoft
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ENTRA_AUTHORIZATION_GRANT_TYPE: authorization_code
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ENTRA_SCOPE: openid,profile,email
+      # The tenant-specific v2.0 issuer. Never `common` or `organizations`: those accept
+      # every tenant, and their discovery document does not match the issuer anyway.
+      SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_ENTRA_ISSUER_URI: https://login.microsoftonline.com/${TINFIRM_ENTRA_TENANT_ID:?is not set in deploy/compose/.env}/v2.0
+      # Entra ID sends no email_verified claim. TRUST_ISSUER lets the tenant assert the
+      # email (CONVENTIONS §5; security note in docs/operations/entra-id.md).
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_EMAIL_TRUST: TRUST_ISSUER
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_EMAIL_CLAIMS: email,preferred_username,verified_primary_email
+      # A new user from the tenant joins the company `main` of compose.yaml (ADR-0075).
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_COMPANY: main
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_ROLE: ${TINFIRM_ENTRA_ROLE:-MEMBER}
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_EMAIL_DOMAINS: ${TINFIRM_ENTRA_EMAIL_DOMAINS:-}
+      # Who decides a member's role (ADR-0088): Entra ID's app roles when the claim is set.
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_ROLE_CLAIM: ${TINFIRM_ENTRA_ROLE_CLAIM:-}
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_ROLE_MAP_ADMIN: ${TINFIRM_ENTRA_ROLE_MAP_ADMIN:-}
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_ROLE_MAP_MEMBER: ${TINFIRM_ENTRA_ROLE_MAP_MEMBER:-}
+      TINFIRM_AUTH_OIDC_PROVIDERS_ENTRA_ROLE_MAP_VIEWER: ${TINFIRM_ENTRA_ROLE_MAP_VIEWER:-}

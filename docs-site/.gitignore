@@ -1,0 +1,4 @@
+# `make docs-serve` and `make docs-build`: the virtual environment, the built site, Zensical's cache.
+.venv/
+site/
+.cache/

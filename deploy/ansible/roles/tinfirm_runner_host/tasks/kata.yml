@@ -1,0 +1,112 @@
+---
+- name: Load the vhost modules at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/kata-containers.conf
+    content: |
+      vhost
+      vhost_net
+      vhost_vsock
+    mode: "0644"
+
+- name: Load the vhost modules now
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  loop: [vhost, vhost_net, vhost_vsock]
+  changed_when: false
+
+- name: Create the download cache
+  ansible.builtin.file:
+    path: "{{ _tinfirm_runner_host_cache_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Download the Kata Containers static release
+  ansible.builtin.get_url:
+    url: "{{ tinfirm_runner_host_kata_download_url }}/{{ tinfirm_runner_host_kata_version }}/{{ tinfirm_runner_host_kata_tarball }}"
+    dest: "{{ _tinfirm_runner_host_cache_dir }}/{{ tinfirm_runner_host_kata_tarball }}"
+    checksum: "{{ _tinfirm_runner_host_kata_checksum }}"
+    mode: "0644"
+
+# The release is built for /opt/kata. A marker per version unpacks a new version once.
+- name: Unpack Kata Containers into /opt/kata
+  ansible.builtin.unarchive:
+    src: "{{ _tinfirm_runner_host_cache_dir }}/{{ tinfirm_runner_host_kata_tarball }}"
+    dest: /
+    remote_src: true
+    creates: "{{ _tinfirm_runner_host_kata_marker }}"
+  register: _tinfirm_runner_host_kata_unpacked
+
+- name: Mark the unpacked version
+  ansible.builtin.copy:
+    dest: "{{ _tinfirm_runner_host_kata_marker }}"
+    content: "{{ tinfirm_runner_host_kata_tarball }}\n"
+    mode: "0644"
+
+- name: Create /etc/kata-containers
+  ansible.builtin.file:
+    path: /etc/kata-containers
+    state: directory
+    mode: "0755"
+
+- name: Look for the Kata configuration
+  ansible.builtin.stat:
+    path: "{{ _tinfirm_runner_host_kata_config }}"
+  register: _tinfirm_runner_host_kata_config_stat
+
+# Cloud Hypervisor's configuration, copied when Kata is installed or upgraded. There is no
+# `privileged_without_host_devices` to set here: that is a containerd CRI and CRI-O option,
+# and Docker has none. The runner host never makes a sandbox privileged (ADR-0025).
+- name: Use the Cloud Hypervisor configuration
+  ansible.builtin.copy:
+    src: "{{ tinfirm_runner_host_kata_config_template }}"
+    dest: "{{ _tinfirm_runner_host_kata_config }}"
+    remote_src: true
+    mode: "0644"
+  when: _tinfirm_runner_host_kata_unpacked is changed or not _tinfirm_runner_host_kata_config_stat.stat.exists
+
+- name: Apply the site's changes to the Kata configuration
+  ansible.builtin.lineinfile:
+    path: "{{ _tinfirm_runner_host_kata_config }}"
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+  loop: "{{ tinfirm_runner_host_kata_config_lines }}"
+
+- name: Check that this machine can run Kata Containers
+  ansible.builtin.command:
+    argv:
+      - "{{ _tinfirm_runner_host_kata_runtime_cli }}"
+      - --config
+      - "{{ _tinfirm_runner_host_kata_config }}"
+      - check
+      - --no-network-checks
+  changed_when: false
+
+# Docker must know the runtime before the smoke test and the image build.
+- name: Restart Docker now if its configuration changed
+  ansible.builtin.meta: flush_handlers
+
+- name: Smoke-test the Kata runtime
+  when: tinfirm_runner_host_kata_smoke_test_image | length > 0
+  block:
+    - name: Run a container under the Kata runtime
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --runtime
+          - "{{ tinfirm_runner_host_kata_runtime_name }}"
+          - "{{ tinfirm_runner_host_kata_smoke_test_image }}"
+          - uname
+          - -r
+      register: _tinfirm_runner_host_kata_guest_kernel
+      changed_when: false
+
+    - name: Check that the container ran on the VM's own kernel
+      ansible.builtin.assert:
+        that:
+          - _tinfirm_runner_host_kata_guest_kernel.stdout | trim != ansible_facts['kernel']
+        fail_msg: >-
+          The container reported this machine's kernel ({{ ansible_facts['kernel'] }}):
+          Docker did not start it in a Kata VM.
+        success_msg: "Kata VM kernel: {{ _tinfirm_runner_host_kata_guest_kernel.stdout | trim }}"

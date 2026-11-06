@@ -1,0 +1,38 @@
+{{- if .Values.litellm.enabled }}
+# The bundled LiteLLM's settings (ADR-0059; docs/operations/litellm.md), the same as
+# deploy/compose/litellm/config.yaml: change both together. No models and no provider keys:
+# they live in LiteLLM's database, added through its admin API. A setting in this file wins
+# over the same setting stored in the database through the admin API.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tinfirm.litellm.fullname" . }}
+  labels:
+    {{- include "tinfirm.litellm.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    general_settings:
+      # Models and provider keys are added with POST /model/new and kept in the database,
+      # encrypted with the salt key.
+      store_model_in_db: true
+      # Prompts and answers are never stored (security review 2026-10-12, row 17): the spend
+      # logs keep who, which model, tokens and cost, never the request or response bodies.
+      store_prompts_in_spend_logs: false
+      # LiteLLM_ErrorLogs would keep a failed request's arguments and the provider's error
+      # text, either of which may quote the prompt.
+      disable_error_logs: true
+      {{- with include "tinfirm.litellm.databaseParams" . | fromJson }}
+      # The chart's litellm.database.params (not in the Compose config): appended to the
+      # database URL, over LiteLLM's own defaults.
+      database_extra_connection_params:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    litellm_settings:
+      # No message content to logging callbacks either, should anyone add one.
+      turn_off_message_logging: true
+      # Structured logs on stdout, like the server's.
+      json_logs: true
+      # A spent budget is 429 budget_exceeded, which the server's relay takes for a key whose
+      # budget is spent; from v1.105.1 LiteLLM answers 422 unless this says otherwise.
+      budget_exceeded_status_code: 429
+{{- end }}

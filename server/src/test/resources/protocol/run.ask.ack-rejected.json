@@ -1,0 +1,8 @@
+{
+  "type": "run.ask.ack",
+  "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f",
+  "requestId": "01926f3e-9d00-7c00-8e11-1d2e3f4a5b72",
+  "status": "REJECTED",
+  "code": "TASK_CLOSED",
+  "message": "The task is DONE, so nobody will answer. Put the question in your summary."
+}

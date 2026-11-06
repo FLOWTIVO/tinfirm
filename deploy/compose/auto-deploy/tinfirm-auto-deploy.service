@@ -1,0 +1,28 @@
+# Template: install.sh replaces @USER@ with the deploy user and installs it as
+# /etc/systemd/system/tinfirm-auto-deploy.service. tinfirm-auto-deploy.timer starts it.
+[Unit]
+Description=Tinfirm auto-deploy: deploy the newest main build
+Documentation=https://github.com/FLOWTIVO/tinfirm/blob/main/docs/operations/auto-deploy.md
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=@USER@
+ExecStart=/usr/local/bin/tinfirm-auto-deploy
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# A pull, a backup and a server start on a small VM; a hung download must not hold the
+# timer forever (a oneshot has no start timeout by default).
+TimeoutStartSec=45min
+# Sandboxing (M13 of the security review of 2026-10-27). The deploy user's Docker access is
+# root-equivalent whatever this says (docs/operations/auto-deploy.md, section 4); these keep
+# the script itself, and anything it runs, from gaining privileges or writing the system:
+# no setuid (so no sudo: the runner host's reload goes through
+# tinfirm-auto-deploy-reload.path), /usr, /boot and /etc read-only, its own /tmp. It writes
+# only the deploy user's home (Compose directory, state, backups, runner binary) and talks
+# to Docker over its socket.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true

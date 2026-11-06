@@ -1,0 +1,59 @@
+{{- $route := .Values.httpRoute }}
+{{- if $route.enabled }}
+{{- if not $route.parentRefs }}
+{{- fail "httpRoute.parentRefs: name the Gateway listener the route attaches to (its https listener)" }}
+{{- end }}
+# Gateway API: the Gateway's https listener to the Service's http port (8080). Management (8081)
+# is never routed.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "tinfirm.fullname" . }}
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+  {{- with $route.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- toYaml $route.parentRefs | nindent 4 }}
+  {{- with $route.hostnames }}
+  hostnames:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - matches:
+        {{- toYaml $route.matches | nindent 8 }}
+      backendRefs:
+        - name: {{ include "tinfirm.fullname" . }}
+          port: {{ .Values.service.port }}
+{{- with $route.redirectParentRefs }}
+---
+# Plain http -> https on the listeners of httpRoute.redirectParentRefs: the session cookie is
+# Secure, so a login over plain http would fail. No backend: every request gets the redirect.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "tinfirm.redirectHttpsName" $ }}
+  labels:
+    {{- include "tinfirm.labels" $ | nindent 4 }}
+  {{- with $route.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs:
+    {{- toYaml . | nindent 4 }}
+  {{- with $route.hostnames }}
+  hostnames:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301
+{{- end }}
+{{- end }}

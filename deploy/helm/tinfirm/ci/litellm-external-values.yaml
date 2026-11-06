@@ -1,0 +1,6 @@
+# `helm lint` / `helm template` without the bundled LiteLLM (CI and `make helm-lint`): a
+# company that brings its own, entered in Tinfirm's Model settings (package 2).
+image:
+  tag: v0.1.0
+litellm:
+  enabled: false

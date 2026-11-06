@@ -1,0 +1,2224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tinfirm.dev/protocol/runner-v1.schema.json",
+  "title": "Tinfirm runner protocol v1",
+  "description": "Messages on the WebSocket between a runner host and the server (GET /api/runner/v1/connect, header `Authorization: Bearer <runner host token>`). Every frame is one UTF-8 JSON text message that matches `Message`. Unknown fields must be ignored; unknown message types must be answered with an `error` and otherwise ignored. See docs/archive/v1/CONVENTIONS.md §15 for the behaviour; the sections this schema names are that document's.",
+  "$ref": "#/$defs/Message",
+  "$defs": {
+    "Message": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Hello"
+        },
+        {
+          "$ref": "#/$defs/Welcome"
+        },
+        {
+          "$ref": "#/$defs/RunAssign"
+        },
+        {
+          "$ref": "#/$defs/RunAccepted"
+        },
+        {
+          "$ref": "#/$defs/RunRejected"
+        },
+        {
+          "$ref": "#/$defs/RunEvent"
+        },
+        {
+          "$ref": "#/$defs/RunHeartbeat"
+        },
+        {
+          "$ref": "#/$defs/RunFinished"
+        },
+        {
+          "$ref": "#/$defs/RunCancel"
+        },
+        {
+          "$ref": "#/$defs/RunRepositoryRequest"
+        },
+        {
+          "$ref": "#/$defs/RunRepositoryRequestAck"
+        },
+        {
+          "$ref": "#/$defs/RunTaskCreate"
+        },
+        {
+          "$ref": "#/$defs/RunTaskCreateAck"
+        },
+        {
+          "$ref": "#/$defs/RunAsk"
+        },
+        {
+          "$ref": "#/$defs/RunAskAck"
+        },
+        {
+          "$ref": "#/$defs/CredentialStatus"
+        },
+        {
+          "$ref": "#/$defs/HostConfig"
+        },
+        {
+          "$ref": "#/$defs/HostConfigApplied"
+        },
+        {
+          "$ref": "#/$defs/Error"
+        }
+      ]
+    },
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "Instant": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Runtime": {
+      "type": "string",
+      "enum": [
+        "CLAUDE_CODE",
+        "CODEX",
+        "PI",
+        "OPENCODE"
+      ],
+      "description": "`PI` and `OPENCODE` were added with ADR-0041 as an additive change of this schema: a server from before them refuses a hello that names them, so a host lists them in `runtimes` only with protocolVersion 2."
+    },
+    "CredentialKind": {
+      "type": "string",
+      "enum": [
+        "CLAUDE_LOGIN",
+        "CODEX_CHATGPT_AUTH",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY"
+      ]
+    },
+    "FailureClass": {
+      "type": "string",
+      "enum": [
+        "USAGE_LIMIT",
+        "SERVER_LIMITED",
+        "CONTEXT_OVERFLOW",
+        "LOGIN_EXPIRED",
+        "VENDOR_BLOCKED",
+        "CREDENTIAL_LEAK",
+        "PROTOCOL_ERROR",
+        "GUARD_STOPPED",
+        "GIT_ERROR",
+        "INFRA",
+        "RUNNER_UNAVAILABLE",
+        "MODEL_REFUSED"
+      ]
+    },
+    "Capacity": {
+      "description": "A number of concurrent runs: a runner host's slots or a credential's pool. The same bound applies to ceilings, desired values and effective values (CONVENTIONS §15.7).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16
+    },
+    "Hello": {
+      "description": "Runner host -> server, first frame after connect. `maxConcurrentRuns` and each credential's `poolSize` are the host's local ceilings, set by the machine owner (`run --max-concurrent-runs`, `credential add --pool`) and read when `run` starts. Desired values set in Tinfirm (host.config) can lower them, never raise them (CONVENTIONS §15.7).",
+      "type": "object",
+      "required": [
+        "type",
+        "protocolVersion",
+        "runnerVersion",
+        "executors",
+        "isolationTiers",
+        "credentials",
+        "runtimes",
+        "maxConcurrentRuns"
+      ],
+      "properties": {
+        "type": {
+          "const": "hello"
+        },
+        "protocolVersion": {
+          "const": 1
+        },
+        "runnerVersion": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "os": {
+          "type": "string",
+          "examples": [
+            "macos",
+            "linux"
+          ]
+        },
+        "arch": {
+          "type": "string",
+          "examples": [
+            "aarch64",
+            "x86_64"
+          ]
+        },
+        "executors": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "docker"
+            ]
+          },
+          "minItems": 1
+        },
+        "isolationTiers": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "container",
+              "gvisor",
+              "microvm"
+            ]
+          },
+          "minItems": 1,
+          "description": "The isolation of the host's sandboxes (ADR-0006, ADR-0025). `microvm` (Kata Containers) was added with protocol v2 (package 8) as an additive change of this schema: a server from before protocol v2 refuses a hello that carries it, so a host sends `microvm` only with protocolVersion 2 and reports `container` here."
+        },
+        "maxConcurrentRuns": {
+          "$ref": "#/$defs/Capacity",
+          "description": "The host's ceiling of concurrent runs (`run --max-concurrent-runs`, 1 to 16)."
+        },
+        "credentials": {
+          "description": "Metadata only. Secret values never leave the runner host except into the sandbox of a run.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "kind",
+              "runtimes",
+              "poolSize"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+              },
+              "kind": {
+                "$ref": "#/$defs/CredentialKind"
+              },
+              "runtimes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Runtime"
+                },
+                "minItems": 1
+              },
+              "poolSize": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The credential's ceiling of concurrent runs (`credential add --pool`, 1 to 16)."
+              }
+            }
+          }
+        },
+        "runtimes": {
+          "description": "The runtimes this host can run: one entry per runtime whose image it found when it built this hello. The server stores the list and sends a run with `modelAccess` only to a host that lists the run's runtime (CONVENTIONS §14.4, ADR-0027); a runtime missing here means the image was missing, or Docker did not report it in time.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "runtime",
+              "image"
+            ],
+            "properties": {
+              "runtime": {
+                "$ref": "#/$defs/Runtime"
+              },
+              "image": {
+                "type": "string",
+                "examples": [
+                  "tinfirm-runner-claude:local"
+                ]
+              },
+              "version": {
+                "type": "string",
+                "description": "Pinned CLI and ACP adapter versions, e.g. `claude-code 2.1.287 / claude-agent-acp 0.87.0`"
+              }
+            }
+          }
+        },
+        "activeRuns": {
+          "description": "Runs still running in this runner host process when it reconnects after a network interruption. The server keeps a run whose epoch matches and whose lease has not expired, and answers run.cancel for any other. After a process restart the host sends an empty array.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "runId",
+              "epoch",
+              "lastSeq"
+            ],
+            "properties": {
+              "runId": {
+                "$ref": "#/$defs/Uuid"
+              },
+              "epoch": {
+                "type": "integer"
+              },
+              "lastSeq": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "Welcome": {
+      "description": "Server -> runner host, answer to hello. The server sends host.config right after it, and assigns runs to the host only after the host's first host.config.applied on this connection. Close codes: 4401 bad or revoked token (right after the upgrade), 4409 replaced by a newer connection of the same host, 1008 first frame not hello or invalid hello, 1002 unsupported protocolVersion, 1009 frame larger than 1 MiB, 1011 peer silent for 3 heartbeat intervals. The server sends WebSocket pings every heartbeat interval.",
+      "type": "object",
+      "required": [
+        "type",
+        "runnerHostId",
+        "companyId",
+        "heartbeatIntervalSeconds",
+        "leaseTtlSeconds"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome"
+        },
+        "runnerHostId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "companyId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "serverVersion": {
+          "type": "string"
+        },
+        "heartbeatIntervalSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "leaseTtlSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "RunAssign": {
+      "description": "Server -> runner host: start a run. The host answers run.accepted or run.rejected within 10 s. Exactly one of `credentialLabel` (a credential of this host) and `modelAccess` (a company model credential, ADR-0027) is present.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "agent",
+        "task",
+        "prompt",
+        "workspaces",
+        "requestableRepositories",
+        "limits"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.assign"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "credentialLabel": {
+          "type": "string",
+          "description": "The label of the host credential the run uses (hello.credentials). Absent for a run with `modelAccess`."
+        },
+        "modelAccess": {
+          "$ref": "#/$defs/ModelAccess"
+        },
+        "agent": {
+          "type": "object",
+          "required": [
+            "id",
+            "name",
+            "runtime"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Uuid"
+            },
+            "name": {
+              "type": "string"
+            },
+            "runtime": {
+              "$ref": "#/$defs/Runtime"
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "task": {
+          "type": "object",
+          "required": [
+            "id",
+            "key",
+            "title"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/Uuid"
+            },
+            "key": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            }
+          }
+        },
+        "prompt": {
+          "type": "string",
+          "description": "The full prompt text, rendered by the server (CONVENTIONS §15.5). The host sends it unchanged as the ACP session/prompt text."
+        },
+        "resumeSessionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ACP session id of the previous run of this agent on this task; the host tries session/load and falls back to session/new."
+        },
+        "workspaces": {
+          "type": "array",
+          "description": "The task's repositories, in the order the prompt lists them. Each is cloned into `/workspace/<dir>`; the agent's working directory is `/workspace`. Empty for tasks without repositories. The `dir` values are unique.",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/Workspace"
+          }
+        },
+        "requestableRepositories": {
+          "type": "array",
+          "description": "The other repositories of the task's project that the agent has access to and may ask for with the platform tool `request_repository` (CONVENTIONS §15.6). Not cloned. Empty when there are none.",
+          "items": {
+            "$ref": "#/$defs/RequestableRepository"
+          }
+        },
+        "limits": {
+          "type": "object",
+          "required": [
+            "maxWallClockSeconds",
+            "maxTurns"
+          ],
+          "properties": {
+            "maxWallClockSeconds": {
+              "type": "integer",
+              "minimum": 60
+            },
+            "maxTurns": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "resumePrompt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Short prompt with only what is new since the previous run (new comments). The host sends it instead of `prompt` when session/load of resumeSessionId succeeded."
+        },
+        "attachments": {
+          "type": "array",
+          "maxItems": 1000,
+          "description": "Files attached to the task (ADR-0014), already scanned for credentials by the server. Before it starts the sandbox, the host downloads each one with GET /api/runner/v1/runs/{runId}/attachments/{id}?epoch={epoch} (header `Authorization: Bearer <runner host token>`), checks sizeBytes and sha256, and mounts them read-only at /attachments/<fileName>. A 404 means the file was deleted meanwhile: the host skips it with a LOG event. Absent or empty: no attachments.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "fileName",
+              "sizeBytes",
+              "sha256"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/Uuid"
+              },
+              "fileName": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "description": "A single path segment: no `/`, `\\` or control characters, never `.` or `..`. Unique within the task."
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "credentialLabel"
+          ],
+          "not": {
+            "required": [
+              "modelAccess"
+            ]
+          }
+        },
+        {
+          "required": [
+            "modelAccess"
+          ],
+          "not": {
+            "required": [
+              "credentialLabel"
+            ]
+          }
+        }
+      ]
+    },
+    "ModelAccess": {
+      "description": "A company model credential (ADR-0027, ADR-0042): a provider's API key, or the endpoint of the company's model gateway and its key, revealed from the server vault for this run. The host uses no credential of its own for the run: it passes them into the sandbox environment as the runtime's variables (runner/README.md, Model access) and redacts the key like the git tokens of the run. Never logged.",
+      "type": "object",
+      "required": [
+        "format",
+        "apiKey"
+      ],
+      "properties": {
+        "format": {
+          "enum": [
+            "anthropic",
+            "openai",
+            "bedrock",
+            "google",
+            "openrouter",
+            "mistral",
+            "groq",
+            "xai",
+            "deepseek"
+          ],
+          "description": "The provider whose API the key opens: `anthropic` (the Messages API; CLAUDE_CODE, PI, OPENCODE), `openai` (CODEX, PI, OPENCODE), `bedrock` (Amazon Bedrock; CLAUDE_CODE, PI, OPENCODE), and `google` (the Gemini API), `openrouter`, `mistral`, `groq`, `xai`, `deepseek` (PI, OPENCODE). The server sends a format only with an agent whose runtime it serves."
+        },
+        "baseUrl": {
+          "type": "string",
+          "pattern": "^https://[^\\s]+$",
+          "description": "`anthropic` and `openai` only: the company's gateway, https, without user info, query or fragment, e.g. `https://litellm.example.com` for `anthropic` or `https://litellm.example.com/v1` for `openai`; the key is then sent as a bearer token. Absent: the provider's own API, with the key as its API key."
+        },
+        "region": {
+          "type": "string",
+          "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]+$",
+          "description": "`bedrock` only, and required there: the AWS region of the Bedrock endpoint, e.g. `us-east-1`."
+        },
+        "accessKeyId": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]{16,128}$",
+          "description": "`bedrock` only: an AWS access key ID, whose secret access key is `apiKey`. Absent: `apiKey` is an Amazon Bedrock API key (a bearer token)."
+        },
+        "apiKey": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The key: a provider's API key, a gateway key such as a LiteLLM virtual key, an Amazon Bedrock API key, or the secret access key of `accessKeyId`."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "const": "bedrock"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "region"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "region"
+                  ]
+                },
+                {
+                  "required": [
+                    "accessKeyId"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "anthropic",
+                  "openai"
+                ]
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "baseUrl"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "Workspace": {
+      "description": "One repository of the task (a component of its project). The runner host clones it into `/workspace/<dir>` and checks out `branch`.",
+      "type": "object",
+      "required": [
+        "componentId",
+        "dir",
+        "name",
+        "repoUrl",
+        "defaultBranch",
+        "branch"
+      ],
+      "properties": {
+        "componentId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "dir": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "maxLength": 64,
+          "description": "Directory name under `/workspace`, derived from the component name by the server (CONVENTIONS §14.7). Unique within the task and stable while the repository stays on the task.",
+          "examples": [
+            "server",
+            "web-app",
+            "web-app-2"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "description": "The component name, as shown to the agent"
+        },
+        "repoUrl": {
+          "type": "string"
+        },
+        "defaultBranch": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string",
+          "description": "The task branch, the same in every repository of the task",
+          "examples": [
+            "agent/MYCO-12"
+          ]
+        },
+        "git": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "HTTPS credentials for this repository (mirror, clone, the git proxy route and push). Used only by the runner host, never passed into the sandbox. Null for public repositories.",
+          "required": [
+            "username",
+            "token"
+          ],
+          "properties": {
+            "username": {
+              "type": "string",
+              "examples": [
+                "x-access-token"
+              ]
+            },
+            "token": {
+              "type": "string"
+            }
+          }
+        },
+        "authorName": {
+          "type": "string",
+          "description": "Git author for commits the host makes, e.g. `Tinfirm agent Backend engineer`"
+        },
+        "authorEmail": {
+          "type": "string"
+        },
+        "readOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "The agent may only read this repository (ADR-0017): the runner host clones it as usual but never pushes it, and reports `pushed: false`."
+        }
+      }
+    },
+    "RequestableRepository": {
+      "description": "A repository the agent may request: a component of the task's project that the agent has access to and that is not on the task.",
+      "type": "object",
+      "required": [
+        "componentId",
+        "name",
+        "repoUrl",
+        "pendingRequest"
+      ],
+      "properties": {
+        "componentId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "name": {
+          "type": "string"
+        },
+        "repoUrl": {
+          "type": "string"
+        },
+        "pendingRequest": {
+          "type": "boolean",
+          "description": "True when the task already has a PENDING request for this repository"
+        }
+      }
+    },
+    "RunAccepted": {
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.accepted"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        }
+      }
+    },
+    "RunRejected": {
+      "description": "The host cannot take the run. The server puts the run back in the queue, dispatches it again after 10 s at the earliest, and shows the reason as the run's queue reason (CONVENTIONS §14.8).",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.rejected"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Text for humans, e.g. `no free slot (2 of 2 runs active)`. Never contains secrets."
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why, machine-readable (CONVENTIONS §15.4 step 1). The server treats TASK_RUN_ACTIVE specially; every other code, and a missing one, is shown with `reason`.",
+          "examples": [
+            "DRAINING",
+            "STALE_EPOCH",
+            "UNKNOWN_CREDENTIAL",
+            "CREDENTIAL_UNAVAILABLE",
+            "INVALID_ASSIGNMENT",
+            "IMAGE_MISSING",
+            "DOCKER_UNAVAILABLE",
+            "TASK_RUN_ACTIVE",
+            "NO_FREE_SLOT",
+            "POOL_FULL"
+          ]
+        }
+      }
+    },
+    "RunEvent": {
+      "description": "Runner host -> server. `seq` starts at 1 per run and increases by 1. The server drops duplicates by (runId, seq) and rejects stale epochs. Size limits: the whole frame stays under 1 MiB; hosts cap a payload at 256 KiB, split long texts into chunks of at most 32 KiB, and cut each diff to 16 KiB.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "seq",
+        "eventType",
+        "at",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.event"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "at": {
+          "$ref": "#/$defs/Instant"
+        },
+        "eventType": {
+          "enum": [
+            "AGENT_MESSAGE",
+            "AGENT_THOUGHT",
+            "TOOL_CALL",
+            "TOOL_CALL_UPDATE",
+            "PLAN",
+            "USAGE",
+            "RATE_LIMIT",
+            "STATUS",
+            "GIT",
+            "LOG",
+            "ERROR"
+          ]
+        },
+        "payload": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "AGENT_MESSAGE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadText"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "AGENT_THOUGHT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadText"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "TOOL_CALL"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadToolCall"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "TOOL_CALL_UPDATE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadToolCallUpdate"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "PLAN"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadPlan"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "USAGE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadUsage"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "RATE_LIMIT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadRateLimit"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "STATUS"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadStatus"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "GIT"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadGit"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "LOG"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadLog"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "eventType": {
+                "const": "ERROR"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "$ref": "#/$defs/EventPayloadError"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "EventPayloadText": {
+      "description": "AGENT_MESSAGE / AGENT_THOUGHT: text chunks. The host coalesces ACP chunks and flushes at least every 250 ms.",
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "EventPayloadToolCall": {
+      "type": "object",
+      "required": [
+        "toolCallId",
+        "title",
+        "kind",
+        "status"
+      ],
+      "properties": {
+        "toolCallId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "read",
+            "edit",
+            "delete",
+            "move",
+            "search",
+            "execute",
+            "think",
+            "fetch",
+            "switch_mode",
+            "other"
+          ]
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "failed"
+          ]
+        },
+        "input": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Raw tool input; strings longer than 4 KiB are truncated"
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "EventPayloadToolCallUpdate": {
+      "type": "object",
+      "required": [
+        "toolCallId"
+      ],
+      "properties": {
+        "toolCallId": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "failed"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "output": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Text output; truncated to 16 KiB with a trailing marker"
+        },
+        "diffs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "newText"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "oldText": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "newText": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Each diff text is cut to 16 KiB"
+        }
+      }
+    },
+    "EventPayloadPlan": {
+      "type": "object",
+      "required": [
+        "entries"
+      ],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "content",
+              "status"
+            ],
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "in_progress",
+                  "completed"
+                ]
+              },
+              "priority": {
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "EventPayloadUsage": {
+      "type": "object",
+      "properties": {
+        "inputTokens": {
+          "type": "integer"
+        },
+        "outputTokens": {
+          "type": "integer"
+        },
+        "cachedInputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "contextUsed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "contextSize": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "costUsd": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "totalTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Exact total for the run so far"
+        },
+        "estimated": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "True when the input/output/cached split is estimated (Codex); totalTokens stays exact"
+        }
+      },
+      "description": "Cumulative totals for the whole run (CONVENTIONS §14.5)."
+    },
+    "EventPayloadRateLimit": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "allowed",
+            "allowed_warning",
+            "rejected"
+          ]
+        },
+        "utilization": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "resetsAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "window": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "examples": [
+            "five_hour",
+            "weekly"
+          ]
+        }
+      }
+    },
+    "EventPayloadStatus": {
+      "type": "object",
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "preparing",
+            "cloning",
+            "starting",
+            "running",
+            "finalizing",
+            "pushing",
+            "cancelling"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "EventPayloadGit": {
+      "description": "A git step in one repository of the run. Hosts always set componentId and dir; events stored before multi-repository runs have neither.",
+      "type": "object",
+      "required": [
+        "action",
+        "branch"
+      ],
+      "properties": {
+        "componentId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid"
+        },
+        "dir": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The repository's directory under `/workspace`"
+        },
+        "action": {
+          "enum": [
+            "cloned",
+            "committed",
+            "pushed",
+            "nothing_to_push"
+          ]
+        },
+        "branch": {
+          "type": "string"
+        },
+        "headSha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commits": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "EventPayloadLog": {
+      "type": "object",
+      "required": [
+        "level",
+        "message"
+      ],
+      "properties": {
+        "level": {
+          "enum": [
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "EventPayloadError": {
+      "type": "object",
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "failureClass": {
+          "$ref": "#/$defs/FailureClass"
+        }
+      }
+    },
+    "RunHeartbeat": {
+      "description": "Runner host -> server every heartbeatIntervalSeconds while at least one run is active. Renews the leases of the listed runs.",
+      "type": "object",
+      "required": [
+        "type",
+        "runs"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.heartbeat"
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "runId",
+              "epoch"
+            ],
+            "properties": {
+              "runId": {
+                "$ref": "#/$defs/Uuid"
+              },
+              "epoch": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      }
+    },
+    "RunFinished": {
+      "description": "Runner host -> server, exactly once per run, after the last run.event.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "outcome",
+        "lastSeq"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.finished"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "outcome": {
+          "enum": [
+            "SUCCEEDED",
+            "FAILED",
+            "CANCELLED"
+          ]
+        },
+        "lastSeq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failureClass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failureMessage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The agent's final message text (Markdown), at most 64 KiB"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the agent reported with the platform tool `finish_run` (CONVENTIONS §15.6), the last call of the run; null or absent when it did not call it. `summary` stays the agent's last message either way."
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ACP session id for resuming this agent on this task"
+        },
+        "git": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "One result per repository the host cloned, in the order of `run.assign.workspaces`. Empty for a run without repositories; null when the host got no git result (e.g. the run failed before cloning).",
+          "items": {
+            "$ref": "#/$defs/GitResult"
+          }
+        },
+        "usage": {
+          "$ref": "#/$defs/EventPayloadUsage"
+        }
+      }
+    },
+    "GitResult": {
+      "description": "The end state of one repository of a run.",
+      "type": "object",
+      "required": [
+        "componentId",
+        "branch",
+        "pushed"
+      ],
+      "properties": {
+        "componentId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "pushed": {
+          "type": "boolean",
+          "description": "True when this run pushed the branch. The host pushes only repositories with commits ahead of the default branch."
+        },
+        "headSha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commits": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Commits on the branch that are not on the default branch"
+        }
+      }
+    },
+    "RunResult": {
+      "description": "The structured result of a run: the agent's last `finish_run` call. Every text is trimmed, redacted like everything that leaves the host, and cut to its length.",
+      "type": "object",
+      "required": [
+        "outcome",
+        "summary"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "COMPLETED",
+            "BLOCKED"
+          ],
+          "description": "COMPLETED: the work is done and ready for review. BLOCKED: the agent cannot continue without a person."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000,
+          "description": "Markdown for the reviewer: what the agent did, how it verified it, and why it is blocked when it is"
+        },
+        "nextSteps": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "description": "What should happen next, one step per entry; empty or absent for none"
+        },
+        "openQuestions": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "description": "Questions for a person, one per entry; empty or absent for none. For BLOCKED, the server makes each one an ask."
+        }
+      }
+    },
+    "RunCancel": {
+      "description": "Server -> runner host. The host sends ACP session/cancel, waits up to 10 s, stops the sandbox, pushes WIP and answers run.finished with outcome CANCELLED.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.cancel"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        }
+      }
+    },
+    "RunRepositoryRequest": {
+      "description": "Runner host -> server: the agent called the platform tool `request_repository` (CONVENTIONS §15.6). The server answers with exactly one run.repository_request.ack with the same requestId, also for a stale epoch or an unknown run. The host does not buffer this message while disconnected; it may send the same frame again after a reconnect while the tool call still waits.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "requestId",
+        "name",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.repository_request"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid",
+          "description": "Generated by the host, one per tool call. A repeated requestId never creates a second repository request."
+        },
+        "componentId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "The entry of `run.assign.requestableRepositories` whose name matched `name` (case-insensitively), when one did. Otherwise the server looks the name up in the task's project."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "The repository name the agent asked for, trimmed"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "Why the agent needs it, trimmed, redacted like every text that leaves the host, and cut to 2000 characters"
+        }
+      }
+    },
+    "RunRepositoryRequestAck": {
+      "description": "Server -> runner host: the answer to one run.repository_request. PENDING means the request was stored and waits for a human; REJECTED means it was not stored. The host returns `message` to the agent as the tool result (an error result for REJECTED).",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "requestId",
+        "status",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.repository_request.ack"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "REJECTED"
+          ]
+        },
+        "repositoryRequestId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "The stored request (the API's RepositoryRequest.id); set when status is PENDING"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why the request was rejected; set when status is REJECTED",
+          "examples": [
+            "UNKNOWN_REPOSITORY",
+            "NO_ACCESS",
+            "ALREADY_ON_TASK",
+            "ALREADY_PENDING",
+            "TOO_MANY_REPOSITORIES",
+            "TOO_MANY_REQUESTS",
+            "TASK_CLOSED",
+            "RUN_NOT_ACTIVE",
+            "INVALID_REQUEST"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "Text for the agent, written by the server"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "PENDING"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "repositoryRequestId"
+            ],
+            "properties": {
+              "repositoryRequestId": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REJECTED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "RunTaskCreate": {
+      "description": "Runner host -> server: the agent called the platform tool `create_task` (CONVENTIONS §15.6). The server answers with exactly one run.task_create.ack with the same requestId, also for a stale epoch or an unknown run. The host does not buffer this message while disconnected; it may send the same frame again after a reconnect while the tool call still waits.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "requestId",
+        "title"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.task_create"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid",
+          "description": "Generated by the host, one per tool call. A repeated requestId never creates a second task."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "The new task's title, trimmed, redacted like every text that leaves the host, and cut to 200 characters"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 50000,
+          "description": "Markdown, trimmed, redacted and cut to 50000 characters; null or absent for none"
+        },
+        "repositories": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "description": "Names of components of the project for the new task, trimmed, without duplicates. Null or absent: the repositories of the run's task that the assignee may access. An empty array: none."
+        },
+        "assignee": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "The name of the agent of the company to assign the new task to, trimmed. Null or absent: the run's agent."
+        }
+      }
+    },
+    "RunTaskCreateAck": {
+      "description": "Server -> runner host: the answer to one run.task_create. CREATED means the task was stored; REJECTED means nothing was stored. The host returns `message` to the agent as the tool result (an error result for REJECTED).",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "requestId",
+        "status",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.task_create.ack"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "status": {
+          "enum": [
+            "CREATED",
+            "REJECTED"
+          ]
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "The new task (the API's Task.id); set when status is CREATED"
+        },
+        "taskKey": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The new task's key, e.g. WEB-13; set when status is CREATED"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why nothing was created; set when status is REJECTED",
+          "examples": [
+            "INVALID_REQUEST",
+            "UNKNOWN_REPOSITORY",
+            "UNKNOWN_AGENT",
+            "NO_ACCESS",
+            "TOO_MANY_TASKS",
+            "PROJECT_USES_TRACKER",
+            "TASK_KEY_TAKEN",
+            "RUN_NOT_ACTIVE"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "Text for the agent, written by the server"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "CREATED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "taskId",
+              "taskKey"
+            ],
+            "properties": {
+              "taskId": {
+                "type": "string"
+              },
+              "taskKey": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REJECTED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "RunAsk": {
+      "description": "Runner host -> server: the agent called the platform tool `ask_human` (CONVENTIONS §15.6, §18). The server answers with exactly one run.ask.ack with the same requestId, also for a stale epoch or an unknown run. The host does not buffer this message while disconnected; it may send the same frame again after a reconnect while the tool call still waits.",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "epoch",
+        "requestId",
+        "question"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.ask"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid",
+          "description": "Generated by the host, one per tool call. A repeated requestId never creates a second ask."
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000,
+          "description": "The question for a person, Markdown: trimmed, redacted like every text that leaves the host, and cut to 2000 characters"
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "description": "Answers the person can pick, trimmed and redacted, without duplicates (ignoring case); empty or absent for a free answer"
+        }
+      }
+    },
+    "RunAskAck": {
+      "description": "Server -> runner host: the answer to one run.ask. PENDING means the ask was stored, posted on the task and waits for a person; REJECTED means nothing was stored. The host returns `message` to the agent as the tool result (an error result for REJECTED).",
+      "type": "object",
+      "required": [
+        "type",
+        "runId",
+        "requestId",
+        "status",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "run.ask.ack"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "requestId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "REJECTED"
+          ]
+        },
+        "askId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "The stored ask (the API's Ask.id); set when status is PENDING"
+        },
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Why nothing was stored; set when status is REJECTED",
+          "examples": [
+            "RUN_NOT_ACTIVE",
+            "TASK_CLOSED",
+            "INVALID_REQUEST",
+            "TOO_MANY_ASKS"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "Text for the agent, written by the server"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "PENDING"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "askId"
+            ],
+            "properties": {
+              "askId": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REJECTED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CredentialStatus": {
+      "description": "Runner host -> server when a credential's state changes (usage limit hit, login expired, recovered).",
+      "type": "object",
+      "required": [
+        "type",
+        "label",
+        "status"
+      ],
+      "properties": {
+        "type": {
+          "const": "credential.status"
+        },
+        "label": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "AVAILABLE",
+            "COOLDOWN",
+            "INVALID"
+          ]
+        },
+        "cooldownUntil": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "HostConfig": {
+      "description": "Server -> runner host: the desired capacity settings of the host and its credentials, as set in Tinfirm (CONVENTIONS §15.7). Always the full state, never a delta. Sent right after welcome and after every change. The host applies it at once (it never cancels a running run to do so) and answers host.config.applied.",
+      "type": "object",
+      "required": [
+        "type",
+        "version",
+        "credentials"
+      ],
+      "properties": {
+        "type": {
+          "const": "host.config"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The host's configuration version. It increases by 1 with every change of a desired value of the host or of one of its credentials; 0 when none was ever set. The host ignores a host.config whose version is lower than the last one it applied on the current connection."
+        },
+        "desiredMaxConcurrentRuns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 16,
+          "description": "The desired number of concurrent runs on the host. Absent or null: none; the host uses its ceiling. A value above the ceiling is capped by the host."
+        },
+        "credentials": {
+          "type": "array",
+          "description": "The host's credentials that have a desired pool size, each label once. A credential that is not listed has none and uses its ceiling. The host ignores labels it does not know.",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "desiredPoolSize"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+              },
+              "desiredPoolSize": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The desired pool size. A value above the credential's ceiling is capped by the host."
+              }
+            }
+          }
+        }
+      }
+    },
+    "HostConfigApplied": {
+      "description": "Runner host -> server: the capacity the host uses now. It answers every host.config the host applies, and is sent unprompted, once the host has applied a host.config on the current connection, whenever an effective value, a ceiling or `draining` changes for a local reason (today: when the host starts to drain). The server stores these values and dispatches with them (CONVENTIONS §14.8, §15.7).",
+      "type": "object",
+      "required": [
+        "type",
+        "version",
+        "draining",
+        "maxConcurrentRuns",
+        "maxConcurrentRunsCeiling",
+        "credentials"
+      ],
+      "properties": {
+        "type": {
+          "const": "host.config.applied"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The version of the latest host.config the host applied on the current connection; the values below are based on it."
+        },
+        "draining": {
+          "type": "boolean",
+          "description": "True after SIGHUP or `tinfirm-runner-host drain`: the host finishes its active runs, rejects new ones (run.rejected code DRAINING) and then exits (CONVENTIONS §15.4 step 13)."
+        },
+        "maxConcurrentRuns": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16,
+          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining."
+        },
+        "maxConcurrentRunsCeiling": {
+          "$ref": "#/$defs/Capacity",
+          "description": "The host's ceiling, as in hello."
+        },
+        "credentials": {
+          "type": "array",
+          "description": "Every credential the host reported in hello, each label once.",
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "poolSize",
+              "poolSizeCeiling"
+            ],
+            "properties": {
+              "label": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+              },
+              "poolSize": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The effective pool: desiredPoolSize capped by the ceiling, or the ceiling without a desired value."
+              },
+              "poolSizeCeiling": {
+                "$ref": "#/$defs/Capacity",
+                "description": "The credential's ceiling, as in hello."
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "draining": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "maxConcurrentRuns": {
+                "const": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "draining": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "maxConcurrentRuns": {
+                "minimum": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Error": {
+      "description": "Either direction: a frame could not be processed. Never contains secrets.",
+      "type": "object",
+      "required": [
+        "type",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "code": {
+          "type": "string",
+          "examples": [
+            "BAD_MESSAGE",
+            "STALE_EPOCH",
+            "UNKNOWN_RUN",
+            "UNKNOWN_TYPE",
+            "UNKNOWN_CREDENTIAL",
+            "UNSUPPORTED_PROTOCOL",
+            "UNKNOWN_CREDENTIAL_KIND",
+            "INTERNAL_ERROR"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/Uuid"
+        },
+        "epoch": {
+          "type": "integer",
+          "description": "The epoch the error refers to, when it concerns one execution of a run"
+        }
+      }
+    }
+  }
+}

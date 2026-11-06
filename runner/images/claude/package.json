@@ -1,0 +1,11 @@
+{
+  "name": "tinfirm-runner-image-claude",
+  "private": true,
+  "description": "The npm packages of the CLAUDE_CODE runner image, installed with npm ci --ignore-scripts from package-lock.json.",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.87.0"
+  },
+  "overrides": {
+    "zod": "4.6.7"
+  }
+}

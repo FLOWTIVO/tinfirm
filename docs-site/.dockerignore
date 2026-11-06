@@ -1,0 +1,4 @@
+# The Dockerfile copies only what the build reads; keep local output out of the context.
+.venv
+site
+.cache

@@ -1,0 +1,17 @@
+{{- /*
+Traefik only (ingress.traefik.redirectHttps): http -> https for the Ingress. Traefik serves an
+Ingress on its http and https entrypoints alike; without this the login can run over plain http,
+where the browser drops the Secure session cookie. ingress.yaml references it.
+*/ -}}
+{{- if and .Values.ingress.enabled .Values.ingress.traefik.redirectHttps }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "tinfirm.redirectHttpsName" . }}
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+{{- end }}

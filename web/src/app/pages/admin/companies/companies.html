@@ -1,0 +1,124 @@
+<div class="flex flex-col gap-6">
+  <app-page-header
+    title="Companies"
+    description="Every company on this instance. Opening one you are not a member of is recorded in its audit log."
+  />
+
+  <p class="text-muted-foreground text-sm" data-testid="companies-declared">
+    Companies are declared in the deployment's configuration: <code>companies</code> in the Helm
+    values, or <code>TINFIRM_COMPANIES_&lt;KEY&gt;_NAME</code> in Docker Compose. The server creates
+    each one at its start; a company without a key is from before and stays as it is.
+  </p>
+
+  @if (!multiCompany()) {
+    <p
+      class="text-muted-foreground flex flex-wrap items-center gap-x-2 gap-y-1 text-sm"
+      data-testid="companies-edition"
+    >
+      <app-edition-badge feature="MULTI_COMPANY" />
+      <span class="min-w-0 flex-1 text-pretty"
+        >Several companies in one instance need an Enterprise licence.</span
+      >
+    </p>
+  } @else if (companiesLicensed(); as most) {
+    <p class="text-muted-foreground text-sm" data-testid="companies-licensed">
+      The licence allows up to {{ most }} companies.
+    </p>
+  }
+
+  @if (companies.firstLoad()) {
+    <app-list-skeleton [rows]="3" />
+  } @else if (companies.failed()) {
+    <app-error-state
+      [error]="companies.error()"
+      heading="Couldn't load companies"
+      (retry)="companies.retry()"
+    />
+  } @else if (companies.empty()) {
+    <div hlmEmpty class="border">
+      <div hlmEmptyHeader>
+        <div hlmEmptyMedia variant="icon">
+          <ng-icon name="lucideBuilding2" aria-hidden="true" />
+        </div>
+        <div hlmEmptyTitle>No companies yet</div>
+        <p hlmEmptyDescription>
+          Declare one in the deployment's configuration; the server creates it at its next start.
+        </p>
+      </div>
+    </div>
+  } @else {
+    <div hlmTableContainer class="bg-card rounded-xl border">
+      <table hlmTable>
+        <caption class="sr-only">
+          Companies on this instance
+        </caption>
+        <thead hlmTHead>
+          <tr hlmTr class="hover:bg-transparent">
+            <th hlmTh>Name</th>
+            <th hlmTh class="hidden w-36 sm:table-cell">Key</th>
+            <th hlmTh class="hidden w-28 sm:table-cell">Your role</th>
+            <th hlmTh class="hidden w-36 md:table-cell">Created</th>
+          </tr>
+        </thead>
+        <tbody hlmTBody>
+          @for (company of companies.items(); track company.id) {
+            <tr hlmTr>
+              <td hlmTd class="max-w-0 py-2.5">
+                <a
+                  class="focus-visible:ring-ring/50 block truncate rounded font-medium underline-offset-4 outline-none hover:underline focus-visible:ring-3"
+                  [routerLink]="['/c', company.id, 'inbox']"
+                  >{{ company.name }}</a
+                >
+              </td>
+              <td
+                hlmTd
+                class="text-muted-foreground hidden sm:table-cell"
+                data-testid="company-key"
+              >
+                @if (company.key) {
+                  <code class="text-xs">{{ company.key }}</code>
+                } @else {
+                  Not declared
+                }
+              </td>
+              <td hlmTd class="text-muted-foreground hidden sm:table-cell">
+                @if (company.myRole) {
+                  <app-role-badge [role]="company.myRole" />
+                } @else {
+                  Not a member
+                }
+              </td>
+              <td hlmTd class="text-muted-foreground hidden md:table-cell">
+                <app-time [value]="company.createdAt" />
+              </td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+
+    @if (companies.moreFailed()) {
+      <app-error-state
+        [error]="companies.error()"
+        heading="Couldn't load more"
+        (retry)="companies.retry()"
+      />
+    } @else if (companies.hasMore()) {
+      <div class="flex justify-center">
+        <button
+          hlmBtn
+          variant="outline"
+          size="sm"
+          type="button"
+          [disabled]="companies.loadingMore()"
+          (click)="companies.loadMore()"
+        >
+          @if (companies.loadingMore()) {
+            <hlm-spinner aria-hidden="true" />
+          }
+          Load more
+        </button>
+      </div>
+    }
+  }
+</div>

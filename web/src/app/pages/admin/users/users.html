@@ -1,0 +1,336 @@
+<div class="flex flex-col gap-6">
+  <app-page-header
+    title="Users"
+    description="Everyone with an account on this instance. Local accounts sign in with a password, SSO accounts through an identity provider."
+  >
+    <button hlmBtn type="button" (click)="openCreate()">
+      <ng-icon name="lucideUserPlus" aria-hidden="true" />
+      New user
+    </button>
+  </app-page-header>
+
+  @if (users.firstLoad()) {
+    <app-list-skeleton [rows]="5" />
+  } @else if (users.failed()) {
+    <app-error-state
+      [error]="users.error()"
+      heading="Couldn't load users"
+      (retry)="users.retry()"
+    />
+  } @else {
+    <div hlmTableContainer class="bg-card rounded-xl border">
+      <table hlmTable>
+        <caption class="sr-only">
+          Users of this instance
+        </caption>
+        <thead hlmTHead>
+          <tr hlmTr class="hover:bg-transparent">
+            <th hlmTh>User</th>
+            <th hlmTh class="hidden w-24 sm:table-cell">Sign-in</th>
+            <th hlmTh class="w-20 sm:w-28">Admin</th>
+            <th hlmTh class="hidden w-28 sm:table-cell">Status</th>
+            <th hlmTh class="hidden w-32 lg:table-cell">Last sign-in</th>
+            <th hlmTh class="w-12"><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody hlmTBody>
+          @for (user of users.items(); track user.id) {
+            @let isMe = user.id === myId();
+            @let busy = busyId() === user.id;
+            <tr hlmTr [class.opacity-60]="!user.active">
+              <td hlmTd class="max-w-0 py-2">
+                <div class="flex min-w-0 items-center gap-3">
+                  <span
+                    class="bg-muted hidden size-8 shrink-0 items-center justify-center rounded-full text-xs font-medium sm:flex"
+                    aria-hidden="true"
+                    >{{ initialsOf(user.displayName) }}</span
+                  >
+                  <div class="flex min-w-0 flex-col">
+                    <span class="flex items-center gap-1.5 truncate font-medium">
+                      <span class="truncate">{{ user.displayName }}</span>
+                      @if (isMe) {
+                        <span hlmBadge variant="secondary">You</span>
+                      }
+                    </span>
+                    <span class="text-muted-foreground truncate text-xs">{{ user.email }}</span>
+                  </div>
+                </div>
+              </td>
+              <td hlmTd class="hidden sm:table-cell">
+                <span hlmBadge variant="outline">{{
+                  user.authSource === 'LOCAL' ? 'Local' : 'SSO'
+                }}</span>
+              </td>
+              <td hlmTd>
+                <hlm-switch
+                  #adminSwitch
+                  [checked]="user.instanceAdmin"
+                  [disabled]="busy"
+                  [aria-label]="'Instance admin: ' + user.displayName"
+                  (checkedChange)="setInstanceAdmin(user, $event, adminSwitch)"
+                />
+              </td>
+              <td hlmTd class="hidden sm:table-cell">
+                @if (user.active) {
+                  <span hlmBadge variant="secondary">Active</span>
+                } @else {
+                  <span hlmBadge variant="destructive">Deactivated</span>
+                }
+              </td>
+              <td hlmTd class="text-muted-foreground hidden lg:table-cell">
+                @if (user.lastLoginAt) {
+                  <app-time [value]="user.lastLoginAt" />
+                } @else {
+                  Never
+                }
+              </td>
+              <td hlmTd class="text-end">
+                <button
+                  hlmBtn
+                  variant="ghost"
+                  size="icon-sm"
+                  type="button"
+                  [disabled]="busy"
+                  [hlmDropdownMenuTrigger]="actions"
+                  align="end"
+                  [attr.aria-label]="'Actions for ' + user.displayName"
+                >
+                  <ng-icon name="lucideEllipsis" aria-hidden="true" />
+                </button>
+                <ng-template #actions>
+                  <hlm-dropdown-menu class="w-52">
+                    @if (user.authSource === 'LOCAL') {
+                      <button hlmDropdownMenuItem type="button" (triggered)="openSetPassword(user)">
+                        <ng-icon name="lucideKeyRound" aria-hidden="true" />
+                        Set password…
+                      </button>
+                    }
+                    @if (user.active) {
+                      <button
+                        hlmDropdownMenuItem
+                        type="button"
+                        variant="destructive"
+                        [disabled]="isMe"
+                        (triggered)="askDeactivate(user)"
+                      >
+                        <ng-icon name="lucideUserX" aria-hidden="true" />
+                        {{ isMe ? "Can't deactivate yourself" : 'Deactivate…' }}
+                      </button>
+                    } @else {
+                      <button hlmDropdownMenuItem type="button" (triggered)="activate(user)">
+                        <ng-icon name="lucideUserCheck" aria-hidden="true" />
+                        Activate
+                      </button>
+                    }
+                  </hlm-dropdown-menu>
+                </ng-template>
+              </td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+
+    @if (users.moreFailed()) {
+      <app-error-state
+        [error]="users.error()"
+        heading="Couldn't load more"
+        (retry)="users.retry()"
+      />
+    } @else if (users.hasMore()) {
+      <div class="flex justify-center">
+        <button
+          hlmBtn
+          variant="outline"
+          size="sm"
+          type="button"
+          [disabled]="users.loadingMore()"
+          (click)="users.loadMore()"
+        >
+          @if (users.loadingMore()) {
+            <hlm-spinner aria-hidden="true" />
+          }
+          Load more
+        </button>
+      </div>
+    }
+  }
+</div>
+
+<!-- Create user -->
+<hlm-dialog [state]="createOpen() ? 'open' : 'closed'" (closed)="closeCreate()">
+  <hlm-dialog-content *hlmDialogPortal="let ctx" class="sm:max-w-md">
+    <hlm-dialog-header>
+      <h2 hlmDialogTitle>New local user</h2>
+      <p hlmDialogDescription>
+        Creates an account that signs in with email and password. SSO users are created on their
+        first sign-in.
+      </p>
+    </hlm-dialog-header>
+
+    <form
+      id="create-user-form"
+      class="flex flex-col gap-4"
+      novalidate
+      (submit)="onCreateSubmit($event)"
+    >
+      @if (createError(); as message) {
+        <div hlmAlert variant="destructive">
+          <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+          <p hlmAlertDescription>{{ message }}</p>
+        </div>
+      }
+      <div hlmField>
+        <label hlmFieldLabel for="user-email">Email</label>
+        <input
+          hlmInput
+          id="user-email"
+          type="email"
+          autocomplete="off"
+          spellcheck="false"
+          [formField]="createForm.email"
+        />
+        <hlm-field-error>{{ firstError(createForm.email) }}</hlm-field-error>
+      </div>
+      <div hlmField>
+        <label hlmFieldLabel for="user-name">Display name</label>
+        <input hlmInput id="user-name" autocomplete="off" [formField]="createForm.displayName" />
+        <hlm-field-error>{{ firstError(createForm.displayName) }}</hlm-field-error>
+      </div>
+      <div hlmField>
+        <label hlmFieldLabel for="user-password">Initial password</label>
+        <input
+          hlmInput
+          id="user-password"
+          type="password"
+          autocomplete="new-password"
+          [formField]="createForm.password"
+        />
+        <p hlmFieldDescription>At least 12 characters. The user can change it on their profile.</p>
+        <hlm-field-error>{{ firstError(createForm.password) }}</hlm-field-error>
+      </div>
+      <div class="flex items-start gap-3">
+        <hlm-switch
+          inputId="user-admin"
+          class="mt-px"
+          [checked]="createModel().instanceAdmin"
+          (checkedChange)="setCreateAdmin($event)"
+          aria-describedby="user-admin-help"
+        />
+        <div class="flex flex-col gap-0.5">
+          <label for="user-admin" class="text-sm font-medium">Instance admin</label>
+          <p id="user-admin-help" class="text-muted-foreground text-xs">
+            Can manage users and create companies, and can open any company.
+          </p>
+        </div>
+      </div>
+    </form>
+
+    <hlm-dialog-footer>
+      <button hlmBtn variant="outline" type="button" hlmDialogClose>Cancel</button>
+      <button hlmBtn type="submit" form="create-user-form" [disabled]="createForm().submitting()">
+        @if (createForm().submitting()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Create user
+      </button>
+    </hlm-dialog-footer>
+  </hlm-dialog-content>
+</hlm-dialog>
+
+<!-- Set password -->
+<hlm-dialog [state]="passwordOpen() ? 'open' : 'closed'" (closed)="closeSetPassword()">
+  <hlm-dialog-content *hlmDialogPortal="let ctx" class="sm:max-w-md">
+    <hlm-dialog-header>
+      <h2 hlmDialogTitle>Set password for {{ passwordUser()?.displayName }}</h2>
+      <p hlmDialogDescription>The new password works right away. Share it with them securely.</p>
+    </hlm-dialog-header>
+
+    <form
+      id="set-password-form"
+      class="flex flex-col gap-4"
+      novalidate
+      (submit)="onPasswordSubmit($event)"
+    >
+      @if (passwordError(); as message) {
+        <div hlmAlert variant="destructive">
+          <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+          <p hlmAlertDescription>{{ message }}</p>
+        </div>
+      }
+      <div hlmField>
+        <label hlmFieldLabel for="set-password">New password</label>
+        <input
+          hlmInput
+          id="set-password"
+          type="password"
+          autocomplete="new-password"
+          [formField]="passwordForm.newPassword"
+        />
+        <hlm-field-error>{{ firstError(passwordForm.newPassword) }}</hlm-field-error>
+      </div>
+      <div hlmField>
+        <label hlmFieldLabel for="set-password-confirm">Repeat password</label>
+        <input
+          hlmInput
+          id="set-password-confirm"
+          type="password"
+          autocomplete="new-password"
+          [formField]="passwordForm.confirmPassword"
+        />
+        <hlm-field-error>{{ firstError(passwordForm.confirmPassword) }}</hlm-field-error>
+      </div>
+    </form>
+
+    <hlm-dialog-footer>
+      <button hlmBtn variant="outline" type="button" hlmDialogClose>Cancel</button>
+      <button
+        hlmBtn
+        type="submit"
+        form="set-password-form"
+        [disabled]="passwordForm().submitting()"
+      >
+        @if (passwordForm().submitting()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Set password
+      </button>
+    </hlm-dialog-footer>
+  </hlm-dialog-content>
+</hlm-dialog>
+
+<!-- Deactivate -->
+<hlm-alert-dialog
+  [state]="deactivateOpen() ? 'open' : 'closed'"
+  (closed)="deactivateOpen.set(false)"
+>
+  <hlm-alert-dialog-content *hlmAlertDialogPortal="let ctx">
+    <hlm-alert-dialog-header>
+      <h2 hlmAlertDialogTitle>Deactivate {{ deactivating()?.displayName }}?</h2>
+      <p hlmAlertDialogDescription>
+        Their sessions end right away and they can't sign in until you activate them again. Their
+        memberships stay.
+      </p>
+    </hlm-alert-dialog-header>
+    @if (deactivateError(); as message) {
+      <div hlmAlert variant="destructive">
+        <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+        <p hlmAlertDescription>{{ message }}</p>
+      </div>
+    }
+    <hlm-alert-dialog-footer>
+      <button hlmAlertDialogCancel [disabled]="!!busyId()">Cancel</button>
+      <button
+        hlmAlertDialogAction
+        variant="destructive"
+        [disabled]="!!busyId()"
+        (click)="confirmDeactivate()"
+      >
+        @if (busyId()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Deactivate
+      </button>
+    </hlm-alert-dialog-footer>
+  </hlm-alert-dialog-content>
+</hlm-alert-dialog>

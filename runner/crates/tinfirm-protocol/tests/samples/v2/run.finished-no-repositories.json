@@ -1,0 +1,1 @@
+{"type": "run.finished", "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6f", "epoch": 3, "outcome": "SUCCEEDED", "lastSeq": 5, "summary": "Requested the repository `server`; waiting for approval.", "sessionId": "019a0000-0000-7000-8000-000000000123", "git": [], "resumed": false, "resumeOutcome": "FIRST_RUN"}

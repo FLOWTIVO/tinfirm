@@ -1,0 +1,43 @@
+name: Open a hotfix branch
+
+# Cut a maintenance branch from a released tag, so a production fix can ship without
+# everything that landed on main since. The steps are reusable-hotfix-branch.yml; this file
+# supplies only the manifest list.
+#
+# Run it with the released tag that needs the fix, e.g. `v0.1.0`. It creates `hotfix/0.1.1`
+# at that tag with the manifests on `0.1.1-SNAPSHOT`. Then pull-request the fix into that
+# branch (ci.yml gates `hotfix/**` pull requests), run Release on it, and merge the
+# merge-back pull request the release opens.
+on:
+  workflow_dispatch:
+    inputs:
+      from_tag:
+        description: 'Released tag to branch from (e.g. v0.1.0)'
+        required: true
+        type: string
+      hotfix_version:
+        description: 'Version the hotfix will release as. Empty = derive (v0.1.0 -> 0.1.1)'
+        required: false
+        type: string
+
+concurrency:
+  group: hotfix-branch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    uses: ./.github/workflows/reusable-hotfix-branch.yml
+    permissions:
+      contents: write
+    with:
+      from_tag: ${{ inputs.from_tag }}
+      hotfix_version: ${{ inputs.hotfix_version }}
+      # The same manifests as release.yml's, so that every one is on the hotfix's -SNAPSHOT.
+      manifests: |
+        pom:server/pom.xml:tinfirm-server
+        pom:model-api/pom.xml:tinfirm-model-api
+        npm:web
+      runner: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}

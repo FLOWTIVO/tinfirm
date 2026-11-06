@@ -1,0 +1,39 @@
+# ADR-0071: An MCP server that needs no account: runs call it without a credential, and nobody connects one
+
+- Status: Accepted
+- Date: 2026-10-16
+- Decided by: the owner, 2026-10-16
+- Sources: [ADR-0058](0058-authority-from-the-audience.md) (systems and accounts, the binding rule), [ADR-0066](0066-internal-hosts.md) (company systems on the deployment's own network); [CONVENTIONS.md](../CONVENTIONS.md) §15.2, §15.3, §15.7 and §15.15; [operations/alerts.md](../operations/alerts.md), sections 3 and 4
+- Changes: the system module (`accountsRequired` on an MCP server, its check, `SystemEvents.AccountsRequiredChanged`), the account module (`AccountBinding.Open`, `Accounts.open`, the stop reason `ACCOUNT_REQUIRED`), the conversation module (the binding `OPEN`, calls without a credential, a trigger's conversation binding `OPEN` without a row), the trigger module (`noAccountSystems`, the choice `NOT_NEEDED`), the agent's readiness and `GET /me/accounts` (`NOT_NEEDED`), `V048__mcp_without_accounts.sql`, the API, the MCP endpoint's renderings, the web app
+
+## Context
+
+- Since ADR-0058 a system holds no account of its own: every call acts with a principal's account, bound per conversation (`OWN`, `GRANTED`, `CHOSEN`) or lent by a trigger's table (`FIXED`), and checked at every use. A conversation that needs a system it has no account on waits for one; a trigger's runs cannot use a system its table has no row for.
+- Some MCP servers check no credential: a server reachable only from Tinfirm's network, whose NetworkPolicy is its boundary, such as the VictoriaLogs MCP servers of the log analysts in the alerts example ([alerts.md](../operations/alerts.md), sections 3 and 4). Tinfirm already knows such a server: its discovery's `initialize` without a token answers `2xx`, and `NONE` means it offers no OAuth.
+- An account there is still required, so each person and each service identity that should act on it pastes a token of any value, which the server ignores. It is a step that protects nothing: any member may connect their own account on a company system, with any value, and the trigger editor shows such a server as "no account, so not available" until someone does.
+
+## Decision
+
+**Whoever manages an MCP server may set it to need no account, after Tinfirm saw it answer without a credential. Conversations then bind it without an account (`OPEN`) and call it without a credential; nobody connects an account there, and a trigger needs no row for it.**
+
+1. **The setting.** `external_system.accounts_required`, true by default and false only for an `MCP` system (`external_system_accounts_required_ck`). `PATCH /systems/{id}` with `accountsRequired` (OWNER, ADMIN; a personal server's owner): false for any other kind is `400 VALIDATION_FAILED`. Set false, Tinfirm first reaches the server without a credential, `initialize` then `tools/list` (`McpClient.listTools`), outside any transaction, between the one that authorises the caller and the one that stores the change: a server that does not answer both is `400 CREDENTIAL_REQUIRED` with its answer, and nothing changes. Set true again, nothing is checked. Audited as `system.changed` with `accountsRequired`, and announced (`SystemEvents.AccountsRequiredChanged`). Explicit, not inferred from the discovery: a server that answers `initialize` may still ask for a token on `tools/call`, and whether runs may reach it without one is the admin's call.
+2. **The binding `OPEN`.** `Accounts.bind` answers `Open` for a personal conversation on such a server, after the checks every binding passes (an active member; a personal server its owner's, while the company allows them), whatever account the member holds there. The conversation stores it `BOUND`, `how = OPEN`, with no account, holder, identity or grant, audited as `conversation.binding.bound` without them, said nowhere in the thread, as one's own account is not. A trigger's conversation binds such a server `OPEN` at its first use, though its table has no row for it: T5 widens to `FIXED`, or `OPEN`. The database lets `OPEN` only where the system needs no account, when the binding becomes `BOUND OPEN` (`conversation_binding_open_ck`), and lets a trigger's conversation bind `FIXED` or `OPEN` only.
+3. **The check at every use.** `Accounts.open(company, system, actingPrincipal)` replaces the account's check for an `OPEN` binding: the system still there and not paused, a personal server's company switch on, the acting principal active and, for a personal server, its owner; and the system still needing no account. Once accounts are needed again (`ACCOUNT_REQUIRED`), a personal conversation's binding waits (`NONE`: the person connects their own account, or a grant binds, when they continue), and a trigger's goes (`ACCOUNT_REMOVED`: its table names no account there). A paused system keeps the binding as it is.
+4. **The call.** `ConversationBindings.use` answers `Open` for an `OPEN` binding: nothing is revealed, no `secret.accessed`; the tool runs with `CallCredential.none()`, and `tool.called` names no account. A `401` then has no account to sign in again: it is the agent's error, which tells it to say that the server asks for a credential now.
+5. **Accounts.** `GET /me/accounts` and the agent's readiness answer `NOT_NEEDED` for such a server; the web app offers no connect there. An account connected before stays, binds nothing new, and is disconnected as before; the API does not refuse one, so a binding waiting for its account's reconnect from before the change can still be served.
+6. **Triggers.** The editor's choices answer `NOT_NEEDED` for such a server and fill no row there; `unavailableSystems` never names it, and the trigger and its preview list it in `noAccountSystems`. A row naming an account on it, saved before, is checked and used as before.
+7. **Rebinding.** `conversation_rebind` leaves an `OPEN` binding as it is when the reassigned trigger's new table has no row for its system: it came from no row.
+
+## Consequences
+
+- In the alerts example, a log analyst's trigger needs one account, on its tracker or none at all: its logs server is set once to need no account, and every trigger, conversation and service identity uses it without a step.
+- Whoever may use an agent with such a server calls it without a credential, as anyone in the cluster could reach it already: the server's own boundary (its NetworkPolicy, ADR-0066's internal hosts) is what protects it, as it was with the token it ignored. Setting a server to need no account says so; the admin decides it per server, and the audit records who did.
+- The audit of a call on such a server names the conversation, the run, the agent and the acting principal, but no account or holder, since none acted.
+- A server that starts asking for a credential refuses the calls (`401`) until an admin sets it to need accounts again; its conversations then wait for accounts as on any other server.
+- Not in this decision: setting it in the registration (an admin registers the server, then sets it), and a suggestion from the discovery's `NONE`.
+
+## Alternatives considered
+
+- **Connect without a token**: keep accounts, and let a principal connect one on such a server with nothing to paste. Smaller, but every person and service identity still connects once per server, and a trigger still needs a row: the step stays, without its field.
+- **Inferring it from the discovery** (`initialize` without a token answers `2xx`): no admin step, but a server that asks for a token on `tools/call` only, or that adds authentication later, would be called without one by surprise, and nobody would have decided that runs may.
+- **A system account**: a credential the system holds for everyone. ADR-0058 removed exactly that (ADR-0051), and a server that checks nothing needs no credential at all.

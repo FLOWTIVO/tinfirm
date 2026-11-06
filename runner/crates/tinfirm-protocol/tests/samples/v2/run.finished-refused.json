@@ -1,0 +1,14 @@
+{
+  "type": "run.finished",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 3,
+  "outcome": "FAILED",
+  "lastSeq": 12,
+  "failureClass": "MODEL_REFUSED",
+  "failureMessage": "The model refused to continue (stop reason: refusal).",
+  "sessionId": "019a0000-0000-7000-8000-000000000123",
+  "git": [{"componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000010", "branch": "agent/MYCO-13", "pushed": false, "headSha": null, "commits": 0}],
+  "usage": {"inputTokens": 1750, "outputTokens": 700, "cachedInputTokens": 4550, "cacheWriteTokens": 0, "contextUsed": 4000, "contextSize": 272000, "costUsd": null, "totalTokens": 7000, "estimated": true},
+  "resumed": false,
+  "resumeOutcome": "LOAD_FAILED"
+}

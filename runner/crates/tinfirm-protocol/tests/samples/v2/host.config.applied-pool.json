@@ -1,0 +1,9 @@
+{
+  "type": "host.config.applied",
+  "version": 9,
+  "draining": false,
+  "maxConcurrentRuns": 24,
+  "maxConcurrentRunsCeiling": 32,
+  "credentials": [],
+  "pool": {"readyTarget": 2, "maxReadyCeiling": 4}
+}

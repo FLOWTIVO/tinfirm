@@ -1,0 +1,67 @@
+{{- if and .Values.litellm.enabled .Values.networkPolicy.enabled }}
+{{- include "tinfirm.litellm.validateDatabase" . }}
+{{- $np := .Values.networkPolicy }}
+{{- $l := $np.litellm }}
+# The LiteLLM pods. Ingress: LiteLLM's own port (every route: the admin API and the model API)
+# from the server pods only, and from nothing else: no ingress controller, no runner host
+# (security review 2026-10-12, row 21); the model port (its model routes alone, ADR-0069)
+# from the server and litellm.modelApi.from. Egress (when
+# enabled): DNS, PostgreSQL and the model providers, plus configured extras.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tinfirm.litellm.fullname" . }}
+  labels:
+    {{- include "tinfirm.litellm.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tinfirm.litellm.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    # The Tinfirm server: the admin API, and the model requests it relays.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "tinfirm.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4000
+    # The model port: the server's model requests and the company services the operator names
+    # (litellm.modelApi.from).
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "tinfirm.selectorLabels" . | nindent 14 }}
+        {{- with .Values.litellm.modelApi.from }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 4001
+  {{- if $np.egress.enabled }}
+  egress:
+    {{- include "tinfirm.networkPolicy.dnsEgress" . | nindent 4 }}
+    # PostgreSQL (LiteLLM's database).
+    - to:
+        {{- toYaml $np.egress.database.to | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ include "tinfirm.litellm.networkPolicyDatabasePort" . }}
+    # The model providers.
+    - to:
+        {{- toYaml $l.egress.providers.to | nindent 8 }}
+      ports:
+        {{- range $l.egress.providers.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- with $l.egress.extra }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

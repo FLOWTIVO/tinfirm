@@ -1,0 +1,71 @@
+{
+  "realm": "tinfirm-saml",
+  "displayName": "Tinfirm SAML (dev)",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "clients": [
+    {
+      "clientId": "${TINFIRM_PUBLIC_URL}/saml2/service-provider-metadata/keycloaksaml",
+      "name": "Tinfirm (SAML)",
+      "description": "DEVELOPMENT ONLY. Tinfirm's SAML service provider (ADR-0086), the provider keycloaksaml of compose.saml.yaml. It signs the response and the assertion and checks the AuthnRequest's signature with the SP's dev certificate, substituted from TINFIRM_SAML_SP_CERT_B64 at import.",
+      "protocol": "saml",
+      "enabled": true,
+      "frontchannelLogout": false,
+      "redirectUris": ["${TINFIRM_PUBLIC_URL}/login/saml2/sso/keycloaksaml"],
+      "attributes": {
+        "saml_assertion_consumer_url_post": "${TINFIRM_PUBLIC_URL}/login/saml2/sso/keycloaksaml",
+        "saml.server.signature": "true",
+        "saml.assertion.signature": "true",
+        "saml.signature.algorithm": "RSA_SHA256",
+        "saml.client.signature": "true",
+        "saml.signing.certificate": "${TINFIRM_SAML_SP_CERT_B64}",
+        "saml_name_id_format": "persistent",
+        "saml_force_name_id_format": "true",
+        "saml.authnstatement": "true",
+        "saml.encrypt": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "config": { "user.attribute": "email", "attribute.name": "email", "attribute.nameformat": "Basic" }
+        },
+        {
+          "name": "givenName",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "config": { "user.attribute": "firstName", "attribute.name": "givenName", "attribute.nameformat": "Basic" }
+        },
+        {
+          "name": "surname",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "config": { "user.attribute": "lastName", "attribute.name": "surname", "attribute.nameformat": "Basic" }
+        },
+        {
+          "name": "groups",
+          "protocol": "saml",
+          "protocolMapper": "saml-group-membership-mapper",
+          "config": { "attribute.name": "groups", "single": "false", "full.path": "false", "attribute.nameformat": "Basic" }
+        }
+      ]
+    }
+  ],
+  "groups": [{ "name": "tinfirm-admins" }, { "name": "tinfirm-users" }],
+  "users": [
+    {
+      "username": "sam",
+      "email": "sam@example.com",
+      "emailVerified": true,
+      "firstName": "Sam",
+      "lastName": "Example",
+      "enabled": true,
+      "credentials": [{ "type": "password", "value": "${TINFIRM_OIDC_TEST_USER_PASSWORD}", "temporary": false }],
+      "groups": ["/tinfirm-users"]
+    }
+  ]
+}

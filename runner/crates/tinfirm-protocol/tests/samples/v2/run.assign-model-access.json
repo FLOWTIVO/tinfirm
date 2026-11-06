@@ -1,0 +1,28 @@
+{
+  "type": "run.assign",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d70",
+  "epoch": 1,
+  "modelAccess": {"format": "openai", "baseUrl": "https://litellm.example.com/v1", "apiKey": "sk-litellm-EXAMPLE-NOT-A-REAL-KEY"},
+  "agent": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000d", "name": "Shared engineer", "runtime": "CODEX", "model": null},
+  "workItem": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000e", "key": "MYCO-14", "title": "Add a health endpoint"},
+  "job": {"id": "0192f1a4-7c1e-7b3a-9d2e-0000000000a1"},
+  "prompt": "You are Shared engineer, an AI agent of the company \"My Company\", working through Tinfirm.\n",
+  "resumeSessionId": null,
+  "workspaces": [
+    {
+      "componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000013",
+      "dir": "server",
+      "name": "server",
+      "repoUrl": "https://gitlab.acme.internal/platform/server.git",
+      "defaultBranch": "main",
+      "branch": "agent/MYCO-14",
+      "git": {"username": "oauth2", "token": "example-token-not-real"},
+      "authorName": "Tinfirm agent Shared engineer",
+      "authorEmail": "agent@tinfirm.invalid"
+    }
+  ],
+  "requestableRepositories": [],
+  "limits": {"maxWallClockSeconds": 3600, "maxTurns": 200},
+  "resumePrompt": null,
+  "platformTools": ["finish", "list_repositories", "save_artifact"]
+}

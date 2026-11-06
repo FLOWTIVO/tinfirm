@@ -1,0 +1,74 @@
+Tinfirm
+Copyright (c) 2026-present FLOWTIVO s.r.o.
+
+Licences
+--------
+
+Tinfirm is licensed in two parts. LICENSE states the scope of each:
+
+* Everything outside the "ee/" directory, the documentation included, is
+  licensed under the MIT licence in LICENSE, except the third-party files
+  below, which keep their own licences.
+* Everything under the "ee/" directory is licensed under the Tinfirm
+  Enterprise licence in ee/LICENSE, except the code served to the browser,
+  which is licensed under the MIT licence wherever it resides.
+
+Third-party files in this repository
+------------------------------------
+
+* The Maven wrapper scripts, server/mvnw, server/mvnw.cmd, model-api/mvnw and
+  model-api/mvnw.cmd, are Apache Maven Wrapper's, licensed under the Apache
+  License, Version 2.0, as their headers state. The two mvnw scripts
+  are changed: they log the URL they download, without its user info or
+  query, stop when the download by Java fails, and describe what arrived
+  when its checksum does not match. Apache Maven Wrapper's notice:
+
+    Apache Maven Wrapper
+    Copyright 2013-2022 The Apache Software Foundation
+
+    This product includes software developed at
+    The Apache Software Foundation (http://www.apache.org/).
+
+    The original idea and initial implementation of the maven-wrapper module
+    is derived from the Gradle Wrapper which was written originally by Hans
+    Dockter and Adam Murdoch.
+    Copyright 2007 the original author or authors.
+
+* The docs site's fonts, in docs-site/content/assets/fonts/, are licensed
+  under the SIL Open Font License 1.1, whose texts are beside them
+  (OFL-*.txt).
+
+Third-party notices of the artefacts
+------------------------------------
+
+Third-party components are licensed under the licences of their owners. Each
+artefact that includes them carries their notices:
+
+* The server's image, ghcr.io/flowtivo/tinfirm-server, in /licenses/, beside
+  LICENSE and ee/LICENSE:
+  - THIRD-PARTY-server.txt: the server's runtime dependencies and their
+    licences, as license-maven-plugin lists them in the Maven build
+    (server/pom.xml). Each jar keeps its own licence files.
+  - THIRD-PARTY-web.txt: the web app's 3rdpartylicenses.txt (below).
+* The model port's image, ghcr.io/flowtivo/tinfirm-model-api, in /licenses/,
+  beside LICENSE: THIRD-PARTY-model-api.txt, listed the same way from
+  model-api/pom.xml.
+* The runner host's archives, tinfirm-runner-host-<version>-<target>, beside
+  LICENSE and ee/LICENSE: THIRD-PARTY-LICENSES.txt, the full licence text of
+  every crate the binary is built with, of the Rust standard library and, in
+  the Linux builds, of musl libc. The file is runner/THIRD-PARTY-LICENSES.txt,
+  which cargo-about generates from runner/Cargo.lock (make runner-licences).
+  The runner host's image, ghcr.io/flowtivo/tinfirm-runner-host, carries it
+  as /licenses/THIRD-PARTY-runner.txt.
+* The web app: its production build (npm run build in web/) writes the
+  notices of the npm packages it bundles to 3rdpartylicenses.txt, beside
+  browser/ in web/dist/tinfirm-web/. The server's image, which serves the web
+  app, carries the file as /licenses/THIRD-PARTY-web.txt.
+
+The Compose archive and the Helm chart carry LICENSE. The packages of the
+base images carry their licences in each image's /usr/share/doc/, and the
+images a deployment pulls from their vendors, such as PostgreSQL and LiteLLM,
+carry their own.
+
+Which licences a dependency may have, and how CI checks them, is decided in
+docs/adr/0082-licence-notices-and-dependency-licences.md.

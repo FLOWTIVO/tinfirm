@@ -1,0 +1,11 @@
+{
+  "type": "hello",
+  "protocolVersion": 2,
+  "runnerVersion": "0.1.0",
+  "executors": ["docker"],
+  "isolationTiers": ["container"],
+  "maxConcurrentRuns": 1,
+  "credentials": [],
+  "runtimes": [],
+  "activeRuns": [{"runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e", "epoch": 2, "lastSeq": 57}]
+}

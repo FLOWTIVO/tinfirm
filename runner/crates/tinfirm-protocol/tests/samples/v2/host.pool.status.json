@@ -1,0 +1,9 @@
+{
+  "type": "host.pool.status",
+  "ready": 2,
+  "starting": 1,
+  "busy": 5,
+  "coldStartP90Seconds": 74,
+  "servedReady": 31,
+  "servedCold": 4
+}

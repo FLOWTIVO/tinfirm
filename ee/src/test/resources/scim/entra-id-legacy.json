@@ -1,0 +1,33 @@
+{
+  "description": "Entra ID's provisioning service without aadOptscim062020: operations named in any case, booleans sent as strings, an operation without a path whose value holds dotted attribute names, and a single-valued attribute sent as an array of one value.",
+  "query": "",
+  "steps": [
+    { "name": "the connection test", "method": "GET", "path": "/Users?filter=userName+eq+%22{{random}}%40example.test%22", "status": 200, "expect": { "/totalResults": 0 } },
+    { "name": "create", "method": "POST", "path": "/Users", "status": 201,
+      "body": {
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+        "externalId": "{{externalId}}",
+        "userName": "{{userName}}",
+        "active": "True",
+        "name": { "familyName": "Lamarr", "givenName": "Hedy" }
+      },
+      "capture": { "id": "/id" },
+      "expect": { "/displayName": "Hedy Lamarr", "/active": true } },
+    { "name": "update without a path", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Replace", "value": { "displayName": "Hedy Kiesler", "name.givenName": "Hedwig" } } ] },
+      "expect": { "/displayName": "Hedy Kiesler" } },
+    { "name": "a value as an array of one", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Add", "path": "displayName", "value": [{ "value": "Hedy L." }] } ] },
+      "expect": { "/displayName": "Hedy L." } },
+    { "name": "deactivate with a string", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Replace", "path": "active", "value": "False" } ] },
+      "expect": { "/active": false } },
+    { "name": "reactivate with a string", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "replace", "path": "active", "value": "True" } ] },
+      "expect": { "/active": true } }
+  ]
+}

@@ -1,0 +1,361 @@
+name: Security (reusable)
+
+# SAST, committed secrets and dependency CVEs. ci.yml calls it on every pull request, push
+# to main and release gate; security.yml calls it for the weekly sweep, since a NEW CVE
+# against code nobody touched is invisible to a pull-request scan.
+#
+# Per ADR-0106, the reporter is this repository's action (.github/actions/report-findings),
+# every third-party action is pinned by commit SHA and every scanner image by digest (M18
+# of the security review of 2026-10-27), and semgrep's rule against mutable action tags is
+# not excluded: nothing here uses one.
+#
+# Three scanners, three different questions:
+#   sast    (semgrep)  — is the code itself unsafe? BLOCKING on ERROR + WARNING.
+#                        WARNING is included deliberately: the registry files command
+#                        injection, `eval` on caller input and `new Function` as WARNING,
+#                        so an ERROR-only filter would run 94 of 312 rules and pass a file
+#                        containing all three. ERROR alone is not a security gate.
+#   secrets (gitleaks) — is a credential committed? BLOCKING.
+#   deps    (trivy)    — does a dependency have a known CVE? BLOCKING on HIGH/CRITICAL.
+#
+# GitHub's own code scanning (CodeQL with a SARIF upload) can run beside these.
+#
+# Every scanner runs from an image pinned by digest. An unpinned scanner turns "someone
+# published new rules" into "main is red this morning", which is how a security gate gets
+# disabled. Bump a digest by hand, with its tag: Dependabot does not read these.
+#
+# What the scanners skip: `.semgrepignore`, `.gitleaks.toml` and `.trivyignore` at the
+# repository root.
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'Runner label for every scanner job. Empty = GitHub-hosted ubuntu-latest.'
+        required: false
+        default: ubuntu-latest
+        type: string
+      semgrep_exclude_rules:
+        description: |
+          Newline-separated semgrep rule IDs to exclude: rules that CANNOT apply to
+          this stack, such as a Mustache rule against Angular. Put the reason next to
+          the entry in the caller; a silent exclusion is indistinguishable from one
+          added to get a build green.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SEMGREP_IMAGE: semgrep/semgrep:1.173.0@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  TRIVY_IMAGE: aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
+
+jobs:
+  sast:
+    name: SAST · semgrep
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Run the scanner as a container rather than a pip install: the image pins the
+      # engine and its Python runtime together, and the runner already has docker.
+      # No `--error` here: the scan must always produce its JSON so the reporter
+      # can annotate the diff, and the FAILURE is decided in a later step. With
+      # `--error` the step died first and every finding stayed buried in the log.
+      - name: Scan
+        env:
+          EXCLUDE_RULES: ${{ inputs.semgrep_exclude_rules }}
+        run: |
+          set -euo pipefail
+          # Caller-supplied exclusions, one --exclude-rule per non-empty line.
+          extra=()
+          while IFS= read -r rule; do
+            rule="$(echo "$rule" | xargs)" || true
+            [ -n "$rule" ] && extra+=(--exclude-rule "$rule")
+          done <<< "${EXCLUDE_RULES:-}"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            "$SEMGREP_IMAGE" \
+            semgrep scan "${extra[@]}" \
+              --config p/default \
+              --config p/java \
+              --config p/typescript \
+              --config p/secrets \
+              --config p/dockerfile \
+              --severity ERROR \
+              --severity WARNING \
+              --metrics=off \
+              --json-output=semgrep.json \
+              --oss-only
+        # What is scanned, and what is not, is in .semgrepignore at the repo root.
+      - name: Report findings
+        if: always()
+        uses: ./.github/actions/report-findings
+        with:
+          mode: annotate
+          reports: semgrep=semgrep.json
+      - name: Fail on findings
+        if: always()
+        run: |
+          set -euo pipefail
+          count=$(python3 -c "import json;print(len(json.load(open('semgrep.json')).get('results',[])))")
+          if [ "$count" -gt 0 ]; then
+            echo "::error::semgrep found $count blocking finding(s) — see the annotations on the diff."
+            exit 1
+          fi
+          echo "semgrep: clean"
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-findings
+          path: semgrep.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  secrets:
+    name: Secrets · gitleaks
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scan the working tree
+        run: |
+          set -euo pipefail
+          # `dir`, not `git`: this scans the files that are actually in the tree, not the
+          # whole history. History scanning would mean one old test fixture that looks
+          # like a key blocks EVERY pull request from then on, which ends with the job
+          # being deleted. A secret that reached history is a rotate-and-purge incident,
+          # not a per-PR gate.
+          #
+          # --redact so a hit never reprints the secret into a public build log.
+          # --exit-code 0 so the report is always written and annotated; the
+          # failure is decided below, from the report itself.
+          # The repository root may hold .gitleaks.toml to allowlist VERIFIED
+          # non-secrets (a published RFC test vector, a symbol the entropy rule
+          # misreads). Passing --config unconditionally would make the file mandatory,
+          # so it is only added when present — same rule as .trivyignore below.
+          config=()
+          if [ -f "$GITHUB_WORKSPACE/.gitleaks.toml" ]; then
+            config=(--config /src/.gitleaks.toml)
+          fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            "$GITLEAKS_IMAGE" \
+            dir /src "${config[@]}" --redact --no-banner --exit-code 0 \
+              --report-format json --report-path /src/gitleaks.json
+      - name: Report findings
+        if: always()
+        uses: ./.github/actions/report-findings
+        with:
+          mode: annotate
+          reports: gitleaks=gitleaks.json
+      - name: Fail on findings
+        if: always()
+        run: |
+          set -euo pipefail
+          count=$(python3 -c "import json;print(len(json.load(open('gitleaks.json'))))")
+          if [ "$count" -gt 0 ]; then
+            echo "::error::gitleaks found $count potential secret(s). Rotate anything real BEFORE removing it from the tree — a pushed secret is compromised, not fixed by a delete."
+            exit 1
+          fi
+          echo "gitleaks: clean"
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitleaks-findings
+          path: gitleaks.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  deps:
+    name: Dependencies · trivy
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Trivy resolves Maven parent POMs over the network to determine dependency
+      # versions, and Maven Central answers 429 Too Many Requests to a shared
+      # runner IP. Priming ~/.m2 from the repo's own poms makes those lookups
+      # local: `dependency:resolve` populates the cache, and the cache is keyed on
+      # the poms so it only refills when they change. Skipped entirely for a checkout
+      # with no pom, which is why the whole step is conditional.
+      - name: Does this repo have Maven modules?
+        id: maven
+        run: |
+          set -euo pipefail
+          if compgen -G "$GITHUB_WORKSPACE/**/pom.xml" > /dev/null || [ -f "$GITHUB_WORKSPACE/pom.xml" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+      - name: Cache the Maven repository
+        if: steps.maven.outputs.present == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.m2/repository
+          key: trivy-m2-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: trivy-m2-${{ runner.os }}-
+      - name: Warm the Maven cache
+        if: steps.maven.outputs.present == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Best-effort: if this is rate-limited too, the scan still runs and simply
+          # reports what it can, with the warning below saying so.
+          while IFS= read -r pom; do
+            dir="$(dirname "$pom")"
+            if [ -x "$dir/mvnw" ]; then
+              (cd "$dir" && ./mvnw -B -q --no-transfer-progress dependency:resolve -DincludeScope=runtime) || true
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -maxdepth 2 -name pom.xml)
+      - name: Scan dependencies for known CVEs
+        env:
+          MAVEN_PRIMED: ${{ steps.maven.outputs.present }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # BLOCKING on HIGH/CRITICAL. A CVE scanner switched on over an untouched
+          # tree starts red, and a gate red on day one gets bypassed rather than
+          # fixed; the tree passes it, so the gate is real.
+          # Anything genuinely accepted goes in .trivyignore WITH a reason.
+          #
+          # The exit code is still decided BELOW, from the report, not by trivy
+          # itself. A scan that did not complete (trivy failed, or wrote no report;
+          # see the Maven cache note) is "no findings reported", not "no findings":
+          # on a pull request it warns, since the usual cause, a Maven Central 429
+          # against the runner, is not the pull request's; on every other event (a
+          # push to main, a release, the weekly sweep) it fails, so nothing reaches
+          # main or a release on a dependency gate that did not run.
+          #
+          # --ignore-unfixed: a CVE with no released fix is not something a PR can act on.
+          # --ignorefile only when the caller actually ships one. Passing the flag
+          # unconditionally makes the file MANDATORY — trivy exits FATAL "ignore file
+          # not found".
+          ignore=()
+          if [ -f "$GITHUB_WORKSPACE/.trivyignore" ]; then
+            ignore=(--ignorefile /src/.trivyignore)
+          fi
+          m2_mount=()
+          [ -d "$HOME/.m2/repository" ] && m2_mount=(-v "$HOME/.m2:/root/.m2:ro")
+          # --exit-code 0: findings do not fail trivy, so any other exit is trivy failing.
+          status=0
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "${m2_mount[@]}" \
+            "$TRIVY_IMAGE" \
+            fs /src \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              "${ignore[@]}" \
+              --format json \
+              --output /src/trivy.json \
+              --exit-code 0 || status=$?
+          if [ "$status" -ne 0 ] || [ ! -s "$GITHUB_WORKSPACE/trivy.json" ]; then
+            what="The dependency scan did not complete (trivy exited ${status}), so this run reports NO dependency findings — that is not the same as finding none. Check the log above (a Maven Central 429 against the runner IP is the usual cause)."
+            if [ "$EVENT" = pull_request ]; then
+              echo "::warning::${what}"
+            else
+              echo "::error::${what} Outside a pull request the scan must complete: re-run this job."
+              exit 1
+            fi
+          fi
+          # A table in the log as well as the JSON: the log is what you read when
+          # a specific CVE is in question.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" \
+            fs /src --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed "${ignore[@]}" --exit-code 0 || true
+      - name: Scan Dockerfiles and compose for misconfiguration
+        run: |
+          set -euo pipefail
+          # Report-only: the findings show in the log and fail nothing.
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            "$TRIVY_IMAGE" \
+            fs /src \
+              --scanners misconfig \
+              --severity HIGH,CRITICAL \
+              --exit-code 0 || true
+      - name: Report findings
+        if: always()
+        uses: ./.github/actions/report-findings
+        with:
+          mode: annotate
+          reports: trivy=trivy.json
+      - name: Fail on findings
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -s trivy.json ]; then
+            # Already warned above. A scanner that could not run must not be
+            # reported as a clean tree, and must not block a merge either.
+            echo "::warning::No dependency report to judge; treating as unknown, not clean."
+            exit 0
+          fi
+          count=$(python3 -c "import json;d=json.load(open('trivy.json'));print(sum(len(r.get('Vulnerabilities') or []) for r in (d.get('Results') or [])))")
+          if [ "$count" -gt 0 ]; then
+            echo "::error::trivy found $count HIGH/CRITICAL vulnerability(ies) with fixes available. Update the dependency, or record an accepted CVE in .trivyignore with a reason."
+            exit 1
+          fi
+          echo "trivy: clean"
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trivy-findings
+          path: trivy.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    name: Report to the pull request
+    needs: [sast, secrets, deps]
+    # always(): the comment matters MOST when a scanner failed. Gating it on
+    # success would post the summary only when there was nothing to report.
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      # The CALLER must grant this too — a called workflow cannot exceed the
+      # permissions of the job that calls it. Without it the comment step warns
+      # and the annotations remain the record.
+      pull-requests: write
+    steps:
+      # The reporter is a file of this repository, read from the workspace: check out
+      # before the reports land there. A plain checkout, not a sparse one: a sparse
+      # checkout makes a self-hosted runner's shared workspace a blob-less partial clone
+      # for every later job (ADR-0106).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Collect the scanners' reports
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: reports
+          merge-multiple: true
+      - name: Post or update the report comment
+        uses: ./.github/actions/report-findings
+        with:
+          mode: comment
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ github.event.pull_request.number }}
+          reports: |
+            semgrep=reports/semgrep.json
+            gitleaks=reports/gitleaks.json
+            trivy=reports/trivy.json

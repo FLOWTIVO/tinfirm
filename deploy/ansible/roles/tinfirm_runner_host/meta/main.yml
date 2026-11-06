@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  role_name: tinfirm_runner_host
+  author: FLOWTIVO
+  description: >-
+    Tinfirm runner host on a Linux VM with nested virtualisation: Docker Engine, Kata
+    Containers with Cloud Hypervisor, the runner host as a systemd service, and the runner
+    images.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: Debian
+      versions: [bookworm, trixie]
+    - name: EL
+      versions: ["9", "10"]
+dependencies: []

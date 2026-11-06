@@ -1,0 +1,86 @@
+# PR-Agent (Qodo Merge) repo settings — see .github/workflows/pr_agent.yml for
+# which tools run when, and the model/provider wiring.
+#
+# READ FROM THE DEFAULT BRANCH ONLY. A change here does nothing until it is
+# merged to main; it does not take effect on the PR that introduces it.
+
+[pr_code_suggestions]
+# Post every suggestion as an inline, committable review comment on the diff
+# rather than one collapsed summary table. That makes each finding a real
+# review thread: anchored to its line, resolvable, and answerable in place.
+#
+# The reason this matters: `/review` has no inline mode at all — the old
+# `inline_code_comments` option no longer exists — so its findings only ever
+# appear inside the one "PR Reviewer Guide" comment, capped at
+# `num_max_findings`. That comment is easy to miss next to the diff, and a
+# reviewer checking review threads alone sees nothing. `/improve` is the only
+# tool that can put findings on the code, so it carries that job here.
+commitable_code_suggestions = true
+
+# `num_code_suggestions_per_chunk` is a TARGET, not a cap: it is interpolated
+# into the prompt ("give me N suggestions"), and the only hard filter in
+# pr_code_suggestions.py is `score >= suggestions_score_threshold`. So the way
+# to control noise is the score gate below, not a small count.
+#
+# The default 3 is sized PER CHUNK, and a chunk is sized by the token budget.
+# With `max_model_tokens` at 200k a large PR collapses into ONE chunk (the job
+# log says `Number of PR chunk calls: 1`), so the per-chunk default silently
+# becomes a whole-PR cap — three suggestions however large the PR is. Raised
+# to cover the big-PR case; a small PR self-regulates, since the model has
+# nothing to report and `focus_only_on_problems` keeps it from padding with nits.
+num_code_suggestions_per_chunk = 10
+
+# The real quality gate, and the backstop for the larger target above. 0 filters
+# nothing. Genuine findings score around 8, so 6 keeps them while dropping weak
+# ones. The upstream comment warns against going above 8, which starts clipping
+# relevant suggestions.
+suggestions_score_threshold = 6
+
+[pr_reviewer]
+# A FLAT cap on `/review` findings regardless of PR size — unrelated to the
+# chunking above; the default 3 shows at most three findings, however large the
+# diff. `/review` is single-call by design (there is no chunking or extended
+# mode in [pr_reviewer]), so this cap is the only lever on how much it reports.
+num_max_findings = 10
+
+[config]
+# PR-Agent clips every model to 32k context by default, whatever the model's
+# real window is (get_pr_diff budgets min(model context, max_model_tokens)).
+# That cap — not the model — is what produces "files were not included in this
+# review because of the token budget" on larger PRs. Raise it so /review sees
+# the whole diff; cost scales with it, but the workflow already runs on
+# OpenAI's flex tier.
+max_model_tokens = 200000
+output_run_details = true
+# What the reviewer is told about this repository, read from the default
+# branch and put into every prompt. There is no CLAUDE.md or AGENTS.md here:
+# the binding contract is docs/CONVENTIONS.md (layout and ownership, the
+# authorization matrix, database and audit rules, code conventions, the
+# domain), and CONTRIBUTING.md holds the checks and the pull-request rules.
+# CONVENTIONS first: the budget below cuts from the end, so the start of the
+# contract is what always reaches the reviewer.
+repo_context_files = ["docs/CONVENTIONS.md", "CONTRIBUTING.md"]
+# The budget for the files above, in lines over all of them, default 500. The
+# excess is cut with a "...(truncated)..." marker — silently, nothing in the
+# PR comment says so. The two files are about 2,800 lines together, so only
+# about the first 700 lines of CONVENTIONS.md are sent and none of
+# CONTRIBUTING.md; raise this to send more of them. At 700 lines the cost is
+# about 25k tokens per call.
+repo_context_max_lines = 700
+# To move to `gpt-6.1-sol`: the image behind the action's floating tag (see
+# pr_agent.yml) must contain upstream commit c0aa60b (2026-10-06), the first
+# with that model in MAX_TOKENS — the first release after v0.47.0. On an older
+# image the model fails in get_max_tokens before any call, and so does every
+# review. Bump the image digest in pr_agent.yml to that release first, then
+# change this line.
+model = "gpt-5.6-sol"
+fallback_models = ["gpt-5.6-terra"]
+
+[ignore]
+# Do not spend review budget on lockfiles. The generated code never reaches a
+# diff: the web API client is gitignored (web/src/app/api/generated/) and the
+# server's controller interfaces are built into target/.
+glob = [
+    "**/package-lock.json",
+    "**/Cargo.lock",
+]

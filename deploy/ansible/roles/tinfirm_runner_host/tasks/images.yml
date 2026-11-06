@@ -1,0 +1,24 @@
+---
+- name: Look for the runner images
+  ansible.builtin.command:
+    argv: "{{ ['docker', 'image', 'inspect'] + _tinfirm_runner_host_images }}"
+  register: _tinfirm_runner_host_images_present
+  changed_when: false
+  failed_when: false
+
+# The Dockerfiles are embedded in the binary: a new binary may bring new images. Docker's
+# layer cache keeps an unchanged build short. Images with Claude Code are built here and
+# never pushed.
+- name: Build the runner images
+  ansible.builtin.command:
+    argv: "{{ _tinfirm_runner_host_images_build_argv }}"
+  become: true
+  become_user: "{{ tinfirm_runner_host_user }}"
+  environment: "{{ _tinfirm_runner_host_env }}"
+  when: >-
+    _tinfirm_runner_host_images_present.rc != 0
+    or _tinfirm_runner_host_binary_copied is changed
+    or _tinfirm_runner_host_binary_unpacked is changed
+  changed_when: true
+  async: "{{ tinfirm_runner_host_images_build_timeout }}"
+  poll: 15

@@ -1,0 +1,47 @@
+# OS / IDE
+.DS_Store
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# The SAML service provider's dev key and certificate (make up-saml).
+deploy/compose/.saml/
+
+# Java / Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# Node / Angular
+node_modules/
+dist/
+.angular/
+coverage/
+web/src/app/api/generated/
+playwright-report/
+test-results/
+
+# Rust
+runner/target/
+
+# Helm
+deploy/helm/**/charts/*.tgz
+
+# Impeccable session state (decision pages)
+.impeccable/questions/
+
+# Review screenshots of the web app (npm run screenshots, E2E_SCREENSHOTS=1), not kept in the repository
+docs/screenshots/
+
+# reusable-hotfix-branch.yml's copy of the actions across its switch to a release tag
+/.ci-actions/
+
+# Python bytecode of the report-findings action's report.py, which runs from source
+__pycache__/
+*.pyc

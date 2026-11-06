@@ -1,0 +1,37 @@
+# A composite action of this repository (ADR-0106). Third-party actions are pinned by
+# commit SHA, with their release in the comment; Dependabot keeps them current.
+name: Log in to GHCR with an isolated credential store
+description: >-
+  Point DOCKER_CONFIG at a per-job directory, then log in to a registry. Required on
+  a self-hosted runner whose concurrent jobs share one $HOME.
+
+inputs:
+  registry:
+    description: 'Registry to log in to.'
+    required: false
+    default: ghcr.io
+  username:
+    description: 'Registry user. Normally github.actor.'
+    required: true
+  password:
+    description: 'Registry token. Normally secrets.GITHUB_TOKEN.'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Where concurrent jobs share one $HOME, the default ~/.docker/config.json is ONE
+    # file shared by all of them, and `docker login` there is last-writer-wins.
+    # GITHUB_TOKEN is scoped to a single job and revoked the moment that job ends, so a
+    # leg that finishes early leaves its dead token in the shared file and the
+    # still-running legs push with it and are refused. $RUNNER_TEMP is per-job, so each
+    # leg reads back exactly the token it wrote.
+    - shell: bash
+      run: |
+        mkdir -p "${RUNNER_TEMP}/docker-config"
+        echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-config" >> "$GITHUB_ENV"
+    - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}

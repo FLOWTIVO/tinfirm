@@ -1,0 +1,634 @@
+name: Release (reusable)
+
+# The release pipeline. release.yml calls it after its gate (ci.yml) and its signing-key
+# check; this file does the rest of the release, in this order:
+#   0. caller   — the release runners only for release.yml's run (Runners, below)
+#   1. guard    — validate the ref, the version and that the tag is free
+#   2. tag      — write the version into every declared manifest, commit, tag, push both
+#   3. images   — build each component FROM THE TAGGED COMMIT, push `:v<version>` and
+#                 `:sha-<release sha>`
+#      charts   — only with the `charts` input: package each chart FROM THE TAGGED COMMIT
+#                 as `<version>` and push it to `chart_registry`
+#   4. next     — set the manifests to the next development version and push that
+#   5. announce — publish the GitHub Release for the tag (a tag alone is not a Release)
+#   6. merge_back — on a maintenance branch, open the pull request back into the default
+#                 branch, so the fix and the next development version reach it
+#
+# A release changes no environment: it publishes, and a deployment names the version
+# itself (ADR-0107).
+#
+# Per ADR-0106, the composite actions are this repository's (.github/actions/), every
+# third-party action is pinned by commit SHA, the jobs that mint App tokens run in the
+# caller's `environment` (H3 of the security review of 2026-10-27) and a component may
+# pass `build_args`.
+#
+# A local action is read from the job's checked-out workspace, so every job that uses one
+# checks this repository out first.
+#
+# THE CALLER MUST GRANT `pull-requests: write`. GitHub validates every permission a nested
+# job requests against the CALLING job BEFORE it evaluates any `if:`, so the `merge_back`
+# job below fails the whole run at startup when the caller withholds it — even on a
+# release from the default branch, where that job never executes. Grant all three:
+#
+#   permissions:
+#     contents: write
+#     packages: write
+#     pull-requests: write
+#
+# Trigger note: the pushes made here start no workflow, so the release commit does NOT
+# start ci.yml's publishing — this workflow owns the whole release and nothing races it.
+# With GITHUB_TOKEN that is GitHub's own rule: it fires no workflow for a GITHUB_TOKEN push.
+# With the release app (RELEASE_APP_*, below) GitHub would fire them, so its two commits
+# carry `[skip ci]`.
+#
+# Branch protection: GITHUB_TOKEN pushes as github-actions[bot], which a ruleset that
+# requires a pull request refuses. `main`'s ruleset does, so the environment holds
+# RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY: `tag` and `next` then push with a token
+# of that app, narrowed to Contents on this repository, and the ruleset lets that one app
+# bypass it.
+#
+# Environments: `tag` and `next` run in `inputs.environment` (release.yml:
+# `release-deploy`, deployment branches `main` and `hotfix/**`). A job that names an
+# environment reads that environment's secrets in place of the ones its caller passed, so
+# the release App's key reaches these two jobs only from the branches the environment
+# allows.
+#
+# Runners: every job but `caller` runs on inputs.runner. Where CI_RELEASE_RUNNER names a
+# self-hosted runner group, this file is among that group's "Selected workflows" at
+# refs/heads/main (release.yml's header, ADR-0106), which admits its jobs also when another
+# workflow calls it, and `guard` checks
+# out the caller's commit and runs a local action from it: a workflow on any branch, or a
+# fork's pull request, could call this file at main and run its own code on the release
+# runners. So `caller` settles the label before any job takes it, as runner-artifacts.yml's
+# `check` does: a CI runner (vars.CI_RUNNER, or GitHub-hosted ubuntu-latest) for any caller,
+# the release runners (vars.CI_RELEASE_RUNNER) only for release.yml's run from main or a
+# hotfix branch, and nothing else. Its script is inline: a local action would be read from
+# the caller's checkout.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version, semver, no leading v (e.g. 1.0.0-beta.2).'
+        required: true
+        type: string
+      next_version:
+        description: 'Development version after the release. Empty = derive.'
+        required: false
+        default: ''
+        type: string
+      manifests:
+        description: |
+          Newline-separated version manifests, `pom:<path>:<artifactId>` or `npm:<dir>`.
+        required: true
+        type: string
+      components:
+        description: |
+          JSON array of images to build, each `{"component","image","context","file"}`,
+          and optionally `"build_args"`: newline-separated KEY=value build arguments.
+          `image` is the full name without a tag, e.g. ghcr.io/flowtivo/tinfirm-server.
+        required: true
+        type: string
+      charts:
+        description: |
+          Newline-separated chart directories to publish, e.g. `deploy/helm/tinfirm`. Each
+          is pushed as `<chart_registry>/<name>:<version>` with appVersion `<version>`.
+          Empty (the default) publishes no chart: the `charts` job is skipped.
+        required: false
+        default: ''
+        type: string
+      chart_registry:
+        description: 'OCI registry and namespace the charts go to.'
+        required: false
+        default: oci://ghcr.io/flowtivo/charts
+        type: string
+      environment:
+        description: >-
+          Environment of the jobs that mint App tokens and push (`tag`, `next`). Its
+          deployment-branch rules decide which branches may release, and its secrets
+          RELEASE_APP_* take the place of the ones passed below.
+        required: true
+        type: string
+      product_name:
+        description: >-
+          Human name used in the annotated tag message and the GitHub Release title.
+          Empty = the repository name.
+        required: false
+        default: ''
+        type: string
+      release_branches:
+        description: |
+          Space-separated glob list of refs a release may run from. A feature branch must
+          never be releasable: it would tag and ship code that was never merged.
+        required: false
+        default: 'refs/heads/main refs/heads/hotfix/*'
+        type: string
+      runner:
+        description: 'Runner label for every job.'
+        required: false
+        default: ubuntu-latest
+        type: string
+      node_version:
+        description: 'Node version. Needed whenever an npm manifest is declared.'
+        required: false
+        default: '24'
+        type: string
+      git_user:
+        description: 'Committer name for the release commits.'
+        required: false
+        default: 'github-actions[bot]'
+        type: string
+      git_email:
+        description: 'Committer email for the release commits.'
+        required: false
+        default: '41898282+github-actions[bot]@users.noreply.github.com'
+        type: string
+    secrets:
+      RELEASE_APP_CLIENT_ID:
+        description: >-
+          Client ID of the App that pushes the release and next-version commits, for a
+          release branch whose ruleset lets only that app push. Both or neither; neither =
+          GITHUB_TOKEN.
+        required: false
+      RELEASE_APP_PRIVATE_KEY:
+        description: 'Private key of that App. Both or neither, with RELEASE_APP_CLIENT_ID.'
+        required: false
+    outputs:
+      version:
+        description: 'The released version, without the leading v.'
+        value: ${{ jobs.guard.outputs.version }}
+      sha:
+        description: 'Commit the release was tagged at.'
+        value: ${{ jobs.tag.outputs.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  # The runner label, before any job takes it (header). Not on inputs.runner, and no
+  # checkout: only this file's own script runs here.
+  caller:
+    name: Check the runner and the caller
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Runner and caller
+        env:
+          RUNNER: ${{ inputs.runner }}
+          CI_RUNNER: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+          RELEASE_RUNNER: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
+        run: |
+          set -euo pipefail
+          release="$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads"
+          case "$RUNNER" in
+            "$CI_RUNNER" | ubuntu-latest) ;;
+            "$RELEASE_RUNNER")
+              case "$GITHUB_WORKFLOW_REF" in
+                "$release/main" | "$release/hotfix/"*) ;;
+                *)
+                  echo "::error title=runner::The release runners ($RUNNER) run only release.yml's release, from main or a hotfix branch; this run is $GITHUB_WORKFLOW_REF."
+                  exit 1 ;;
+              esac ;;
+            *)
+              echo "::error title=runner::'$RUNNER' is none of this repository's runner labels (the header of reusable-release.yml)."
+              exit 1 ;;
+          esac
+          echo "Release jobs on $RUNNER, for $GITHUB_WORKFLOW_REF"
+
+  guard:
+    name: Validate the release request
+    needs: [caller]
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      next_version: ${{ steps.check.outputs.next_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the tag-already-exists check reads the local tag refs.
+          fetch-depth: 0
+          persist-credentials: false
+      # set-version runs `npm version` for npm manifests, so this job needs node even
+      # though it builds nothing.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Derive the next development version
+        id: next
+        uses: ./.github/actions/set-version
+        with:
+          manifests: ${{ inputs.manifests }}
+          next_of: ${{ inputs.version }}
+      # Half a release app would push with GITHUB_TOKEN after all, and fail at the
+      # ruleset only after the images exist. Refuse it before anything is pushed. This job
+      # has no environment, so it sees only the secrets the caller passed; `tag` checks the
+      # environment's again before it pushes.
+      - name: Check the release app's secrets
+        env:
+          HAS_ID: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+          HAS_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$HAS_ID" != "$HAS_KEY" ]; then
+            echo "::error::Pass both RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY, or neither."
+            exit 1
+          fi
+      - name: Check the ref, the version and the tag
+        id: check
+        env:
+          VERSION: ${{ inputs.version }}
+          NEXT_VERSION: ${{ inputs.next_version }}
+          DERIVED_NEXT: ${{ steps.next.outputs.next }}
+          RELEASE_BRANCHES: ${{ inputs.release_branches }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          allowed=0
+          for pattern in $RELEASE_BRANCHES; do
+            # The pattern is meant to glob.
+            # shellcheck disable=SC2254
+            case "$GITHUB_REF" in $pattern) allowed=1 ;; esac
+          done
+          if [ "$allowed" != 1 ]; then
+            echo "::error::Release runs from '$RELEASE_BRANCHES' only; got $GITHUB_REF"
+            exit 1
+          fi
+
+          # A maintenance branch that CONTAINS the default branch's HEAD is the default
+          # branch with extra steps — the signature of GitHub's "Update branch" button
+          # (or the web conflict editor) having merged the default branch into it on a
+          # merge-back PR, which is how a "hotfix" can ship all of main. A legitimate maintenance branch is always missing
+          # whatever the default branch merged since the released tag; if the default
+          # branch genuinely has not moved, release from the default branch instead.
+          if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ] \
+              && git rev-parse -q --verify "origin/$DEFAULT_BRANCH" > /dev/null \
+              && git merge-base --is-ancestor "origin/$DEFAULT_BRANCH" HEAD; then
+            echo "::error::$GITHUB_REF_NAME contains $DEFAULT_BRANCH's current HEAD, so releasing it would ship everything on $DEFAULT_BRANCH. If '$DEFAULT_BRANCH' was merged in by accident (e.g. the Update-branch button on a merge-back PR), reset the branch; if $DEFAULT_BRANCH truly has not moved since the released tag, release from $DEFAULT_BRANCH instead."
+            exit 1
+          fi
+
+          VERSION="${VERSION#v}"
+          if [ -z "$NEXT_VERSION" ]; then
+            NEXT_VERSION="$DERIVED_NEXT"
+          else
+            NEXT_VERSION="${NEXT_VERSION#v}"
+          fi
+
+          # A tag that already exists means this version shipped. Re-tagging it would
+          # move a released version onto different code.
+          if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null; then
+            echo "::error::Tag v$VERSION already exists. Pick a new version."
+            exit 1
+          fi
+
+          echo "version=$VERSION"           >> "$GITHUB_OUTPUT"
+          echo "next_version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Releasing v$VERSION from $GITHUB_REF_NAME; branch continues on $NEXT_VERSION"
+      # Both versions are written into this throwaway tree and thrown away. A version
+      # the manifests cannot take, or a manifest path that no longer exists, therefore
+      # fails HERE — before anything is tagged, built or pushed.
+      - name: Dry-run the release version against every manifest
+        uses: ./.github/actions/set-version
+        with:
+          version: ${{ steps.check.outputs.version }}
+          manifests: ${{ inputs.manifests }}
+      - name: Dry-run the next development version against every manifest
+        uses: ./.github/actions/set-version
+        with:
+          version: ${{ steps.check.outputs.next_version }}
+          manifests: ${{ inputs.manifests }}
+      # The charts too, when the caller publishes any: a chart that does not package under
+      # this version, or that does not link its package to this repository, fails here
+      # and not after the tag is pushed.
+      - name: Dry-run the charts
+        if: ${{ inputs.charts != '' }}
+        uses: ./.github/actions/helm-publish
+        with:
+          charts: ${{ inputs.charts }}
+          version: ${{ steps.check.outputs.version }}
+          app-version: ${{ steps.check.outputs.version }}
+          registry: ${{ inputs.chart_registry }}
+          push: 'false'
+
+  tag:
+    name: Set version, commit and tag
+    needs: [guard]
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    env:
+      RELEASE_APP: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+    steps:
+      # The environment's secrets, which this job reads in place of the passed ones: both
+      # of the release app's, or neither, before anything is pushed.
+      - name: Check the release app's secrets
+        env:
+          HAS_ID: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+          HAS_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ "$HAS_ID" != "$HAS_KEY" ]; then
+            echo "::error::The environment holds one of RELEASE_APP_CLIENT_ID and RELEASE_APP_PRIVATE_KEY without the other."
+            exit 1
+          fi
+      # The release app's token, when the environment holds one: Contents on this
+      # repository alone, revoked when the job ends. The ruleset of a protected release
+      # branch lets this app push, and nothing else.
+      - id: token
+        if: ${{ env.RELEASE_APP == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Keep the credentials this time: this job pushes the release commit and the
+          # tag, with the release app's token or else GITHUB_TOKEN + `contents: write`.
+          # GITHUB_TOKEN pushes as github-actions[bot]: a branch whose ruleset requires a
+          # pull request refuses it here, and needs the release app.
+          token: ${{ steps.token.outputs.token || github.token }}
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Set the release version in every manifest
+        id: setv
+        uses: ./.github/actions/set-version
+        with:
+          version: ${{ needs.guard.outputs.version }}
+          manifests: ${{ inputs.manifests }}
+      - name: Commit and tag
+        id: commit
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          PATHS: ${{ steps.setv.outputs.paths }}
+          # The repository name when the caller names no product, so the message never
+          # starts with a bare " v<version>".
+          PRODUCT: ${{ inputs.product_name || github.event.repository.name }}
+          GIT_USER: ${{ inputs.git_user }}
+          GIT_EMAIL: ${{ inputs.git_email }}
+        run: |
+          set -euo pipefail
+          git config user.name  "$GIT_USER"
+          git config user.email "$GIT_EMAIL"
+          # PATHS is a space-separated list.
+          read -r -a paths <<< "$PATHS"
+          git add "${paths[@]}"
+          # An app's push fires workflows, GITHUB_TOKEN's does not: keep it that way.
+          skip=""
+          if [ "$RELEASE_APP" = true ]; then skip=" [skip ci]"; fi
+          git commit -m "release: v$VERSION$skip"
+          # Annotated: `git describe` and the GitHub release UI both want a tag object.
+          git tag -a "v$VERSION" -m "$PRODUCT v$VERSION"
+          # The commit and the tag in one atomic push: both land or neither does. If the branch
+          # moved under us, or a tag rule refuses the tag, nothing is pushed, so a re-run starts
+          # from a clean state instead of a release commit without its tag (which a re-run could
+          # not repeat: it would find no manifest change to commit) or a tag with no commit.
+          git push --atomic origin "HEAD:$GITHUB_REF_NAME" "refs/tags/v$VERSION"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  images:
+    name: Build & publish ${{ matrix.component }} image
+    needs: [guard, tag]
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      # Independent contexts and image names — a failure in one leg must not cancel the
+      # others, so a re-run only rebuilds what actually failed.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.components) }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tagged commit, not the branch head — the branch gets its next-version
+          # commit later in this same run, and the image must be the released code.
+          ref: ${{ needs.tag.outputs.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/docker-login
+        with:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          # The component's own build arguments, if it declares any (release.yml:
+          # CACHE_SCOPE=main, so that the release's builds read main's BuildKit cache mounts
+          # and never a pull request's).
+          build-args: ${{ matrix.build_args }}
+          push: true
+          # Both tags: `v<version>` is what a deployment pins for the release, `sha-<sha>`
+          # keeps the release commit addressable the same way every other commit is.
+          tags: |
+            ${{ matrix.image }}:v${{ needs.guard.outputs.version }}
+            ${{ matrix.image }}:sha-${{ needs.tag.outputs.sha }}
+          # Without this label GHCR creates the package unlinked and private; a
+          # pull of it then gets `denied`, and a Kubernetes deployment of it waits in
+          # ImagePullBackOff.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+  charts:
+    name: Publish the charts
+    needs: [guard, tag]
+    # Opt-in: a caller that passes no `charts` gets this job skipped.
+    if: ${{ inputs.charts != '' }}
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tagged commit, as for the images.
+          ref: ${{ needs.tag.outputs.sha }}
+          persist-credentials: false
+      # Under the release's version, with appVersion the same, so a chart installed with
+      # its defaults runs this release's images (`v<version>`), and a deployment that
+      # derives its chart version from the image tag it pins finds it (ADR-0080).
+      - uses: ./.github/actions/helm-publish
+        with:
+          charts: ${{ inputs.charts }}
+          version: ${{ needs.guard.outputs.version }}
+          app-version: ${{ needs.guard.outputs.version }}
+          registry: ${{ inputs.chart_registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+  next:
+    name: Open the next development version
+    needs: [guard, tag, images]
+    # Runs once the images exist, whatever becomes of the charts: the tag is pushed, so the
+    # branch must move off the released version either way. A branch left sitting on a
+    # released version is how the NEXT release silently rebuilds the last one.
+    if: ${{ always() && needs.images.result == 'success' }}
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+    env:
+      RELEASE_APP: ${{ secrets.RELEASE_APP_CLIENT_ID != '' }}
+    steps:
+      # As in `tag`: the release app's token when the environment holds one.
+      - id: token
+        if: ${{ env.RELEASE_APP == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The release commit this run pushed, not the branch's head at this moment, so
+          # that the actions this job runs are the released ones; the push below rebases
+          # onto whatever the branch moved to since.
+          ref: ${{ needs.tag.outputs.sha }}
+          token: ${{ steps.token.outputs.token || github.token }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Set the next development version
+        id: setv
+        uses: ./.github/actions/set-version
+        with:
+          version: ${{ needs.guard.outputs.next_version }}
+          manifests: ${{ inputs.manifests }}
+      - name: Commit and push
+        env:
+          NEXT_VERSION: ${{ needs.guard.outputs.next_version }}
+          PATHS: ${{ steps.setv.outputs.paths }}
+          GIT_USER: ${{ inputs.git_user }}
+          GIT_EMAIL: ${{ inputs.git_email }}
+        run: |
+          set -euo pipefail
+          git config user.name  "$GIT_USER"
+          git config user.email "$GIT_EMAIL"
+          # PATHS is a space-separated list.
+          read -r -a paths <<< "$PATHS"
+          git add "${paths[@]}"
+          skip=""
+          if [ "$RELEASE_APP" = true ]; then skip=" [skip ci]"; fi
+          git commit -m "chore: prepare $NEXT_VERSION$skip" || { echo "already on $NEXT_VERSION"; exit 0; }
+          for _ in 1 2 3; do
+            git push origin "HEAD:$GITHUB_REF_NAME" && exit 0
+            git pull --rebase origin "$GITHUB_REF_NAME"
+          done
+          git push origin "HEAD:$GITHUB_REF_NAME"
+
+  announce:
+    name: Publish the GitHub release
+    needs: [guard, tag, images]
+    # The tag exists and every image is pushed, so the release IS shipped — publish the
+    # Release even when the charts fail. A failed image build stops it: a Release page
+    # pointing at images that do not exist is worse than no Release page.
+    if: ${{ always() && needs.images.result == 'success' }}
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+    steps:
+      # A git tag is NOT a GitHub Release — GitHub never promotes one to the other.
+      #
+      # The REST API, not `gh`: no workflow here depends on the CLI being installed on
+      # a self-hosted runner, and this is not the place to start.
+      - name: Create the GitHub release for v${{ needs.guard.outputs.version }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.guard.outputs.version }}
+          SHA: ${{ needs.tag.outputs.sha }}
+          # As in `tag`: the repository name when the caller names no product.
+          PRODUCT: ${{ inputs.product_name || github.event.repository.name }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}/releases
+        run: |
+          set -euo pipefail
+          # Idempotent: re-running a release whose images succeeded must not 422 here.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API/tags/v$VERSION")
+          if [ "$code" = 200 ]; then
+            echo "::notice::Release v$VERSION already exists"
+            exit 0
+          fi
+
+          # A semver prerelease part (1.0.0-beta.2) marks the Release as a prerelease, so
+          # the Releases page keeps "Latest" on the newest STABLE version instead of
+          # moving it to every beta.
+          case "$VERSION" in *-*) PRE=true ;; *) PRE=false ;; esac
+
+          # `generate_release_notes` builds the body from the PRs merged since the previous
+          # tag. There is no CHANGELOG, so this IS the changelog.
+          #
+          # jq is not assumed present on the runners, so the body is written by hand. Every
+          # interpolated value is safe to inline: VERSION passed the guard's semver checks,
+          # SHA is a git object id, and PRODUCT is a workflow input or the repository name,
+          # neither of them user content.
+          curl -sS --fail-with-body -X POST "$API" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"v$VERSION\",
+                 \"name\":\"$PRODUCT v$VERSION\",
+                 \"target_commitish\":\"$SHA\",
+                 \"generate_release_notes\":true,
+                 \"prerelease\":$PRE,
+                 \"draft\":false}" > /dev/null
+          echo "::notice::Published the GitHub release for v$VERSION (prerelease=$PRE)"
+
+  merge_back:
+    name: Open the merge-back pull request
+    needs: [guard, tag, images, next]
+    # Only for a maintenance branch. A release from the default branch has nothing to
+    # merge back.
+    if: ${{ always() && needs.next.result == 'success' && github.ref_name != github.event.repository.default_branch }}
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # The hotfix that is never merged back is the failure this job exists for: a hotfix
+      # branch deleted with its `chore: prepare <next>` commit still on it leaves main
+      # claiming a version that has already shipped.
+      #
+      # A PR, not a push: the merge usually needs a human to resolve it against whatever
+      # the default branch moved on to. Opening it AFTER the release is deliberate — a
+      # merge-back done before the release is what makes the maintenance branch swallow
+      # the default branch, which the `guard` job refuses to release.
+      - name: Open the pull request into ${{ github.event.repository.default_branch }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.guard.outputs.version }}
+          BRANCH: ${{ github.ref_name }}
+          BASE: ${{ github.event.repository.default_branch }}
+          OWNER: ${{ github.repository_owner }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # `--fail-with-body` on the LOOKUP too: an error response is a JSON object, and
+          # treating one as "a pull request already exists" would silently skip the job
+          # every time — the failure mode this job exists to end.
+          open=$(curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API/pulls?state=open&base=$BASE&head=$OWNER:$BRANCH")
+          if [ "$(printf '%s' "$open" | tr -d '[:space:]')" != '[]' ]; then
+            echo "::notice::A merge-back pull request for $BRANCH is already open"
+            exit 0
+          fi
+
+          body="Merge \`$BRANCH\` back into \`$BASE\` after the v$VERSION release.\n\nWithout this, \`$BASE\` loses the fix and keeps its manifests on a version that has already shipped.\n\nDo NOT use the **Update branch** button or the web conflict editor on this pull request: both merge \`$BASE\` INTO the maintenance branch, which makes the next release from that branch ship all of \`$BASE\`. Resolve any conflict locally.\n\nMerge it with a merge commit, not a squash: a release pushed by the release app marks its commits \`[skip ci]\`, and a squash would carry that into \`$BASE\`'s commit and skip its CI.\n\nDelete \`$BRANCH\` only after this merges."
+          curl -sS --fail-with-body -X POST "$API/pulls" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"title\":\"Merge $BRANCH back into $BASE after v$VERSION\",
+                 \"head\":\"$BRANCH\",
+                 \"base\":\"$BASE\",
+                 \"body\":\"$body\"}" > /dev/null
+          echo "::notice::Opened the merge-back pull request for $BRANCH"

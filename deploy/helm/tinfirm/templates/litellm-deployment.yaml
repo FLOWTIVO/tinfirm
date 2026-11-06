@@ -1,0 +1,263 @@
+{{- if .Values.litellm.enabled }}
+{{- include "tinfirm.litellm.validateDatabase" . }}
+{{- $l := .Values.litellm }}
+{{- $db := $l.database }}
+{{- $ca := include "tinfirm.litellm.databaseCaSecret" . | fromJson }}
+{{- $sslMode := $db.sslMode | default .Values.database.sslMode }}
+{{- $password := include "tinfirm.litellm.databasePasswordRef" . | fromJson }}
+# The bundled LiteLLM, the company's model gateway (ADR-0059, ADR-0069;
+# docs/operations/litellm.md). Its own port, every route, is the server's alone; the model
+# port beside it (container model-api) serves its model routes alone to the server and the
+# company's services (litellm-networkpolicy.yaml). Nothing exposes either outside the release;
+# runner hosts reach only the server.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tinfirm.litellm.fullname" . }}
+  labels:
+    {{- include "tinfirm.litellm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $l.replicaCount }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "tinfirm.litellm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pods when the settings change. The referenced Secret is not tracked:
+        # restart the Deployment after rotating it.
+        checksum/config: {{ include (print $.Template.BasePath "/litellm-configmap.yaml") . | sha256sum }}
+        {{- with $l.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "tinfirm.litellm.labels" . | nindent 8 }}
+        {{- with $l.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "tinfirm.serviceAccountName" . }}
+      # LiteLLM never calls the Kubernetes API.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "tinfirm.securityContext" (dict "context" $l.podSecurityContext "root" $) | nindent 8 }}
+      containers:
+        - name: litellm
+          image: {{ include "tinfirm.litellm.image" . | quote }}
+          imagePullPolicy: {{ $l.image.pullPolicy }}
+          args: ["--port", "4000", "--config", "/etc/litellm/config.yaml"]
+          securityContext:
+            {{- include "tinfirm.securityContext" (dict "context" $l.securityContext "root" $) | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 4000
+              protocol: TCP
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $l.existingSecret }}
+                  key: {{ $l.secretKeys.masterKey }}
+            # Encrypts the provider keys LiteLLM stores. Never change it once keys are stored.
+            - name: LITELLM_SALT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $l.existingSecret }}
+                  key: {{ $l.secretKeys.saltKey }}
+            {{- if $db.secretKeys.url }}
+            # A complete postgresql:// URL with the password, from a Secret: it replaces the
+            # split DATABASE_* settings, which LiteLLM ignores once DATABASE_URL is set. It
+            # turns libpq's sslmode=verify-ca/verify-full and sslrootcert in it into Prisma's
+            # TLS settings.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $db.existingSecret }}
+                  key: {{ $db.secretKeys.url }}
+            {{- else }}
+            # LiteLLM builds DATABASE_URL from these, URL-encoding the password, and turns
+            # libpq's verify-ca/verify-full and the CA into Prisma's TLS settings. The port
+            # goes into DATABASE_HOST: this version's proxy ignores DATABASE_PORT.
+            - name: DATABASE_HOST
+              value: {{ include "tinfirm.litellm.databaseHost" . | quote }}
+            - name: DATABASE_NAME
+              value: {{ $db.name | quote }}
+            {{- if $db.secretKeys.username }}
+            - name: DATABASE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $db.existingSecret }}
+                  key: {{ $db.secretKeys.username }}
+            {{- else }}
+            - name: DATABASE_USERNAME
+              value: {{ $db.user | quote }}
+            {{- end }}
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $password.name }}
+                  key: {{ $password.key }}
+            {{- with $sslMode }}
+            - name: DATABASE_SSLMODE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $ca.name }}
+            - name: DATABASE_SSLROOTCERT
+              value: {{ printf "/etc/litellm/database-ca/%s" $ca.key | quote }}
+            {{- end }}
+            {{- end }}
+            # The admin UI is off unless litellm.adminUi; the admin API stays (the server uses it).
+            - name: DISABLE_ADMIN_UI
+              value: {{ ternary "False" "True" $l.adminUi | quote }}
+            # With the ConfigMap: prompts and answers never go to the spend logs.
+            - name: STORE_PROMPTS_IN_SPEND_LOGS
+              value: "False"
+            # Read no .env file from the working directory.
+            - name: LITELLM_MODE
+              value: PRODUCTION
+            # Caches (Hugging Face tokenizers, ...) under /tmp, the only writable path.
+            - name: XDG_CACHE_HOME
+              value: /tmp/.cache
+            {{- with $l.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: {{ $l.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ $l.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ $l.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: {{ $l.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $l.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ $l.probes.liveness.failureThreshold }}
+          # Ready once the database answers.
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            periodSeconds: {{ $l.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $l.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ $l.probes.readiness.failureThreshold }}
+          {{- with $l.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/litellm/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            {{- if $ca.name }}
+            - name: database-ca
+              mountPath: /etc/litellm/database-ca
+              readOnly: true
+            {{- end }}
+        # The model port (ADR-0069; model-api/README.md): LiteLLM's model routes alone, each by
+        # its exact path, with LiteLLM's own fields removed from every body. It holds no key:
+        # each caller sends its own, which LiteLLM checks.
+        - name: model-api
+          image: {{ include "tinfirm.modelApi.image" . | quote }}
+          imagePullPolicy: {{ $l.modelApi.image.pullPolicy }}
+          securityContext:
+            {{- include "tinfirm.securityContext" (dict "context" $l.modelApi.securityContext "root" $) | nindent 12 }}
+          ports:
+            - name: model
+              containerPort: 4001
+              protocol: TCP
+            - name: model-health
+              containerPort: 4002
+              protocol: TCP
+          env:
+            - name: MODEL_API_UPSTREAM
+              value: http://127.0.0.1:4000
+            - name: MODEL_API_MAX_REQUEST_BYTES
+              value: {{ $l.modelApi.maxRequestBytes | int64 | toString | quote }}
+            - name: MODEL_API_MAX_INFLIGHT_BYTES
+              value: {{ $l.modelApi.maxInflightBytes | int64 | toString | quote }}
+            - name: MODEL_API_IDLE_TIMEOUT
+              value: {{ $l.modelApi.idleTimeout | quote }}
+            - name: MODEL_API_PROVIDER_TOOLS
+              value: {{ $l.modelApi.providerTools | default "OFF" | quote }}
+            - name: JAVA_TOOL_OPTIONS
+              value: {{ $l.modelApi.javaToolOptions | quote }}
+            {{- with $l.modelApi.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: model-health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: model-health
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: model-health
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- with $l.modelApi.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: model-api-tmp
+              mountPath: /tmp
+      volumes:
+        # /tmp of LiteLLM, its only writable path.
+        - name: tmp
+          emptyDir:
+            {{- with ($l.tmpVolume | default dict).sizeLimit }}
+            sizeLimit: {{ . }}
+            {{- else }} {}
+            {{- end }}
+        # /tmp of the model port, its only writable path (Tomcat's work directory).
+        - name: model-api-tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: config
+          configMap:
+            name: {{ include "tinfirm.litellm.fullname" . }}
+        {{- if $ca.name }}
+        - name: database-ca
+          secret:
+            secretName: {{ $ca.name }}
+            items:
+              - key: {{ $ca.key }}
+                path: {{ $ca.key }}
+            defaultMode: 0444
+        {{- end }}
+      {{- with $l.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $l.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $l.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

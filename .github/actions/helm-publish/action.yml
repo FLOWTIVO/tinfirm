@@ -1,0 +1,146 @@
+# A composite action of this repository (ADR-0106). Third-party actions are pinned by
+# commit SHA, with their release in the comment; Dependabot keeps them current.
+name: Publish Helm charts to an OCI registry
+description: >-
+  Package chart directories under one version and push them to an OCI registry (GHCR by
+  default), with helm's state in a per-job directory. With `push: false` it only packages
+  and checks the charts, which is how the release's guard tries them before tagging.
+
+inputs:
+  charts:
+    description: >-
+      Newline-separated chart directories, relative to the workspace (e.g.
+      deploy/helm/tinfirm). Blank lines and `#` comments are allowed.
+    required: true
+  version:
+    description: >-
+      Chart version to publish, SemVer without a leading v (e.g. 1.2.0, or
+      0.0.0-sha-<commit> for a build of the default branch). It is also the OCI tag.
+    required: true
+  app-version:
+    description: "appVersion to write into each package. Empty keeps the one in its Chart.yaml."
+    required: false
+    default: ''
+  registry:
+    description: 'OCI registry and namespace the charts are pushed under; each chart name is appended.'
+    required: false
+    default: oci://ghcr.io/flowtivo/charts
+  username:
+    description: 'Registry user. Normally github.actor. Not needed with push: false.'
+    required: false
+    default: ''
+  password:
+    description: 'Registry token. Normally secrets.GITHUB_TOKEN (packages: write). Not needed with push: false.'
+    required: false
+    default: ''
+  push:
+    description: "'false' packages and checks the charts without logging in or pushing."
+    required: false
+    default: 'true'
+  helm-version:
+    description: 'Helm release to install.'
+    required: false
+    default: v4.3.0
+
+outputs:
+  refs:
+    description: >-
+      Newline-separated chart references, <registry host and path>/<name>:<version>@<digest>
+      (without oci://; no digest with push: false).
+    value: ${{ steps.publish.outputs.refs }}
+
+runs:
+  using: composite
+  steps:
+    - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      with:
+        version: ${{ inputs.helm-version }}
+    - id: publish
+      shell: bash
+      env:
+        CHARTS: ${{ inputs.charts }}
+        VERSION: ${{ inputs.version }}
+        APP_VERSION: ${{ inputs.app-version }}
+        REGISTRY: ${{ inputs.registry }}
+        REGISTRY_USER: ${{ inputs.username }}
+        REGISTRY_PASSWORD: ${{ inputs.password }}
+        PUSH: ${{ inputs.push }}
+        REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        # Every helm home in a directory of this job, for the reason the docker-login action
+        # gives: where concurrent jobs share one $HOME, helm's default registry
+        # config (~/.config/helm/registry/config.json) is one file for every concurrent
+        # job, and a job that ends revokes the GITHUB_TOKEN another job is pushing with.
+        home="$(mktemp -d "${RUNNER_TEMP}/helm.XXXXXXXX")"
+        export HELM_CACHE_HOME="$home/cache" HELM_CONFIG_HOME="$home/config" \
+          HELM_DATA_HOME="$home/data" HELM_REGISTRY_CONFIG="$home/registry.json"
+        trap 'rm -rf "$home"' EXIT
+
+        case "$REGISTRY" in
+          oci://*) ;;
+          *) echo "::error::registry must start with oci://; got '$REGISTRY'"; exit 1 ;;
+        esac
+        host="${REGISTRY#oci://}"
+        host="${host%%/*}"
+
+        # Package every chart before pushing any, so a chart that does not package leaves
+        # nothing half-published.
+        packages=()
+        refs=()
+        while IFS= read -r chart; do
+          chart="${chart%%#*}"
+          chart="$(printf '%s' "$chart" | tr -d '[:space:]')"
+          [ -n "$chart" ] || continue
+          if [ ! -f "$chart/Chart.yaml" ]; then
+            echo "::error::No Chart.yaml in '$chart'."
+            exit 1
+          fi
+
+          # Helm turns the first `sources:` entry into the manifest annotation
+          # org.opencontainers.image.source, which links the GHCR package to this
+          # repository, as the label does for the release's images. An unlinked package
+          # is created private and outside the repository's access settings.
+          meta="$(helm show chart "$chart")"
+          name="$(printf '%s\n' "$meta" | sed -n 's/^name: *//p' | head -n 1)"
+          source="$(printf '%s\n' "$meta" | awk '
+            /^sources:/ { inside = 1; next }
+            inside && /^- / { sub(/^- */, ""); print; exit }
+            inside && /^[^ -]/ { exit }')"
+          if [ "$(printf '%s' "$source" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$REPOSITORY_URL" | tr '[:upper:]' '[:lower:]')" ]; then
+            echo "::error file=$chart/Chart.yaml::The chart's first sources entry must be $REPOSITORY_URL (it is '${source:-missing}'): it links the GHCR package to this repository."
+            exit 1
+          fi
+
+          # `helm package` checks the version as SemVer and the chart's metadata.
+          args=(--version "$VERSION" --destination "$home/out")
+          if [ -n "$APP_VERSION" ]; then
+            args+=(--app-version "$APP_VERSION")
+          fi
+          helm package "$chart" "${args[@]}"
+          packages+=("$home/out/${name}-${VERSION}.tgz")
+          refs+=("${REGISTRY#oci://}/${name}:${VERSION}")
+        done <<< "$CHARTS"
+        if [ "${#packages[@]}" = 0 ]; then
+          echo "::error::No chart directory in the charts input."
+          exit 1
+        fi
+
+        if [ "$PUSH" != "true" ]; then
+          echo "::notice::${refs[*]} package; not pushed."
+          printf 'refs<<EOF\n%s\nEOF\n' "$(printf '%s\n' "${refs[@]}")" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        printf '%s' "$REGISTRY_PASSWORD" | helm registry login "$host" -u "$REGISTRY_USER" --password-stdin
+        pushed=()
+        for i in "${!packages[@]}"; do
+          out="$(helm push "${packages[$i]}" "$REGISTRY" 2>&1)" || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          digest="$(printf '%s\n' "$out" | sed -n 's/^Digest: *//p' | head -n 1)"
+          pushed+=("${refs[$i]}${digest:+@$digest}")
+          echo "::notice::Published ${refs[$i]}${digest:+ ($digest)}"
+        done
+        helm registry logout "$host" || true
+        printf 'refs<<EOF\n%s\nEOF\n' "$(printf '%s\n' "${pushed[@]}")" >> "$GITHUB_OUTPUT"

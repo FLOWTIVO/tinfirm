@@ -1,0 +1,245 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tinfirm.fullname" . }}
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+  {{- with .Values.strategy }}
+  strategy:
+    {{- /* A Recreate Deployment must not carry rollingUpdate, which the default sets. */}}
+    {{- toYaml (ternary (omit . "rollingUpdate") . (eq (toString .type) "Recreate")) | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tinfirm.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pods when the non-secret configuration changes. The referenced Secrets
+        # are not tracked: restart the Deployment after rotating one.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.scrapeAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: /actuator/prometheus
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "tinfirm.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "tinfirm.serviceAccountName" . }}
+      # The server never calls the Kubernetes API.
+      automountServiceAccountToken: false
+      # No docker-link style variables: a Service named `tinfirm` would otherwise inject
+      # TINFIRM_PORT, TINFIRM_SERVICE_HOST, ... which Spring binds as tinfirm.* properties.
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- include "tinfirm.securityContext" (dict "context" .Values.podSecurityContext "root" $) | nindent 8 }}
+      containers:
+        - name: server
+          image: {{ include "tinfirm.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "tinfirm.securityContext" (dict "context" .Values.securityContext "root" $) | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: management
+              containerPort: 8081
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "tinfirm.fullname" . }}
+          env:
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.secretKeys.appPassword }}
+            - name: SPRING_FLYWAY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret }}
+                  key: {{ .Values.database.secretKeys.ownerPassword }}
+            - name: TINFIRM_VAULT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vault.existingSecret }}
+                  key: {{ .Values.vault.secretKeys.keys }}
+            - name: TINFIRM_VAULT_ACTIVE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vault.existingSecret }}
+                  key: {{ .Values.vault.secretKeys.activeKey }}
+            {{- with .Values.bootstrap.existingSecret }}
+            # Optional: bootstrap matters only while the user table is empty.
+            - name: TINFIRM_BOOTSTRAP_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.bootstrap.secretKeys.adminEmail }}
+                  optional: true
+            - name: TINFIRM_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.bootstrap.secretKeys.adminPassword }}
+                  optional: true
+            {{- end }}
+            {{- if .Values.litellm.enabled }}
+            # The bundled LiteLLM's master key, for its admin API. Optional, so that a missing
+            # LiteLLM Secret stops only the LiteLLM pods: the server then starts without a
+            # bundled gateway (Model access: "This deployment bundles none.").
+            - name: TINFIRM_LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litellm.existingSecret }}
+                  key: {{ .Values.litellm.secretKeys.masterKey }}
+                  optional: true
+            {{- end }}
+            {{- if .Values.runner.enabled }}
+            # The runner pod's token (ADR-0101, decision 8): the server registers its host with
+            # it at the start, and keeps its hash.
+            - name: TINFIRM_COMPANIES_{{ upper .Values.runner.company }}_RUNNER_HOST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.runner.existingSecret }}
+                  key: {{ .Values.runner.secretKeys.token }}
+            {{- end }}
+            {{- with .Values.errorReports.dsnSecret.name }}
+            # The vendor's error tracker (ADR-0070). Optional: without it nothing is delivered.
+            - name: TINFIRM_ERROR_REPORTS_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.errorReports.dsnSecret.key }}
+                  optional: true
+            {{- end }}
+            {{- range .Values.auth.oidc.providers }}
+            - name: SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_{{ upper .id }}_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret }}
+                  key: {{ dig "secretKeys" "clientSecret" "client-secret" . }}
+            {{- end }}
+            {{- range .Values.auth.saml.sp.credentials }}
+            - name: TINFIRM_AUTH_SAML_SP_CREDENTIALS_{{ upper .kid }}_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.saml.sp.existingSecret is required with SAML credentials" $.Values.auth.saml.sp.existingSecret }}
+                  key: {{ .keyKey | default (printf "%s.key" .kid) }}
+            - name: TINFIRM_AUTH_SAML_SP_CREDENTIALS_{{ upper .kid }}_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.auth.saml.sp.existingSecret }}
+                  key: {{ .certKey | default (printf "%s.crt" .kid) }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: management
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: management
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: management
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- if gt (int .Values.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ int .Values.preStopSleepSeconds }}"]
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.database.caCertSecret.name }}
+            - name: database-ca
+              mountPath: {{ include "tinfirm.databaseCaDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if include "tinfirm.samlMetadataFiles" . }}
+            - name: saml-metadata
+              mountPath: /etc/tinfirm/saml
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: tmp
+          {{- $tmp := dict }}
+          {{- with .Values.tmpVolume.medium }}{{ $_ := set $tmp "medium" . }}{{ end }}
+          {{- with .Values.tmpVolume.sizeLimit }}{{ $_ := set $tmp "sizeLimit" . }}{{ end }}
+          emptyDir: {{- if $tmp }}{{ toYaml $tmp | nindent 12 }}{{ else }} {}{{ end }}
+        {{- with .Values.database.caCertSecret.name }}
+        - name: database-ca
+          secret:
+            secretName: {{ . }}
+            items:
+              - key: {{ $.Values.database.caCertSecret.key }}
+                path: {{ $.Values.database.caCertSecret.key }}
+            defaultMode: 0444
+        {{- end }}
+        {{- if include "tinfirm.samlMetadataFiles" . }}
+        - name: saml-metadata
+          configMap:
+            name: {{ include "tinfirm.fullname" . }}-saml-metadata
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

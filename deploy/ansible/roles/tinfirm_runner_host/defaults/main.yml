@@ -1,0 +1,174 @@
+---
+# Defaults of the role tinfirm_runner_host (deploy/ansible/README.md, ADR-0025).
+# Every variable that a site may set is here. Secrets (the host token, header tokens) belong
+# in Ansible Vault, never in this file or an inventory in git.
+
+# --- Docker Engine -----------------------------------------------------------------------
+
+# Docker's package repository, or a mirror of it (Nexus or Artifactory apt/yum proxy).
+# Empty: download.docker.com for the distribution (ubuntu, debian, rhel or centos).
+tinfirm_runner_host_docker_repo_url: ""
+# Docker Engine version, e.g. "29.8.2". Empty: the newest in the repository. Pins docker-ce
+# and docker-ce-cli; containerd.io and the plugins follow the repository.
+tinfirm_runner_host_docker_version: ""
+# The fingerprint of the key that signs Docker's packages (Docker's release key; the runner
+# base image checks the same one). The role refuses a downloaded key with another fingerprint.
+# A mirror that re-signs the packages: its key's fingerprint, without spaces.
+tinfirm_runner_host_docker_key_fingerprint: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+# Registry mirrors of this machine's dockerd, used to pull the runner images' base image
+# (node:…-trixie-slim from Docker Hub) when `images build` runs. Not the sandboxes' mirrors.
+tinfirm_runner_host_docker_registry_mirrors: []
+# Registries this machine's dockerd may reach over plain HTTP (host:port). Avoid if you can.
+tinfirm_runner_host_docker_insecure_registries: []
+# More keys for /etc/docker/daemon.json, merged over what the role writes (runtimes,
+# registry-mirrors, insecure-registries). Changing daemon.json restarts Docker, which stops
+# every running sandbox: drain the runner host first.
+tinfirm_runner_host_docker_daemon_extra: {}
+
+# --- Kata Containers -----------------------------------------------------------------------
+
+# The Kata Containers static release (pinned). 3.x and 4.x releases work alike.
+tinfirm_runner_host_kata_version: "4.2.0"
+# Where the release tarballs are: GitHub, or a mirror with the same layout
+# (<url>/<version>/<tarball>), such as a Nexus raw proxy.
+tinfirm_runner_host_kata_download_url: "https://github.com/kata-containers/kata-containers/releases/download"
+# The tarball: Kata 4.x ships the Go runtime as kata-go-static-…, the Rust runtime
+# (runtime-rs) as kata-static-…. The role configures the Go runtime's shim.
+tinfirm_runner_host_kata_tarball: "kata-go-static-{{ tinfirm_runner_host_kata_version }}-{{ _tinfirm_runner_host_kata_arch }}.tar.zst"
+# Checksum of the tarball, "sha256:<hex>". Empty: the known checksum of the pinned version and
+# this machine's architecture (vars/main.yml); the role stops when it knows none, so a version
+# you pin yourself needs its checksum here (from the release's assets).
+tinfirm_runner_host_kata_checksum: ""
+# The Kata configuration to start from: Cloud Hypervisor. The role copies it to
+# /etc/kata-containers/configuration.toml when Kata is installed or upgraded.
+tinfirm_runner_host_kata_config_template: /opt/kata/share/defaults/kata-containers/configuration-clh.toml
+# Changes to /etc/kata-containers/configuration.toml, each a lineinfile item with `regexp`
+# and `line`, applied after the copy. Example (bigger default VM):
+#   - regexp: '^default_memory\s*='
+#     line: 'default_memory = 4096'
+tinfirm_runner_host_kata_config_lines: []
+# Name of the Docker runtime that the role registers and the runner host uses. It must start
+# with `kata`: `run --sandbox-docker` refuses any other runtime.
+tinfirm_runner_host_kata_runtime_name: kata
+# Optional smoke test after the install: an image (from a registry this machine can pull
+# from) that runs `uname -r` under the Kata runtime; the VM's kernel differs from this one's.
+# Empty: no test.
+tinfirm_runner_host_kata_smoke_test_image: ""
+
+# --- Runner host binary --------------------------------------------------------------------
+
+# Exactly one of the two:
+# - a `tinfirm-runner-host` binary on the control node (built, or taken out of a release);
+tinfirm_runner_host_binary_src: ""
+# - a release archive tinfirm-runner-host-<version>-<target>.tar.gz to download, e.g. from
+#   a Nexus raw repository that holds the release assets.
+tinfirm_runner_host_binary_url: ""
+# Where the release's SHA256SUMS and SHA256SUMS.sig are, a URL of their directory. Empty: the
+# directory of tinfirm_runner_host_binary_url (a mirror keeps a release's assets together).
+tinfirm_runner_host_release_url: ""
+# The public key SHA256SUMS.sig must verify against before any checksum in SHA256SUMS is
+# trusted: a file on the control node. The default is FLOWTIVO's release key, shipped with the
+# role (files/cosign.pub, a copy of deploy/compose/auto-deploy/cosign.pub). For `rolling`,
+# the rolling key: deploy/compose/auto-deploy/cosign-rolling.pub of the repository.
+tinfirm_runner_host_public_key: cosign.pub
+# Checksum of that archive, "sha256:<hex>". Empty: the archive's line of the release's
+# SHA256SUMS, once its signature verifies. Set: it must be that line too. Required only for a
+# release without SHA256SUMS.sig, which tinfirm_runner_host_allow_unsigned admits.
+tinfirm_runner_host_binary_checksum: ""
+# true: install a release archive whose SHA256SUMS has no signature (SHA256SUMS.sig answers
+# 404), against tinfirm_runner_host_binary_checksum, with a warning. A signature that does not
+# verify is refused even then.
+tinfirm_runner_host_allow_unsigned: false
+# HTTP headers for the download, e.g. {Authorization: "Bearer …"}; keep them in Vault.
+tinfirm_runner_host_binary_url_headers: {}
+# Where the binary goes.
+tinfirm_runner_host_binary_path: /usr/local/bin/tinfirm-runner-host
+
+# --- Runner host user and directories ------------------------------------------------------
+
+# The user that runs the runner host. It is in the `docker` group, which is root-equivalent
+# on this machine. Its uid is not the sandbox's (1000): with the sandbox bridge (the default)
+# the workspaces and homes travel over the bridge, not as bind mounts, so the agent never
+# writes this user's files. Without the bridge the workspaces are bind mounts written by uid
+# 1000: the role then requires uid 1000 (`doctor` warns otherwise).
+tinfirm_runner_host_user: tinfirm
+tinfirm_runner_host_uid: 1990
+# false: the user exists already (for example the image's default user with uid 1000).
+tinfirm_runner_host_create_user: true
+tinfirm_runner_host_home: /var/lib/tinfirm
+tinfirm_runner_host_config_dir: "{{ tinfirm_runner_host_home }}/config"
+tinfirm_runner_host_data_dir: "{{ tinfirm_runner_host_home }}/data"
+
+# --- Registration --------------------------------------------------------------------------
+
+# The Tinfirm server and the host token `tfr_…` shown once when the host is registered in
+# Tinfirm (Runner hosts → Register). The role logs in once; a later run leaves an existing
+# login alone unless tinfirm_runner_host_relogin is true.
+tinfirm_runner_host_server_url: ""
+tinfirm_runner_host_token: ""
+tinfirm_runner_host_relogin: false
+
+# --- run options -----------------------------------------------------------------------------
+
+# The host's ceiling of runs at once, 1 to 16 (`run --max-concurrent-runs`).
+tinfirm_runner_host_max_concurrent_runs: 2
+# The agent's own Docker in the sandbox (`run --sandbox-docker`); needs the Kata runtime.
+tinfirm_runner_host_sandbox_docker: true
+# The sandboxes reach the network only through the host's egress proxy (`run --egress-proxy`,
+# ADR-0044): the agent's model, the package mirrors of the sandbox settings below and the
+# tinfirm_runner_host_egress_allow hosts. false gives every sandbox open egress (R24).
+tinfirm_runner_host_egress_proxy: true
+# More hosts the sandboxes may reach through the egress proxy (`run --egress-allow`):
+# HOST[:PORT], `*.example.com`, or an IP address.
+tinfirm_runner_host_egress_allow: []
+# The agent runs over the sandbox bridge (`run --sandbox-bridge`, ADR-0095): the host's listeners
+# are on loopback, reached only through each sandbox's own bridge (R28), and the run's
+# credentials are not in the container's settings. Needs a static Linux build of the runner host
+# (the release archives are); a binary of your own build: set tinfirm_runner_host_bridge_binary.
+# false: the listeners are on Docker's bridge, reachable from every container on it.
+tinfirm_runner_host_sandbox_bridge: true
+# A static Linux build of the runner host for the sandboxes (TINFIRM_RUNNER_BRIDGE_BINARY).
+# Empty: the installed binary itself.
+tinfirm_runner_host_bridge_binary: ""
+# Log filter of the runner host (TINFIRM_RUNNER_LOG).
+tinfirm_runner_host_log: info
+
+# Mirror settings of the sandboxes (`run --sandbox-env`). They reach every sandbox
+# unredacted: NEVER credentials, and no URL with a user name or password (the runner host
+# refuses those).
+# Registry mirrors of the agent's own dockerd (TINFIRM_SANDBOX_REGISTRY_MIRRORS).
+tinfirm_runner_host_sandbox_registry_mirrors: []
+# Registries the agent's dockerd may reach over plain HTTP (TINFIRM_SANDBOX_INSECURE_REGISTRIES).
+tinfirm_runner_host_sandbox_insecure_registries: []
+# A Maven repository that mirrors Maven Central (TINFIRM_SANDBOX_MAVEN_MIRROR), and what it
+# mirrors (TINFIRM_SANDBOX_MAVEN_MIRROR_OF; empty: central).
+tinfirm_runner_host_sandbox_maven_mirror: ""
+tinfirm_runner_host_sandbox_maven_mirror_of: ""
+# The npm registry (TINFIRM_SANDBOX_NPM_REGISTRY).
+tinfirm_runner_host_sandbox_npm_registry: ""
+# The Python package index, for pip and uv (TINFIRM_SANDBOX_PIP_INDEX).
+tinfirm_runner_host_sandbox_pip_index: ""
+# Size of the disk of the agent's /var/lib/docker (TINFIRM_SANDBOX_DOCKER_DISK); empty: the
+# image's default (40G, sparse).
+tinfirm_runner_host_sandbox_docker_disk: ""
+# More variables for every sandbox, e.g. {HTTPS_PROXY: "http://proxy.internal:3128",
+# NO_PROXY: ".internal"}.
+tinfirm_runner_host_sandbox_env_extra: {}
+
+# --- Runner images -------------------------------------------------------------------------
+
+# Build the runner images with `images build` when the binary changed or an image is missing.
+tinfirm_runner_host_images_build: true
+# claude, codex, pi, opencode or all.
+tinfirm_runner_host_images_runtime: all
+# Build arguments (runner/README.md, "Image build arguments"), e.g.
+#   APT_MIRROR: http://nexus.internal/repository
+#   DOCKER_APT_URL: https://nexus.internal/repository/docker-debian
+#   NPM_REGISTRY: https://nexus.internal/repository/npm/
+#   PIP_INDEX_URL: https://nexus.internal/repository/pypi/simple
+#   MAVEN_REPOSITORY_URL: https://nexus.internal/repository/maven-central
+#   GRADLE_DOWNLOAD_URL: https://nexus.internal/repository/gradle-distributions
+# Never credentials: build arguments stay in the image's history.
+tinfirm_runner_host_images_build_args: {}
+# How long the image build may take, in seconds.
+tinfirm_runner_host_images_build_timeout: 3600

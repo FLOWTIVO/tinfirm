@@ -1,0 +1,43 @@
+{
+  "type": "run.assign",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 1,
+  "credentialLabel": "claude-main",
+  "agent": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000a", "name": "Backend engineer", "runtime": "CLAUDE_CODE", "model": null},
+  "task": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000b", "key": "MYCO-12", "title": "Add a health endpoint"},
+  "prompt": "You are Backend engineer, an AI agent of the company \"My Company\", working through Tinfirm.\n\n# Task MYCO-12: Add a health endpoint\n",
+  "resumeSessionId": null,
+  "workspaces": [
+    {
+      "componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000010",
+      "dir": "server",
+      "name": "server",
+      "repoUrl": "https://github.com/flowtivo/tinfirm.git",
+      "defaultBranch": "main",
+      "branch": "agent/MYCO-12",
+      "git": {"username": "x-access-token", "token": "github_pat_EXAMPLE_NOT_A_REAL_TOKEN"},
+      "authorName": "Tinfirm agent Backend engineer",
+      "authorEmail": "agent@tinfirm.invalid"
+    },
+    {
+      "componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000011",
+      "dir": "web-app",
+      "name": "Web app",
+      "repoUrl": "https://github.com/my-company/web-app.git",
+      "defaultBranch": "develop",
+      "branch": "agent/MYCO-12",
+      "git": null,
+      "authorName": "Tinfirm agent Backend engineer",
+      "authorEmail": "agent@tinfirm.invalid",
+      "readOnly": true
+    }
+  ],
+  "requestableRepositories": [
+    {"componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000012", "name": "docs", "repoUrl": "https://github.com/my-company/docs.git", "pendingRequest": false}
+  ],
+  "limits": {"maxWallClockSeconds": 3600, "maxTurns": 200},
+  "resumePrompt": null,
+  "attachments": [
+    {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000c", "fileName": "design notes.pdf", "sizeBytes": 18234, "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+  ]
+}

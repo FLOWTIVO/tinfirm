@@ -1,0 +1,36 @@
+[package]
+name = "tinfirm-bridge"
+description = "Tinfirm sandbox bridge: one pinned TLS stream per run between the runner host and its sandbox (ADR-0095)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# The Tinfirm Enterprise licence (ee/LICENSE): its code is under ee/runner/tinfirm-bridge.
+license = "LicenseRef-Tinfirm-Enterprise"
+publish.workspace = true
+
+[lib]
+path = "../../../ee/runner/tinfirm-bridge/src/lib.rs"
+
+[[test]]
+name = "bridge"
+path = "../../../ee/runner/tinfirm-bridge/tests/bridge.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+ring.workspace = true
+rcgen.workspace = true
+tar.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

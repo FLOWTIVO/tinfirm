@@ -1,0 +1,17 @@
+{
+  "type": "run.assign",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d70",
+  "epoch": 1,
+  "credentialLabel": "codex-main",
+  "agent": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000a", "name": "Release manager", "runtime": "CODEX", "model": null},
+  "workItem": {"id": "0192f1a4-7c1e-7b3a-9d2e-00000000000b", "key": "MYCO-14", "title": "Write the release notes"},
+  "job": {"id": "0192f1a4-7c1e-7b3a-9d2e-0000000000a2"},
+  "prompt": "You are Release manager, an AI agent of the company \"My Company\", working through Tinfirm.\n\n# Work item MYCO-14: Write the release notes\n",
+  "workspaces": [],
+  "requestableRepositories": [],
+  "limits": {"maxWallClockSeconds": 3600, "maxTurns": 200},
+  "skills": [
+    {"skillId": "0192f1a4-7c1e-7b3a-9d2e-000000000051", "version": 3, "name": "release-notes", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "sizeBytes": 4182},
+    {"skillId": "0192f1a4-7c1e-7b3a-9d2e-000000000052", "version": 1, "name": "pdf", "sha256": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752", "sizeBytes": 5242880}
+  ]
+}

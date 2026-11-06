@@ -1,0 +1,170 @@
+name: Open a hotfix branch (reusable)
+
+# Cut a maintenance branch from a released tag, so a production fix can ship without
+# taking everything that landed on main since that release.
+#
+# hotfix-branch.yml calls this with the released tag, e.g. `v1.0.0`. It creates
+# `hotfix/1.0.1` at that tag with the manifests set to `1.0.1-SNAPSHOT`.
+#
+# Per ADR-0106, the set-version action is a local action of this repository
+# (.github/actions/set-version), kept from this commit across the switch to the tag
+# (below), and the third-party actions are pinned by commit SHA.
+#
+# Then:
+#   1. Open PRs against the hotfix branch. ci.yml runs on `hotfix/**` PRs, so a fix gets
+#      the same gate as one going to main.
+#   2. Run the Release workflow WITH THE HOTFIX BRANCH SELECTED as the ref, version
+#      `1.0.1`. It tags, builds and publishes exactly as on main.
+#   3. Merge the hotfix branch back into main, or main loses the fix AND keeps its
+#      manifests on a version that has already shipped. The release's `merge_back` job
+#      opens that pull request for you once the release succeeds; a human still merges it,
+#      because the merge usually needs resolving against what main has moved on to.
+#      Delete the hotfix branch only after that pull request merges — its
+#      `chore: prepare <next>` commit lives there and nowhere else.
+on:
+  workflow_call:
+    inputs:
+      from_tag:
+        description: 'Released tag to branch from (e.g. v1.0.0).'
+        required: true
+        type: string
+      hotfix_version:
+        description: 'Version the hotfix will release as. Empty = derive (v1.0.0 -> 1.0.1).'
+        required: false
+        default: ''
+        type: string
+      manifests:
+        description: 'Newline-separated version manifests, as in the release workflow.'
+        required: true
+        type: string
+      runner:
+        description: 'Runner label.'
+        required: false
+        default: ubuntu-latest
+        type: string
+      node_version:
+        description: 'Node version. Needed whenever an npm manifest is declared.'
+        required: false
+        default: '24'
+        type: string
+      git_user:
+        description: 'Committer name.'
+        required: false
+        default: 'github-actions[bot]'
+        type: string
+      git_email:
+        description: 'Committer email.'
+        required: false
+        default: '41898282+github-actions[bot]@users.noreply.github.com'
+        type: string
+    outputs:
+      branch:
+        description: 'The hotfix branch that was created.'
+        value: ${{ jobs.cut.outputs.branch }}
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    name: Cut the branch
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+    outputs:
+      branch: ${{ steps.cut.outputs.branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history and tags: this job checks out the tag itself and pushes a new
+          # branch from it.
+          fetch-depth: 0
+      # A local action is read from the workspace when its step runs, and the step that
+      # writes the hotfix's version runs after the switch to the tag, whose tree may hold
+      # an older set-version. So this commit's actions are kept, untracked, in .ci-actions:
+      # `git checkout` of the tag leaves an untracked directory alone, and the commit below
+      # adds only the manifests.
+      - name: Keep this commit's actions across the switch to the tag
+        run: cp -R .github/actions .ci-actions
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: Resolve the tag and the hotfix version
+        id: resolve
+        env:
+          FROM_TAG: ${{ inputs.from_tag }}
+        run: |
+          set -euo pipefail
+          # Accept `1.0.0` as well as `v1.0.0`. Written as an `if`, not `[ ... ] && ...`:
+          # under `set -e` a false test at the head of an `&&` list exits the script.
+          TAG="$FROM_TAG"
+          case "$TAG" in v*) ;; *) TAG="v$TAG" ;; esac
+          if ! git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "::error::No such tag: $TAG"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      # The hotfix version is the released version with its last number stepped:
+      # v1.0.0 -> 1.0.1, v1.0.0-beta.1 -> 1.0.0-beta.2. The action appends `-SNAPSHOT`
+      # for the in-progress manifests; the branch is named for the version it will
+      # RELEASE, so the name strips it.
+      - name: Derive the development version
+        id: derive
+        uses: ./.ci-actions/set-version
+        with:
+          manifests: ${{ inputs.manifests }}
+          next_of: ${{ steps.resolve.outputs.tag }}
+      - name: Create the branch and open its development version
+        id: cut
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+          HOTFIX_VERSION: ${{ inputs.hotfix_version }}
+          DERIVED_DEV: ${{ steps.derive.outputs.next }}
+          GIT_USER: ${{ inputs.git_user }}
+          GIT_EMAIL: ${{ inputs.git_email }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HOTFIX_VERSION" ]; then
+            DEV_VERSION="$DERIVED_DEV"
+            HOTFIX_VERSION="${DEV_VERSION%-SNAPSHOT}"
+          else
+            HOTFIX_VERSION="${HOTFIX_VERSION#v}"
+            DEV_VERSION="${HOTFIX_VERSION}-SNAPSHOT"
+          fi
+          BRANCH="hotfix/$HOTFIX_VERSION"
+
+          # Never reopen an existing hotfix branch: it may already carry fixes, and
+          # resetting it to the tag would drop them.
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            echo "::error::Branch $BRANCH already exists. Push the fix to it, or pass a different hotfix_version."
+            exit 1
+          fi
+
+          git checkout -b "$BRANCH" "refs/tags/$TAG"
+          echo "branch=$BRANCH"          >> "$GITHUB_OUTPUT"
+          echo "dev_version=$DEV_VERSION" >> "$GITHUB_OUTPUT"
+          echo "HOTFIX_BRANCH=$BRANCH"    >> "$GITHUB_ENV"
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+      - name: Set the development version on the new branch
+        id: setv
+        uses: ./.ci-actions/set-version
+        with:
+          version: ${{ env.DEV_VERSION }}
+          manifests: ${{ inputs.manifests }}
+      - name: Commit and push the branch
+        env:
+          PATHS: ${{ steps.setv.outputs.paths }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          GIT_USER: ${{ inputs.git_user }}
+          GIT_EMAIL: ${{ inputs.git_email }}
+        run: |
+          set -euo pipefail
+          git config user.name  "$GIT_USER"
+          git config user.email "$GIT_EMAIL"
+          # PATHS is a space-separated list.
+          read -r -a paths <<< "$PATHS"
+          git add "${paths[@]}"
+          git commit -m "chore: open $HOTFIX_BRANCH at $DEV_VERSION (from $TAG)" \
+            || echo "manifests already at $DEV_VERSION"
+          git push origin "$HOTFIX_BRANCH"
+          echo "::notice::$HOTFIX_BRANCH is open at $DEV_VERSION. PR your fix into it, then run Release on that branch."

@@ -1,0 +1,101 @@
+# The issue form for a bug (GitHub issue forms). A vulnerability never goes here: SECURITY.md.
+name: Bug report
+description: Something in Tinfirm does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **A security vulnerability?** Do not report it here. Report it privately, as [SECURITY.md](https://github.com/FLOWTIVO/tinfirm/security/policy) says.
+
+        Search the [existing issues](https://github.com/FLOWTIVO/tinfirm/issues?q=is%3Aissue) first. Leave out secrets, tokens, keys and personal data, in the text and in the logs.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Where the bug shows. Pick more than one if it crosses them.
+      multiple: true
+      options:
+        - Server (REST API, MCP endpoints, triggers, chats)
+        - Web app
+        - Runner host
+        - Model port or LiteLLM
+        - Outlook add-in or Gmail add-on
+        - Helm chart
+        - Compose stack
+        - Release assets or images
+        - Documentation or the docs site
+        - CI workflows
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: >-
+        The release (`v0.1.0`), the image tag (`sha-<commit>`), the version of a `rolling` asset, or the commit.
+        The server reports its version and commit at `GET /api/system/info`; `tinfirm-runner-host --version`
+        prints the runner host's.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Helm chart on Kubernetes
+        - Docker Compose
+        - Local development (make up, or the server from an IDE)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, with any error message or problem code exactly as shown.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened, and where it is documented if you know.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence of steps that shows the bug, from a known state.
+      placeholder: |
+        1. Sign in as an Admin of a company.
+        2. Open ...
+        3. Select ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        What else the bug may depend on: the sign-in method (local, OIDC, SAML), the runner host's
+        operating system and executor (Docker, Kata Containers, a VM per run), the agent runtime,
+        the browser for the web app, the PostgreSQL version.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant lines of the server's or the runner host's log. They are shown as code.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the existing issues, and none reports this bug.
+          required: true
+        - label: This report holds no vulnerability details, secrets or personal data.
+          required: true

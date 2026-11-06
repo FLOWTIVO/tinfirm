@@ -1,0 +1,78 @@
+name: DCO
+
+# The Developer Certificate of Origin (ADR-0077 decision 2, CONTRIBUTING §6): every commit of a
+# pull request carries a `Signed-off-by:` trailer that names its author, exactly as
+# `git log --format='%an <%ae>'` shows them. A small script rather than a third-party action, so
+# that nothing unpinned reads the repository. A two-parent merge whose tree is exactly Git's
+# automatic merge of its parents is skipped: it adds no change of its own (GitHub's "Update
+# branch" makes such merges without a sign-off). A merge with a resolved conflict or any other
+# change of its own needs the sign-off like any commit. Dependabot signs off its commits as
+# `dependabot[bot] <support@github.com>`, not as their author's noreply address: that sign-off
+# counts for a commit whose author is Dependabot.
+#
+# Whether this is a required check is the owner's choice, in the repository's settings.
+on:
+  pull_request:
+    branches: [main, 'hotfix/**']
+    # `edited` too: a pull request retargeted to main from another base fires only that. An edit of
+    # the title or the body re-runs the check as well, which takes seconds, rather than leaving a
+    # skipped result on the head commit.
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: dco-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: DCO · sign-off
+    # GitHub-hosted for every pull request, a fork's too: a few seconds of git, which needs
+    # nothing a self-hosted runner has.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The whole history, so that base..head holds every commit of the pull request.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Check every commit's sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          failed=0
+          count=0
+          for commit in $(git rev-list --reverse "$BASE_SHA..$HEAD_SHA"); do
+            count=$((count + 1))
+            author="$(git log -1 --format='%an <%ae>' "$commit")"
+            signer="$author"
+            if [ "$author" = "dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>" ]; then
+              signer="dependabot[bot] <support@github.com>"
+            fi
+            subject="$(git log -1 --format='%s' "$commit")"
+            read -r -a parents <<<"$(git log -1 --format='%P' "$commit")"
+            if [ "${#parents[@]}" -eq 2 ] \
+                && auto_tree="$(git merge-tree --write-tree "${parents[0]}" "${parents[1]}" 2>/dev/null)" \
+                && [ "$auto_tree" = "$(git log -1 --format='%T' "$commit")" ]; then
+              echo "skipped ${commit:0:12} $subject (automatic merge)"
+              continue
+            fi
+            if git log -1 --format='%(trailers:key=Signed-off-by,valueonly,unfold)' "$commit" \
+                | sed 's/[[:space:]]*$//' | grep -qxF -e "$author" -e "$signer"; then
+              echo "ok      ${commit:0:12} $subject"
+            else
+              echo "::error::Commit ${commit:0:12} (\"$subject\") has no 'Signed-off-by: $signer'."
+              failed=1
+            fi
+          done
+          echo "Checked $count commit(s) between ${BASE_SHA:0:12} and ${HEAD_SHA:0:12}."
+          if [ "$failed" -ne 0 ]; then
+            echo "Sign off with 'git commit -s'; CONTRIBUTING.md §6, 'Sign-off and licence', says how to fix a commit."
+            exit 1
+          fi

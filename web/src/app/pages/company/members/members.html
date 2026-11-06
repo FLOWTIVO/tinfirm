@@ -1,0 +1,390 @@
+<div class="flex flex-col gap-5">
+  <app-page-header
+    title="Members"
+    [description]="
+      'The people of ' +
+      (companyName() ?? 'this company') +
+      ', their roles, and the groups they form.'
+    "
+  >
+    @if (activeTab() === 'members') {
+      @if (canManage()) {
+        <button hlmBtn type="button" class="max-sm:h-11" aria-haspopup="dialog" (click)="openAdd()">
+          <ng-icon name="lucideUserPlus" aria-hidden="true" />
+          Add member
+        </button>
+      }
+    } @else if (canManageGroups()) {
+      <button
+        hlmBtn
+        type="button"
+        class="max-sm:h-11"
+        aria-haspopup="dialog"
+        data-testid="new-group"
+        (click)="newGroup()"
+      >
+        <ng-icon name="lucidePlus" aria-hidden="true" />
+        New group
+      </button>
+    }
+  </app-page-header>
+
+  <nav class="flex gap-1" aria-label="Members or groups" data-testid="members-tabs">
+    @for (t of ['members', 'groups']; track t) {
+      @let on = activeTab() === t;
+      <a
+        class="focus-visible:ring-ring/50 inline-flex h-9 items-center gap-2 rounded-full border px-4 text-sm font-semibold outline-none focus-visible:ring-3 max-sm:h-11"
+        [class]="
+          on
+            ? 'bg-card border-border text-foreground shadow-[0_1px_3px_rgb(0_0_0/0.08)]'
+            : 'text-muted-foreground hover:bg-sidebar-accent hover:text-foreground border-transparent'
+        "
+        [routerLink]="[]"
+        [queryParams]="{ tab: t === 'groups' ? 'groups' : null }"
+        queryParamsHandling="merge"
+        [replaceUrl]="true"
+        [attr.aria-current]="on ? 'page' : null"
+        [attr.data-tab]="t"
+      >
+        {{ t === 'groups' ? 'Groups' : 'Members' }}
+        <span class="text-faint font-mono text-xs font-medium">{{
+          t === 'groups' ? groupCount() : memberCount()
+        }}</span>
+      </a>
+    }
+  </nav>
+
+  @if (activeTab() === 'members' && seatsText(); as seats) {
+    <p class="text-muted-foreground -mt-1 text-sm text-pretty" data-testid="seat-count">
+      <span class="text-foreground font-semibold" [class.text-warning]="noSeatLeft()">{{
+        seats
+      }}</span>
+      @if (seatsCounted()) {
+        on this instance. Owners, Admins and Members each hold one; Viewers hold none.
+        @if (noSeatLeft()) {
+          Every seat is taken: new people join as Viewers until one is free.
+        }
+      } @else {
+        on this instance: Owners, Admins and Members. Nothing is counted against a licence.
+      }
+    </p>
+  }
+
+  @if (activeTab() === 'groups') {
+    <app-groups />
+  } @else {
+    @if (canManage()) {
+      <app-open-departures />
+    }
+
+    @if (members.firstLoad()) {
+      <app-list-skeleton [rows]="4" />
+    } @else if (members.failed()) {
+      <app-error-state
+        [error]="members.error()"
+        heading="Couldn't load members"
+        (retry)="members.retry()"
+      />
+    } @else if (members.empty()) {
+      <div hlmEmpty class="border">
+        <div hlmEmptyHeader>
+          <div hlmEmptyMedia variant="icon"><ng-icon name="lucideUsers" aria-hidden="true" /></div>
+          <div hlmEmptyTitle>No members</div>
+          <p hlmEmptyDescription>Nobody belongs to this company yet.</p>
+        </div>
+      </div>
+    } @else {
+      <section
+        class="bg-card @container overflow-hidden rounded-[14px] border"
+        [attr.aria-label]="'Members of ' + (companyName() ?? 'the company')"
+        data-testid="member-list"
+      >
+        <div class="flex flex-wrap items-center gap-x-3 gap-y-2.5 p-3">
+          <div class="relative min-w-48 flex-[0_1_19rem] max-sm:flex-auto">
+            <ng-icon
+              name="lucideSearch"
+              class="text-faint pointer-events-none absolute start-3 top-1/2 -translate-y-1/2"
+              aria-hidden="true"
+            />
+            <input
+              hlmInput
+              id="member-search"
+              class="w-full ps-9 max-sm:h-11 max-sm:text-base"
+              type="search"
+              autocomplete="off"
+              placeholder="Find a member by name or email"
+              aria-label="Find a member"
+              data-testid="member-search"
+              [value]="query()"
+              (input)="onQuery($event)"
+            />
+          </div>
+          <div
+            class="bg-muted relative flex max-w-full gap-0.5 overflow-x-auto rounded-full p-[3px] [scrollbar-width:none]"
+            role="radiogroup"
+            aria-label="Show"
+            data-testid="member-filters"
+            [attr.data-value]="filter()"
+          >
+            @for (f of filters; track f.value) {
+              <label
+                class="text-muted-foreground has-checked:bg-card has-checked:text-foreground has-focus-visible:ring-ring/50 hover:text-foreground flex h-[30px] flex-none cursor-pointer items-center gap-1.5 rounded-full px-3 text-[0.8125rem] font-semibold whitespace-nowrap has-checked:shadow-[0_1px_3px_rgb(0_0_0/0.08)] has-focus-visible:ring-3 max-sm:h-10"
+                [attr.data-value]="f.value"
+              >
+                <input
+                  type="radio"
+                  class="sr-only"
+                  name="member-filter"
+                  [id]="'member-filter-' + f.value"
+                  [value]="f.value"
+                  [checked]="filter() === f.value"
+                  (change)="setFilter(f.value)"
+                />
+                {{ f.label }}
+                <span class="text-faint font-mono text-xs font-medium">{{
+                  counts()[f.value]
+                }}</span>
+              </label>
+            }
+          </div>
+        </div>
+
+        <ul class="m-0 list-none p-0" aria-label="Members">
+          @for (m of shown(); track m.userId) {
+            <li class="border-t" [attr.data-testid]="'member-' + m.email">
+              @if (canManage()) {
+                <button
+                  type="button"
+                  class="hover:bg-accent focus-visible:ring-ring/50 cursor-pointer outline-none focus-visible:ring-3 focus-visible:ring-inset"
+                  [class]="rowClass"
+                  [class.bg-accent]="openedId() === m.userId"
+                  aria-haspopup="dialog"
+                  data-testid="open-member"
+                  (click)="open(m)"
+                >
+                  <ng-container *ngTemplateOutlet="row; context: { $implicit: m }" />
+                </button>
+              } @else {
+                <div [class]="rowClass">
+                  <ng-container *ngTemplateOutlet="row; context: { $implicit: m }" />
+                </div>
+              }
+            </li>
+          }
+        </ul>
+
+        @if (shown().length === 0) {
+          <div
+            class="m-3 mt-0 flex flex-col items-center gap-1.5 rounded-[14px] border border-dashed px-5 py-9 text-center"
+            data-testid="members-filtered-empty"
+          >
+            <p class="text-[0.9375rem] font-semibold">{{ emptyTitle() }}</p>
+            <p class="text-muted-foreground text-sm">
+              Clear the search and the filter to see everyone.
+            </p>
+            <button
+              hlmBtn
+              variant="outline"
+              size="sm"
+              type="button"
+              class="mt-2 max-sm:h-11"
+              (click)="showEveryone()"
+            >
+              Show everyone
+            </button>
+          </div>
+        }
+      </section>
+
+      @if (members.moreFailed()) {
+        <app-error-state
+          [error]="members.error()"
+          heading="Couldn't load more"
+          (retry)="members.retry()"
+        />
+      } @else if (members.hasMore()) {
+        <div class="flex justify-center">
+          <button
+            hlmBtn
+            variant="outline"
+            size="sm"
+            type="button"
+            [disabled]="members.loadingMore()"
+            (click)="members.loadMore()"
+          >
+            @if (members.loadingMore()) {
+              <hlm-spinner aria-hidden="true" />
+            }
+            Load more
+          </button>
+        </div>
+      }
+
+      @if (!canManage()) {
+        <p class="text-muted-foreground text-xs">
+          Only owners and admins can add or change members.
+        </p>
+      }
+    }
+  }
+</div>
+
+<!-- One member's row: initials, name, email, role, the accounts' status, when added. -->
+<ng-template #row let-m>
+  @let accounts = accountsOf(m);
+  <span
+    class="row-span-2 flex size-9 shrink-0 items-center justify-center rounded-[10px] text-xs font-bold @3xl:row-span-1"
+    [class]="m.suspended ? 'bg-muted text-faint' : 'bg-secondary text-foreground'"
+    aria-hidden="true"
+    >{{ initialsOf(m.displayName) }}</span
+  >
+  <span
+    class="col-start-2 row-start-1 flex min-w-0 flex-col @3xl:col-start-auto @3xl:row-start-auto"
+  >
+    <span
+      class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm leading-snug font-semibold max-sm:text-[0.9375rem]"
+    >
+      <span class="min-w-0 break-words">{{ m.displayName }}</span>
+      @if (m.userId === myId()) {
+        <span
+          class="bg-secondary text-muted-foreground inline-flex h-[22px] items-center rounded-full px-2.5 text-xs font-semibold"
+          >You</span
+        >
+      }
+      @if (m.suspended) {
+        <span
+          class="bg-card text-warning border-warning/40 inline-flex h-[22px] items-center gap-1 rounded-full border px-2.5 text-xs font-semibold"
+          data-testid="member-suspended"
+          ><ng-icon name="lucideCirclePause" size="12" aria-hidden="true" />Suspended</span
+        >
+      }
+    </span>
+    <span class="text-muted-foreground truncate text-xs">{{ m.email }}</span>
+  </span>
+  <span class="col-span-2 col-start-2 row-start-2 flex min-w-0 items-center gap-2 @3xl:contents">
+    <span class="flex shrink-0 items-center gap-1.5"
+      ><app-role-badge [role]="m.role" tone="chip" />
+      @if (m.roleManagedBy; as manager) {
+        <span
+          class="text-muted-foreground text-xs"
+          data-testid="member-role-managed"
+          [title]="'The role is managed by ' + manager.name"
+          >managed by {{ manager.name }}</span
+        >
+      }
+    </span>
+    <span
+      class="flex min-w-0 items-center gap-1.5 text-xs @3xl:text-[0.8125rem]"
+      [class]="
+        accounts?.tone === 'warning'
+          ? 'text-warning'
+          : accounts?.tone === 'destructive'
+            ? 'text-destructive'
+            : 'text-muted-foreground'
+      "
+      data-testid="accounts-summary"
+    >
+      @if (accounts) {
+        @if (accounts.tone === 'warning' || accounts.tone === 'destructive') {
+          <ng-icon name="lucideTriangleAlert" size="14" class="shrink-0" aria-hidden="true" />
+        }
+        <span class="truncate">{{ accounts.text }}</span>
+      } @else if (canManage()) {
+        <hlm-skeleton class="h-3 w-28" />
+        <span class="sr-only">Loading the accounts…</span>
+      }
+    </span>
+  </span>
+  <span
+    class="text-muted-foreground col-start-3 row-start-1 text-end text-xs whitespace-nowrap @3xl:col-start-auto @3xl:row-start-auto"
+    ><span class="hidden @3xl:inline">Added </span
+    ><time [attr.datetime]="m.addedAt">{{ added(m.addedAt) }}</time></span
+  >
+  <!-- ng-icon sets its own display: the span hides it on a narrow list. -->
+  <span class="text-faint hidden @3xl:flex" aria-hidden="true"
+    ><ng-icon name="lucideChevronRight"
+  /></span>
+</ng-template>
+
+<app-member-dialog [member]="opened()" (closed)="openedId.set(null)" />
+
+<hlm-dialog [state]="addOpen() ? 'open' : 'closed'" (closed)="addOpen.set(false)">
+  <hlm-dialog-content *hlmDialogPortal="let ctx" class="max-h-[92svh] overflow-y-auto sm:max-w-md">
+    <hlm-dialog-header>
+      <h2 hlmDialogTitle>Add member</h2>
+      <p hlmDialogDescription>
+        Give an existing Tinfirm user access to {{ companyName() ?? 'this company' }}.
+      </p>
+    </hlm-dialog-header>
+
+    <form
+      id="add-member-form"
+      class="flex flex-col gap-4"
+      novalidate
+      (submit)="onAddSubmit($event)"
+    >
+      @if (addError(); as message) {
+        <div hlmAlert variant="destructive">
+          <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+          <p hlmAlertDescription>{{ message }}</p>
+        </div>
+      }
+
+      <div hlmField>
+        <label hlmFieldLabel for="add-member-email">Email</label>
+        <input
+          hlmInput
+          id="add-member-email"
+          type="email"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="name@example.com"
+          [formField]="addForm.email"
+        />
+        <hlm-field-error>{{ firstError(addForm.email) }}</hlm-field-error>
+      </div>
+
+      <fieldset class="m-0 flex min-w-0 flex-col gap-2 border-0 p-0" data-testid="add-member-roles">
+        <legend class="mb-1.5 p-0 text-sm font-medium">Role</legend>
+        @for (role of addRoles(); track role) {
+          <label [class]="roleCard" [attr.data-role]="role">
+            <input
+              type="radio"
+              class="sr-only"
+              name="add-member-role"
+              [id]="'add-member-role-' + role"
+              [value]="role"
+              [checked]="addModel().role === role"
+              (change)="setAddRole(role)"
+            />
+            <span [class]="roleDot" aria-hidden="true"></span>
+            <span class="flex min-w-0 flex-col">
+              <span class="text-sm font-semibold">{{ roleLabels[role] }}</span>
+              <span class="text-muted-foreground text-[0.8125rem] leading-normal text-pretty">{{
+                roleDescriptions[role]
+              }}</span>
+            </span>
+          </label>
+        }
+        @if (!canAddOwner()) {
+          <p class="text-muted-foreground m-0 text-xs">Only an owner adds an owner.</p>
+        }
+        @if (noSeatLeft()) {
+          <p class="text-warning m-0 text-xs" data-testid="add-no-seat">
+            Every seat of the licence is taken, so only a Viewer can be added now.
+          </p>
+        }
+      </fieldset>
+    </form>
+
+    <hlm-dialog-footer>
+      <button hlmBtn variant="outline" type="button" hlmDialogClose>Cancel</button>
+      <button hlmBtn type="submit" form="add-member-form" [disabled]="addForm().submitting()">
+        @if (addForm().submitting()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Add member
+      </button>
+    </hlm-dialog-footer>
+  </hlm-dialog-content>
+</hlm-dialog>

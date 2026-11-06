@@ -1,0 +1,10 @@
+{
+  "type": "run.task_create",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 1,
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000040",
+  "title": "Retry webhook deliveries with backoff",
+  "description": "Found while adding the health endpoint: failed webhook deliveries are dropped. Retry them with exponential backoff, at most 5 times.",
+  "repositories": ["server"],
+  "assignee": "Frontend engineer"
+}

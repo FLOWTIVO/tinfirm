@@ -1,0 +1,324 @@
+@layer theme, base, components, utilities;
+@import 'tailwindcss/theme.css' layer(theme);
+@import 'tailwindcss/preflight.css' layer(base);
+@import 'tailwindcss/utilities.css';
+
+@import '@spartan-ng/brain/hlm-tailwind-preset.css';
+@import '@fontsource-variable/figtree/wght.css';
+@import '@fontsource/dm-mono/400.css';
+@import '@fontsource/dm-mono/500.css';
+
+/*
+ * Theme tokens: the "Thread" direction (see DESIGN.md). Light is the default; dark applies when
+ * <html> has the `dark` class (set by ThemeService from the stored preference or the OS setting).
+ * A sage ground under white rounded sheets; deep green marks the agent and primary actions;
+ * warm orange marks only "you" and "needs a human".
+ */
+:root {
+  color-scheme: light;
+
+  --font-sans:
+    'Figtree Variable', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --radius: 0.625rem;
+
+  --background: #edf1ea;
+  --foreground: #1b221c;
+  --card: #ffffff;
+  --card-foreground: #1b221c;
+  --popover: #ffffff;
+  --popover-foreground: #1b221c;
+  --primary: #1d6a4d;
+  --primary-foreground: #ffffff;
+  --secondary: #e3eadf;
+  --secondary-foreground: #1b221c;
+  --muted: #f1f4ee;
+  --muted-foreground: #56635a;
+  --accent: #e8eee4;
+  --accent-foreground: #1b221c;
+  --destructive: #b42318;
+  --success: #1f7a45;
+  --warning: #9a5a00;
+  --border: #dae2d6;
+  --input: #ccd6c8;
+  --ring: #1d6a4d;
+
+  /* Thread roles */
+  --human: #b8430d;
+  --human-foreground: #ffffff;
+  --human-soft: #fdeadf;
+  --bubble-me: #1d6a4d;
+  --bubble-me-foreground: #ffffff;
+  /* Quieter than muted text: counts, shas and costs in the thread. */
+  --faint: #637067;
+  /* An opened tool call in the thread: its input, output and diff. */
+  --code: #f1f4ef;
+  --diff-add: #e3f1e8;
+  --diff-del: #fbeceb;
+  /* The logo's lighter sheet: the T's stem and the i under the agent-green bar. */
+  --logo-stem: #4fae86;
+
+  --chart-1: #1d6a4d;
+  --chart-2: #b8430d;
+  --chart-3: #5a8f6f;
+  --chart-4: #d9a441;
+  --chart-5: #7c8f80;
+
+  --sidebar: #edf1ea;
+  --sidebar-foreground: #1b221c;
+  --sidebar-primary: #1d6a4d;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #dfe7da;
+  --sidebar-accent-foreground: #1b221c;
+  --sidebar-border: #dae2d6;
+  --sidebar-ring: #1d6a4d;
+}
+
+:root.dark {
+  color-scheme: dark;
+
+  --background: #111511;
+  --foreground: #e5ebe4;
+  --card: #1a1f1a;
+  --card-foreground: #e5ebe4;
+  --popover: #1f251f;
+  --popover-foreground: #e5ebe4;
+  --primary: #72d3a8;
+  --primary-foreground: #0b1f16;
+  --secondary: #242b24;
+  --secondary-foreground: #e5ebe4;
+  --muted: #222822;
+  --muted-foreground: #9aa79b;
+  --accent: #262e26;
+  --accent-foreground: #e5ebe4;
+  --destructive: #f28b80;
+  --success: #6cc592;
+  --warning: #f2b24c;
+  --border: #29312a;
+  --input: #354036;
+  --ring: #72d3a8;
+
+  --human: #ff9f6b;
+  --human-foreground: #2a1206;
+  --human-soft: #3a2418;
+  --bubble-me: #244a3a;
+  --bubble-me-foreground: #e6f5ec;
+  --faint: #839086;
+  --code: #131713;
+  --diff-add: #1c3326;
+  --diff-del: #3a1d1b;
+  --logo-stem: #3f8c6b;
+
+  --chart-1: #72d3a8;
+  --chart-2: #ff9f6b;
+  --chart-3: #4f9a74;
+  --chart-4: #e6b95a;
+  --chart-5: #8c9a8d;
+
+  --sidebar: #111511;
+  --sidebar-foreground: #e5ebe4;
+  --sidebar-primary: #72d3a8;
+  --sidebar-primary-foreground: #0b1f16;
+  --sidebar-accent: #1f261f;
+  --sidebar-accent-foreground: #e5ebe4;
+  --sidebar-border: #232a23;
+  --sidebar-ring: #72d3a8;
+}
+
+@theme inline {
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-human: var(--human);
+  --color-human-foreground: var(--human-foreground);
+  --color-human-soft: var(--human-soft);
+  --color-bubble-me: var(--bubble-me);
+  --color-bubble-me-foreground: var(--bubble-me-foreground);
+  --color-faint: var(--faint);
+  --color-code: var(--code);
+  --color-diff-add: var(--diff-add);
+  --color-diff-del: var(--diff-del);
+  --color-logo-stem: var(--logo-stem);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    accent-color: var(--primary);
+    scrollbar-color: var(--input) transparent;
+  }
+
+  body {
+    @apply bg-background text-foreground min-h-svh font-sans antialiased;
+    caret-color: var(--primary);
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--primary) 22%, transparent);
+  }
+
+  code,
+  kbd,
+  samp,
+  pre {
+    @apply font-mono;
+    font-feature-settings: normal;
+  }
+
+  a {
+    text-underline-offset: 3px;
+  }
+
+  /* The agent is still working: three dots at the end of the thread. */
+  .thread-dot {
+    @apply bg-muted-foreground size-1.5 rounded-full;
+    animation: thread-dot 1.2s ease-in-out infinite;
+  }
+  .thread-dot:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .thread-dot:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+  @keyframes thread-dot {
+    0%,
+    60%,
+    100% {
+      transform: none;
+      opacity: 0.5;
+    }
+    30% {
+      transform: translateY(-3px);
+      opacity: 1;
+    }
+  }
+
+  /* A new entry of a live run's trace: a short fade with a small rise. */
+  .thread-enter {
+    animation: thread-enter 160ms ease-out;
+  }
+  @keyframes thread-enter {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+/*
+ * Rendered Markdown (task descriptions, comments, agent output). The HTML comes from
+ * `renderMarkdown()` through Angular's sanitizer, so these rules style plain elements.
+ */
+@layer components {
+  .markdown {
+    @apply text-sm leading-relaxed break-words;
+  }
+  .markdown > div > :first-child {
+    @apply mt-0;
+  }
+  .markdown > div > :last-child {
+    @apply mb-0;
+  }
+  .markdown :where(p, ul, ol, pre, blockquote, table) {
+    @apply my-2;
+  }
+  .markdown :where(h1, h2, h3, h4, h5, h6) {
+    @apply mt-4 mb-2 font-semibold tracking-tight;
+  }
+  .markdown h1 {
+    @apply text-lg;
+  }
+  .markdown h2 {
+    @apply text-base;
+  }
+  .markdown :where(h3, h4, h5, h6) {
+    @apply text-sm;
+  }
+  .markdown ul {
+    @apply list-disc ps-5;
+  }
+  .markdown ol {
+    @apply list-decimal ps-5;
+  }
+  .markdown li {
+    @apply my-0.5;
+  }
+  .markdown li:has(> .md-task) {
+    @apply -ms-5 list-none;
+  }
+  .markdown a {
+    @apply text-primary decoration-primary/40 hover:decoration-primary font-medium underline underline-offset-2;
+  }
+  .markdown :not(pre) > code {
+    @apply bg-muted rounded-md px-1.5 py-0.5 text-[0.85em];
+  }
+  .markdown pre {
+    @apply bg-muted overflow-x-auto rounded-lg border px-3.5 py-2.5 text-xs leading-normal;
+  }
+  .markdown blockquote {
+    @apply text-muted-foreground bg-muted rounded-lg px-3.5 py-2;
+  }
+  .markdown hr {
+    @apply my-4;
+  }
+  .markdown table {
+    @apply block w-max max-w-full overflow-x-auto border-collapse text-xs;
+  }
+  .markdown :where(th, td) {
+    @apply border px-2 py-1 text-start;
+  }
+  .markdown th {
+    @apply bg-muted/60 font-medium;
+  }
+
+  /* Markdown inside a filled bubble (your own messages): text, links and code follow the fill. */
+  .markdown-on-fill .markdown a {
+    @apply text-current decoration-current/50 hover:decoration-current;
+  }
+  .markdown-on-fill .markdown :not(pre) > code,
+  .markdown-on-fill .markdown pre {
+    @apply border-transparent bg-black/15 text-current;
+  }
+  .markdown-on-fill .markdown blockquote {
+    @apply bg-black/15 text-current/85;
+  }
+
+  /* The rich mode of `app-markdown-editor` (Tiptap): the same look, plus editing affordances. */
+  .markdown-editor .tiptap p.is-editor-empty:first-child::before {
+    @apply text-muted-foreground pointer-events-none float-start h-0;
+    content: attr(data-placeholder);
+  }
+  .markdown-editor ul[data-type='taskList'] {
+    @apply list-none ps-0;
+  }
+  .markdown-editor ul[data-type='taskList'] li {
+    @apply flex items-start gap-2;
+  }
+  .markdown-editor ul[data-type='taskList'] li > label {
+    @apply mt-[0.3em] shrink-0;
+  }
+  .markdown-editor ul[data-type='taskList'] li > div {
+    @apply min-w-0 flex-1;
+  }
+  .markdown-editor table {
+    @apply table w-full;
+  }
+  .markdown-editor .selectedCell {
+    @apply bg-primary/10;
+  }
+}

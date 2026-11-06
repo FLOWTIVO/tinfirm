@@ -1,0 +1,71 @@
+[package]
+name = "tinfirm-runner-host"
+description = "Tinfirm runner host: connects to the server, runs agents in Docker sandboxes over ACP"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# The root LICENSE (MIT), and the Tinfirm Enterprise licence (ee/LICENSE) for the modules and
+# tests it compiles in from ee/runner/tinfirm-runner-host (ADR-0100), as server/pom.xml names both.
+license = "MIT AND LicenseRef-Tinfirm-Enterprise"
+publish.workspace = true
+
+[[bin]]
+name = "tinfirm-runner-host"
+path = "src/main.rs"
+
+[dependencies]
+tinfirm-protocol.workspace = true
+tinfirm-bridge.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
+ring.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+agent-client-protocol.workspace = true
+bollard.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true
+rpassword.workspace = true
+aho-corasick.workspace = true
+base64.workspace = true
+flate2.workspace = true
+percent-encoding.workspace = true
+tar.workspace = true
+zip.workspace = true
+url.workspace = true
+hostname.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+# The paid features' tests (ADR-0100), with their code under ee/.
+[[test]]
+name = "bridge_runs"
+path = "../../../ee/runner/tinfirm-runner-host/tests/bridge_runs.rs"
+
+[[test]]
+name = "vm_runs"
+path = "../../../ee/runner/tinfirm-runner-host/tests/vm_runs.rs"
+
+[[test]]
+name = "pool_runs"
+path = "../../../ee/runner/tinfirm-runner-host/tests/pool_runs.rs"

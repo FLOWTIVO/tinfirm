@@ -1,0 +1,22 @@
+{
+  "type": "hello",
+  "protocolVersion": 1,
+  "runnerVersion": "0.1.0",
+  "hostname": "my-laptop",
+  "os": "macos",
+  "arch": "aarch64",
+  "executors": ["docker"],
+  "isolationTiers": ["container"],
+  "maxConcurrentRuns": 2,
+  "credentials": [
+    { "label": "claude-max", "kind": "CLAUDE_LOGIN", "runtimes": ["CLAUDE_CODE"], "poolSize": 3 },
+    { "label": "codex-plus", "kind": "CODEX_CHATGPT_AUTH", "runtimes": ["CODEX"], "poolSize": 1 }
+  ],
+  "runtimes": [
+    { "runtime": "CLAUDE_CODE", "image": "tinfirm-runner-claude:local", "version": "claude-code 2.1.290 / claude-agent-acp 0.81.2" },
+    { "runtime": "CODEX", "image": "tinfirm-runner-codex:local" }
+  ],
+  "activeRuns": [
+    { "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f", "epoch": 2, "lastSeq": 41 }
+  ]
+}

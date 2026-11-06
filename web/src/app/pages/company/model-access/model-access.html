@@ -1,0 +1,804 @@
+<div class="flex flex-col gap-6">
+  <app-page-header
+    title="Model access"
+    description="The company’s model gateway, the budgets that pay for agents’ turns, and what they spent."
+  />
+
+  <div class="grid gap-5 lg:grid-cols-[15rem_minmax(0,1fr)] lg:items-start lg:gap-8">
+    <!-- The sections, each with how it stands; on a phone, a row of pills -->
+    <nav
+      #railNav
+      class="-mx-4 flex gap-1.5 overflow-x-auto px-4 pb-1 md:-mx-8 md:px-8 lg:sticky lg:top-18 lg:mx-0 lg:flex-col lg:gap-1 lg:overflow-visible lg:p-0"
+      aria-label="Sections of model access"
+      data-testid="model-access-sections"
+    >
+      @for (item of railItems(); track item.id) {
+        <a
+          class="focus-visible:ring-ring/50 flex min-h-11 shrink-0 items-center gap-2.5 rounded-full border px-3.5 py-2.5 text-start outline-none focus-visible:ring-3 lg:items-start lg:rounded-xl lg:px-3"
+          [class]="
+            item.active
+              ? 'bg-card border-border shadow-[0_1px_3px_rgb(0_0_0/0.08)]'
+              : 'hover:bg-accent border-transparent'
+          "
+          [routerLink]="[]"
+          [queryParams]="{ tab: item.id === 'gateway' ? null : item.id }"
+          queryParamsHandling="merge"
+          [attr.aria-current]="item.active ? 'page' : null"
+          [attr.data-section]="item.id"
+        >
+          <ng-icon
+            [name]="item.icon"
+            size="16"
+            class="shrink-0 lg:mt-0.5"
+            [class.text-primary]="item.active"
+            [class.text-muted-foreground]="!item.active"
+            aria-hidden="true"
+          />
+          <span class="flex min-w-0 flex-col">
+            <span class="flex items-center gap-1.5 text-sm font-semibold whitespace-nowrap"
+              >{{ item.label }}
+              @if (item.unsaved) {
+                <span
+                  class="bg-primary size-1.75 shrink-0 rounded-full"
+                  aria-hidden="true"
+                  data-testid="unsaved-dot"
+                ></span>
+                <span class="sr-only">, unsaved changes</span>
+              }
+            </span>
+            @if (item.detail) {
+              <span
+                class="text-muted-foreground hidden items-center gap-1.5 text-xs leading-snug text-pretty lg:flex"
+                data-testid="section-detail"
+              >
+                @if (item.dot) {
+                  <span
+                    class="size-1.75 shrink-0 rounded-full"
+                    [class]="item.dot"
+                    aria-hidden="true"
+                  ></span>
+                }
+                {{ item.detail }}
+              </span>
+            }
+          </span>
+        </a>
+      }
+    </nav>
+
+    <div class="flex min-w-0 flex-col gap-5">
+      @if (loaded(); as s) {
+        @if (form(); as f) {
+          @let st = status()!;
+          <form id="model-settings-form" class="contents" novalidate (submit)="save($event)">
+            <!-- Gateway: where it stands, then which LiteLLM -->
+            <div
+              class="flex flex-col gap-5"
+              data-panel="gateway"
+              [hidden]="section() !== 'gateway'"
+            >
+              <ng-template #testButton>
+                <button
+                  hlmBtn
+                  type="button"
+                  class="shrink-0 self-start"
+                  data-testid="test-gateway"
+                  [variant]="
+                    st.state === 'READY' || st.state === 'NOT_CONFIGURED' ? 'outline' : 'default'
+                  "
+                  [disabled]="testing() || gatewayChanged() || !s.configured"
+                  (click)="test()"
+                >
+                  @if (testing()) {
+                    <hlm-spinner aria-hidden="true" />
+                    Testing…
+                  } @else {
+                    <ng-icon name="lucidePlugZap" aria-hidden="true" />
+                    {{ st.state === 'FAILED' ? 'Test again' : 'Test' }}
+                  }
+                </button>
+              </ng-template>
+
+              <section
+                class="bg-card rounded-xl border px-4 pt-4 pb-3.5 sm:px-5"
+                [class]="
+                  st.tone === 'warning'
+                    ? 'border-warning/50'
+                    : st.tone === 'failed'
+                      ? 'border-destructive/50'
+                      : ''
+                "
+                aria-labelledby="gateway-status-title"
+                data-testid="gateway-status"
+                [attr.data-state]="st.state"
+              >
+                <div class="flex flex-wrap items-start gap-x-4 gap-y-3" aria-live="polite">
+                  <div class="min-w-0 flex-[1_1_20rem]">
+                    <div
+                      [class]="
+                        st.state === 'READY'
+                          ? 'flex flex-wrap items-center gap-x-2.5 gap-y-1.5'
+                          : 'flex flex-col items-start gap-2'
+                      "
+                    >
+                      <span
+                        class="inline-flex h-6 items-center gap-1.5 rounded-full px-2.5 text-xs font-semibold whitespace-nowrap"
+                        [class]="
+                          st.tone === 'ready'
+                            ? 'bg-success/10 text-success'
+                            : st.tone === 'failed'
+                              ? 'bg-destructive/10 text-destructive'
+                              : 'bg-warning/10 text-warning'
+                        "
+                        data-testid="gateway-chip"
+                      >
+                        <ng-icon
+                          [name]="
+                            st.tone === 'ready'
+                              ? 'lucideCheck'
+                              : st.tone === 'failed'
+                                ? 'lucideCircleX'
+                                : 'lucideCircleAlert'
+                          "
+                          size="12"
+                          aria-hidden="true"
+                        />
+                        {{ st.chip }}
+                      </span>
+                      <h2
+                        id="gateway-status-title"
+                        class="text-base font-bold"
+                        [class.sm:text-lg]="st.state !== 'READY'"
+                      >
+                        {{ st.title }}
+                      </h2>
+                    </div>
+                    <p
+                      class="mt-1.5 max-w-3xl text-sm text-pretty"
+                      [attr.data-testid]="testResult() ? 'test-result' : 'gateway-status-text'"
+                      [attr.data-ok]="testResult()?.ok ?? null"
+                    >
+                      {{ statusText() }}
+                    </p>
+                    @if (s.testedAt && (st.state === 'READY' || st.state === 'FAILED')) {
+                      <p class="text-muted-foreground mt-0.5 text-xs">
+                        Tested <app-time [value]="s.testedAt" />
+                      </p>
+                    }
+                  </div>
+                  @if (st.state === 'READY') {
+                    <ng-container *ngTemplateOutlet="testButton" />
+                  }
+                </div>
+
+                @if (st.state === 'READY') {
+                  <div
+                    class="mt-3.5 flex flex-wrap items-center gap-2 border-t pt-3.5"
+                    data-testid="served"
+                  >
+                    <span class="me-1 text-[0.8125rem] font-semibold">Serves</span>
+                    @for (model of servedModels(); track model) {
+                      <span
+                        class="bg-code inline-flex h-6.5 items-center rounded-lg border px-2 font-mono text-xs"
+                        >{{ model }}</span
+                      >
+                    } @empty {
+                      <span class="text-muted-foreground text-[0.8125rem]">{{
+                        servedNote() ?? 'Reading the models…'
+                      }}</span>
+                    }
+                  </div>
+                  <p class="text-muted-foreground mt-2.5 text-xs">{{ testNote() }}</p>
+                } @else {
+                  <ol
+                    class="m-0 mt-3.5 flex list-none flex-col gap-0.5 p-0"
+                    aria-label="Setting up model access"
+                    data-testid="gateway-steps"
+                  >
+                    @for (step of steps(); track step.title) {
+                      <li class="flex items-start gap-2.5 py-1.5" [attr.data-step]="step.state">
+                        @switch (step.state) {
+                          @case ('done') {
+                            <ng-icon
+                              name="lucideCircleCheck"
+                              size="16"
+                              class="text-success mt-0.5 shrink-0"
+                              aria-hidden="true"
+                            />
+                          }
+                          @case ('now') {
+                            <ng-icon
+                              name="lucideCircleDot"
+                              size="16"
+                              class="text-foreground mt-0.5 shrink-0"
+                              aria-hidden="true"
+                            />
+                          }
+                          @case ('failed') {
+                            <ng-icon
+                              name="lucideCircleX"
+                              size="16"
+                              class="text-destructive mt-0.5 shrink-0"
+                              aria-hidden="true"
+                            />
+                          }
+                          @default {
+                            <ng-icon
+                              name="lucideCircleDashed"
+                              size="16"
+                              class="text-faint mt-0.5 shrink-0"
+                              aria-hidden="true"
+                            />
+                          }
+                        }
+                        <span class="flex min-w-0 flex-col">
+                          <span
+                            class="text-sm"
+                            [class.font-semibold]="step.state !== 'todo'"
+                            [class.font-medium]="step.state === 'todo'"
+                            [class.text-muted-foreground]="step.state === 'todo'"
+                            [class.text-destructive]="step.state === 'failed'"
+                            >{{ step.title
+                            }}<span class="sr-only">{{
+                              step.state === 'done'
+                                ? ', done'
+                                : step.state === 'now'
+                                  ? ', next'
+                                  : step.state === 'failed'
+                                    ? ', failed'
+                                    : ''
+                            }}</span></span
+                          >
+                          <span class="text-muted-foreground text-xs text-pretty">{{
+                            step.detail
+                          }}</span>
+                        </span>
+                      </li>
+                    }
+                  </ol>
+                  <div class="mt-3.5 flex flex-wrap items-center gap-x-4 gap-y-2 border-t pt-3.5">
+                    <p class="text-muted-foreground m-0 flex-[1_1_16rem] text-xs">
+                      {{ testNote() }}
+                    </p>
+                    <ng-container *ngTemplateOutlet="testButton" />
+                  </div>
+                }
+              </section>
+
+              <section
+                class="bg-card rounded-xl border"
+                aria-labelledby="gateway-title"
+                data-testid="gateway"
+              >
+                <div class="px-4 pt-4 pb-3.5 sm:px-5">
+                  <h2 id="gateway-title" class="text-base font-bold">Which LiteLLM</h2>
+                  <p class="text-muted-foreground mt-0.5 text-sm text-pretty">
+                    Agents reach the models through LiteLLM, which holds a key and a budget for
+                    every member and service account.
+                  </p>
+                </div>
+                <app-setting-row rowId="gateway" label="Gateway">
+                  <span help data-testid="gateway-description"
+                    >{{ gatewayDescriptions[f.gateway] }}
+                    @if (!s.bundledAvailable) {
+                      This deployment bundles none.
+                    }
+                  </span>
+                  <div class="flex w-full flex-wrap items-center gap-2.5 sm:w-auto">
+                    <app-segmented
+                      inputId="gateway"
+                      labelledBy="gateway-label"
+                      [options]="gatewayOptions()"
+                      [value]="f.gateway"
+                      (valueChange)="setGateway($event)"
+                    />
+                    @if (was().gateway; as w) {
+                      <span class="text-muted-foreground text-xs" data-testid="was"
+                        >was {{ w }}</span
+                      >
+                    }
+                  </div>
+                </app-setting-row>
+
+                @if (f.gateway === 'EXTERNAL') {
+                  <app-setting-row
+                    rowId="gateway-admin-url"
+                    label="Admin URL"
+                    for="gateway-admin-url"
+                  >
+                    <span help>Where Tinfirm reaches LiteLLM’s admin API.</span>
+                    <input
+                      hlmInput
+                      id="gateway-admin-url"
+                      type="url"
+                      class="w-full font-mono sm:max-w-md"
+                      spellcheck="false"
+                      autocomplete="off"
+                      placeholder="https://litellm.example.com"
+                      [value]="f.adminUrl"
+                      [attr.aria-invalid]="errors().adminUrl ? 'true' : null"
+                      aria-describedby="gateway-admin-url-help gateway-admin-url-error"
+                      (input)="patch({ adminUrl: $any($event.target).value })"
+                    />
+                    @if (errors().adminUrl; as message) {
+                      <p
+                        id="gateway-admin-url-error"
+                        class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                        role="alert"
+                      >
+                        <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{
+                          message
+                        }}
+                      </p>
+                    }
+                  </app-setting-row>
+                  <app-setting-row
+                    rowId="gateway-admin-key"
+                    label="Master or admin key"
+                    for="gateway-admin-key"
+                  >
+                    <span help data-testid="admin-key-state">
+                      @if (keyRequired()) {
+                        Kept in the company’s vault and never shown again. A new URL needs the key
+                        again.
+                      } @else {
+                        A key is stored in the company’s vault. Leave this empty to keep it.
+                      }
+                    </span>
+                    <div class="flex w-full flex-wrap items-center gap-2.5">
+                      <input
+                        hlmInput
+                        id="gateway-admin-key"
+                        type="password"
+                        class="min-w-0 flex-1 font-mono sm:max-w-md"
+                        autocomplete="new-password"
+                        [placeholder]="keyRequired() ? '' : 'Stored · type to replace'"
+                        [value]="f.adminKey"
+                        [attr.aria-invalid]="errors().adminKey ? 'true' : null"
+                        aria-describedby="gateway-admin-key-help gateway-admin-key-error"
+                        (input)="patch({ adminKey: $any($event.target).value })"
+                      />
+                      <span
+                        class="text-muted-foreground inline-flex h-5.5 items-center gap-1 rounded-full border px-2 text-xs font-semibold"
+                      >
+                        <ng-icon name="lucideLock" size="12" aria-hidden="true" />
+                        Write-only
+                      </span>
+                    </div>
+                    @if (errors().adminKey; as message) {
+                      <p
+                        id="gateway-admin-key-error"
+                        class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                        role="alert"
+                      >
+                        <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{
+                          message
+                        }}
+                      </p>
+                    }
+                  </app-setting-row>
+                }
+
+                <app-setting-row rowId="relay" label="Relay">
+                  <span help
+                    >Runner hosts reach the models through this address and never see a key.</span
+                  >
+                  <div class="flex max-w-full min-w-0 items-center gap-1.5">
+                    <code
+                      class="bg-muted/60 block min-w-0 truncate rounded-md border px-2.5 py-1.5 text-xs"
+                      data-testid="relay-url"
+                      >{{ s.relayBaseUrl }}</code
+                    >
+                    <app-copy-button [value]="s.relayBaseUrl" ariaLabel="Copy the relay address" />
+                  </div>
+                </app-setting-row>
+              </section>
+            </div>
+
+            <!-- Default budget: every key's without its own, and the alerts -->
+            <div
+              class="flex flex-col gap-5"
+              data-panel="defaults"
+              [hidden]="section() !== 'defaults'"
+            >
+              <section
+                class="bg-card rounded-xl border"
+                aria-labelledby="defaults-title"
+                data-testid="defaults"
+              >
+                <div class="px-4 pt-4 pb-3.5 sm:px-5">
+                  <h2 id="defaults-title" class="text-base font-bold">Default budget</h2>
+                  <p class="text-muted-foreground mt-0.5 text-sm text-pretty">
+                    The budget and models of every member and service account without their own. A
+                    change reaches their keys at once.
+                  </p>
+                </div>
+
+                <app-setting-row rowId="default-budget" label="Budget" for="default-budget">
+                  <span help>What each key may spend in a period.</span>
+                  <div class="flex flex-wrap items-center gap-2.5">
+                    <span class="text-muted-foreground text-sm" aria-hidden="true">$</span>
+                    <input
+                      hlmInput
+                      id="default-budget"
+                      class="w-30 text-right font-mono tabular-nums"
+                      inputmode="decimal"
+                      autocomplete="off"
+                      [value]="f.budget"
+                      [attr.aria-invalid]="errors().budget ? 'true' : null"
+                      aria-describedby="default-budget-help default-budget-error"
+                      (input)="patch({ budget: $any($event.target).value })"
+                    />
+                    <span class="text-muted-foreground text-sm">per {{ periodWords() }}</span>
+                    @if (was().budget; as w) {
+                      <span class="text-muted-foreground text-xs" data-testid="was"
+                        >was <span class="font-mono tabular-nums">{{ w }}</span></span
+                      >
+                    }
+                  </div>
+                  @if (errors().budget; as message) {
+                    <p
+                      id="default-budget-error"
+                      class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                      role="alert"
+                    >
+                      <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{ message }}
+                    </p>
+                  }
+                </app-setting-row>
+
+                <app-setting-row rowId="budget-period" label="Period" for="budget-period-count">
+                  <span help
+                    >Every key’s budget resets this often, counted from when the key was made.</span
+                  >
+                  <div class="flex flex-wrap items-center gap-2.5">
+                    <input
+                      hlmInput
+                      id="budget-period-count"
+                      class="w-22 text-right font-mono tabular-nums"
+                      inputmode="numeric"
+                      autocomplete="off"
+                      [value]="f.periodCount"
+                      [attr.aria-invalid]="errors().period ? 'true' : null"
+                      aria-describedby="budget-period-help budget-period-error"
+                      (input)="patch({ periodCount: $any($event.target).value })"
+                    />
+                    <label class="sr-only" for="budget-period-unit">Period unit</label>
+                    <hlm-native-select
+                      class="w-32"
+                      selectId="budget-period-unit"
+                      [value]="f.periodUnit"
+                      (valueChange)="setUnit($event)"
+                    >
+                      @for (unit of periodUnits; track unit.value) {
+                        <option [value]="unit.value">{{ unit.many }}</option>
+                      }
+                    </hlm-native-select>
+                    @if (was().period; as w) {
+                      <span class="text-muted-foreground text-xs" data-testid="was"
+                        >was {{ w }}</span
+                      >
+                    }
+                  </div>
+                  @if (errors().period; as message) {
+                    <p
+                      id="budget-period-error"
+                      class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                      role="alert"
+                    >
+                      <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{ message }}
+                    </p>
+                  }
+                </app-setting-row>
+
+                <app-setting-row rowId="default-models" label="Models">
+                  <span help>Which models a key may call.</span>
+                  <div
+                    class="flex flex-col"
+                    role="radiogroup"
+                    aria-labelledby="default-models-label"
+                    aria-describedby="default-models-help"
+                  >
+                    <label class="flex min-h-11 items-center gap-2.5 text-sm sm:min-h-7">
+                      <input
+                        type="radio"
+                        name="default-models"
+                        id="default-models-every"
+                        class="accent-primary size-4 shrink-0"
+                        [checked]="!f.modelsLimited"
+                        (change)="patch({ modelsLimited: false })"
+                      />
+                      Every model the gateway serves
+                    </label>
+                    <label class="flex min-h-11 items-center gap-2.5 text-sm sm:min-h-7">
+                      <input
+                        type="radio"
+                        name="default-models"
+                        id="default-models-only"
+                        class="accent-primary size-4 shrink-0"
+                        [checked]="f.modelsLimited"
+                        [disabled]="choices().length === 0"
+                        (change)="patch({ modelsLimited: true })"
+                      />
+                      Only these
+                    </label>
+                  </div>
+                  @if (servedNote(); as note) {
+                    <p class="text-muted-foreground m-0 ms-6.5 text-xs" data-testid="models-note">
+                      {{ note }}
+                    </p>
+                  }
+                  @if (f.modelsLimited) {
+                    <ul class="m-0 ms-6.5 flex list-none flex-col p-0" aria-label="Default models">
+                      @for (choice of choices(); track choice.name) {
+                        <li>
+                          <label class="flex min-h-11 items-center gap-2.5 text-sm sm:min-h-7">
+                            <input
+                              type="checkbox"
+                              class="accent-primary size-4 shrink-0"
+                              [checked]="f.models.includes(choice.name)"
+                              (change)="toggleModel(choice.name, $any($event.target).checked)"
+                            />
+                            <span class="font-mono text-xs">{{ choice.name }}</span>
+                            @if (!choice.served) {
+                              <span class="text-warning text-xs">not served now</span>
+                            }
+                          </label>
+                        </li>
+                      }
+                    </ul>
+                  }
+                  @if (was().models; as w) {
+                    <span class="text-muted-foreground text-xs" data-testid="was">was {{ w }}</span>
+                  }
+                  @if (errors().models; as message) {
+                    <p
+                      class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                      role="alert"
+                    >
+                      <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{ message }}
+                    </p>
+                  }
+                </app-setting-row>
+
+                <!-- How many keys a change reaches, from the principals as read -->
+                <div
+                  class="px-4 pb-4 empty:hidden sm:ps-[calc(15rem+3.25rem)] sm:pe-5"
+                  aria-live="polite"
+                >
+                  @if (reach(); as text) {
+                    <p
+                      class="bg-muted text-muted-foreground m-0 flex max-w-xl items-start gap-2 rounded-[10px] px-3 py-2 text-xs leading-normal text-pretty"
+                      data-testid="reach"
+                    >
+                      <ng-icon
+                        name="lucideKeyRound"
+                        size="14"
+                        class="mt-0.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                      <span>{{ text }}</span>
+                    </p>
+                  }
+                </div>
+
+                <div role="group" aria-labelledby="alerts-title" data-testid="alerts">
+                  <div class="border-t px-4 pt-5 pb-3.5 sm:px-5">
+                    <h3 id="alerts-title" class="text-[0.9375rem] font-bold">Alerts</h3>
+                    <p class="text-muted-foreground mt-0.5 text-sm text-pretty">
+                      Who is told in the inbox as a budget is spent. Alerts apply to every budget,
+                      their own or the default, and cap nothing.
+                    </p>
+                  </div>
+                  <app-setting-row
+                    rowId="alert-thresholds"
+                    label="Tell people at"
+                    for="alert-thresholds"
+                  >
+                    <span help
+                      >A member is told of their own budget, the admins of a service account’s, and
+                      of everyone’s once it is spent. One to three percentages.</span
+                    >
+                    <div class="flex flex-wrap items-center gap-2.5">
+                      <input
+                        hlmInput
+                        id="alert-thresholds"
+                        class="w-36 font-mono tabular-nums"
+                        autocomplete="off"
+                        [value]="f.thresholds"
+                        [attr.aria-invalid]="errors().thresholds ? 'true' : null"
+                        aria-describedby="alert-thresholds-help alert-thresholds-error"
+                        (input)="patch({ thresholds: $any($event.target).value })"
+                      />
+                      <span class="text-muted-foreground text-sm">% of a budget</span>
+                      @if (was().thresholds; as w) {
+                        <span class="text-muted-foreground text-xs" data-testid="was"
+                          >was <span class="font-mono tabular-nums">{{ w }}</span></span
+                        >
+                      }
+                    </div>
+                    @if (errors().thresholds; as message) {
+                      <p
+                        id="alert-thresholds-error"
+                        class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                        role="alert"
+                      >
+                        <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{
+                          message
+                        }}
+                      </p>
+                    }
+                  </app-setting-row>
+                  <app-setting-row
+                    rowId="monthly-alert"
+                    label="Tell the admins when a month passes"
+                    for="monthly-alert"
+                  >
+                    <span help
+                      >The company’s spend in a calendar month (UTC). Leave it empty for no alert.
+                      Nothing is capped.</span
+                    >
+                    <div class="flex flex-wrap items-center gap-2.5">
+                      <span class="text-muted-foreground text-sm" aria-hidden="true">$</span>
+                      <input
+                        hlmInput
+                        id="monthly-alert"
+                        class="w-36 text-right font-mono tabular-nums"
+                        inputmode="decimal"
+                        autocomplete="off"
+                        placeholder="No alert"
+                        [value]="f.monthlyAlert"
+                        [attr.aria-invalid]="errors().monthlyAlert ? 'true' : null"
+                        aria-describedby="monthly-alert-help monthly-alert-error"
+                        (input)="patch({ monthlyAlert: $any($event.target).value })"
+                      />
+                      @if (was().monthlyAlert; as w) {
+                        <span class="text-muted-foreground text-xs" data-testid="was"
+                          >was {{ w }}</span
+                        >
+                      }
+                    </div>
+                    @if (errors().monthlyAlert; as message) {
+                      <p
+                        id="monthly-alert-error"
+                        class="text-destructive m-0 flex items-center gap-1.5 text-xs font-medium"
+                        role="alert"
+                      >
+                        <ng-icon name="lucideCircleAlert" size="14" aria-hidden="true" />{{
+                          message
+                        }}
+                      </p>
+                    }
+                    @if (monthSoFar(); as spent) {
+                      <p class="text-muted-foreground m-0 text-xs" data-testid="month-so-far">
+                        This month so far: <span class="font-mono tabular-nums">{{ spent }}</span>
+                      </p>
+                    }
+                  </app-setting-row>
+                </div>
+              </section>
+            </div>
+          </form>
+        }
+
+        <app-members-budgets
+          data-panel="budgets"
+          [hidden]="section() !== 'budgets'"
+          [rows]="budgetRows()"
+          [loading]="budgetsLoading()"
+          [membersError]="members.error() ?? null"
+          [identitiesError]="identities.error() ?? null"
+          [defaultPhrase]="defaultBudget()"
+          [companyId]="companyId() ?? ''"
+          [noIdentities]="noIdentities()"
+          (edit)="editBudget($event)"
+          (retryMembers)="members.reload()"
+          (retryIdentities)="identities.reload()"
+        />
+      } @else if (section() !== 'spend') {
+        @if (settings.error()) {
+          <app-error-state
+            [error]="settings.error()"
+            heading="Couldn't load model access"
+            [messages]="{ 'status:403': 'Only owners and admins see model access.' }"
+            (retry)="settings.reload()"
+          />
+        } @else {
+          <div class="flex flex-col gap-3" aria-busy="true">
+            <span class="sr-only" role="status">Loading model access…</span>
+            <hlm-skeleton class="h-40 w-full rounded-xl" />
+            <hlm-skeleton class="h-56 w-full rounded-xl" />
+          </div>
+        }
+      }
+
+      <!-- Spend: read once the section is first opened -->
+      @if (spendOpened()) {
+        <section
+          class="flex flex-col gap-3"
+          aria-labelledby="spend-title"
+          data-panel="spend"
+          [hidden]="section() !== 'spend'"
+        >
+          <div class="px-1">
+            <h2 id="spend-title" class="text-base font-bold">Spend</h2>
+            <p class="text-muted-foreground mt-0.5 text-sm text-pretty">
+              What the agents’ turns cost in this company, by person, agent, trigger and model.
+            </p>
+          </div>
+          <app-spend-view />
+        </section>
+      }
+
+      @if (saveError(); as message) {
+        <div hlmAlert variant="destructive" data-testid="save-error">
+          <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+          <p hlmAlertDescription>{{ message }}</p>
+        </div>
+      }
+
+      <!-- One bar saves the gateway, the defaults and the alerts together -->
+      @if (loaded(); as s) {
+        @if (!s.configured) {
+          <div
+            class="sticky bottom-4 z-10 block"
+            role="region"
+            aria-label="Not set up yet"
+            data-testid="setup-bar"
+          >
+            <div
+              class="bg-card flex flex-wrap items-center gap-x-3 gap-y-2 rounded-[18px] border py-2.5 pr-2.5 pl-4 shadow-[0_10px_30px_-12px_rgb(0_0_0/0.25)] sm:pl-5"
+            >
+              <p
+                class="m-0 flex min-w-0 flex-1 basis-48 flex-col text-sm sm:flex-row sm:items-baseline sm:gap-3"
+                aria-live="polite"
+              >
+                <span class="font-semibold">Not set up yet</span>
+                <span
+                  class="truncate text-[0.8125rem]"
+                  [class.text-muted-foreground]="!blocked()"
+                  [class.text-destructive]="!!blocked()"
+                  >{{ blocked() || setupSummary() }}</span
+                >
+              </p>
+              <button
+                hlmBtn
+                type="submit"
+                form="model-settings-form"
+                class="ml-auto"
+                data-testid="save-model-settings"
+                [disabled]="saving() || !!blocked()"
+              >
+                @if (saving()) {
+                  <hlm-spinner aria-hidden="true" />
+                }
+                Set up model access
+              </button>
+            </div>
+          </div>
+        } @else if (changes().length > 0) {
+          <app-unsaved-changes-bar
+            form="model-settings-form"
+            saveTestId="save-model-settings"
+            [changes]="changeNames()"
+            [saving]="saving()"
+            [blocked]="blocked()"
+            (discard)="discard()"
+          />
+        }
+      }
+    </div>
+  </div>
+</div>
+
+@if (companyId(); as id) {
+  <app-principal-budget-dialog
+    [(open)]="budgetOpen"
+    [companyId]="id"
+    [principal]="budgetPrincipal()"
+    [view]="budgetView()"
+    [defaults]="defaults()"
+    [served]="servedModels()"
+    (saved)="onBudgetSaved($event)"
+  />
+}

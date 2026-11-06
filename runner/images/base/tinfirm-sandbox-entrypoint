@@ -1,0 +1,143 @@
+#!/bin/sh
+# tinfirm-sandbox-entrypoint: the entrypoint of the Tinfirm runner images (ADR-0025). It
+# prepares the sandbox and then execs its arguments, the image's command (the ACP adapter).
+#
+#  1. A random UID without a passwd entry (OpenShift style, GID 0) gets one.
+#  2. With TINFIRM_SANDBOX_DOCKER=1 (`run --sandbox-docker`, only in a Kata VM), as root:
+#     makes /sys and the cgroup filesystems writable, enables cgroup v2 nesting, puts
+#     /var/lib/docker on a loop disk of TINFIRM_SANDBOX_DOCKER_DISK (a sparse file in the
+#     container's own filesystem; default 40G, `off` for none), writes
+#     /etc/docker/daemon.json (tinfirm-sandbox-setup), starts dockerd, waits for it at most
+#     TINFIRM_SANDBOX_DOCKER_START_TIMEOUT seconds (default 60), and then runs the rest as the
+#     agent's user, TINFIRM_SANDBOX_AGENT_USER (UID:GID, set by the runner host).
+#  3. Writes the mirror settings into the agent's home (tinfirm-sandbox-setup user-config).
+#
+# Messages go to stderr, which the runner host shows as log lines of the run. Stdout belongs
+# to the adapter: it carries ACP.
+
+set -eu
+
+log() { printf 'tinfirm-sandbox: %s\n' "$*" >&2; }
+die() {
+    log "error: $*"
+    exit 1
+}
+
+[ "$#" -gt 0 ] || die "no command to run"
+
+if ! id -un >/dev/null 2>&1 && [ -w /etc/passwd ]; then
+    printf 'agent-%s:x:%s:%s:Tinfirm agent:%s:/bin/bash\n' \
+        "$(id -u)" "$(id -u)" "$(id -g)" "${HOME:-/home/agent}" >>/etc/passwd
+fi
+
+if [ -n "${TINFIRM_SANDBOX_MAVEN_MIRROR:-}" ] && [ -z "${MVNW_REPOURL:-}" ]; then
+    # The Maven wrapper (mvnw) then downloads Maven from the mirror, not from Maven Central.
+    MVNW_REPOURL=${TINFIRM_SANDBOX_MAVEN_MIRROR%/}
+    export MVNW_REPOURL
+fi
+
+if [ "${TINFIRM_SANDBOX_DOCKER:-}" != 1 ]; then
+    tinfirm-sandbox-setup user-config
+    exec "$@"
+fi
+
+# --- Docker in the sandbox ----------------------------------------------------------------
+
+[ "$(id -u)" = 0 ] || die "TINFIRM_SANDBOX_DOCKER=1 needs a container that starts as root"
+agent=${TINFIRM_SANDBOX_AGENT_USER:-1000:1000}
+uid=${agent%%:*}
+gid=${agent#*:}
+case "$uid/$gid" in
+    */ | /* | *[!0-9/]*) die "TINFIRM_SANDBOX_AGENT_USER must be UID:GID, not '$agent'" ;;
+esac
+[ "$uid" != 0 ] || die "TINFIRM_SANDBOX_AGENT_USER must not be root"
+timeout=${TINFIRM_SANDBOX_DOCKER_START_TIMEOUT:-60}
+case $timeout in
+    '' | *[!0-9]*) die "TINFIRM_SANDBOX_DOCKER_START_TIMEOUT must be whole seconds" ;;
+esac
+disk=${TINFIRM_SANDBOX_DOCKER_DISK:-40G}
+case $disk in
+    off) ;;
+    '' | *[!0-9KMGT]* | [!0-9]*) die "TINFIRM_SANDBOX_DOCKER_DISK must be a size such as 40G, or off" ;;
+esac
+
+# The sandbox has every capability but is not `--privileged` (that would hand the VM the
+# runner host's devices), so Docker mounted /sys and the cgroup filesystems read-only.
+# dockerd needs them writable; they belong to the VM's kernel.
+awk '{
+    type = ""
+    for (i = 7; i < NF; i++) if ($i == "-") { type = $(i + 1); break }
+    if (type == "sysfs" || type == "cgroup" || type == "cgroup2" ||
+        ($5 == "/sys/fs/cgroup" && type == "tmpfs")) print $5
+}' /proc/self/mountinfo | while read -r point; do
+    mount -o remount,rw "$point" 2>/dev/null || log "warning: cannot make $point writable"
+done
+
+# cgroup v2: move this container's processes into a child group, so that dockerd can enable
+# the controllers for the agent's containers (as moby's hack/dind does).
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    mkdir -p /sys/fs/cgroup/init
+    xargs -rn1 </sys/fs/cgroup/cgroup.procs >/sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :
+    sed -e 's/ / +/g' -e 's/^/+/' </sys/fs/cgroup/cgroup.controllers \
+        >/sys/fs/cgroup/cgroup.subtree_control 2>/dev/null ||
+        log "warning: cannot enable the cgroup controllers; limits of the agent's containers may not apply"
+fi
+mount --make-rshared / 2>/dev/null || log "warning: cannot make / a shared mount"
+
+# /var/lib/docker gets a disk of its own. Under Kata the container's filesystem is virtio-fs,
+# which overlayfs cannot use as its upper layer: dockerd would fail, or copy every layer. An
+# ext4 file system in a sparse file of the container's own filesystem, on a loop device of
+# the VM's kernel, is the layout Kata documents for Docker in a Kata container. It goes away
+# with the container. TINFIRM_SANDBOX_DOCKER_DISK=off keeps the data directly in the
+# container's filesystem.
+if [ "$disk" != off ]; then
+    disk_image=/var/lib/tinfirm/docker-disk.img
+    mkdir -p /var/lib/tinfirm /var/lib/docker
+    [ -e /dev/loop-control ] || mknod -m 0660 /dev/loop-control c 10 237
+    n=0
+    while [ "$n" -lt 8 ]; do
+        [ -e "/dev/loop$n" ] || mknod -m 0660 "/dev/loop$n" b 7 "$n"
+        n=$((n + 1))
+    done
+    truncate -s "$disk" "$disk_image" || die "cannot create $disk_image ($disk)"
+    mkfs.ext4 -q -F -m 0 -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 "$disk_image" ||
+        die "cannot create the file system of $disk_image"
+    loop_device=$(losetup --find --show "$disk_image") ||
+        die "cannot attach $disk_image to a loop device"
+    mount -t ext4 "$loop_device" /var/lib/docker ||
+        die "cannot mount $loop_device at /var/lib/docker"
+fi
+
+tinfirm-sandbox-setup docker-config /etc/docker/daemon.json
+mkdir -p /var/log/tinfirm
+dockerd_log=/var/log/tinfirm/dockerd.log
+# The socket belongs to the agent's group, so the agent and Testcontainers can use it.
+dockerd --group "$gid" </dev/null >"$dockerd_log" 2>&1 &
+dockerd_pid=$!
+
+ticks=0
+until docker version >/dev/null 2>&1; do
+    if ! kill -0 "$dockerd_pid" 2>/dev/null; then
+        tail -n 40 "$dockerd_log" >&2 || :
+        die "dockerd stopped while it was starting; its last log lines are above ($dockerd_log)"
+    fi
+    if [ "$ticks" -ge $((timeout * 5)) ]; then
+        tail -n 40 "$dockerd_log" >&2 || :
+        kill "$dockerd_pid" 2>/dev/null || :
+        die "dockerd did not answer within ${timeout}s; its last log lines are above ($dockerd_log)"
+    fi
+    sleep 0.2
+    ticks=$((ticks + 1))
+done
+log "Docker $(docker version --format '{{.Server.Version}}') is running in the sandbox (storage driver $(docker info --format '{{.Driver}}'), log $dockerd_log)"
+
+DOCKER_HOST=${DOCKER_HOST:-unix:///var/run/docker.sock}
+# Testcontainers would look for published ports at the container's gateway, which is the
+# runner host; the agent's own dockerd publishes them in this network namespace.
+TESTCONTAINERS_HOST_OVERRIDE=${TESTCONTAINERS_HOST_OVERRIDE:-localhost}
+export DOCKER_HOST TESTCONTAINERS_HOST_OVERRIDE
+
+# The files in the home belong to the agent, as on every other run.
+setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all -- \
+    tinfirm-sandbox-setup user-config
+exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all -- "$@"

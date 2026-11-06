@@ -1,0 +1,11 @@
+{
+  "type": "host.config.applied",
+  "version": 3,
+  "draining": true,
+  "maxConcurrentRuns": 0,
+  "maxConcurrentRunsCeiling": 4,
+  "credentials": [
+    { "label": "claude-max", "poolSize": 2, "poolSizeCeiling": 3 },
+    { "label": "codex-plus", "poolSize": 1, "poolSizeCeiling": 1 }
+  ]
+}

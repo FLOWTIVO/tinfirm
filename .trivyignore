@@ -1,0 +1,8 @@
+# Accepted dependency CVEs (read by .github/workflows/reusable-security.yml), one per line as
+# `CVE-YYYY-NNNNN`. The dependency scan blocks on HIGH/CRITICAL findings that have a fix.
+#
+# Every entry needs a comment above it: why it does not apply here or why the fix cannot
+# land yet, who decided, and when to look again. An entry without a reason cannot be told
+# apart from a CVE silenced to get a build green.
+#
+# Nothing is accepted.

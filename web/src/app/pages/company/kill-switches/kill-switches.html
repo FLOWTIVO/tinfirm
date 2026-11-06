@@ -1,0 +1,424 @@
+<div class="flex flex-col gap-5">
+  <app-page-header
+    title="Kill switches"
+    [description]="
+      manages()
+        ? 'Everything that is switched off in this company, who did it and why, and how to undo it. Nothing is undone by time.'
+        : 'Whether the company’s runs are stopped, and your own suspension.'
+    "
+  >
+    @if (manages() && loaded() && !loaded()!.runsStop) {
+      <button hlmBtn variant="outline" type="button" data-testid="stop-runs" (click)="openStop()">
+        <ng-icon name="lucideOctagonPause" class="text-destructive" aria-hidden="true" />
+        Stop every run
+      </button>
+    }
+  </app-page-header>
+
+  @if (switches.isLoading() && !loaded()) {
+    <div class="flex flex-col gap-3" aria-busy="true">
+      <span class="sr-only" role="status">Loading the kill switches…</span>
+      <hlm-skeleton class="h-24 w-full rounded-xl" />
+      <hlm-skeleton class="h-40 w-full rounded-xl" />
+    </div>
+  } @else if (switches.error()) {
+    <app-error-state
+      [error]="switches.error()"
+      heading="Couldn't load the kill switches"
+      (retry)="switches.reload()"
+    />
+  } @else if (loaded(); as ks) {
+    <!-- The company's runs -->
+    <section hlmCard aria-labelledby="runs-title" data-testid="runs-switch">
+      <div hlmCardHeader>
+        <h2 hlmCardTitle id="runs-title">The company’s runs</h2>
+        <p hlmCardDescription>
+          Stopping cancels every running turn and holds the rest: no turn runs, no conversation
+          starts, no approval is decided and no trigger fires. Messages and answers are kept, and
+          their turns wait for the lift.
+        </p>
+      </div>
+      <div hlmCardContent class="flex flex-col gap-3" aria-live="polite">
+        @if (ks.runsStop) {
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-start" data-testid="runs-stopped">
+            <div class="flex min-w-0 flex-1 items-start gap-3">
+              <ng-icon
+                name="lucideOctagonPause"
+                class="text-destructive mt-0.5 shrink-0"
+                aria-hidden="true"
+              />
+              <div class="min-w-0 text-sm">
+                <p class="font-semibold">Stopped</p>
+                <p class="text-muted-foreground text-pretty">{{ stoppedText() }}</p>
+              </div>
+            </div>
+            @if (manages()) {
+              <button
+                hlmBtn
+                type="button"
+                class="shrink-0 self-start"
+                data-testid="lift-runs"
+                (click)="openLift()"
+              >
+                <ng-icon name="lucidePlay" aria-hidden="true" />
+                Lift the stop
+              </button>
+            }
+          </div>
+        } @else {
+          <p class="flex items-center gap-2 text-sm" data-testid="runs-going">
+            <ng-icon name="lucideShieldCheck" class="text-success" aria-hidden="true" />
+            Runs go as usual.
+          </p>
+        }
+        @if (lifted(); as l) {
+          <div hlmAlert data-testid="lift-result">
+            <ng-icon name="lucideCirclePlay" aria-hidden="true" />
+            <h3 hlmAlertTitle>The stop is lifted</h3>
+            <p hlmAlertDescription>
+              Waiting turns are dispatched.
+              @if (l.triggersArmed) {
+                {{ l.triggersArmed }}
+                {{ l.triggersArmed === 1 ? 'trigger fires' : 'triggers fire' }}
+                again from now on.
+              }
+              @if (l.heldRowsReleased) {
+                {{ l.heldRowsReleased }} held
+                {{ l.heldRowsReleased === 1 ? 'write-back goes' : 'write-backs go' }} out.
+              }
+              {{ liftedStillOn() ?? 'No other switch is on.' }}
+            </p>
+          </div>
+        }
+      </div>
+    </section>
+
+    @if (ks.mySuspension; as mine) {
+      <section hlmCard aria-labelledby="mine-title" data-testid="my-suspension-card">
+        <div hlmCardHeader>
+          <h2 hlmCardTitle id="mine-title">You are suspended</h2>
+          <p hlmCardDescription>{{ pulled(mine, 'Suspended') }}</p>
+        </div>
+        @if (causeOf(mine.cause); as c) {
+          <p hlmCardContent class="text-muted-foreground text-sm">{{ c }}</p>
+        }
+      </section>
+    }
+
+    @if (manages()) {
+      @let g = groups()!;
+      @if (chips().length) {
+        <ul class="flex flex-wrap gap-2" aria-label="What is switched off" data-testid="counts">
+          @for (count of chips(); track count.kind) {
+            <li class="bg-card rounded-full border px-3 py-1 text-xs font-semibold">
+              {{ countPhrase(count) }}
+            </li>
+          }
+        </ul>
+      }
+
+      <!-- Systems -->
+      <section hlmCard aria-labelledby="systems-title" data-testid="systems-switch">
+        <div hlmCardHeader>
+          <h2 hlmCardTitle id="systems-title">Paused systems</h2>
+          <p hlmCardDescription>
+            A paused system’s accounts are used for nothing: its tools are not offered, turns that
+            need its repositories wait, and its triggers pause.
+          </p>
+        </div>
+        <div hlmCardContent class="flex flex-col gap-3">
+          @if (g.systems.length === 0) {
+            <p class="text-muted-foreground text-sm">No system is paused.</p>
+          } @else {
+            <ul class="flex flex-col divide-y" aria-label="Paused systems">
+              @for (kill of g.systems; track kill.targetId) {
+                <li
+                  class="flex flex-col gap-2 py-3 first:pt-0 last:pb-0 sm:flex-row sm:items-start"
+                  [attr.data-system]="kill.name"
+                >
+                  <div class="min-w-0 flex-1 text-sm">
+                    <a
+                      class="font-semibold underline-offset-4 hover:underline"
+                      [routerLink]="['/c', companyId(), 'systems', kill.targetId]"
+                      >{{ kill.name }}</a
+                    >
+                    <p class="text-muted-foreground text-pretty">{{ pulled(kill, 'Paused') }}</p>
+                    @if (kill.pausedTriggers?.length) {
+                      <p class="text-muted-foreground">
+                        Its pause paused
+                        {{ kill.pausedTriggers!.length }}
+                        {{ kill.pausedTriggers!.length === 1 ? 'trigger' : 'triggers' }}.
+                      </p>
+                    }
+                  </div>
+                  <button
+                    hlmBtn
+                    variant="outline"
+                    size="sm"
+                    type="button"
+                    class="self-start"
+                    [attr.aria-label]="'Resume ' + kill.name"
+                    (click)="openResume(kill)"
+                  >
+                    <ng-icon name="lucideCirclePlay" aria-hidden="true" />
+                    Resume
+                  </button>
+                </li>
+              }
+            </ul>
+          }
+          <div>
+            <button
+              hlmBtn
+              variant="outline"
+              size="sm"
+              type="button"
+              data-testid="pause-system"
+              [disabled]="pausable().length === 0"
+              (click)="openPause()"
+            >
+              <ng-icon name="lucideCirclePause" aria-hidden="true" />
+              Pause a system
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Suspended principals -->
+      <section hlmCard aria-labelledby="suspended-title" data-testid="suspended-switch">
+        <div hlmCardHeader>
+          <h2 hlmCardTitle id="suspended-title">Suspended</h2>
+          <p hlmCardDescription>
+            Members and service accounts that act, pay and decide for nothing. Resume a member here
+            or on Members, a service account on its own page.
+          </p>
+        </div>
+        <div hlmCardContent>
+          @if (g.principals.length === 0) {
+            <p class="text-muted-foreground text-sm">Nobody is suspended.</p>
+          } @else {
+            <ul class="flex flex-col divide-y" aria-label="Suspended">
+              @for (kill of g.principals; track kill.targetId) {
+                <li
+                  class="flex flex-col gap-2 py-3 text-sm first:pt-0 last:pb-0 sm:flex-row sm:items-start"
+                  [attr.data-principal]="kill.name"
+                >
+                  <div class="min-w-0 flex-1">
+                    <a
+                      class="font-semibold underline-offset-4 hover:underline"
+                      [routerLink]="['/c', companyId(), ...linkOf(kill)!]"
+                      >{{ kill.name }}</a
+                    >
+                    <span class="text-muted-foreground">
+                      · {{ kill.kind === 'MEMBER_SUSPENDED' ? 'member' : 'service account' }}</span
+                    >
+                    <p class="text-muted-foreground text-pretty">{{ pulled(kill, 'Suspended') }}</p>
+                    @if (causeOf(kill.cause); as c) {
+                      <p class="text-muted-foreground">{{ c }}</p>
+                    }
+                  </div>
+                  @if (resumable(kill)) {
+                    <button
+                      hlmBtn
+                      variant="outline"
+                      size="sm"
+                      type="button"
+                      class="self-start"
+                      [attr.aria-label]="'Resume ' + kill.name"
+                      [disabled]="resumingMember() === kill.userId"
+                      (click)="resumeMember(kill)"
+                    >
+                      @if (resumingMember() === kill.userId) {
+                        <hlm-spinner aria-hidden="true" />
+                      } @else {
+                        <ng-icon name="lucideCirclePlay" aria-hidden="true" />
+                      }
+                      Resume
+                    </button>
+                  }
+                </li>
+              }
+            </ul>
+          }
+        </div>
+      </section>
+
+      <!-- The rest -->
+      @if (g.others.length) {
+        <section hlmCard aria-labelledby="others-title" data-testid="other-switches">
+          <div hlmCardHeader>
+            <h2 hlmCardTitle id="others-title">Also switched off</h2>
+            <p hlmCardDescription>Each is undone on its own page.</p>
+          </div>
+          <div hlmCardContent>
+            <ul class="flex flex-col divide-y">
+              @for (kill of g.others; track kill.kind + kill.targetId) {
+                <li class="py-3 text-sm first:pt-0 last:pb-0">
+                  @if (linkOf(kill); as link) {
+                    <a
+                      class="font-semibold underline-offset-4 hover:underline"
+                      [routerLink]="['/c', companyId(), ...link]"
+                      >{{
+                        kill.kind === 'PERSONAL_MCP_SERVERS_OFF' ? labels[kill.kind].one : kill.name
+                      }}</a
+                    >
+                  }
+                  @if (kill.kind !== 'PERSONAL_MCP_SERVERS_OFF') {
+                    <span class="text-muted-foreground"> · {{ labels[kill.kind].one }}</span>
+                  }
+                  <p class="text-muted-foreground text-pretty">{{ pulled(kill, 'Since') }}</p>
+                </li>
+              }
+            </ul>
+          </div>
+        </section>
+      }
+    } @else if (!ks.runsStop && !ks.mySuspension) {
+      <p class="text-muted-foreground text-sm">Nothing is switched off for you.</p>
+    }
+  }
+</div>
+
+<app-reason-dialog
+  testId="stop-dialog"
+  heading="Stop every run of the company?"
+  description="Every running turn is cancelled now. Until you lift the stop, nothing runs, nothing starts, no approval is decided and no trigger fires; every page says so."
+  confirmLabel="Stop every run"
+  [open]="stopOpen()"
+  [busy]="stopBusy()"
+  [error]="stopError()"
+  (confirm)="stop($event)"
+  (closed)="stopOpen.set(false)"
+/>
+
+<hlm-alert-dialog [state]="liftOpen() ? 'open' : 'closed'" (closed)="liftOpen.set(false)">
+  <hlm-alert-dialog-content *hlmAlertDialogPortal="let ctx" data-testid="lift-dialog">
+    <hlm-alert-dialog-header>
+      <h2 hlmAlertDialogTitle>Lift the stop?</h2>
+      <p hlmAlertDialogDescription>
+        Waiting turns are dispatched, held write-backs go out, and every active trigger fires again
+        from now on; nothing that happened during the stop fires.
+        {{ stayingOn() ?? 'No other switch is on.' }}
+      </p>
+    </hlm-alert-dialog-header>
+    @if (liftError(); as message) {
+      <div hlmAlert variant="destructive" role="alert">
+        <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+        <p hlmAlertDescription>{{ message }}</p>
+      </div>
+    }
+    <hlm-alert-dialog-footer>
+      <button hlmAlertDialogCancel [disabled]="liftBusy()">Cancel</button>
+      <button
+        hlmAlertDialogAction
+        data-testid="confirm-lift"
+        [disabled]="liftBusy()"
+        (click)="lift()"
+      >
+        @if (liftBusy()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Lift the stop
+      </button>
+    </hlm-alert-dialog-footer>
+  </hlm-alert-dialog-content>
+</hlm-alert-dialog>
+
+<app-reason-dialog
+  testId="pause-dialog"
+  heading="Pause a system?"
+  description="Its accounts are used for nothing until you resume it, and every trigger that uses it pauses."
+  confirmLabel="Pause"
+  [open]="pauseOpen()"
+  [busy]="pauseBusy()"
+  [error]="pauseError()"
+  (confirm)="pause($event)"
+  (closed)="pauseOpen.set(false)"
+>
+  <div hlmField>
+    <label hlmFieldLabel for="pause-system-id">System</label>
+    <hlm-native-select
+      class="w-full"
+      selectId="pause-system-id"
+      [value]="pauseSystemId()"
+      (valueChange)="pauseSystemId.set($event ?? '')"
+    >
+      @for (system of pausable(); track system.id) {
+        <option [value]="system.id">{{ system.name }}</option>
+      }
+    </hlm-native-select>
+  </div>
+  <label class="flex items-start gap-2 text-sm">
+    <input
+      type="checkbox"
+      class="accent-primary mt-0.5 size-4"
+      data-testid="pause-stop-running"
+      [checked]="pauseStopRunning()"
+      (change)="pauseStopRunning.set($any($event.target).checked)"
+    />
+    <span>Also cancel the turns running now in conversations that use it</span>
+  </label>
+</app-reason-dialog>
+
+<hlm-alert-dialog [state]="resumeOpen() ? 'open' : 'closed'" (closed)="resumeOpen.set(false)">
+  <hlm-alert-dialog-content *hlmAlertDialogPortal="let ctx" data-testid="resume-dialog">
+    @let kill = resuming();
+    <hlm-alert-dialog-header>
+      <h2 hlmAlertDialogTitle>Resume {{ kill?.name }}?</h2>
+      <p hlmAlertDialogDescription>
+        Its accounts work again and waiting turns go on.
+        @if (!kill?.pausedTriggers?.length) {
+          Its pause paused no trigger.
+        }
+      </p>
+    </hlm-alert-dialog-header>
+    @if (kill && resumeLabel(kill); as label) {
+      <div class="flex flex-col gap-2 text-sm">
+        <label class="flex items-start gap-2 font-medium">
+          <input
+            type="checkbox"
+            class="accent-primary mt-0.5 size-4"
+            data-testid="resume-triggers"
+            [checked]="resumeTriggers()"
+            (change)="resumeTriggers.set($any($event.target).checked)"
+          />
+          <span>{{ label }}</span>
+        </label>
+        <ul class="text-muted-foreground ms-6 list-disc ps-4">
+          @for (trigger of kill.pausedTriggers; track trigger.id) {
+            <li>
+              {{ trigger.name }}
+              @if (trigger.authorName) {
+                <span>, by {{ trigger.authorName }}</span>
+              }
+            </li>
+          }
+        </ul>
+        <p class="text-muted-foreground text-xs">
+          Each resumes from now on: nothing of the pause fires. One left out stays paused until its
+          author or an admin resumes it.
+        </p>
+      </div>
+    }
+    @if (resumeError(); as message) {
+      <div hlmAlert variant="destructive" role="alert">
+        <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+        <p hlmAlertDescription>{{ message }}</p>
+      </div>
+    }
+    <hlm-alert-dialog-footer>
+      <button hlmAlertDialogCancel [disabled]="resumeBusy()">Cancel</button>
+      <button
+        hlmAlertDialogAction
+        data-testid="confirm-resume"
+        [disabled]="resumeBusy()"
+        (click)="resume()"
+      >
+        @if (resumeBusy()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Resume
+      </button>
+    </hlm-alert-dialog-footer>
+  </hlm-alert-dialog-content>
+</hlm-alert-dialog>

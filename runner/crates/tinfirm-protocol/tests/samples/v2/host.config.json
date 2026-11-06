@@ -1,0 +1,8 @@
+{
+  "type": "host.config",
+  "version": 7,
+  "desiredMaxConcurrentRuns": 3,
+  "credentials": [
+    {"label": "claude-main", "desiredPoolSize": 2}
+  ]
+}

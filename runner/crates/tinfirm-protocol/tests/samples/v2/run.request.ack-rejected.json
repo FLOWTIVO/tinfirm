@@ -1,0 +1,9 @@
+{
+  "type": "run.request.ack",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000082",
+  "status": "REJECTED",
+  "payload": null,
+  "code": "RESULT_TOO_LARGE",
+  "message": "The result of `jira_search` is larger than Tinfirm carries to you (800 KiB). Narrow the query, for example with a smaller `limit` or a tighter JQL, and call the tool again."
+}

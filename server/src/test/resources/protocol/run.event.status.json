@@ -1,0 +1,5 @@
+{
+  "type": "run.event", "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f", "epoch": 1, "seq": 1,
+  "eventType": "STATUS", "at": "2026-09-26T08:15:00Z",
+  "payload": { "phase": "cloning", "message": null }
+}

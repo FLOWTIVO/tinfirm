@@ -1,0 +1,16 @@
+---
+# Restarting Docker stops every running sandbox: drain the runner host before you change
+# daemon.json on a host with active runs.
+- name: Restart Docker
+  ansible.builtin.systemd_service:
+    name: docker
+    state: restarted
+
+# SIGHUP drains (docs/archive/v1/CONVENTIONS.md §15.4 step 13): the active runs finish,
+# `run` exits 0, and systemd starts it again with the binary and the unit that are
+# installed now.
+- name: Reload the runner host
+  ansible.builtin.systemd_service:
+    name: tinfirm-runner-host
+    state: reloaded
+    daemon_reload: true

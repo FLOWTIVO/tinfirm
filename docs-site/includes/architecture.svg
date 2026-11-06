@@ -1,0 +1,99 @@
+<svg class="tf-arch" viewBox="0 0 920 724" role="img" aria-labelledby="tf-arch-title tf-arch-desc" xmlns="http://www.w3.org/2000/svg">
+  <title id="tf-arch-title">Tinfirm's architecture</title>
+  <desc id="tf-arch-desc">People reach the Tinfirm server through your ingress from a browser, an AI client, Outlook or Gmail, Slack or Teams, and webhook senders. In your deployment, the server uses PostgreSQL and the LiteLLM model gateway, which calls the model providers. The server calls the identity provider and the company's systems. Runner hosts connect out to the server through the same ingress, run each turn in a sandbox, and fetch and push git from the code hosts.</desc>
+  <defs>
+    <marker id="tf-arch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path class="tf-arrowhead" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+  <!-- Where people work -->
+  <g>
+    <rect class="tf-box" x="20" y="20" width="128" height="66" rx="8"/>
+    <text class="tf-title" x="84" y="48" text-anchor="middle">Web browser</text>
+    <text class="tf-note" x="84" y="68" text-anchor="middle">the web app</text>
+    <rect class="tf-box" x="158" y="20" width="128" height="66" rx="8"/>
+    <text class="tf-title" x="222" y="48" text-anchor="middle">AI clients</text>
+    <text class="tf-note" x="222" y="68" text-anchor="middle">Claude Code, … (MCP)</text>
+    <rect class="tf-box" x="296" y="20" width="128" height="66" rx="8"/>
+    <text class="tf-title" x="360" y="48" text-anchor="middle">Outlook · Gmail</text>
+    <text class="tf-note" x="360" y="68" text-anchor="middle">the add-ins</text>
+    <rect class="tf-box" x="434" y="20" width="128" height="66" rx="8"/>
+    <text class="tf-title" x="498" y="48" text-anchor="middle">Slack · Teams</text>
+    <text class="tf-note" x="498" y="68" text-anchor="middle">the bot's events</text>
+    <rect class="tf-box" x="572" y="20" width="128" height="66" rx="8"/>
+    <text class="tf-title" x="636" y="48" text-anchor="middle">Webhook senders</text>
+    <text class="tf-note" x="636" y="68" text-anchor="middle">alerting, CI, scripts</text>
+  </g>
+  <g>
+    <line class="tf-edge" x1="84" y1="86" x2="84" y2="154" marker-end="url(#tf-arch-arrow)"/>
+    <line class="tf-edge" x1="222" y1="86" x2="222" y2="154" marker-end="url(#tf-arch-arrow)"/>
+    <line class="tf-edge" x1="360" y1="86" x2="360" y2="154" marker-end="url(#tf-arch-arrow)"/>
+    <line class="tf-edge" x1="498" y1="86" x2="498" y2="154" marker-end="url(#tf-arch-arrow)"/>
+    <line class="tf-edge" x1="636" y1="86" x2="636" y2="154" marker-end="url(#tf-arch-arrow)"/>
+  </g>
+  <!-- Your deployment -->
+  <rect class="tf-zone" x="20" y="116" width="680" height="414" rx="12"/>
+  <text class="tf-zone-label" x="34" y="137">YOUR DEPLOYMENT · Kubernetes with Helm, or one Docker Compose host</text>
+  <rect class="tf-band" x="40" y="156" width="640" height="40" rx="6"/>
+  <text class="tf-title" x="360" y="181" text-anchor="middle">Ingress or load balancer · TLS for your host name</text>
+  <line class="tf-edge" x1="350" y1="196" x2="350" y2="230" marker-end="url(#tf-arch-arrow)"/>
+  <rect class="tf-box tf-box--key" x="160" y="232" width="380" height="160" rx="8"/>
+  <text class="tf-title" x="350" y="258" text-anchor="middle">Tinfirm server</text>
+  <text x="350" y="284" text-anchor="middle">web app · REST API · MCP endpoint</text>
+  <text x="350" y="306" text-anchor="middle">webhooks · chat events · add-ins</text>
+  <text x="350" y="328" text-anchor="middle">runner connections · model relay</text>
+  <text x="350" y="350" text-anchor="middle">worker: runs, polls, schedules, write-back</text>
+  <text class="tf-note" x="350" y="376" text-anchor="middle">port 8080 (app) · 8081 (health, metrics)</text>
+  <line class="tf-edge" x1="250" y1="392" x2="250" y2="430" marker-end="url(#tf-arch-arrow)"/>
+  <line class="tf-edge" x1="460" y1="392" x2="460" y2="430" marker-end="url(#tf-arch-arrow)"/>
+  <rect class="tf-box" x="160" y="432" width="180" height="78" rx="8"/>
+  <text class="tf-title" x="250" y="458" text-anchor="middle">PostgreSQL 18</text>
+  <text class="tf-note" x="250" y="478" text-anchor="middle">databases tinfirm, litellm</text>
+  <text class="tf-note" x="250" y="496" text-anchor="middle">also the queue of work</text>
+  <rect class="tf-box" x="380" y="432" width="160" height="78" rx="8"/>
+  <text class="tf-title" x="460" y="458" text-anchor="middle">LiteLLM</text>
+  <text class="tf-note" x="460" y="478" text-anchor="middle">gateway :4000</text>
+  <text class="tf-note" x="460" y="496" text-anchor="middle">model port :4001</text>
+  <line class="tf-edge" x1="380" y1="471" x2="342" y2="471" marker-end="url(#tf-arch-arrow)"/>
+  <!-- Outside: services the deployment calls -->
+  <rect class="tf-box" x="740" y="232" width="160" height="58" rx="8"/>
+  <text class="tf-title" x="820" y="256" text-anchor="middle">Identity provider</text>
+  <text class="tf-note" x="820" y="276" text-anchor="middle">OIDC, optional</text>
+  <rect class="tf-box" x="740" y="306" width="160" height="86" rx="8"/>
+  <text class="tf-title" x="820" y="330" text-anchor="middle">Company systems</text>
+  <text class="tf-note" x="820" y="350" text-anchor="middle">Jira · GitHub · GitLab</text>
+  <text class="tf-note" x="820" y="368" text-anchor="middle">MCP servers</text>
+  <text class="tf-note" x="820" y="386" text-anchor="middle">Slack and Teams APIs</text>
+  <rect class="tf-box" x="740" y="432" width="160" height="78" rx="8"/>
+  <text class="tf-title" x="820" y="458" text-anchor="middle">Model providers</text>
+  <text class="tf-note" x="820" y="478" text-anchor="middle">Anthropic, OpenAI,</text>
+  <text class="tf-note" x="820" y="496" text-anchor="middle">Bedrock, …</text>
+  <line class="tf-edge" x1="540" y1="261" x2="738" y2="261" marker-end="url(#tf-arch-arrow)"/>
+  <line class="tf-edge" x1="540" y1="349" x2="738" y2="349" marker-end="url(#tf-arch-arrow)"/>
+  <line class="tf-edge" x1="540" y1="471" x2="738" y2="471" marker-end="url(#tf-arch-arrow)"/>
+  <text class="tf-note" x="640" y="254" text-anchor="middle">sign-in</text>
+  <text class="tf-note" x="640" y="342" text-anchor="middle">tools, polls, write-back</text>
+  <text class="tf-note" x="640" y="464" text-anchor="middle">provider keys stay here</text>
+  <!-- Runner hosts -->
+  <rect class="tf-zone" x="20" y="560" width="680" height="130" rx="12"/>
+  <text class="tf-zone-label" x="34" y="581">RUNNER HOSTS · your machines or VMs, company or personal</text>
+  <rect class="tf-box tf-box--key" x="40" y="596" width="260" height="80" rx="8"/>
+  <text class="tf-title" x="170" y="620" text-anchor="middle">tinfirm-runner-host</text>
+  <text class="tf-note" x="170" y="642" text-anchor="middle">git mirrors · git proxy</text>
+  <text class="tf-note" x="170" y="662" text-anchor="middle">model proxy · egress proxy</text>
+  <line class="tf-edge" x1="100" y1="596" x2="100" y2="198" marker-end="url(#tf-arch-arrow)"/>
+  <text class="tf-note" transform="translate(90 400) rotate(-90)" text-anchor="middle">outbound only: WebSocket and HTTPS</text>
+  <rect class="tf-box" x="368" y="588" width="312" height="80" rx="8"/>
+  <rect class="tf-box" x="360" y="592" width="312" height="80" rx="8"/>
+  <rect class="tf-box" x="352" y="596" width="312" height="80" rx="8"/>
+  <text class="tf-title" x="508" y="620" text-anchor="middle">A sandbox for each turn</text>
+  <text class="tf-note" x="508" y="642" text-anchor="middle">Claude Code · Codex · pi · OpenCode</text>
+  <text class="tf-note" x="508" y="662" text-anchor="middle">2 CPUs · 4 GiB · a container or a Kata microVM</text>
+  <line class="tf-edge" x1="300" y1="636" x2="350" y2="636" marker-end="url(#tf-arch-arrow)"/>
+  <rect class="tf-box" x="740" y="596" width="160" height="80" rx="8"/>
+  <text class="tf-title" x="820" y="622" text-anchor="middle">Code hosts</text>
+  <text class="tf-note" x="820" y="642" text-anchor="middle">GitHub, GitLab, git</text>
+  <text class="tf-note" x="820" y="660" text-anchor="middle">clone, fetch, push</text>
+  <polyline class="tf-edge" points="170,676 170,700 820,700 820,678" marker-end="url(#tf-arch-arrow)"/>
+  <text class="tf-note" x="495" y="717" text-anchor="middle">git over HTTPS, with the conversation's account; the token stays on the host</text>
+</svg>

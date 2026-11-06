@@ -1,0 +1,46 @@
+{
+  "description": "Entra ID's provisioning service with aadOptscim062020, in the documented sequence of Microsoft's 'Develop and plan provisioning for a SCIM endpoint': the connection test, matching, create, update, the role from an app role, deactivate, reactivate and the delete 30 days after a user is deleted.",
+  "query": "aadOptscim062020",
+  "steps": [
+    { "name": "the connection test: a random userName", "method": "GET", "path": "/Users?filter=userName+eq+%22{{random}}%40example.test%22", "status": 200, "expect": { "/totalResults": 0 } },
+    { "name": "matching by userName", "method": "GET", "path": "/Users?filter=userName+eq+%22{{userName}}%22", "status": 200, "expect": { "/totalResults": 0 } },
+    { "name": "create", "method": "POST", "path": "/Users", "status": 201,
+      "body": {
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User", "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"],
+        "externalId": "{{externalId}}",
+        "userName": "{{userName}}",
+        "active": true,
+        "emails": [{ "primary": true, "type": "work", "value": "{{userName}}" }],
+        "meta": { "resourceType": "User" },
+        "name": { "formatted": "Grace Hopper", "familyName": "Hopper", "givenName": "Grace" },
+        "roles": [],
+        "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": { "department": "Navy", "manager": { "value": "42" } }
+      },
+      "capture": { "id": "/id" },
+      "expect": { "/userName": "{{userName}}", "/externalId": "{{externalId}}", "/active": true, "/displayName": "Grace Hopper", "/urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User/role": "member" } },
+    { "name": "get by id", "method": "GET", "path": "/Users/{{id}}", "status": 200, "expect": { "/id": "{{id}}" } },
+    { "name": "matching after create", "method": "GET", "path": "/Users?filter=userName+eq+%22{{userName}}%22", "status": 200, "expect": { "/totalResults": 1, "/Resources/0/id": "{{id}}" } },
+    { "name": "matching by externalId", "method": "GET", "path": "/Users?filter=externalId+eq+%22{{externalId}}%22", "status": 200, "expect": { "/totalResults": 1 } },
+    { "name": "update several attributes", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Replace", "path": "emails[type eq \"work\"].value", "value": "updated-{{userName}}" },
+        { "op": "Replace", "path": "name.familyName", "value": "Murray" },
+        { "op": "Replace", "path": "displayName", "value": "Grace Murray Hopper" } ] },
+      "expect": { "/displayName": "Grace Murray Hopper", "/userName": "{{userName}}" } },
+    { "name": "the role from an app role (SingleAppRoleAssignment)", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Add", "path": "urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User:role", "value": "admin" } ] },
+      "expect": { "/urn:ietf:params:scim:schemas:extension:tinfirm:2.0:User/role": "admin" } },
+    { "name": "deactivate", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Replace", "path": "active", "value": false } ] },
+      "expect": { "/active": false } },
+    { "name": "the next cycle reads the user", "method": "GET", "path": "/Users/{{id}}", "status": 200, "expect": { "/active": false } },
+    { "name": "reactivate", "method": "PATCH", "path": "/Users/{{id}}", "status": 200,
+      "body": { "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
+        { "op": "Replace", "path": "active", "value": true } ] },
+      "expect": { "/active": true } },
+    { "name": "delete, 30 days after the user is deleted", "method": "DELETE", "path": "/Users/{{id}}", "status": 204 },
+    { "name": "gone", "method": "GET", "path": "/Users/{{id}}", "status": 404 }
+  ]
+}

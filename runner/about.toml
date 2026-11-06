@@ -1,0 +1,52 @@
+# cargo-about (runner/ci.Dockerfile, stages `licences` and `licences-file`): the licence check
+# of the crates the runner host binary is built with, and its third-party notices,
+# THIRD-PARTY-LICENSES.txt, which every runner host archive holds (ADR-0082).
+#
+# `accepted` is the policy of ADR-0082 for the licences crates use, in the order cargo-about
+# prefers them when a crate offers a choice. server/pom.xml, model-api/pom.xml and
+# web/scripts/licences.mjs hold the same accepted licences: change them together. A crate whose
+# licence expression no choice of these satisfies fails the check.
+#
+# Their EDL-1.0 is not here: cargo-about takes SPDX identifiers only, and refuses EDL-1.0 as an
+# unknown term. SPDX has no identifier for the Eclipse Distribution License 1.0, whose text is
+# the BSD 3-clause licence's: a crate under it declares BSD-3-Clause, which is accepted.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MIT-0",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OFL-1.1",
+    "MPL-2.0",
+    "EPL-2.0",
+    "LGPL-2.1-only",
+    "LGPL-2.1-or-later",
+    "GPL-2.0-only WITH Classpath-exception-2.0",
+]
+
+# The targets the releases build (.github/workflows/runner-artifacts.yml), Windows included.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Not in the binary: the tests' crates. Build scripts and proc macros stay, as they shape it.
+ignore-dev-dependencies = true
+
+# The workspace's own crates (publish = false) are the binary, under the root LICENSE and, for
+# the code under ee/runner/, ee/LICENSE (ADR-0100).
+private = { ignore = true }
+
+# Crates whose licence files cargo-about reads with built-in corrections.
+workarounds = ["ring", "rustls"]

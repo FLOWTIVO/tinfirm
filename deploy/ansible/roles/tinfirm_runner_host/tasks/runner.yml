@@ -1,0 +1,249 @@
+---
+- name: Create the runner host user
+  ansible.builtin.user:
+    name: "{{ tinfirm_runner_host_user }}"
+    uid: "{{ tinfirm_runner_host_uid }}"
+    home: "{{ tinfirm_runner_host_home }}"
+    shell: /usr/sbin/nologin
+    groups: [docker]
+    append: true
+  when: tinfirm_runner_host_create_user | bool
+
+# Docker's socket is root-equivalent on this machine; the runner host needs it.
+- name: Put the existing runner host user in the docker group
+  ansible.builtin.user:
+    name: "{{ tinfirm_runner_host_user }}"
+    groups: [docker]
+    append: true
+  when: not (tinfirm_runner_host_create_user | bool)
+
+- name: Create the runner host's directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ tinfirm_runner_host_user }}"
+    mode: "0700"
+  loop:
+    - "{{ tinfirm_runner_host_home }}"
+    - "{{ tinfirm_runner_host_config_dir }}"
+    - "{{ tinfirm_runner_host_data_dir }}"
+
+- name: Install the runner host binary from the control node
+  ansible.builtin.copy:
+    src: "{{ tinfirm_runner_host_binary_src }}"
+    dest: "{{ tinfirm_runner_host_binary_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: tinfirm_runner_host_binary_src | length > 0
+  register: _tinfirm_runner_host_binary_copied
+  notify: Reload the runner host
+
+# M13's rule for every host that installs a release: a checksum beside the files proves
+# nothing against whoever can replace them, so SHA256SUMS is trusted only once its signature
+# SHA256SUMS.sig verifies against the public key the role ships (as tinfirm-auto-deploy and
+# deploy/release/assets.sh verify-sums do), and the archive is then checked against it.
+- name: Install the runner host binary from a release archive
+  when: tinfirm_runner_host_binary_url | length > 0
+  vars:
+    _archive: "{{ tinfirm_runner_host_binary_url | basename }}"
+    _release: >-
+      {{ tinfirm_runner_host_release_url | regex_replace('/+$', '')
+         if tinfirm_runner_host_release_url | length > 0
+         else tinfirm_runner_host_binary_url | dirname }}
+    _sums: "{{ _tinfirm_runner_host_cache_dir }}/{{ _archive }}.SHA256SUMS"
+    # The signature was missing (404) and allow_unsigned admitted that.
+    _unsigned: "{{ (_tinfirm_runner_host_sums_sig.status_code | default(0)) == 404 }}"
+  block:
+    - name: Create the download cache
+      ansible.builtin.file:
+        path: "{{ _tinfirm_runner_host_cache_dir }}"
+        state: directory
+        mode: "0755"
+
+    # A copy of an earlier run must not stand in for a signature that is missing now.
+    - name: Remove the release's SHA256SUMS and signature of an earlier run
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _sums }}"
+        - "{{ _sums }}.sig"
+        - "{{ _sums }}.der"
+
+    - name: Download the release's SHA256SUMS.sig
+      ansible.builtin.get_url:
+        url: "{{ _release }}/SHA256SUMS.sig"
+        dest: "{{ _sums }}.sig"
+        headers: "{{ tinfirm_runner_host_binary_url_headers }}"
+        mode: "0644"
+      register: _tinfirm_runner_host_sums_sig
+      # Missing (404) is a release without a signature, admitted only with allow_unsigned.
+      failed_when: >-
+        _tinfirm_runner_host_sums_sig is failed
+        and not ((tinfirm_runner_host_allow_unsigned | bool)
+                 and (_tinfirm_runner_host_sums_sig.status_code | default(0)) == 404)
+      no_log: "{{ tinfirm_runner_host_binary_url_headers | length > 0 }}"
+
+    - name: Check SHA256SUMS against its signature and take the archive's checksum from it
+      when: not (_unsigned | bool)
+      block:
+        - name: Download the release's SHA256SUMS
+          ansible.builtin.get_url:
+            url: "{{ _release }}/SHA256SUMS"
+            dest: "{{ _sums }}"
+            headers: "{{ tinfirm_runner_host_binary_url_headers }}"
+            mode: "0644"
+          no_log: "{{ tinfirm_runner_host_binary_url_headers | length > 0 }}"
+
+        - name: Put the public key on the host
+          ansible.builtin.copy:
+            src: "{{ tinfirm_runner_host_public_key }}"
+            dest: "{{ _tinfirm_runner_host_cache_dir }}/tinfirm-release.pub"
+            mode: "0644"
+
+        # cosign's signature of a blob is the base64 of an ECDSA P-256 signature over its
+        # SHA-256, in DER, which openssl checks against cosign's public key.
+        - name: Decode SHA256SUMS.sig
+          ansible.builtin.command:
+            argv: [openssl, base64, -d, -A, -in, "{{ _sums }}.sig", -out, "{{ _sums }}.der"]
+          changed_when: false
+          failed_when: false
+          register: _tinfirm_runner_host_sig_decoded
+
+        - name: Verify SHA256SUMS.sig
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - dgst
+              - -sha256
+              - -verify
+              - "{{ _tinfirm_runner_host_cache_dir }}/tinfirm-release.pub"
+              - -signature
+              - "{{ _sums }}.der"
+              - "{{ _sums }}"
+          changed_when: false
+          failed_when: false
+          register: _tinfirm_runner_host_sig_verified
+
+        - name: Refuse a SHA256SUMS whose signature does not verify
+          ansible.builtin.assert:
+            that:
+              - _tinfirm_runner_host_sig_decoded.rc == 0
+              - _tinfirm_runner_host_sig_verified.rc == 0
+            fail_msg: >-
+              SHA256SUMS.sig at {{ _release }} is not a signature of its SHA256SUMS by
+              {{ tinfirm_runner_host_public_key }}: nothing of this release is installed.
+              For `rolling`, set tinfirm_runner_host_public_key to the rolling key
+              (cosign-rolling.pub).
+            quiet: true
+
+        - name: Read SHA256SUMS
+          ansible.builtin.slurp:
+            src: "{{ _sums }}"
+          register: _tinfirm_runner_host_sums_file
+
+        - name: Take the archive's line of SHA256SUMS
+          ansible.builtin.set_fact:
+            _tinfirm_runner_host_signed_sum: >-
+              {{ _tinfirm_runner_host_sums_file.content | b64decode
+                 | regex_search('^([0-9a-fA-F]{64}) [ *]' ~ (_archive | regex_escape) ~ '$', '\1', multiline=True)
+                 | default([''], true) | first | lower }}
+
+        - name: Check the archive's line of SHA256SUMS
+          ansible.builtin.assert:
+            that:
+              - _tinfirm_runner_host_signed_sum | length == 64
+              - >-
+                tinfirm_runner_host_binary_checksum | length == 0
+                or (tinfirm_runner_host_binary_checksum | lower) == 'sha256:' ~ _tinfirm_runner_host_signed_sum
+            fail_msg: >-
+              {{ _archive }} is not listed in the release's signed SHA256SUMS, or
+              tinfirm_runner_host_binary_checksum is not its line there.
+            quiet: true
+
+    - name: Warn of a release without a signature
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ _release }} has no SHA256SUMS.sig; installing {{ _archive }} against
+          tinfirm_runner_host_binary_checksum only, because tinfirm_runner_host_allow_unsigned is true.
+      when: _unsigned | bool
+
+    - name: Check the checksum of an unsigned release
+      ansible.builtin.assert:
+        that:
+          - tinfirm_runner_host_binary_checksum | length > 0
+        fail_msg: >-
+          {{ _release }} has no SHA256SUMS.sig: set tinfirm_runner_host_binary_checksum to the
+          archive's "sha256:<hex>" to install it unsigned.
+        quiet: true
+      when: _unsigned | bool
+
+    - name: Download the release archive
+      ansible.builtin.get_url:
+        url: "{{ tinfirm_runner_host_binary_url }}"
+        dest: "{{ _tinfirm_runner_host_cache_dir }}/{{ tinfirm_runner_host_binary_url | basename }}"
+        checksum: >-
+          {{ tinfirm_runner_host_binary_checksum if _unsigned | bool
+             else 'sha256:' ~ _tinfirm_runner_host_signed_sum }}
+        headers: "{{ tinfirm_runner_host_binary_url_headers }}"
+        mode: "0644"
+      no_log: "{{ tinfirm_runner_host_binary_url_headers | length > 0 }}"
+
+    - name: Create the directory of the unpacked release
+      ansible.builtin.file:
+        path: "{{ _tinfirm_runner_host_cache_dir }}/{{ tinfirm_runner_host_binary_url | basename | regex_replace('\\.tar\\.gz$', '') }}"
+        state: directory
+        mode: "0755"
+
+    - name: Unpack the release archive
+      ansible.builtin.unarchive:
+        src: "{{ _tinfirm_runner_host_cache_dir }}/{{ tinfirm_runner_host_binary_url | basename }}"
+        dest: "{{ _tinfirm_runner_host_cache_dir }}/{{ tinfirm_runner_host_binary_url | basename | regex_replace('\\.tar\\.gz$', '') }}"
+        remote_src: true
+        extra_opts: [--strip-components=1]
+
+    - name: Install the binary from the release
+      ansible.builtin.copy:
+        src: "{{ _tinfirm_runner_host_cache_dir }}/{{ tinfirm_runner_host_binary_url | basename | regex_replace('\\.tar\\.gz$', '') }}/tinfirm-runner-host"
+        dest: "{{ tinfirm_runner_host_binary_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      register: _tinfirm_runner_host_binary_unpacked
+      notify: Reload the runner host
+
+- name: Look for an existing login
+  ansible.builtin.stat:
+    path: "{{ tinfirm_runner_host_config_dir }}/config.json"
+  register: _tinfirm_runner_host_login
+
+- name: Register the host with the server
+  when: not _tinfirm_runner_host_login.stat.exists or (tinfirm_runner_host_relogin | bool)
+  block:
+    - name: Check the server URL and the host token
+      ansible.builtin.assert:
+        that:
+          - tinfirm_runner_host_server_url | length > 0
+          - tinfirm_runner_host_token | length > 0
+        fail_msg: >-
+          Set tinfirm_runner_host_server_url and tinfirm_runner_host_token (from Runner hosts → Register in
+          Tinfirm; keep the token in Ansible Vault).
+        quiet: true
+
+    # The token goes on stdin, never on the command line.
+    - name: Log in to the server
+      ansible.builtin.command:
+        argv:
+          - "{{ tinfirm_runner_host_binary_path }}"
+          - login
+          - --server
+          - "{{ tinfirm_runner_host_server_url }}"
+        stdin: "{{ tinfirm_runner_host_token }}"
+      become: true
+      become_user: "{{ tinfirm_runner_host_user }}"
+      environment: "{{ _tinfirm_runner_host_env }}"
+      changed_when: true
+      no_log: true
+      notify: Reload the runner host

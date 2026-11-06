@@ -1,0 +1,21 @@
+# Paths semgrep does not scan (read by .github/workflows/reusable-security.yml). Keep this
+# list to things that are NOT source. Never silence a finding by listing its file here: put
+# a `nosemgrep` comment with the reason on the line instead, where the code is read.
+
+# Dependencies and build output
+node_modules/
+target/
+dist/
+coverage/
+.angular/
+
+# Generated from api/openapi.yaml (git-ignored; listed for local runs)
+web/src/app/api/generated/
+
+# Test reports
+playwright-report/
+test-results/
+
+# The docs site's local build and virtual environment (git-ignored)
+docs-site/site/
+docs-site/.venv/

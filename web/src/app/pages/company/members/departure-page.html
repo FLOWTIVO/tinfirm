@@ -1,0 +1,313 @@
+<div class="flex flex-col gap-5">
+  <a
+    class="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 self-start text-sm"
+    [routerLink]="['/c', companyId(), 'members']"
+  >
+    <ng-icon name="lucideArrowLeft" aria-hidden="true" />
+    Members
+  </a>
+
+  @if (departure.isLoading() && !loaded()) {
+    <div class="flex flex-col gap-3" aria-busy="true">
+      <span class="sr-only" role="status">Loading the checklist…</span>
+      <hlm-skeleton class="h-10 w-64 rounded-lg" />
+      <hlm-skeleton class="h-40 w-full rounded-xl" />
+    </div>
+  } @else if (departure.error()) {
+    <app-error-state
+      [error]="departure.error()"
+      heading="Couldn't load the checklist"
+      [messages]="{ 'status:404': 'No member who left has this checklist.' }"
+      (retry)="departure.reload()"
+    />
+  } @else if (loaded(); as d) {
+    <app-page-header
+      [title]="d.name + ' left'"
+      [description]="'What they left behind, and who takes it over. Nothing acts or pays as them any more; their conversations, spend and audit stay.'"
+    />
+
+    @if (d.closedAt) {
+      <div hlmAlert data-testid="departure-closed">
+        <ng-icon name="lucideCircleCheck" aria-hidden="true" />
+        <h2 hlmAlertTitle>The checklist is closed</h2>
+        <p hlmAlertDescription>Closed <app-time [value]="d.closedAt" />.</p>
+      </div>
+    } @else if (d.open) {
+      <p class="text-sm" data-testid="departure-open">
+        {{ plural(openItems(), 'item') }} {{ openItems() === 1 ? 'needs' : 'need' }} someone before
+        the checklist closes.
+      </p>
+    } @else {
+      <p class="text-sm" data-testid="departure-ready">
+        Everything that needed someone is taken over. Close the checklist to end the admins’ inbox
+        item.
+      </p>
+    }
+
+    <ol class="flex list-none flex-col gap-4 p-0">
+      <li>
+        <section hlmCard aria-labelledby="d-triggers" data-testid="departure-triggers">
+          <div hlmCardHeader>
+            <h2 hlmCardTitle id="d-triggers">1. Triggers they wrote</h2>
+            <p hlmCardDescription>
+              Paused until someone takes them over with their own accounts and budget, or deletes
+              them. Their waiting conversations go on with the new author.
+            </p>
+          </div>
+          <div hlmCardContent>
+            @if (d.triggers.length === 0) {
+              <p class="text-muted-foreground text-sm">None.</p>
+            } @else {
+              <ul class="flex flex-col gap-2">
+                @for (t of d.triggers; track t.id) {
+                  <li class="text-sm">
+                    <a
+                      class="font-semibold underline-offset-4 hover:underline"
+                      [routerLink]="['/c', companyId(), 'triggers', t.id]"
+                      >{{ t.name }}</a
+                    >
+                    @if (t.waitingConversations) {
+                      <span class="text-muted-foreground">
+                        · {{ plural(t.waitingConversations, 'conversation') }} waiting</span
+                      >
+                    }
+                  </li>
+                }
+              </ul>
+            }
+          </div>
+        </section>
+      </li>
+
+      <li>
+        <section hlmCard aria-labelledby="d-groups" data-testid="departure-groups">
+          <div hlmCardHeader>
+            <h2 hlmCardTitle id="d-groups">2. Groups left without members</h2>
+            <p hlmCardDescription>
+              Nobody in them decides their approvals any more: add members, or give their triggers
+              another team.
+            </p>
+          </div>
+          <div hlmCardContent>
+            @if (d.emptyGroups.length === 0) {
+              <p class="text-muted-foreground text-sm">None.</p>
+            } @else {
+              <ul class="flex flex-wrap gap-2">
+                @for (g of d.emptyGroups; track g.id) {
+                  <li>
+                    <a
+                      class="bg-muted inline-flex min-h-8 items-center rounded-full px-3 text-sm font-medium"
+                      [routerLink]="['/c', companyId(), 'members']"
+                      [queryParams]="{ tab: 'groups' }"
+                      >{{ g.name }}</a
+                    >
+                  </li>
+                }
+              </ul>
+            }
+          </div>
+        </section>
+      </li>
+
+      <li>
+        <section hlmCard aria-labelledby="d-accounts" data-testid="departure-accounts">
+          <div hlmCardHeader>
+            <h2 hlmCardTitle id="d-accounts">3. System credentials they connected</h2>
+            <p hlmCardDescription>
+              The token or the sign-in may be theirs, and leave with them: give each a new token, or
+              sign it in again, on its system’s page.
+            </p>
+          </div>
+          <div hlmCardContent>
+            @if (d.connectedCredentials.length === 0) {
+              <p class="text-muted-foreground text-sm">None.</p>
+            } @else {
+              <ul class="flex flex-col gap-2">
+                @for (c of d.connectedCredentials; track c.credentialId) {
+                  <li class="text-sm" data-testid="departure-credential">
+                    <a
+                      class="font-semibold underline-offset-4 hover:underline"
+                      [routerLink]="['/c', companyId(), 'systems', c.systemId]"
+                      [fragment]="'credential-' + c.credentialId"
+                      >{{ c.credentialName }}</a
+                    >
+                    <span class="text-muted-foreground">
+                      on {{ c.systemName }} · {{ credentialFix(c) }}</span
+                    >
+                  </li>
+                }
+              </ul>
+            }
+          </div>
+        </section>
+      </li>
+
+      <li>
+        <section hlmCard aria-labelledby="d-agents" data-testid="departure-agents">
+          <div hlmCardHeader>
+            <h2 hlmCardTitle id="d-agents">4. Agents passed to the admins</h2>
+            <p hlmCardDescription>
+              The admins edit them now. Give one a new owner, who then edits it as its creator did,
+              or keep it with the admins.
+            </p>
+          </div>
+          <div hlmCardContent>
+            @if (d.agents.length === 0) {
+              <p class="text-muted-foreground text-sm">None.</p>
+            } @else {
+              <ul class="flex flex-col divide-y">
+                @for (agent of d.agents; track agent.id) {
+                  <li
+                    class="flex flex-col gap-2 py-3 first:pt-0 last:pb-0 sm:flex-row sm:items-center"
+                    [attr.data-agent]="agent.name"
+                  >
+                    <a
+                      class="min-w-0 flex-1 truncate text-sm font-semibold underline-offset-4 hover:underline"
+                      [routerLink]="['/c', companyId(), 'agents', agent.id]"
+                      >{{ agent.name }}</a
+                    >
+                    <div class="flex items-center gap-2">
+                      <label class="sr-only" [for]="'owner-' + agent.id"
+                        >New owner of {{ agent.name }}</label
+                      >
+                      <hlm-native-select
+                        size="sm"
+                        class="w-44"
+                        [selectId]="'owner-' + agent.id"
+                        [value]="picked()[agent.id] ?? ''"
+                        (valueChange)="pick(agent.id, $event)"
+                      >
+                        <option value="">Keep with the admins</option>
+                        @for (m of owners(); track m.userId) {
+                          <option [value]="m.userId">{{ m.displayName }}</option>
+                        }
+                      </hlm-native-select>
+                      <button
+                        hlmBtn
+                        size="sm"
+                        variant="outline"
+                        type="button"
+                        [disabled]="!picked()[agent.id] || ownerBusy() === agent.id"
+                        (click)="giveOwner(agent)"
+                      >
+                        @if (ownerBusy() === agent.id) {
+                          <hlm-spinner aria-hidden="true" />
+                        }
+                        Give
+                      </button>
+                    </div>
+                  </li>
+                }
+              </ul>
+            }
+          </div>
+        </section>
+      </li>
+
+      <li>
+        <section hlmCard aria-labelledby="d-changes" data-testid="departure-changes">
+          <div hlmCardHeader>
+            <h2 hlmCardTitle id="d-changes">5. Change requests opened with their own account</h2>
+            <p hlmCardDescription>
+              They stay at the code host under their name; someone may take them over there.
+            </p>
+          </div>
+          <div hlmCardContent>
+            @if (d.changeRequests.length === 0) {
+              <p class="text-muted-foreground text-sm">None open.</p>
+            } @else {
+              <ul class="flex flex-col gap-2">
+                @for (cr of d.changeRequests; track cr.url) {
+                  <li class="flex min-w-0 items-center gap-2 text-sm">
+                    <a
+                      class="min-w-0 truncate font-mono text-xs underline-offset-4 hover:underline"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      [href]="cr.url"
+                      >{{ cr.url }}</a
+                    >
+                    <span class="text-muted-foreground shrink-0 text-xs">{{
+                      cr.state === 'DRAFT' ? 'draft' : 'open'
+                    }}</span>
+                  </li>
+                }
+              </ul>
+            }
+          </div>
+        </section>
+      </li>
+
+      <li>
+        <section hlmCard aria-labelledby="d-conversations" data-testid="departure-conversations">
+          <div hlmCardHeader>
+            <h2 hlmCardTitle id="d-conversations">6. Their personal conversations</h2>
+            <p hlmCardDescription>
+              {{ plural(d.endedConversations, 'conversation') }} of theirs ended. Only the Owner
+              reads them; retention removes their content in time, or the Owner erases it now.
+            </p>
+          </div>
+          <div hlmCardContent>
+            <a
+              class="text-primary text-sm font-semibold underline underline-offset-4"
+              [routerLink]="['/c', companyId(), 'retention']"
+              [queryParams]="{ erase: d.principalId, name: d.name }"
+              >Holds and erasure</a
+            >
+          </div>
+        </section>
+      </li>
+    </ol>
+
+    @if (!d.closedAt) {
+      @if (closeError(); as message) {
+        <div hlmAlert variant="destructive" role="alert">
+          <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+          <p hlmAlertDescription>{{ message }}</p>
+        </div>
+      }
+      <div class="flex justify-end">
+        <button
+          hlmBtn
+          type="button"
+          data-testid="close-departure"
+          [disabled]="closeBusy()"
+          (click)="close(false)"
+        >
+          @if (closeBusy() && !forceOpen()) {
+            <hlm-spinner aria-hidden="true" />
+          }
+          Close the checklist
+        </button>
+      </div>
+    }
+  }
+</div>
+
+<hlm-alert-dialog [state]="forceOpen() ? 'open' : 'closed'" (closed)="forceOpen.set(false)">
+  <hlm-alert-dialog-content *hlmAlertDialogPortal="let ctx" data-testid="force-dialog">
+    <hlm-alert-dialog-header>
+      <h2 hlmAlertDialogTitle>Close it with items open?</h2>
+      <p hlmAlertDialogDescription>
+        {{ plural(openItems(), 'item') }} still {{ openItems() === 1 ? 'needs' : 'need' }}
+        someone: paused triggers, groups without members or accounts they connected. Closing it
+        anyway ends the admins’ inbox item and leaves them as they are; the audit log records that
+        you accepted it.
+      </p>
+    </hlm-alert-dialog-header>
+    <hlm-alert-dialog-footer>
+      <button hlmAlertDialogCancel [disabled]="closeBusy()">Keep it open</button>
+      <button
+        hlmAlertDialogAction
+        variant="destructive"
+        data-testid="confirm-force"
+        [disabled]="closeBusy()"
+        (click)="close(true)"
+      >
+        @if (closeBusy()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Close anyway
+      </button>
+    </hlm-alert-dialog-footer>
+  </hlm-alert-dialog-content>
+</hlm-alert-dialog>

@@ -1,0 +1,12 @@
+# Installed by install.sh as /etc/systemd/system/tinfirm-auto-deploy.timer.
+# Pause the deploys: sudo systemctl stop tinfirm-auto-deploy.timer (start it again later).
+[Unit]
+Description=Run tinfirm-auto-deploy every 5 minutes
+Documentation=https://github.com/FLOWTIVO/tinfirm/blob/main/docs/operations/auto-deploy.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

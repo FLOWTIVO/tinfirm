@@ -1,0 +1,20 @@
+# `helm lint` / `helm template` with Traefik's http -> https redirect (ingress.traefik.redirectHttps),
+# merged before a middleware already named in the annotation.
+image:
+  tag: v0.1.0
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: tinfirm-other@kubernetescrd
+  hosts:
+    - host: tinfirm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: tinfirm-tls
+      hosts:
+        - tinfirm.example.com
+  traefik:
+    redirectHttps: true

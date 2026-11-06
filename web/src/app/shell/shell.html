@@ -1,0 +1,136 @@
+<a
+  href="#main-content"
+  class="bg-background focus:ring-ring sr-only z-50 rounded-md px-3 py-2 text-sm focus:not-sr-only focus:fixed focus:start-3 focus:top-3 focus:ring-2"
+  >Skip to content</a
+>
+
+<div hlmSidebarWrapper>
+  <hlm-sidebar
+    srOnlySheetTitle="Navigation"
+    srOnlySheetDescription="Company and instance navigation"
+  >
+    <div hlmSidebarHeader>
+      <ul hlmSidebarMenu>
+        <li hlmSidebarMenuItem>
+          <a
+            hlmSidebarMenuButton
+            closeMobileSidebarOnClick
+            routerLink="/"
+            aria-label="Tinfirm home"
+            class="h-10"
+            data-testid="sidebar-logo"
+          >
+            <app-logo wordmark quiet class="h-7" />
+          </a>
+        </li>
+      </ul>
+      <app-company-switcher />
+    </div>
+
+    <div hlmSidebarContent>
+      @if (current.navTargetId(); as companyId) {
+        @for (section of companyNav(); track section.group) {
+          <nav
+            hlmSidebarGroup
+            [attr.aria-label]="section.label"
+            [attr.data-nav-group]="section.group"
+          >
+            <div hlmSidebarGroupLabel>{{ section.label }}</div>
+            <div hlmSidebarGroupContent>
+              <ul hlmSidebarMenu>
+                @for (item of section.items; track item.path) {
+                  <li hlmSidebarMenuItem>
+                    <a
+                      hlmSidebarMenuButton
+                      closeMobileSidebarOnClick
+                      [routerLink]="['/c', companyId, item.path]"
+                      routerLinkActive
+                      #rla="routerLinkActive"
+                      ariaCurrentWhenActive="page"
+                      [isActive]="rla.isActive"
+                      [attr.data-nav]="item.path"
+                    >
+                      <ng-icon [name]="item.icon" aria-hidden="true" />
+                      <span>{{ item.label }}</span>
+                      @if (item.path === 'inbox' && inbox.needsYou(); as count) {
+                        <span class="sr-only">, {{ count }} need you</span>
+                      }
+                    </a>
+                    @if (item.path === 'inbox' && inbox.needsYou(); as count) {
+                      <span
+                        hlmSidebarMenuBadge
+                        class="bg-human-soft text-human rounded-full px-1.5 font-semibold"
+                        data-testid="inbox-badge"
+                        aria-hidden="true"
+                        >{{ count > 99 ? '99+' : count }}</span
+                      >
+                    }
+                  </li>
+                }
+              </ul>
+            </div>
+          </nav>
+        }
+      }
+
+      @if (session.isInstanceAdmin()) {
+        <nav hlmSidebarGroup aria-label="Instance administration">
+          <div hlmSidebarGroupLabel>Instance admin</div>
+          <div hlmSidebarGroupContent>
+            <ul hlmSidebarMenu>
+              @for (item of adminNav; track item.path) {
+                <li hlmSidebarMenuItem>
+                  <a
+                    hlmSidebarMenuButton
+                    closeMobileSidebarOnClick
+                    [routerLink]="item.path"
+                    routerLinkActive
+                    #rla="routerLinkActive"
+                    ariaCurrentWhenActive="page"
+                    [isActive]="rla.isActive"
+                  >
+                    <ng-icon [name]="item.icon" aria-hidden="true" />
+                    <span>{{ item.label }}</span>
+                  </a>
+                </li>
+              }
+            </ul>
+          </div>
+        </nav>
+      }
+    </div>
+
+    <div hlmSidebarFooter>
+      <app-user-menu />
+    </div>
+  </hlm-sidebar>
+
+  <main hlmSidebarInset class="min-w-0">
+    <header
+      class="bg-background/85 supports-backdrop-filter:bg-background/70 sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 px-3 backdrop-blur md:px-5"
+    >
+      <button
+        hlmSidebarTrigger
+        srOnlyText="Toggle navigation"
+        aria-label="Toggle navigation"
+      ></button>
+      <div hlmSeparator orientation="vertical" class="me-1 h-4 data-vertical:self-center"></div>
+      <p class="flex min-w-0 items-center gap-1.5 text-sm" aria-live="polite">
+        @if (crumb(); as name) {
+          <span class="text-muted-foreground truncate">{{ name }}</span>
+          <span class="text-muted-foreground/60" aria-hidden="true">/</span>
+        }
+        <span class="truncate font-semibold">{{ pageTitle() }}</span>
+      </p>
+    </header>
+
+    <div
+      id="main-content"
+      tabindex="-1"
+      class="mx-auto w-full px-4 pt-2 pb-10 outline-none md:px-8 md:pt-3"
+      [class]="wide() ? 'max-w-[100rem]' : 'max-w-6xl'"
+    >
+      <router-outlet />
+    </div>
+  </main>
+</div>

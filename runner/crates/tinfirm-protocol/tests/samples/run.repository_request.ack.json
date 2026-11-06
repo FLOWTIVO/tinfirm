@@ -1,0 +1,9 @@
+{
+  "type": "run.repository_request.ack",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000030",
+  "status": "PENDING",
+  "repositoryRequestId": "0192f1a4-7c1e-7b3a-9d2e-000000000020",
+  "code": null,
+  "message": "Requested the repository `docs`. The request is posted on the task, where a member approves or denies it. You may ask more, or request another repository. When you have nothing else to do, stop without writing a summary: Tinfirm wakes you with the decision."
+}

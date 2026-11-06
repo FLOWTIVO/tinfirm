@@ -1,0 +1,61 @@
+# A second company with a sign-in of its own (ADR-0075). An EXAMPLE: copy it, rename the
+# company key `acme` and the provider id `acmesso`, and layer it on compose.yaml (and on
+# compose.oidc.yaml or compose.entra.yaml, if you use them):
+#
+#   docker compose -f deploy/compose/compose.yaml \
+#     -f deploy/compose/compose.companies.example.yaml up -d
+#
+# Companies are declared in the environment only; the app cannot create one. Each group of
+# TINFIRM_COMPANIES_<KEY>_* variables declares one company, whose key is <KEY> in lower case:
+# letters and digits, starting with a letter. Never change a key. A company is created at the
+# server's start when it does not exist yet; removing its variables never deletes it.
+#
+# Set these in deploy/compose/.env:
+#   TINFIRM_ACME_OWNER           Email of the user who becomes Acme's OWNER while it has none.
+#                                Empty: TINFIRM_BOOTSTRAP_ADMIN_EMAIL.
+#   TINFIRM_ACME_ISSUER_URI      Issuer of Acme's OpenID Connect provider, exactly as it names
+#                                itself in its tokens (`iss`)
+#   TINFIRM_ACME_CLIENT_ID       Client ID of Tinfirm's registration at that provider
+#   TINFIRM_ACME_CLIENT_SECRET   Its client secret
+#   TINFIRM_ACME_EMAIL_DOMAINS   Optional, comma-separated: only these emails get an account
+#   TINFIRM_ACME_SCIM_ENABLED    Optional, true: Acme's identity provider provisions its people
+#                                through SCIM (ADR-0087); set TINFIRM_ACME_AUTO_PROVISION=false too
+# Register ${TINFIRM_PUBLIC_URL}/login/oauth2/code/acmesso as the redirect URI at the provider.
+# People sign in with the button "Acme" on the login page, or with the direct link
+# ${TINFIRM_PUBLIC_URL}/login?provider=acmesso, which offers that provider only.
+#
+# With two or more companies, a provider that names no company gives a new user no
+# membership: give each provider its _COMPANY (compose.oidc.yaml and compose.entra.yaml bind
+# theirs to `main`). As with compose.oidc.yaml, the server fetches the issuer's discovery
+# document at startup: it does not start while the issuer is unreachable.
+#
+# One provider for several companies (ADR-0089, Enterprise): instead of a provider per
+# company, one provider's role claim can fill further companies. Beside its own _COMPANY and
+# _ROLE_MAP_*, list each further company's values under _COMPANIES_<KEY>_ROLE_MAP_ADMIN,
+# _MEMBER and _VIEWER. At every sign-in a person is then a member of each company the claim
+# names, with the role mapped there: named in a new company, they join it; named no more, they
+# leave it (Owners excepted). For example, on compose.oidc.yaml's Keycloak provider:
+#
+#   TINFIRM_AUTH_OIDC_PROVIDERS_KEYCLOAK_COMPANIES_ACME_ROLE_MAP_ADMIN: acme-admins
+#   TINFIRM_AUTH_OIDC_PROVIDERS_KEYCLOAK_COMPANIES_ACME_ROLE_MAP_MEMBER: acme-users
+
+services:
+  server:
+    environment:
+      TINFIRM_COMPANIES_ACME_NAME: Acme
+      TINFIRM_COMPANIES_ACME_OWNER: ${TINFIRM_ACME_OWNER:-}
+      # Registration id `acmesso`: lowercase letters and digits only.
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ACMESSO_CLIENT_ID: ${TINFIRM_ACME_CLIENT_ID:?is not set in deploy/compose/.env}
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ACMESSO_CLIENT_SECRET: ${TINFIRM_ACME_CLIENT_SECRET:?is not set in deploy/compose/.env}
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ACMESSO_CLIENT_NAME: Acme
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ACMESSO_AUTHORIZATION_GRANT_TYPE: authorization_code
+      SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_ACMESSO_SCOPE: openid,profile,email
+      SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_ACMESSO_ISSUER_URI: ${TINFIRM_ACME_ISSUER_URI:?is not set in deploy/compose/.env}
+      # A new user from this provider joins the company `acme` as a MEMBER (or ADMIN).
+      TINFIRM_AUTH_OIDC_PROVIDERS_ACMESSO_COMPANY: acme
+      TINFIRM_AUTH_OIDC_PROVIDERS_ACMESSO_ROLE: MEMBER
+      TINFIRM_AUTH_OIDC_PROVIDERS_ACMESSO_EMAIL_DOMAINS: ${TINFIRM_ACME_EMAIL_DOMAINS:-}
+      # Acme's identity provider provisions its people through SCIM (ADR-0087), Enterprise: the
+      # people it assigned sign in, bound by the provider's id, and nobody else gets an account.
+      TINFIRM_COMPANIES_ACME_SCIM_ENABLED: ${TINFIRM_ACME_SCIM_ENABLED:-false}
+      TINFIRM_AUTH_OIDC_PROVIDERS_ACMESSO_AUTO_PROVISION: ${TINFIRM_ACME_AUTO_PROVISION:-true}

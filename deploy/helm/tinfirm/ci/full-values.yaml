@@ -1,0 +1,210 @@
+# `helm lint` / `helm template` with every optional branch on (CI and `make helm-lint`):
+# Traefik ingress, two companies with OIDC providers bound to them (one makes Viewers),
+# verified database TLS, metrics, two replicas, LiteLLM on a database server of its own.
+image:
+  tag: sha-0123456789abcdef0123456789abcdef01234567
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+replicaCount: 2
+publicUrl: https://tinfirm.example.com/
+database:
+  host: tinfirm-db.example.internal
+  port: 5433
+  sslMode: verify-full
+  caCertSecret:
+    name: tinfirm-database-ca
+    key: ca.crt
+  params: ApplicationName=tinfirm
+companies:
+  - key: example
+    name: Example Ltd
+    id: 0192f0c4-7d1e-7c3a-9b4e-2f1a3c5d7e9f
+  - key: acme
+    name: Acme s.r.o.
+    owner: jane@acme.example
+    scim:
+      enabled: true
+      role: VIEWER
+      roleSource: APP
+auth:
+  oidc:
+    providers:
+      - id: sso
+        name: Company SSO
+        issuerUri: https://sso.example.com/realms/tinfirm
+        clientId: tinfirm
+        existingSecret: tinfirm-oidc-sso
+        company: example
+        autoProvision: false
+        scimMatch: EXTERNAL_ID_OR_EMAIL
+        roleClaim: groups
+        roleMap:
+          admin: [tinfirm-admins]
+          member: [tinfirm-users, engineering]
+          viewer: [tinfirm-viewers]
+        # The same provider fills the company `acme` from the same claim (ADR-0089).
+        companies:
+          - key: acme
+            roleMap:
+              admin: [acme-admins]
+              member: [acme-users]
+      - id: entra
+        name: Microsoft
+        issuerUri: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0
+        clientId: 11111111-1111-1111-1111-111111111111
+        existingSecret: tinfirm-oidc-entra
+        emailTrust: TRUST_ISSUER
+        emailClaims: [email, preferred_username, verified_primary_email]
+        company: acme
+        role: ADMIN
+        roleSource: APP
+        emailDomains: [acme.example, acme-group.example]
+      - id: auditors
+        name: Auditors
+        issuerUri: https://sso.example.com/realms/auditors
+        clientId: tinfirm-auditors
+        existingSecret: tinfirm-oidc-auditors
+        company: acme
+        role: VIEWER
+  saml:
+    sp:
+      existingSecret: tinfirm-saml-sp
+      credentials:
+        - kid: k2026
+        - kid: k2027
+          keyKey: next.key
+          certKey: next.crt
+      activeCredential: k2026
+    providers:
+      - id: entrasaml
+        name: Microsoft (SAML)
+        metadataUrl: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/federationmetadata/2007-06/federationmetadata.xml?appid=22222222-2222-2222-2222-222222222222
+        company: example
+        subject: http://schemas.microsoft.com/identity/claims/objectidentifier
+        emailDomains: [example.com]
+        roleClaim: http://schemas.microsoft.com/ws/2008/06/identity/claims/role
+        roleMap:
+          admin: [Tinfirm.Admin]
+          member: [Tinfirm.Member]
+        roleSource: APP
+        requireEncryptedAssertions: true
+        metadataRefresh: PT6H
+      - id: adfs
+        name: AD FS
+        metadata: |
+          <EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="http://adfs.example.com/adfs/services/trust"/>
+        company: acme
+        autoProvision: false
+        scimMatch: EXTERNAL_ID_OR_EMAIL
+extraConfig:
+  SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: 10
+extraEnv:
+  - name: EXAMPLE_FLAG
+    value: "on"
+# A log shipper beside the server, tailing the file the server also writes.
+extraVolumes:
+  - name: logs
+    emptyDir:
+      sizeLimit: 128Mi
+extraVolumeMounts:
+  - name: logs
+    mountPath: /var/log/tinfirm
+extraContainers:
+  - name: log-shipper
+    image: fluent/fluent-bit:4.2.7
+    args: ["-i", "tail", "-p", "path=/var/log/tinfirm/server.log", "-o", "stdout"]
+    securityContext:
+      runAsUser: 10001
+      readOnlyRootFilesystem: true
+    volumeMounts:
+      - name: logs
+        mountPath: /var/log/tinfirm
+metrics:
+  scrapeAnnotations: true
+tmpVolume:
+  medium: Memory
+  sizeLimit: 256Mi
+podDisruptionBudget:
+  minAvailable: 1
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: tinfirm
+ingress:
+  enabled: true
+  className: traefik
+  hosts:
+    - host: tinfirm.example.com
+      paths:
+        - path: /
+  tls:
+    - secretName: tinfirm-tls
+      hosts:
+        - tinfirm.example.com
+litellm:
+  existingSecret: tinfirm-litellm-prod
+  database:
+    host: litellm-db.example.internal
+    port: 5434
+    sslMode: verify-full
+    caCertSecret:
+      name: litellm-database-ca
+      key: ca.pem
+  extraEnv:
+    - name: LITELLM_LOG
+      value: INFO
+  podAnnotations:
+    example.com/team: platform
+  nodeSelector:
+    kubernetes.io/os: linux
+networkPolicy:
+  litellm:
+    egress:
+      providers:
+        to:
+          - ipBlock:
+              cidr: 10.30.0.10/32
+        ports:
+          - 3128
+      extra:
+        - to:
+            - ipBlock:
+                cidr: 169.254.20.10/32
+          ports:
+            - protocol: UDP
+              port: 53
+  ingress:
+    controller:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: traefik
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: traefik
+    metrics:
+      enabled: true
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+  egress:
+    database:
+      to:
+        - ipBlock:
+            cidr: 10.0.0.0/20
+    extra:
+      - to:
+          - ipBlock:
+              cidr: 169.254.20.10/32
+        ports:
+          - protocol: UDP
+            port: 53
+
+# Error reports (ADR-0070): the operator's mode, the DSN from a Secret, a label and a proxy.
+errorReports:
+  mode: automatic
+  dsnSecret:
+    name: tinfirm-error-reports
+  label: acme-prod
+  proxy: http://proxy.acme.internal:3128

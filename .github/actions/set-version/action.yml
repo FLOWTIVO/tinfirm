@@ -1,0 +1,79 @@
+# A local composite action (ADR-0106). Third-party actions are pinned by
+# commit SHA, with their release in the comment; Dependabot keeps them current.
+name: Set version
+description: >-
+  Write a version into every manifest it is given (single-module poms and
+  npm packages), and expose the development version that follows a released one.
+
+inputs:
+  version:
+    description: 'Semver version to write, no leading v. Omit to only compute outputs.'
+    required: false
+    default: ''
+  manifests:
+    description: |
+      Newline-separated manifest list. `pom:<path>:<artifactId>` or `npm:<dir>`.
+      Blank lines and `#` comments are allowed.
+    required: true
+  next_of:
+    description: >-
+      Released version to derive a development version from. Sets the `next` output;
+      does not write anything.
+    required: false
+    default: ''
+
+outputs:
+  next:
+    description: 'Development version following `next_of` (1.0.0 -> 1.0.1-SNAPSHOT).'
+    value: ${{ steps.run.outputs.next }}
+  paths:
+    description: >-
+      Space-separated paths this action writes, ready to hand to `git add`. Includes
+      each npm package's lock file.
+    value: ${{ steps.run.outputs.paths }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        MANIFESTS: ${{ inputs.manifests }}
+        NEXT_OF: ${{ inputs.next_of }}
+        # `github.action_path` is this action's directory in the checked-out workspace:
+        # how a composite action reaches its own scripts wherever it is called from.
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$NEXT_OF" ]; then
+          echo "next=$("$ACTION_PATH/next-version.sh" "$NEXT_OF")" >> "$GITHUB_OUTPUT"
+        fi
+
+        # The paths output is derived from the same list the script consumes, so a change
+        # that adds a manifest never has to also update a `git add` line somewhere else.
+        paths=""
+        while IFS= read -r line; do
+          line="${line%%#*}"
+          line="$(echo "$line" | xargs)" || true
+          [ -n "$line" ] || continue
+          case "$line" in
+            pom:*) IFS=':' read -r _ p _ <<< "$line"; paths="$paths $p" ;;
+            npm:*)
+              IFS=':' read -r _ d <<< "$line"
+              d="${d%/}"
+              # `npm:.` must not produce `./package.json` with a leading `./` chain.
+              if [ "$d" = "." ]; then
+                paths="$paths package.json package-lock.json"
+              else
+                paths="$paths $d/package.json $d/package-lock.json"
+              fi
+              ;;
+          esac
+        done <<< "$MANIFESTS"
+        echo "paths=$(echo "$paths" | xargs)" >> "$GITHUB_OUTPUT"
+
+        if [ -n "$VERSION" ]; then
+          "$ACTION_PATH/set-version.sh" "$VERSION" <<< "$MANIFESTS"
+        fi

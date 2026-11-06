@@ -1,0 +1,19 @@
+# The run's container in a sandbox VM (ADR-0096): `tinfirm-runner-host vm-boot` reads the VM's
+# user data and runs the run's runner image with the sandbox bridge, which waits for the runner
+# host to dial in. Once at boot; the runner host deletes the VM when the run ends.
+[Unit]
+Description=Tinfirm sandbox: the run's container and its bridge
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/opt/tinfirm/tinfirm-runner-host vm-boot
+Restart=no
+# The bridge's messages; never a credential (those come over the bridge, into the adapter).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

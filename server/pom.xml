@@ -1,0 +1,584 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.2</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.flowtivo.tinfirm</groupId>
+  <artifactId>tinfirm-server</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <name>Tinfirm server</name>
+  <description>Tinfirm control-plane server (API, OIDC, SPA host)</description>
+
+  <!-- The repository's root LICENSE (ADR-0077): MIT, and the Tinfirm Enterprise licence (ee/LICENSE) for the ee/ part
+       this build compiles in. -->
+  <licenses>
+    <license>
+      <name>MIT</name>
+      <url>https://opensource.org/license/mit</url>
+      <distribution>repo</distribution>
+      <comments>Everything outside ee/</comments>
+    </license>
+    <license>
+      <name>LicenseRef-Tinfirm-Enterprise</name>
+      <url>https://github.com/FLOWTIVO/tinfirm/blob/main/ee/LICENSE</url>
+      <distribution>repo</distribution>
+      <comments>The Tinfirm Enterprise licence (ee/LICENSE): the part of the code under ee/</comments>
+    </license>
+  </licenses>
+
+  <properties>
+    <java.version>25</java.version>
+    <!-- Guava comes in with OpenSAML (opensaml-saml-api), at 33.0.0: CVE-2026-102554 (a deserialized map's size taken
+         unbounded). Remove when OpenSAML pulls 33.7.2 or later. -->
+    <guava.version>33.7.2-jre</guava.version>
+    <spring-modulith.version>2.1.2</spring-modulith.version>
+    <openapi-generator.version>7.26.0</openapi-generator.version>
+    <mapstruct.version>1.6.3</mapstruct.version>
+    <bouncycastle.version>1.86</bouncycastle.version>
+    <bucket4j.version>8.21.0</bucket4j.version>
+    <!-- ShedLock's JDBC lock (CONVENTIONS §15.21): a scheduled job that one worker replica at a time runs. -->
+    <shedlock.version>7.10.1</shedlock.version>
+    <uuid-creator.version>6.1.1</uuid-creator.version>
+    <json-schema-validator.version>3.0.8</json-schema-validator.version>
+    <wiremock.version>3.13.2</wiremock.version>
+    <!-- MCP Security for Spring AI (ADR-0045): a community project at 0.1.x whose APIs may change. Pinned, in
+         Dependabot's scope, and used only through its configurers, never its auto-configuration. -->
+    <mcp-security.version>0.1.14</mcp-security.version>
+    <!-- Spring AI's MCP server starter (ADR-0001, ADR-0045): the MCP endpoint for people's clients. -->
+    <spring-ai.version>2.0.2</spring-ai.version>
+    <!-- The dependency licence check and the third-party list (ADR-0082); model-api/pom.xml pins the same. -->
+    <license-maven-plugin.version>2.7.1</license-maven-plugin.version>
+    <!-- The S3 client of the session bundle store (ADR-0097): Spaces, Ceph RGW, MinIO and AWS through one API, over the
+         JDK's own HTTP client (no Netty, no Apache client). -->
+    <aws-sdk.version>2.57.7</aws-sdk.version>
+    <openapi.spec>${project.basedir}/../api/openapi.yaml</openapi.spec>
+    <runner.protocol.schema>${project.basedir}/../protocol/runner-v1.schema.json</runner.protocol.schema>
+  </properties>
+
+  <repositories>
+    <!--
+      OpenSAML 5 and Shibboleth's support libraries (ADR-0086), published only here. .mvn/rrf/ limits this repository
+      to the groups org.opensaml and net.shibboleth (Maven Resolver's remote repository filter, .mvn/maven.config), so
+      that nothing else is ever resolved from it.
+    -->
+    <repository>
+      <id>shibboleth-releases</id>
+      <url>https://build.shibboleth.net/maven/releases/</url>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+    </repository>
+  </repositories>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.modulith</groupId>
+        <artifactId>spring-modulith-bom</artifactId>
+        <version>${spring-modulith.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-bom</artifactId>
+        <version>${spring-ai.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>software.amazon.awssdk</groupId>
+        <artifactId>bom</artifactId>
+        <version>${aws-sdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.google.guava</groupId>
+        <artifactId>guava</artifactId>
+        <version>${guava.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- Web, security, sessions -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-webmvc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security-oauth2-client</artifactId>
+    </dependency>
+    <dependency>
+      <!--
+        SAML 2.0 sign-in (ADR-0086): Spring Security's service provider on OpenSAML 5, which only the Shibboleth
+        repository publishes (below). Used by ee/ only, through the core's identity.internal.SamlLogin.
+      -->
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-saml2-service-provider</artifactId>
+    </dependency>
+    <dependency>
+      <!-- Tinfirm's own OAuth 2.1 authorization server for people's MCP clients (ADR-0045) -->
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security-oauth2-authorization-server</artifactId>
+    </dependency>
+    <dependency>
+      <!-- The MCP endpoint validates the authorization server's JWT access tokens (ADR-0045) -->
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springaicommunity</groupId>
+      <artifactId>mcp-authorization-server</artifactId>
+      <version>${mcp-security.version}</version>
+    </dependency>
+    <dependency>
+      <!-- The MCP endpoint of each company, stateless Streamable HTTP (ADR-0045, the mcp module) -->
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-session-jdbc</artifactId>
+    </dependency>
+    <dependency>
+      <!-- Runner host transport: raw WebSocket at /api/runner/v1/connect (CONVENTIONS §15.1) -->
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-websocket</artifactId>
+    </dependency>
+
+    <!-- Persistence -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-flyway</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+    </dependency>
+    <dependency>
+      <!-- Compile scope: a check raised by a trigger is told by the constraint it names (ServerErrorMessage). -->
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+    </dependency>
+
+    <!-- Operations -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+
+    <!-- Module boundaries -->
+    <dependency>
+      <groupId>org.springframework.modulith</groupId>
+      <artifactId>spring-modulith-starter-core</artifactId>
+    </dependency>
+
+    <!-- Libraries -->
+    <dependency>
+      <groupId>org.mapstruct</groupId>
+      <artifactId>mapstruct</artifactId>
+      <version>${mapstruct.version}</version>
+    </dependency>
+    <dependency>
+      <!-- Argon2id for Spring Security's Argon2PasswordEncoder -->
+      <groupId>org.bouncycastle</groupId>
+      <artifactId>bcprov-jdk18on</artifactId>
+      <version>${bouncycastle.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.bucket4j</groupId>
+      <artifactId>bucket4j_jdk17-core</artifactId>
+      <version>${bucket4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>net.javacrumbs.shedlock</groupId>
+      <artifactId>shedlock-provider-jdbc-template</artifactId>
+      <version>${shedlock.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.ben-manes.caffeine</groupId>
+      <artifactId>caffeine</artifactId>
+    </dependency>
+    <dependency>
+      <!-- The front matter of a skill's SKILL.md (ADR-0064), read with the safe constructor. -->
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.github.f4b6a3</groupId>
+      <artifactId>uuid-creator</artifactId>
+      <version>${uuid-creator.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.jspecify</groupId>
+      <artifactId>jspecify</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>jakarta.annotation</groupId>
+      <artifactId>jakarta.annotation-api</artifactId>
+    </dependency>
+
+    <!-- The session bundle store's S3 adapter (ADR-0097) -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>s3</artifactId>
+      <exclusions>
+        <exclusion>
+          <groupId>software.amazon.awssdk</groupId>
+          <artifactId>netty-nio-client</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>software.amazon.awssdk</groupId>
+          <artifactId>apache-client</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>url-connection-client</artifactId>
+    </dependency>
+
+    <!-- Tests -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.modulith</groupId>
+      <artifactId>spring-modulith-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- Validates runner protocol frames against protocol/runner-v1.schema.json (JSON Schema 2020-12) in the tests,
+           and, since the MCP server (ADR-0045), the arguments of every tool call at runtime: the MCP SDK's
+           mcp-json-jackson3 needs it on the runtime classpath. Compile scope on purpose: a direct test-scoped
+           declaration would override the SDK's transitive one and leave the class out of the jar
+           (NoClassDefFoundError com.networknt.schema.dialect.Dialects at startup). -->
+      <groupId>com.networknt</groupId>
+      <artifactId>json-schema-validator</artifactId>
+      <version>${json-schema-validator.version}</version>
+    </dependency>
+    <dependency>
+      <!-- GitHub API stub for pull request creation; the standalone jar shades Jetty and Jackson 2 -->
+      <groupId>org.wiremock</groupId>
+      <artifactId>wiremock-standalone</artifactId>
+      <version>${wiremock.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>build-info</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <!--
+          Controllers implement interfaces generated from the binding HTTP contract.
+          Generated code lives in target/generated-sources/openapi and is never committed.
+        -->
+        <groupId>org.openapitools</groupId>
+        <artifactId>openapi-generator-maven-plugin</artifactId>
+        <version>${openapi-generator.version}</version>
+        <executions>
+          <execution>
+            <id>tinfirm-api</id>
+            <goals>
+              <goal>generate</goal>
+            </goals>
+            <configuration>
+              <inputSpec>${openapi.spec}</inputSpec>
+              <generatorName>spring</generatorName>
+              <library>spring-boot</library>
+              <apiPackage>com.flowtivo.tinfirm.shared.api</apiPackage>
+              <modelPackage>com.flowtivo.tinfirm.shared.api.model</modelPackage>
+              <!-- Masks writeOnly properties (e.g. secret values) in the generated toString(). -->
+              <templateDirectory>${project.basedir}/src/main/openapi-templates</templateDirectory>
+              <generateApiTests>false</generateApiTests>
+              <generateApiDocumentation>false</generateApiDocumentation>
+              <generateModelTests>false</generateModelTests>
+              <generateModelDocumentation>false</generateModelDocumentation>
+              <generateSupportingFiles>false</generateSupportingFiles>
+              <configOptions>
+                <interfaceOnly>true</interfaceOnly>
+                <skipDefaultInterface>true</skipDefaultInterface>
+                <useTags>true</useTags>
+                <openApiNullable>false</openApiNullable>
+                <useSpringBoot4>true</useSpringBoot4>
+                <useJackson3>true</useJackson3>
+                <useJakartaEe>true</useJakartaEe>
+                <useJspecify>true</useJspecify>
+                <useBeanValidation>true</useBeanValidation>
+                <useSpringBuiltInValidation>true</useSpringBuiltInValidation>
+                <performBeanValidation>false</performBeanValidation>
+                <documentationProvider>none</documentationProvider>
+                <annotationLibrary>none</annotationLibrary>
+                <requestMappingMode>api_interface</requestMappingMode>
+                <useResponseEntity>true</useResponseEntity>
+                <dateLibrary>java8</dateLibrary>
+                <hideGenerationTimestamp>true</hideGenerationTimestamp>
+                <serializableModel>false</serializableModel>
+                <generateJsonIncludeAnnotations>false</generateJsonIncludeAnnotations>
+                <generateJsonSetterNullsAnnotations>false</generateJsonSetterNullsAnnotations>
+                <sourceFolder>src/main/java</sourceFolder>
+              </configOptions>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <!-- The shared libraries (CONVENTIONS §2): their sources and tests are compiled into this build. libs/jira,
+             package com.flowtivo.tinfirm.shared.jira; libs/litellm, package com.flowtivo.tinfirm.shared.litellm;
+             libs/net, package com.flowtivo.tinfirm.shared.net. And ee/, the commercial part under its own licence
+             (ADR-0077): the licence, package com.flowtivo.tinfirm.ee, and the paid features' code, in the packages
+             of the modules it belongs to; in every build and every image, as GitLab's ee/ is. -->
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>add-libraries</id>
+            <phase>generate-sources</phase>
+            <goals>
+              <goal>add-source</goal>
+            </goals>
+            <configuration>
+              <sources>
+                <source>${project.basedir}/../libs/jira/src/main/java</source>
+                <source>${project.basedir}/../libs/litellm/src/main/java</source>
+                <source>${project.basedir}/../libs/net/src/main/java</source>
+                <source>${project.basedir}/../ee/src/main/java</source>
+              </sources>
+            </configuration>
+          </execution>
+          <execution>
+            <id>add-library-tests</id>
+            <phase>generate-test-sources</phase>
+            <goals>
+              <goal>add-test-source</goal>
+            </goals>
+            <configuration>
+              <sources>
+                <source>${project.basedir}/../libs/jira/src/test/java</source>
+                <source>${project.basedir}/../libs/litellm/src/test/java</source>
+                <source>${project.basedir}/../libs/net/src/test/java</source>
+                <source>${project.basedir}/../ee/src/test/java</source>
+              </sources>
+            </configuration>
+          </execution>
+          <execution>
+            <id>add-ee-resources</id>
+            <phase>generate-resources</phase>
+            <goals>
+              <goal>add-resource</goal>
+            </goals>
+            <configuration>
+              <resources>
+                <resource>
+                  <directory>${project.basedir}/../ee/src/main/resources</directory>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+          <execution>
+            <id>add-library-test-resources</id>
+            <phase>generate-test-resources</phase>
+            <goals>
+              <goal>add-test-resource</goal>
+            </goals>
+            <configuration>
+              <resources>
+                <resource>
+                  <directory>${project.basedir}/../libs/litellm/src/test/resources</directory>
+                </resource>
+                <resource>
+                  <directory>${project.basedir}/../ee/src/test/resources</directory>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <parameters>true</parameters>
+          <annotationProcessorPaths>
+            <path>
+              <groupId>org.mapstruct</groupId>
+              <artifactId>mapstruct-processor</artifactId>
+              <version>${mapstruct.version}</version>
+            </path>
+            <path>
+              <groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-configuration-processor</artifactId>
+              <version>${project.parent.version}</version>
+            </path>
+          </annotationProcessorPaths>
+          <compilerArgs>
+            <arg>-Amapstruct.defaultComponentModel=spring</arg>
+            <arg>-Amapstruct.defaultInjectionStrategy=constructor</arg>
+            <arg>-Amapstruct.unmappedTargetPolicy=ERROR</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <!-- Exposes ${org.mockito:mockito-core:jar} for the Mockito agent below. -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>properties</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!--
+            Two JVMs run the test classes in parallel, one class at a time in each. Each JVM has its own database
+            (support/TestDatabase: its own container, or its own database on an external server), so their cached
+            contexts, stubs and the instance's settings never meet.
+          -->
+          <forkCount>2</forkCount>
+          <reuseForks>true</reuseForks>
+          <!-- Load Mockito as an agent instead of self-attaching (disallowed by default in future JDKs). -->
+          <argLine>-javaagent:${org.mockito:mockito-core:jar} -Xshare:off</argLine>
+          <systemPropertyVariables>
+            <tinfirm.openapi.spec>${openapi.spec}</tinfirm.openapi.spec>
+            <tinfirm.runner.protocol.schema>${runner.protocol.schema}</tinfirm.runner.protocol.schema>
+            <tinfirm.test.fork>${surefire.forkNumber}</tinfirm.test.fork>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <!--
+          The licences of the dependencies this build ships (ADR-0082): the runtime ones, not test or provided. The
+          check fails the build on a dependency whose licence is not one the policy accepts, or that names none; the
+          list of them, target/generated-sources/license/THIRD-PARTY.txt, goes into the image's /licenses/ (Dockerfile).
+          licenseMerges maps the names the poms use to the policy's SPDX identifiers; a new name fails the check until
+          it is added here, after a look at the licence it means. src/license/override-THIRD-PARTY.properties corrects
+          a pom's wrong metadata, for one version. The policy is ADR-0082's; model-api/pom.xml, web/scripts/licences.mjs
+          and runner/about.toml hold the same lists: change them together.
+        -->
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>license-maven-plugin</artifactId>
+        <version>${license-maven-plugin.version}</version>
+        <executions>
+          <execution>
+            <id>third-party</id>
+            <goals>
+              <goal>add-third-party</goal>
+            </goals>
+            <configuration>
+              <excludedScopes>test,provided,system</excludedScopes>
+              <failOnMissing>true</failOnMissing>
+              <failOnBlacklist>true</failOnBlacklist>
+              <sortArtifactByName>true</sortArtifactByName>
+              <licenseMerges>
+                <licenseMerge>MIT|MIT License|The MIT License</licenseMerge>
+                <licenseMerge>Apache-2.0|Apache License, Version 2.0|The Apache Software License, Version 2.0|Apache 2.0|The Apache License, Version 2.0|Apache License 2.0|Apache License Version 2.0|Apache License, version 2.0|Apache License</licenseMerge>
+                <!-- "BSD" without a version: ANTLR's runtime and StringTemplate, both under the 3-clause text. -->
+                <licenseMerge>BSD-3-Clause|BSD|BSD licence|The BSD License</licenseMerge>
+                <licenseMerge>EPL-2.0|EPL 2.0|Eclipse Public License v. 2.0|Eclipse Public License - v 2.0</licenseMerge>
+                <licenseMerge>EDL-1.0|Eclipse Distribution License - v 1.0|Eclipse Distribution License v. 1.0|EDL 1.0</licenseMerge>
+                <licenseMerge>GPL-2.0-only WITH Classpath-exception-2.0|GPL2 w/ CPE</licenseMerge>
+                <licenseMerge>CC0-1.0|Public Domain, per Creative Commons CC0</licenseMerge>
+              </licenseMerges>
+              <includedLicenses>
+                <includedLicense>MIT</includedLicense>
+                <includedLicense>MIT-0</includedLicense>
+                <includedLicense>Apache-2.0</includedLicense>
+                <includedLicense>Apache-2.0 WITH LLVM-exception</includedLicense>
+                <includedLicense>BSD-2-Clause</includedLicense>
+                <includedLicense>BSD-3-Clause</includedLicense>
+                <includedLicense>ISC</includedLicense>
+                <includedLicense>0BSD</includedLicense>
+                <includedLicense>Zlib</includedLicense>
+                <includedLicense>Unlicense</includedLicense>
+                <includedLicense>CC0-1.0</includedLicense>
+                <includedLicense>Unicode-3.0</includedLicense>
+                <includedLicense>Unicode-DFS-2016</includedLicense>
+                <includedLicense>BSL-1.0</includedLicense>
+                <includedLicense>EDL-1.0</includedLicense>
+                <includedLicense>Bouncy Castle Licence</includedLicense>
+                <includedLicense>OFL-1.1</includedLicense>
+                <includedLicense>EPL-2.0</includedLicense>
+                <includedLicense>MPL-2.0</includedLicense>
+                <includedLicense>LGPL-2.1-only</includedLicense>
+                <includedLicense>LGPL-2.1-or-later</includedLicense>
+                <includedLicense>GPL-2.0-only WITH Classpath-exception-2.0</includedLicense>
+              </includedLicenses>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

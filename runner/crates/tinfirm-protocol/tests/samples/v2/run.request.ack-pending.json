@@ -1,0 +1,9 @@
+{
+  "type": "run.request.ack",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000050",
+  "status": "PENDING",
+  "payload": {"decisionId": "0192f1a4-7c1e-7b3a-9d2e-000000000052"},
+  "code": null,
+  "message": "Your question is posted on the work item, where a person answers it. Ask any other question you need, one per call. When you have nothing else to do, stop without writing a summary: Tinfirm wakes you with all the answers at once."
+}

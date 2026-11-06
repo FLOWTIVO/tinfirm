@@ -1,0 +1,11 @@
+{
+  "type": "run.request",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 1,
+  "requestId": "0192f1a4-7c1e-7b3a-9d2e-000000000050",
+  "kind": "ASK",
+  "payload": {
+    "question": "The issue says \"retry failed deliveries\". Should a delivery that failed with a 4xx answer be retried too, or only timeouts and 5xx answers?",
+    "options": ["Only timeouts and 5xx", "Every failure"]
+  }
+}

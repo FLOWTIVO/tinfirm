@@ -1,0 +1,214 @@
+{{- include "tinfirm.companies.validate" . }}
+# Non-secret server configuration (docs/CONVENTIONS.md §4). Secret values come from the
+# referenced Secrets in the Deployment, never from here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tinfirm.fullname" . }}
+  labels:
+    {{- include "tinfirm.labels" . | nindent 4 }}
+data:
+  SPRING_DATASOURCE_URL: {{ include "tinfirm.jdbcUrl" . | quote }}
+  # Fixed role names: migrations grant privileges to them.
+  SPRING_DATASOURCE_USERNAME: "tinfirm_app"
+  SPRING_FLYWAY_USER: "tinfirm_owner"
+  TINFIRM_ROLES: {{ .Values.serverRoles | quote }}
+  {{- with include "tinfirm.publicUrl" . }}
+  TINFIRM_PUBLIC_URL: {{ . | quote }}
+  {{- end }}
+  TINFIRM_AUTH_LOCAL_ENABLED: {{ .Values.auth.localEnabled | quote }}
+  TINFIRM_AUTH_OIDC_AUTO_PROVISION: {{ .Values.auth.oidcAutoProvision | quote }}
+  TINFIRM_SESSION_IDLE_TIMEOUT: {{ .Values.session.idleTimeout | quote }}
+  TINFIRM_SESSION_MAX_AGE: {{ .Values.session.maxAge | quote }}
+  TINFIRM_CONNECTION_ALLOW_HTTP: {{ .Values.connection.allowHttp | quote }}
+  TINFIRM_CONNECTION_ALLOW_PRIVATE_ADDRESSES: {{ .Values.connection.allowPrivateAddresses | quote }}
+  TINFIRM_CONNECTION_TIMEOUT: {{ .Values.connection.timeout | quote }}
+  {{- with include "tinfirm.internalHosts" . }}
+  TINFIRM_CONNECTION_INTERNAL_HOSTS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.errorReports.mode }}
+  TINFIRM_ERROR_REPORTS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.errorReports.label }}
+  TINFIRM_ERROR_REPORTS_LABEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.errorReports.proxy }}
+  TINFIRM_ERROR_REPORTS_PROXY: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.trustedProxies }}
+  SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES: {{ . | quote }}
+  {{- end }}
+  {{- range .Values.companies }}
+  {{- $key := upper .key }}
+  # Company "{{ .key }}" (ADR-0075).
+  TINFIRM_COMPANIES_{{ $key }}_NAME: {{ .name | quote }}
+  {{- with .owner }}
+  TINFIRM_COMPANIES_{{ $key }}_OWNER: {{ . | quote }}
+  {{- end }}
+  {{- with .id }}
+  TINFIRM_COMPANIES_{{ $key }}_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .scim }}
+  {{- if hasKey . "enabled" }}
+  TINFIRM_COMPANIES_{{ $key }}_SCIM_ENABLED: {{ .enabled | toString | quote }}
+  {{- end }}
+  {{- with .role }}
+  TINFIRM_COMPANIES_{{ $key }}_SCIM_ROLE: {{ . | quote }}
+  {{- end }}
+  {{- with .roleSource }}
+  TINFIRM_COMPANIES_{{ $key }}_SCIM_ROLE_SOURCE: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- if and $.Values.runner.enabled (eq .key $.Values.runner.company) }}
+  # The runner pod's host (ADR-0101, decision 8); its token comes from runner.existingSecret.
+  TINFIRM_COMPANIES_{{ $key }}_RUNNER_HOST_NAME: {{ $.Values.runner.name | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.javaToolOptions }}
+  JAVA_TOOL_OPTIONS: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.litellm.enabled }}
+  # The bundled LiteLLM, inside the cluster: its admin API on its own port, and the model
+  # requests the server relays for runner hosts, and its own, on the model port (ADR-0069).
+  TINFIRM_LITELLM_ADMIN_URL: {{ include "tinfirm.litellm.adminUrl" . | quote }}
+  TINFIRM_LITELLM_MODEL_URL: {{ include "tinfirm.litellm.modelUrl" . | quote }}
+  {{- end }}
+  {{- range .Values.auth.oidc.providers }}
+  {{- $id := upper .id }}
+  SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_{{ $id }}_CLIENT_ID: {{ .clientId | quote }}
+  SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_{{ $id }}_CLIENT_NAME: {{ .name | default .id | quote }}
+  SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_{{ $id }}_SCOPE: {{ .scope | default "openid,profile,email" | quote }}
+  SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_{{ $id }}_AUTHORIZATION_GRANT_TYPE: "authorization_code"
+  SPRING_SECURITY_OAUTH2_CLIENT_PROVIDER_{{ $id }}_ISSUER_URI: {{ .issuerUri | quote }}
+  {{- with .emailTrust }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_EMAIL_TRUST: {{ . | quote }}
+  {{- end }}
+  {{- with .emailClaims }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_EMAIL_CLAIMS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .company }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_COMPANY: {{ . | quote }}
+  {{- end }}
+  {{- with .role }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_ROLE: {{ . | quote }}
+  {{- end }}
+  {{- with .emailDomains }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_EMAIL_DOMAINS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .roleSource }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_ROLE_SOURCE: {{ . | quote }}
+  {{- end }}
+  {{- if hasKey . "autoProvision" }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_AUTO_PROVISION: {{ .autoProvision | toString | quote }}
+  {{- end }}
+  {{- with .scimMatch }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_SCIM_MATCH: {{ . | quote }}
+  {{- end }}
+  {{- with .roleClaim }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_ROLE_CLAIM: {{ . | quote }}
+  {{- end }}
+  {{- with .roleMap }}
+  {{- with .admin }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_ROLE_MAP_ADMIN: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .member }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_ROLE_MAP_MEMBER: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .viewer }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_ROLE_MAP_VIEWER: {{ join "," . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- range .companies }}
+  {{- $key := upper .key }}
+  {{- with .roleMap }}
+  {{- with .admin }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_COMPANIES_{{ $key }}_ROLE_MAP_ADMIN: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .member }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_COMPANIES_{{ $key }}_ROLE_MAP_MEMBER: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .viewer }}
+  TINFIRM_AUTH_OIDC_PROVIDERS_{{ $id }}_COMPANIES_{{ $key }}_ROLE_MAP_VIEWER: {{ join "," . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.auth.saml.sp.activeCredential }}
+  TINFIRM_AUTH_SAML_SP_ACTIVE_CREDENTIAL: {{ . | quote }}
+  {{- end }}
+  {{- range .Values.auth.saml.providers }}
+  {{- $id := upper .id }}
+  {{- if .metadata }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_METADATA_LOCATION: {{ printf "file:/etc/tinfirm/saml/%s.xml" .id | quote }}
+  {{- else }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_METADATA_LOCATION: {{ .metadataUrl | quote }}
+  {{- end }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_NAME: {{ .name | default .id | quote }}
+  {{- with .entityId }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_ENTITY_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .company }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_COMPANY: {{ . | quote }}
+  {{- end }}
+  {{- with .role }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_ROLE: {{ . | quote }}
+  {{- end }}
+  {{- with .emailDomains }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_EMAIL_DOMAINS: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .subject }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_SUBJECT: {{ . | quote }}
+  {{- end }}
+  {{- with .emailAttributes }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_EMAIL_ATTRIBUTES: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .nameAttributes }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_NAME_ATTRIBUTES: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .roleSource }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_ROLE_SOURCE: {{ . | quote }}
+  {{- end }}
+  {{- with .roleClaim }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_ROLE_CLAIM: {{ . | quote }}
+  {{- end }}
+  {{- with .roleMap }}
+  {{- with .admin }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_ROLE_MAP_ADMIN: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .member }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_ROLE_MAP_MEMBER: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .viewer }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_ROLE_MAP_VIEWER: {{ join "," . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- range .companies }}
+  {{- $key := upper .key }}
+  {{- with .roleMap }}
+  {{- with .admin }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_COMPANIES_{{ $key }}_ROLE_MAP_ADMIN: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .member }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_COMPANIES_{{ $key }}_ROLE_MAP_MEMBER: {{ join "," . | quote }}
+  {{- end }}
+  {{- with .viewer }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_COMPANIES_{{ $key }}_ROLE_MAP_VIEWER: {{ join "," . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- if hasKey . "autoProvision" }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_AUTO_PROVISION: {{ .autoProvision | toString | quote }}
+  {{- end }}
+  {{- if hasKey . "requireEncryptedAssertions" }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_REQUIRE_ENCRYPTED_ASSERTIONS: {{ .requireEncryptedAssertions | toString | quote }}
+  {{- end }}
+  {{- with .metadataRefresh }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_METADATA_REFRESH: {{ . | quote }}
+  {{- end }}
+  {{- with .scimMatch }}
+  TINFIRM_AUTH_SAML_PROVIDERS_{{ $id }}_SCIM_MATCH: {{ . | quote }}
+  {{- end }}
+  {{- end }}
+  {{- range $key, $value := .Values.extraConfig }}
+  {{ $key }}: {{ $value | toString | quote }}
+  {{- end }}

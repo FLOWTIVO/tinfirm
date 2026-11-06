@@ -1,0 +1,219 @@
+<div class="flex flex-col gap-5">
+  <p class="text-muted-foreground max-w-[46rem] text-sm text-pretty">
+    Named sets of members. Agents are shared with groups, a system’s credentials are lent to groups
+    on the system’s page, and a service account names the groups that may use it.
+  </p>
+
+  @if (groups.firstLoad()) {
+    <app-list-skeleton [rows]="3" />
+  } @else if (groups.failed()) {
+    <app-error-state
+      [error]="groups.error()"
+      heading="Couldn't load groups"
+      (retry)="groups.retry()"
+    />
+  } @else if (groups.empty()) {
+    <div hlmEmpty class="border border-dashed" data-testid="groups-empty">
+      <div hlmEmptyHeader>
+        <div hlmEmptyMedia variant="icon">
+          <ng-icon name="lucideUsersRound" aria-hidden="true" />
+        </div>
+        <div hlmEmptyTitle>No groups yet</div>
+        <p hlmEmptyDescription>
+          @if (canManage()) {
+            Put the people who look after a company agent in a group, then give the group its rights
+            on the agent.
+          } @else {
+            Owners and admins create groups.
+          }
+        </p>
+      </div>
+      @if (canManage()) {
+        <div hlmEmptyContent>
+          <button
+            hlmBtn
+            variant="outline"
+            size="sm"
+            type="button"
+            class="max-sm:h-11"
+            aria-haspopup="dialog"
+            (click)="openCreate()"
+          >
+            <ng-icon name="lucidePlus" aria-hidden="true" />
+            New group
+          </button>
+        </div>
+      }
+    </div>
+  } @else {
+    @if (canManage() && usageError()) {
+      <app-error-state
+        [error]="usageError()"
+        heading="Couldn’t read what the groups may use"
+        (retry)="retryUsage()"
+      />
+    }
+    <section
+      class="bg-card @container overflow-hidden rounded-[14px] border"
+      [attr.aria-label]="'Groups of ' + (companyName() ?? 'the company')"
+    >
+      <ul class="m-0 list-none divide-y p-0" aria-label="Groups">
+        @for (group of groups.items(); track group.id) {
+          <li [attr.data-testid]="'group-' + group.id" [attr.data-group]="group.name">
+            @if (canManage()) {
+              <button
+                type="button"
+                class="hover:bg-accent focus-visible:ring-ring/50 cursor-pointer outline-none focus-visible:ring-3 focus-visible:ring-inset"
+                [class]="rowClass"
+                [class.bg-accent]="isOpen(group)"
+                aria-haspopup="dialog"
+                data-testid="open-group"
+                (click)="open(group)"
+              >
+                <ng-container *ngTemplateOutlet="row; context: { $implicit: group }" />
+              </button>
+            } @else {
+              <div [class]="rowClass">
+                <ng-container *ngTemplateOutlet="row; context: { $implicit: group }" />
+              </div>
+            }
+          </li>
+        }
+      </ul>
+    </section>
+
+    @if (groups.moreFailed()) {
+      <app-error-state
+        [error]="groups.error()"
+        heading="Couldn't load more"
+        (retry)="groups.retry()"
+      />
+    } @else if (groups.hasMore()) {
+      <div class="flex justify-center">
+        <button
+          hlmBtn
+          variant="outline"
+          size="sm"
+          type="button"
+          [disabled]="groups.loadingMore()"
+          (click)="groups.loadMore()"
+        >
+          @if (groups.loadingMore()) {
+            <hlm-spinner aria-hidden="true" />
+          }
+          Load more
+        </button>
+      </div>
+    }
+  }
+
+  @if (!canManage() && !groups.firstLoad() && !groups.failed()) {
+    <p class="text-muted-foreground text-xs" data-testid="groups-read-only">
+      Only owners and admins can create or change groups and see who is in them.
+    </p>
+  }
+</div>
+
+<!-- One group's row: its name, its members' initials, and what it may use. -->
+<ng-template #row let-group>
+  <span
+    class="bg-secondary text-foreground row-span-3 flex size-9 shrink-0 items-center justify-center rounded-[10px] @3xl:row-span-1"
+    aria-hidden="true"
+  >
+    <ng-icon name="lucideUsersRound" size="16" />
+  </span>
+  <span class="flex min-w-0 flex-col">
+    <span class="text-sm leading-snug font-semibold break-words" data-testid="group-name">{{
+      group.name
+    }}</span>
+    @if (group.description) {
+      <span class="text-muted-foreground truncate text-xs" data-testid="group-description">{{
+        group.description
+      }}</span>
+    }
+  </span>
+  <span class="col-start-2 flex items-center gap-2 @3xl:col-start-auto">
+    @if (canManage()) {
+      @let s = stack(group);
+      @if (s) {
+        @if (s.initials.length) {
+          <span class="flex items-center" aria-hidden="true" data-testid="group-stack">
+            @for (ini of s.initials; track $index) {
+              <span
+                class="bg-secondary border-card -ms-1.5 flex size-7 items-center justify-center rounded-full border-2 text-[10px] font-bold first:ms-0"
+                >{{ ini }}</span
+              >
+            }
+            @if (s.more) {
+              <span
+                class="bg-muted border-card text-muted-foreground -ms-1.5 flex size-7 items-center justify-center rounded-full border-2 font-mono text-[10px] font-medium"
+                >+{{ s.more }}</span
+              >
+            }
+          </span>
+        }
+      } @else {
+        <hlm-skeleton class="h-7 w-14 rounded-full" />
+      }
+    }
+    <span
+      class="text-muted-foreground text-[0.8125rem] whitespace-nowrap"
+      data-testid="group-members"
+      >{{ count(group.memberCount) }}</span
+    >
+  </span>
+  @if (canManage()) {
+    <span
+      class="text-muted-foreground col-start-2 flex min-w-0 flex-col gap-1 text-[0.8125rem] @3xl:col-start-auto"
+      data-testid="group-uses"
+    >
+      @let u = uses(group);
+      @if (u) {
+        @if (u.agents.length) {
+          <span class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            @for (agent of u.agents; track agent.id) {
+              <span
+                class="bg-secondary text-foreground inline-flex h-[22px] max-w-full items-center gap-1.5 rounded-full ps-0.5 pe-2.5 text-xs font-semibold"
+                ><span
+                  class="bg-primary text-primary-foreground flex size-[18px] shrink-0 items-center justify-center rounded-md text-[9px] font-bold"
+                  aria-hidden="true"
+                  >{{ agentInitials(agent.name) }}</span
+                ><span class="truncate">{{ agent.name }}</span></span
+              >
+            }
+            <span class="text-xs"
+              >{{ u.moreAgents ? '+' + u.moreAgents + ' · ' : '' }}shared
+              {{ u.agents.length + u.moreAgents === 1 ? 'agent' : 'agents' }}</span
+            >
+          </span>
+        }
+        @for (line of u.accounts; track line) {
+          <span class="flex min-w-0 items-center gap-2">
+            <ng-icon name="lucideKeyRound" size="14" class="shrink-0" aria-hidden="true" />
+            <span class="truncate">{{ line }}</span>
+          </span>
+        }
+        @if (u.identities.length && !u.agents.length && !u.accounts.length) {
+          <span class="truncate"
+            >May use <span class="font-mono text-xs">{{ u.identities.join(', ') }}</span></span
+          >
+        }
+        @if (!u.agents.length && !u.accounts.length && !u.identities.length) {
+          <span>Nothing shared with it or lent to it yet</span>
+        }
+      } @else if (!usages().get(group.id)?.error) {
+        <hlm-skeleton class="h-4 w-48" />
+      }
+    </span>
+    <span class="text-faint hidden @3xl:flex" aria-hidden="true"
+      ><ng-icon name="lucideChevronRight"
+    /></span>
+  }
+</ng-template>
+
+<app-group-dialog
+  [target]="target()"
+  [usages]="usages()"
+  (retryUsage)="retryUsage()"
+  (closed)="target.set(null)"
+/>

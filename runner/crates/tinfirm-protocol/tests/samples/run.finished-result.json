@@ -1,0 +1,18 @@
+{
+  "type": "run.finished",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 2,
+  "outcome": "SUCCEEDED",
+  "lastSeq": 17,
+  "summary": "I cannot finish this without access to the staging database.",
+  "result": {
+    "outcome": "BLOCKED",
+    "summary": "Added the retry queue and its tests. The migration test needs the staging database, which this run cannot reach.",
+    "nextSteps": ["Grant the agent read access to the staging database", "Run the migration test against it"],
+    "openQuestions": ["Which staging database should the migration test use?"]
+  },
+  "sessionId": "5b0c4d7e-1234-4a5b-9c8d-0e1f2a3b4c5d",
+  "git": [
+    {"componentId": "0192f1a4-7c1e-7b3a-9d2e-000000000010", "branch": "agent/MYCO-12", "pushed": true, "headSha": "3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a", "commits": 1}
+  ]
+}

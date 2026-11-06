@@ -1,0 +1,361 @@
+name: Release assets
+
+# The downloadable artifacts of one revision, attached to a GitHub Release. One definition
+# for both kinds of release (docs/operations/auto-deploy.md):
+#   - `rolling`, the rolling prerelease of main: ci.yml calls this after every push to
+#     main that passed the gate, once the server image sha-<sha> is pushed.
+#   - `v<version>`: release.yml calls this after reusable-release.yml created the Release.
+# Run it by hand (Actions -> Release assets) to attach the assets to a release again, on the
+# CI runners (Runners, below).
+#
+# Assets (deploy/release/assets.sh builds and names them):
+#   tinfirm-runner-host-<version>-x86_64-unknown-linux-musl.tar.gz    static, self-hosted runner
+#   tinfirm-runner-host-<version>-aarch64-unknown-linux-musl.tar.gz   static, self-hosted runner
+#   tinfirm-runner-host-<version>-aarch64-apple-darwin.tar.gz         macOS runner, see below
+#   tinfirm-runner-host-<version>-x86_64-pc-windows-msvc.zip          Windows runner, see below
+#   tinfirm-compose-<version>.tar.gz    deploy/compose, never a .env
+#   REVISION, SHA256SUMS
+#   SHA256SUMS.sig, SHA256SUMS.sigstore.json   the signature of SHA256SUMS (M13): for
+#     rolling made here, by the rolling key; for v<version> by release.yml's sign-assets,
+#     with the release key, once these assets are up
+# <version> is rolling-<sha7> for rolling, x.y.z for vx.y.z.
+#
+# The rolling key (ROLLING_COSIGN_PRIVATE_KEY, ROLLING_COSIGN_PASSWORD) is a key pair of its
+# own, not the release key of docs-site/content/cosign.pub: it is a secret of the
+# environment `rolling` (deployment branch `main`, no reviewers), which only the `publish`
+# job of a run for `rolling` names, so a pull request's workflow cannot read it. Its public
+# half is deploy/compose/auto-deploy/cosign-rolling.pub, which hosts on auto-deploy check
+# `rolling` against. It signs on a CI runner, where pull-request jobs run too, which is why
+# it is not the release key. When the environment does not hold it, `rolling` is published
+# unsigned (a warning), and hosts that follow it need TINFIRM_AUTO_DEPLOY_ALLOW_UNSIGNED=1
+# (docs/operations/auto-deploy.md, section Signed assets).
+# The release tag decides the commit (the `check` job). `rolling` builds the commit of its
+# own event and takes no `ref`: the environment admits any run of main, and `publish` runs
+# the checked-out commit's scripts with the key, so a dispatch from main that named another
+# commit, a fork's among them, would hand the key to that commit. v<version> builds
+# refs/tags/v<version>, never a branch of that name or another commit: `publish` runs the
+# commit's scripts with a token that writes the releases, and release.yml's sign-assets
+# signs only assets whose REVISION is the tag's commit.
+#
+# Windows: the runner host does not build on Windows yet (a port is planned). The job
+# runs only when the repository variable RUNNER_WINDOWS_ENABLED is 'true'; until then the
+# releases have no Windows asset.
+#
+# Runners: the Linux jobs run on the `runner` input, else vars.CI_RUNNER, else
+# GitHub-hosted ubuntu-latest. Where CI_RELEASE_RUNNER names a self-hosted runner group,
+# this file is among that group's "Selected workflows" (release.yml's header, ADR-0106),
+# so the `check` job settles the label before any job builds: a CI runner (vars.CI_RUNNER,
+# or ubuntu-latest) for any run, the release runners (vars.CI_RELEASE_RUNNER) only for
+# release.yml's call from main or a hotfix branch, and nothing else. A dispatch by hand
+# takes a CI runner's label or ubuntu-latest, so whoever can dispatch this file cannot put
+# a commit of their choice on the release runners; a release's assets are built there
+# again by re-running release.yml's `assets`.
+# The macOS and Windows builds need a machine of their own system: they run GitHub-hosted
+# (macos-14, windows-latest), unless the repository variables CI_RUNNER_MACOS /
+# CI_RUNNER_WINDOWS name a self-hosted runner label (Apple silicon, and Windows with the
+# MSVC build tools; the jobs install Rust themselves).
+#
+# Images with Claude Code are never published. These are the runner HOST
+# binary, which only embeds the runner images' Dockerfiles; hosts build the images
+# themselves (`images build`).
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "'rolling', or the release tag v<version>"
+        required: true
+        type: string
+      ref:
+        description: 'Empty, or the release tag itself. rolling builds the commit of the triggering event, v<version> its tag (header).'
+        required: false
+        type: string
+        default: ''
+      runner:
+        description: 'Runner label of the Linux jobs. Empty = vars.CI_RUNNER, else ubuntu-latest. The release runners only from release.yml (header).'
+        required: false
+        type: string
+        default: ''
+    # The rolling key, read in the environment `rolling` (header). The caller has no
+    # environment, so what it passes is empty; the environment's secrets override it in
+    # `publish`.
+    secrets:
+      ROLLING_COSIGN_PRIVATE_KEY:
+        required: false
+      ROLLING_COSIGN_PASSWORD:
+        required: false
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "'rolling', or the release tag v<version> (it must exist)"
+        required: true
+        type: string
+      ref:
+        description: 'Empty, or the release tag itself. rolling builds the selected branch, v<version> its tag (header).'
+        required: false
+        type: string
+        default: ''
+      runner:
+        description: 'Runner label of the Linux jobs: empty = vars.CI_RUNNER, else ubuntu-latest; or ubuntu-latest. Never the release runners (header).'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  # The suffix of runner-musl.Dockerfile's BuildKit cache ids (assets.sh runner-linux): `main`
+  # for main and the release branches, `pr` for a run dispatched from any other branch, so
+  # that its build never writes the caches `rolling` and the releases are built from.
+  CACHE_SCOPE: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/hotfix/')) && 'main' || 'pr' }}
+
+jobs:
+  # The inputs, before any job builds (header): the release tag, the commit it builds and the
+  # label of the Linux jobs, which the other jobs take from this job's outputs. No checkout:
+  # only this file's own script runs here. GitHub-hosted when the input asks for
+  # ubuntu-latest, so that a dispatch away from unavailable CI runners does not wait for
+  # them here.
+  check:
+    name: Check the inputs
+    runs-on: ${{ inputs.runner == 'ubuntu-latest' && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      ref: ${{ steps.check.outputs.ref }}
+      runner: ${{ steps.check.outputs.runner }}
+    steps:
+      - name: Release tag, ref and runner
+        id: check
+        env:
+          REF: ${{ inputs.ref }}
+          RUNNER: ${{ inputs.runner }}
+          CI_RUNNER: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+          RELEASE_RUNNER: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
+        run: |
+          set -euo pipefail
+          # The versions release.yml releases (set-version.sh): 1.2.3 or 1.2.3-beta.4.
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          if [ "$RELEASE_TAG" = rolling ]; then
+            if [ -n "$REF" ]; then
+              echo "::error title=ref::rolling is built from the commit of the run; leave ref empty (it is '$REF')."
+              exit 1
+            fi
+            ref=''
+          elif [[ $RELEASE_TAG =~ $semver ]]; then
+            case "$REF" in
+              '' | "$RELEASE_TAG" | "refs/tags/$RELEASE_TAG") ;;
+              *)
+                echo "::error title=ref::$RELEASE_TAG is built from its tag; leave ref empty (it is '$REF')."
+                exit 1 ;;
+            esac
+            ref="refs/tags/$RELEASE_TAG"
+          else
+            echo "::error title=release_tag::'$RELEASE_TAG' is neither rolling nor v<version>."
+            exit 1
+          fi
+          runner="${RUNNER:-$CI_RUNNER}"
+          release="$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads"
+          case "$runner" in
+            "$CI_RUNNER" | ubuntu-latest) ;;
+            "$RELEASE_RUNNER")
+              case "$GITHUB_WORKFLOW_REF" in
+                "$release/main" | "$release/hotfix/"*) ;;
+                *)
+                  echo "::error title=runner::The release runners ($runner) build only release.yml's assets, from main or a hotfix branch; this run is $GITHUB_WORKFLOW_REF."
+                  exit 1 ;;
+              esac ;;
+            *)
+              echo "::error title=runner::'$runner' is none of this repository's runner labels (the header of runner-artifacts.yml)."
+              exit 1 ;;
+          esac
+          echo "Building ${ref:-$GITHUB_SHA} for $RELEASE_TAG; Linux jobs on $runner"
+          {
+            echo "ref=$ref"
+            echo "runner=$runner"
+          } >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Runner host · ${{ matrix.target }}
+    needs: [check]
+    runs-on: ${{ needs.check.outputs.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+          persist-credentials: false
+      # Cross-compiled with zig in Docker (deploy/release/runner-musl.Dockerfile), on the
+      # daemon's own builder, whose cache mounts keep the registry and target directory.
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="$(deploy/release/assets.sh version "$RELEASE_TAG")"
+          deploy/release/assets.sh runner-linux "$TARGET" "$version" dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runner-host-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  # GitHub-hosted unless CI_RUNNER_MACOS names a
+  # self-hosted Mac: one native build, nothing else.
+  macos:
+    name: Runner host · aarch64-apple-darwin
+    needs: [check]
+    runs-on: ${{ vars.CI_RUNNER_MACOS || 'macos-14' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-09-12
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: runner
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        run: |
+          set -euo pipefail
+          (cd runner && cargo build --release --locked -p tinfirm-runner-host)
+          runner/target/release/tinfirm-runner-host --version
+          version="$(deploy/release/assets.sh version "$RELEASE_TAG")"
+          deploy/release/assets.sh package aarch64-apple-darwin "$version" \
+            runner/target/release/tinfirm-runner-host dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runner-host-aarch64-apple-darwin
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  windows:
+    name: Runner host · x86_64-pc-windows-msvc
+    needs: [check]
+    # Off until the Windows port of the runner host lands (see the header).
+    if: vars.RUNNER_WINDOWS_ENABLED == 'true'
+    runs-on: ${{ vars.CI_RUNNER_WINDOWS || 'windows-latest' }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-09-12
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: runner
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        run: |
+          set -euo pipefail
+          (cd runner && cargo build --release --locked -p tinfirm-runner-host)
+          runner/target/release/tinfirm-runner-host.exe --version
+          version="$(deploy/release/assets.sh version "$RELEASE_TAG")"
+          deploy/release/assets.sh package x86_64-pc-windows-msvc "$version" \
+            runner/target/release/tinfirm-runner-host.exe dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: runner-host-x86_64-pc-windows-msvc
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish · ${{ inputs.release_tag }}
+    needs: [check, linux, macos, windows]
+    # The Linux binaries are required. A failed macOS build (a GitHub-hosted runner) holds back a
+    # versioned release, but not `rolling`: the hosts that follow it are Linux, and it then
+    # ships without the macOS asset (the failed job stays red). Windows may be skipped.
+    if: >-
+      ${{ !cancelled()
+        && needs.linux.result == 'success'
+        && (needs.macos.result == 'success' || (inputs.release_tag == 'rolling' && needs.macos.result == 'failure'))
+        && (needs.windows.result == 'success' || needs.windows.result == 'skipped') }}
+    runs-on: ${{ needs.check.outputs.runner }}
+    timeout-minutes: 15
+    # The rolling key's environment for `rolling` (header); none for a versioned release,
+    # which release.yml signs in `release`. An empty name is no environment.
+    environment: ${{ inputs.release_tag == 'rolling' && 'rolling' || '' }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      # gh is not assumed on a self-hosted runner (reusable-release.yml does not either);
+      # this pinned release is installed when it is missing.
+      GH_VERSION: 2.102.0
+      GH_SHA256_AMD64: bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+      GH_SHA256_ARM64: 7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: runner-host-*
+          path: dist
+          merge-multiple: true
+      - name: Compose files, REVISION and SHA256SUMS
+        env:
+          MACOS_RESULT: ${{ needs.macos.result }}
+        run: |
+          set -euo pipefail
+          if [ "$MACOS_RESULT" != success ]; then
+            echo "::warning title=No macOS asset::The macOS build failed; $RELEASE_TAG ships without tinfirm-runner-host for aarch64-apple-darwin."
+          fi
+          version="$(deploy/release/assets.sh version "$RELEASE_TAG")"
+          deploy/release/assets.sh compose "$version" dist
+          deploy/release/assets.sh sums dist
+      # `rolling` only: SHA256SUMS signed with the rolling key, uploaded after SHA256SUMS
+      # and before REVISION (assets.sh, publish). Without the key it stays unsigned, with a
+      # warning.
+      - name: Sign SHA256SUMS (rolling key)
+        if: ${{ inputs.release_tag == 'rolling' }}
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.ROLLING_COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.ROLLING_COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "::warning title=rolling unsigned::ROLLING_COSIGN_PRIVATE_KEY is not set in the environment rolling, so the rolling prerelease is published without SHA256SUMS.sig; hosts that follow it need TINFIRM_AUTO_DEPLOY_ALLOW_UNSIGNED=1 (docs/operations/auto-deploy.md, Signed assets)."
+            exit 0
+          fi
+          deploy/release/sign-images.sh install "${RUNNER_TEMP}/signing" cosign
+          PATH="${RUNNER_TEMP}/signing/bin:$PATH" \
+            deploy/release/assets.sh sign-sums dist deploy/compose/auto-deploy/cosign-rolling.pub
+      - name: Install gh if missing
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then gh --version | head -n 1; exit 0; fi
+          case "$(uname -m)" in
+            x86_64) arch=amd64; sum="$GH_SHA256_AMD64" ;;
+            aarch64) arch=arm64; sum="$GH_SHA256_ARM64" ;;
+            *) echo "::error::no pinned gh for $(uname -m)"; exit 1 ;;
+          esac
+          dir="${RUNNER_TEMP}/gh"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/gh.tar.gz" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${arch}.tar.gz"
+          echo "${sum}  $dir/gh.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/gh.tar.gz" -C "$dir" --strip-components=1
+          echo "$dir/bin" >> "$GITHUB_PATH"
+      # For `rolling`: only while this commit is still the tip of main, and in an order that
+      # lets the hosts recognise a half-updated release (assets.sh, cmd_publish).
+      - name: Upload to ${{ inputs.release_tag }}
+        run: deploy/release/assets.sh publish "$RELEASE_TAG" dist

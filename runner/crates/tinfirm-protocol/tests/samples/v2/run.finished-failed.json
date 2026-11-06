@@ -1,0 +1,14 @@
+{
+  "type": "run.finished",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 1,
+  "outcome": "FAILED",
+  "lastSeq": 7,
+  "failureClass": "USAGE_LIMIT",
+  "failureMessage": "Claude usage limit reached; resets at 2026-09-26T15:00:00Z",
+  "summary": null,
+  "sessionId": null,
+  "git": null,
+  "resumed": false,
+  "resumeOutcome": "NO_SESSION"
+}

@@ -1,0 +1,12 @@
+{
+  "type": "run.assign",
+  "runId": "01926f3e-8c1a-7b2e-9f3d-2a4b6c8d0e1f",
+  "epoch": 3,
+  "credentialLabel": "claude-max",
+  "agent": { "id": "01926f3e-5800-7a00-8b11-1c2d3e4f5a6b", "name": "Researcher", "runtime": "CLAUDE_CODE", "model": "claude-opus-4" },
+  "task": { "id": "01926f3e-4700-7900-8a11-0b1c2d3e4f5a", "key": "MYCO-13", "title": "Summarise the design review" },
+  "prompt": "You are Researcher, an AI agent of the company \"My Company\", working through Tinfirm.\n",
+  "workspaces": [],
+  "requestableRepositories": [],
+  "limits": { "maxWallClockSeconds": 3600, "maxTurns": 200 }
+}

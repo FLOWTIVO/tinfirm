@@ -1,0 +1,8 @@
+{
+  "name": "tinfirm-runner-image-opencode",
+  "private": true,
+  "description": "The npm packages of the OPENCODE runner image, installed with npm ci --ignore-scripts from package-lock.json.",
+  "dependencies": {
+    "@opencode/cli": "2.0.29"
+  }
+}

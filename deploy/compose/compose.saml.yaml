@@ -1,0 +1,62 @@
+# SAML sign-in against the dev Keycloak (ADR-0086). DEVELOPMENT ONLY. Layer it on compose.yaml
+# together with the `oidc` profile, which runs Keycloak; `make up-saml` does exactly this, after
+# it made the service provider's dev key in deploy/compose/.saml/ (git-ignored):
+#
+#   docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.saml.yaml \
+#     --profile oidc up -d --build
+#
+# Keycloak's realm tinfirm-saml (keycloak/tinfirm-saml-realm.json) has one SAML client, which signs
+# the response and the assertion and checks the AuthnRequest's signature with the SP's dev
+# certificate. The server reads the IdP metadata only from https or a file, so saml-metadata saves
+# Keycloak's descriptor into a volume the server mounts. Sign in at http://localhost:8080/login with
+# "Keycloak SAML (dev)" as sam; SAML needs the Enterprise edition (a licence key, ADR-0077).
+
+services:
+  keycloak:
+    environment:
+      # Substituted into keycloak/tinfirm-saml-realm.json at import.
+      TINFIRM_SAML_SP_CERT_B64: ${TINFIRM_SAML_SP_CERT_B64:?run make up-saml, which makes the SP's dev key}
+    volumes:
+      - ./keycloak/tinfirm-saml-realm.json:/opt/keycloak/data/import/tinfirm-saml-realm.json:ro
+
+  saml-metadata:
+    profiles: [oidc]
+    # The image of the bundled LiteLLM, for its Python: it fetches the descriptor once. As root,
+    # not as the image's non-root user: Docker creates the fresh volume root-owned.
+    image: ghcr.io/berriai/litellm-non_root:v1.106.6@sha256:6363e53f135dafbf4a68fac25f77aec3f2b99be37665e8c5f623a952637c220b
+    user: "0:0"
+    entrypoint:
+      - python3
+      - -c
+      - >-
+        import urllib.request;
+        open('/saml/keycloak.xml', 'wb').write(urllib.request.urlopen(
+        'http://keycloak.localhost:8180/realms/tinfirm-saml/protocol/saml/descriptor').read())
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    volumes:
+      - saml-metadata:/saml
+    restart: "no"
+
+  server:
+    depends_on:
+      saml-metadata:
+        condition: service_completed_successfully
+    volumes:
+      - saml-metadata:/etc/tinfirm/saml:ro
+    environment:
+      TINFIRM_AUTH_SAML_SP_CREDENTIALS_DEV_KEY: ${TINFIRM_SAML_SP_KEY:?run make up-saml, which makes the SP's dev key}
+      TINFIRM_AUTH_SAML_SP_CREDENTIALS_DEV_CERT: ${TINFIRM_SAML_SP_CERT:?run make up-saml, which makes the SP's dev key}
+      TINFIRM_AUTH_SAML_SP_ACTIVE_CREDENTIAL: dev
+      TINFIRM_AUTH_SAML_PROVIDERS_KEYCLOAKSAML_NAME: Keycloak SAML (dev)
+      TINFIRM_AUTH_SAML_PROVIDERS_KEYCLOAKSAML_METADATA_LOCATION: file:/etc/tinfirm/saml/keycloak.xml
+      # A new user from Keycloak joins the company `main` of compose.yaml (ADR-0075), and Keycloak's
+      # groups decide the role at every sign-in (ADR-0088): sam is in tinfirm-users.
+      TINFIRM_AUTH_SAML_PROVIDERS_KEYCLOAKSAML_COMPANY: main
+      TINFIRM_AUTH_SAML_PROVIDERS_KEYCLOAKSAML_ROLE_CLAIM: groups
+      TINFIRM_AUTH_SAML_PROVIDERS_KEYCLOAKSAML_ROLE_MAP_ADMIN: tinfirm-admins
+      TINFIRM_AUTH_SAML_PROVIDERS_KEYCLOAKSAML_ROLE_MAP_MEMBER: tinfirm-users
+
+volumes:
+  saml-metadata:

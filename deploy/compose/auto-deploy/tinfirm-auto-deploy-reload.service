@@ -1,0 +1,11 @@
+# Template: install.sh replaces @SYSTEMCTL@ and @UNIT@ (the runner host's unit, default
+# tinfirm-runner) and installs it as /etc/systemd/system/tinfirm-auto-deploy-reload.service.
+# Started by tinfirm-auto-deploy-reload.path only. `reload` drains the runner host (SIGHUP):
+# its runs finish, and systemd starts the binary installed now (runner/README.md, Drain and
+# upgrades). The deploy user can ask for exactly this.
+[Unit]
+Description=Tinfirm auto-deploy: drain the runner host so that it restarts with its new binary
+
+[Service]
+Type=oneshot
+ExecStart=@SYSTEMCTL@ reload @UNIT@

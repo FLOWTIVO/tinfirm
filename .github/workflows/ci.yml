@@ -1,0 +1,982 @@
+name: CI
+
+# The gate. It runs on pull requests and on every push to main: the merge commit on main is
+# a different commit from the one the pull request tested, and it is the one that gets
+# released. release.yml calls this same workflow (`workflow_call`) as its release gate.
+# Under `workflow_call` the event name is the CALLER's (`workflow_dispatch`), so no gate
+# job may branch on it. The two that do, `publish` and `rolling`, must NOT run under the
+# release gate: after a push to main they publish that commit, the server image
+# (sha-<sha> and `main`) and the rolling prerelease with the runner host binaries and the
+# Compose files, which hosts that follow rolling deploy from
+# (docs/operations/auto-deploy.md).
+#
+# Runners: every job runs on the runner label in the repository variable CI_RUNNER
+# (Settings -> Secrets and variables -> Actions -> Variables), else on GitHub-hosted
+# `ubuntu-latest`; rolling and security pass the same label to their reusable workflow's
+# `runner` input. What the jobs need of a runner is Docker:
+#   - server needs a Docker daemon for Testcontainers: a real one, with no
+#     docker-in-docker and no privileged containers.
+#   - image, publish, runner, docs and the Linux builds of rolling build on that daemon. On
+#     a self-hosted runner whose daemon persists, its BuildKit cache keeps the npm, Maven
+#     and cargo cache mounts between runs. runner checks in Docker (runner/ci.Dockerfile)
+#     and docs builds in Docker (docs-site/Dockerfile), so a runner needs no C toolchain
+#     and no Python.
+#   - web, helm, main-complete and the security scanners need nothing special of the
+#     runner. helm installs its linters as pinned binaries, not Docker Hub images.
+# Beyond this workflow, the macOS build of the release assets needs a macOS runner
+# (runner-artifacts.yml). The release's signing and image builds take a label of their own
+# (release.yml: vars.CI_RELEASE_RUNNER, else `ubuntu-latest`).
+# BuildKit cache mounts are scoped: every `id=` in Dockerfile, model-api/Dockerfile and
+# deploy/release/runner-musl.Dockerfile ends in the build argument CACHE_SCOPE, `main` for
+# builds of main and hotfix branches (pushes, the release gate, the release) and `pr` for
+# everything else (env CACHE_SCOPE below), so a pull request's build, or a dependency it
+# pulls, never writes a cache that a build of main reads. The scope is set in this file,
+# which a pull request can change for its own run: it keeps an honest pull request's
+# dependencies out of main's caches, and the release runner keeps the release apart.
+# A self-hosted label in CI_RUNNER needs the repository in that runner group, or the jobs
+# queue forever; deleting the variable sends them back to `ubuntu-latest`, no code change.
+# A pull request from a fork runs on `ubuntu-latest` whatever CI_RUNNER names: each job here
+# that runs on a pull request, and security's `runner`, checks whether the head repository
+# is this one, so that outside code never runs on a self-hosted runner (dco.yml always runs
+# on `ubuntu-latest`). Pushes, same-repository pull requests, the release gate and the
+# weekly sweep take CI_RUNNER, and so does pr_agent.yml, whose `if:` skips a fork's head.
+# A fork's run reads the workflow files of its own head, so the expression is the default,
+# not the guard: two settings, not code, stack with it, the runner group's "Allow public
+# repositories" and Actions' "Require approval for all outside collaborators".
+# The security scan, the release and the hotfix cut are reusable workflows of this
+# repository (reusable-*.yml), and the steps they share are its composite actions
+# (.github/actions/, ADR-0106).
+# A local action is read from the job's workspace, so a job checks this repository out
+# before it uses one. Every third-party action, in the workflows and in the composite
+# actions, is pinned by commit SHA with its release in the comment, and every scanner
+# image by digest; the helm job's pin check (.github/check-pins.sh) fails on any other.
+#
+# Secrets and environments (H3 of the security review of 2026-10-27): the cosign key is a
+# secret of the environment `release` and the release App's key of `release-deploy`
+# (release.yml), the rolling key of `rolling` (runner-artifacts.yml). An environment's
+# secrets reach only the jobs that name it, and only from the branches it allows, so a
+# workflow file on a feature branch cannot read them; no repository or organisation secret
+# of those names may exist. No job here holds a key to a deployment repository: CI
+# publishes images and moves tags, and a deployment repository follows them on its own
+# schedule (ADR-0107).
+# OPENAI_KEY (pr_agent.yml) is a repository secret, in no environment: it can only cost
+# money, and gating it would need a pull_request_target job.
+on:
+  pull_request:
+    # Hotfix branches get the same gate as main (reusable-hotfix-branch.yml).
+    branches: [main, 'hotfix/**']
+  push:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  # `github.workflow` is the CALLER's name under workflow_call, so the release gate never
+  # shares a group with (and never cancels) the CI run of a push or pull request.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A push to main is never cancelled by the next merge: its result is the evidence for
+  # that exact commit. Pull-request runs supersede each other.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+permissions:
+  contents: read
+
+env:
+  # The suffix of the BuildKit cache ids (header): `main` for main and hotfix branches,
+  # `pr` for pull requests and anything else.
+  CACHE_SCOPE: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/hotfix/')) && 'main' || 'pr' }}
+
+jobs:
+  server:
+    name: Server · verify
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: server/pom.xml
+      # Compile, unit and integration tests (Testcontainers PostgreSQL 18, needs Docker),
+      # Modulith verification.
+      - name: Verify
+        working-directory: server
+        run: ./mvnw -B -ntp verify
+      - name: Keep the test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-test-reports
+          path: |
+            server/target/surefire-reports/
+            server/target/failsafe-reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  model-api:
+    name: Model API · verify
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: model-api/pom.xml
+      # The model port (ADR-0069): its tests against a fake LiteLLM on localhost, and the shared
+      # libraries' own (libs/litellm, libs/net).
+      - name: Verify
+        working-directory: model-api
+        run: ./mvnw -B -ntp verify
+      - name: Keep the test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: model-api-test-reports
+          path: model-api/target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  web:
+    name: Web · lint, test, build
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      NG_CLI_ANALYTICS: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        working-directory: web
+        run: npm ci
+      # The licences of the production packages, against ADR-0082's policy.
+      - name: Licences
+        working-directory: web
+        run: npm run licences
+      # `pretest` and `prebuild` regenerate the API client from ../api/openapi.yaml.
+      - name: Lint
+        working-directory: web
+        run: npm run lint
+      - name: Test
+        working-directory: web
+        run: npm test
+      - name: Build
+        working-directory: web
+        run: npm run build
+
+  e2e:
+    name: Web · e2e (Playwright, real server)
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    # web/e2e/README.md: the server built from this commit, the production build of the app
+    # served by it (E2E_WEB=built), the fakes and the scripted runner, then the desktop and
+    # phone projects. About 20 minutes on 4 CPUs, plus the jar and the app's build.
+    timeout-minutes: 45
+    env:
+      NG_CLI_ANALYTICS: 'false'
+      CI: '1'
+      E2E_WEB: built
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: server/pom.xml
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # Self-hosted runners on one machine may share its Docker daemon and its host
+      # ports, and two e2e jobs may run side by side there, so this job's ports, the
+      # database's and the stack's (web/e2e/harness/config.ts), are free ones the OS hands out.
+      - name: Ports
+        run: |
+          node -e '
+            const net = require("node:net");
+            const names = ["E2E_DB_PORT", "E2E_SERVER_PORT", "E2E_MANAGEMENT_PORT", "E2E_WEB_PORT",
+              "E2E_CONTROL_PORT", "E2E_LITELLM_PORT", "E2E_STUBS_PORT"];
+            const open = () => new Promise((ok) => {
+              const server = net.createServer().listen(0, "127.0.0.1", () => ok(server));
+            });
+            Promise.all(names.map(open)).then((servers) => {
+              servers.forEach((server, i) => console.log(names[i] + "=" + server.address().port));
+              servers.forEach((server) => server.close());
+            });
+          ' | tee -a "$GITHUB_ENV"
+      # PostgreSQL 18 on the runner's daemon, and psql from the same image, so that the runner
+      # needs none: the harness recreates its database through E2E_PSQL.
+      - name: PostgreSQL
+        run: |
+          set -euo pipefail
+          name="tinfirm-e2e-pg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "PG_CONTAINER=$name" >> "$GITHUB_ENV"
+          docker run -d --name "$name" -e POSTGRES_PASSWORD=postgres \
+            -p "127.0.0.1:${E2E_DB_PORT}:5432" postgres:18
+          psql="$RUNNER_TEMP/psql"
+          cat > "$psql" <<'SH'
+          #!/bin/sh
+          exec docker run --rm -i --network host -e PGPASSWORD postgres:18 psql "$@"
+          SH
+          chmod +x "$psql"
+          echo "E2E_PSQL=$psql" >> "$GITHUB_ENV"
+          # Over TCP: while the image initialises, its first server listens on the socket only.
+          for _ in $(seq 1 60); do
+            PGPASSWORD=postgres "$psql" -h 127.0.0.1 -p "$E2E_DB_PORT" -U postgres -tAc 'SELECT 1' \
+              >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "::error::PostgreSQL did not start"; exit 1
+      - name: Server jar
+        working-directory: server
+        run: ./mvnw -B -ntp -DskipTests package
+      - name: Install
+        working-directory: web
+        run: npm ci
+      # The stack (the fakes, the scripted runner, the server serving the app's build) runs on
+      # the CI runner itself, seeded there: the seed signs the run's licence key with the JDK.
+      - name: Stack
+        working-directory: web
+        env:
+          E2E_SERVER_BUILD: never
+        run: |
+          set -euo pipefail
+          # node itself, not npm, so that the last step's SIGTERM stops the server it started.
+          nohup node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON e2e/harness/stack.ts \
+            > "$RUNNER_TEMP/e2e-stack.log" 2>&1 &
+          echo "STACK_PID=$!" >> "$GITHUB_ENV"
+          # It builds the app first when there is no build; then the server's migrations.
+          for _ in $(seq 1 900); do
+            curl -fsS -o /dev/null "http://127.0.0.1:${E2E_CONTROL_PORT}/health" 2>/dev/null && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null "http://127.0.0.1:${E2E_CONTROL_PORT}/health" \
+            || { tail -n 50 "$RUNNER_TEMP/e2e-stack.log"; echo "::error::the e2e stack did not start"; exit 1; }
+          npm run e2e:seed
+      # Playwright in its own image, whose Chromium brings the system libraries it needs, against
+      # the stack above (E2E_STACK=external); the image's tag is the lockfile's version.
+      - name: e2e
+        run: |
+          # What the run competes with: runners on one machine may share its CPUs (web/e2e/README.md, "Parallel workers").
+          echo "CPUs: $(nproc); load: $(cut -d' ' -f1-3 /proc/loadavg); memory: $(free -m | awk '/^Mem/ {print $7 " MB available of " $2}')"
+          docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e CI -e E2E_WEB -e E2E_STACK=external -e E2E_DB_PORT -e E2E_SERVER_PORT \
+            -e E2E_MANAGEMENT_PORT -e E2E_WEB_PORT -e E2E_CONTROL_PORT -e E2E_LITELLM_PORT \
+            -e E2E_STUBS_PORT -v "$PWD:/work" -w /work/web \
+            mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f \
+            npx playwright test
+      # Each failed attempt, a flaky test's among them: its page's snapshot and the API requests
+      # that failed or were slow, then the server's warnings and errors, in this log for a reader
+      # who cannot fetch the artifact.
+      - name: What the failed attempts saw
+        if: always()
+        continue-on-error: true
+        working-directory: web
+        run: node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON e2e/harness/failure-report.ts
+      - name: Keep the report and the logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+            web/e2e/.state/*.log
+            ${{ runner.temp }}/e2e-stack.log
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Stop the stack
+        if: always() && env.STACK_PID != ''
+        run: kill "$STACK_PID" 2>/dev/null || true
+      - name: Stop PostgreSQL
+        if: always() && env.PG_CONTAINER != ''
+        run: docker rm -f "$PG_CONTAINER"
+
+  docs:
+    name: Docs site · strict build, image
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # docs-site/Dockerfile: its build stage installs the locked Zensical and builds the site
+      # with --strict, which fails on a link to a page or an anchor that does not exist; its
+      # runtime stage is the image that serves the site. In Docker, as the runner's checks
+      # are, so a CI runner needs no Python. The server's publishing does not wait for this
+      # job; publish-docs does.
+      - name: Build
+        run: |
+          set -euo pipefail
+          tag="tinfirm-docs:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          docker build --progress=plain -t "$tag" docs-site
+      # What the image must run with: user 101, a read-only root with /tmp writable, no
+      # capabilities. Then a page, a directory without its slash, a page that does not exist
+      # and the probe, as nginx serves them.
+      - name: Check the runtime contract
+        run: |
+          set -euo pipefail
+          user="$(docker image inspect --format '{{.Config.User}}' "$TAG")"
+          echo "user=$user"
+          [ "$user" = "101:101" ] || { echo "::error::the docs image runs as '$user', expected 101:101"; exit 1; }
+          container="$(docker run -d --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges:true -p 127.0.0.1::8080 "$TAG")"
+          echo "CONTAINER=$container" >> "$GITHUB_ENV"
+          base="http://$(docker port "$container" 8080/tcp | head -n 1)"
+          for _ in $(seq 1 20); do
+            curl -fsS -o /dev/null "$base/healthz" 2>/dev/null && break
+            sleep 0.5
+          done
+          expect() {
+            local got
+            got="$(curl -s -o /dev/null -w '%{http_code}' "$base$1" || true)"
+            echo "$1: $got"
+            if [ "$got" != "$2" ]; then
+              echo "::error::$1 answered $got, expected $2"
+              docker logs "$container"
+              exit 1
+            fi
+          }
+          expect /healthz 200
+          expect / 200
+          expect /concepts/ 200
+          expect /concepts 301
+          expect /no/such/page 404
+      - name: Remove the container and the image
+        if: always()
+        run: |
+          if [ -n "${CONTAINER:-}" ]; then docker rm -f "$CONTAINER" > /dev/null || true; fi
+          if [ -n "${TAG:-}" ]; then docker image rm "$TAG" || true; fi
+
+  helm:
+    name: Deploy · helm, compose, Dockerfile and workflow lint
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    # The linters are the release binaries of the versions `make deploy-lint` runs as images
+    # (change both together), checked against these SHA-256 sums, not Docker images: a binary
+    # starts at once, with no pull from Docker Hub that can stall the job, and publishing waits
+    # for this job. actionlint's sums are from its checksums.txt; hadolint and shellcheck
+    # publish none, so theirs are of the release files as downloaded.
+    env:
+      HADOLINT_VERSION: 2.15.1
+      HADOLINT_SHA256_AMD64: c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
+      HADOLINT_SHA256_ARM64: f6198ef8090f404dbb771abfee086eb8c48ac177f30da7fd3510aca35b344b5d
+      SHELLCHECK_VERSION: 0.11.0
+      SHELLCHECK_SHA256_AMD64: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+      SHELLCHECK_SHA256_ARM64: 12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256_AMD64: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+      ACTIONLINT_SHA256_ARM64: 325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.0
+      # The release key's public half ships with the Compose files, where install.sh gives it
+      # to the auto-deploy hosts, and with the runner host's Ansible role (M13): copies of the
+      # one customers verify against.
+      - name: The shipped cosign.pub
+        run: |
+          for copy in deploy/compose/auto-deploy/cosign.pub deploy/ansible/roles/tinfirm_runner_host/files/cosign.pub; do
+            cmp docs-site/content/cosign.pub "$copy" \
+              || { echo "::error::$copy must be a copy of docs-site/content/cosign.pub"; exit 1; }
+          done
+      # The check the auto-deploy hosts run on SHA256SUMS.sig (openssl, no cosign), against
+      # a throwaway P-256 key and a signature in cosign's format (base64 DER).
+      - name: The signature check of SHA256SUMS
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          echo test > "$dir/asset"
+          (cd "$dir" && sha256sum asset > SHA256SUMS)
+          openssl ecparam -name prime256v1 -genkey -noout -out "$dir/key.pem"
+          openssl ec -in "$dir/key.pem" -pubout -out "$dir/key.pub"
+          openssl dgst -sha256 -sign "$dir/key.pem" "$dir/SHA256SUMS" | openssl base64 -A > "$dir/SHA256SUMS.sig"
+          rm "$dir/key.pem"
+          deploy/release/assets.sh verify-sums "$dir" "$dir/key.pub"
+          echo "x" >> "$dir/SHA256SUMS"
+          if deploy/release/assets.sh verify-sums "$dir" "$dir/key.pub" 2>/dev/null; then
+            echo "::error::verify-sums accepted a changed SHA256SUMS"; exit 1
+          fi
+          rm -rf "$dir"
+      # The published chart carries the repository's licence (ADR-0082): a copy of it.
+      - name: The chart's LICENSE
+        run: |
+          cmp LICENSE deploy/helm/tinfirm/LICENSE \
+            || { echo "::error::deploy/helm/tinfirm/LICENSE must be a copy of the root LICENSE: cp LICENSE deploy/helm/tinfirm/LICENSE"; exit 1; }
+      # Default values, then every values set in ci/ (ingress on; every optional branch).
+      - name: Helm lint and template
+        run: |
+          set -euo pipefail
+          chart=deploy/helm/tinfirm
+          helm lint --strict "$chart"
+          helm template tinfirm "$chart" > /dev/null
+          for values in "$chart"/ci/*.yaml; do
+            echo "::group::$values"
+            helm lint --strict "$chart" -f "$values"
+            helm template tinfirm "$chart" -f "$values" > /dev/null
+            echo "::endgroup::"
+          done
+      - name: Compose config (with and without the oidc profile, SAML, and the Entra ID and second-company examples)
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env.example)
+          "${compose[@]}" config --quiet
+          "${compose[@]}" --profile oidc config --quiet
+          "${compose[@]}" -f deploy/compose/compose.oidc.yaml --profile oidc config --quiet
+          TINFIRM_SAML_SP_KEY=lint TINFIRM_SAML_SP_CERT=lint TINFIRM_SAML_SP_CERT_B64=lint \
+            "${compose[@]}" -f deploy/compose/compose.saml.yaml --profile oidc config --quiet
+          TINFIRM_ENTRA_TENANT_ID=lint TINFIRM_ENTRA_CLIENT_ID=lint TINFIRM_ENTRA_CLIENT_SECRET=lint \
+            "${compose[@]}" -f deploy/compose/compose.entra.yaml config --quiet
+          TINFIRM_ACME_ISSUER_URI=https://sso.example.com TINFIRM_ACME_CLIENT_ID=lint TINFIRM_ACME_CLIENT_SECRET=lint \
+            "${compose[@]}" -f deploy/compose/compose.companies.example.yaml config --quiet
+      # Dependabot bumps the Compose file's LiteLLM alone. The chart's goes with it, and the
+      # shared filter of LiteLLM's fields with both (libs/litellm, LiteLlmRequests, which the
+      # server's relay and the model port use): it removes the new version's
+      # all_litellm_params, which libs/litellm/src/test/resources/litellm/all-litellm-params.txt
+      # lists.
+      - name: LiteLLM pin (the chart's is the Compose file's)
+        run: |
+          set -euo pipefail
+          # LiteLLM's container only: the model port (model-api) runs in the same pod.
+          chart=$(helm template tinfirm deploy/helm/tinfirm --show-only templates/litellm-deployment.yaml \
+            | sed -n 's/^ *image: "\(.*\/berriai\/litellm-non_root:.*\)"$/\1/p')
+          compose=$(docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env.example \
+            config --images | grep '/berriai/litellm-non_root:')
+          echo "chart:   $chart"
+          echo "compose: $compose"
+          if [ -z "$chart" ] || [ "$chart" != "$compose" ]; then
+            echo "::error::The LiteLLM image of deploy/helm/tinfirm/values.yaml and deploy/compose/compose.yaml differ: pin one tag and digest in both, and check LiteLlmRequests against that version's all_litellm_params"
+            exit 1
+          fi
+      # Into this job's own temporary directory, never $HOME, which other jobs on a
+      # self-hosted runner may share. On the PATH, shellcheck also checks the workflows'
+      # `run:` scripts for actionlint, as in its image.
+      - name: Install the linters
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) hadolint=x86_64; shellcheck=x86_64; actionlint=amd64
+              sums=("$HADOLINT_SHA256_AMD64" "$SHELLCHECK_SHA256_AMD64" "$ACTIONLINT_SHA256_AMD64") ;;
+            aarch64) hadolint=arm64; shellcheck=aarch64; actionlint=arm64
+              sums=("$HADOLINT_SHA256_ARM64" "$SHELLCHECK_SHA256_ARM64" "$ACTIONLINT_SHA256_ARM64") ;;
+            *) echo "::error::no pinned linters for $(uname -m)"; exit 1 ;;
+          esac
+          dir="${RUNNER_TEMP}/lint"
+          mkdir -p "$dir/bin"
+          fetch() { curl -fsSL --retry 3 --max-time 120 -o "$dir/$1" "$2"; echo "$3  $dir/$1" | sha256sum -c -; }
+          fetch hadolint \
+            "https://github.com/hadolint/hadolint/releases/download/v${HADOLINT_VERSION}/hadolint-linux-${hadolint}" "${sums[0]}"
+          fetch shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.${shellcheck}.tar.xz" "${sums[1]}"
+          fetch actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_${actionlint}.tar.gz" "${sums[2]}"
+          install -m 755 "$dir/hadolint" "$dir/bin/hadolint"
+          tar -xJf "$dir/shellcheck.tar.xz" -C "$dir/bin" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          tar -xzf "$dir/actionlint.tar.gz" -C "$dir/bin" actionlint
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          "$dir/bin/hadolint" --version
+          "$dir/bin/shellcheck" --version | sed -n 2p
+          "$dir/bin/actionlint" -version | head -n 1
+      - name: Dockerfile lint (hadolint)
+        timeout-minutes: 2
+        run: hadolint Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile model-api/Dockerfile docs-site/Dockerfile
+      - name: Shell script lint (shellcheck)
+        timeout-minutes: 2
+        run: |
+          shellcheck deploy/compose/deploy-host.sh deploy/compose/smoke.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh ee/runner/images/vm/setup.sh \
+            .github/check-pins.sh .github/actions/set-version/*.sh
+      - name: Workflow lint (actionlint)
+        timeout-minutes: 2
+        run: actionlint -color
+      # Every action pinned by commit SHA and every scanner image by digest (ADR-0106).
+      - name: Action pins
+        timeout-minutes: 2
+        run: .github/check-pins.sh
+
+  image:
+    name: Image · build (no push)
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No setup-buildx-action on purpose: the daemon's own builder keeps its cache
+      # between runs on a self-hosted runner, and BuildKit is the default builder.
+      - name: Build
+        run: |
+          set -euo pipefail
+          tag="tinfirm-server:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          docker build --progress=plain \
+            --build-arg "REVISION=${GITHUB_SHA}" \
+            --build-arg "CACHE_SCOPE=${CACHE_SCOPE}" \
+            -t "$tag" .
+      - name: Check the runtime contract
+        run: |
+          set -euo pipefail
+          user="$(docker image inspect --format '{{.Config.User}}' "$TAG")"
+          ports="$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$TAG")"
+          echo "user=$user ports=$ports"
+          [ "$user" = "10001:10001" ] || { echo "::error::image user is '$user', expected 10001:10001"; exit 1; }
+          case "$ports" in *'"8080/tcp"'*'"8081/tcp"'*) ;; *) echo "::error::image must expose 8080 and 8081"; exit 1 ;; esac
+          # The JVM starts as the image user with a read-only root and only /tmp writable.
+          docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --entrypoint java "$TAG" -version
+          docker run --rm --read-only --entrypoint test "$TAG" -s /app/application.jar
+          # The licences and the third-party notices (ADR-0082).
+          docker run --rm --read-only --entrypoint sh "$TAG" -c \
+            'for f in LICENSE ee/LICENSE THIRD-PARTY-server.txt THIRD-PARTY-web.txt; do test -s "/licenses/$f" || { echo "no /licenses/$f" >&2; exit 1; }; done'
+      - name: Start the image against PostgreSQL
+        # The unit tests run on the test classpath; only a start of the packaged image shows a class the jar lacks,
+        # a bean that cannot be created or a migration that fails (CONTRIBUTING §5).
+        timeout-minutes: 8
+        run: deploy/compose/smoke.sh "$TAG" 240
+      # The image of the model port (ADR-0069): the same runtime contract as the server's, with
+      # its own ports.
+      - name: Build the model port
+        run: |
+          set -euo pipefail
+          model_api="tinfirm-model-api:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "SERVICE_TAGS=$model_api" >> "$GITHUB_ENV"
+          check() {
+            local tag="$1" dockerfile="$2" first="$3" second="$4" user ports
+            docker build --progress=plain -f "$dockerfile" \
+              --build-arg "REVISION=${GITHUB_SHA}" \
+              --build-arg "CACHE_SCOPE=${CACHE_SCOPE}" \
+              -t "$tag" .
+            user="$(docker image inspect --format '{{.Config.User}}' "$tag")"
+            ports="$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$tag")"
+            echo "$tag: user=$user ports=$ports"
+            [ "$user" = "10001:10001" ] || { echo "::error::$tag runs as '$user', expected 10001:10001"; exit 1; }
+            case "$ports" in *"\"$first/tcp\""*"\"$second/tcp\""*) ;; *) echo "::error::$tag must expose $first and $second"; exit 1 ;; esac
+            docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
+              --security-opt no-new-privileges:true \
+              --entrypoint java "$tag" -version
+            docker run --rm --read-only --entrypoint test "$tag" -s /app/application.jar
+            docker run --rm --read-only --entrypoint sh "$tag" -c \
+              'for f in LICENSE THIRD-PARTY-model-api.txt; do test -s "/licenses/$f" || { echo "no /licenses/$f" >&2; exit 1; }; done'
+          }
+          check "$model_api" model-api/Dockerfile 4001 4002
+      - name: Remove the images
+        if: always()
+        run: |
+          if [ -n "${TAG:-}" ]; then docker image rm "$TAG" || true; fi
+          for tag in ${SERVICE_TAGS:-}; do docker image rm "$tag" || true; done
+
+  runner:
+    name: Runner · test, clippy, fmt
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+    # A daemon's first run, as every run on a GitHub-hosted runner is, pulls the Rust image
+    # and compiles every dependency, about 26 minutes. Later runs on a self-hosted runner's
+    # persistent daemon reuse its image and cache mounts.
+    timeout-minutes: 45
+    # Each check is a stage of runner/ci.Dockerfile, built on the CI runner's daemon, so the
+    # runner itself needs no C toolchain: that image has one, the pinned Rust (1.99.1, the
+    # release build's; the workspace's rust-version 1.89 is the minimum) and Node for the
+    # fake ACP agent. Its cache mounts keep the crate registry and the target directory
+    # between runs, and nothing is written into the checkout.
+    # `cacheonly`: a check's result is its build log; no image is kept. A check whose inputs
+    # did not change since it passed on this daemon shows CACHED instead of running again.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Format
+        run: docker build --progress=plain --output type=cacheonly -f runner/ci.Dockerfile --target fmt .
+      - name: Clippy
+        run: docker build --progress=plain --output type=cacheonly -f runner/ci.Dockerfile --target clippy .
+      # Unit, protocol schema, CLI and end-to-end tests, and the pi adapter's tests. Not
+      # docker_runs.rs, which runs the key scenarios in real containers: a build has no
+      # Docker daemon (`make runner-test` runs them, on a host with Docker and a uid-1000
+      # user; runner/README.md, "Linux hosts").
+      - name: Test
+        run: docker build --progress=plain --output type=cacheonly -f runner/ci.Dockerfile --target test .
+      # The crates' licences against ADR-0082's policy, and runner/THIRD-PARTY-LICENSES.txt as
+      # Cargo.lock gives it (cargo-about; `make runner-licences` writes it again).
+      - name: Licences
+        run: docker build --progress=plain --output type=cacheonly -f runner/ci.Dockerfile --target licences .
+
+  # After a push to main that passed the gate (not the security scans), two jobs publish the
+  # commit for hosts that deploy main (docs/operations/auto-deploy.md):
+  #   publish  the server image ghcr.io/flowtivo/tinfirm-server:sha-<sha>, and `main`, and
+  #            the chart oci://ghcr.io/flowtivo/charts/tinfirm:0.0.0-sha-<sha> (ADR-0080);
+  #   rolling  the rolling prerelease with the runner host binaries and the Compose files
+  #            (runner-artifacts.yml), after the image: hosts that see the new prerelease
+  #            pull sha-<sha> right away.
+  # Releases keep their own images and assets (release.yml).
+  #
+  # Both are skipped under the release gate (workflow_call), where the event is the caller's
+  # `workflow_dispatch`. release.yml still grants their permissions, because GitHub
+  # validates a nested job's permissions before it evaluates `if:`. Each has a concurrency
+  # group that is never cancelled, so pushes publish one after the other, in order; and
+  # each moves `main`/`rolling` only while its commit is still the tip of main, so a re-run
+  # of an older run never moves them back (the hosts would deploy an older server onto a
+  # database that newer Flyway migrations already changed).
+  publish:
+    name: Publish · server image (main)
+    needs: [server, web, helm, image, runner]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    concurrency:
+      group: publish-server-image
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/flowtivo/tinfirm-server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The same Dockerfile and REVISION as the image job: on a self-hosted runner whose daemon
+      # persists, the BuildKit cache makes this mostly a cache hit. Hosts log the subject label
+      # with each deploy (for a merge commit, the pull request's title).
+      - name: Build
+        run: |
+          set -euo pipefail
+          subject="$(deploy/release/assets.sh subject)"
+          docker build --progress=plain \
+            --build-arg "REVISION=${GITHUB_SHA}" \
+            --build-arg "CACHE_SCOPE=${CACHE_SCOPE}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "dev.tinfirm.commit-subject=${subject}" \
+            -t "${IMAGE}:sha-${GITHUB_SHA}" -t "${IMAGE}:main" .
+      # The credential goes into a fresh DOCKER_CONFIG directory of this job, never into the
+      # runner user's ~/.docker: a self-hosted runner's Docker daemon and $HOME may be shared by
+      # every job (.github/actions/docker-login explains the race). The next step removes it.
+      # The token reaches docker and curl on stdin, never on a command line.
+      - name: Push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          config="$(mktemp -d "${RUNNER_TEMP}/docker-config.XXXXXXXX")"
+          echo "PUBLISH_DOCKER_CONFIG=${config}" >> "$GITHUB_ENV"
+          printf '%s' "$GITHUB_TOKEN" | docker --config "$config" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker --config "$config" push "${IMAGE}:sha-${GITHUB_SHA}"
+          tip="$(printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" | curl -fsSL --retry 3 -H @- \
+            -H 'Accept: application/vnd.github.sha' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/main")"
+          if [ "$tip" = "$GITHUB_SHA" ]; then
+            docker --config "$config" push "${IMAGE}:main"
+          else
+            echo "::notice title=main not moved::main is at ${tip} now. ${GITHUB_SHA} is published as sha-${GITHUB_SHA} only; the run of the newer commit moves main."
+          fi
+      # The chart of this commit as 0.0.0-sha-<sha>, below every release, so a version range
+      # never picks a build of main. Before main-complete, which waits for this job: a
+      # deployment repository deploys the published chart whose version it derives from
+      # `image.tag` (sha-<sha>: 0.0.0-sha-<sha>), with only values of its own (ADR-0080). Its
+      # appVersion is sha-<sha>, so that its default image is this commit's, for anyone who
+      # installs it without setting the tag (ADR-0090).
+      - name: Publish the chart
+        uses: ./.github/actions/helm-publish
+        with:
+          charts: deploy/helm/tinfirm
+          version: 0.0.0-sha-${{ github.sha }}
+          app-version: sha-${{ github.sha }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log out and remove the local tags
+        if: always()
+        run: |
+          if [ -n "${PUBLISH_DOCKER_CONFIG:-}" ]; then
+            docker --config "$PUBLISH_DOCKER_CONFIG" logout ghcr.io || true
+            rm -rf "$PUBLISH_DOCKER_CONFIG"
+          fi
+          for tag in "sha-${GITHUB_SHA}" main; do
+            docker image rm "${IMAGE}:${tag}" 2>/dev/null || true
+          done
+
+  # The images of the model port (ADR-0069) and of the runner host for the chart's runner pod
+  # (ADR-0101, decision 8, the last stage of runner-musl.Dockerfile), as `publish` does the
+  # server's: sha-<sha>, and `main` while main has not moved on. A job of its own, so that the
+  # server's publishing and rolling never wait on it; `main-complete` does, because the
+  # chart's model port and runner images follow `image.tag`.
+  publish-services:
+    name: Publish · ${{ matrix.name }} image (main)
+    needs: [model-api, helm, image, runner]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: model-api
+            dockerfile: model-api/Dockerfile
+          - name: runner-host
+            dockerfile: deploy/release/runner-musl.Dockerfile
+    concurrency:
+      group: publish-${{ matrix.name }}-image
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/flowtivo/tinfirm-${{ matrix.name }}
+      DOCKERFILE: ${{ matrix.dockerfile }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker build --progress=plain -f "$DOCKERFILE" \
+            --build-arg "REVISION=${GITHUB_SHA}" \
+            --build-arg "CACHE_SCOPE=${CACHE_SCOPE}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${IMAGE}:sha-${GITHUB_SHA}" -t "${IMAGE}:main" .
+      # As publish: a fresh DOCKER_CONFIG of this job, the token on stdin only.
+      - name: Push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          config="$(mktemp -d "${RUNNER_TEMP}/docker-config.XXXXXXXX")"
+          echo "PUBLISH_DOCKER_CONFIG=${config}" >> "$GITHUB_ENV"
+          printf '%s' "$GITHUB_TOKEN" | docker --config "$config" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker --config "$config" push "${IMAGE}:sha-${GITHUB_SHA}"
+          tip="$(printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" | curl -fsSL --retry 3 -H @- \
+            -H 'Accept: application/vnd.github.sha' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/main")"
+          if [ "$tip" = "$GITHUB_SHA" ]; then
+            docker --config "$config" push "${IMAGE}:main"
+          else
+            echo "::notice title=main not moved::main is at ${tip} now. ${GITHUB_SHA} is published as sha-${GITHUB_SHA} only; the run of the newer commit moves main."
+          fi
+      - name: Log out and remove the local tags
+        if: always()
+        run: |
+          if [ -n "${PUBLISH_DOCKER_CONFIG:-}" ]; then
+            docker --config "$PUBLISH_DOCKER_CONFIG" logout ghcr.io || true
+            rm -rf "$PUBLISH_DOCKER_CONFIG"
+          fi
+          for tag in "sha-${GITHUB_SHA}" main; do
+            docker image rm "${IMAGE}:${tag}" 2>/dev/null || true
+          done
+
+  # The docs site's image follows main. After a push to main that changed docs-site/, this job
+  # publishes the site's image ghcr.io/flowtivo/tinfirm-docs:sha-<sha>, then moves the tag
+  # `main` to it. A deployment of the site can follow `main` on its own schedule (ADR-0107). The
+  # image's label org.opencontainers.image.revision names the commit; dev.tinfirm.docs-tree,
+  # the git tree of docs-site/ it was built from, says whether a push changed the site. A
+  # push that did not publishes nothing; a change whose publishing failed is published by the
+  # next push. Only while this commit is still the tip of main, like the other publishing
+  # jobs.
+  publish-docs:
+    name: Publish · docs site image (main)
+    needs: [docs, helm]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    concurrency:
+      group: publish-docs
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/flowtivo/tinfirm-docs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # As publish: a fresh DOCKER_CONFIG of this job, the token on stdin only.
+      - name: Still the tip of main, and the site changed
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tip="$(printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" | curl -fsSL --retry 3 -H @- \
+            -H 'Accept: application/vnd.github.sha' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/main")"
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice title=docs not published::main is at ${tip} now; the run of the newer commit publishes the site."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          config="$(mktemp -d "${RUNNER_TEMP}/docker-config.XXXXXXXX")"
+          echo "PUBLISH_DOCKER_CONFIG=${config}" >> "$GITHUB_ENV"
+          printf '%s' "$GITHUB_TOKEN" | docker --config "$config" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          tree="$(git rev-parse HEAD:docs-site)"
+          echo "DOCS_TREE=${tree}" >> "$GITHUB_ENV"
+          live=""
+          if docker --config "$config" pull -q "${IMAGE}:main" > /dev/null 2>&1; then
+            live="$(docker image inspect --format '{{ index .Config.Labels "dev.tinfirm.docs-tree" }}' "${IMAGE}:main")"
+          fi
+          if [ "$live" = "$tree" ]; then
+            echo "::notice title=docs unchanged::${IMAGE}:main is docs-site/ as of this commit (tree ${tree}); nothing to publish."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs-site/ is tree ${tree}; ${IMAGE}:main is '${live:-nothing yet}'."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push sha-<sha>
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          docker build --progress=plain \
+            --build-arg "REVISION=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "dev.tinfirm.docs-tree=${DOCS_TREE}" \
+            -t "${IMAGE}:sha-${GITHUB_SHA}" -t "${IMAGE}:main" docs-site
+          docker --config "$PUBLISH_DOCKER_CONFIG" push "${IMAGE}:sha-${GITHUB_SHA}"
+      # After sha-<sha>, so that `main` never names an image the registry does not hold.
+      - name: Move main
+        if: steps.check.outputs.publish == 'true'
+        run: docker --config "$PUBLISH_DOCKER_CONFIG" push "${IMAGE}:main"
+      - name: Log out and remove the local tags
+        if: always()
+        run: |
+          if [ -n "${PUBLISH_DOCKER_CONFIG:-}" ]; then
+            docker --config "$PUBLISH_DOCKER_CONFIG" logout ghcr.io || true
+            rm -rf "$PUBLISH_DOCKER_CONFIG"
+          fi
+          for tag in "sha-${GITHUB_SHA}" main; do
+            docker image rm "${IMAGE}:${tag}" 2>/dev/null || true
+          done
+
+  # The rolling prerelease's SHA256SUMS is signed with the rolling key, a key pair of its
+  # own (not the release key), in runner-artifacts.yml's `publish` job, which runs in the
+  # environment `rolling` (deployment branch main, no reviewers; secrets
+  # ROLLING_COSIGN_PRIVATE_KEY and ROLLING_COSIGN_PASSWORD). A job that calls a workflow
+  # cannot name an environment itself.
+  rolling:
+    name: Publish · rolling prerelease
+    needs: [publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: publish-rolling-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    uses: ./.github/workflows/runner-artifacts.yml
+    # Empty here (no environment on this job); the environment `rolling` provides them there.
+    secrets:
+      ROLLING_COSIGN_PRIVATE_KEY: ${{ secrets.ROLLING_COSIGN_PRIVATE_KEY }}
+      ROLLING_COSIGN_PASSWORD: ${{ secrets.ROLLING_COSIGN_PASSWORD }}
+    with:
+      release_tag: rolling
+      # The Linux builds on this workflow's runners (header).
+      runner: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+
+  # `main-complete` marks the newest commit of main that is published whole: its server image
+  # (publish), its model port's and runner host's images (publish-services) and the rolling
+  # prerelease (rolling). It is a tag of the server image's own package,
+  # ghcr.io/flowtivo/tinfirm-server, beside sha-<sha> and `main`, on this commit's image,
+  # whose label org.opencontainers.image.revision names the commit.
+  # A deployment repository can follow it on its own schedule (ADR-0107); this repository
+  # holds no key to one. After `publish-services`: the chart's
+  # `litellm.modelApi.image.tag` and `runner.image.tag` default to `image.tag`, so a commit
+  # named before its model port image exists leaves the model port in ImagePullBackOff.
+  # After `rolling`: runner-only hosts on auto-deploy install the runner host of the
+  # revision the server reports, from `rolling` (docs/operations/auto-deploy.md, section 8).
+  # A failed `publish-services` or `rolling` skips this job (no `always()` here). Only while
+  # this commit is still the tip of main, like `publish` and `rolling`: an older run that
+  # finishes late must never move the tag back.
+  main-complete:
+    name: Publish · main-complete tag
+    needs: [publish, publish-services, rolling]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    concurrency:
+      group: publish-main-complete
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE: ghcr.io/flowtivo/tinfirm-server
+      TARGET: ghcr.io/flowtivo/tinfirm-server:main-complete
+    steps:
+      # As publish: a fresh DOCKER_CONFIG of this job, the token on stdin only. The revision
+      # label, which a deployment repository reads, is checked before the tag moves: buildx
+      # prints the image's config (of an index, each platform's) as indented JSON,
+      # `"<label>": "<value>"`, and a label value that quotes another is escaped, so it cannot
+      # match. `imagetools create` with one source and --prefer-index=false writes that
+      # manifest itself under the new tag, in the same repository, so the tag's digest is
+      # sha-<sha>'s.
+      - name: Still the tip of main, then move main-complete
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tip="$(printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" | curl -fsSL --retry 3 -H @- \
+            -H 'Accept: application/vnd.github.sha' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/main")"
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice title=main-complete not moved::main is at ${tip} now; the run of the newer commit moves main-complete."
+            exit 0
+          fi
+          config="$(mktemp -d "${RUNNER_TEMP}/docker-config.XXXXXXXX")"
+          echo "PUBLISH_DOCKER_CONFIG=${config}" >> "$GITHUB_ENV"
+          printf '%s' "$GITHUB_TOKEN" | docker --config "$config" login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          source="${SOURCE}:sha-${GITHUB_SHA}"
+          image="$(DOCKER_CONFIG="$config" docker buildx imagetools inspect "$source" --format '{{ json .Image }}')"
+          if ! grep -Eq "\"org\.opencontainers\.image\.revision\":[[:space:]]*\"${GITHUB_SHA}\"" <<< "$image"; then
+            echo "::error title=main-complete not moved::${source} does not carry the label org.opencontainers.image.revision=${GITHUB_SHA}, which deployments read (publish sets it)."
+            exit 1
+          fi
+          DOCKER_CONFIG="$config" docker buildx imagetools create --prefer-index=false --tag "$TARGET" "$source"
+          echo "::notice title=main-complete::${TARGET} is ${source} now."
+      - name: Log out
+        if: always()
+        run: |
+          if [ -n "${PUBLISH_DOCKER_CONFIG:-}" ]; then
+            docker --config "$PUBLISH_DOCKER_CONFIG" logout ghcr.io || true
+            rm -rf "$PUBLISH_DOCKER_CONFIG"
+          fi
+
+  # SAST, secrets and dependency CVEs (reusable-security.yml). Called from here so it gates
+  # each pull request AND the release (release.yml -> ci.yml -> reusable-security.yml). The
+  # weekly sweep of an unchanged tree is security.yml.
+  security:
+    name: Security
+    # A called workflow cannot exceed its caller's permissions; the reusable workflow's
+    # findings comment needs pull-requests: write.
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/reusable-security.yml
+    with:
+      runner: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
+      # Rules that cannot apply to this stack (not "noisy": inapplicable).
+      #  - template-explicit-unescape (Mustache) fires on
+      #    server/src/main/openapi-templates/*.mustache. Those are openapi-generator
+      #    templates that emit JAVA SOURCE at build time; `{{{...}}}` there writes type
+      #    names into code, and no HTML is ever rendered from them. The server renders no
+      #    Mustache views, and Angular templates have no triple-brace syntax.
+      # security.yml (the weekly sweep) passes the SAME list; change both together.
+      semgrep_exclude_rules: |
+        javascript.express.security.audit.xss.mustache.explicit-unescape.template-explicit-unescape

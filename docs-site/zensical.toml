@@ -1,0 +1,194 @@
+# The Tinfirm documentation site: the manuals for the people who use Tinfirm, the Owners and
+# Admins who set a company up in it, and the operators who install it. Built with Zensical
+# (https://zensical.org). docs-site/README.md says how to write, preview and build it.
+#
+# Public at site_url. No repo_url, on purpose: the site documents the product, not its
+# source.
+
+[project]
+site_name = "Tinfirm Docs"
+site_url = "https://docs.tinfirm.com/"
+site_description = "How to use, administer and operate Tinfirm, the self-hosted platform on which a company runs AI agents."
+# The docs are under MIT, with the code outside ee/ (ADR-0077 decision 1).
+copyright = "Copyright © 2026 FLOWTIVO s.r.o. Tinfirm's documentation is licensed under the MIT licence."
+docs_dir = "content"
+
+# Each top-level entry is a tab, one per audience, and the pages of a tab are grouped by task. A
+# page listed without a title takes its title from its first heading, so the navigation and the
+# page never disagree.
+nav = [
+  { "Home" = [
+    "index.md",
+    "concepts.md",
+  ] },
+  { "User guide" = [
+    "user-guide/index.md",
+    { "Work with agents" = [
+      "user-guide/conversations.md",
+      "user-guide/inbox.md",
+      "user-guide/agents.md",
+      "user-guide/my-settings.md",
+      "user-guide/skills.md",
+      "user-guide/memory.md",
+    ] },
+    { "Automate" = [
+      "user-guide/triggers.md",
+    ] },
+    { "Your accounts" = [
+      "user-guide/accounts.md",
+      "user-guide/spend.md",
+      "user-guide/profile.md",
+    ] },
+    { "Outside Tinfirm" = [
+      "user-guide/chats.md",
+      "user-guide/outlook.md",
+      "user-guide/gmail.md",
+      "user-guide/ai-clients.md",
+    ] },
+  ] },
+  { "Admin guide" = [
+    "admin-guide/index.md",
+    "admin-guide/roles.md",
+    "admin-guide/editions.md",
+    { "Set up the company" = [
+      "admin-guide/model-access.md",
+      "admin-guide/runner-hosts.md",
+      "admin-guide/members.md",
+      "admin-guide/scim.md",
+      "admin-guide/scim-entra-id.md",
+      "admin-guide/scim-okta.md",
+      "admin-guide/saml.md",
+      "admin-guide/saml-entra-id.md",
+      "admin-guide/saml-okta.md",
+      "admin-guide/saml-adfs.md",
+      "admin-guide/service-accounts.md",
+      "admin-guide/settings.md",
+    ] },
+    { "Systems" = [
+      "admin-guide/systems.md",
+      "admin-guide/mcp-servers.md",
+      "admin-guide/chat-systems.md",
+      "admin-guide/webhooks.md",
+      "admin-guide/alerts.md",
+    ] },
+    { "Add-ins" = [
+      "admin-guide/outlook-add-in.md",
+      "admin-guide/gmail-add-on.md",
+    ] },
+    { "Govern" = [
+      "admin-guide/kill-switches.md",
+      "admin-guide/audit-log.md",
+      "admin-guide/retention.md",
+    ] },
+  ] },
+  { "Operator guide" = [
+    "operator-guide/index.md",
+    { "Plan" = [
+      "operator-guide/architecture.md",
+      "operator-guide/requirements.md",
+    ] },
+    { "Install" = [
+      "operator-guide/quick-start.md",
+      "operator-guide/database.md",
+      "operator-guide/helm.md",
+      "operator-guide/sign-in.md",
+      "operator-guide/saml.md",
+      "operator-guide/scim.md",
+      "operator-guide/model-gateway.md",
+      "operator-guide/runner-hosts.md",
+    ] },
+    { "Run" = [
+      "operator-guide/maintenance.md",
+      "operator-guide/licence.md",
+      "operator-guide/verify-images.md",
+      "operator-guide/instance-admin.md",
+      "operator-guide/error-reports.md",
+    ] },
+  ] },
+  { "Reference" = [
+    "reference/index.md",
+    "reference/configuration.md",
+    "reference/runner-host.md",
+    "reference/mcp-tools.md",
+    "reference/licence.md",
+  ] },
+]
+
+extra_css = ["assets/stylesheets/tinfirm.css"]
+
+[project.theme]
+language = "en"
+logo = "assets/images/mark.svg"
+favicon = "assets/images/mark.svg"
+# The fonts are self-hosted in assets/fonts (tinfirm.css), as the web app does, so that reading
+# the docs sends nothing to Google Fonts.
+font = false
+features = [
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tabs.link",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.tabs",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "toc.follow",
+]
+
+# Agent Green as the primary colour, light and dark (DESIGN.md); tinfirm.css sets the values.
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+toc.permalink = true
+pymdownx.betterem = {}
+pymdownx.caret = {}
+pymdownx.details = {}
+pymdownx.emoji.emoji_generator = "zensical.extensions.emoji.to_svg"
+pymdownx.emoji.emoji_index = "zensical.extensions.emoji.twemoji"
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.mark = {}
+pymdownx.smartsymbols = {}
+# Every page gets the abbreviations of includes/abbreviations.md, shown as a tooltip on hover.
+pymdownx.snippets.base_path = ["includes"]
+pymdownx.snippets.auto_append = ["abbreviations.md"]
+pymdownx.snippets.check_paths = true
+pymdownx.superfences = {}
+pymdownx.tabbed.alternate_style = true
+pymdownx.tabbed.combine_header_slug = true
+pymdownx.tasklist.custom_checkbox = true
+pymdownx.tilde = {}

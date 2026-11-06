@@ -1,0 +1,42 @@
+# `helm lint` / `helm template` with the Gateway API instead of an Ingress (CI and `make helm-lint`):
+# an HTTPRoute on the Gateway's https listener and the http -> https redirect route on its http
+# listener, the NetworkPolicy naming the Gateway's proxy pods, the Prometheus Operator's PodMonitor
+# in the monitoring namespace, and a Recreate strategy over the chart's rollingUpdate.
+image:
+  tag: v0.1.0
+httpRoute:
+  enabled: true
+  annotations:
+    example.com/owner: platform
+  parentRefs:
+    - name: public
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - tinfirm.example.com
+  redirectParentRefs:
+    - name: public
+      namespace: gateway-system
+      sectionName: http
+metrics:
+  podMonitor:
+    enabled: true
+    namespace: monitoring
+    labels:
+      release: kube-prometheus-stack
+    interval: 30s
+    scrapeTimeout: 10s
+networkPolicy:
+  ingress:
+    controller:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: envoy-gateway-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: envoy
+          app.kubernetes.io/component: proxy
+    metrics:
+      enabled: true
+strategy:
+  type: Recreate

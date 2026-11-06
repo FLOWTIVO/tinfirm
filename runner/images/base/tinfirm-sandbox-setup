@@ -1,0 +1,226 @@
+#!/bin/sh
+# tinfirm-sandbox-setup: writes the mirror settings of a Tinfirm sandbox from its environment
+# (ADR-0025, runner/README.md "Kata Containers and Docker in the sandbox").
+#
+#   tinfirm-sandbox-setup docker-config FILE   daemon.json of the agent's own dockerd
+#   tinfirm-sandbox-setup user-config          Maven, npm, pip and uv settings in $HOME
+#
+# The runner host passes the inputs with `run --sandbox-env`; all are optional:
+#   TINFIRM_SANDBOX_REGISTRY_MIRRORS       registry mirror URLs for dockerd, comma-separated
+#   TINFIRM_SANDBOX_INSECURE_REGISTRIES    host[:port] or CIDR entries for dockerd, comma-separated
+#   TINFIRM_SANDBOX_DOCKER_STORAGE_DRIVER  dockerd's storage driver (default: dockerd chooses)
+#   TINFIRM_SANDBOX_MAVEN_MIRROR           URL of a Maven repository that mirrors Maven Central
+#   TINFIRM_SANDBOX_MAVEN_MIRROR_OF        what that mirror replaces (default: central)
+#   TINFIRM_SANDBOX_NPM_REGISTRY           npm registry URL
+#   TINFIRM_SANDBOX_PIP_INDEX              Python package index URL, for pip and uv
+#   HTTP_PROXY, HTTPS_PROXY, NO_PROXY      the runner host's egress proxy (`run --egress-proxy`);
+#                                          dockerd gets them as its proxy, to pull images
+#
+# A file in $HOME carries a marker line. A file without the marker belongs to the agent and
+# stays as it is (with a warning). A marked file whose variable is no longer set is removed.
+# Values are checked, never escaped: a value with a character outside a safe set is an error.
+# Messages go to stderr; stdout stays free for the agent's ACP stream.
+
+set -eu
+set -f
+
+MARKER='Written by tinfirm-sandbox-setup'
+DATA_ROOT=/var/lib/docker
+NL='
+'
+
+log() { printf 'tinfirm-sandbox: %s\n' "$*" >&2; }
+die() {
+    log "error: $*"
+    exit 1
+}
+
+# check NAME VALUE ALLOWED: VALUE is not empty and has only characters of the bracket
+# expression ALLOWED.
+check() {
+    case $2 in
+        '' | *"$NL"*) die "$1 is empty or spans lines" ;;
+    esac
+    if printf '%s' "$2" | LC_ALL=C grep -q "[^$3]"; then
+        die "$1 has a character outside [$3]"
+    fi
+}
+
+# check_url NAME VALUE: an http(s) URL without a user name, password, quotes or markup.
+check_url() {
+    case $2 in
+        http://?* | https://?*) ;;
+        *) die "$1 must be an http:// or https:// URL" ;;
+    esac
+    check "$1" "$2" 'A-Za-z0-9._~:/?=%+-'
+}
+
+# check_proxy_url NAME VALUE: an http(s) URL that may carry the egress proxy's credential
+# (user:secret@host), without quotes or markup.
+check_proxy_url() {
+    case $2 in
+        http://?* | https://?*) ;;
+        *) die "$1 must be an http:// or https:// URL" ;;
+    esac
+    check "$1" "$2" 'A-Za-z0-9._~:/?=%+@-'
+}
+
+check_registry() { check "$1" "$2" 'A-Za-z0-9.:/-'; }
+
+# trim VALUE: VALUE without leading and trailing blanks.
+trim() {
+    s=$1
+    while :; do
+        case $s in
+            ' '* | '	'*) s=${s#?} ;;
+            *) break ;;
+        esac
+    done
+    while :; do
+        case $s in
+            *' ' | *'	') s=${s%?} ;;
+            *) break ;;
+        esac
+    done
+    printf '%s' "$s"
+}
+
+# json_list NAME VALUE CHECKER: the comma-separated items of VALUE as a JSON array. The
+# items are cut off the front of VALUE one by one, so IFS stays as it is.
+json_list() {
+    out=
+    rest=$2
+    while [ -n "$rest" ]; do
+        case $rest in
+            *,*) item=${rest%%,*}; rest=${rest#*,} ;;
+            *) item=$rest; rest= ;;
+        esac
+        item=$(trim "$item")
+        [ -n "$item" ] || continue
+        "$3" "$1" "$item"
+        out="${out:+$out, }\"$item\""
+    done
+    printf '[%s]' "$out"
+}
+
+docker_config() {
+    file=$1
+    mirrors=$(json_list TINFIRM_SANDBOX_REGISTRY_MIRRORS "${TINFIRM_SANDBOX_REGISTRY_MIRRORS:-}" check_url)
+    insecure=$(json_list TINFIRM_SANDBOX_INSECURE_REGISTRIES "${TINFIRM_SANDBOX_INSECURE_REGISTRIES:-}" check_registry)
+    driver=${TINFIRM_SANDBOX_DOCKER_STORAGE_DRIVER:-}
+    [ -z "$driver" ] || check TINFIRM_SANDBOX_DOCKER_STORAGE_DRIVER "$driver" 'A-Za-z0-9_-'
+    # The egress proxy of the runner host: the sandbox has no other way out, and dockerd
+    # does not read the environment's proxy variables.
+    proxies=
+    http_proxy_url=${HTTP_PROXY:-${http_proxy:-}}
+    https_proxy_url=${HTTPS_PROXY:-${https_proxy:-}}
+    no_proxy_list=${NO_PROXY:-${no_proxy:-}}
+    if [ -n "$http_proxy_url$https_proxy_url" ]; then
+        [ -z "$http_proxy_url" ] || check_proxy_url HTTP_PROXY "$http_proxy_url"
+        [ -z "$https_proxy_url" ] || check_proxy_url HTTPS_PROXY "$https_proxy_url"
+        [ -z "$no_proxy_list" ] || check NO_PROXY "$no_proxy_list" 'A-Za-z0-9._:,*-'
+        proxies=$(printf '"http-proxy": "%s", "https-proxy": "%s", "no-proxy": "%s"' \
+            "$http_proxy_url" "$https_proxy_url" "$no_proxy_list")
+    fi
+    mkdir -p "$(dirname "$file")"
+    {
+        printf '{\n'
+        # In the container's own filesystem: never under /workspace or /home/agent, which are
+        # directories of the runner host.
+        printf '  "data-root": "%s",\n' "$DATA_ROOT"
+        [ -z "$driver" ] || printf '  "storage-driver": "%s",\n' "$driver"
+        printf '  "registry-mirrors": %s,\n' "$mirrors"
+        if [ -n "$proxies" ]; then
+            printf '  "insecure-registries": %s,\n' "$insecure"
+            printf '  "proxies": {%s}\n' "$proxies"
+        else
+            printf '  "insecure-registries": %s\n' "$insecure"
+        fi
+        printf '}\n'
+    } >"$file.tmp"
+    mv "$file.tmp" "$file"
+}
+
+maven_settings() {
+    check_url TINFIRM_SANDBOX_MAVEN_MIRROR "$1"
+    mirror_of=${TINFIRM_SANDBOX_MAVEN_MIRROR_OF:-central}
+    check TINFIRM_SANDBOX_MAVEN_MIRROR_OF "$mirror_of" 'A-Za-z0-9._,*!:-'
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- $MARKER from TINFIRM_SANDBOX_MAVEN_MIRROR at the start of every run. -->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0">
+  <mirrors>
+    <mirror>
+      <id>tinfirm-sandbox-mirror</id>
+      <mirrorOf>$mirror_of</mirrorOf>
+      <url>$1</url>
+    </mirror>
+  </mirrors>
+</settings>
+EOF
+}
+
+npmrc() {
+    check_url TINFIRM_SANDBOX_NPM_REGISTRY "$1"
+    printf '# %s from TINFIRM_SANDBOX_NPM_REGISTRY at the start of every run.\n' "$MARKER"
+    printf 'registry=%s\n' "$1"
+}
+
+pip_conf() {
+    check_url TINFIRM_SANDBOX_PIP_INDEX "$1"
+    printf '# %s from TINFIRM_SANDBOX_PIP_INDEX at the start of every run.\n' "$MARKER"
+    printf '[global]\nindex-url = %s\n' "$1"
+}
+
+uv_toml() {
+    check_url TINFIRM_SANDBOX_PIP_INDEX "$1"
+    printf '# %s from TINFIRM_SANDBOX_PIP_INDEX at the start of every run.\n' "$MARKER"
+    printf '[[index]]\nurl = "%s"\ndefault = true\n' "$1"
+}
+
+managed() { [ -f "$1" ] && grep -q "$MARKER" "$1"; }
+
+# user_file FILE VALUE RENDERER: FILE gets RENDERER's output for VALUE; without a value, a
+# file that this script wrote is removed.
+user_file() {
+    file=$1
+    if [ -z "$2" ]; then
+        if managed "$file"; then
+            rm -f "$file" || log "warning: cannot remove $file"
+        fi
+        return 0
+    fi
+    if [ -e "$file" ] && ! managed "$file"; then
+        log "warning: $file was not written by Tinfirm; it stays as it is, without the mirror"
+        return 0
+    fi
+    mkdir -p "$(dirname "$file")" || die "cannot create the directory of $file"
+    if ! ("$3" "$2") >"$file.tmp"; then
+        rm -f "$file.tmp"
+        exit 1
+    fi
+    mv "$file.tmp" "$file" || die "cannot write $file"
+}
+
+user_config() {
+    home=${HOME:-}
+    [ -n "$home" ] || die "HOME is not set"
+    user_file "$home/.m2/settings.xml" "${TINFIRM_SANDBOX_MAVEN_MIRROR:-}" maven_settings
+    user_file "$home/.npmrc" "${TINFIRM_SANDBOX_NPM_REGISTRY:-}" npmrc
+    user_file "$home/.config/pip/pip.conf" "${TINFIRM_SANDBOX_PIP_INDEX:-}" pip_conf
+    user_file "$home/.config/uv/uv.toml" "${TINFIRM_SANDBOX_PIP_INDEX:-}" uv_toml
+}
+
+case ${1:-} in
+    docker-config)
+        [ "$#" -eq 2 ] || die "usage: tinfirm-sandbox-setup docker-config FILE"
+        docker_config "$2"
+        ;;
+    user-config)
+        [ "$#" -eq 1 ] || die "usage: tinfirm-sandbox-setup user-config"
+        user_config
+        ;;
+    *)
+        die "usage: tinfirm-sandbox-setup docker-config FILE | user-config"
+        ;;
+esac

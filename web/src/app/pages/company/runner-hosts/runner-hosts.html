@@ -1,0 +1,171 @@
+<div class="flex flex-col gap-5">
+  <app-page-header
+    title="Runner hosts"
+    description="The company’s machines that run agents’ turns in Docker, paid by a budget. Updates every 10 seconds."
+  >
+    @if (canManage()) {
+      <button
+        hlmBtn
+        type="button"
+        data-testid="open-register-host"
+        (click)="registerOpen.set(true)"
+      >
+        <ng-icon name="lucidePlus" aria-hidden="true" />
+        Register a runner host
+      </button>
+    }
+  </app-page-header>
+
+  @if (hosts.firstLoad()) {
+    <app-list-skeleton [rows]="2" />
+  } @else if (hosts.failed()) {
+    <app-error-state
+      [error]="hosts.error()"
+      heading="Couldn't load the runner hosts"
+      [messages]="{ 'status:403': 'Only owners and admins see the company’s runner hosts.' }"
+      (retry)="hosts.retry()"
+    />
+  } @else if (companyHosts().length === 0) {
+    <div hlmEmpty class="border" data-testid="hosts-empty">
+      <div hlmEmptyHeader>
+        <div hlmEmptyMedia variant="icon"><ng-icon name="lucideServer" aria-hidden="true" /></div>
+        <div hlmEmptyTitle>No company runner host yet</div>
+        <p hlmEmptyDescription>
+          Without one, no turn paid by a budget runs. Register a machine with Docker: agents run
+          there, never on the Tinfirm server.
+        </p>
+      </div>
+      @if (canManage()) {
+        <div hlmEmptyContent>
+          <button hlmBtn size="sm" type="button" (click)="registerOpen.set(true)">
+            <ng-icon name="lucidePlus" aria-hidden="true" />
+            Register a runner host
+          </button>
+        </div>
+      }
+    </div>
+  } @else {
+    @if (noneTakesTurns()) {
+      <div hlmAlert class="border-warning/50" data-testid="none-takes-turns">
+        <ng-icon name="lucideTriangleAlert" class="text-warning" aria-hidden="true" />
+        <h2 hlmAlertTitle>No company host takes turns now</h2>
+        <p hlmAlertDescription>
+          Turns paid by a budget wait until a host with runner {{ gatewayVersion }} or later is
+          online.
+        </p>
+      </div>
+    }
+
+    <ul class="m-0 flex list-none flex-col gap-4 p-0" aria-label="Company runner hosts">
+      @for (host of companyHosts(); track host.id) {
+        <li [attr.data-host]="host.name">
+          <app-runner-host-card
+            [host]="host"
+            [editable]="canManage()"
+            [desired]="desired(host)"
+            [capacityError]="capacityErrors().get(host.id) ?? null"
+            (capacityChange)="setCapacity(host, $event)"
+            (poolEdit)="editPool(host)"
+            (remove)="askRemove(host)"
+          />
+        </li>
+      }
+    </ul>
+
+    @if (hosts.moreFailed()) {
+      <app-error-state
+        [error]="hosts.error()"
+        heading="Couldn't load more"
+        (retry)="hosts.retry()"
+      />
+    } @else if (hosts.hasMore()) {
+      <div class="flex justify-center">
+        <button
+          hlmBtn
+          variant="outline"
+          size="sm"
+          type="button"
+          [disabled]="hosts.loadingMore()"
+          (click)="hosts.loadMore()"
+        >
+          @if (hosts.loadingMore()) {
+            <hlm-spinner aria-hidden="true" />
+          }
+          Load more
+        </button>
+      </div>
+    }
+
+    @if (canManage()) {
+      <p class="text-muted-foreground flex items-start gap-2 text-xs text-pretty">
+        <ng-icon class="mt-0.5 shrink-0" name="lucideInfo" aria-hidden="true" />
+        <span>
+          A company host runs any member’s turns that a budget pays for, through Tinfirm’s model
+          relay, and holds no subscriptions. Its machine’s limit is a ceiling set on the host with
+          <code class="font-mono whitespace-nowrap">--max-concurrent-runs</code>: Tinfirm can run
+          fewer, never more, and a change applies without a restart and never stops a running turn.
+        </span>
+      </p>
+    }
+  }
+
+  @if (hasOwnHosts()) {
+    <p class="text-muted-foreground text-xs" data-testid="own-hosts">
+      Your own runner hosts, which run only your turns, are under
+      <a
+        class="text-primary underline underline-offset-2"
+        routerLink="../accounts"
+        [queryParams]="{ tab: 'hosts' }"
+        >Accounts › Runner hosts</a
+      >.
+    </p>
+  }
+</div>
+
+@if (current.id(); as companyId) {
+  <app-register-runner-host-dialog
+    scope="COMPANY"
+    [(open)]="registerOpen"
+    [companyId]="companyId"
+    (registered)="onRegistered($event)"
+  />
+  <app-pool-schedule-dialog
+    [(open)]="poolOpen"
+    [companyId]="companyId"
+    [host]="poolHost()"
+    (saved)="onPoolSaved($event)"
+  />
+}
+
+<hlm-alert-dialog [state]="removeOpen() ? 'open' : 'closed'" (closed)="removeOpen.set(false)">
+  <hlm-alert-dialog-content *hlmAlertDialogPortal="let ctx">
+    <hlm-alert-dialog-header>
+      <h2 hlmAlertDialogTitle>Remove {{ removing()?.name }}?</h2>
+      <p hlmAlertDialogDescription>
+        Its token stops working at once, and it takes no more turns. A host that runs turns cannot
+        be removed until they end. You can register it again later, with a new token.
+      </p>
+    </hlm-alert-dialog-header>
+    @if (removeError(); as message) {
+      <div hlmAlert variant="destructive" data-testid="remove-host-error">
+        <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+        <p hlmAlertDescription>{{ message }}</p>
+      </div>
+    }
+    <hlm-alert-dialog-footer>
+      <button hlmAlertDialogCancel [disabled]="removeBusy()">Cancel</button>
+      <button
+        hlmAlertDialogAction
+        variant="destructive"
+        data-testid="confirm-remove-host"
+        [disabled]="removeBusy()"
+        (click)="confirmRemove()"
+      >
+        @if (removeBusy()) {
+          <hlm-spinner aria-hidden="true" />
+        }
+        Remove runner host
+      </button>
+    </hlm-alert-dialog-footer>
+  </hlm-alert-dialog-content>
+</hlm-alert-dialog>

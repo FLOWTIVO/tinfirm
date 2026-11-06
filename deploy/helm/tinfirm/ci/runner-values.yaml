@@ -1,0 +1,52 @@
+# The runner pod (ADR-0101, decision 8): a declared company's runner host whose sandboxes are
+# DigitalOcean Droplets, with every optional branch of its templates.
+publicUrl: https://tinfirm.example.com
+companies:
+  - key: main
+    name: My Company
+  - key: acme
+    name: Acme
+runner:
+  enabled: true
+  company: acme
+  name: k8s-runner
+  maxConcurrentRuns: 20
+  vm:
+    template: sandbox-4c8g
+    probes:
+      - tcp:postgres.database.svc:5432
+      - dns:internal.example.com
+    digitalocean:
+      connect: public
+      templates:
+        sandbox-4c8g:
+          region: fra1
+          size: s-4vcpu-8gb
+          image: "123456789"
+          vpc: 00000000-0000-4000-8000-000000000001
+          firewall: 00000000-0000-4000-8000-000000000002
+          bridgePort: 7443
+  pool:
+    runtime: any
+  extraConfig:
+    TINFIRM_RUNNER_EGRESS_ALLOW: |-
+      registry.npmjs.org
+      pypi.org
+  extraEnv:
+    - name: RUST_BACKTRACE
+      value: "1"
+  persistence:
+    storageClassName: do-block-storage
+  nodeSelector:
+    kubernetes.io/os: linux
+networkPolicy:
+  runner:
+    egress:
+      extra:
+        - to:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: ingress-nginx
+          ports:
+            - protocol: TCP
+              port: 8443
