@@ -153,6 +153,7 @@ CI refuses a dependency that ships under a licence outside the policy of [ADR-00
 - Never commit real secrets. Development defaults are allowed only in `.env.example` and in test code, and must be clearly marked (CONVENTIONS §13).
 - Never edit a released Flyway migration. Add a new one (CONVENTIONS §7).
 - Sign off every commit: `git commit -s`. [Sign-off and licence](#sign-off-and-licence) says why.
+- A person authors, commits and signs off every commit, never an AI agent ([AI agents](#ai-agents)).
 
 ### Sign-off and licence
 
@@ -162,7 +163,8 @@ Every commit carries a `Signed-off-by:` line: the [Developer Certificate of Orig
 - **Every contribution is licensed under MIT.** Whatever you contribute, to the core or to `ee/`, you license to FLOWTIVO and to everyone under the MIT licence. The commercial licence of `ee/` binds its users, not your contribution.
 - **Paid code goes under `ee/`.** The server code that only a paid feature runs lives under `ee/`, in the package of the module it belongs to, never in the core ([ADR-0077](docs/adr/0077-licence-editions-and-seats.md) decision 1, CONVENTIONS §15.24). So does the runner host's, under `ee/runner/`, which the manifests in `runner/` name ([ADR-0100](docs/adr/0100-elastic-runners-in-pro.md)). The planned Enterprise features go there too when they are built: the audit streamed to a SIEM, high availability and the air-gapped bundle. The core keeps only a limit that every edition applies, a primitive that every edition uses, and a fallback that answers Community, `403 EDITION_REQUIRED`, without `ee/`. `ModularityTest.onlyTheCoresKnownGatesNameAFeature` fails the build when a class of the core outside `shared.licence` and the test's list of known gates names `Feature`, until the code moves under `ee/` or the list is extended on purpose.
 - **You keep your copyright.** No assignment is asked, and there is no CLA.
-- **The check.** CI's `DCO` workflow (`.github/workflows/dco.yml`) fails a pull request with any commit whose message lacks a `Signed-off-by:` line for its author. It skips a merge whose result is exactly Git's automatic merge, such as GitHub's **Update branch**; a merge in which you resolved a conflict needs your sign-off (`git merge --signoff`, or `git commit -s` after resolving). Dependabot's commits pass with the sign-off GitHub gives them, `dependabot[bot] <support@github.com>`.
+- **Only a person signs off.** The certificate is a person's own statement, so an AI agent can never make it: neither for itself nor in your name. A commit whose author, committer or `Signed-off-by:` is an AI agent is refused ([AI agents](#ai-agents)).
+- **The check.** CI's `DCO` workflow (`.github/workflows/dco.yml`) fails a pull request with any commit whose message lacks a `Signed-off-by:` line for its author, and with any commit whose author, committer or sign-off is an AI agent's identity. It skips a merge whose result is exactly Git's automatic merge, such as GitHub's **Update branch**; a merge in which you resolved a conflict needs your sign-off (`git merge --signoff`, or `git commit -s` after resolving). Dependabot's commits pass with the sign-off GitHub gives them, `dependabot[bot] <support@github.com>`.
 
 To fix a missing sign-off:
 
@@ -174,7 +176,17 @@ To fix a missing sign-off:
 
 Rewrite only your own branch. On someone else's branch, ask its author to sign off.
 
-AI agents follow CONVENTIONS §13: they do not run `git commit`, `git push` or any command that publishes anything. They report their changes instead. Humans follow this guide.
+### AI agents
+
+An AI agent (Claude Code, Codex, Copilot, Cursor and the like) may write code, docs and commits for the person it works for. That person is the contributor, and answers for every line (CONVENTIONS §13):
+
+- **The person is the author and the committer.** Before an agent commits, set the clone's `user.name` and `user.email` to yours. Never commit as the agent (`Claude <noreply@anthropic.com>`, `Copilot`, `Cursor Agent`, a `[bot]` account of an agent).
+- **The agent never signs off.** It adds no `Signed-off-by:` line, not for itself and not for you. Read its commits, then sign them off yourself: `git rebase --signoff origin/main` on the branch, and `git push --force-with-lease`. Until you do, the `DCO` check stays red.
+- **The agent is credited, not certified.** A `Co-Authored-By:` trailer may name the agent; that is the only place its name goes.
+- **The agent signs nothing else either.** No commit or tag signature with the agent's own key on your commits: turn its commit signing off in the clone (`git config commit.gpgsign false`) or sign with your own key.
+- **An agent pushes only to a branch of its own,** and only when you ask it to. It never pushes to `main` or `hotfix/**`, never merges a pull request, and publishes nothing else: no release, tag, image or package.
+
+The `DCO` workflow refuses a commit whose author, committer or sign-off is one of the agents' identities it knows (`AGENT_IDENTITIES` in `.github/workflows/dco.yml`): add an agent's identity there when you start to use it. `CLAUDE.md` at the root repeats these rules for Claude Code, which reads it in every session.
 
 ### Pull requests
 

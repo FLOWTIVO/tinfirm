@@ -10,6 +10,12 @@ name: DCO
 # `dependabot[bot] <support@github.com>`, not as their author's noreply address: that sign-off
 # counts for a commit whose author is Dependabot.
 #
+# A person authors, commits and signs off every commit, never an AI agent (CONTRIBUTING §6, "AI
+# agents"; CONVENTIONS §13): the certificate is a person's own statement. A commit whose author,
+# committer or any `Signed-off-by:` is one of AGENT_IDENTITIES (an extended regular expression on
+# `Name <email>`, case-insensitive) fails, whatever else it carries. An agent may still be credited
+# in a `Co-Authored-By:` trailer, which this check does not read.
+#
 # Whether this is a required check is the owner's choice, in the repository's settings.
 on:
   pull_request:
@@ -44,6 +50,10 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # The AI agents' commit identities: Anthropic's Claude (Claude Code, its GitHub App), OpenAI's
+          # Codex, GitHub's Copilot coding agent, Cursor's agent, Devin. Add one when you start to use it.
+          AGENT_IDENTITIES: >-
+            <(noreply@anthropic\.com|noreply@openai\.com|codex@openai\.com|cursoragent@cursor\.com|([0-9]+\+)?(claude|claude\[bot\]|copilot|copilot-swe-agent\[bot\]|chatgpt-codex-connector\[bot\]|openai-codex\[bot\]|cursor\[bot\]|devin-ai-integration\[bot\])@users\.noreply\.github\.com)>$
         run: |
           set -euo pipefail
           failed=0
@@ -56,6 +66,22 @@ jobs:
               signer="dependabot[bot] <support@github.com>"
             fi
             subject="$(git log -1 --format='%s' "$commit")"
+            committer="$(git log -1 --format='%cn <%ce>' "$commit")"
+            agent=""
+            for who in "$author" "$committer"; do
+              if printf '%s\n' "$who" | grep -qiE "$AGENT_IDENTITIES"; then agent="$who"; fi
+            done
+            while IFS= read -r signoff; do
+              if [ -n "$signoff" ] && printf '%s\n' "$signoff" | grep -qiE "$AGENT_IDENTITIES"; then
+                agent="$signoff"
+              fi
+            done < <(git log -1 --format='%(trailers:key=Signed-off-by,valueonly,unfold)' "$commit" \
+                       | sed 's/[[:space:]]*$//')
+            if [ -n "$agent" ]; then
+              echo "::error::Commit ${commit:0:12} (\"$subject\") is authored, committed or signed off by an AI agent ($agent): a person authors and signs off every commit."
+              failed=1
+              continue
+            fi
             read -r -a parents <<<"$(git log -1 --format='%P' "$commit")"
             if [ "${#parents[@]}" -eq 2 ] \
                 && auto_tree="$(git merge-tree --write-tree "${parents[0]}" "${parents[1]}" 2>/dev/null)" \
@@ -73,6 +99,6 @@ jobs:
           done
           echo "Checked $count commit(s) between ${BASE_SHA:0:12} and ${HEAD_SHA:0:12}."
           if [ "$failed" -ne 0 ]; then
-            echo "Sign off with 'git commit -s'; CONTRIBUTING.md §6, 'Sign-off and licence', says how to fix a commit."
+            echo "Sign off with 'git commit -s', as yourself, never as an AI agent; CONTRIBUTING.md §6, 'Sign-off and licence' and 'AI agents', says how to fix a commit."
             exit 1
           fi
