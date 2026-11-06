@@ -4,6 +4,7 @@
 - Date: 2026-10-15
 - Decided by: the owner, 2026-10-15
 - Sources: [PLATFORM.md](../PLATFORM.md) §2 (principles 3 and 5), §9; [CONVENTIONS.md](../CONVENTIONS.md) §15.4 (keys and their rotation), §15.18 (agent memory); the package 2 contract ([reviews/2026-10-12-package-2-contract.md](../reviews/2026-10-12-package-2-contract.md), §3.2 and §6); [threat-model.md](../threat-model.md)
+- Amended by: [ADR-0094](0094-more-than-one-model-gateway.md), under which, at a gateway whose keys a company's gateway team provides, the company key is the team's, entered by an admin as the principals' keys are: decisions 1 and 2's creation by the first sync, rotation and sweep do not apply to it
 - Supersedes: ADR-0063, decision 8's platform credential (a service identity and a model in the company's model settings)
 - Changes: the server's model module (a key that is no principal's, its sync, rotation, reconciliation and forgetting), the agent module (the company's memory settings), `V045__company_model_key.sql`; the API (`getCompanyKeyModelAccess`, `updateCompanyKeyModelAccess`, `rotateCompanyKey`, `getMemorySettings`, `putMemorySettings`; `GET`/`PUT /model-settings/platform` and `PlatformCredential` go; `ModelAccessView.principalId` is absent for the company key); the audit (`model_key.*` with the target `company_model_key`, `memory_settings.changed`); the web app (the company key's row in Members' budgets, the Memory section of the company's settings; the card "Tinfirm's own requests" goes)
 

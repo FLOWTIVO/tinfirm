@@ -68,8 +68,9 @@ class SpendLogsImplTest {
     /** The company's settings as last changed at {@code updatedAt}, naming the gateway; untested without one. */
     private void settings(Instant updatedAt, Gateway gateway) {
         ModelSettingsStore.SettingsRow row = new ModelSettingsStore.SettingsRow(COMPANY,
-                ModelSettingsStore.GatewayKind.EXTERNAL, gateway != null ? gateway.baseUrl() : null,
-                gateway != null ? UUID.randomUUID() : null, gateway != null, new BigDecimal("50"), "MONTHLY",
+                ModelSettingsStore.GatewayKind.EXTERNAL, GatewayVendor.LITELLM,
+                gateway != null ? gateway.baseUrl() : null, null, false, gateway != null ? UUID.randomUUID() : null,
+                gateway != null, new BigDecimal("50"), "MONTHLY",
                 List.of(), gateway != null ? updatedAt : null, null, updatedAt, null);
         when(settings.find(COMPANY)).thenReturn(Optional.of(row));
         when(gateways.of(row)).thenReturn(Optional.ofNullable(gateway));

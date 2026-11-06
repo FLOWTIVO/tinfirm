@@ -34,7 +34,7 @@ const KEY_NOTES: Record<NonNullable<ModelAccessView['keyStatus']>, string | null
   BUDGET_SPENT:
     'The company key’s budget is spent: memories are only cleared of duplicates until it resets.',
   BLOCKED: 'The company key is blocked: memories are only cleared of duplicates.',
-  ERROR: 'LiteLLM refuses the company key, or cannot be reached.',
+  ERROR: 'The gateway refuses the company key, or cannot be reached.',
 };
 
 /** The server's own words for a 400 without field errors (it names the model in `detail`). */

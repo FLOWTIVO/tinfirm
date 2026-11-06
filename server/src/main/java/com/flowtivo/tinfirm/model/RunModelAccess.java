@@ -77,7 +77,8 @@ public sealed interface RunModelAccess {
 
     /**
      * The run waits: {@code BUDGET_SPENT} until {@code until} (the budget's reset), {@code KEY_ERROR} (LiteLLM refused
-     * the key or is unreachable, or the key is being created), {@code HOST_OFFLINE} (the subscription's host is not
+     * the key or is unreachable, or the key is being created), {@code NO_MODEL_KEY} (the company's gateway team
+     * provides the keys and the payer has none yet, ADR-0094), {@code HOST_OFFLINE} (the subscription's host is not
      * connected). {@code detail} is for people and holds no secret.
      */
     record Wait(WaitReason reason, @Nullable Instant until, String detail) implements RunModelAccess {
@@ -103,7 +104,7 @@ public sealed interface RunModelAccess {
 
     /** Why a run waits; also its queue reason (contract §5.2). */
     enum WaitReason {
-        BUDGET_SPENT, KEY_ERROR, HOST_OFFLINE
+        BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE
     }
 
     /** Why a run cannot be paid. */

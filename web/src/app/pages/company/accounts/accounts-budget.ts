@@ -17,6 +17,7 @@ import {
 import { ListSkeleton } from '../../../shared/list-skeleton';
 import { Time } from '../../../shared/time';
 import { budgetView } from './budget-view';
+import { MyModelKey } from './my-model-key';
 
 /**
  * Accounts › Budget (plan §5): who pays for the reader's conversations. Their budget at the
@@ -26,7 +27,7 @@ import { budgetView } from './budget-view';
  */
 @Component({
   selector: 'app-accounts-budget',
-  imports: [RouterLink, NgIcon, ErrorState, ListSkeleton, Time],
+  imports: [RouterLink, NgIcon, ErrorState, ListSkeleton, MyModelKey, Time],
   providers: [provideIcons({ lucideClock, lucideCreditCard, lucideTriangleAlert })],
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: { class: 'flex flex-col gap-5' },
@@ -137,6 +138,12 @@ import { budgetView } from './budget-view';
           }
         }
       </section>
+
+      @if (access.value(); as a) {
+        @if ((a.canEnterOwnKey || a.keyProvided) && current.id(); as companyId) {
+          <app-my-model-key [companyId]="companyId" [access]="a" (changed)="access.set($event)" />
+        }
+      }
 
       <section class="flex flex-col gap-3" aria-labelledby="subscriptions-heading">
         <div class="flex flex-col gap-0.5">

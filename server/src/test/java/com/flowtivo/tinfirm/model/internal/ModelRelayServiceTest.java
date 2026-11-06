@@ -21,11 +21,11 @@ import org.springframework.boot.context.properties.source.MapConfigurationProper
 import com.flowtivo.tinfirm.shared.net.InflightBytes;
 
 /**
- * Parts of the model relay without a server: what a request's plan prints, the settings that bound the bytes of
- * request bodies a replica holds ({@code InflightBytes}, tested in {@code libs/net}), LiteLLM's own fields and those of
- * its guardrails removed from a body and its {@code drop_params} put on; the settings' defaults (the host's own token
- * required, the body deadline, the beta values passed on), a body's share taken as its bytes arrive whatever its
- * declared length, a body past its deadline 408, and a provider's tool refused unless the company allows it.
+ * Parts of the model relay without a server: what a request's plan prints, the settings that bound the bytes of request
+ * bodies a replica holds ({@code InflightBytes}, tested in {@code libs/net}), LiteLLM's own fields and those of its
+ * guardrails removed from a body and its {@code drop_params} put on for a LiteLLM; the settings' defaults (the host's
+ * own token required, the body deadline, the beta values passed on), a body's share taken as its bytes arrive whatever
+ * its declared length, a body past its deadline 408, and a provider's tool refused unless the company allows it.
  */
 class ModelRelayServiceTest {
 
@@ -82,6 +82,18 @@ class ModelRelayServiceTest {
         assertThat(new String(result.bytes()))
             .isEqualTo("{\"model\":\"moonshotai/kimi-k3\",\"reasoning_effort\":\"high\",\"drop_params\":true}");
         assertThat(result.model()).isEqualTo("moonshotai/kimi-k3");
+    }
+
+    /**
+     * A gateway of another vendor gets no {@code drop_params}, LiteLLM's own control, which a provider given the body
+     * as it came refuses (ADR-0094); LiteLLM's fields still go.
+     */
+    @Test
+    void anotherVendorsGatewayGetsNoDropParams() throws RelayBody.Refused {
+        RelayBody.Result result = RelayBody.transform(RelayBody.mapper(1024),
+                "{\"model\":\"claude-sonnet-4-5\",\"api_base\":\"http://elsewhere\",\"max_tokens\":1}".getBytes(),
+                false);
+        assertThat(new String(result.bytes())).isEqualTo("{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":1}");
     }
 
     /** The defaults an operator gets without a variable (M1, M3 and I8 of the security review of 2026-10-27). */
@@ -186,11 +198,15 @@ class ModelRelayServiceTest {
         assertThatThrownBy(() -> RelayBody.transform(RelayBody.mapper(1024), connector))
             .isInstanceOf(RelayBody.Refused.class)
             .hasMessageContaining("`mcp_servers`");
+        // Whatever the gateway's vendor (ADR-0094): another vendor's gateway is refused them too.
+        assertThatThrownBy(() -> RelayBody.transform(RelayBody.mapper(1024), search, false))
+            .isInstanceOf(RelayBody.Refused.class)
+            .hasMessageContaining("`web_search_20250305`");
     }
 
     private static ModelProperties properties(long maxRequestBytes, long maxInflightBytes) {
         return new ModelProperties(null, null, Duration.ofSeconds(10), Duration.ofMinutes(5), Duration.ofMinutes(10),
                 maxRequestBytes, 16, 16, Duration.ofDays(30), Duration.ofMinutes(10), Duration.ofMinutes(1),
-                maxInflightBytes, false, null, Duration.ofSeconds(30), null, null);
+                maxInflightBytes, false, null, Duration.ofSeconds(30), null, null, GatewayVendor.LITELLM);
     }
 }

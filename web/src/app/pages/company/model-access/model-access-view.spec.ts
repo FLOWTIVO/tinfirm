@@ -1,4 +1,8 @@
-import type { ModelSettings, ModelSettingsRequest } from '../../../api/generated/models';
+import type {
+  ModelAccessView,
+  ModelSettings,
+  ModelSettingsRequest,
+} from '../../../api/generated/models';
 import { aModelAccess, aModelSettings, AT } from '../../../testing/fixtures';
 import {
   adminKeyRequired,
@@ -18,6 +22,7 @@ import {
   parsePeriod,
   parseUsd,
   periodPhrase,
+  providedKeyState,
   reachPhrase,
   type SettingsChange,
   type SettingsForm,
@@ -116,7 +121,7 @@ describe('the gateway’s state', () => {
   ])('walks the three steps: %s', (_, state, states) => {
     const steps = gatewaySteps(state, 'BUNDLED', '$50.00 per 30 days, every model');
     expect(steps.map((s) => s.state)).toEqual(states);
-    expect(steps.map((s) => s.title)).toEqual(['Choose which LiteLLM', 'Set it up', 'Test it']);
+    expect(steps.map((s) => s.title)).toEqual(['Choose the model gateway', 'Set it up', 'Test it']);
     expect(steps[0].detail).toBe('Bundled, below');
     expect(steps[1].detail).toBe(
       'Saves the gateway and the defaults of every key: $50.00 per 30 days, every model',
@@ -215,6 +220,9 @@ describe('the settings form', () => {
       gateway: 'BUNDLED',
       adminUrl: '',
       adminKey: '',
+      modelUrl: '',
+      vendor: 'GENERIC',
+      memberKeys: false,
       budget: '50',
       periodCount: '2',
       periodUnit: 'w',
@@ -223,6 +231,65 @@ describe('the settings form', () => {
       thresholds: '80, 100',
       monthlyAlert: '',
     });
+  });
+
+  it('starts a gateway whose keys its team provides from its model URL, product and switch', () => {
+    const provided = aModelSettings({
+      gateway: 'PROVIDED',
+      vendor: 'LITELLM',
+      modelUrl: 'https://ai-gateway.acme.test',
+      memberKeys: true,
+    });
+    const form = settingsForm(provided);
+    expect(form).toMatchObject({
+      gateway: 'PROVIDED',
+      modelUrl: 'https://ai-gateway.acme.test',
+      vendor: 'LITELLM',
+      memberKeys: true,
+    });
+    expect(settingsErrors({ ...form, modelUrl: '' }, provided)).toEqual({
+      modelUrl: 'Enter the model URL of your gateway.',
+    });
+    expect(settingsErrors({ ...form, modelUrl: 'ai-gateway' }, provided).modelUrl).toContain(
+      'https',
+    );
+    expect(settingsRequest(form, provided)).toMatchObject({
+      gateway: 'PROVIDED',
+      modelUrl: 'https://ai-gateway.acme.test',
+      vendor: 'LITELLM',
+      memberKeys: true,
+    });
+    expect(settingsRequest(form, provided).adminUrl).toBeUndefined();
+    expect(settingsChanges({ ...form, vendor: 'GENERIC', memberKeys: false }, provided)).toEqual([
+      'vendor',
+      'memberKeys',
+    ]);
+    expect(settingsWas(['vendor', 'memberKeys'], provided)).toEqual({
+      vendor: 'LiteLLM',
+      memberKeys: 'allowed',
+    });
+    // From another gateway, a provided one starts as another product, members' keys off.
+    expect(settingsForm(aModelSettings()).vendor).toBe('GENERIC');
+  });
+
+  it.each<[string, Partial<ModelAccessView>, string]>([
+    [
+      'no key yet',
+      { keyProvided: false },
+      'No key yet: until one is entered, the work it pays for waits.',
+    ],
+    [
+      'an admin’s',
+      { keyProvided: true, keyHint: 'a1b2', keyProvidedAt: '2026-10-03T09:00:00Z' },
+      'Entered by an admin · ends in …a1b2 · ',
+    ],
+    [
+      'its holder’s',
+      { keyProvided: true, keyProvidedBySelf: true, keyHint: 'zz99' },
+      'Entered by its holder · ends in …zz99',
+    ],
+  ])('names where a provided key stands: %s', (_, overrides, words) => {
+    expect(providedKeyState(aModelAccess(overrides))).toContain(words);
   });
 
   it('starts an unconfigured company without a bundled LiteLLM on its own', () => {

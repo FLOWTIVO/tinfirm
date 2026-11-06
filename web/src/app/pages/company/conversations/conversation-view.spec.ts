@@ -195,7 +195,7 @@ describe('turnLine and turnMeta', () => {
     expect(turnLine(run, [], cost)).toMatchObject({
       shaAndCost: '$0.380',
       usageTitle:
-        'Input 1,200, cache writes included · output 340 tokens · Settled from LiteLLM’s records',
+        'Input 1,200, cache writes included · output 340 tokens · Settled from the gateway’s records',
     });
     // Another turn's spend leaves this one's estimate as it is.
     const other = { ...cost, turns: [{ ...cost.turns[0], runId: 'another-run' }] };

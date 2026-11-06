@@ -13,8 +13,9 @@ import java.util.UUID;
  *                 held to the outbound guard
  * @param modelUrl the gateway's root for model requests, without a trailing slash: the bundled gateway's model port
  *                 (ADR-0069), which serves the model API alone, or {@code baseUrl}
+ * @param vendor   the product the gateway is, whose {@link GatewayAdapter} speaks to it (ADR-0094)
  */
-record Gateway(String baseUrl, String adminKey, boolean bundled, String modelUrl) {
+record Gateway(String baseUrl, String adminKey, boolean bundled, String modelUrl, GatewayVendor vendor) {
 
     /** What the alias of the company's own key names in place of a principal. */
     private static final String COMPANY = "company";
@@ -24,9 +25,22 @@ record Gateway(String baseUrl, String adminKey, boolean bundled, String modelUrl
         modelUrl = withoutSlash(modelUrl);
     }
 
-    /** A gateway with one URL for its admin API and its model requests: a company's own. */
+    /**
+     * A gateway whose keys the company's gateway team provides (ADR-0094): its model URL, no admin key. Tinfirm makes,
+     * rotates and deletes no key there ({@link #managed()} is false).
+     */
+    static Gateway provided(String modelUrl, GatewayVendor vendor) {
+        return new Gateway(modelUrl, "", false, modelUrl, vendor);
+    }
+
+    /** Whether Tinfirm manages the gateway's keys through its admin API: it holds an admin key there. */
+    boolean managed() {
+        return !adminKey.isEmpty();
+    }
+
+    /** A LiteLLM with one URL for its admin API and its model requests: a company's own. */
     Gateway(String baseUrl, String adminKey, boolean bundled) {
-        this(baseUrl, adminKey, bundled, baseUrl);
+        this(baseUrl, adminKey, bundled, baseUrl, GatewayVendor.LITELLM);
     }
 
     private static String withoutSlash(String url) {
@@ -86,6 +100,7 @@ record Gateway(String baseUrl, String adminKey, boolean bundled, String modelUrl
 
     @Override
     public String toString() {
-        return "Gateway[baseUrl=" + baseUrl + ", modelUrl=" + modelUrl + ", bundled=" + bundled + ", adminKey=***]";
+        return "Gateway[vendor=" + vendor + ", baseUrl=" + baseUrl + ", modelUrl=" + modelUrl + ", bundled=" + bundled
+                + ", adminKey=" + (managed() ? "***" : "none") + "]";
     }
 }

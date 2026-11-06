@@ -255,13 +255,15 @@ tinfirm:
     # 5 s longer for the answer.
     tool-timeout: ${TINFIRM_RUN_TOOL_TIMEOUT:PT60S}
   model:
-    # The LiteLLM bundled with the deployment (ADR-0059, CONVENTIONS §4): its address inside the deployment's network,
-    # for its admin API, and its master key. Unset, none is bundled, and a company configures its own (EXTERNAL).
-    # Runner hosts never reach it. The model requests the server relays and its own go to the model port (ADR-0069),
-    # which serves the model API alone; unset, to the admin URL.
-    litellm-admin-url: ${TINFIRM_LITELLM_ADMIN_URL:}
-    litellm-master-key: ${TINFIRM_LITELLM_MASTER_KEY:}
-    litellm-model-url: ${TINFIRM_LITELLM_MODEL_URL:}
+    # The model gateway bundled with the deployment (ADR-0059, ADR-0094, CONVENTIONS §4): its product, its address
+    # inside the deployment's network, for its admin API, and its admin key (LiteLLM's master key). Unset, none is
+    # bundled, and a company configures its own (EXTERNAL). Runner hosts never reach it. The model requests the server
+    # relays and its own go to the model port (ADR-0069), which serves the model API alone; unset, to the admin URL.
+    # The TINFIRM_LITELLM_* names of these variables are still read when the new ones are unset.
+    gateway-vendor: ${TINFIRM_MODEL_GATEWAY_VENDOR:LITELLM}
+    gateway-admin-url: ${TINFIRM_MODEL_GATEWAY_ADMIN_URL:${TINFIRM_LITELLM_ADMIN_URL:}}
+    gateway-admin-key: ${TINFIRM_MODEL_GATEWAY_ADMIN_KEY:${TINFIRM_LITELLM_MASTER_KEY:}}
+    gateway-model-url: ${TINFIRM_MODEL_GATEWAY_MODEL_URL:${TINFIRM_LITELLM_MODEL_URL:}}
     # Each principal's LiteLLM key is rotated this long after its creation (at least P1D); the key it replaces keeps
     # serving the requests that already hold it for the grace (at most PT1H), and is then blocked and deleted. A
     # rotation an admin asks for gives the old key no grace (CONVENTIONS §15.4).

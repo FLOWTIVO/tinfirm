@@ -93,6 +93,8 @@ class SpendSyncLateUsageTest {
             .thenAnswer(call -> ((Supplier<?>) call.getArgument(1)).get());
         when(transactions.unscoped(ArgumentMatchers.<Supplier<Object>>any()))
             .thenAnswer(call -> ((Supplier<?>) call.getArgument(0)).get());
+        // The company's gateway keeps spend logs Tinfirm reads (SpendLogs.recorded), as LiteLLM does.
+        when(logs.recorded(COMPANY)).thenReturn(true);
     }
 
     /** The run's pending settlement, due now and claimed by this worker: it ended {@code endedAgo} ago. */

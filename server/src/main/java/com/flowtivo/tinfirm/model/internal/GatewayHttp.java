@@ -19,13 +19,13 @@ import com.flowtivo.tinfirm.shared.net.OutboundProxy;
 import com.flowtivo.tinfirm.shared.net.OutboundUrls;
 
 /**
- * The server's HTTP client to companies' LiteLLMs, for their admin API and the model requests the relay forwards. The
- * deployment's bundled gateway is the operator's address and is reached as configured. A company's own gateway
- * ({@code EXTERNAL}) is an address an admin entered: it is held to the outbound guard of the company's systems
- * (CONVENTIONS §14.4), with the operator's choices for them ({@code TINFIRM_CONNECTION_ALLOW_HTTP},
- * {@code TINFIRM_CONNECTION_ALLOW_PRIVATE_ADDRESSES}): https unless http is allowed, no loopback, link-local or private
- * address unless allowed, checked when it is entered and before every request, and guarded against a changed DNS
- * answer while a request is in flight. Redirects are never followed.
+ * The server's HTTP client to companies' model gateways, for their admin API and the model requests the relay
+ * forwards. The deployment's bundled gateway is the operator's address and is reached as configured. A company's own
+ * gateway ({@code EXTERNAL}, or {@code PROVIDED} by its model URL, ADR-0094) is an address an admin entered: it is held
+ * to the outbound guard of the company's systems (CONVENTIONS §14.4), with the operator's choices for them
+ * ({@code TINFIRM_CONNECTION_ALLOW_HTTP}, {@code TINFIRM_CONNECTION_ALLOW_PRIVATE_ADDRESSES}): https unless http is
+ * allowed, no loopback, link-local or private address unless allowed, checked when it is entered and before every
+ * request, and guarded against a changed DNS answer while a request is in flight. Redirects are never followed.
  */
 @Component
 class GatewayHttp {
@@ -48,7 +48,7 @@ class GatewayHttp {
             @Value("${tinfirm.connection.allowed-private-hosts:}") Set<String> allowedPrivateHosts,
             Environment environment) {
         Set<String> bundled = new HashSet<>();
-        addHost(bundled, properties.litellmAdminUrl());
+        addHost(bundled, properties.gatewayAdminUrl());
         addHost(bundled, properties.bundledModelUrl());
         this.http = HttpClient.newBuilder()
             .connectTimeout(properties.adminTimeout())

@@ -195,7 +195,8 @@ public enum AuditAction {
     /**
      * A principal's key was deleted, its secret with it: {@code principalId}, {@code cause} ({@code principal.left},
      * {@code principal.deleted}, {@code gateway.changed}). LiteLLM deletes it after the commit, best effort; the
-     * reconciliation deletes what it missed.
+     * reconciliation deletes what it missed. A key a gateway team provided stays at its gateway
+     * ({@link #MODEL_KEY_REVOKE_REQUESTED}).
      */
     MODEL_KEY_DELETED("model_key.deleted"),
     /**
@@ -210,6 +211,25 @@ public enum AuditAction {
      * {@code ERROR} until a sync repairs it. Actor SYSTEM.
      */
     MODEL_KEY_REFUSED("model_key.refused"),
+    /**
+     * A key the company's gateway team made was entered for a principal or the company (ADR-0094): {@code principalId}
+     * (none for the company's own key), {@code by} ({@code self} or {@code admin}), {@code hint} (its last four
+     * characters), {@code replaced} (whether it replaced one). Never the key.
+     */
+    MODEL_KEY_PROVIDED("model_key.provided"),
+    /**
+     * Tinfirm forgot a key its gateway team made (ADR-0094): {@code principalId}, {@code hint}, {@code by}
+     * ({@code self} or {@code admin}). The key stays at the gateway.
+     */
+    MODEL_KEY_REMOVED("model_key.removed"),
+    /**
+     * A principal whose key its gateway team made left or was deleted, or was suspended, or the company's settings
+     * left that gateway, the company's own key too (ADR-0094): Tinfirm no longer pays with the key, and asks the
+     * gateway team to revoke it there. {@code principalId} (or {@code holder}), {@code hint}, {@code cause}
+     * ({@code principal.left}, {@code principal.deleted}, {@code principal.suspended}, {@code gateway.changed}). Actor
+     * as the change's.
+     */
+    MODEL_KEY_REVOKE_REQUESTED("model_key.revoke_requested"),
     /**
      * An admin asked to rotate a principal's key at once, its previous key without a grace: {@code principalId},
      * {@code scope} ({@code principal}, or {@code company} for every key of the company). Actor USER.

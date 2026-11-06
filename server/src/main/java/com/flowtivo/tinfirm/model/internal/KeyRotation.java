@@ -126,7 +126,7 @@ public class KeyRotation {
 
     private final Gateways gateways;
 
-    private final LiteLlm litellm;
+    private final GatewayAdapter adapter;
 
     private final KeySync sync;
 
@@ -141,14 +141,14 @@ public class KeyRotation {
     private final Map<UUID, Step> crashes = new ConcurrentHashMap<>();
 
     KeyRotation(SystemTransactions transactions, ModelSettingsStore settingsStore, ModelKeyStore keys,
-            Principals principals, Gateways gateways, LiteLlm litellm, KeySync sync, SecretWriter secrets,
+            Principals principals, Gateways gateways, GatewayAdapter adapter, KeySync sync, SecretWriter secrets,
             AuditLog auditLog, ModelProperties properties, TimeSource time) {
         this.transactions = transactions;
         this.settingsStore = settingsStore;
         this.keys = keys;
         this.principals = principals;
         this.gateways = gateways;
-        this.litellm = litellm;
+        this.adapter = adapter;
         this.sync = sync;
         this.secrets = secrets;
         this.auditLog = auditLog;
@@ -160,7 +160,8 @@ public class KeyRotation {
     Outcome run(KeyHolder holder) {
         UUID companyId = holder.companyId();
         Optional<ModelKeyStore.KeyRow> look = transactions.inCompany(companyId, () -> keys.find(holder));
-        if (look.isEmpty()) {
+        if (look.isEmpty() || look.get().provided() != null) {
+            // A key its gateway team made is theirs to rotate (ADR-0094).
             return new Outcome(Result.NOTHING, null, null);
         }
         if (next(look.get(), time.now()) == Next.NONE) {
@@ -319,15 +320,15 @@ public class KeyRotation {
     private void rotate(KeyHolder holder, State state) {
         UUID companyId = holder.companyId();
         ModelKeyStore.KeyRow row = state.row();
-        String currentId = Objects.requireNonNull(row.litellmKeyId());
+        String currentId = Objects.requireNonNull(row.gatewayKeyId());
         Gateway gateway = state.gateway();
-        LiteLlm.KeyState current = litellm.info(gateway, currentId)
+        GatewayAdapter.KeyState current = adapter.info(gateway, currentId)
             .orElseThrow(() -> new LiteLlmException(404,
                     "LiteLLM does not know the current key; the sync makes it again"));
         int generation = row.rotation().generation() + 1;
         BigDecimal carried = BigDecimal.valueOf(current.spend());
         KeySync.Desired desired = KeySync.desired(state.settings(), row, state.principal());
-        LiteLlm.CreatedKey created = sync.generate(gateway, KeySync.keySpec(holder.alias(generation),
+        GatewayAdapter.CreatedKey created = sync.generate(gateway, KeySync.keySpec(holder.alias(generation),
                 Gateway.teamId(companyId), holder, KeySync.kind(state.principal()), state.names(), desired, carried),
                 companyId, state.names().company());
 
@@ -350,11 +351,11 @@ public class KeyRotation {
     }
 
     /** The switch, in a transaction of the company; false when the row moved on meanwhile. */
-    private boolean switchTo(KeyHolder holder, State state, String currentId, LiteLlm.CreatedKey created,
+    private boolean switchTo(KeyHolder holder, State state, String currentId, GatewayAdapter.CreatedKey created,
             int generation, BigDecimal carried, @Nullable Instant resetsAt) {
         UUID companyId = holder.companyId();
         Optional<ModelKeyStore.KeyRow> row = keys.lock(holder);
-        if (row.isEmpty() || !currentId.equals(row.get().litellmKeyId()) || row.get().rotation().retiringKeyId() != null
+        if (row.isEmpty() || !currentId.equals(row.get().gatewayKeyId()) || row.get().rotation().retiringKeyId() != null
                 || !settingsStore.find(companyId).map(KeySync::connection).filter(state.connection()::equals)
                     .isPresent()) {
             return false;
@@ -381,7 +382,7 @@ public class KeyRotation {
     private void blockPrevious(KeyHolder holder, State state) {
         String previous = Objects.requireNonNull(state.row().rotation().retiringKeyId());
         try {
-            litellm.block(state.gateway(), previous);
+            adapter.block(state.gateway(), previous);
         }
         catch (LiteLlmException ex) {
             if (!ex.notFound()) {
@@ -412,20 +413,20 @@ public class KeyRotation {
     private void deletePrevious(KeyHolder holder, State state) {
         ModelKeyStore.KeyRow row = state.row();
         String previous = Objects.requireNonNull(row.rotation().retiringKeyId());
-        Optional<LiteLlm.KeyState> old = litellm.info(state.gateway(), previous);
+        Optional<GatewayAdapter.KeyState> old = adapter.info(state.gateway(), previous);
         BigDecimal spent = null;
         if (old.isPresent()) {
             double late = lateSpend(old.get(), row.rotation());
             if (late > EPSILON && row.hasKey()) {
-                String currentId = Objects.requireNonNull(row.litellmKeyId());
-                Optional<LiteLlm.KeyState> current = litellm.info(state.gateway(), currentId);
+                String currentId = Objects.requireNonNull(row.gatewayKeyId());
+                Optional<GatewayAdapter.KeyState> current = adapter.info(state.gateway(), currentId);
                 if (current.isPresent()) {
                     spent = BigDecimal.valueOf(current.get().spend() + late);
-                    litellm.setSpend(state.gateway(), currentId, spent);
+                    adapter.setSpend(state.gateway(), currentId, spent);
                 }
             }
             checkpoint(holder, Step.TRANSFERRED);
-            litellm.delete(state.gateway(), previous);
+            adapter.delete(state.gateway(), previous);
         }
         checkpoint(holder, Step.DELETED);
         BigDecimal spentUsd = spent;
@@ -441,7 +442,7 @@ public class KeyRotation {
      * What the previous key spent after the current one was created with its spend: its spend since, or all of its
      * spend when its period restarted meanwhile (the current key's restarted too).
      */
-    static double lateSpend(LiteLlm.KeyState previous, ModelKeyStore.Rotation rotation) {
+    static double lateSpend(GatewayAdapter.KeyState previous, ModelKeyStore.Rotation rotation) {
         boolean restarted = previous.budgetResetAt() != null && rotation.retiringResetsAt() != null
                 && previous.budgetResetAt().isAfter(rotation.retiringResetsAt());
         double carried = rotation.retiringSpendUsd() != null ? rotation.retiringSpendUsd().doubleValue()
@@ -451,7 +452,7 @@ public class KeyRotation {
 
     private void deleteQuietly(Gateway gateway, String keyId) {
         try {
-            litellm.delete(gateway, keyId);
+            adapter.delete(gateway, keyId);
         }
         catch (LiteLlmException ex) {
             log.warn("A rotation's key Tinfirm could not keep was not deleted ({}); the reconciliation deletes it",

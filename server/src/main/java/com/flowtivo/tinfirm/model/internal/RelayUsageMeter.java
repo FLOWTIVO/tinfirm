@@ -37,10 +37,11 @@ import tools.jackson.databind.json.JsonMapper;
  * too long, and the lines after it are still read within the capacity already reserved. A line is read where it is
  * kept, never copied, and parsed only when it is a {@code data:} line that names a usage or a model. A plain answer
  * the budget or the cap cannot hold gives its buffer back at once and is passed on unmetered, counting a request and
- * no tokens, with one warning. The fields are the last ones reported, since a stream reports its usage as running
+ * no tokens, with one warning. Each field is the largest value reported, since a stream reports its usage as running
  * totals: Anthropic's {@code message_start} and {@code message_delta}, OpenAI's final chunk ({@code usage} with
- * {@code prompt_tokens}) and the Responses API's {@code response.completed}. An answer without usage counts a request
- * and no tokens. Never sees a key: the key's LiteLLM id is its SHA-256.
+ * {@code prompt_tokens}) and the Responses API's {@code response.completed}; a total never falls, and a gateway may
+ * report a field it no longer counts as 0 (Bifrost's {@code message_delta} reports {@code input_tokens: 0}). An answer
+ * without usage counts a request and no tokens. Never sees a key: the key's LiteLLM id is its SHA-256.
  */
 final class RelayUsageMeter {
 
@@ -458,14 +459,14 @@ final class RelayUsageMeter {
                 "cache_creation_input_tokens", "prompt_tokens", "completion_tokens"}) {
             JsonNode value = usage.get(name);
             if (value != null && value.isNumber()) {
-                fields.put(name, value.asLong());
+                fields.merge(name, value.asLong(), Math::max);
             }
         }
         for (String details : new String[] {"prompt_tokens_details", "input_tokens_details"}) {
             JsonNode node = usage.get(details);
             JsonNode cached = node != null ? node.get("cached_tokens") : null;
             if (cached != null && cached.isNumber()) {
-                fields.put("cached_tokens", cached.asLong());
+                fields.merge("cached_tokens", cached.asLong(), Math::max);
             }
         }
     }

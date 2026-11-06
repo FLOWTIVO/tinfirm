@@ -17,10 +17,12 @@ import org.springframework.validation.annotation.Validated;
 /**
  * Settings of model access (CONVENTIONS §4; the package 2 contract, §6, §6.1).
  *
- * @param litellmAdminUrl              the LiteLLM bundled with the deployment, inside its network
- *                                     ({@code TINFIRM_LITELLM_ADMIN_URL}); blank: none is bundled, and companies
+ * @param gatewayAdminUrl              the model gateway bundled with the deployment, inside its network, for its admin
+ *                                     API ({@code TINFIRM_MODEL_GATEWAY_ADMIN_URL}, or the older
+ *                                     {@code TINFIRM_LITELLM_ADMIN_URL}); blank: none is bundled, and companies
  *                                     configure their own ({@code EXTERNAL})
- * @param litellmMasterKey             its master key ({@code TINFIRM_LITELLM_MASTER_KEY}); never logged
+ * @param gatewayAdminKey              its admin key, LiteLLM's master key ({@code TINFIRM_MODEL_GATEWAY_ADMIN_KEY}, or
+ *                                     the older {@code TINFIRM_LITELLM_MASTER_KEY}); never logged
  * @param adminTimeout                 connect and request timeout of one call to LiteLLM's admin API
  * @param reconcileInterval            how often a {@code worker} replica compares every company's keys with LiteLLM's
  *                                     and repairs what drifted
@@ -49,10 +51,12 @@ import org.springframework.validation.annotation.Validated;
  *                                     ({@code TINFIRM_MODEL_RELAY_REQUIRE_HOST_TOKEN}, on by default: runner
  *                                     {@code 0.3.0} is the minimum); off, a host before runner {@code 0.3.0} may leave
  *                                     it out (the package 2 contract, open point 6), for an upgrade only
- * @param litellmModelUrl              the bundled LiteLLM's model port, which serves the model API alone
- *                                     ({@code TINFIRM_LITELLM_MODEL_URL}, ADR-0069): the model requests the server
- *                                     relays and its own go there, its admin API to {@code litellmAdminUrl}; blank, both
- *                                     go to {@code litellmAdminUrl}. A company's own gateway has one URL for both
+ * @param gatewayModelUrl              the bundled gateway's model port, which serves the model API alone
+ *                                     ({@code TINFIRM_MODEL_GATEWAY_MODEL_URL}, or the older
+ *                                     {@code TINFIRM_LITELLM_MODEL_URL}; ADR-0069): the model requests the server
+ *                                     relays and its own go there, its admin API to {@code gatewayAdminUrl}; blank,
+ *                                     both go to {@code gatewayAdminUrl}. A company's own gateway has one URL for
+ *                                     both
  * @param relayBodyTimeout             the longest the relay waits for a request's whole body
  *                                     ({@code TINFIRM_MODEL_RELAY_BODY_TIMEOUT}, 30 s); a body still arriving then is
  *                                     408. One read that waits for the next bytes is bounded by Tomcat's
@@ -64,10 +68,12 @@ import org.springframework.validation.annotation.Validated;
  * @param relayOpenaiBetas             the {@code OpenAI-Beta} values the relay passes on
  *                                     ({@code TINFIRM_MODEL_RELAY_OPENAI_BETAS}; unset, {@link #OPENAI_BETAS}), as
  *                                     {@code relayAnthropicBetas}
+ * @param gatewayVendor                the product the bundled gateway is ({@code TINFIRM_MODEL_GATEWAY_VENDOR},
+ *                                     ADR-0094): {@code LITELLM}, the only product the deployment bundles
  */
 @Validated
 @ConfigurationProperties("tinfirm.model")
-record ModelProperties(@Nullable String litellmAdminUrl, @Nullable String litellmMasterKey,
+record ModelProperties(@Nullable String gatewayAdminUrl, @Nullable String gatewayAdminKey,
         @NotNull @DefaultValue("PT10S") Duration adminTimeout, @NotNull @DefaultValue("PT5M") Duration reconcileInterval,
         @NotNull @DefaultValue("PT10M") Duration relayIdleTimeout,
         @Positive @DefaultValue("67108864") long relayMaxRequestBytes,
@@ -77,9 +83,9 @@ record ModelProperties(@Nullable String litellmAdminUrl, @Nullable String litell
         @NotNull @DefaultValue("PT10M") Duration keyRotationGrace,
         @NotNull @DefaultValue("PT1M") Duration keyRotationSettle,
         @Positive @DefaultValue("268435456") long relayMaxInflightBytes,
-        @DefaultValue("true") boolean relayRequireHostToken, @Nullable String litellmModelUrl,
+        @DefaultValue("true") boolean relayRequireHostToken, @Nullable String gatewayModelUrl,
         @NotNull @DefaultValue("PT30S") Duration relayBodyTimeout, @Nullable List<String> relayAnthropicBetas,
-        @Nullable List<String> relayOpenaiBetas) {
+        @Nullable List<String> relayOpenaiBetas, @NotNull @DefaultValue("LITELLM") GatewayVendor gatewayVendor) {
 
     /**
      * The {@code anthropic-beta} values the relay passes on by default (M1 of the security review of 2026-10-27): the
@@ -149,9 +155,13 @@ record ModelProperties(@Nullable String litellmAdminUrl, @Nullable String litell
             throw new IllegalArgumentException("tinfirm.model.relay-max-inflight-bytes (" + relayMaxInflightBytes
                     + ") must be at least twice tinfirm.model.relay-max-request-bytes (" + relayMaxRequestBytes + ")");
         }
-        if (litellmModelUrl != null && !litellmModelUrl.isBlank() && !modelUrl(litellmModelUrl.trim())) {
-            throw new IllegalArgumentException("TINFIRM_LITELLM_MODEL_URL must be an http(s) URL without credentials, "
-                    + "a query or a fragment, e.g. http://model-api:4001");
+        if (gatewayModelUrl != null && !gatewayModelUrl.isBlank() && !modelUrl(gatewayModelUrl.trim())) {
+            throw new IllegalArgumentException("TINFIRM_MODEL_GATEWAY_MODEL_URL must be an http(s) URL without "
+                    + "credentials, a query or a fragment, e.g. http://model-api:4001");
+        }
+        if (gatewayVendor == GatewayVendor.GENERIC) {
+            throw new IllegalArgumentException("TINFIRM_MODEL_GATEWAY_VENDOR must be LITELLM: Tinfirm manages the "
+                    + "bundled gateway's keys, and GENERIC is for a company's gateway whose keys its team provides");
         }
     }
 
@@ -168,27 +178,28 @@ record ModelProperties(@Nullable String litellmAdminUrl, @Nullable String litell
         }
     }
 
-    /** Where the server sends model requests to the bundled LiteLLM: its model port, or else its admin URL. */
+    /** Where the server sends model requests to the bundled gateway: its model port, or else its admin URL. */
     @Nullable String bundledModelUrl() {
-        return litellmModelUrl != null && !litellmModelUrl.isBlank() ? litellmModelUrl.trim() : litellmAdminUrl;
+        return gatewayModelUrl != null && !gatewayModelUrl.isBlank() ? gatewayModelUrl.trim() : gatewayAdminUrl;
     }
 
-    /** Whether the deployment bundles a LiteLLM: both its URL and its master key are set. */
+    /** Whether the deployment bundles a gateway: both its URL and its admin key are set. */
     boolean bundled() {
-        return litellmAdminUrl != null && !litellmAdminUrl.isBlank() && litellmMasterKey != null
-                && !litellmMasterKey.isBlank();
+        return gatewayAdminUrl != null && !gatewayAdminUrl.isBlank() && gatewayAdminKey != null
+                && !gatewayAdminKey.isBlank();
     }
 
     @Override
     public String toString() {
-        return "ModelProperties[litellmAdminUrl=" + litellmAdminUrl + ", litellmMasterKey="
-                + (litellmMasterKey == null || litellmMasterKey.isBlank() ? "unset" : "***") + ", adminTimeout="
-                + adminTimeout + ", reconcileInterval=" + reconcileInterval + ", relayIdleTimeout=" + relayIdleTimeout
+        return "ModelProperties[gatewayVendor=" + gatewayVendor + ", gatewayAdminUrl=" + gatewayAdminUrl
+                + ", gatewayAdminKey=" + (gatewayAdminKey == null || gatewayAdminKey.isBlank() ? "unset" : "***")
+                + ", adminTimeout=" + adminTimeout + ", reconcileInterval=" + reconcileInterval + ", relayIdleTimeout="
+                + relayIdleTimeout
                 + ", relayMaxRequestBytes=" + relayMaxRequestBytes + ", relayRunConcurrency=" + relayRunConcurrency
                 + ", relayHostConcurrencyPerSlot=" + relayHostConcurrencyPerSlot + ", keyRotationInterval="
                 + keyRotationInterval + ", keyRotationGrace=" + keyRotationGrace + ", keyRotationSettle="
                 + keyRotationSettle + ", relayMaxInflightBytes=" + relayMaxInflightBytes + ", relayRequireHostToken="
-                + relayRequireHostToken + ", litellmModelUrl=" + litellmModelUrl + ", relayBodyTimeout="
+                + relayRequireHostToken + ", gatewayModelUrl=" + gatewayModelUrl + ", relayBodyTimeout="
                 + relayBodyTimeout + ", relayAnthropicBetas=" + relayAnthropicBetas + ", relayOpenaiBetas="
                 + relayOpenaiBetas + "]";
     }
