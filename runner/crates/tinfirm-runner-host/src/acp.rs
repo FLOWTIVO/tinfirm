@@ -6,7 +6,7 @@
 //!   the run's platform MCP endpoint in `mcpServers` when the agent supports MCP over HTTP
 //!   (`agentCapabilities.mcpCapabilities.http`), else `[]` (docs/archive/v1/CONVENTIONS.md §15.6),
 //!   and the runtime's session `_meta` ([`crate::runtime_env::session_meta`]: Claude Code's
-//!   disallowed WebSearch through a gateway, ADR-0108);
+//!   disallowed WebSearch, ADR-0108);
 //!   why the run did not resume is reported as a [`ResumeOutcome`] (`run.finished.resumeOutcome`);
 //! - `session/set_config_option` of the session's thought-level option when the run has an
 //!   effort that its runtime does not take from the environment ([`ThoughtLevel`]);
@@ -301,7 +301,7 @@ pub struct AcpParams {
     /// The run's platform MCP endpoint, when the host serves one.
     pub mcp_url: Option<String>,
     /// The `_meta` of `session/new` and `session/load`
-    /// ([`crate::runtime_env::session_meta`]): Claude Code's disallowed tools through a gateway.
+    /// ([`crate::runtime_env::session_meta`]): Claude Code's disallowed tools.
     pub session_meta: Option<serde_json::Map<String, Value>>,
     /// What the host does with the session's thought-level config option.
     pub thought_level: ThoughtLevel,
