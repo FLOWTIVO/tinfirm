@@ -830,6 +830,15 @@ async fn model_access_without_a_base_url_never_reaches_the_sandbox() {
         conn.send(next.to_json());
         let t = conn.until_finished(next.run_id).await;
         assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        // Without a gateway too, no run may have the provider run a tool (ADR-0108): Claude
+        // Code's WebSearch is off.
+        assert!(
+            t.agent_text().contains(
+                r#"session-meta={"claudeCode":{"options":{"disallowedTools":["WebSearch"]}}}"#
+            ),
+            "{}",
+            t.agent_text()
+        );
         assert!(
             !host
                 .host
