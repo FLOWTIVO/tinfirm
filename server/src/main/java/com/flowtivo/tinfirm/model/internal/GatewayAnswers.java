@@ -60,14 +60,17 @@ final class GatewayAnswers {
 
     /**
      * A gateway's text without the key Tinfirm sent it, as it came and as a JSON string writes it: a key a company's
-     * gateway team provided may have any form (ADR-0094), which {@link #redact} does not know.
+     * gateway team provided may have any form (ADR-0094), which {@link #redact} does not know. A JSON text is written
+     * anew first, since its writer may have escaped the key's characters its own way ({@code \/}, {@code \u002b}).
      */
     static String withoutKey(String text, String key) {
         if (key.isEmpty()) {
             return text;
         }
+        JsonNode parsed = text.isBlank() ? null : parse(text);
+        String normalized = parsed != null ? JSON.writeValueAsString(parsed) : text;
         String json = JSON.writeValueAsString(key);
-        return text.replace(key, "***").replace(json.substring(1, json.length() - 1), "***");
+        return normalized.replace(key, "***").replace(json.substring(1, json.length() - 1), "***");
     }
 
     /** The answer's body, read within its limit; a larger one fails the call with its status. */

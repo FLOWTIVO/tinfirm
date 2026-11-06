@@ -165,7 +165,11 @@ class ProvidedKeyService {
             // The gateway knows the key, and limits it now (its budget, or a rate): the relay learns which.
         }
         transactions.executeWithoutResult(status -> {
-            ModelSettingsStore.SettingsRow settings = settings(holder, who);
+            settings(holder, who);
+            // The company's settings row, locked: the key entries of one company wait for each other here, so that
+            // the check below that no other holder has this key holds until the commit, and a change of the settings
+            // made meanwhile is seen.
+            ModelSettingsStore.SettingsRow settings = settingsStore.lock(holder.companyId()).orElseThrow();
             if (!settings.updatedAt().equals(target.settingsAt())) {
                 throw ApiException.conflict(ProblemCode.MODEL_KEYS_MANAGED,
                         "The model settings changed while the key was checked: enter it again");
@@ -263,9 +267,10 @@ class ProvidedKeyService {
     /** The key as entered, without surrounding whitespace: 8 to 1000 printable characters without spaces. */
     private static String checkedText(@Nullable String entered) {
         String key = entered != null ? entered.strip() : "";
-        if (key.length() < MIN_KEY || key.length() > MAX_KEY
-                || key.chars().anyMatch(c -> c <= ' ' || c == 0x7f || Character.isWhitespace(c))) {
-            throw ApiException.invalid("A key is " + MIN_KEY + " to " + MAX_KEY + " characters without spaces", "key");
+        // Visible ASCII only: the key goes into a request header, which takes nothing else.
+        if (key.length() < MIN_KEY || key.length() > MAX_KEY || key.chars().anyMatch(c -> c < 0x21 || c > 0x7e)) {
+            throw ApiException.invalid("A key is " + MIN_KEY + " to " + MAX_KEY
+                    + " visible ASCII characters, without spaces", "key");
         }
         return key;
     }
