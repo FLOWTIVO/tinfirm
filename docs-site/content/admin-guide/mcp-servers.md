@@ -125,6 +125,20 @@ Set it only on a server that truly checks nothing, and only when nothing but Tin
 
 Untick **Needs no account** to need accounts again. A person's conversation that used the server then waits for an account at its next call. A trigger's conversation cannot use it until the trigger names an account there. If a server starts asking for a credential while set to need none, its calls are refused and the agent says so.
 
+## Web search for agents
+
+Agents search the web through Tinfirm, never through the model's provider. The model relay refuses every request that asks the provider to run a tool itself: its web search or web fetch, its code execution, its connection to an MCP server. There is no setting that allows it. The runtimes' own web search through the provider is switched off in Tinfirm's runs (Claude Code's **WebSearch**, Codex's web search), so an agent that needs search gets it as an MCP tool, like any other.
+
+To give agents web search:
+
+1. Run a search MCP server that agents may use: one in front of a search engine you choose, such as a SearXNG of your own, or one of a search service your company has a key for. Keep the key on the MCP server's side or store it on a credential here, never in a prompt.
+2. Register it as a company MCP server ([Register a company MCP server](#register-a-company-mcp-server)). If it is reachable only from Tinfirm's network and checks no credential, set it to [need no account](#a-server-that-needs-no-account), so that no member has to connect one.
+3. Confirm its search tool as one that **Reads**, and add the server to the agents that should search.
+
+Each search is then a tool call the Tinfirm server makes: it appears in the audit log with the conversation, the run, the agent and the query, it follows the agent's tool settings and the approvals they ask for, and it counts as data sent to that server (see [Keep it safe](#keep-it-safe)). What a search returns comes from the web: treat it as untrusted, as any tool result.
+
+Claude Code's **WebFetch** stays on: it fetches pages from the sandbox, through the runner host's egress proxy, which reaches only the hosts your operator allows.
+
 ## Move a server to a new endpoint
 
 When the server moves to another host, port or path, **Change** takes the new **MCP endpoint**. A token is sent only where it was given, so saving the new endpoint:
