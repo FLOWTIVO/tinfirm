@@ -189,8 +189,6 @@ spec:
               value: {{ $l.modelApi.maxInflightBytes | int64 | toString | quote }}
             - name: MODEL_API_IDLE_TIMEOUT
               value: {{ $l.modelApi.idleTimeout | quote }}
-            - name: MODEL_API_PROVIDER_TOOLS
-              value: {{ $l.modelApi.providerTools | default "OFF" | quote }}
             - name: JAVA_TOOL_OPTIONS
               value: {{ $l.modelApi.javaToolOptions | quote }}
             {{- with $l.modelApi.extraEnv }}

@@ -34,7 +34,5 @@ model-api:
   max-request-bytes: ${MODEL_API_MAX_REQUEST_BYTES:67108864}
   max-inflight-bytes: ${MODEL_API_MAX_INFLIGHT_BYTES:134217728}
   idle-timeout: ${MODEL_API_IDLE_TIMEOUT:PT10M}
-  # Which tools the model's provider may run itself for a request (M1 of the security review of 2026-10-27): OFF, none
-  # (a request that names web search or fetch, code execution or an MCP server is 400); WEB_SEARCH, the providers' web
-  # search too. The server's relay applies each company's own choice before the port: the stricter of the two holds.
-  provider-tools: ${MODEL_API_PROVIDER_TOOLS:OFF}
+  # No setting lets the model's provider run a tool itself (ADR-0108): a request that asks for web search or fetch,
+  # code execution or an MCP server is always 400.

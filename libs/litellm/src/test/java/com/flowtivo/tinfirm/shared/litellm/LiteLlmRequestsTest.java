@@ -15,9 +15,9 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * LiteLLM's own fields never pass, by name, prefix and shape; the model's API passes as it came; {@code drop_params}
  * passes or is forced, as the caller asks; a body that is not one JSON object is refused. The provider is never a relay
- * the agent directs (M1 and D8 of the security review of 2026-10-27): {@code mcp_servers} and {@code container} are
- * removed, a tool the provider would run is refused wherever the body defines one, unless it is the providers' web
- * search and the caller allows it, and only the beta values on the caller's list pass.
+ * the agent directs and never runs a tool itself (M1 and D8 of the security review of 2026-10-27; ADR-0108): the MCP
+ * connector, the code execution container, every web search and every tool the provider would run refuse the request,
+ * wherever the body asks for them, and only the beta values on the caller's list pass.
  */
 class LiteLlmRequestsTest {
 
@@ -76,21 +76,52 @@ class LiteLlmRequestsTest {
                 .isInstanceOf(LiteLlmRequests.Refused.class);
         }
     }
+    /**
+     * The MCP shapes of every provider refuse the request, never silently removed: Anthropic's {@code mcp_servers} with
+     * or without an {@code mcp_toolset}, OpenAI Responses' {@code mcp} tool to a server or to a connector, and
+     * Anthropic's code execution {@code container}. No pinned runtime sends any of them (it runs MCP itself).
+     */
     @Test
-    void theProvidersMcpConnectorAndContainerAreRemoved() throws LiteLlmRequests.Refused {
-        byte[] body = ("{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,\"mcp_servers\":[{\"type\":\"url\","
-                + "\"url\":\"https://evil.example/mcp\",\"name\":\"x\"}],\"Container\":{\"skills\":[]},"
-                + "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}").getBytes(StandardCharsets.UTF_8);
-        for (LiteLlmRequests.ProviderTools tools : LiteLlmRequests.ProviderTools.values()) {
-            assertThat(new String(LiteLlmRequests.clean(JSON, body, false, tools).bytes(), StandardCharsets.UTF_8))
-                .isEqualTo("{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,"
-                        + "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+    void everyMcpShapeAndTheContainerAreRefused() {
+        String[][] cases = {
+            { "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,\"mcp_servers\":[{\"type\":\"url\","
+                    + "\"url\":\"https://evil.example/mcp\",\"name\":\"x\"}],"
+                    + "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", "`mcp_servers`" },
+            { "{\"model\":\"m\",\"MCP_Servers\":[],\"tools\":[{\"name\":\"ok\"}]}", "`MCP_Servers`" },
+            { "{\"model\":\"m\",\"mcp_servers\":[{\"type\":\"url\",\"url\":\"https://e.example\",\"name\":\"x\"}],"
+                    + "\"tools\":[{\"type\":\"mcp_toolset\",\"mcp_server_name\":\"x\"}]}", "`mcp_servers`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"mcp_toolset\",\"mcp_server_name\":\"x\"}]}",
+                "tool type `mcp_toolset`" },
+            { "{\"model\":\"m\",\"input\":\"hi\",\"tools\":[{\"type\":\"mcp\",\"server_label\":\"x\","
+                    + "\"server_url\":\"https://evil.example/mcp\",\"require_approval\":\"never\"}]}",
+                "tool type `mcp`" },
+            { "{\"model\":\"m\",\"input\":\"hi\",\"tools\":[{\"type\":\"mcp\",\"server_label\":\"gmail\","
+                    + "\"connector_id\":\"connector_gmail\",\"authorization\":\"t\"}]}", "tool type `mcp`" },
+            { "{\"model\":\"m\",\"Container\":{\"skills\":[]}}", "`Container`" },
+            { "{\"model\":\"m\",\"container\":\"container_011\"}", "`container`" } };
+        for (String[] refused : cases) {
+            byte[] body = refused[0].getBytes(StandardCharsets.UTF_8);
+            for (boolean dropParams : new boolean[] { false, true }) {
+                assertThatThrownBy(() -> LiteLlmRequests.clean(JSON, body, dropParams)).as(refused[0])
+                    .isInstanceOf(LiteLlmRequests.Refused.class)
+                    .hasMessageContaining(refused[1]);
+            }
         }
-        assertThat(List.of("mcp_servers", "MCP_SERVERS", "container")).allMatch(LiteLlmRequests::providerAction);
-        assertThat(List.of("tools", "messages", "input", "containers")).noneMatch(LiteLlmRequests::providerAction);
+        assertThat(List.of("mcp_servers", "MCP_SERVERS", "container", "web_search_options", "search_parameters"))
+            .allMatch(LiteLlmRequests::providerAction);
+        assertThat(List.of("tools", "messages", "input", "containers", "prompt")).noneMatch(
+                LiteLlmRequests::providerAction);
     }
 
-    /** What the pinned runtimes send passes, whatever the company chose. */
+    /** A provider action set to null asks for nothing, and passes as it came. */
+    @Test
+    void aProviderActionThatIsNullPasses() throws LiteLlmRequests.Refused {
+        String body = "{\"model\":\"m\",\"mcp_servers\":null,\"container\":null,\"web_search_options\":null}";
+        assertThat(new String(LiteLlmRequests.clean(JSON, body.getBytes(StandardCharsets.UTF_8), false).bytes(),
+                StandardCharsets.UTF_8)).isEqualTo(body);
+    }
+
+    /** What the pinned runtimes send passes. */
     @Test
     void theToolsTheRuntimeRunsPass() throws LiteLlmRequests.Refused {
         String[] bodies = {
@@ -115,7 +146,11 @@ class LiteLlmRequestsTest {
             "{\"model\":\"m\",\"tools\":[{\"type\":\"bash_20250124\",\"name\":\"bash\"},{\"type\":"
                     + "\"text_editor_20250728\",\"name\":\"str_replace_based_edit_tool\"},{\"type\":"
                     + "\"memory_20250818\",\"name\":\"memory\"},{\"type\":\"tool_search_tool_regex_20251119\","
-                    + "\"name\":\"tool_search\"}]}" };
+                    + "\"name\":\"tool_search\"}]}",
+            // A tool the model calls directly, said so; a text completion's prompt, a string.
+            "{\"model\":\"m\",\"tools\":[{\"name\":\"f\",\"allowed_callers\":[\"direct\"],\"input_schema\":"
+                    + "{\"type\":\"object\"}}]}",
+            "{\"model\":\"m\",\"prompt\":\"Once upon a time\"}" };
         for (String body : bodies) {
             byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
             assertThat(new String(LiteLlmRequests.clean(JSON, bytes, false).bytes(), StandardCharsets.UTF_8)).as(body)
@@ -167,41 +202,85 @@ class LiteLlmRequestsTest {
                 .isInstanceOf(LiteLlmRequests.Refused.class)
                 .hasMessageContaining("tool type `" + refused[1] + "`");
         }
-        // Chat Completions' own web search, and a tool's type that is not a string.
-        assertThatThrownBy(() -> LiteLlmRequests.clean(JSON,
-                "{\"model\":\"gpt-4o-search-preview\",\"web_search_options\":{}}".getBytes(StandardCharsets.UTF_8),
-                false))
-            .hasMessageContaining("web_search_options");
+        // A tool's type that is not a string.
         assertThatThrownBy(() -> LiteLlmRequests.clean(JSON,
                 "{\"model\":\"m\",\"tools\":[{\"type\":1}]}".getBytes(StandardCharsets.UTF_8), false))
             .isInstanceOf(LiteLlmRequests.Refused.class);
     }
 
-    /** {@code WEB_SEARCH} lets the providers' web search through, and nothing else. */
+    /**
+     * Every web search shape of every provider is refused: there is no setting that lets one through. Anthropic's
+     * versions, the dynamic-filtering ones ({@code web_search_20260209} and later, whose default
+     * {@code allowed_callers} provisions code execution) with or without {@code allowed_callers}; OpenAI's
+     * {@code web_search} and {@code web_search_preview}; Chat Completions' {@code web_search_options}; xAI's live
+     * search; Gemini's grounding.
+     */
     @Test
-    void webSearchPassesOnlyWhenAllowed() throws LiteLlmRequests.Refused {
-        LiteLlmRequests.ProviderTools search = LiteLlmRequests.ProviderTools.WEB_SEARCH;
-        for (String body : new String[] {
-            "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\",\"max_uses\":8}]}",
-            "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search\",\"external_web_access\":false}]}",
-            "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_preview\"}]}",
-            "{\"model\":\"m\",\"web_search_options\":{\"search_context_size\":\"low\"}}" }) {
-            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-            assertThat(new String(LiteLlmRequests.clean(JSON, bytes, false, search).bytes(), StandardCharsets.UTF_8))
-                .isEqualTo(body);
-            assertThatThrownBy(() -> LiteLlmRequests.clean(JSON, bytes, false, LiteLlmRequests.ProviderTools.OFF))
-                .isInstanceOf(LiteLlmRequests.Refused.class);
+    void everyWebSearchShapeIsRefused() {
+        String[][] cases = {
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\","
+                    + "\"max_uses\":8}]}", "tool type `web_search_20250305`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_20260209\",\"name\":\"web_search\"}]}",
+                "tool type `web_search_20260209`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_20260209\",\"name\":\"web_search\","
+                    + "\"allowed_callers\":[\"direct\"]}]}", "tool type `web_search_20260209`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_20260318\",\"name\":\"web_search\","
+                    + "\"allowed_callers\":[\"code_execution_20260120\"]}]}", "code_execution_20260120" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_fetch_20260209\",\"name\":\"web_fetch\"}]}",
+                "tool type `web_fetch_20260209`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search\",\"external_web_access\":false}]}",
+                "tool type `web_search`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_2025_08_26\"}]}",
+                "tool type `web_search_2025_08_26`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_preview\"}]}", "tool type `web_search_preview`" },
+            { "{\"model\":\"m\",\"tools\":[{\"type\":\"x_search\"}]}", "tool type `x_search`" },
+            { "{\"model\":\"gpt-4o-search-preview\",\"web_search_options\":{\"search_context_size\":\"low\"}}",
+                "`web_search_options`" },
+            { "{\"model\":\"m\",\"web_search_options\":{}}", "`web_search_options`" },
+            { "{\"model\":\"grok-4\",\"search_parameters\":{\"mode\":\"auto\"}}", "`search_parameters`" },
+            { "{\"model\":\"gemini-2.5-pro\",\"tools\":[{\"googleSearch\":{}}]}", "`googleSearch`" },
+            { "{\"model\":\"gemini-2.5-pro\",\"tools\":[{\"google_search_retrieval\":{}}]}",
+                "`google_search_retrieval`" },
+            { "{\"model\":\"gemini-2.5-pro\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"},"
+                    + "\"url_context\":{}}]}", "`url_context`" },
+            { "{\"model\":\"gemini-2.5-pro\",\"tools\":[{\"functionDeclarations\":[{\"name\":\"f\"}]},"
+                    + "{\"enterpriseWebSearch\":{}}]}", "`enterpriseWebSearch`" } };
+        for (String[] refused : cases) {
+            byte[] body = refused[0].getBytes(StandardCharsets.UTF_8);
+            for (boolean dropParams : new boolean[] { false, true }) {
+                assertThatThrownBy(() -> LiteLlmRequests.clean(JSON, body, dropParams)).as(refused[0])
+                    .isInstanceOf(LiteLlmRequests.Refused.class)
+                    .hasMessageContaining(refused[1]);
+            }
         }
-        for (String other : new String[] { "web_fetch_20250910", "code_execution_20250825", "mcp", "file_search" }) {
-            byte[] bytes = ("{\"model\":\"m\",\"tools\":[{\"type\":\"" + other + "\"}]}")
-                .getBytes(StandardCharsets.UTF_8);
-            assertThatThrownBy(() -> LiteLlmRequests.clean(JSON, bytes, false, search)).as(other)
-                .hasMessageContaining("`" + other + "`");
+        assertThat(LiteLlmRequests.toolAllowed(null)).isTrue();
+        assertThat(List.of("web_search_20260209", "web_search_20260318", "web_search_2025_08_26",
+                "web_search_preview", "web_searcher")).noneMatch(LiteLlmRequests::toolAllowed);
+        assertThat(List.of("googleSearch", "google_search", "codeExecution", "URL_CONTEXT"))
+            .allMatch(LiteLlmRequests::providerToolKey);
+        assertThat(List.of("name", "input_schema", "function", "description")).noneMatch(
+                LiteLlmRequests::providerToolKey);
+    }
+
+    /**
+     * A custom tool that the provider's own code execution may call ({@code allowed_callers}), and a prompt stored at
+     * the provider (OpenAI Responses' {@code prompt} object, which can carry its own tools), are refused.
+     */
+    @Test
+    void theProvidersCodeCallingAToolAndAStoredPromptAreRefused() {
+        String[][] cases = {
+            { "{\"model\":\"m\",\"tools\":[{\"name\":\"f\",\"allowed_callers\":[\"direct\","
+                    + "\"code_execution_20250825\"]}]}", "`code_execution_20250825`" },
+            { "{\"model\":\"m\",\"tools\":[{\"name\":\"f\",\"allowed_callers\":[{\"x\":1}]}]}",
+                "not a string" },
+            { "{\"model\":\"m\",\"input\":\"hi\",\"prompt\":{\"id\":\"pmpt_1\",\"version\":\"2\"}}",
+                "`prompt`" } };
+        for (String[] refused : cases) {
+            byte[] body = refused[0].getBytes(StandardCharsets.UTF_8);
+            assertThatThrownBy(() -> LiteLlmRequests.clean(JSON, body, false)).as(refused[0])
+                .isInstanceOf(LiteLlmRequests.Refused.class)
+                .hasMessageContaining(refused[1]);
         }
-        assertThat(LiteLlmRequests.toolAllowed(null, LiteLlmRequests.ProviderTools.OFF)).isTrue();
-        assertThat(LiteLlmRequests.toolAllowed("web_search_2025_08_26", search)).isTrue();
-        assertThat(LiteLlmRequests.toolAllowed("web_search_2025_08_26", LiteLlmRequests.ProviderTools.OFF)).isFalse();
-        assertThat(LiteLlmRequests.toolAllowed("web_searcher", search)).isFalse();
     }
 
     /** Only the beta values on the caller's list pass, from every line of the header, each once; never refused. */

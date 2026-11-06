@@ -48,13 +48,26 @@ import tools.jackson.databind.json.JsonMapper;
  * {@code model}, a caller checks one); its {@code model} is read for the caller's check.
  * <p>
  * The provider is a channel for what the model emits, never a relay the agent directs (threat model 7.2, R13; the
- * security review of 2026-10-27, M1 and D8): a request may not ask the model's provider to run a tool itself, which
- * would carry what the agent writes to any host or run code outside the sandbox. So {@code mcp_servers} and
- * {@code container} (Anthropic's MCP connector and code execution container) are removed, like LiteLLM's fields, and
- * a tool whose {@code type} is not one the runtime runs ({@link #CLIENT_TOOL_TYPES}) refuses the request, wherever
- * the body defines one (an array named {@code tools} at any depth, an Anthropic {@code tool_addition} block of a
- * message); so does Chat Completions' {@code web_search_options}. {@link ProviderTools#WEB_SEARCH}, a company's
- * choice, lets the providers' web search through ({@link #WEB_SEARCH_TOOL_TYPES}) and nothing else.
+ * security review of 2026-10-27, M1 and D8; ADR-0108): a request may never ask the model's provider to run a tool
+ * itself, which would carry what the agent writes to any host or run code outside the sandbox, with no audit, grant or
+ * rate limit of Tinfirm's. Every web search and every MCP call goes through Tinfirm; there is no setting that lets a
+ * provider's tool through. So the request is refused ({@link Refused}, naming what it asked for):
+ * <ul>
+ * <li>when a top-level field asks the provider to act ({@link #PROVIDER_ACTIONS}: Anthropic's MCP connector
+ * {@code mcp_servers} and code execution {@code container}, Chat Completions' {@code web_search_options}, xAI's live
+ * search {@code search_parameters}) or names a prompt stored at the provider (an OpenAI Responses {@code prompt}
+ * object, which can carry its own tools);</li>
+ * <li>when a tool's {@code type} is not one the runtime runs ({@link #CLIENT_TOOL_TYPES}), wherever the body defines
+ * one (an array named {@code tools} at any depth, an Anthropic {@code tool_addition} block of a message): web search
+ * and fetch of every version, code execution, MCP ({@code mcp_toolset}, OpenAI's {@code mcp}), file search, ...;</li>
+ * <li>when a tool, typed or not, names one of Gemini's built-in tools ({@link #PROVIDER_TOOL_KEYS}:
+ * {@code googleSearch}, {@code codeExecution}, {@code urlContext}, ...), which LiteLLM passes to Google and
+ * Vertex;</li>
+ * <li>when a tool may be called from the provider's own code execution ({@code allowed_callers} naming anything but
+ * {@code direct}, Anthropic's programmatic tool calling).</li>
+ * </ul>
+ * No pinned runtime sends any of these by default (runner/images: Claude Code runs MCP itself, Codex sends MCP tools as
+ * functions), so a refusal is never silent: the caller learns what was refused and why.
  */
 public final class LiteLlmRequests {
 
@@ -110,19 +123,39 @@ public final class LiteLlmRequests {
             "disable_fallbacks", "deployment_id", "api_type", "timeout", "secret_key", "access_token");
 
     /**
-     * Fields of the model's API, not LiteLLM's, that make the provider act on its own: removed (M1). Lower case.
+     * Top-level fields of the model's API, not LiteLLM's, that make the provider act on its own: a request that sets
+     * one (to anything but {@code null}) is refused (M1; ADR-0108). Lower case.
      */
-    private static final Set<String> PROVIDER_ACTIONS = Set.of(
+    static final Set<String> PROVIDER_ACTIONS = Set.of(
             // Anthropic's MCP connector: the provider calls the MCP servers the request names, at any URL.
             "mcp_servers",
             // Anthropic's code execution container (and the skills in it): the provider runs code for the request.
-            "container");
+            "container",
+            // Chat Completions' parameter of a search model's own web search (LiteLLM maps it to the provider's search
+            // tool for Anthropic, Gemini and others).
+            "web_search_options",
+            // xAI's live search: the provider searches the web and X for the request.
+            "search_parameters");
+
+    /** OpenAI Responses' prompt stored at the provider, which carries its own tools when it is an object. */
+    private static final String STORED_PROMPT = "prompt";
 
     /**
-     * The {@code tools[].type} values that pass whatever the company's setting: tools the runtime itself runs, the
-     * model only asking for a call. A versioned type ({@code bash_20250124}) counts by its name before the date. Every
-     * other type refuses the request: a tool the provider runs (web search and fetch, code execution, MCP, file search,
-     * image generation, an advisor model) or one no pinned runtime drives (computer use). What the pinned runtimes send
+     * Gemini's built-in tools, which a tool names by a field rather than a type ({@code {"googleSearch": {}}}) and
+     * LiteLLM passes to Google AI Studio and Vertex AI: lower case, without underscores, so that both spellings count.
+     */
+    static final Set<String> PROVIDER_TOOL_KEYS = Set.of("googlesearch", "googlesearchretrieval",
+            "enterprisewebsearch", "codeexecution", "urlcontext", "googlemaps", "computeruse", "filesearch",
+            "retrieval");
+
+    /** The one caller of a tool that is not the provider's own code: the model itself, for the runtime to run. */
+    private static final String DIRECT_CALLER = "direct";
+
+    /**
+     * The {@code tools[].type} values that pass: tools the runtime itself runs, the model only asking for a call. A
+     * versioned type ({@code bash_20250124}) counts by its name before the date. Every other type refuses the
+     * request: a tool the provider runs (web search and fetch, code execution, MCP, file search, image generation, an
+     * advisor model) or one no pinned runtime drives (computer use). What the pinned runtimes send
      * (runner/images): Claude Code and pi Anthropic custom tools; OpenCode function or custom tools through its SDK;
      * Codex function, custom, {@code local_shell}, {@code namespace} and {@code tool_search}.
      */
@@ -146,17 +179,6 @@ public final class LiteLlmRequests {
             // the edit or the memory operation in its own sandbox. No pinned runtime sends them today.
             "bash", "text_editor", "memory");
 
-    /**
-     * The providers' web search, which only {@link ProviderTools#WEB_SEARCH} lets through: Anthropic's versioned
-     * {@code web_search_*} and OpenAI's {@code web_search} and {@code web_search_preview} (with or without a date).
-     * Never web fetch: a search sends the agent's query to the provider's search; a fetch sends the provider to any
-     * URL.
-     */
-    static final Set<String> WEB_SEARCH_TOOL_TYPES = Set.of("web_search", "web_search_preview");
-
-    /** Chat Completions' parameter of a search model's own web search: as a web search tool. */
-    private static final String WEB_SEARCH_OPTIONS = "web_search_options";
-
     /** A versioned tool type: a name, then an underscore and the date (or a date with underscores, OpenAI's). */
     private static final Pattern VERSIONED_TYPE = Pattern.compile("([a-z_]+?)_(\\d{8}|\\d{4}_\\d{2}_\\d{2})");
 
@@ -178,15 +200,6 @@ public final class LiteLlmRequests {
 
     /** The body to pass on and the model it names (null when it names none). */
     public record Cleaned(byte[] bytes, @Nullable String model) {
-    }
-
-    /**
-     * Which tools the model's provider may run itself for a request: {@code OFF}, none; {@code WEB_SEARCH}, the
-     * providers' web search ({@link #WEB_SEARCH_TOOL_TYPES}). A company's {@code modelSettings.providerTools} at the
-     * relay, {@code MODEL_API_PROVIDER_TOOLS} at the model port.
-     */
-    public enum ProviderTools {
-        OFF, WEB_SEARCH
     }
 
     /** Why a body cannot be passed on; the message is for the caller. */
@@ -223,13 +236,19 @@ public final class LiteLlmRequests {
         return lower.contains("_cost_per_") || lower.endsWith("_cost") || lower.contains("_token_cost");
     }
 
-    /** Whether a top-level name makes the provider act on its own ({@code mcp_servers}, {@code container}). */
+    /**
+     * Whether a top-level name makes the provider act on its own ({@link #PROVIDER_ACTIONS}): a request that sets one
+     * is refused.
+     */
     public static boolean providerAction(String name) {
         return PROVIDER_ACTIONS.contains(name.toLowerCase(Locale.ROOT));
     }
 
-    /** Whether a tool of this {@code type} passes under {@code allowed}; a tool without a type is a custom one. */
-    public static boolean toolAllowed(@Nullable String type, ProviderTools allowed) {
+    /**
+     * Whether a tool of this {@code type} is one the runtime runs ({@link #CLIENT_TOOL_TYPES}, a versioned type by its
+     * name before the date); a tool without a type is a custom one. Any other type is a tool the provider would run.
+     */
+    public static boolean toolAllowed(@Nullable String type) {
         if (type == null) {
             return true;
         }
@@ -238,10 +257,12 @@ public final class LiteLlmRequests {
         if (versioned.matches()) {
             name = versioned.group(1);
         }
-        if (CLIENT_TOOL_TYPES.contains(name)) {
-            return true;
-        }
-        return allowed == ProviderTools.WEB_SEARCH && WEB_SEARCH_TOOL_TYPES.contains(name);
+        return CLIENT_TOOL_TYPES.contains(name);
+    }
+
+    /** Whether a tool's field names one of Gemini's built-in tools ({@link #PROVIDER_TOOL_KEYS}), either spelling. */
+    public static boolean providerToolKey(String name) {
+        return PROVIDER_TOOL_KEYS.contains(name.replace("_", "").toLowerCase(Locale.ROOT));
     }
 
     /**
@@ -267,25 +288,18 @@ public final class LiteLlmRequests {
         return DROP_CONTROLS.contains(name.toLowerCase(Locale.ROOT));
     }
 
-    /** The body without LiteLLM's fields, no tool of the provider's allowed ({@link ProviderTools#OFF}). */
-    public static Cleaned clean(JsonMapper mapper, byte[] body, boolean dropParams) throws Refused {
-        return clean(mapper, body, dropParams, ProviderTools.OFF);
-    }
-
     /**
-     * The body without LiteLLM's fields and without {@code mcp_servers} and {@code container}.
+     * The body without LiteLLM's fields.
      *
-     * @param dropParams    whether LiteLLM is to drop what the model's provider does not take, whatever the request
-     *                      asked: the caller's own {@code drop_params} and {@code additional_drop_params} go and
-     *                      {@code "drop_params": true} is added last; else they pass as they came
-     * @param providerTools the tools the provider may run itself for the request
-     * @throws Refused when the body is not one JSON object, names a top-level field twice, or names a tool the provider
-     *                 would run that {@code providerTools} does not allow (the message names its type)
+     * @param dropParams whether LiteLLM is to drop what the model's provider does not take, whatever the request asked:
+     *                   the caller's own {@code drop_params} and {@code additional_drop_params} go and
+     *                   {@code "drop_params": true} is added last; else they pass as they came
+     * @throws Refused when the body is not one JSON object, names a top-level field twice, or asks the model's provider
+     *                 to run a tool itself (the message names the field or the tool's type)
      */
-    public static Cleaned clean(JsonMapper mapper, byte[] body, boolean dropParams, ProviderTools providerTools)
-            throws Refused {
+    public static Cleaned clean(JsonMapper mapper, byte[] body, boolean dropParams) throws Refused {
         Cleaned cleaned = copy(mapper, body, dropParams);
-        checkTools(mapper, body, providerTools);
+        checkTools(mapper, body);
         return cleaned;
     }
 
@@ -313,7 +327,7 @@ public final class LiteLlmRequests {
                     }
                     model = parser.getString();
                 }
-                if (liteLlmField(name) || providerAction(name) || dropParams && dropControl(name)) {
+                if (liteLlmField(name) || dropParams && dropControl(name)) {
                     parser.skipChildren();
                     continue;
                 }
@@ -336,26 +350,30 @@ public final class LiteLlmRequests {
     }
 
     /**
-     * Refuses a tool the provider would run that {@code allowed} does not let through, wherever the body defines or
-     * names one: each element of an array named {@code tools} at any depth ({@code tools} itself, a
+     * Refuses a request that asks the provider to run a tool itself: a top-level field of {@link #PROVIDER_ACTIONS}
+     * that is not {@code null}, a stored {@code prompt} object, and a tool the provider would run wherever the body
+     * defines or names one: each element of an array named {@code tools} at any depth ({@code tools} itself, a
      * {@code namespace}'s, a {@code tool_search_output}'s, {@code tool_choice}'s allowed tools), and the
      * {@code definition} of a content block's {@code tool} (Anthropic's {@code tool_addition}, the {@code inline-tools}
-     * beta); and Chat Completions' {@code web_search_options}. JSON schemas ({@code input_schema},
-     * {@code parameters}, ...) are data and are not read. The body is already known to be one JSON object; it is read
-     * again as a stream, nothing kept.
+     * beta). JSON schemas ({@code input_schema}, {@code parameters}, ...) are data and are not read. The body is
+     * already known to be one JSON object; it is read again as a stream, nothing kept.
      */
-    private static void checkTools(JsonMapper mapper, byte[] body, ProviderTools allowed) throws Refused {
+    private static void checkTools(JsonMapper mapper, byte[] body) throws Refused {
         try (JsonParser parser = mapper.createParser(body)) {
             parser.nextToken();
             for (JsonToken token = parser.nextToken(); token == JsonToken.PROPERTY_NAME; token = parser.nextToken()) {
                 String name = parser.currentName();
                 JsonToken value = parser.nextToken();
-                if (name.equals(WEB_SEARCH_OPTIONS) && value != JsonToken.VALUE_NULL
-                        && allowed != ProviderTools.WEB_SEARCH) {
-                    throw new Refused("The request asks the model's provider to search the web itself (`"
-                            + WEB_SEARCH_OPTIONS + "`), which this company's model settings do not allow");
+                if (providerAction(name) && value != JsonToken.VALUE_NULL) {
+                    throw new Refused("The request asks the model's provider to act itself (`" + shortName(name)
+                            + "`): no provider runs a tool, an MCP server or a web search for Tinfirm; the runtime "
+                            + "runs its tools, and MCP servers and web search are Tinfirm's");
                 }
-                field(parser, name, value, null, allowed);
+                if (name.equals(STORED_PROMPT) && value == JsonToken.START_OBJECT) {
+                    throw new Refused("The request names a prompt stored at the model's provider (`" + STORED_PROMPT
+                            + "` as an object), which can carry tools the provider runs itself");
+                }
+                field(parser, name, value, null);
             }
         }
         catch (JacksonException ex) {
@@ -367,15 +385,15 @@ public final class LiteLlmRequests {
      * A field's value, the parser on its first token: a {@code tools} array's elements are tools, a {@code tool}'s
      * {@code definition} is one, a schema is skipped, anything else is searched. Leaves the parser on its last token.
      */
-    private static void field(JsonParser parser, String name, JsonToken value, @Nullable String parent,
-            ProviderTools allowed) throws Refused {
+    private static void field(JsonParser parser, String name, JsonToken value, @Nullable String parent)
+            throws Refused {
         if (SCHEMAS.contains(name)) {
             parser.skipChildren();
         }
         else if (name.equals("tools") && value == JsonToken.START_ARRAY) {
             for (JsonToken token = parser.nextToken(); token != JsonToken.END_ARRAY; token = parser.nextToken()) {
                 if (token == JsonToken.START_OBJECT) {
-                    tool(parser, allowed);
+                    tool(parser);
                 }
                 else {
                     parser.skipChildren();
@@ -383,33 +401,37 @@ public final class LiteLlmRequests {
             }
         }
         else if (name.equals("definition") && "tool".equals(parent) && value == JsonToken.START_OBJECT) {
-            tool(parser, allowed);
+            tool(parser);
         }
         else if (value == JsonToken.START_OBJECT) {
-            object(parser, name, allowed);
+            object(parser, name);
         }
         else if (value == JsonToken.START_ARRAY) {
             for (JsonToken token = parser.nextToken(); token != JsonToken.END_ARRAY; token = parser.nextToken()) {
                 if (token == JsonToken.START_OBJECT) {
-                    object(parser, null, allowed);
+                    object(parser, null);
                 }
                 else if (token == JsonToken.START_ARRAY) {
-                    field(parser, "", token, null, allowed);
+                    field(parser, "", token, null);
                 }
             }
         }
     }
 
     /** An object's fields, searched, the parser on its start; leaves the parser on its end. */
-    private static void object(JsonParser parser, @Nullable String name, ProviderTools allowed) throws Refused {
+    private static void object(JsonParser parser, @Nullable String name) throws Refused {
         for (JsonToken token = parser.nextToken(); token == JsonToken.PROPERTY_NAME; token = parser.nextToken()) {
             String child = parser.currentName();
-            field(parser, child, parser.nextToken(), name, allowed);
+            field(parser, child, parser.nextToken(), name);
         }
     }
 
-    /** One tool's definition, the parser on its start, its other fields searched; leaves the parser on its end. */
-    private static void tool(JsonParser parser, ProviderTools allowed) throws Refused {
+    /**
+     * One tool's definition, the parser on its start, its other fields searched; leaves the parser on its end. Refused:
+     * a type the runtime does not run, a field naming one of Gemini's built-in tools, and {@code allowed_callers}
+     * naming a caller other than {@code direct} (the provider's code execution calling the tool).
+     */
+    private static void tool(JsonParser parser) throws Refused {
         @Nullable String type = null;
         for (JsonToken token = parser.nextToken(); token == JsonToken.PROPERTY_NAME; token = parser.nextToken()) {
             String name = parser.currentName();
@@ -420,14 +442,33 @@ public final class LiteLlmRequests {
                 }
                 type = parser.getString();
             }
+            else if (providerToolKey(name)) {
+                throw new Refused("The request asks the model's provider to run its built-in tool `" + shortName(name)
+                        + "` itself: only tools the runtime runs pass");
+            }
+            else if (name.equals("allowed_callers") && value == JsonToken.START_ARRAY) {
+                allowedCallers(parser);
+            }
             else {
-                field(parser, name, value, null, allowed);
+                field(parser, name, value, null);
             }
         }
-        if (type != null && !toolAllowed(type, allowed)) {
+        if (type != null && !toolAllowed(type)) {
             throw new Refused("The request asks the model's provider to run the tool type `" + shortName(type)
-                    + "` itself, which this company's model settings do not allow: only tools the runtime runs pass"
-                    + (allowed == ProviderTools.WEB_SEARCH ? ", and the provider's web search" : ""));
+                    + "` itself: only tools the runtime runs pass; MCP servers and web search are Tinfirm's");
+        }
+    }
+
+    /** A tool's {@code allowed_callers}, the parser on its start: only {@code direct}; leaves the parser on its end. */
+    private static void allowedCallers(JsonParser parser) throws Refused {
+        for (JsonToken token = parser.nextToken(); token != JsonToken.END_ARRAY; token = parser.nextToken()) {
+            String caller = token == JsonToken.VALUE_STRING ? parser.getString() : null;
+            if (!DIRECT_CALLER.equals(caller)) {
+                parser.skipChildren();
+                throw new Refused("The request lets the model's provider call a tool from its own code execution "
+                        + "(`allowed_callers`: " + (caller == null ? "not a string" : "`" + shortName(caller) + "`")
+                        + "): only `" + DIRECT_CALLER + "` passes");
+            }
         }
     }
 

@@ -158,9 +158,9 @@ class ModelPortTest {
     }
 
     /**
-     * The relay's filter (M1 of the security review of 2026-10-27): a tool the provider would run is refused before
-     * LiteLLM, with its type named, while {@code MODEL_API_PROVIDER_TOOLS} is {@code OFF} (the default); the MCP
-     * connector and the code container are removed; the runtime's own tools pass.
+     * The relay's filter (M1 of the security review of 2026-10-27; ADR-0108): a tool the provider would run, web search
+     * among them, and the MCP connector and the code container are refused before LiteLLM, with what they asked named;
+     * the runtime's own tools pass. There is no setting that lets a provider's tool through.
      */
     @Test
     void aToolTheProviderWouldRunIsRefusedBeforeLiteLlm() throws Exception {
@@ -173,11 +173,22 @@ class ModelPortTest {
                 + "[{\"type\":\"mcp\",\"server_label\":\"x\",\"server_url\":\"https://evil.example/mcp\"}]}");
         assertThat(mcp.statusCode()).isEqualTo(400);
         assertThat(mcp.body()).contains("`mcp`");
+        HttpResponse<String> connector = post("/v1/messages", "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,"
+                + "\"mcp_servers\":[{\"type\":\"url\",\"url\":\"https://evil.example/mcp\",\"name\":\"x\"}],"
+                + "\"tools\":[{\"name\":\"Bash\",\"input_schema\":{\"type\":\"object\"}}],"
+                + "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+        assertThat(connector.statusCode()).isEqualTo(400);
+        assertThat(connector.body()).contains("`mcp_servers`");
+        HttpResponse<String> container = post("/v1/messages", "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,"
+                + "\"container\":\"c\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+        assertThat(container.statusCode()).isEqualTo(400);
+        HttpResponse<String> searchOptions = post("/v1/chat/completions", "{\"model\":\"gpt-4o-search-preview\","
+                + "\"web_search_options\":{},\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+        assertThat(searchOptions.statusCode()).isEqualTo(400);
         assertThat(LITELLM.received).isEmpty();
 
         HttpResponse<String> own = post("/v1/messages", "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,"
-                + "\"mcp_servers\":[{\"type\":\"url\",\"url\":\"https://evil.example/mcp\",\"name\":\"x\"}],"
-                + "\"container\":\"c\",\"tools\":[{\"name\":\"Bash\",\"input_schema\":{\"type\":\"object\"}}],"
+                + "\"tools\":[{\"name\":\"Bash\",\"input_schema\":{\"type\":\"object\"}}],"
                 + "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
         assertThat(own.statusCode()).isEqualTo(200);
         assertThat(LITELLM.received.getFirst().body()).isEqualTo("{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,"

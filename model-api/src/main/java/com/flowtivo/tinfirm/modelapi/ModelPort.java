@@ -43,9 +43,10 @@ import tools.jackson.databind.node.ObjectNode;
  * {@code 404} (or {@code 405}) and never reaches LiteLLM. The request goes to LiteLLM at the table's path, without
  * its query.</li>
  * <li><b>The body</b> (a {@code POST}): JSON, at most {@code maxRequestBytes}, one object without a repeated name,
- * written anew without LiteLLM's own fields, {@code mcp_servers} and {@code container} ({@link LiteLlmRequests}), and
- * refused ({@code 400}, naming the type) when it names a tool the provider would run that {@code providerTools}
- * ({@code MODEL_API_PROVIDER_TOOLS}, {@code OFF} by default) does not allow; {@code drop_params} passes as it came. The
+ * written anew without LiteLLM's own fields ({@link LiteLlmRequests}), and refused ({@code 400}, naming the field or
+ * the tool's type) when it asks the model's provider to run a tool itself: an MCP server ({@code mcp_servers}, an
+ * {@code mcp} tool), code execution, a web search, any tool the runtime does not run (ADR-0108; no setting lets one
+ * through); {@code drop_params} passes as it came. The
  * bodies held at once stay within {@code maxInflightBytes} ({@link InflightBytes}), counted as their bytes arrive:
  * LiteLLM checks the caller's key only once a body is read, so a request beyond is {@code 429} with
  * {@code Retry-After} as soon as it would pass the cap, and a slow upload holds only what it sent.</li>
@@ -154,7 +155,7 @@ public class ModelPort extends HttpServlet {
             return null;
         }
         try {
-            LiteLlmRequests.Cleaned cleaned = LiteLlmRequests.clean(bodies, raw, false, properties.providerTools());
+            LiteLlmRequests.Cleaned cleaned = LiteLlmRequests.clean(bodies, raw, false);
             share.keep(cleaned.bytes().length);
             return cleaned.bytes();
         }
