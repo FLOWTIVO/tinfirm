@@ -94,10 +94,10 @@ import tools.jackson.databind.node.ObjectNode;
  * grace.</li>
  * <li>The limits: at most 16 requests of a run at a time, and 16 per slot of its host's ceiling; more are 429.</li>
  * <li>The body: at most 64 MiB (413), whole within {@code relay-body-timeout} (30 s; else 408), one JSON object
- * without LiteLLM's fields, {@code mcp_servers} and {@code container}, with {@code drop_params} on for a LiteLLM, and
- * without a tool the provider would run that the company's {@code providerTools} does not allow (400 naming its type;
- * {@link RelayBody}), and a model the key allows (403): its models, or the company's default ones, every model when
- * the list is empty. The bodies this replica holds, each counted twice while it is read and written anew, then once
+ * without LiteLLM's fields, with {@code drop_params} on for a LiteLLM, and asking the model's provider to run no tool
+ * itself: no MCP server, code execution or web search of the provider's (400 naming the field or the tool's type;
+ * {@link RelayBody}; ADR-0108), and a model the key allows (403): its models, or the company's default ones, every
+ * model when the list is empty. The bodies this replica holds, each counted twice while it is read and written anew, then once
  * until its answer ends, stay within {@code relay-max-inflight-bytes} (256 MiB; {@link InflightBytes}), counted as
  * their bytes arrive, a declared length too, so that a slow upload holds only what it sent; a body beyond it is 429
  * with {@code Retry-After}. What the meter keeps of an answer to read its usage (a plain JSON answer up to 4 MiB, or
@@ -335,17 +335,17 @@ class ModelRelayService {
 
     /**
      * What a request may use: its token, the gateway, the key (and the secret it was revealed from), the models it
-     * allows, its host's limit, and the tools the company lets the model's provider run itself.
+     * allows, and its host's limit.
      */
     record Plan(RelayTokenStore.TokenRow token, Gateway gateway, String key, UUID secretId, List<String> models,
-            int hostLimit, LiteLlmRequests.ProviderTools providerTools) {
+            int hostLimit) {
 
         /** Never the paying principal's key, nor the token's hash. */
         @Override
         public String toString() {
             return "Plan[runId=" + token.runId() + ", epoch=" + token.epoch() + ", runnerHostId="
                     + token.runnerHostId() + ", gateway=" + gateway + ", key=***, secretId=" + secretId + ", models="
-                    + models + ", hostLimit=" + hostLimit + ", providerTools=" + providerTools + "]";
+                    + models + ", hostLimit=" + hostLimit + "]";
         }
     }
 
@@ -490,7 +490,7 @@ class ModelRelayService {
             List<String> models = key.models() != null ? key.models() : settings.defaultModels();
             int hostLimit = Math.max(1, host.maxConcurrentRunsCeiling()) * properties.relayHostConcurrencyPerSlot();
             return new Plan(row, gateway, key(companyId, row, key), Objects.requireNonNull(key.secretId()), models,
-                    hostLimit, settings.providerTools());
+                    hostLimit);
         });
     }
 
@@ -640,8 +640,7 @@ class ModelRelayService {
         byte[] raw = read(request.getInputStream(), max, share, properties.relayBodyTimeout());
         RelayBody.Result result;
         try {
-            result = RelayBody.transform(bodies, raw, plan.providerTools(),
-                    plan.gateway().vendor() == GatewayVendor.LITELLM);
+            result = RelayBody.transform(bodies, raw, plan.gateway().vendor() == GatewayVendor.LITELLM);
         }
         catch (RelayBody.Refused ex) {
             throw new Refusal(400, ex.getMessage());

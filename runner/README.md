@@ -924,8 +924,8 @@ run of the relay, "the gateway" in this table is the run's listener and "the key
 
 | Format | Runtime | Sandbox environment |
 |---|---|---|
-| `anthropic` | Claude Code | `ANTHROPIC_API_KEY`; with a gateway `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (the key, sent as a bearer token) and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` |
-| `openai` | Codex | `OPENAI_API_KEY`, `DEFAULT_AUTH_REQUEST`; with a gateway also `OPENAI_BASE_URL`, and in `CODEX_CONFIG`, where Codex reads its base URL, the gateway as a provider of its own without WebSockets (`model_provider = "tinfirm"`, `base_url` the gateway, `env_key = "OPENAI_API_KEY"`, `wire_api = "responses"`, `supports_websockets = false`), and `web_search = "disabled"`, since the model relay refuses a request whose tools the provider runs itself unless the company allows web search: with its built-in OpenAI provider Codex first tries the Responses API over a WebSocket, which LiteLLM is not known to serve and the [model proxy](#model-proxy) refuses, for about 6 s per session, and writes a fallback warning into the agent's reply |
+| `anthropic` | Claude Code | `ANTHROPIC_API_KEY`; with a gateway `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (the key, sent as a bearer token) and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; in every run, gateway or not, in `session/new` and `session/load` the `_meta` `{"claudeCode": {"options": {"disallowedTools": ["WebSearch"]}}}`, which `claude-agent-acp` passes to the Agent SDK: Claude Code's WebSearch is Anthropic's server-side `web_search` tool, which the model relay and the model port always refuse ([ADR-0108](../docs/adr/0108-no-provider-run-tools.md)); WebFetch fetches in the sandbox, through the egress proxy, and stays |
+| `openai` | Codex | `OPENAI_API_KEY`, `DEFAULT_AUTH_REQUEST`; with a gateway also `OPENAI_BASE_URL`, and in `CODEX_CONFIG`, where Codex reads its base URL, the gateway as a provider of its own without WebSockets (`model_provider = "tinfirm"`, `base_url` the gateway, `env_key = "OPENAI_API_KEY"`, `wire_api = "responses"`, `supports_websockets = false`); in every run, gateway or not, a ChatGPT login too, `web_search = "disabled"` in `CODEX_CONFIG`, since no Tinfirm run may have the provider run a tool and the model relay and the model port always refuse one (ADR-0108). Without WebSockets because with its built-in OpenAI provider Codex first tries the Responses API over a WebSocket, which LiteLLM is not known to serve and the [model proxy](#model-proxy) refuses, for about 6 s per session, and writes a fallback warning into the agent's reply |
 | `bedrock` | Claude Code | `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_BEARER_TOKEN_BEDROCK` (a Bedrock API key) or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` |
 | every format | pi | The provider's variable (`ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` for a gateway; `OPENAI_API_KEY`; the AWS variables; `GEMINI_API_KEY`; `OPENROUTER_API_KEY`; `MISTRAL_API_KEY`; `GROQ_API_KEY`; `XAI_API_KEY`; `DEEPSEEK_API_KEY`), `TINFIRM_MODEL_PROVIDER` (pi's provider ID), `TINFIRM_MODEL` (the agent's model), and for a gateway `TINFIRM_MODEL_BASE_URL` and `PI_OFFLINE=1` |
 | every format | OpenCode | The provider's variable (as for pi; for `google` also `GOOGLE_GENERATIVE_AI_API_KEY`), and `OPENCODE_CONFIG_CONTENT`: only the provider enabled, the agent's model as `provider/model`, no updates or sharing, and a gateway's `baseURL` with `Authorization: Bearer {env:…}` |
@@ -937,6 +937,15 @@ provider, with or without the provider in front (`claude-sonnet-4-5` or
 (`anthropic/claude-sonnet-4.5`). Through the relay it is a model name of the company's LiteLLM,
 which the payer's key must allow. An API-key credential of this machine works the same way for pi
 and OpenCode, as an `anthropic` or `openai` key without a gateway.
+
+No runtime asks the model's provider to run a tool itself, in any run (ADR-0108): Claude Code's
+WebSearch and Codex's web search are off whatever reaches the model, a gateway, a key of this
+host, a login or Bedrock, as the table says. Without a gateway no relay would refuse them, so
+the runtime's switch is the only guard there. OpenCode 2.0.29 and pi
+1.0.4 send no provider-run tool by default: OpenCode's own web search calls its search
+providers (Exa, Tavily, ...) from the sandbox, through the egress proxy, and pi has none, so
+neither needs a switch. Agents search the web through a search MCP server the company registers,
+which the Tinfirm server calls like any other system.
 
 The agent's effort (`run.assign.agent.effort`, protocol v2: `LOW` … `MAX`; absent is the
 runtime's default) goes to Claude Code as `CLAUDE_CODE_EFFORT_LEVEL`, to Codex as
@@ -1405,8 +1414,9 @@ new session (`resumeOutcome` `NO_SESSION`).
    the run with `INFRA` and says that the Docker daemon is busy or stuck.
 5. Speaks ACP over the container's stdio (Docker attach): `initialize` without fs or
    terminal capabilities, `session/load` of the previous session (falls back to
-   `session/new`), `session/prompt`. Both session requests get `cwd: "/workspace"` and the
-   run's [platform tools](#platform-tools) in `mcpServers`. Permission requests are
+   `session/new`), `session/prompt`. Both session requests get `cwd: "/workspace"`, the
+   run's [platform tools](#platform-tools) in `mcpServers`, and for Claude Code through a
+   gateway its disallowed WebSearch in `_meta` ([What the runtime gets](#what-the-runtime-gets)). Permission requests are
    auto-approved (`allow_once`). When the run does not resume a session, the host logs why
    and, under protocol v2, reports it in `run.finished.resumeOutcome`: `FIRST_RUN` (no
    previous session), `NOT_SUPPORTED` (the agent has no `session/load`), `NO_SESSION` (the

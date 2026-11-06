@@ -570,6 +570,10 @@ async fn model_access_reaches_the_sandbox_as_the_runtimes_variables() {
             "DEFAULT_AUTH_REQUEST=-".to_string(),
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1".to_string(),
             "CODEX_CONFIG=-".to_string(),
+            // Claude Code's WebSearch, Anthropic's server-side tool, is off through a gateway: the
+            // relay refuses it (ADR-0108).
+            r#"session-meta={"claudeCode":{"options":{"disallowedTools":["WebSearch"]}}}"#
+                .to_string(),
             format!("key-length={}", DUMMY_KEY.len()),
         ] {
             assert!(text.contains(&expected), "{expected} in {text}");
@@ -600,6 +604,7 @@ async fn model_access_reaches_the_sandbox_as_the_runtimes_variables() {
             r#""wire_api":"responses""#.to_string(),
             r#""supports_websockets":false"#.to_string(),
             r#""web_search":"disabled""#.to_string(),
+            "session-meta=null".to_string(),
             format!("key-length={}", DUMMY_KEY.len()),
         ] {
             assert!(text.contains(&expected), "{expected} in {text}");
@@ -825,6 +830,15 @@ async fn model_access_without_a_base_url_never_reaches_the_sandbox() {
         conn.send(next.to_json());
         let t = conn.until_finished(next.run_id).await;
         assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        // Without a gateway too, no run may have the provider run a tool (ADR-0108): Claude
+        // Code's WebSearch is off.
+        assert!(
+            t.agent_text().contains(
+                r#"session-meta={"claudeCode":{"options":{"disallowedTools":["WebSearch"]}}}"#
+            ),
+            "{}",
+            t.agent_text()
+        );
         assert!(
             !host
                 .host

@@ -18,7 +18,6 @@ import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 
-import com.flowtivo.tinfirm.shared.litellm.LiteLlmRequests;
 import com.flowtivo.tinfirm.shared.net.InflightBytes;
 
 /**
@@ -40,7 +39,7 @@ class ModelRelayServiceTest {
                 UUID.randomUUID(), UUID.randomUUID(), RelayTokenStore.RelayFormat.ANTHROPIC, null, null, null);
         ModelRelayService.Plan plan = new ModelRelayService.Plan(token,
                 new Gateway("http://litellm:4000", "sk-TEST-ONLY-admin-key", true), KEY, UUID.randomUUID(),
-                List.of("claude-*"), 16, LiteLlmRequests.ProviderTools.OFF);
+                List.of("claude-*"), 16);
         assertThat(plan.toString()).contains(runId.toString())
             .contains("key=***")
             .contains("claude-*")
@@ -93,7 +92,7 @@ class ModelRelayServiceTest {
     void anotherVendorsGatewayGetsNoDropParams() throws RelayBody.Refused {
         RelayBody.Result result = RelayBody.transform(RelayBody.mapper(1024),
                 "{\"model\":\"claude-sonnet-4-5\",\"api_base\":\"http://elsewhere\",\"max_tokens\":1}".getBytes(),
-                LiteLlmRequests.ProviderTools.OFF, false);
+                false);
         assertThat(new String(result.bytes())).isEqualTo("{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":1}");
     }
 
@@ -185,21 +184,24 @@ class ModelRelayServiceTest {
         }
     }
 
-    /** A tool the provider would run is refused unless the company allows it; {@code mcp_servers} is removed. */
+    /** A tool the provider would run, web search among them, and {@code mcp_servers} are always refused. */
     @Test
-    void theRelayRefusesAProvidersToolUnlessTheCompanyAllowsIt() throws RelayBody.Refused {
-        byte[] search = ("{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}],"
-                + "\"mcp_servers\":[{\"type\":\"url\",\"url\":\"https://evil.example/mcp\"}]}")
+    void theRelayAlwaysRefusesAProvidersTool() {
+        byte[] search = "{\"model\":\"m\",\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}]}"
             .getBytes(StandardCharsets.UTF_8);
-        assertThat(RelayBody.removed("mcp_servers")).isTrue();
+        byte[] connector = "{\"model\":\"m\",\"mcp_servers\":[{\"type\":\"url\",\"url\":\"https://evil.example/mcp\"}]}"
+            .getBytes(StandardCharsets.UTF_8);
+        assertThat(RelayBody.removed("mcp_servers")).isFalse();
         assertThatThrownBy(() -> RelayBody.transform(RelayBody.mapper(1024), search))
             .isInstanceOf(RelayBody.Refused.class)
             .hasMessageContaining("`web_search_20250305`");
-        RelayBody.Result allowed = RelayBody.transform(RelayBody.mapper(1024), search,
-                LiteLlmRequests.ProviderTools.WEB_SEARCH);
-        assertThat(new String(allowed.bytes(), StandardCharsets.UTF_8)).doesNotContain("mcp_servers")
-            .doesNotContain("evil.example")
-            .contains("web_search_20250305");
+        assertThatThrownBy(() -> RelayBody.transform(RelayBody.mapper(1024), connector))
+            .isInstanceOf(RelayBody.Refused.class)
+            .hasMessageContaining("`mcp_servers`");
+        // Whatever the gateway's vendor (ADR-0094): another vendor's gateway is refused them too.
+        assertThatThrownBy(() -> RelayBody.transform(RelayBody.mapper(1024), search, false))
+            .isInstanceOf(RelayBody.Refused.class)
+            .hasMessageContaining("`web_search_20250305`");
     }
 
     private static ModelProperties properties(long maxRequestBytes, long maxInflightBytes) {

@@ -32,12 +32,10 @@ import com.flowtivo.tinfirm.shared.access.CompanyPermission;
 import com.flowtivo.tinfirm.shared.api.model.GatewayModelList;
 import com.flowtivo.tinfirm.shared.api.model.ModelGateway;
 import com.flowtivo.tinfirm.shared.api.model.ModelGatewayVendor;
-import com.flowtivo.tinfirm.shared.api.model.ModelProviderTools;
 import com.flowtivo.tinfirm.shared.api.model.ModelSettings;
 import com.flowtivo.tinfirm.shared.api.model.ModelSettingsRequest;
 import com.flowtivo.tinfirm.shared.api.model.ModelSettingsTestResult;
 import com.flowtivo.tinfirm.shared.config.TinfirmProperties;
-import com.flowtivo.tinfirm.shared.litellm.LiteLlmRequests;
 import com.flowtivo.tinfirm.shared.security.Actor;
 import com.flowtivo.tinfirm.shared.security.ActorType;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
@@ -186,10 +184,6 @@ class ModelSettingsService {
             List<String> defaultModels = request.getDefaultModels() != null
                     ? modelNames("defaultModels", request.getDefaultModels())
                     : current.map(ModelSettingsStore.SettingsRow::defaultModels).orElse(List.of());
-            LiteLlmRequests.ProviderTools providerTools = request.getProviderTools() != null
-                    ? LiteLlmRequests.ProviderTools.valueOf(request.getProviderTools().getValue())
-                    : current.map(ModelSettingsStore.SettingsRow::providerTools)
-                        .orElse(LiteLlmRequests.ProviderTools.OFF);
 
             List<String> changed = new ArrayList<>();
             if (current.isEmpty() || current.get().gateway() != gateway) {
@@ -219,10 +213,6 @@ class ModelSettingsService {
             if (current.isEmpty() || !current.get().defaultModels().equals(defaultModels)) {
                 changed.add("defaultModels");
             }
-            if (current.isPresent() ? current.get().providerTools() != providerTools
-                    : providerTools != LiteLlmRequests.ProviderTools.OFF) {
-                changed.add("providerTools");
-            }
             BudgetAlertStore.AlertSettings currentAlerts = alerts.settings(companyId);
             BudgetAlertStore.AlertSettings nextAlerts = alertSettings(request, currentAlerts);
             if (!currentAlerts.thresholds().equals(nextAlerts.thresholds())) {
@@ -235,29 +225,17 @@ class ModelSettingsService {
                 return new Saved(view(current.get()), List.of());
             }
             boolean neitherGatewayNorKeys = changed.stream()
-                .allMatch(name -> name.equals("budgetAlertThresholds") || name.equals("monthlyAlertUsd")
-                        || name.equals("providerTools"));
+                .allMatch(name -> name.equals("budgetAlertThresholds") || name.equals("monthlyAlertUsd"));
             if (neitherGatewayNorKeys) {
-                // Package 6's alert settings (§5.3) and the provider's tools (M1 of the security review of
-                // 2026-10-27, which the relay reads at each request) touch neither the gateway nor the keys.
+                // Package 6's alert settings (§5.3) touch neither the gateway nor the keys.
                 alerts.setSettings(companyId, nextAlerts);
-                Actor actor = CurrentActor.actor();
                 ModelSettingsStore.SettingsRow kept = current.get();
-                if (changed.contains("providerTools")) {
-                    Instant at = time.now();
-                    UUID by = actor.type() == ActorType.USER ? actor.id() : null;
-                    store.setProviderTools(companyId, providerTools, at, by);
-                    kept = kept.withProviderTools(providerTools, at, by);
-                }
-                AuditRecord.Builder audit = AuditRecord.company(companyId, AuditAction.MODEL_SETTINGS_CHANGED, actor)
+                auditLog.record(AuditRecord.company(companyId, AuditAction.MODEL_SETTINGS_CHANGED, CurrentActor.actor())
                     .target(TARGET, companyId)
                     .detail("changed", changed)
                     .detail("gateway", gateway.name())
-                    .detail("relayEnabled", kept.relayEnabled());
-                if (changed.contains("providerTools")) {
-                    audit.detail("providerTools", providerTools.name());
-                }
-                auditLog.record(audit.build());
+                    .detail("relayEnabled", kept.relayEnabled())
+                    .build());
                 return new Saved(view(kept), List.of());
             }
             boolean reconnect = connectionChanged || adminKey != null;
@@ -288,19 +266,16 @@ class ModelSettingsService {
                     adminUrl, modelUrl, memberKeys,
                     gateway == ModelSettingsStore.GatewayKind.EXTERNAL ? secretId : null, relayEnabled, budget, period,
                     defaultModels, current.map(ModelSettingsStore.SettingsRow::testedAt).orElse(null), lastError, now,
-                    actor.type() == ActorType.USER ? actor.id() : null, providerTools);
+                    actor.type() == ActorType.USER ? actor.id() : null);
             store.upsert(next);
             alerts.setSettings(companyId, nextAlerts);
             List<String> oldKeyIds = connectionChanged ? forgetKeys(companyId, now) : List.of();
-            AuditRecord.Builder audit = AuditRecord.company(companyId, AuditAction.MODEL_SETTINGS_CHANGED, actor)
+            auditLog.record(AuditRecord.company(companyId, AuditAction.MODEL_SETTINGS_CHANGED, actor)
                 .target(TARGET, companyId)
                 .detail("changed", changed)
                 .detail("gateway", gateway.name())
-                .detail("relayEnabled", relayEnabled);
-            if (changed.contains("providerTools")) {
-                audit.detail("providerTools", providerTools.name());
-            }
-            auditLog.record(audit.build());
+                .detail("relayEnabled", relayEnabled)
+                .build());
             events.publishEvent(new ModelEvents.ModelSettingsChanged(companyId, relayEnabled));
             AfterCommit.run(() -> gateways.forget(companyId));
             if (oldGateway.isPresent() && !oldKeyIds.isEmpty()) {
@@ -673,8 +648,7 @@ class ModelSettingsService {
                 .defaultBudgetUsd(BigDecimal.ZERO)
                 .budgetPeriod(DEFAULT_PERIOD)
                 .defaultModels(new ArrayList<>())
-                .budgetAlertThresholds(new ArrayList<>(BudgetAlertStore.DEFAULT_THRESHOLDS))
-                .providerTools(ModelProviderTools.OFF);
+                .budgetAlertThresholds(new ArrayList<>(BudgetAlertStore.DEFAULT_THRESHOLDS));
         }
         boolean external = row.gateway() == ModelSettingsStore.GatewayKind.EXTERNAL;
         BudgetAlertStore.AlertSettings alertSettings = alerts.settings(row.companyId());
@@ -691,7 +665,6 @@ class ModelSettingsService {
             .defaultModels(new ArrayList<>(row.defaultModels()))
             .budgetAlertThresholds(new ArrayList<>(alertSettings.thresholds()))
             .monthlyAlertUsd(alertSettings.monthlyAlertUsd())
-            .providerTools(ModelProviderTools.fromValue(row.providerTools().name()))
             .testedAt(ts(row.testedAt()))
             .lastError(row.lastError())
             .updatedAt(ts(row.updatedAt()))

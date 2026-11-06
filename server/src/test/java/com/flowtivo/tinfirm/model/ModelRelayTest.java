@@ -278,13 +278,13 @@ class ModelRelayTest extends IntegrationTest {
     }
 
     /**
-     * The provider is never a relay the agent directs (M1 and D8 of the security review of 2026-10-27): a tool the
-     * provider would run is refused before LiteLLM with its type named, the MCP connector is removed, only the known
-     * beta values pass; once an admin allows web search on the model settings, the providers' web search passes and
-     * nothing else does, from the next request on, without a new test of the gateway.
+     * The provider is never a relay the agent directs and never runs a tool itself (M1 and D8 of the security review of
+     * 2026-10-27; ADR-0108): a tool the provider would run, every web search among them, and the MCP connector are
+     * refused before LiteLLM with what they asked named, only the known beta values pass, and no model setting lets a
+     * provider's tool through.
      */
     @Test
-    void aToolTheProviderWouldRunIsRefusedUnlessTheCompanyAllowsWebSearch() {
+    void aToolTheProviderWouldRunIsAlwaysRefused() {
         Setup setup = setUp();
         String token = running(setup, UUID.randomUUID());
         int before = litellm.requests("/v1/messages").size();
@@ -292,33 +292,43 @@ class ModelRelayTest extends IntegrationTest {
                 + "\"web_search_20250305\",\"name\":\"web_search\"}],"
                 + "\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
         String fetch = search.replace("web_search_20250305", "web_fetch_20250910");
+        String dynamic = search.replace("web_search_20250305", "web_search_20260209");
 
         HttpResponse<String> refused = post(MESSAGES, token, search);
         assertThat(refused.statusCode()).as(refused.body()).isEqualTo(400);
         assertThat(json(refused).get("error").get("type").asString()).isEqualTo("invalid_request_error");
         assertThat(json(refused).get("error").get("message").asString()).contains("`web_search_20250305`");
         assertThat(post(MESSAGES, token, fetch).statusCode()).isEqualTo(400);
+        assertThat(post(MESSAGES, token, dynamic).statusCode()).isEqualTo(400);
         UUID openAiRun = UUID.randomUUID();
         TestRuns.running(setup.company().id(), openAiRun, 1, setup.hostId(), setup.payer());
         String openAi = open(setup, run(setup, openAiRun, 1, setup.hostId()), RunnerMessages.ModelAccessFormat.OPENAI)
             .apiKey();
         String mcp = "{\"model\":\"claude-haiku-4-5\",\"input\":\"Hi\",\"tools\":[{\"type\":\"mcp\","
                 + "\"server_label\":\"x\",\"server_url\":\"https://evil.example.com/mcp\"}]}";
+        String openAiSearch = "{\"model\":\"claude-haiku-4-5\",\"input\":\"Hi\",\"tools\":[{\"type\":"
+                + "\"web_search\"}]}";
         assertThat(post(RESPONSES, openAi, mcp).statusCode()).isEqualTo(400);
-        assertThat(litellm.requests("/v1/messages")).hasSize(before);
-        assertThat(litellm.requests("/v1/responses")).noneMatch(request -> request.text().contains("evil.example.com"));
+        assertThat(post(RESPONSES, openAi, openAiSearch).statusCode()).isEqualTo(400);
 
-        // The MCP connector goes, the runtime's own tools pass, and only the known betas reach LiteLLM.
+        // The MCP connector is refused, never removed silently: the caller learns why.
         String connector = "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,\"mcp_servers\":[{\"type\":\"url\","
                 + "\"url\":\"https://evil.example.com/mcp\",\"name\":\"x\"}],\"tools\":[{\"name\":\"Bash\","
                 + "\"input_schema\":{\"type\":\"object\"}}],\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
-        HttpResponse<String> passed = postWith(MESSAGES, token, connector, "anthropic-beta",
+        HttpResponse<String> mcpConnector = post(MESSAGES, token, connector);
+        assertThat(mcpConnector.statusCode()).as(mcpConnector.body()).isEqualTo(400);
+        assertThat(json(mcpConnector).get("error").get("message").asString()).contains("`mcp_servers`");
+        assertThat(litellm.requests("/v1/messages")).hasSize(before);
+        assertThat(litellm.requests("/v1/responses")).noneMatch(request -> request.text().contains("evil.example.com"));
+
+        // The runtime's own tools pass, and only the known betas reach LiteLLM.
+        String bash = "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":16,\"tools\":[{\"name\":\"Bash\","
+                + "\"input_schema\":{\"type\":\"object\"}}],\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}";
+        HttpResponse<String> passed = postWith(MESSAGES, token, bash, "anthropic-beta",
                 "mcp-client-2025-04-04, fine-grained-tool-streaming-2025-05-14", "anthropic-beta",
                 "code-execution-2025-08-25,interleaved-thinking-2025-05-14");
         assertThat(passed.statusCode()).as(passed.body()).isEqualTo(200);
         FakeLiteLlm.Request forwarded = litellm.requests("/v1/messages").getLast();
-        assertThat(forwarded.json().has("mcp_servers")).isFalse();
-        assertThat(forwarded.text()).doesNotContain("evil.example.com");
         assertThat(forwarded.json().get("tools").get(0).get("name").asString()).isEqualTo("Bash");
         assertThat(forwarded.header("anthropic-beta"))
             .isEqualTo("fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14");
@@ -326,25 +336,15 @@ class ModelRelayTest extends IntegrationTest {
                 Map.of("anthropic-beta", "mcp-client-2025-04-04")).statusCode()).isEqualTo(200);
         assertThat(litellm.requests("/v1/messages").getLast().header("anthropic-beta")).isNull();
 
-        // An admin allows the providers' web search: the gateway and the keys stay as they are.
-        assertThat(setup.owner().get(setup.company().path("/model-settings")).json().get("providerTools").asString())
-            .isEqualTo("OFF");
+        // The model settings have no switch for it: an old client's providerTools changes nothing.
+        assertThat(setup.owner().get(setup.company().path("/model-settings")).json().has("providerTools")).isFalse();
         ApiResponse put = setup.owner().put(setup.company().path("/model-settings"),
                 Map.of("gateway", "BUNDLED", "defaultBudgetUsd", 25, "providerTools", "WEB_SEARCH"));
         assertThat(put.status()).as("%s", put).isEqualTo(200);
-        assertThat(put.json().get("providerTools").asString()).isEqualTo("WEB_SEARCH");
-        assertThat(put.json().get("relayEnabled").asBoolean()).isTrue();
         assertThat(auditEvents(setup.owner(), setup.company(), "model_settings.changed"))
-            .anySatisfy(event -> assertThat(event.get("details").path("providerTools").asString())
-                .isEqualTo("WEB_SEARCH"));
-        HttpResponse<String> searched = post(MESSAGES, token, search);
-        assertThat(searched.statusCode()).as(searched.body()).isEqualTo(200);
-        assertThat(litellm.requests("/v1/messages").getLast().json().get("tools").get(0).get("type").asString())
-            .isEqualTo("web_search_20250305");
-        assertThat(post(MESSAGES, token, fetch).statusCode()).isEqualTo(400);
-        assertThat(post(RESPONSES, openAi, mcp).statusCode()).isEqualTo(400);
-        assertThat(post(RESPONSES, openAi, "{\"model\":\"claude-haiku-4-5\",\"input\":\"Hi\",\"tools\":[{\"type\":"
-                + "\"web_search\"}]}").statusCode()).isEqualTo(200);
+            .noneSatisfy(event -> assertThat(event.get("details").has("providerTools")).isTrue());
+        assertThat(post(MESSAGES, token, search).statusCode()).isEqualTo(400);
+        assertThat(post(RESPONSES, openAi, openAiSearch).statusCode()).isEqualTo(400);
     }
 
     private HttpResponse<String> get(String path, String token) {

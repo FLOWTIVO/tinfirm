@@ -18,7 +18,8 @@
 //                      dummy key there
 //   model-env          reports the model variables of its environment and the length of its key,
 //                      never a key itself (a gateway's run: the model proxy's dummy key), and the
-//                      value the host set for the session's `effort` option
+//                      value the host set for the session's `effort` option, and the session's
+//                      `_meta` (`session-meta=`, JSON)
 //   model-proxy        reports the port and host of its model base URL and its key (the model proxy's dummy,
 //                      which every gateway's run gets; a real key would be a leak), then sends that
 //                      key to a model endpoint (`/v1/messages`) and to one outside the model API
@@ -213,6 +214,7 @@ async function handle(msg) {
         history: [],
         mcpServers: msg.params.mcpServers ?? [],
         mcpFrom: "session/new",
+        meta: msg.params._meta ?? null,
       };
       saveSession(sessionId, session);
       return send({ id: msg.id, result: { sessionId, configOptions: configOptions(session) } });
@@ -230,6 +232,7 @@ async function handle(msg) {
       session.cwd = msg.params.cwd;
       session.mcpServers = msg.params.mcpServers ?? [];
       session.mcpFrom = "session/load";
+      session.meta = msg.params._meta ?? null;
       saveSession(msg.params.sessionId, session);
       return send({ id: msg.id, result: { configOptions: configOptions(session) } });
     }
@@ -582,6 +585,8 @@ async function prompt(msg) {
         value("CLAUDE_CODE_EFFORT_LEVEL"),
         value("TINFIRM_THINKING_LEVEL"),
         `effort-option=${session.effort ?? "-"}`,
+        // The session's `_meta` (Claude Code's disallowed tools through a gateway, ADR-0108).
+        `session-meta=${JSON.stringify(session.meta ?? null)}`,
         `key-length=${key.length}`,
       ];
       chunk(sessionId, report.join(" "));

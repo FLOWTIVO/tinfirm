@@ -800,6 +800,7 @@ pub async fn execute(
                     new_home,
                     client_version: shared.opts.runner_version.clone(),
                     mcp_url: access.mcp.as_ref().map(|m| m.url().to_string()),
+                    session_meta: crate::runtime_env::session_meta(assign.agent.runtime),
                     steering: steering.clone(),
                     thought_level: if effort_in_env(assign.agent.runtime) {
                         ThoughtLevel::Untouched
@@ -3975,9 +3976,15 @@ mod tests {
             pairs(&[
                 ("OPENAI_API_KEY", "s3cret-value"),
                 ("DEFAULT_AUTH_REQUEST", r#"{"methodId":"api-key"}"#),
+                ("CODEX_CONFIG", r#"{"web_search":"disabled"}"#),
             ])
         );
-        assert!(env(CredentialKind::CodexChatgptAuth, Runtime::Codex).is_empty());
+        // A ChatGPT login needs no variable to sign in, but Codex's web search is off in every
+        // run (ADR-0108).
+        assert_eq!(
+            env(CredentialKind::CodexChatgptAuth, Runtime::Codex),
+            pairs(&[("CODEX_CONFIG", r#"{"web_search":"disabled"}"#)])
+        );
         // An API key of this host also serves pi and OpenCode.
         assert_eq!(
             env(CredentialKind::AnthropicApiKey, Runtime::Pi),

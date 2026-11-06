@@ -143,6 +143,8 @@ The bundled gateway's variables were called `TINFIRM_LITELLM_ADMIN_URL`, `TINFIR
 | `TINFIRM_MODEL_RELAY_BODY_TIMEOUT` | `PT30S` | How long the model relay waits for a request's whole body; beyond, `408`. | `extraConfig` |
 | `TINFIRM_MODEL_RELAY_ANTHROPIC_BETAS`, `TINFIRM_MODEL_RELAY_OPENAI_BETAS` | the pinned runtimes' | The `anthropic-beta` and `OpenAI-Beta` values the model relay passes on, comma-separated; any other is dropped. Never add one that lets the provider act for a request (MCP connector, code execution, web fetch). | `extraConfig` |
 
+No variable lets the model's provider run a tool itself for a run: the model relay and the model port refuse every request that asks for the provider's web search or fetch, code execution or MCP connection. The model port's former `MODEL_API_PROVIDER_TOOLS` (Helm `litellm.modelApi.providerTools`, Compose `TINFIRM_MODEL_API_PROVIDER_TOOLS`) is gone; remove it from your values. Agents search the web through a search MCP server ([Web search for agents](../admin-guide/mcp-servers.md#web-search-for-agents)).
+
 ## Runs and runner hosts
 
 | Variable | Default | Meaning | Helm value |

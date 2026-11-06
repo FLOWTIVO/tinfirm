@@ -453,12 +453,6 @@ litellm:
     maxInflightBytes: 134217728
     # The longest wait for LiteLLM's answer to start, and between two of its parts.
     idleTimeout: PT10M
-    # Which tools the model's provider may run itself for a request (MODEL_API_PROVIDER_TOOLS):
-    # "OFF", none, so that a request that names web search or fetch, code execution or an MCP
-    # server is 400; "WEB_SEARCH", the providers' web search too. The server's relay applies
-    # each company's own choice (Model access page) before the port: the stricter holds, so a
-    # company's WEB_SEARCH takes effect on the bundled gateway only with WEB_SEARCH here.
-    providerTools: "OFF"
     # Who else may call the model port, as NetworkPolicyPeers (networkPolicy.enabled): the
     # server always may. E.g. a namespace of your services that call models:
     #   - namespaceSelector:

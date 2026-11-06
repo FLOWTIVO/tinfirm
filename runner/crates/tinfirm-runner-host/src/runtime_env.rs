@@ -26,6 +26,15 @@
 //! A gateway's key stays on the host ([`crate::model_proxy`], always on): the runtime gets the
 //! run's model proxy as its base URL and [`DUMMY_KEY`] as its key, in the same variables
 //! ([`Access::through_model_proxy`]), so a sandbox never gets a gateway's own URL or key.
+//!
+//! No runtime asks the model's provider to run a tool itself, in any run (ADR-0108): a
+//! runtime's own switch for a provider-run tool is off whatever its model access, since through
+//! a gateway the model relay and the model port refuse such a request with 400, and with a
+//! provider's own key or a subscription nothing else would stop it. Codex's web search is off in `CODEX_CONFIG`
+//! ([`codex_config`]); Claude Code's WebSearch, which is Anthropic's server-side `web_search`
+//! tool, is a disallowed tool of the session ([`session_meta`]). OpenCode 2.0.29 and pi 1.0.4
+//! send no provider-run tool by default (OpenCode's own web search calls its search providers
+//! from the sandbox, through the egress proxy), so they need no switch.
 
 use crate::egress_proxy::Rule;
 use crate::model_proxy::DUMMY_KEY;
@@ -179,9 +188,7 @@ pub fn runtime_env(
             }
         }
         Runtime::Codex => {
-            if let Some(config) = codex_config(access, model, effort) {
-                env.push(("CODEX_CONFIG".into(), config));
-            }
+            env.push(("CODEX_CONFIG".into(), codex_config(access, model, effort)));
         }
         Runtime::Pi => {
             if let Some(effort) = effort {
@@ -283,6 +290,32 @@ pub fn opencode_config(p: &ProviderKey<'_>, model: Option<&str>) -> Value {
     config
 }
 
+/// Claude Code's tools that no Tinfirm session offers the model: WebSearch is Anthropic's
+/// server-side `web_search` tool, a tool the provider runs itself, which no Tinfirm run may use
+/// (ADR-0108), whatever reaches the model: the model relay and the model port refuse it, and a
+/// key of Anthropic's own, a Claude login or Bedrock would let it run. WebFetch stays: Claude
+/// Code fetches in the sandbox, through its egress proxy.
+pub const CLAUDE_CODE_DISALLOWED_TOOLS: &[&str] = &["WebSearch"];
+
+/// The `_meta` of `session/new` and `session/load` for a run of `runtime`, or `None`. Claude
+/// Code gets, whatever its model access
+/// `{"claudeCode": {"options": {"disallowedTools": ["WebSearch"]}}}`: `claude-agent-acp` (0.87.0,
+/// the version the CLAUDE image pins) passes `_meta.claudeCode.options` to the Agent SDK, whose
+/// `disallowedTools` removes the tool from the model's context, the documented way to turn a
+/// built-in tool off. The session's settings files cannot add it back: a disallowed tool stays
+/// denied.
+pub fn session_meta(runtime: Runtime) -> Option<serde_json::Map<String, Value>> {
+    match runtime {
+        Runtime::ClaudeCode => match json!({
+            "claudeCode": {"options": {"disallowedTools": CLAUDE_CODE_DISALLOWED_TOOLS}}
+        }) {
+            Value::Object(meta) => Some(meta),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The name of the provider that Codex gets for an `openai` gateway.
 pub const CODEX_GATEWAY_PROVIDER: &str = "tinfirm";
 
@@ -297,14 +330,15 @@ pub const CODEX_GATEWAY_PROVIDER: &str = "tinfirm";
 /// per session, and writes a fallback warning into the agent's reply. A provider's own key,
 /// without a base URL, keeps the built-in provider.
 ///
-/// Through a gateway, Codex's own web search is off (`web_search = "disabled"`, the top-level
-/// key of Codex's config.toml, in Codex 0.156.1, the version the CODEX image
-/// pins; its default, `cached`, adds the provider-run `web_search` tool to every request):
-/// the model relay refuses with 400 a request whose tools ask the provider to run a tool
-/// itself unless the company allows web search, so with it on every turn through the relay
-/// would fail.
-fn codex_config(access: Access<'_>, model: Option<&str>, effort: Option<Effort>) -> Option<String> {
+/// Codex's own web search is off in every run (`web_search = "disabled"`, the top-level key of
+/// Codex's config.toml, in Codex 0.156.1, the version the CODEX image pins; its default,
+/// `cached`, adds the provider-run `web_search` tool to every request): no Tinfirm run may have
+/// the provider run a tool (ADR-0108). Through a gateway the model relay and the model port
+/// would refuse the request with 400; with a provider's own key or a ChatGPT login nothing
+/// would, so the config is the only guard there.
+fn codex_config(access: Access<'_>, model: Option<&str>, effort: Option<Effort>) -> String {
     let mut config = serde_json::Map::new();
+    config.insert("web_search".into(), "disabled".into());
     if let Some(model) = model {
         config.insert("model".into(), model.into());
     }
@@ -318,7 +352,6 @@ fn codex_config(access: Access<'_>, model: Option<&str>, effort: Option<Effort>)
     }) = access
     {
         config.insert("model_provider".into(), CODEX_GATEWAY_PROVIDER.into());
-        config.insert("web_search".into(), "disabled".into());
         config.insert(
             "model_providers".into(),
             json!({
@@ -332,7 +365,7 @@ fn codex_config(access: Access<'_>, model: Option<&str>, effort: Option<Effort>)
             }),
         );
     }
-    (!config.is_empty()).then(|| Value::Object(config).to_string())
+    Value::Object(config).to_string()
 }
 
 /// The hosts that a run of `runtime` with `access` talks to for its model: the egress proxy
@@ -552,6 +585,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_code_has_no_web_search_in_any_run() {
+        // WebSearch, Anthropic's server-side tool, is a disallowed tool of every Claude Code
+        // session: through a gateway the relay would refuse it, and with a key of Anthropic's
+        // own, Bedrock or a login nothing else would stop it (ADR-0108).
+        assert_eq!(
+            session_meta(Runtime::ClaudeCode).map(Value::Object),
+            Some(json!({"claudeCode": {"options": {"disallowedTools": ["WebSearch"]}}}))
+        );
+        // WebFetch runs in the sandbox, through its egress proxy: it stays.
+        assert!(!CLAUDE_CODE_DISALLOWED_TOOLS.contains(&"WebFetch"));
+        // The other runtimes take no session `_meta`: Codex's switch is in CODEX_CONFIG, and
+        // OpenCode and pi send no provider-run tool.
+        for runtime in [Runtime::Codex, Runtime::Opencode, Runtime::Pi] {
+            assert_eq!(session_meta(runtime), None, "{runtime:?}");
+        }
+    }
+
     /// `CODEX_CONFIG`'s gateway provider with `base_url`, next to the other `fields`.
     fn codex_gateway(base_url: &str, fields: Value) -> Value {
         let mut config = json!({
@@ -584,7 +635,10 @@ mod tests {
             pairs(&[
                 ("OPENAI_API_KEY", KEY),
                 ("DEFAULT_AUTH_REQUEST", OPENAI_API_KEY_AUTH),
-                ("CODEX_CONFIG", r#"{"model":"gpt-5.5"}"#),
+                (
+                    "CODEX_CONFIG",
+                    r#"{"web_search":"disabled","model":"gpt-5.5"}"#
+                ),
             ])
         );
         // A gateway: a provider of its own with the gateway's URL, without WebSockets, also
@@ -610,13 +664,12 @@ mod tests {
             )
         );
         assert!(!get(&via_gateway, "CODEX_CONFIG").unwrap().contains(KEY));
-        // The relay refuses provider-run tools, so Codex's web search is off through a
-        // gateway, and left as Codex has it with a provider's own key.
+        // No run may have the provider run a tool (ADR-0108): Codex's web search is off
+        // through a gateway, with a provider's own key, and with a ChatGPT login.
         assert_eq!(codex_config_of(&via_gateway)["web_search"], "disabled");
-        assert!(
-            codex_config_of(&env(key(ModelFormat::Openai), Some("gpt-5.5")))
-                .get("web_search")
-                .is_none()
+        assert_eq!(
+            codex_config_of(&env(key(ModelFormat::Openai), Some("gpt-5.5")))["web_search"],
+            "disabled"
         );
         assert!(
             !get(&via_gateway, "CODEX_CONFIG")
@@ -627,7 +680,10 @@ mod tests {
             kind: CredentialKind::CodexChatgptAuth,
             secret: "",
         };
-        assert!(runtime_env(Runtime::Codex, chatgpt, None, None).is_empty());
+        assert_eq!(
+            runtime_env(Runtime::Codex, chatgpt, None, None),
+            pairs(&[("CODEX_CONFIG", r#"{"web_search":"disabled"}"#)])
+        );
     }
 
     #[test]
@@ -843,7 +899,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<Value>(get(&codex, "CODEX_CONFIG").unwrap()).unwrap(),
-            json!({"model": "gpt-5.5", "model_reasoning_effort": "xhigh"})
+            json!({"web_search": "disabled", "model": "gpt-5.5", "model_reasoning_effort": "xhigh"})
         );
         // A ChatGPT login has no other variables, but the effort still needs its config.
         let chatgpt = Access::Subscription {
@@ -855,7 +911,7 @@ mod tests {
                 &runtime_env(Runtime::Codex, chatgpt, None, effort),
                 "CODEX_CONFIG"
             ),
-            Some(r#"{"model_reasoning_effort":"xhigh"}"#)
+            Some(r#"{"web_search":"disabled","model_reasoning_effort":"xhigh"}"#)
         );
         let pi = runtime_env(
             Runtime::Pi,

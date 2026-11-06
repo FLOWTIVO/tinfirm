@@ -182,8 +182,6 @@ services:
     networks: [default, gateway]
     environment:
       MODEL_API_UPSTREAM: http://litellm:4000
-      # Which tools the model's provider may run itself: OFF (none) or WEB_SEARCH (model-api/README.md).
-      MODEL_API_PROVIDER_TOOLS: ${TINFIRM_MODEL_API_PROVIDER_TOOLS:-OFF}
     ports:
       # Loopback only, for a service run from the IDE. On the Compose network, the company's
       # services reach it as http://model-api:4001.

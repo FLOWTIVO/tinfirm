@@ -15,9 +15,9 @@ import tools.jackson.databind.json.JsonMapper;
  * A run's own {@code drop_params} and {@code additional_drop_params} then do not count. Another vendor's gateway gets
  * no {@code drop_params} from Tinfirm: it is LiteLLM's own control, which a provider given the body as it came refuses.
  * The body must be one JSON object without a repeated top-level name (LiteLLM would take the last {@code model},
- * Tinfirm checks one); its {@code model} is read for the check. Without {@code mcp_servers} and {@code container}, and
- * refused when it names a tool the provider would run that the company's {@code providerTools} does not allow (M1 of
- * the security review of 2026-10-27).
+ * Tinfirm checks one); its {@code model} is read for the check. Refused, whatever the gateway's vendor, when it asks
+ * the model's provider to run a tool itself: an MCP server, code execution, a web search, any tool the runtime does
+ * not run (M1 of the security review of 2026-10-27; ADR-0108). No company setting lets one through.
  */
 final class RelayBody {
 
@@ -43,34 +43,26 @@ final class RelayBody {
         return LiteLlmRequests.mapper(maxBytes);
     }
 
-    /**
-     * Whether a top-level name is removed: one of LiteLLM's own fields, {@code mcp_servers} or {@code container}, or
-     * the run's own {@code drop_params}.
-     */
+    /** Whether a top-level name is removed: one of LiteLLM's own fields, or the run's own {@code drop_params}. */
     static boolean removed(String name) {
-        return LiteLlmRequests.liteLlmField(name) || LiteLlmRequests.providerAction(name)
-                || LiteLlmRequests.dropControl(name);
+        return LiteLlmRequests.liteLlmField(name) || LiteLlmRequests.dropControl(name);
     }
 
-    /** The body without LiteLLM's fields, with {@code "drop_params": true}; no tool of the provider's allowed. */
+    /**
+     * The body without LiteLLM's fields, with {@code "drop_params": true}; refused when it asks the provider to run a
+     * tool itself.
+     */
     static Result transform(JsonMapper mapper, byte[] body) throws Refused {
-        return transform(mapper, body, LiteLlmRequests.ProviderTools.OFF);
-    }
-
-    /** The body without LiteLLM's fields, with {@code "drop_params": true}; the provider's tools as chosen. */
-    static Result transform(JsonMapper mapper, byte[] body, LiteLlmRequests.ProviderTools providerTools)
-            throws Refused {
-        return transform(mapper, body, providerTools, true);
+        return transform(mapper, body, true);
     }
 
     /**
      * The body without LiteLLM's fields, with {@code "drop_params": true} when {@code dropParams} (a LiteLLM), else
-     * with the run's own as it sent them; the provider's tools as chosen.
+     * with the run's own as it sent them; refused when it asks the provider to run a tool itself.
      */
-    static Result transform(JsonMapper mapper, byte[] body, LiteLlmRequests.ProviderTools providerTools,
-            boolean dropParams) throws Refused {
+    static Result transform(JsonMapper mapper, byte[] body, boolean dropParams) throws Refused {
         try {
-            LiteLlmRequests.Cleaned cleaned = LiteLlmRequests.clean(mapper, body, dropParams, providerTools);
+            LiteLlmRequests.Cleaned cleaned = LiteLlmRequests.clean(mapper, body, dropParams);
             return new Result(cleaned.bytes(), cleaned.model());
         }
         catch (LiteLlmRequests.Refused ex) {

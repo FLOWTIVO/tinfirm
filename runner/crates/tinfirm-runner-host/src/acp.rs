@@ -4,7 +4,9 @@
 //!   inside the sandbox;
 //! - `session/load(resumeSessionId)` when given and supported, else `session/new`; both get
 //!   the run's platform MCP endpoint in `mcpServers` when the agent supports MCP over HTTP
-//!   (`agentCapabilities.mcpCapabilities.http`), else `[]` (docs/archive/v1/CONVENTIONS.md §15.6);
+//!   (`agentCapabilities.mcpCapabilities.http`), else `[]` (docs/archive/v1/CONVENTIONS.md §15.6),
+//!   and the runtime's session `_meta` ([`crate::runtime_env::session_meta`]: Claude Code's
+//!   disallowed WebSearch, ADR-0108);
 //!   why the run did not resume is reported as a [`ResumeOutcome`] (`run.finished.resumeOutcome`);
 //! - `session/set_config_option` of the session's thought-level option when the run has an
 //!   effort that its runtime does not take from the environment ([`ThoughtLevel`]);
@@ -298,6 +300,9 @@ pub struct AcpParams {
     pub client_version: String,
     /// The run's platform MCP endpoint, when the host serves one.
     pub mcp_url: Option<String>,
+    /// The `_meta` of `session/new` and `session/load`
+    /// ([`crate::runtime_env::session_meta`]): Claude Code's disallowed tools.
+    pub session_meta: Option<serde_json::Map<String, Value>>,
     /// What the host does with the session's thought-level config option.
     pub thought_level: ThoughtLevel,
     /// The person's messages for the run: the session takes them, and closes it when the prompt
@@ -610,7 +615,8 @@ async fn converse(
             match cx
                 .send_request(
                     LoadSessionRequest::new(resume.clone(), params.cwd.clone())
-                        .mcp_servers(servers.clone()),
+                        .mcp_servers(servers.clone())
+                        .meta(params.session_meta.clone()),
                 )
                 .block_task()
                 .await
@@ -634,7 +640,11 @@ async fn converse(
     let session_id = match session_id {
         Some(id) => id,
         None => match cx
-            .send_request(NewSessionRequest::new(params.cwd.clone()).mcp_servers(servers))
+            .send_request(
+                NewSessionRequest::new(params.cwd.clone())
+                    .mcp_servers(servers)
+                    .meta(params.session_meta.clone()),
+            )
             .block_task()
             .await
         {
@@ -982,6 +992,7 @@ mod tests {
             new_home: false,
             client_version: "0".into(),
             mcp_url: None,
+            session_meta: None,
             thought_level: ThoughtLevel::Untouched,
             steering: Steering::new(
                 uuid::Uuid::new_v4(),

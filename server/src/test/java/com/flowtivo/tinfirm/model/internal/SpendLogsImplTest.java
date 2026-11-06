@@ -21,7 +21,6 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentMatchers;
 
 import com.flowtivo.tinfirm.model.SpendLogs;
-import com.flowtivo.tinfirm.shared.litellm.LiteLlmRequests;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 
@@ -72,8 +71,7 @@ class SpendLogsImplTest {
                 ModelSettingsStore.GatewayKind.EXTERNAL, GatewayVendor.LITELLM,
                 gateway != null ? gateway.baseUrl() : null, null, false, gateway != null ? UUID.randomUUID() : null,
                 gateway != null, new BigDecimal("50"), "MONTHLY",
-                List.of(), gateway != null ? updatedAt : null, null, updatedAt, null,
-                LiteLlmRequests.ProviderTools.OFF);
+                List.of(), gateway != null ? updatedAt : null, null, updatedAt, null);
         when(settings.find(COMPANY)).thenReturn(Optional.of(row));
         when(gateways.of(row)).thenReturn(Optional.ofNullable(gateway));
     }

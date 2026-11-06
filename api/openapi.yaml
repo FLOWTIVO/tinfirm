@@ -4596,8 +4596,9 @@ paths:
         after the commit; the keys whose status it may change reach it before the answer, so that their model access
         read after it shows that status (a spent key the raised default frees is `OK` again, a key whose spend the
         lowered default no longer covers is `BUDGET_SPENT`, and a spent key shows the new period's reset time).
-        `budgetAlertThresholds`, `monthlyAlertUsd` (package 6) and `providerTools` change neither the gateway nor the
-        keys; `providerTools` applies to the company's next relayed model request. Audited as
+        `budgetAlertThresholds` and `monthlyAlertUsd` (package 6) change neither the gateway nor the keys. No setting
+        lets a model's provider run a tool itself (web search, MCP, code execution): the relay always refuses such a
+        request (ADR-0108). Audited as
         `model_settings.changed` with the names of the changed settings (`adminKey` for a new key), never the key; a
         request that changes nothing is not. A 400 VALIDATION_FAILED, and INVALID_BASE_URL, name the fields refused in
         `errors` (`[{field, message}]`), as the request's schema validation does.
@@ -10374,25 +10375,13 @@ components:
           maxLength: 200
           pattern: '^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]*$'
           description: A model the company's own key allows, as the gateway names it; a small one suffices; null for none
-    ModelProviderTools:
-      type: string
-      description: |
-        Which tools the model's provider may run itself for the company's runs (the security review of 2026-10-27, M1).
-        `OFF` (the default): none; a relayed request whose `tools` (or a namespace's tools, or an Anthropic
-        `tool_addition` block) name a tool the provider runs, such as web search or fetch, code execution or an MCP
-        server, is refused `400` with the tool's type, and `mcp_servers` and `container` are removed from every request.
-        The tools the runtime runs itself (`function`, `custom`, and the runtimes' local types) always pass.
-        `WEB_SEARCH`: the providers' web search also passes (Anthropic's `web_search_*`, OpenAI's `web_search` and
-        `web_search_preview`, Chat Completions' `web_search_options`): the agent's queries go to the provider's search,
-        and the results come back to the model. Nothing else does. On the bundled gateway, the deployment's model port
-        filters the same way by its own `MODEL_API_PROVIDER_TOOLS` (`OFF` by default), so `WEB_SEARCH` takes effect
-        there only once the operator allows it too.
-      enum: ['OFF', WEB_SEARCH]
     ModelSettings:
       type: object
       description: |
         The company's model gateway and the defaults of its keys (the package 2 contract, §3.1). Runner hosts never
-        reach LiteLLM: they reach the server's model relay, `relayBaseUrl`.
+        reach LiteLLM: they reach the server's model relay, `relayBaseUrl`, which refuses `400` every request that asks
+        the model's provider to run a tool itself (web search or fetch, code execution, an MCP server; ADR-0108):
+        agents search the web and call MCP servers through Tinfirm.
       required: [configured, gateway, vendor, memberKeys, bundledAvailable, adminKeySet, relayEnabled, relayBaseUrl, defaultBudgetUsd, budgetPeriod, defaultModels, keyRotationInterval, keyRotationGrace]
       properties:
         configured:
@@ -10448,8 +10437,6 @@ components:
           type: number
           nullable: true
           description: "Admins are told once a calendar month (UTC) when the company's spend crosses it; nothing is capped"
-        providerTools:
-          $ref: '#/components/schemas/ModelProviderTools'
         testedAt:
           type: string
           format: date-time
@@ -10507,8 +10494,6 @@ components:
           description: 1 to 3 distinct whole percentages, from 1 to 100
         monthlyAlertUsd: { type: number, minimum: 0, maximum: 1000000000 }
         clearMonthlyAlert: { type: boolean, description: 'Removes the monthly alert amount; not with `monthlyAlertUsd`' }
-        providerTools:
-          $ref: '#/components/schemas/ModelProviderTools'
     ModelSettingsTestResult:
       type: object
       required: [ok, models]

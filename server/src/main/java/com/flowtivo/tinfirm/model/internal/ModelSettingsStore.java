@@ -14,7 +14,6 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 
-import com.flowtivo.tinfirm.shared.litellm.LiteLlmRequests;
 
 /**
  * SQL access to {@code model_settings} (V002), under row-level security, and the cross-company lookup of the companies
@@ -25,8 +24,7 @@ class ModelSettingsStore {
 
     private static final String COLUMNS = """
             company_id, gateway, vendor, admin_url, model_url, member_keys, admin_key_secret_id, relay_enabled,
-            default_budget_usd, budget_period, default_models, tested_at, last_error, updated_at, updated_by,
-            provider_tools""";
+            default_budget_usd, budget_period, default_models, tested_at, last_error, updated_at, updated_by""";
 
     private final JdbcClient jdbc;
 
@@ -45,24 +43,15 @@ class ModelSettingsStore {
     /**
      * A company's settings; {@code vendor} the product its gateway is (V081, ADR-0094), {@code modelUrl} a
      * {@code PROVIDED} gateway's root for model requests and {@code memberKeys} whether its members enter their own key
-     * (V082). {@code providerTools}: which tools the model's provider may run itself for the company's relayed requests
-     * ({@code provider_tools}, V076; M1 of the security review of 2026-10-27), {@code OFF} unless an admin chose
-     * otherwise.
+     * (V082).
      */
     record SettingsRow(UUID companyId, GatewayKind gateway, GatewayVendor vendor, @Nullable String adminUrl,
             @Nullable String modelUrl, boolean memberKeys, @Nullable UUID adminKeySecretId,
             boolean relayEnabled, BigDecimal defaultBudgetUsd, String budgetPeriod, List<String> defaultModels,
-            @Nullable Instant testedAt, @Nullable String lastError, Instant updatedAt, @Nullable UUID updatedBy,
-            LiteLlmRequests.ProviderTools providerTools) {
+            @Nullable Instant testedAt, @Nullable String lastError, Instant updatedAt, @Nullable UUID updatedBy) {
 
         SettingsRow {
             defaultModels = List.copyOf(defaultModels);
-        }
-
-        /** These settings with another choice of the provider's tools. */
-        SettingsRow withProviderTools(LiteLlmRequests.ProviderTools tools, Instant at, @Nullable UUID by) {
-            return new SettingsRow(companyId, gateway, vendor, adminUrl, modelUrl, memberKeys, adminKeySecretId,
-                    relayEnabled, defaultBudgetUsd, budgetPeriod, defaultModels, testedAt, lastError, at, by, tools);
         }
     }
 
@@ -84,9 +73,8 @@ class ModelSettingsStore {
         jdbc.sql("""
                 INSERT INTO model_settings (company_id, gateway, vendor, admin_url, model_url, member_keys,
                                             admin_key_secret_id, relay_enabled, default_budget_usd, budget_period,
-                                            default_models, tested_at, last_error, updated_at, updated_by,
-                                            provider_tools)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?, ?)
+                                            default_models, tested_at, last_error, updated_at, updated_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?, ?, ?, ?)
                 ON CONFLICT (company_id) DO UPDATE
                    SET gateway = EXCLUDED.gateway, vendor = EXCLUDED.vendor, admin_url = EXCLUDED.admin_url,
                        model_url = EXCLUDED.model_url, member_keys = EXCLUDED.member_keys,
@@ -94,18 +82,11 @@ class ModelSettingsStore {
                        default_budget_usd = EXCLUDED.default_budget_usd, budget_period = EXCLUDED.budget_period,
                        default_models = EXCLUDED.default_models, tested_at = EXCLUDED.tested_at,
                        last_error = EXCLUDED.last_error, updated_at = EXCLUDED.updated_at,
-                       updated_by = EXCLUDED.updated_by, provider_tools = EXCLUDED.provider_tools""")
+                       updated_by = EXCLUDED.updated_by""")
             .params(row.companyId(), row.gateway().name(), row.vendor().name(), row.adminUrl(), row.modelUrl(),
                     row.memberKeys(), row.adminKeySecretId(), row.relayEnabled(), row.defaultBudgetUsd(),
                     row.budgetPeriod(), ModelJson.write(row.defaultModels()), ts(row.testedAt()), row.lastError(),
-                    ts(row.updatedAt()), row.updatedBy(), row.providerTools().name())
-            .update();
-    }
-
-    /** Records an admin's choice of the provider's tools alone; the gateway and the keys stay as they are. */
-    void setProviderTools(UUID companyId, LiteLlmRequests.ProviderTools tools, Instant at, @Nullable UUID by) {
-        jdbc.sql("UPDATE model_settings SET provider_tools = ?, updated_at = ?, updated_by = ? WHERE company_id = ?")
-            .params(tools.name(), ts(at), by, companyId)
+                    ts(row.updatedAt()), row.updatedBy())
             .update();
     }
 
@@ -139,8 +120,7 @@ class ModelSettingsStore {
                 rs.getObject("admin_key_secret_id", UUID.class), rs.getBoolean("relay_enabled"),
                 rs.getBigDecimal("default_budget_usd"), rs.getString("budget_period"),
                 ModelJson.strings(rs.getString("default_models")), instant(rs, "tested_at"), rs.getString("last_error"),
-                rs.getObject("updated_at", OffsetDateTime.class).toInstant(), rs.getObject("updated_by", UUID.class),
-                LiteLlmRequests.ProviderTools.valueOf(rs.getString("provider_tools")));
+                rs.getObject("updated_at", OffsetDateTime.class).toInstant(), rs.getObject("updated_by", UUID.class));
     }
 
     private static @Nullable Instant instant(ResultSet rs, String column) throws SQLException {
