@@ -84,28 +84,16 @@ set_cargo_version() {
     }
   ' "$manifest")"
   [ -n "$old" ] || { echo "error: no version in [workspace.package] of $manifest" >&2; exit 1; }
-  # Re-running a release that already set it is not an error (as npm's --allow-same-version).
-  if [ "$old" = "$VERSION" ]; then
-    echo "  $manifest, $lock -> $VERSION (already)"
-    return
-  fi
-  VERSION="$VERSION" awk '
-    /^\[/ { in_pkg = ($0 ~ /^\[workspace\.package\][[:space:]]*$/) }
-    in_pkg && !done && /^version[[:space:]]*=[[:space:]]*"[^"]*"/ {
-      sub(/"[^"]*"/, "\"" ENVIRON["VERSION"] "\"")
-      done = 1
-    }
-    { print }
-  ' "$manifest" > "$manifest.tmp"
-  mv "$manifest.tmp" "$manifest"
-  # Cargo.lock: each [[package]] block is buffered until its end, then its version line is
-  # rewritten when the block has no source and the old version.
+  # Cargo.lock first, into a temporary file: each [[package]] block is buffered until its end,
+  # then its version line is rewritten when the block has no source and the old version. When
+  # the manifest already has the version (a re-run, as npm's --allow-same-version), this checks
+  # that the lock has it too, so a lock left stale by an earlier failure is never reported done.
   OLD="$old" VERSION="$VERSION" awk '
     function flush(   i) {
       if (n == 0) return
       if (is_pkg && !has_source && vline && version == ENVIRON["OLD"]) {
         buf[vline] = "version = \"" ENVIRON["VERSION"] "\""
-        changed++
+        matched++
       }
       for (i = 1; i <= n; i++) print buf[i]
       n = 0; is_pkg = 0; has_source = 0; vline = 0; version = ""
@@ -120,10 +108,20 @@ set_cargo_version() {
     }
     END {
       flush()
-      if (!changed) { print "error: no package of the workspace with version " ENVIRON["OLD"] " in the lock" > "/dev/stderr"; exit 1 }
+      if (!matched) { print "error: no package of the workspace with version " ENVIRON["OLD"] " in the lock" > "/dev/stderr"; exit 1 }
     }
   ' "$lock" > "$lock.tmp" || { rm -f "$lock.tmp"; exit 1; }
+  # Then the manifest, so that a failure above leaves both files as they were.
+  VERSION="$VERSION" awk '
+    /^\[/ { in_pkg = ($0 ~ /^\[workspace\.package\][[:space:]]*$/) }
+    in_pkg && !done && /^version[[:space:]]*=[[:space:]]*"[^"]*"/ {
+      sub(/"[^"]*"/, "\"" ENVIRON["VERSION"] "\"")
+      done = 1
+    }
+    { print }
+  ' "$manifest" > "$manifest.tmp"
   mv "$lock.tmp" "$lock"
+  mv "$manifest.tmp" "$manifest"
   echo "  $manifest, $lock -> $VERSION"
 }
 
