@@ -26,6 +26,11 @@
 # `main` for the builds of `rolling` and of a release (assets.sh passes $CACHE_SCOPE, which
 # runner-artifacts.yml sets), so that no other build writes the registry or target
 # directory a published binary is built from.
+#
+# TINFIRM_RUNNER_BUILD, empty by default, is what the binary was published as: assets.sh
+# passes the asset's version (`rolling-<sha7>` for rolling, the version for a release).
+# `--version` shows it next to the workspace's version; hello.runnerVersion stays the
+# workspace's version alone (ADR-0109).
 ARG CACHE_SCOPE=pr
 
 # ---- 1. Toolchain: Rust, the two musl targets, zig, cargo-zigbuild ----------------------
@@ -58,6 +63,7 @@ FROM toolchain AS build
 ARG TARGET
 ARG CACHE_SCOPE
 ARG TARGETARCH
+ARG TINFIRM_RUNNER_BUILD=
 WORKDIR /src
 COPY protocol/ protocol/
 COPY runner/ runner/

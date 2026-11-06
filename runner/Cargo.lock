@@ -2375,7 +2375,7 @@ dependencies = [
 
 [[package]]
 name = "tinfirm-bridge"
-version = "0.3.0"
+version = "0.1.0-SNAPSHOT"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "tinfirm-protocol"
-version = "0.3.0"
+version = "0.1.0-SNAPSHOT"
 dependencies = [
  "chrono",
  "jsonschema",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "tinfirm-runner-host"
-version = "0.3.0"
+version = "0.1.0-SNAPSHOT"
 dependencies = [
  "agent-client-protocol",
  "aho-corasick",

@@ -226,9 +226,10 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          (cd runner && cargo build --release --locked -p tinfirm-runner-host)
-          runner/target/release/tinfirm-runner-host --version
           version="$(deploy/release/assets.sh version "$RELEASE_TAG")"
+          # --version shows the asset's version next to the workspace's (ADR-0109).
+          (cd runner && TINFIRM_RUNNER_BUILD="$version" cargo build --release --locked -p tinfirm-runner-host)
+          runner/target/release/tinfirm-runner-host --version
           deploy/release/assets.sh package aarch64-apple-darwin "$version" \
             runner/target/release/tinfirm-runner-host dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -263,9 +264,10 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          (cd runner && cargo build --release --locked -p tinfirm-runner-host)
-          runner/target/release/tinfirm-runner-host.exe --version
           version="$(deploy/release/assets.sh version "$RELEASE_TAG")"
+          # --version shows the asset's version next to the workspace's (ADR-0109).
+          (cd runner && TINFIRM_RUNNER_BUILD="$version" cargo build --release --locked -p tinfirm-runner-host)
+          runner/target/release/tinfirm-runner-host.exe --version
           deploy/release/assets.sh package x86_64-pc-windows-msvc "$version" \
             runner/target/release/tinfirm-runner-host.exe dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

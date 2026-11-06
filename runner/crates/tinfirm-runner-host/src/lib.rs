@@ -46,6 +46,7 @@ pub mod steer;
 pub mod takeback;
 pub mod usage;
 pub mod util;
+pub mod version;
 #[path = "../../../../ee/runner/tinfirm-runner-host/src/vm.rs"]
 pub mod vm;
 #[path = "../../../../ee/runner/tinfirm-runner-host/src/vm_boot.rs"]

@@ -143,8 +143,11 @@ cmd_runner_linux() {
   # The daemon's own builder (as in ci.yml), so the cache mounts persist between builds.
   # CACHE_SCOPE: the suffix of the Dockerfile's cache ids, `main` from runner-artifacts.yml
   # for main and the release branches, else `pr` (runner-musl.Dockerfile).
+  # TINFIRM_RUNNER_BUILD: the asset's version, which `--version` shows next to the
+  # workspace's (`0.1.0-SNAPSHOT (rolling-abc1234)`; ADR-0109).
   docker build --progress=plain -f "$ROOT/deploy/release/runner-musl.Dockerfile" --target binary \
     --build-arg "TARGET=$target" --build-arg "CACHE_SCOPE=${CACHE_SCOPE:-pr}" \
+    --build-arg "TINFIRM_RUNNER_BUILD=$version" \
     --output "type=local,dest=$work" "$ROOT" >&2
   cmd_package "$target" "$version" "$work/tinfirm-runner-host" "$outdir"
   rm -rf "$work"

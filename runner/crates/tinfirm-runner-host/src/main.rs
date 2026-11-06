@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser)]
 #[command(
     name = "tinfirm-runner-host",
-    version,
+    version = tinfirm_runner_host::version::display(),
     about = "Tinfirm runner host: runs Tinfirm agents in local Docker sandboxes"
 )]
 struct Cli {
@@ -1977,7 +1977,7 @@ async fn docker_executor(
         None
     };
     tracing::info!(
-        runner_version = env!("CARGO_PKG_VERSION"),
+        runner_version = tinfirm_runner_host::version::display(),
         protocol_version = cfg.protocol_version,
         max_concurrent_runs,
         executor = "docker",
@@ -2065,7 +2065,7 @@ async fn vm_executor(
         .await
         .context("--executor vm: the VM driver's checks failed")?;
     tracing::info!(
-        runner_version = env!("CARGO_PKG_VERSION"),
+        runner_version = tinfirm_runner_host::version::display(),
         protocol_version = cfg.protocol_version,
         max_concurrent_runs,
         executor = "vm",

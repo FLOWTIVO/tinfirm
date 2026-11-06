@@ -2,8 +2,8 @@
 # commit SHA, with their release in the comment; Dependabot keeps them current.
 name: Set version
 description: >-
-  Write a version into every manifest it is given (single-module poms and
-  npm packages), and expose the development version that follows a released one.
+  Write a version into every manifest it is given (single-module poms, npm
+  packages and Cargo workspaces), and expose the development version that follows a released one.
 
 inputs:
   version:
@@ -12,7 +12,8 @@ inputs:
     default: ''
   manifests:
     description: |
-      Newline-separated manifest list. `pom:<path>:<artifactId>` or `npm:<dir>`.
+      Newline-separated manifest list. `pom:<path>:<artifactId>`, `npm:<dir>` or
+      `cargo:<dir>` (a workspace: <dir>/Cargo.toml and <dir>/Cargo.lock).
       Blank lines and `#` comments are allowed.
     required: true
   next_of:
@@ -29,7 +30,7 @@ outputs:
   paths:
     description: >-
       Space-separated paths this action writes, ready to hand to `git add`. Includes
-      each npm package's lock file.
+      each npm package's and each Cargo workspace's lock file.
     value: ${{ steps.run.outputs.paths }}
 
 runs:
@@ -68,6 +69,15 @@ runs:
                 paths="$paths package.json package-lock.json"
               else
                 paths="$paths $d/package.json $d/package-lock.json"
+              fi
+              ;;
+            cargo:*)
+              IFS=':' read -r _ d <<< "$line"
+              d="${d%/}"
+              if [ "$d" = "." ]; then
+                paths="$paths Cargo.toml Cargo.lock"
+              else
+                paths="$paths $d/Cargo.toml $d/Cargo.lock"
               fi
               ;;
           esac
