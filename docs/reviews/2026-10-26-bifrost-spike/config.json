@@ -1,0 +1,67 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "encryption_key": "spike-only-spike-only-spike-only-spike",
+  "auth_config": {
+    "is_enabled": true,
+    "admin_username": "admin",
+    "admin_password": "spike-pass"
+  },
+  "client": {
+    "enforce_governance_header": true,
+    "enable_logging": true,
+    "disable_content_logging": true
+  },
+  "providers": {
+    "anthropic": {
+      "keys": [
+        {
+          "name": "anth",
+          "value": "sk-ant-upstream",
+          "models": [
+            "*"
+          ],
+          "weight": 1
+        }
+      ],
+      "network_config": {
+        "base_url": "http://127.0.0.1:9911"
+      }
+    },
+    "openai": {
+      "keys": [
+        {
+          "name": "oai",
+          "value": "sk-oai-upstream",
+          "models": [
+            "*"
+          ],
+          "weight": 1
+        }
+      ],
+      "network_config": {
+        "base_url": "http://127.0.0.1:9911"
+      }
+    }
+  },
+  "config_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": {
+      "path": "./config.db"
+    }
+  },
+  "logs_store": {
+    "enabled": true,
+    "type": "sqlite",
+    "config": {
+      "path": "./logs.db"
+    }
+  },
+  "framework": {
+    "pricing": {
+      "pricing_url": "file:///ABSOLUTE/PATH/TO/pricing.json",
+      "model_parameters_url": "file:///ABSOLUTE/PATH/TO/params.json",
+      "mcp_library_sync_interval": 0
+    }
+  }
+}

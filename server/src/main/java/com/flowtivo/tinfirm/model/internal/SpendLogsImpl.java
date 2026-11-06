@@ -42,7 +42,7 @@ class SpendLogsImpl implements SpendLogs {
 
     private final Gateways gateways;
 
-    private final LiteLlm litellm;
+    private final GatewayAdapter adapter;
 
     private final TimeSource time;
 
@@ -56,12 +56,12 @@ class SpendLogsImpl implements SpendLogs {
     private record Target(Instant updatedAt, Gateway gateway) {
     }
 
-    SpendLogsImpl(SystemTransactions transactions, ModelSettingsStore settings, Gateways gateways, LiteLlm litellm,
-            TimeSource time) {
+    SpendLogsImpl(SystemTransactions transactions, ModelSettingsStore settings, Gateways gateways,
+            GatewayAdapter adapter, TimeSource time) {
         this.transactions = transactions;
         this.settings = settings;
         this.gateways = gateways;
-        this.litellm = litellm;
+        this.adapter = adapter;
         this.time = time;
     }
 
@@ -75,7 +75,7 @@ class SpendLogsImpl implements SpendLogs {
         List<Entry> entries = new ArrayList<>();
         for (String keyId : new LinkedHashSet<>(keyIds)) {
             try {
-                entries.addAll(litellm.spendLogs(gateway, keyId, first, last));
+                entries.addAll(adapter.spendLogs(gateway, keyId, first, last));
             }
             catch (LiteLlmException ex) {
                 throw new Unavailable(ex.getMessage());
@@ -100,7 +100,7 @@ class SpendLogsImpl implements SpendLogs {
             return same.prices();
         }
         try {
-            Map<String, Price> read = Map.copyOf(litellm.prices(target.gateway()));
+            Map<String, Price> read = Map.copyOf(adapter.prices(target.gateway()));
             prices.put(companyId, new CachedPrices(target.updatedAt(), read, now.plus(KEEP_PRICES)));
             return read;
         }
@@ -111,13 +111,23 @@ class SpendLogsImpl implements SpendLogs {
         }
     }
 
+    @Override
+    public boolean recorded(UUID companyId) {
+        return transactions.inCompany(companyId, () -> settings.find(companyId)
+            .map(row -> row.gateway() != ModelSettingsStore.GatewayKind.PROVIDED)
+            .orElse(true));
+    }
+
     /**
      * The gateway of the company's settings and the settings' identity, read in one short transaction; empty while
-     * the gateway has not passed its test or cannot be reached at all.
+     * the gateway has not passed its test or cannot be reached at all, and for a gateway whose records Tinfirm does
+     * not read ({@link #recorded}).
      */
     private Optional<Target> target(UUID companyId) {
         return transactions.inCompany(companyId, () -> settings.find(companyId)
             .filter(ModelSettingsStore.SettingsRow::relayEnabled)
-            .flatMap(row -> gateways.of(row).map(gateway -> new Target(row.updatedAt(), gateway))));
+            .flatMap(row -> gateways.of(row)
+                .filter(Gateway::managed)
+                .map(gateway -> new Target(row.updatedAt(), gateway))));
     }
 }

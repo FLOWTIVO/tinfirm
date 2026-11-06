@@ -73,7 +73,7 @@ import tools.jackson.databind.node.ObjectNode;
 
 /**
  * The model relay (the package 2 contract, §6.1, M7): a runner host's model request with a run's one-run token goes to
- * the company's LiteLLM with the paying principal's key, and LiteLLM's answer streams back as it arrives.
+ * the company's model gateway with the paying principal's key, and the gateway's answer streams back as it arrives.
  * <ol>
  * <li>The token: its hash names the company ({@code run_model_token_company}); in the company's context the token must
  * be unrevoked, of the endpoint's format, and its run {@code RUNNING} on the token's host with the token's epoch
@@ -94,8 +94,8 @@ import tools.jackson.databind.node.ObjectNode;
  * grace.</li>
  * <li>The limits: at most 16 requests of a run at a time, and 16 per slot of its host's ceiling; more are 429.</li>
  * <li>The body: at most 64 MiB (413), whole within {@code relay-body-timeout} (30 s; else 408), one JSON object
- * without LiteLLM's fields, {@code mcp_servers} and {@code container}, with {@code drop_params} on, and without a tool
- * the provider would run that the company's {@code providerTools} does not allow (400 naming its type;
+ * without LiteLLM's fields, {@code mcp_servers} and {@code container}, with {@code drop_params} on for a LiteLLM, and
+ * without a tool the provider would run that the company's {@code providerTools} does not allow (400 naming its type;
  * {@link RelayBody}), and a model the key allows (403): its models, or the company's default ones, every model when
  * the list is empty. The bodies this replica holds, each counted twice while it is read and written anew, then once
  * until its answer ends, stay within {@code relay-max-inflight-bytes} (256 MiB; {@link InflightBytes}), counted as
@@ -107,14 +107,16 @@ import tools.jackson.databind.node.ObjectNode;
  * <li>Forwarding, outside any transaction: the endpoint's path at the gateway, no query, only the request headers
  * {@code Accept}, {@code anthropic-version}, {@code anthropic-beta} and {@code OpenAI-Beta} (only the values of
  * {@code relay-anthropic-betas} and {@code relay-openai-betas}, the others dropped) and {@code User-Agent}
- * (LiteLLM treats Claude Code and Codex apart by it), the key as the bearer, and the run, its
- * conversation and agent as LiteLLM tags ({@code x-litellm-tags}). The answer streams back part by part, each flushed,
- * with only its {@code Content-Type}, {@code Retry-After}, request ids and rate limit headers (never LiteLLM's own
- * {@code x-litellm-*}); no total timeout, an idle one of 10 minutes between two parts and until the headers.</li>
- * <li>LiteLLM's refusals: a spent budget (429 {@code budget_exceeded}) makes the key {@code BUDGET_SPENT}
- * ({@code model_key.budget_spent}), a refused key (401, 403, but a model the key may not use) {@code ERROR}
- * ({@code model_key.refused}) unless a rotation replaced it since the request took it; both are synced again. Their
- * text is passed on without what it echoes of the key.</li>
+ * (LiteLLM treats Claude Code and Codex apart by it), the key as the bearer, and the run, its conversation and agent as
+ * the gateway's tags (its adapter's headers: LiteLLM's {@code x-litellm-tags}, else {@code x-tinfirm-tags}). The
+ * answer streams back part by part, each flushed, with only its {@code Content-Type}, {@code Retry-After}, request ids
+ * and rate limit headers (never LiteLLM's own {@code x-litellm-*}); no total timeout, an idle one of 10 minutes between
+ * two parts and until the headers.</li>
+ * <li>The gateway's refusals, as its vendor's {@link GatewayAdapter} reads them: a spent budget makes the key
+ * {@code BUDGET_SPENT} ({@code model_key.budget_spent}) and is answered with the relay's own refusal, whatever the
+ * gateway said ({@link #BUDGET_SPENT}); a refused key {@code ERROR} ({@code model_key.refused}) unless a rotation
+ * replaced it since the request took it; both are synced again. Every other refusal's text is passed on without the
+ * key that paid, whatever its form, and without what it echoes of a key.</li>
  * <li>The token's counters: the request as it is admitted ({@code admitted_count}, before it is forwarded; a request
  * the limits refuse is not admitted), and at its end the request and the bytes of both bodies ({@code request_count});
  * the difference is the run's answers under way ({@link ModelRelay#answersUnderWay}), for which its settlement waits
@@ -131,8 +133,15 @@ class ModelRelayService {
     /** The longest error answer of LiteLLM that is read, checked and passed on. */
     private static final int MAX_ERROR_BYTES = 64 * 1024;
 
-    /** LiteLLM's words, in either format, for a model it does not serve (a 400), in lower case. */
-    private static final String NOT_SERVED = "invalid model name passed in model=";
+    /**
+     * The relay's answer to a request whose payer's budget is spent (ADR-0094), in the request's format with this
+     * error type, as 429, whatever the gateway answered: the runner host recognises its words as a usage limit
+     * ({@code limits.rs}), as it recognised LiteLLM's before, so a run fails {@code USAGE_LIMIT} behind any gateway.
+     */
+    static final String BUDGET_SPENT = "Budget has been exceeded: the model budget that pays for this run is spent";
+
+    /** The error type of {@link #BUDGET_SPENT}, LiteLLM's, which runner hosts recognise too. */
+    static final String BUDGET_SPENT_TYPE = "budget_exceeded";
 
     /** The longest model name the relay notes as not served ({@code run_model_token.model_not_served}). */
     private static final int MAX_MODEL_NAME = 200;
@@ -170,6 +179,8 @@ class ModelRelayService {
 
     private final Gateways gateways;
 
+    private final GatewayAdapter adapter;
+
     private final GatewayHttp http;
 
     private final RunnerDirectory runners;
@@ -206,7 +217,8 @@ class ModelRelayService {
     private final CompanySwitches companySwitches;
 
     ModelRelayService(SystemTransactions transactions, RelayTokenStore tokens, ObjectProvider<RunModelTokens> runTokens,
-            ModelSettingsStore settingsStore, ModelKeyStore keys, Gateways gateways, GatewayHttp http,
+            ModelSettingsStore settingsStore, ModelKeyStore keys, Gateways gateways, GatewayAdapter adapter,
+            GatewayHttp http,
             RunnerDirectory runners, RunnerAuthentication hostAuthentication, Principals principals, VaultService vault,
             KeyWork work, AuditLog auditLog, ApplicationEventPublisher events, ModelProperties properties,
             TimeSource time, CompanySwitches companySwitches) {
@@ -217,6 +229,7 @@ class ModelRelayService {
         this.settingsStore = settingsStore;
         this.keys = keys;
         this.gateways = gateways;
+        this.adapter = adapter;
         this.http = http;
         this.runners = runners;
         this.hostAuthentication = hostAuthentication;
@@ -627,7 +640,8 @@ class ModelRelayService {
         byte[] raw = read(request.getInputStream(), max, share, properties.relayBodyTimeout());
         RelayBody.Result result;
         try {
-            result = RelayBody.transform(bodies, raw, plan.providerTools());
+            result = RelayBody.transform(bodies, raw, plan.providerTools(),
+                    plan.gateway().vendor() == GatewayVendor.LITELLM);
         }
         catch (RelayBody.Refused ex) {
             throw new Refusal(400, ex.getMessage());
@@ -701,8 +715,8 @@ class ModelRelayService {
         HttpRequest.Builder upstream = HttpRequest.newBuilder(URI.create(plan.gateway().modelUrl() + endpoint.path))
             .timeout(properties.relayIdleTimeout())
             .header("Authorization", "Bearer " + plan.key())
-            .header("Accept-Encoding", "identity")
-            .header("x-litellm-tags", tags(plan.token()));
+            .header("Accept-Encoding", "identity");
+        adapter.tagHeaders(plan.gateway(), tags(plan.token())).forEach(upstream::header);
         for (String name : REQUEST_HEADERS) {
             String value = switch (name) {
                 case "anthropic-beta" -> betas(request, name, properties.relayAnthropicBetas());
@@ -736,7 +750,7 @@ class ModelRelayService {
         return LiteLlmRequests.allowedBetas(Collections.list(values), allowed);
     }
 
-    /** The run's LiteLLM tags: its id, conversation and agent (§6.1; exact spend per run). */
+    /** The run's tags: its id, conversation and agent (§6.1; exact spend per run), in the adapter's headers. */
     static String tags(RelayTokenStore.TokenRow token) {
         List<String> tags = new ArrayList<>();
         tags.add("run:" + token.runId());
@@ -808,27 +822,31 @@ class ModelRelayService {
     }
 
     /**
-     * Passes on LiteLLM's refusal without what it echoes of the key, after noting a spent budget, a refused key or a
-     * model it does not serve; the bytes passed on.
+     * Passes on the gateway's refusal without the key that paid and what else it echoes of a key, after noting a spent
+     * budget, a refused key or a model it does not serve; the bytes passed on.
      */
     private long refused(Endpoint endpoint, Plan plan, byte @Nullable [] body, HttpResponse<?> answer, Pump pump,
             HttpServletResponse response) throws IOException, InterruptedException {
         byte[] raw = pump.collect(MAX_ERROR_BYTES, properties.relayIdleTimeout());
-        String text = LiteLlm.redact(new String(raw, StandardCharsets.UTF_8));
+        String text = adapter.redact(plan.gateway(),
+                GatewayAnswers.withoutKey(new String(raw, StandardCharsets.UTF_8), plan.key()));
         int status = answer.statusCode();
-        String type = errorType(text);
         RelayTokenStore.TokenRow token = plan.token();
-        if (status == 429 && "budget_exceeded".equals(type)) {
-            budgetSpent(token.companyId(), token.payingPrincipalId());
-        }
-        else if ((status == 401 || status == 403) && !"budget_exceeded".equals(type)
-                && (type == null || !type.endsWith("_model_access_denied"))) {
-            keyRefused(token.companyId(), token.payingPrincipalId(), plan.secretId(), status, reason(text));
-        }
-        else if (status == 400 && text.toLowerCase(Locale.ROOT).contains(NOT_SERVED)) {
-            String model = RelayUsageMeter.requestModel(body);
-            if (model != null) {
-                notServed(token, model);
+        switch (adapter.classify(plan.gateway(), status, text)) {
+            case BUDGET_SPENT -> {
+                Instant resetsAt = budgetSpent(token.companyId(), token.payingPrincipalId());
+                return budgetSpentAnswer(response, endpoint.format, resetsAt);
+            }
+            case KEY_REFUSED -> keyRefused(token.companyId(), token.payingPrincipalId(), plan.secretId(), status,
+                    reason(text));
+            case MODEL_NOT_SERVED -> {
+                String model = RelayUsageMeter.requestModel(body);
+                if (model != null) {
+                    notServed(token, model);
+                }
+            }
+            case OTHER -> {
+                // Passed on as it came.
             }
         }
         response.setStatus(status);
@@ -850,17 +868,6 @@ class ModelRelayService {
         });
     }
 
-    private static @Nullable String errorType(String text) {
-        try {
-            JsonNode error = JSON.readTree(text).path("error");
-            JsonNode type = error.path("type");
-            return type.isString() ? type.stringValue() : null;
-        }
-        catch (JacksonException ex) {
-            return null;
-        }
-    }
-
     private static String reason(String text) {
         try {
             JsonNode message = JSON.readTree(text).path("error").path("message");
@@ -876,10 +883,15 @@ class ModelRelayService {
 
     // ---- what LiteLLM said of the key -------------------------------------------------------------------------
 
-    private void budgetSpent(UUID companyId, UUID principalId) {
+    /** Notes the spent budget on the payer's key; when it resets, as the gateway last said, or null. */
+    private @Nullable Instant budgetSpent(UUID companyId, UUID principalId) {
+        Instant[] resetsAt = {null};
         transactions.runInCompany(companyId, () -> {
             KeyHolder holder = KeyHolder.principal(companyId, principalId);
             Optional<ModelKeyStore.KeyRow> row = keys.lock(holder);
+            if (row.isPresent()) {
+                resetsAt[0] = row.get().budgetResetsAt();
+            }
             if (row.isEmpty() || row.get().status() == ModelKeyStore.KeyStatus.BUDGET_SPENT) {
                 return;
             }
@@ -893,8 +905,9 @@ class ModelRelayService {
             events.publishEvent(new ModelEvents.ModelKeyStatusChanged(companyId, principalId,
                     ModelKeyStore.KeyStatus.BUDGET_SPENT.name()));
         });
-        // Its reset time, as LiteLLM knows it.
+        // Its reset time, as the gateway knows it.
         work.syncAfterCommit(companyId, principalId);
+        return resetsAt[0];
     }
 
     private void keyRefused(UUID companyId, UUID principalId, UUID secretId, int status, String reason) {
@@ -911,7 +924,7 @@ class ModelRelayService {
             if (row.isEmpty() || row.get().status() == ModelKeyStore.KeyStatus.ERROR) {
                 return;
             }
-            keys.recordStatus(holder, ModelKeyStore.KeyStatus.ERROR, "LiteLLM refused the key (" + status + "): "
+            keys.recordStatus(holder, ModelKeyStore.KeyStatus.ERROR, "The gateway refused the key (" + status + "): "
                     + reason, null, time.now());
             auditLog.record(holder
                 .audit(AuditRecord.company(companyId, AuditAction.MODEL_KEY_REFUSED, CurrentActor.actor()))
@@ -960,22 +973,38 @@ class ModelRelayService {
     /** An error in the format's own shape, so that the runtime shows it as the provider's. */
     static void error(HttpServletResponse response, RelayTokenStore.RelayFormat format, int status, String message)
             throws IOException {
+        error(response, format, status,
+                format == RelayTokenStore.RelayFormat.ANTHROPIC ? anthropicType(status) : openAiType(status), message);
+    }
+
+    /** The bytes written. */
+    private static int error(HttpServletResponse response, RelayTokenStore.RelayFormat format, int status, String type,
+            String message) throws IOException {
         ObjectNode body = JSON.createObjectNode();
         if (format == RelayTokenStore.RelayFormat.ANTHROPIC) {
             body.put("type", "error");
-            body.putObject("error").put("type", anthropicType(status)).put("message", message);
+            body.putObject("error").put("type", type).put("message", message);
         }
         else {
             body.putObject("error")
                 .put("message", message)
-                .put("type", openAiType(status))
+                .put("type", type)
                 .putNull("param")
                 .put("code", String.valueOf(status));
         }
+        byte[] bytes = JSON.writeValueAsBytes(body);
         response.setStatus(status);
         response.setContentType("application/json");
-        response.getOutputStream().write(JSON.writeValueAsBytes(body));
+        response.getOutputStream().write(bytes);
         response.flushBuffer();
+        return bytes.length;
+    }
+
+    /** The relay's own answer to a spent budget ({@link #BUDGET_SPENT}), with its reset time when known. */
+    private static long budgetSpentAnswer(HttpServletResponse response, RelayTokenStore.RelayFormat format,
+            @Nullable Instant resetsAt) throws IOException {
+        String message = resetsAt != null ? BUDGET_SPENT + "; it resets at " + resetsAt + "." : BUDGET_SPENT + ".";
+        return error(response, format, 429, BUDGET_SPENT_TYPE, message);
     }
 
     private static String anthropicType(int status) {

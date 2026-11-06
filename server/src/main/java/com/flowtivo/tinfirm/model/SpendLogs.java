@@ -33,6 +33,12 @@ public interface SpendLogs {
     Map<String, Price> prices(UUID companyId);
 
     /**
+     * Whether the company's gateway keeps spend logs Tinfirm reads: false for one whose keys its team provides
+     * (ADR-0094), whose runs are settled from the relay's own count at once.
+     */
+    boolean recorded(UUID companyId);
+
+    /**
      * One request LiteLLM logged.
      *
      * @param model             the model as the request named it (LiteLLM's model group), else as LiteLLM logged it

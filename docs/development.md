@@ -173,7 +173,7 @@ Notes:
 | `TINFIRM_SESSION_MAX_AGE` | default `P7D` | Absolute session lifetime, checked on every request |
 | `SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES` | unset | Trusted proxies for `X-Forwarded-For`. Unset means Tomcat's default (private ranges). Never set it to an empty string: Spring Boot then trusts every peer. |
 | `SPRING_SECURITY_OAUTH2_CLIENT_…` | see section 2.3 | One registration per IdP |
-| `TINFIRM_LITELLM_ADMIN_URL`, `TINFIRM_LITELLM_MASTER_KEY`, `TINFIRM_LITELLM_MODEL_URL` | unset | The bundled LiteLLM. Unset, the server bundles no gateway, and a company configures its own on Model access. To use the Compose LiteLLM from your IDE, start it (`make up`, then stop the Compose `server`) and set `http://localhost:4000`, `<LITELLM_MASTER_KEY>` and `http://localhost:4001` |
+| `TINFIRM_MODEL_GATEWAY_ADMIN_URL`, `TINFIRM_MODEL_GATEWAY_ADMIN_KEY`, `TINFIRM_MODEL_GATEWAY_MODEL_URL` | unset | The bundled LiteLLM. Unset, the server bundles no gateway, and a company configures its own on Model access. To use the Compose LiteLLM from your IDE, start it (`make up`, then stop the Compose `server`) and set `http://localhost:4000`, `<LITELLM_MASTER_KEY>` and `http://localhost:4001` |
 | `TINFIRM_ROLES` | default `api,worker` | `worker` runs the background work: the dispatcher and the reaper, polls, schedules, the outbox, retention and the other sweeps. Run both roles in one process locally. |
 
 To make a new development vault key:

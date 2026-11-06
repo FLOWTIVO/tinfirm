@@ -193,6 +193,7 @@ export const WAITING_TEXTS: Record<QueueReasonCode, string> = {
   ACCOUNT_REQUIRED: 'An account of its workspace waits to be connected.',
   BUDGET_SPENT: 'Your budget is spent.',
   KEY_ERROR: 'The gateway could not hand out a key for your budget.',
+  NO_MODEL_KEY: 'Whoever pays has no key at the company’s model gateway yet.',
   HOST_OFFLINE: 'The runner host of its subscription is offline.',
   MODEL_ACCESS_UNAVAILABLE: 'Nobody can pay for it as your settings stand.',
   NO_HOST_FOR_CREDENTIALS: 'No runner host may carry its credentials.',

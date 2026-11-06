@@ -94,6 +94,12 @@ class ModelAccessImpl implements ModelAccess {
                             + "settings");
         }
         Optional<ModelKeyStore.KeyRow> row = keys.find(KeyHolder.principal(companyId, payer.id()));
+        if (settings.get().gateway() == ModelSettingsStore.GatewayKind.PROVIDED
+                && (row.isEmpty() || !row.get().hasKey())) {
+            // The company's gateway team provides the keys (ADR-0094): nothing to make, a key to enter.
+            return new RunModelAccess.Wait(RunModelAccess.WaitReason.NO_MODEL_KEY, null,
+                    "The principal has no key at the company's model gateway yet");
+        }
         if (row.isEmpty() || !row.get().hasKey()) {
             work.syncAfterCommit(companyId, payer.id());
             String reason = row.map(ModelKeyStore.KeyRow::lastError).orElse(null);
@@ -122,7 +128,7 @@ class ModelAccessImpl implements ModelAccess {
                         "The principal's model key is being unblocked");
             }
             case ERROR -> new RunModelAccess.Wait(RunModelAccess.WaitReason.KEY_ERROR, null,
-                    key.lastError() != null ? key.lastError() : "LiteLLM refused the principal's model key");
+                    key.lastError() != null ? key.lastError() : "The gateway refused the principal's model key");
         };
     }
 

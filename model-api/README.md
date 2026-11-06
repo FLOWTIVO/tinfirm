@@ -6,7 +6,7 @@ The bundled LiteLLM's model API and nothing else, for the company's services: [A
 - **Bodies without LiteLLM's fields**: the shared filter of the server's model relay (`../libs/litellm`, `LiteLlmRequests`). `drop_params` passes as it came. `mcp_servers` and `container` are removed, and a request that names a tool the model's provider would run itself (web search or fetch, code execution, MCP) is `400`, naming its type, unless `MODEL_API_PROVIDER_TOOLS` allows it ([litellm.md](../docs/operations/litellm.md#2-how-it-is-secured)). The bodies held at once stay within `MODEL_API_MAX_INFLIGHT_BYTES` (`../libs/net`, `InflightBytes`, as the relay's).
 - **The caller's key and the formats' headers**: `Authorization`, `x-api-key`, `api-key`, `anthropic-version`, `anthropic-beta`, `openai-beta`, `Accept`, `User-Agent` and `x-litellm-tags`. LiteLLM checks the key: each service has a LiteLLM key of its own, with its budget and models.
 
-The answer streams back part by part; of its headers, the type, the request ids and the rate limits. Tinfirm's server sends its model requests here too (`TINFIRM_LITELLM_MODEL_URL`); its admin API calls go to LiteLLM's own port, which only the server reaches.
+The answer streams back part by part; of its headers, the type, the request ids and the rate limits. Tinfirm's server sends its model requests here too (`TINFIRM_MODEL_GATEWAY_MODEL_URL`); its admin API calls go to LiteLLM's own port, which only the server reaches.
 
 Java 25 and Spring Boot 4.1, as the server.
 

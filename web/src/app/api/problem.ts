@@ -52,6 +52,9 @@ export type ProblemCode =
   // Model access and runner hosts (package 2, §15.4)
   | 'GATEWAY_NOT_CONFIGURED'
   | 'GATEWAY_UNREACHABLE'
+  // Keys a company's gateway team provides (ADR-0094)
+  | 'MODEL_KEYS_MANAGED'
+  | 'MODEL_KEY_REFUSED'
   | 'CANNOT_RUN_ANYWHERE'
   | 'SUBSCRIPTION_GONE'
   | 'PERSONAL_HOST_CREDENTIAL_ONLY'
@@ -227,6 +230,8 @@ const CODE_MESSAGES: Record<ProblemCode, string> = {
   GATEWAY_NOT_CONFIGURED:
     'The company’s model gateway is not set up yet. An admin sets it up under Model access.',
   GATEWAY_UNREACHABLE: 'Tinfirm could not reach the model gateway.',
+  MODEL_KEYS_MANAGED: 'This key cannot be entered or changed here.',
+  MODEL_KEY_REFUSED: 'The gateway refused this key.',
   CANNOT_RUN_ANYWHERE: 'No runner host may run this as it is set up.',
   SUBSCRIPTION_GONE: 'This subscription is no longer on its runner host.',
   PERSONAL_HOST_CREDENTIAL_ONLY:
@@ -408,6 +413,7 @@ const CODES_WITH_DETAIL: ReadonlySet<string> = new Set<ProblemCode>([
   'INVALID_BASE_URL',
   'ACCOUNT_REFUSED',
   'GATEWAY_UNREACHABLE',
+  'MODEL_KEYS_MANAGED',
   'ATTACHMENT_TOO_LARGE',
   'TOO_MANY_ATTACHMENTS',
   'MODEL_ACCESS_UNAVAILABLE',
