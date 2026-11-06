@@ -26,6 +26,14 @@
 //! A gateway's key stays on the host ([`crate::model_proxy`], always on): the runtime gets the
 //! run's model proxy as its base URL and [`DUMMY_KEY`] as its key, in the same variables
 //! ([`Access::through_model_proxy`]), so a sandbox never gets a gateway's own URL or key.
+//!
+//! Through a gateway no runtime asks the model's provider to run a tool itself (ADR-0108): the
+//! model relay and the model port refuse such a request with 400, so a runtime's own switch for
+//! a provider-run tool is off there. Codex's web search is off in `CODEX_CONFIG`
+//! ([`codex_config`]); Claude Code's WebSearch, which is Anthropic's server-side `web_search`
+//! tool, is a disallowed tool of the session ([`session_meta`]). OpenCode 2.0.29 and pi 1.0.4
+//! send no provider-run tool by default (OpenCode's own web search calls its search providers
+//! from the sandbox, through the egress proxy), so they need no switch.
 
 use crate::egress_proxy::Rule;
 use crate::model_proxy::DUMMY_KEY;
@@ -283,6 +291,42 @@ pub fn opencode_config(p: &ProviderKey<'_>, model: Option<&str>) -> Value {
     config
 }
 
+/// Claude Code's tools that a session through a gateway does not offer the model: WebSearch is
+/// Anthropic's server-side `web_search` tool, which the model relay and the model port always
+/// refuse (ADR-0108). WebFetch stays: Claude Code fetches in the sandbox, through its egress
+/// proxy.
+pub const CLAUDE_CODE_GATEWAY_DISALLOWED_TOOLS: &[&str] = &["WebSearch"];
+
+/// The `_meta` of `session/new` and `session/load` for a run of `runtime` with `access`, or
+/// `None`. Claude Code through a gateway gets
+/// `{"claudeCode": {"options": {"disallowedTools": ["WebSearch"]}}}`: `claude-agent-acp` (0.87.0,
+/// the version the CLAUDE image pins) passes `_meta.claudeCode.options` to the Agent SDK, whose
+/// `disallowedTools` removes the tool from the model's context, the documented way to turn a
+/// built-in tool off. The session's settings files cannot add it back: a disallowed tool stays
+/// denied. A key of Anthropic's own, a login and Bedrock keep Claude Code as it is: no relay is
+/// in front of them.
+pub fn session_meta(
+    runtime: Runtime,
+    access: Access<'_>,
+) -> Option<serde_json::Map<String, Value>> {
+    match (runtime, access) {
+        (
+            Runtime::ClaudeCode,
+            Access::Provider(ProviderKey {
+                format: ModelFormat::Anthropic,
+                base_url: Some(_),
+                ..
+            }),
+        ) => match json!({
+            "claudeCode": {"options": {"disallowedTools": CLAUDE_CODE_GATEWAY_DISALLOWED_TOOLS}}
+        }) {
+            Value::Object(meta) => Some(meta),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The name of the provider that Codex gets for an `openai` gateway.
 pub const CODEX_GATEWAY_PROVIDER: &str = "tinfirm";
 
@@ -300,9 +344,8 @@ pub const CODEX_GATEWAY_PROVIDER: &str = "tinfirm";
 /// Through a gateway, Codex's own web search is off (`web_search = "disabled"`, the top-level
 /// key of Codex's config.toml, in Codex 0.156.1, the version the CODEX image
 /// pins; its default, `cached`, adds the provider-run `web_search` tool to every request):
-/// the model relay refuses with 400 a request whose tools ask the provider to run a tool
-/// itself unless the company allows web search, so with it on every turn through the relay
-/// would fail.
+/// the model relay and the model port always refuse with 400 a request that asks the provider
+/// to run a tool itself (ADR-0108), so with it on every turn through a gateway would fail.
 fn codex_config(access: Access<'_>, model: Option<&str>, effort: Option<Effort>) -> Option<String> {
     let mut config = serde_json::Map::new();
     if let Some(model) = model {
@@ -552,6 +595,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn claude_code_has_no_web_search_through_a_gateway() {
+        let meta = |runtime, p| session_meta(runtime, Access::Provider(p)).map(Value::Object);
+        // Through a gateway, and through the run's model proxy in front of it: WebSearch is a
+        // disallowed tool of the session, the relay refusing Anthropic's server-side web search.
+        let disallowed = json!({"claudeCode": {"options": {"disallowedTools": ["WebSearch"]}}});
+        assert_eq!(
+            meta(
+                Runtime::ClaudeCode,
+                gateway(ModelFormat::Anthropic, "https://litellm.example.test")
+            ),
+            Some(disallowed.clone())
+        );
+        let proxied = Access::Provider(gateway(
+            ModelFormat::Anthropic,
+            "https://litellm.example.test",
+        ))
+        .through_model_proxy("http://10.0.0.1:41000");
+        assert_eq!(
+            session_meta(Runtime::ClaudeCode, proxied).map(Value::Object),
+            Some(disallowed)
+        );
+        // WebFetch runs in the sandbox, through its egress proxy: it stays.
+        assert!(!CLAUDE_CODE_GATEWAY_DISALLOWED_TOOLS.contains(&"WebFetch"));
+        // A key of Anthropic's own, Bedrock and a login: no relay in front, Claude Code as it is.
+        assert_eq!(meta(Runtime::ClaudeCode, key(ModelFormat::Anthropic)), None);
+        assert_eq!(
+            meta(
+                Runtime::ClaudeCode,
+                ProviderKey {
+                    region: Some("eu-central-1"),
+                    ..key(ModelFormat::Bedrock)
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            session_meta(
+                Runtime::ClaudeCode,
+                Access::Subscription {
+                    kind: CredentialKind::ClaudeLogin,
+                    secret: ""
+                }
+            ),
+            None
+        );
+        // The other runtimes take no session `_meta`: Codex's switch is in CODEX_CONFIG, and
+        // OpenCode and pi send no provider-run tool.
+        for runtime in [Runtime::Codex, Runtime::Opencode, Runtime::Pi] {
+            for format in [ModelFormat::Anthropic, ModelFormat::Openai] {
+                assert_eq!(
+                    meta(runtime, gateway(format, "https://litellm.example.test")),
+                    None,
+                    "{runtime:?} {format}"
+                );
+            }
+        }
+    }
+
     /// `CODEX_CONFIG`'s gateway provider with `base_url`, next to the other `fields`.
     fn codex_gateway(base_url: &str, fields: Value) -> Value {
         let mut config = json!({
@@ -610,8 +712,8 @@ mod tests {
             )
         );
         assert!(!get(&via_gateway, "CODEX_CONFIG").unwrap().contains(KEY));
-        // The relay refuses provider-run tools, so Codex's web search is off through a
-        // gateway, and left as Codex has it with a provider's own key.
+        // The relay always refuses provider-run tools (ADR-0108), so Codex's web search is off
+        // through a gateway, and left as Codex has it with a provider's own key.
         assert_eq!(codex_config_of(&via_gateway)["web_search"], "disabled");
         assert!(
             codex_config_of(&env(key(ModelFormat::Openai), Some("gpt-5.5")))
