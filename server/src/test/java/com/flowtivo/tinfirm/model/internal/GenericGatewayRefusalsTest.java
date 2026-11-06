@@ -61,6 +61,9 @@ class GenericGatewayRefusalsTest {
         String key = "TEST-ONLY/provided+key\"7f3a";
         String echoed = "{\"error\":{\"message\":\"invalid key " + key.replace("\"", "\\\"") + "\"}}";
         assertThat(GatewayAnswers.withoutKey(echoed, key)).isEqualTo("{\"error\":{\"message\":\"invalid key ***\"}}");
+        // Escaped as another JSON writer may escape it.
+        String escaped = echoed.replace("/", "\\/").replace("+", "\\u002b");
+        assertThat(GatewayAnswers.withoutKey(escaped, key)).isEqualTo("{\"error\":{\"message\":\"invalid key ***\"}}");
         assertThat(GatewayAnswers.withoutKey("invalid key " + key + ".", key)).isEqualTo("invalid key ***.");
         assertThat(generic.redact(gateway, GatewayAnswers.withoutKey("key " + key + " and sk-other", key)))
             .isEqualTo("key *** and sk-***");
