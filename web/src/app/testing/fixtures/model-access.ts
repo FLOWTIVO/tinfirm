@@ -23,6 +23,9 @@ export function aModelAccess(overrides: Partial<ModelAccessView> = {}): ModelAcc
     modelsOverridden: false,
     subscriptions: [],
     syncedAt: AT.start,
+    keyProvided: false,
+    keyProvidedBySelf: false,
+    canEnterOwnKey: false,
     ...overrides,
   };
 }
@@ -43,6 +46,8 @@ export function aSubscription(overrides: Partial<ModelSubscription> = {}): Model
 export function aModelSettings(overrides: Partial<ModelSettings> = {}): ModelSettings {
   return {
     gateway: 'BUNDLED',
+    vendor: 'LITELLM',
+    memberKeys: false,
     bundledAvailable: true,
     configured: true,
     adminKeySet: true,

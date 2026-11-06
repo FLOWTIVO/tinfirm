@@ -132,6 +132,7 @@ export function readinessSystemLine(
 const PAYER_WAITING: Record<string, string> = {
   BUDGET_SPENT: 'Your budget is spent',
   KEY_ERROR: 'Your budget cannot be used right now',
+  NO_MODEL_KEY: 'You have no key at the company’s model gateway yet',
   HOST_OFFLINE: 'Your subscription’s runner host is offline',
 };
 

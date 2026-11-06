@@ -1,6 +1,6 @@
 # Model access and budgets
 
-This page is for a company's Owners and Admins. Every turn of an agent calls a model through the company's model gateway, LiteLLM, and someone pays for it. On **Model access**, in the sidebar's **Company** section, you choose the gateway, set the budgets that pay for turns, and see what they spent. The page has four sections: **Gateway**, **Default budget**, **Members' budgets** and **Spend**.
+This page is for a company's Owners and Admins. Every turn of an agent calls a model through the company's model gateway, and someone pays for it. On **Model access**, in the sidebar's **Company** section, you choose the gateway, set the budgets that pay for turns, and see what they spent. The page has four sections: **Gateway**, **Default budget**, **Members' budgets** and **Spend**.
 
 The operator installs the gateway, adds its providers and models, and connects the company's other services to it: [Run the model gateway](../operator-guide/model-gateway.md).
 
@@ -12,25 +12,40 @@ The operator installs the gateway, adds its providers and models, and connects t
 | A trigger's conversation | The trigger's payer, which its editor names: its author or a service account, from their budget. The author's subscription only where the company allows it, under **Settings**, **General**, **Triggers**, **Its author's subscription**. |
 | Tinfirm's own requests, such as tidying agents' memories | The [company key](#the-company-key) |
 
-Each member and each service account has one key in LiteLLM, with a **budget**: an amount in USD per period, and the models it may call. Tinfirm makes the keys, keeps them in its vault, and never switches a conversation's payer. A subscription is not metered: it shows on **Spend** with its tokens and no cost. Members see their own budget under **Accounts**, **Budget**: [Your budget and spend](../user-guide/spend.md).
+Each member and each service account has one key at the gateway, with a **budget**: an amount in USD per period, and the models it may call. Tinfirm makes the keys, or, at a [gateway whose team makes the keys](#a-gateway-whose-team-makes-the-keys), you enter them; Tinfirm keeps them in its vault, and never switches a conversation's payer. A subscription is not metered: it shows on **Spend** with its tokens and no cost. Members see their own budget under **Accounts**, **Budget**: [Your budget and spend](../user-guide/spend.md).
 
 ## Set up the gateway
 
 A new company can pay for nothing until its gateway passes a test. Until then, the **Gateway** section says **Model access is not set up**, and every new conversation on a budget is refused: members see **An admin must set up model access first**.
 
-1. Open **Model access**. **Gateway** shows where the gateway stands, with three steps: **Choose which LiteLLM**, **Set it up**, **Test it**.
-2. Under **Which LiteLLM**, choose the **Gateway**:
+1. Open **Model access**. **Gateway** shows where the gateway stands, with three steps: **Choose the model gateway**, **Set it up**, **Test it**.
+2. Under **Which model gateway**, choose the **Gateway**:
     - **Bundled**: the LiteLLM that comes with this Tinfirm deployment. Nothing to enter. When the deployment bundles none, the page says **This deployment bundles none.** and you cannot choose it.
     - **Your own LiteLLM**: a LiteLLM your company already runs. Enter its **Admin URL**, where Tinfirm reaches LiteLLM's admin API, and a **Master or admin key**. The key is **Write-only**: it is kept in the company's vault and never shown again, and a new URL needs the key again.
 3. Check the **Default budget** ([below](#default-budget)): setting up saves it with the gateway.
 4. Choose **Set up model access** in the bar at the bottom.
-5. Choose **Test**. The test reaches LiteLLM's admin API, makes sure the company exists there, and lists the models the gateway serves. When it passes, the page says **LiteLLM answered and serves** so many models, **Turns paid by a budget may start**, and every member and service account gets a key. When it fails, it gives LiteLLM's reason; fix it with the operator, then choose **Test again**.
+5. Choose **Test**. The test reaches LiteLLM's admin API, makes sure the company exists there, and lists the models the gateway serves. When it passes, the page says **The gateway answered and serves** so many models, **Turns paid by a budget may start**, and every member and service account gets a key. When it fails, it gives LiteLLM's reason; fix it with the operator, then choose **Test again**.
 
 Once the gateway is **Ready**, the card lists under **Serves** the models people can pick. The **Relay** row shows the address through which runner hosts reach the models; they never see a key.
 
 A change of the gateway, its URL or its key needs a new test, and the card says **Test the gateway again**: until it passes, nothing is paid by a budget. A change of the gateway or its URL also deletes every key of the company at the former gateway; the new gateway's test makes them again, with the same budgets and models.
 
 The operator decides which addresses your own LiteLLM may have: by default an `https` address on the internet, not inside your network. Ask them when the test refuses the address.
+
+## A gateway whose team makes the keys
+
+Some companies run their own model gateway and do not give Tinfirm its admin API. Its team makes a key for each member and service account, with the budget and models it allows, and the gateway enforces them. Tinfirm makes, rotates and deletes no key there: you enter the keys the team made.
+
+1. Under **Which model gateway**, choose **Keys from your gateway** as the **Gateway**.
+2. Enter the **Model URL**, where the relay sends the model requests, each with the key of whoever pays.
+3. Under **Gateway product**, choose **LiteLLM** or **Another gateway**. Tinfirm reads a spent budget in the gateway's own words: LiteLLM's, or another gateway's `402`, or a `429` that speaks of a budget, a quota, a spend limit, credit or billing and not of a rate limit.
+4. Turn on **Members' own keys** when members may enter the key the gateway team gave them themselves, under **Accounts**, **Budget**. Admins always may. A member replaces or removes only a key they entered; one an admin entered is the admin's to change.
+5. Choose **Set up model access**, then **Test**. The test asks the gateway for its model list with a key no gateway issues: a refusal of that key shows the gateway answers. When it passes, the page says **The gateway answered. Turns may start for whoever has a key entered.**, and **Serves** says that each key serves the models its gateway team allows.
+6. Enter each key: **Change budget** on a row of **Members' budgets** opens **Key of** the name. Paste the key and choose **Save key**. Tinfirm asks the gateway whether it knows the key before it keeps it: **The gateway refused this key** means it does not. A key is one payer's: a key already entered for another member, service account or the company is refused. The key is kept in the company's vault and never shown again, only its last four characters. The [company key](#the-company-key) is entered the same way, on its row.
+
+Until a payer has a key, their turns wait with **You have no key at the company's model gateway yet**, and go on once one is entered. Budgets and models are set at the gateway, not here, and the gateway team rotates the keys. When a member or service account is suspended or leaves, Tinfirm stops using their key and records **model_key.revoke_requested** in the audit log: ask the gateway team to revoke it there. Spend is what the relay counted from each turn's answers.
+
+A change of the model URL, or a change to another kind of gateway, forgets every key entered and records **model_key.revoke_requested** for each; a change of the product or of **Members' own keys** keeps them.
 
 ## Default budget
 

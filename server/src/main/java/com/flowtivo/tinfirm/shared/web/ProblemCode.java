@@ -77,6 +77,14 @@ public enum ProblemCode {
     /** 502: the model settings' test did not reach LiteLLM's admin API, or LiteLLM refused the admin key (§9). */
     GATEWAY_UNREACHABLE,
     /**
+     * 409: a key is entered only at a gateway whose keys its team provides (ADR-0094); Tinfirm makes, rotates and
+     * deletes the keys of the others. Also a member's own key where the company does not let members enter theirs, or
+     * where an admin entered it.
+     */
+    MODEL_KEYS_MANAGED,
+    /** 400: the company's gateway refused the key entered (ADR-0094). */
+    MODEL_KEY_REFUSED,
+    /**
      * 409: the run's model access and accounts fit no runner host: a subscription on a member's personal host with a
      * workspace account that is not that member's (§5.2, §9).
      */

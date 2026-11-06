@@ -51,7 +51,7 @@ class KeyWork implements DisposableBean {
 
     private final KeyRotation rotation;
 
-    private final LiteLlm litellm;
+    private final GatewayAdapter adapter;
 
     private final SystemTransactions transactions;
 
@@ -73,11 +73,11 @@ class KeyWork implements DisposableBean {
 
     private final ReentrantLock[] stripes = new ReentrantLock[STRIPES];
 
-    KeyWork(KeySync sync, KeyRotation rotation, LiteLlm litellm, SystemTransactions transactions,
+    KeyWork(KeySync sync, KeyRotation rotation, GatewayAdapter adapter, SystemTransactions transactions,
             ModelSettingsStore settings, Gateways gateways, TimeSource time) {
         this.sync = sync;
         this.rotation = rotation;
-        this.litellm = litellm;
+        this.adapter = adapter;
         this.transactions = transactions;
         this.settings = settings;
         this.gateways = gateways;
@@ -115,8 +115,9 @@ class KeyWork implements DisposableBean {
      */
     void deleteAfterCommit(UUID companyId, @Nullable String keyId, String alias) {
         runAfterCommit("Deleting a LiteLLM key", () -> {
+            // A gateway whose keys its team provides deletes them itself (ADR-0094).
             Optional<Gateway> gateway = transactions.inCompany(companyId,
-                    () -> settings.find(companyId).flatMap(gateways::of));
+                    () -> settings.find(companyId).flatMap(gateways::of).filter(Gateway::managed));
             if (gateway.isPresent()) {
                 delete(gateway.get(), keyId, alias);
             }
@@ -126,7 +127,7 @@ class KeyWork implements DisposableBean {
     /** Deletes a key at the gateway now; a failure is logged. Never inside a transaction. */
     void delete(Gateway gateway, @Nullable String keyId, String alias) {
         try {
-            boolean deleted = keyId != null ? litellm.delete(gateway, keyId) : litellm.deleteByAlias(gateway, alias);
+            boolean deleted = keyId != null ? adapter.delete(gateway, keyId) : adapter.deleteByAlias(gateway, alias);
             log.debug("LiteLLM key {} {}", alias, deleted ? "deleted" : "was gone already");
         }
         catch (LiteLlmException ex) {

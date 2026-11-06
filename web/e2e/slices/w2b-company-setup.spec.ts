@@ -114,7 +114,7 @@ test.describe('W2b: company setup', { tag: ['@app', '@phone'] }, () => {
     await sections.locator('[data-section="gateway"]').click();
     await page.getByTestId('test-gateway').click();
     await expect(page.getByTestId('test-result')).toContainText(
-      'LiteLLM answered and serves 3 models',
+      'The gateway answered and serves 3 models',
     );
     await expect(page.getByTestId('served')).toContainText('claude-sonnet-4-5');
     await check(page, testInfo, 'model-access');

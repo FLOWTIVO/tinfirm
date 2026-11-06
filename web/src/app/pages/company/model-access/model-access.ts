@@ -34,6 +34,7 @@ import { HlmInput } from '@spartan-ng/helm/input';
 import { HlmNativeSelectImports } from '@spartan-ng/helm/native-select';
 import { HlmSkeleton } from '@spartan-ng/helm/skeleton';
 import { HlmSpinner } from '@spartan-ng/helm/spinner';
+import { HlmSwitchImports } from '@spartan-ng/helm/switch';
 import { Api } from '../../../api/generated/api';
 import {
   getModelSettings,
@@ -84,6 +85,7 @@ import {
   GATEWAY_DESCRIPTIONS,
   GATEWAY_FIELDS,
   GATEWAY_LABELS,
+  VENDOR_LABELS,
   GATEWAY_NAMES,
   gatewayRailDetail,
   gatewayStatus,
@@ -180,6 +182,7 @@ function saveMessage(error: unknown): string {
     HlmNativeSelectImports,
     HlmSkeleton,
     HlmSpinner,
+    HlmSwitchImports,
     CopyButton,
     ErrorState,
     MembersBudgets,
@@ -273,9 +276,12 @@ export class ModelAccess {
   protected readonly servedModels = computed(() =>
     this.served.hasValue() ? (this.served.value()?.models ?? []) : [],
   );
-  protected readonly servedNote = computed(() =>
-    this.served.hasValue() ? (this.served.value()?.unavailable ?? null) : null,
-  );
+  protected readonly servedNote = computed(() => {
+    // A gateway whose team makes the keys lists no models of its own (ADR-0094).
+    if (this.loaded()?.gateway === 'PROVIDED')
+      return 'Each key serves the models its gateway team allows.';
+    return this.served.hasValue() ? (this.served.value()?.unavailable ?? null) : null;
+  });
 
   /** What the company spent this calendar month (UTC), as the monthly alert counts it. */
   protected readonly monthSpend = resource({
@@ -313,11 +319,17 @@ export class ModelAccess {
         value: 'BUNDLED',
         label: GATEWAY_LABELS.BUNDLED,
         disabled: !bundled,
-        title: bundled ? undefined : 'This deployment bundles no LiteLLM.',
+        title: bundled ? undefined : 'This deployment bundles no model gateway.',
       },
       { value: 'EXTERNAL', label: GATEWAY_LABELS.EXTERNAL },
+      { value: 'PROVIDED', label: GATEWAY_LABELS.PROVIDED },
     ];
   });
+
+  protected readonly vendorOptions: SegmentedOption[] = [
+    { value: 'LITELLM', label: VENDOR_LABELS.LITELLM },
+    { value: 'GENERIC', label: VENDOR_LABELS.GENERIC },
+  ];
 
   /** What the form changes, in the page's order. */
   protected readonly changes = computed(() => {
@@ -357,6 +369,7 @@ export class ModelAccess {
     if (!this.submitted()) {
       delete errors.adminUrl;
       delete errors.adminKey;
+      delete errors.modelUrl;
     }
     return errors;
   });
@@ -389,7 +402,13 @@ export class ModelAccess {
   }
 
   protected setGateway(value: string): void {
-    if (value === 'BUNDLED' || value === 'EXTERNAL') this.patch({ gateway: value as ModelGateway });
+    if (value === 'BUNDLED' || value === 'EXTERNAL' || value === 'PROVIDED') {
+      this.patch({ gateway: value as ModelGateway });
+    }
+  }
+
+  protected setVendor(value: string): void {
+    if (value === 'LITELLM' || value === 'GENERIC') this.patch({ vendor: value });
   }
 
   protected setUnit(value: string | null | undefined): void {
@@ -509,7 +528,9 @@ export class ModelAccess {
   protected readonly testNote = computed(() => {
     if (this.gatewayChanged()) return 'Save your changes, then test them.';
     if (!this.loaded()?.configured) return 'Set up the gateway first, then test it.';
-    return 'The test reaches LiteLLM’s admin API and lists its models.';
+    return this.loaded()?.gateway === 'PROVIDED'
+      ? 'The test reaches the gateway’s model URL; each key is checked when it is entered.'
+      : 'The test reaches the gateway’s admin API and lists its models.';
   });
 
   protected async test(): Promise<void> {
@@ -522,8 +543,10 @@ export class ModelAccess {
       this.testResult.set({
         ok: result.ok,
         text: result.ok
-          ? `LiteLLM answered and serves ${result.models.length} ${result.models.length === 1 ? 'model' : 'models'}. Turns paid by a budget may start.`
-          : 'LiteLLM answered, but not as expected.',
+          ? this.loaded()?.gateway === 'PROVIDED'
+            ? 'The gateway answered. Turns may start for whoever has a key entered.'
+            : `The gateway answered and serves ${result.models.length} ${result.models.length === 1 ? 'model' : 'models'}. Turns paid by a budget may start.`
+          : 'The gateway answered, but not as expected.',
       });
     } catch (error) {
       this.testResult.set({ ok: false, text: problemMessage(error, FORBIDDEN) });
@@ -681,6 +704,13 @@ export class ModelAccess {
   }
 
   protected onBudgetSaved(access: ModelAccessView): void {
+    // A key saved or removed keeps the dialog open, on the view the server answered.
+    if (
+      this.budgetOpen() &&
+      (this.budgetView()?.principalId ?? null) === (access.principalId ?? null)
+    ) {
+      this.budgetView.set(access);
+    }
     if (!access.principalId) {
       this.companyKey.set(access);
       return;

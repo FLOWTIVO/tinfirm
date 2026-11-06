@@ -4,6 +4,7 @@
 - Date: 2026-10-16
 - Decided by: the owner, 2026-10-16
 - Sources: [ADR-0059](0059-litellm-budgets-and-the-model-proxy.md); the security review of 2026-10-12, row 21 ([reviews/2026-10-12-platform-redesign.md](../reviews/2026-10-12-platform-redesign.md)); [operations/litellm.md](../operations/litellm.md); the [threat model](../threat-model.md)
+- Amended by: [ADR-0094](0094-more-than-one-model-gateway.md), under which decision 4's `TINFIRM_LITELLM_MODEL_URL` and `TINFIRM_LITELLM_ADMIN_URL` are `TINFIRM_MODEL_GATEWAY_MODEL_URL` and `TINFIRM_MODEL_GATEWAY_ADMIN_URL` (the old names still read), and a bundled Bifrost, once Tinfirm manages one, would sit behind the same model port
 - Amends: [ADR-0059](0059-litellm-budgets-and-the-model-proxy.md) decision 1 (who reaches the bundled LiteLLM); its decision 2 (runner hosts reach only the server's relay) stands
 - Changes: a new top-level directory `model-api/` (Maven project `tinfirm-model-api`, image `ghcr.io/flowtivo/tinfirm-model-api`), run beside LiteLLM in its pod (Helm) or as a service of its own (Compose); a shared library `libs/litellm` with the filter of LiteLLM's request fields, which the server's relay and the model port both use; the server's `TINFIRM_LITELLM_MODEL_URL`
 

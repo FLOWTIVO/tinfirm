@@ -144,7 +144,7 @@ class ModelKeyLockOrderTest extends IntegrationTest {
 
     private static String keyId(UUID companyId, UUID principalId) throws SQLException {
         try (TenantSql sql = TenantSql.in(companyId)) {
-            return (String) sql.column("SELECT litellm_key_id FROM principal_model_key WHERE principal_id = ?",
+            return (String) sql.column("SELECT gateway_key_id FROM principal_model_key WHERE principal_id = ?",
                     principalId).getFirst();
         }
     }

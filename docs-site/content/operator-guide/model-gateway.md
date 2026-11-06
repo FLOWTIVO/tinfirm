@@ -1,6 +1,6 @@
 # Run the model gateway
 
-This page is for the operator. Every model call of an agent goes through the company's model gateway, [LiteLLM](https://docs.litellm.ai), with the key and the budget of whoever pays. Tinfirm ships a LiteLLM with its Compose stack and its Helm chart. Here you add the providers and models to it, secure it, connect the company's own services to it, and keep it running; or you point a company at a LiteLLM it already runs.
+This page is for the operator. Every model call of an agent goes through the company's model gateway, [LiteLLM](https://docs.litellm.ai), with the key and the budget of whoever pays. Tinfirm ships a LiteLLM with its Compose stack and its Helm chart. Here you add the providers and models to it, secure it, connect the company's own services to it, and keep it running; or you point a company at a LiteLLM it already runs, or at a gateway whose team makes the keys.
 
 ## What LiteLLM does for Tinfirm
 
@@ -29,7 +29,7 @@ Tinfirm never adds, changes or deletes a model or a provider key: that is yours.
 | Secrets | `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, `LITELLM_DB_PASSWORD` in `deploy/compose/.env` | The Secret `tinfirm-litellm`: `master-key`, `salt-key`, `database-password` |
 | Settings | `deploy/compose/litellm/config.yaml` | The ConfigMap `<release>-litellm` |
 
-The server gets three variables: `TINFIRM_LITELLM_ADMIN_URL` (LiteLLM's own port, for its admin API), `TINFIRM_LITELLM_MODEL_URL` (the model port, for the requests it relays and its own) and `TINFIRM_LITELLM_MASTER_KEY`. The deployment bundles a gateway only when the admin URL and the master key are both set; otherwise **Model access** says **This deployment bundles none.** and **Bundled** cannot be chosen. Without a model URL, the model requests go to the admin URL.
+The server gets four variables: `TINFIRM_MODEL_GATEWAY_VENDOR` (`LITELLM`), `TINFIRM_MODEL_GATEWAY_ADMIN_URL` (LiteLLM's own port, for its admin API), `TINFIRM_MODEL_GATEWAY_MODEL_URL` (the model port, for the requests it relays and its own) and `TINFIRM_MODEL_GATEWAY_ADMIN_KEY`. The deployment bundles a gateway only when the admin URL and the master key are both set; otherwise **Model access** says **This deployment bundles none.** and **Bundled** cannot be chosen. Without a model URL, the model requests go to the admin URL.
 
 Check that LiteLLM is up:
 
@@ -149,6 +149,17 @@ A company that already runs LiteLLM can use it instead of the bundled one.
 
 The server reaches that one URL for the admin API and the relayed model requests; runner hosts never do. Keep the gateway off the internet, with TLS between it and the server unless they share a private network. Tinfirm cannot enforce settings on a gateway it does not run, so configure it like the bundled one: `store_prompts_in_spend_logs: false`, `disable_error_logs: true` and `turn_off_message_logging: true`; `store_model_in_db: true`; `budget_exceeded_status_code: 429` under `litellm_settings` (otherwise LiteLLM answers a spent budget with `422`, which the relay does not read as a spent budget); a salt key; and the admin UI off, or on an internal address only.
 
+## A gateway whose team makes the keys
+
+A company can keep its gateway's admin API from Tinfirm: it chooses **Keys from your gateway** on **Model access** and enters only the gateway's model URL. The gateway may be LiteLLM, Bifrost, Kong or any gateway that serves OpenAI's and Anthropic's model routes and takes a key per caller as a bearer token (`Authorization: Bearer`). Its team makes a key per member and service account, with its budget and models; an admin, or a member where the company allows it, enters it in Tinfirm, which checks it with `GET /v1/models` and keeps it in the company's vault.
+
+- The model URL is held to the same outbound rules as an external LiteLLM's admin URL, above.
+- The gateway must answer a spent budget in words Tinfirm reads: LiteLLM with `429` and `budget_exceeded` (`budget_exceeded_status_code: 429`); another gateway with `402`, or with a `429` whose message speaks of a budget, a quota, a spend limit, credit or billing and not of a rate limit (a provider's rate limit passes on as it came, so that the runtime waits and retries). The relay then answers the runner `429` with `type` `budget_exceeded`, whatever the gateway said.
+- Tinfirm sends each turn's tags in `x-tinfirm-tags` to a gateway other than LiteLLM, for the gateway's own spend logs. Its spend in Tinfirm is what the relay counted.
+- Tinfirm never rotates or revokes such a key. When a principal is suspended or leaves it stops using the key and records `model_key.revoke_requested`: revoke it at the gateway.
+
+The server's own variables for the bundled gateway are `TINFIRM_MODEL_GATEWAY_VENDOR`, `TINFIRM_MODEL_GATEWAY_ADMIN_URL`, `TINFIRM_MODEL_GATEWAY_ADMIN_KEY` and `TINFIRM_MODEL_GATEWAY_MODEL_URL` ([Server configuration](../reference/configuration.md)); a provided gateway is a company's setting and needs none.
+
 ## The model port and the company's own services
 
 The bundled gateway is the company's, not only Tinfirm's. Its **model port** serves LiteLLM's model routes alone, each by its exact path: chat completions, completions, responses, embeddings, messages and their token count, rerank, and the model list. Every other path is `404` without reaching LiteLLM, LiteLLM's own fields are removed from every body, and it holds no key: each caller sends its own LiteLLM key.
@@ -203,7 +214,7 @@ On suspicion of a leak, an Owner or Admin rotates at once, without a grace, thro
 | `docker compose up` fails: `required variable LITELLM_MASTER_KEY is missing a value` | A `.env` without LiteLLM's settings | Add `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY` and `LITELLM_DB_PASSWORD`. Never generate a new salt key for a `.env` that has one. |
 | With Compose, `litellm` does not start, and `litellm-db` exited with an error | `litellm-db` cannot sign in to PostgreSQL as `postgres`: `POSTGRES_PASSWORD` in `.env` is not the superuser password the database volume was created with | Read `docker compose logs litellm-db`, and set the password the volume was created with |
 | `litellm` restarts with a database error | A wrong password or database settings; with Helm, a missing database, role or Secret; or a failed migration | Compose: `up -d` again. Helm: [Prepare PostgreSQL](database.md). |
-| **Model access** says **This deployment bundles none.** | The server has no `TINFIRM_LITELLM_ADMIN_URL` or `TINFIRM_LITELLM_MASTER_KEY`; with Helm, `litellm.enabled: false`, or the Secret did not exist when the server started | Create the Secret (Compose: the `.env` value), then restart the server |
+| **Model access** says **This deployment bundles none.** | The server has no `TINFIRM_MODEL_GATEWAY_ADMIN_URL` or `TINFIRM_MODEL_GATEWAY_ADMIN_KEY`; with Helm, `litellm.enabled: false`, or the Secret did not exist when the server started | Create the Secret (Compose: the `.env` value), then restart the server |
 | The test fails | LiteLLM is down or not ready, the admin key is wrong, or a company's own gateway's address is refused or unreachable | The reason names it. Check `/health/readiness`, the key, and the outbound rules above |
 | The list of models is empty | No model is added | [Add one](#add-providers-and-models) |
 | A turn fails: **The gateway does not serve the model** | A model the settings name, or one a runtime asks for on its own, is not served | Add the model, or pick one it serves in the settings |

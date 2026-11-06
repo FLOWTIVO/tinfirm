@@ -615,7 +615,7 @@ describe('ConversationPage', () => {
     // The turn's status line says its settled cost, not the runtime's estimate.
     expect(text('[data-testid=turn-cost]')).toBe('$1.24');
     expect(el.querySelector('[data-testid=turn-cost]')?.getAttribute('title')).toContain(
-      'Settled from LiteLLM’s records',
+      'Settled from the gateway’s records',
     );
   });
 
