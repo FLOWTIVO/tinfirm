@@ -32,12 +32,15 @@ import tools.jackson.databind.json.JsonMapper;
  * {@code mock_response}, {@code litellm_*}, {@code user_config}, {@code extra_headers}, {@code extra_body};</li>
  * <li>{@code guardrail_config}, {@code policies} and {@code include_guardrail_response}, which LiteLLM's proxy takes
  * from the body for the request's guardrails;</li>
- * <li>the other parameters LiteLLM v1.106.6 takes as its own from a request ({@code all_litellm_params} in
+ * <li>the other parameters LiteLLM v1.108.0 takes as its own from a request ({@code all_litellm_params} in
  * {@code litellm/types/utils.py}: routing, retries, fallbacks, caching, credentials of Azure, AWS and Vertex, the
- * workload identity federation of Anthropic and OpenAI, the callbacks' keys and hosts, the custom prices), by name
- * and by their prefixes ({@code _}, {@code aws_}, {@code azure_}, {@code vertex_}, {@code langfuse_}, ...) and the
- * prices' shapes ({@code *_cost_per_*}, {@code *_cost}); the test resource {@code litellm/all-litellm-params.txt}
- * lists them all;</li>
+ * workload identity federation of Anthropic and OpenAI, the OAuth token exchange (whose {@code token_exchange_endpoint}
+ * would receive the caller's token), GitHub Copilot's per-user connection, the callbacks' keys and hosts, the custom
+ * prices), by name and by their prefixes ({@code _}, {@code aws_}, {@code azure_}, {@code vertex_},
+ * {@code langfuse_}, {@code token_exchange_}, {@code github_copilot_}, ...) and the prices' shapes
+ * ({@code *_cost_per_*}, {@code *_cost}); the test resource {@code litellm/all-litellm-params.txt} lists them all;</li>
+ * <li>{@code user_provider_credentials} and {@code user_provider_credentials_user_id}, the per-user provider
+ * credentials LiteLLM's proxy keeps for a caller, which v1.108.0's proxy refuses in a body;</li>
  * <li>LiteLLM's other controls of a request: {@code disable_fallbacks}, {@code deployment_id}, {@code api_type},
  * {@code timeout}, {@code secret_key}, {@code access_token}.</li>
  * </ul>
@@ -76,11 +79,11 @@ public final class LiteLlmRequests {
             // The contract's list.
             "api_base", "base_url", "api_key", "api_version", "custom_llm_provider", "organization", "metadata",
             "tags", "user", "mock_response", "user_config", "extra_headers", "extra_body",
-            // all_litellm_params of v1.106.6 that no prefix below covers.
+            // all_litellm_params of v1.108.0 that no prefix below covers.
             "max_agentic_loops", "keepalive_seconds", "allow_client_keepalive_override", "guardrails", "acompletion",
             // A timeout per service tier, for the request and for its stream.
             "timeout_by_service_tier", "stream_timeout_by_service_tier",
-            // Not in all_litellm_params, but v1.106.6's proxy takes them from the body for the request's guardrails
+            // Not in all_litellm_params, but v1.108.0's proxy takes them from the body for the request's guardrails
             // (litellm_pre_call_utils.py): their configuration, the policies that choose them, and whether the answer
             // carries their findings.
             "guardrail_config", "policies", "include_guardrail_response",
@@ -107,6 +110,9 @@ public final class LiteLlmRequests {
             "regional_processing_uplift_multiplier_eu", "regional_processing_uplift_multiplier_us",
             "cost_per_second", "log_client_error_tracebacks", "max_file_size_mb", "provider_affinity_header",
             "silent_model", "stream_chunk_size", "tag_regex",
+            // Not in all_litellm_params: a caller's per-user provider credentials (GitHub Copilot's connection), which
+            // v1.108.0's proxy fills from its own secret_fields and refuses in a body (auth_utils.py).
+            "user_provider_credentials", "user_provider_credentials_user_id",
             // The workload identity federation of Anthropic and OpenAI (v1.106.6), and Fireworks' user forwarding.
             // LiteLLM's proxy refuses them in a body too (auth_utils.py; Fireworks' one unless an admin opts in), but
             // not every name of these providers is LiteLLM's own: Bedrock and Vertex take an anthropic_version, so no
@@ -193,7 +199,10 @@ public final class LiteLlmRequests {
     private static final List<String> REMOVED_PREFIXES = List.of("_", "litellm_", "aws_", "azure_", "vertex_",
             "watsonx_", "s3_", "gcs_", "langfuse_", "langsmith_", "humanloop_", "arize_", "posthog_", "wandb_",
             "weave_", "dd_", "newrelic_", "signoz_", "mock_", "input_cost_", "output_cost_", "auto_router_",
-            "complexity_router_", "adaptive_router_", "quality_router_");
+            "complexity_router_", "adaptive_router_", "quality_router_",
+            // v1.108.0: the OAuth token exchange (RFC 8693, on-behalf-of), whose endpoint, profile, scope and audience
+            // a request could choose, and GitHub Copilot's per-user connection (its mode and the caller's session).
+            "token_exchange_", "github_copilot_");
 
     private LiteLlmRequests() {
     }
