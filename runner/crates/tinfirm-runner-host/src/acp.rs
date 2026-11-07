@@ -21,7 +21,7 @@
 //! - `session/cancel` is sent when the run loop asks for it.
 
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CancelNotification, ContentBlock, Implementation, InitializeRequest, LoadSessionRequest,
     McpServer, McpServerHttp, NewSessionRequest, PromptRequest, SessionConfigId, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions,
@@ -33,9 +33,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use agent_client_protocol::v1::{ConnectionTo, Responder};
 use agent_client_protocol::{
-    Agent, Client, ConnectionTo, Dispatch, HandleDispatchFrom, Handled, Lines, Responder,
-    UntypedMessage,
+    Agent, Client, Dispatch, HandleDispatchFrom, Handled, Lines, UntypedMessage,
 };
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -226,7 +226,8 @@ impl HandleDispatchFrom<Agent> for BudgetObserver {
     async fn handle_dispatch_from(
         &mut self,
         dispatch: Dispatch,
-        _cx: ConnectionTo<Agent>,
+        // The handler chain is version-neutral: it sees the raw dispatch and connection.
+        _cx: agent_client_protocol::ConnectionTo<Agent>,
     ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
         match dispatch {
             Dispatch::Notification(message) if message.method == BUDGET_PROBE_METHOD => {
@@ -521,7 +522,7 @@ pub(crate) async fn run_session(
     };
     let permission_tx = inbound.clone();
     let result = Client
-        .builder()
+        .v1()
         .name("tinfirm-runner-host")
         .with_handler(observer)
         .on_receive_request(
@@ -1145,7 +1146,7 @@ mod tests {
         let transport = Lines::new(Box::pin(outgoing), stream);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let connection = Client
-            .builder()
+            .v1()
             .name("test")
             .with_handler(observer)
             .connect_with(transport, async move |_cx: ConnectionTo<Agent>| {
@@ -1229,7 +1230,7 @@ mod tests {
         let transport = Lines::new(Box::pin(outgoing), stream);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let connection = Client
-            .builder()
+            .v1()
             .name("test")
             .with_handler(observer)
             .connect_with(transport, async move |_cx: ConnectionTo<Agent>| {
@@ -1331,5 +1332,185 @@ mod tests {
         assert!(held.lock().unwrap().is_empty());
         done_tx.send(()).unwrap();
         connection.await.unwrap();
+    }
+
+    /// One turn against a scripted agent, through [`run_session`] and the SDK, line by line:
+    /// what the runtimes rely on from the ACP client. `initialize` asks for protocol v1 and
+    /// offers no fs or terminal; a client request the host does not serve is answered
+    /// `-32601`; a permission request gets its allow-once option; a `session/update` reaches
+    /// the run loop; a message of the person goes to `_session/steering` while the prompt
+    /// runs; the run loop's cancel is `session/cancel`; and the prompt's answer is read raw, so
+    /// a stop reason newer than the SDK still ends the turn with it.
+    #[tokio::test]
+    async fn a_turn_keeps_the_protocol_the_runtimes_rely_on() {
+        use futures::SinkExt;
+        let (out_tx, mut out_rx) = futures::channel::mpsc::unbounded::<String>();
+        let outgoing = out_tx.sink_map_err(|_| std::io::Error::other("the agent is gone"));
+        let (line_tx, line_rx) = mpsc::channel(ACP_LINE_QUEUE);
+        let budget = inbound_budget();
+        let transport = AcpTransport {
+            outgoing: Box::pin(outgoing),
+            lines: line_rx,
+            budget: budget.clone(),
+        };
+        let run_id = uuid::Uuid::new_v4();
+        let steering = Steering::new(run_id, 1, Arc::new(crate::outbox::Outbox::new()));
+        let params = AcpParams {
+            cwd: "/workspace".into(),
+            prompt: "Do it.".into(),
+            resume_session_id: None,
+            resume_prompt: None,
+            new_home: true,
+            client_version: "1.2.3".into(),
+            mcp_url: None,
+            session_meta: None,
+            thought_level: ThoughtLevel::Untouched,
+            steering: steering.clone(),
+        };
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let session = tokio::spawn(run_session(transport, params, inbound_tx, control_rx));
+
+        let send = async |value: Value| {
+            let text = value.to_string();
+            let permit = budget
+                .clone()
+                .try_acquire_many_owned(line_cost(text.len()))
+                .unwrap();
+            line_tx.send(Ok(AcpLine { text, permit })).await.unwrap();
+        };
+        let mut next = async || -> Value {
+            let line = tokio::time::timeout(Duration::from_secs(5), out_rx.next())
+                .await
+                .expect("the host sends the next message")
+                .expect("the host keeps the connection");
+            serde_json::from_str(&line).unwrap()
+        };
+
+        let init = next().await;
+        assert_eq!(init["method"], "initialize");
+        assert_eq!(init["params"]["protocolVersion"], 1);
+        assert_eq!(init["params"]["clientInfo"]["version"], "1.2.3");
+        let caps = &init["params"]["clientCapabilities"];
+        assert_ne!(caps["fs"]["readTextFile"], true, "{caps}");
+        assert_ne!(caps["fs"]["writeTextFile"], true, "{caps}");
+        assert_ne!(caps["terminal"], true, "{caps}");
+        send(json!({"jsonrpc": "2.0", "id": init["id"], "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {"loadSession": false},
+            "agentInfo": {"name": "scripted", "version": "9.9.9"},
+            "_meta": {"steering": {"supported": true}}
+        }}))
+        .await;
+
+        let new = next().await;
+        assert_eq!(new["method"], "session/new");
+        assert_eq!(new["params"]["cwd"], "/workspace");
+        assert_eq!(new["params"]["mcpServers"], json!([]));
+        send(json!({"jsonrpc": "2.0", "id": new["id"], "result": {"sessionId": "s1"}})).await;
+
+        let prompt = next().await;
+        assert_eq!(prompt["method"], "session/prompt");
+        assert_eq!(prompt["params"]["sessionId"], "s1");
+        assert_eq!(prompt["params"]["prompt"][0]["text"], "Do it.");
+
+        send(
+            json!({"jsonrpc": "2.0", "id": 100, "method": "fs/read_text_file",
+            "params": {"sessionId": "s1", "path": "/etc/passwd"}}),
+        )
+        .await;
+        send(
+            json!({"jsonrpc": "2.0", "id": 101, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "toolCall": {"toolCallId": "t1", "title": "Run tests"},
+                "options": [
+                    {"optionId": "no", "kind": "reject_once", "name": "No"},
+                    {"optionId": "once", "kind": "allow_once", "name": "Yes"}
+                ]}}),
+        )
+        .await;
+        send(
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1",
+            "update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Working."}}}}),
+        )
+        .await;
+        let mut answers = std::collections::HashMap::new();
+        while answers.len() < 2 {
+            let answer = next().await;
+            answers.insert(answer["id"].as_i64().unwrap(), answer);
+        }
+        assert_eq!(
+            answers[&100]["error"]["code"], -32601,
+            "{:?}",
+            answers[&100]
+        );
+        assert_eq!(
+            answers[&101]["result"],
+            json!({"outcome": {"outcome": "selected", "optionId": "once"}})
+        );
+
+        let mut seen = Vec::new();
+        let mut wait_for = async |seen: &mut Vec<AcpInbound>,
+                                  pred: &dyn Fn(&AcpInbound) -> bool| {
+            loop {
+                let item = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+                    .await
+                    .expect("the run loop hears from the session")
+                    .expect("the session goes on");
+                let hit = pred(&item);
+                seen.push(item);
+                if hit {
+                    return;
+                }
+            }
+        };
+        wait_for(&mut seen, &|item| {
+            matches!(item, AcpInbound::Update { params, .. }
+                if params["update"]["content"]["text"] == "Working.")
+        })
+        .await;
+        assert!(seen.iter().any(|item| matches!(item,
+            AcpInbound::Prompting { session_id, agent_version, .. }
+                if session_id == "s1" && agent_version.as_deref() == Some("9.9.9"))));
+        assert!(seen.iter().any(|item| matches!(item,
+            AcpInbound::PermissionGranted { title, option }
+                if title == "Run tests" && option == "once")));
+
+        steering.offer(RunSteer {
+            run_id,
+            epoch: 1,
+            steer_id: uuid::Uuid::new_v4(),
+            text: "Use staging.".into(),
+        });
+        let steer = next().await;
+        assert_eq!(steer["method"], STEER_METHOD);
+        assert_eq!(steer["params"]["sessionId"], "s1");
+        assert_eq!(steer["params"]["prompt"][0]["text"], "Use staging.");
+        send(json!({"jsonrpc": "2.0", "id": steer["id"], "result": {"outcome": "injected"}})).await;
+        wait_for(&mut seen, &|item| {
+            matches!(item, AcpInbound::Info(line) if line.contains("reached the agent's running turn"))
+        })
+        .await;
+
+        control_tx.send(AcpControl::Cancel).unwrap();
+        let cancel = next().await;
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "s1");
+        assert!(cancel.get("id").is_none(), "a notification: {cancel}");
+        send(json!({"jsonrpc": "2.0", "id": prompt["id"], "result": {
+            "stopReason": "a_reason_newer_than_the_sdk",
+            "usage": {"inputTokens": 3, "outputTokens": 4, "totalTokens": 7}
+        }}))
+        .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("the session ends with the prompt's answer")
+            .unwrap();
+        assert_eq!(result.session_id.as_deref(), Some("s1"));
+        assert!(!result.loaded);
+        let outcome = result.outcome.expect("the turn ended");
+        assert_eq!(outcome.stop_reason, "a_reason_newer_than_the_sdk");
+        assert_eq!(outcome.usage.unwrap()["totalTokens"], 7);
     }
 }
