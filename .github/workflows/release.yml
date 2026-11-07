@@ -150,6 +150,9 @@ jobs:
       version: ${{ inputs.version }}
       next_version: ${{ inputs.next_version }}
       product_name: Tinfirm
+      # The GitHub Release's body: the section `## [<version>]` of CHANGELOG.md, then
+      # GitHub's generated notes.
+      changelog: CHANGELOG.md
       # Published as oci://ghcr.io/flowtivo/charts/tinfirm:<version>, appVersion <version>:
       # a deployment repository deploys the chart of the version its `image.tag` names
       # (ADR-0080).

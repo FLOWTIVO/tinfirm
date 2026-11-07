@@ -28,7 +28,7 @@ tinfirm_runner_host_docker_daemon_extra: {}
 # --- Kata Containers -----------------------------------------------------------------------
 
 # The Kata Containers static release (pinned). 3.x and 4.x releases work alike.
-tinfirm_runner_host_kata_version: "4.2.0"
+tinfirm_runner_host_kata_version: "4.3.1"
 # Where the release tarballs are: GitHub, or a mirror with the same layout
 # (<url>/<version>/<tarball>), such as a Nexus raw proxy.
 tinfirm_runner_host_kata_download_url: "https://github.com/kata-containers/kata-containers/releases/download"

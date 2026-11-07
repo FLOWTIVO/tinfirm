@@ -4,9 +4,9 @@ This page installs Tinfirm on Kubernetes with the Helm chart `tinfirm`: the Secr
 
 The chart deploys the server and, unless you turn it off, the bundled LiteLLM, and, if you turn it on, a runner host whose sandboxes are VMs ([The runner pod](#the-runner-pod)). It deploys no database and creates no Secret: you prepare PostgreSQL ([Prepare PostgreSQL](database.md)) and create the Secrets yourself.
 
-!!! warning "No release yet"
+!!! info "Releases and development builds"
 
-    No version of Tinfirm is released yet. Each commit on the development branch publishes a chart `0.0.0-sha-<commit>` and images tagged `sha-<commit>`: they are not releases, and they are not signed as releases are ([What is not signed](verify-images.md#what-is-not-signed)). Use them to evaluate Tinfirm, and run a release in production once one exists.
+    This page installs a release. The current one is v1.0.0: chart `1.0.0`, whose defaults run the images tagged `v1.0.0`, all signed with FLOWTIVO's key ([Verify your images](verify-images.md)). Each commit on the development branch also publishes a chart `0.0.0-sha-<commit>` and images tagged `sha-<commit>`. That is a development channel for trying changes before they are released: those builds are not releases, and they are not signed as releases are ([What is not signed](verify-images.md#what-is-not-signed)). Run a release in production.
 
 ## Before you start
 
@@ -74,13 +74,13 @@ Use the same passwords when you create the database roles, and sign in the first
 
 ## Choose the values
 
-Write your values into a file, such as `values-prod.yaml`. `helm show values oci://ghcr.io/flowtivo/charts/tinfirm --version <version>` prints every value of a version with its default, and the chart's schema refuses a value of the wrong shape before anything is applied. [Server configuration](../reference/configuration.md) lists the server variable behind each value.
+Write your values into a file, such as `values-prod.yaml`. `helm show values oci://ghcr.io/flowtivo/charts/tinfirm --version 1.0.0` prints every value of a version, here v1.0.0's, with its default, and the chart's schema refuses a value of the wrong shape before anything is applied. [Server configuration](../reference/configuration.md) lists the server variable behind each value.
 
 ### Image
 
 | Value | Default | Meaning |
 |---|---|---|
-| `image.tag` | empty | The server image's tag. Empty means the chart's own image: a release's chart runs that release's image, `v<version>`, and a development chart `0.0.0-sha-<commit>` the images `sha-<commit>`. |
+| `image.tag` | empty | The server image's tag. Leave it empty: the chart then runs its own image, so chart `1.0.0` runs `v1.0.0`, and a development chart `0.0.0-sha-<commit>` the images `sha-<commit>`. If you set it, name the chart's own version, `v1.0.0`. |
 | `image.repository` | `ghcr.io/flowtivo/tinfirm-server` | Point it at your registry when you mirror the images |
 | `image.digest` | empty | `sha256:…`. Set, the chart pulls the image as tag and digest. |
 | `imagePullSecrets` | `[]` | For a private registry |
@@ -442,11 +442,11 @@ networkPolicy:
           app.kubernetes.io/name: ingress-nginx
 ```
 
-Install it with the chart's version, or with the chart's digest after you verified it ([Verify the Helm chart](verify-images.md#verify-the-helm-chart)):
+Install it with the release's chart version, `1.0.0` for v1.0.0, or with the chart's digest after you verified it ([Verify the Helm chart](verify-images.md#verify-the-helm-chart)):
 
 ```sh
 helm upgrade --install tinfirm oci://ghcr.io/flowtivo/charts/tinfirm \
-  --version <version> \
+  --version 1.0.0 \
   --namespace tinfirm \
   --values values-prod.yaml
 ```

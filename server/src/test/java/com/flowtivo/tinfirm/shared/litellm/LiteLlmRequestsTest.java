@@ -38,6 +38,13 @@ class LiteLlmRequestsTest {
         assertThat(List.of("API_BASE", "Guardrail_Config", "policies", "include_guardrail_response", "deployment_id",
                 "access_token", "litellm_anything", "langfuse_host", "gpt_cost_per_token", "input_cost_x"))
             .allSatisfy(name -> assertThat(LiteLlmRequests.liteLlmField(name)).as(name).isTrue());
+        // v1.108.0: the OAuth token exchange, whose endpoint would receive the caller's token, GitHub Copilot's
+        // per-user connection and the per-user credentials its proxy refuses in a body; a later name of either
+        // family goes by its prefix.
+        assertThat(List.of("token_exchange_endpoint", "Token_Exchange_Audience", "token_exchange_anything",
+                "github_copilot_user_session", "github_copilot_auth_type", "github_copilot_anything",
+                "user_provider_credentials", "user_provider_credentials_user_id"))
+            .allSatisfy(name -> assertThat(LiteLlmRequests.liteLlmField(name)).as(name).isTrue());
         // What the model's API takes passes: chat, messages, responses and embeddings alike.
         assertThat(List.of("model", "messages", "max_tokens", "temperature", "stream", "tools", "reasoning_effort",
                 "input", "encoding_format", "dimensions", "system", "instructions"))
