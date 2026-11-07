@@ -46,7 +46,7 @@ Sections 2 to 13 are the engineering rules of the whole repository: layout, name
 | Spring AI | 2.0.x, for the MCP server (`spring-ai-starter-mcp-server-webmvc`; 2.0.2 in `server/pom.xml`) |
 | Rust | 1.89 or later, edition 2024 (`runner/Cargo.toml`: `rust-version`, `edition`) |
 | Runner host | The product's version, as the server's and the web app's: the `version` of `runner/`'s workspace (`runner/Cargo.toml`), `0.1.0-SNAPSHOT` between releases, which the release sets with the others (`cargo:runner`, [ADR-0109](adr/0109-runner-version-is-the-release-version.md)). The host reports it in `--version` and `hello.runnerVersion`; the server stores and shows it and decides nothing from it. Compatibility is `hello.protocolVersion` and `hello.features` (§14.10) |
-| LiteLLM | v1.106.6, pinned by tag and digest, not a line: Compose's `litellm` image, Helm's `litellm.image`, and the list of its own request fields in the server's test resources (`server/src/test/resources/litellm/all-litellm-params.txt`); bump them together |
+| LiteLLM | v1.108.0, pinned by tag and digest, not a line: Compose's `litellm` image, Helm's `litellm.image`, and the list of its own request fields in the server's test resources (`server/src/test/resources/litellm/all-litellm-params.txt`); bump them together |
 
 ## 4. Runtime contract of the server
 
