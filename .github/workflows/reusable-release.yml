@@ -318,8 +318,14 @@ jobs:
             echo "::error::$CHANGELOG does not exist on $GITHUB_REF_NAME."
             exit 1
           fi
-          if ! awk -v head="## [$VERSION]" 'index($0, head) == 1 { found = 1 } END { exit !found }' "$CHANGELOG"; then
-            echo "::error::$CHANGELOG has no section '## [$VERSION]'. Write the release notes in a pull request first (CONTRIBUTING §5)."
+          # Exactly `## [<version>] - unreleased`, which the tag job dates, or a heading that
+          # already carries a date: a heading the date step would not recognise, such as one
+          # with trailing blanks, stops the release instead of shipping "unreleased".
+          if ! awk -v unreleased="## [$VERSION] - unreleased" -v dated="## [$VERSION] - " '
+              $0 == unreleased { found = 1 }
+              index($0, dated) == 1 && substr($0, length(dated) + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ { found = 1 }
+              END { exit !found }' "$CHANGELOG"; then
+            echo "::error::$CHANGELOG has no heading '## [$VERSION] - unreleased' (or '## [$VERSION] - YYYY-MM-DD'). Write the release notes in a pull request first (CONTRIBUTING §5)."
             exit 1
           fi
       # The charts too, when the caller publishes any: a chart that does not package under
