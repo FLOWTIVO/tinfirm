@@ -260,7 +260,7 @@ A **drain** lets the active runs finish instead of cancelling them:
 
 A drain can last as long as the longest turn. SIGTERM or `Ctrl-C` during a drain cancels what is still running. Closing the terminal of a foreground `run` drains it too.
 
-To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts, except from a development build to v1.0.0: then upgrade the hosts first, as its release notes say.
+To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts.
 
 ## Disk maintenance
 

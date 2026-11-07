@@ -159,7 +159,7 @@ Keep the old host name pointing at Tinfirm, redirecting to the new one, for as l
 
 ## Upgrade runner hosts
 
-Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. The one exception is the move from a development build to v1.0.0, whose release notes say to upgrade the runner hosts first. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
+Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
 
 ## The Compose stack
 
