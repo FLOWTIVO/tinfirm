@@ -115,6 +115,15 @@ on:
         required: false
         default: ''
         type: string
+      changelog:
+        description: |
+          Path of a Keep a Changelog file in the repository, e.g. `CHANGELOG.md`. Set: the
+          GitHub Release's body starts with the section `## [<version>]` of that file as the
+          release commit holds it, followed by the generated notes. Empty (the default), or a
+          file without that section: the generated notes alone.
+        required: false
+        default: ''
+        type: string
       release_branches:
         description: |
           Space-separated glob list of refs a release may run from. A feature branch must
@@ -546,6 +555,8 @@ jobs:
           SHA: ${{ needs.tag.outputs.sha }}
           # As in `tag`: the repository name when the caller names no product.
           PRODUCT: ${{ inputs.product_name || github.event.repository.name }}
+          CHANGELOG: ${{ inputs.changelog }}
+          REPO_API: ${{ github.api_url }}/repos/${{ github.repository }}
           API: ${{ github.api_url }}/repos/${{ github.repository }}/releases
         run: |
           set -euo pipefail
@@ -564,12 +575,44 @@ jobs:
           case "$VERSION" in *-*) PRE=true ;; *) PRE=false ;; esac
 
           # `generate_release_notes` builds the body from the PRs merged since the previous
-          # tag. There is no CHANGELOG, so this IS the changelog.
-          #
+          # tag. With `inputs.changelog`, GitHub puts `body` before those notes: the section
+          # `## [<version>]` of the changelog as the release commit holds it, read through the
+          # API (no checkout), up to the next `## ` heading or the link definitions at the end.
+          # A changelog without that section warns and leaves the generated notes alone: the
+          # release is shipped by now, and its page must not fail over its text.
+          body=""
+          if [ -n "$CHANGELOG" ]; then
+            notes="$RUNNER_TEMP/changelog.md"
+            if curl -sS --fail -o "$notes" -H "Authorization: Bearer $TOKEN" \
+                 -H "Accept: application/vnd.github.raw" \
+                 "$REPO_API/contents/$CHANGELOG?ref=$SHA"; then
+              # The section, without its heading and without blank lines at either end.
+              section=$(awk -v head="## [$VERSION]" '
+                  /^## / { if (inside) exit; if (index($0, head) == 1) { inside = 1; next } }
+                  inside && /^\[[^]]+\]: / { exit }
+                  inside { print }' "$notes" \
+                | awk 'NF { started = 1 } started' \
+                | awk '{ lines[NR] = $0 } NF { last = NR } END { for (i = 1; i <= last; i++) print lines[i] }')
+              if [ -n "$section" ]; then
+                # JSON string by hand (no jq): backslashes, quotes and tabs escaped, other
+                # control characters dropped, lines joined with \n.
+                tab=$(printf '\t')
+                body=$(printf '%s\n' "$section" \
+                  | tr -d '\000-\010\013-\037' \
+                  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$tab/\\\\t/g" \
+                  | awk '{ printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }')
+              else
+                echo "::warning::$CHANGELOG at $SHA has no section '## [$VERSION]': the release notes are the generated ones alone."
+              fi
+            else
+              echo "::warning::Could not read $CHANGELOG at $SHA: the release notes are the generated ones alone."
+            fi
+          fi
+
           # jq is not assumed present on the runners, so the body is written by hand. Every
           # interpolated value is safe to inline: VERSION passed the guard's semver checks,
-          # SHA is a git object id, and PRODUCT is a workflow input or the repository name,
-          # neither of them user content.
+          # SHA is a git object id, PRODUCT is a workflow input or the repository name, and
+          # body is the changelog's section of the release commit, escaped above.
           curl -sS --fail-with-body -X POST "$API" \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -577,6 +620,7 @@ jobs:
             -d "{\"tag_name\":\"v$VERSION\",
                  \"name\":\"$PRODUCT v$VERSION\",
                  \"target_commitish\":\"$SHA\",
+                 \"body\":\"$body\",
                  \"generate_release_notes\":true,
                  \"prerelease\":$PRE,
                  \"draft\":false}" > /dev/null
