@@ -2,7 +2,6 @@ import { Component } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { provideRouter, Router } from '@angular/router';
 import { RouterTestingHarness } from '@angular/router/testing';
-import { rememberSignInReturn } from '../../core/return-url';
 import { Session } from '../../core/session';
 import { aCurrentUser, aMembership } from '../../testing/fixtures';
 import { provideTestHttp } from '../../testing/test-helpers';
@@ -38,11 +37,10 @@ describe('homeRedirectGuard', () => {
     expect(await open('/?account=invalid_state')).toBe('/c/c1/accounts?account=invalid_state');
   });
 
-  it('goes back to the page that asked for a sign-in, once', async () => {
-    rememberSignInReturn('/me');
-    expect(await open('/')).toBe('/me');
-    TestBed.resetTestingModule();
+  it('ignores a page an earlier version kept in the tab', async () => {
+    sessionStorage.setItem('tinfirm.signInReturn', JSON.stringify({ path: '/me', at: Date.now() }));
     expect(await open('/')).toBe('/c/c1/inbox');
+    sessionStorage.clear();
   });
 
   it('stays without a company', async () => {

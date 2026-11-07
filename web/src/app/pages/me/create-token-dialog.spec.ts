@@ -6,7 +6,6 @@ import type {
   PersonalAccessTokenCreateRequest,
 } from '../../api/generated/models';
 import { Session } from '../../core/session';
-import { takeSignInReturn } from '../../core/return-url';
 import { aCurrentUser, aMembership } from '../../testing/fixtures';
 import {
   fakeNotify,
@@ -306,9 +305,9 @@ describe('CreateTokenDialog', () => {
       .expectOne({ method: 'POST', url: '/api/auth/logout' })
       .flush(null, { status: 204, statusText: 'No Content' });
     await stable();
+    // The login page names /me to the server as a sign-in's `returnTo` (Q44); nothing kept in the tab.
     expect(navigate).toHaveBeenCalledWith('/login?returnUrl=%2Fme');
-    // The identity provider lands on `/`, which takes the page back from here.
-    expect(takeSignInReturn()).toBe('/me');
+    expect(sessionStorage.getItem('tinfirm.signInReturn')).toBeNull();
   });
 
   it('requires a name before calling the server', async () => {
