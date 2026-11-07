@@ -26,20 +26,19 @@ To try Tinfirm with [Docker Compose](quick-start.md), with the server, PostgreSQ
 | Disk | 60 GB free, SSD | 100 GB free, SSD |
 | Operating system | Linux, or macOS on Apple silicon, with Docker and Compose v2 | Linux |
 
-The Compose stack itself takes up to about 5 GiB: the server and LiteLLM may use 2 GiB each, the model port 512 MiB, and PostgreSQL what it needs. The rest is for the runner host and its two sandboxes, its default number of turns at a time.
+The Compose stack itself takes up to about 4.5 GiB: the server and LiteLLM may use 2 GiB each, and PostgreSQL what it needs. The rest is for the runner host and its two sandboxes, its default number of turns at a time.
 
 ### The deployment
 
-The server, LiteLLM and the model port, on Kubernetes or on a Compose host. The minimum is what the Helm chart asks for by default.
+The server and LiteLLM, on Kubernetes or on a Compose host. The minimum is what the Helm chart asks for by default.
 
 | Part | Minimum | Recommended | Notes |
 |---|---|---|---|
 | **Server** | 0.25 CPU, 1 GiB memory | 1 to 2 CPUs, 2 GiB memory | It uses about 450 MB when idle. The chart's default limit of 1 GiB gives its Java heap 768 MiB. Give it 2 GiB when many turns run at once: the model relay holds up to 256 MiB of requests in flight. |
 | **LiteLLM** | 0.25 CPU, 1 GiB memory | 1 CPU, 2 GiB memory | It uses about 500 MB when idle. The chart's default limit is 2 GiB. |
-| **Model port** | 0.05 CPU, 256 MiB memory | 384 MiB memory | The chart's default limit. It holds up to 128 MiB of requests in flight. |
-| **Total** | 1 CPU, 2.5 GiB memory | 2 to 4 CPUs, 4.5 GiB memory | On Kubernetes, leave room for a second server pod: an upgrade starts the new pod before it stops the old one. |
+| **Total** | 1 CPU, 2 GiB memory | 2 to 4 CPUs, 4 GiB memory | On Kubernetes, leave room for a second server pod: an upgrade starts the new pod before it stops the old one. |
 
-The server and the model port need no disk of their own: their root filesystems are read-only, and they write only to `/tmp`. LiteLLM writes into its own container's filesystem.
+The server needs no disk of its own: its root filesystem is read-only, and it writes only to `/tmp`. LiteLLM writes into its own container's filesystem.
 
 ### PostgreSQL
 
@@ -80,7 +79,7 @@ These assume Claude Code or a similar runtime and agents that sometimes build co
 |---|---|---|
 | People | up to 25 | up to 150 |
 | Turns at a time | 4 | 16 |
-| Deployment (server, LiteLLM, model port) | 2 CPUs, 6 GiB | 4 CPUs, 8 GiB |
+| Deployment (server, LiteLLM) | 2 CPUs, 6 GiB | 4 CPUs, 8 GiB |
 | PostgreSQL | 2 CPUs, 4 GiB, 50 GB | 4 CPUs, 8 GiB, 200 GB |
 | Runner hosts | one host: 9 CPUs, 18 GiB, 150 GB | four hosts of 4 slots: each 9 CPUs, 18 GiB, 200 GB |
 

@@ -8,17 +8,17 @@ name: Release
 # build and the assets.
 #
 # One run: gate (ci.yml) -> set version, commit, tag v<version> -> build and push
-# ghcr.io/flowtivo/tinfirm-server:v<version> and :sha-<sha> (and the model port's
-# ghcr.io/flowtivo/tinfirm-model-api and the runner host's ghcr.io/flowtivo/tinfirm-runner-host,
-# the same tags), and the chart oci://ghcr.io/flowtivo/charts/tinfirm:<version>
-# (ADR-0080) -> GitHub Release -> next -SNAPSHOT version on the branch -> the release assets
-# (runner-artifacts.yml) on the GitHub Release.
+# ghcr.io/flowtivo/tinfirm-server:v<version> and :sha-<sha> (and the runner host's
+# ghcr.io/flowtivo/tinfirm-runner-host, the same tags), and the chart
+# oci://ghcr.io/flowtivo/charts/tinfirm:<version> (ADR-0080) -> GitHub Release -> next
+# -SNAPSHOT version on the branch -> the release assets (runner-artifacts.yml) on the GitHub
+# Release.
 #
 # A release changes no environment. A version runs in one once that environment's deployment
 # repository names `image.tag: v<version>`, an edit made there (ADR-0107).
 #
 # Signed artifacts (ADR-0081): `signing-key` checks the cosign key before anything is
-# published, `sign` signs the three images and the chart by digest after the push, and attests
+# published, `sign` signs the two images and the chart by digest after the push, and attests
 # an SBOM of each image, and `sign-assets` signs the assets' SHA256SUMS once they are on
 # the GitHub Release. All three run in the protected environment `release`, the only place
 # that holds COSIGN_PRIVATE_KEY and COSIGN_PASSWORD, so each waits for a required reviewer.
@@ -150,6 +150,9 @@ jobs:
       version: ${{ inputs.version }}
       next_version: ${{ inputs.next_version }}
       product_name: Tinfirm
+      # The GitHub Release's body: the section `## [<version>]` of CHANGELOG.md, then
+      # GitHub's generated notes.
+      changelog: CHANGELOG.md
       # Published as oci://ghcr.io/flowtivo/charts/tinfirm:<version>, appVersion <version>:
       # a deployment repository deploys the chart of the version its `image.tag` names
       # (ADR-0080).
@@ -158,21 +161,17 @@ jobs:
       charts: deploy/helm/tinfirm
       manifests: |
         pom:server/pom.xml:tinfirm-server
-        pom:model-api/pom.xml:tinfirm-model-api
         npm:web
         # The runner host's workspace (ADR-0109): its --version and hello.runnerVersion are
         # the release's version, as are its assets' names and its image's tag.
         cargo:runner
-      # The model port (ADR-0069) and the runner host's image (ADR-0101, decision 8) are
-      # released with the server, under the same version: the chart's
-      # litellm.modelApi.image.tag and runner.image.tag default to the server's.
+      # The runner host's image (ADR-0101, decision 8) is released with the server, under the
+      # same version: the chart's runner.image.tag defaults to the server's.
       # CACHE_SCOPE=main: the BuildKit cache mounts of builds from main and releases, never
       # the ones pull-request builds write (`-pr`, the Dockerfiles' default).
       components: >-
         [{"component":"server","image":"ghcr.io/flowtivo/tinfirm-server",
           "context":".","file":"./Dockerfile","build_args":"CACHE_SCOPE=main"},
-         {"component":"model-api","image":"ghcr.io/flowtivo/tinfirm-model-api",
-          "context":".","file":"./model-api/Dockerfile","build_args":"CACHE_SCOPE=main"},
          {"component":"runner-host","image":"ghcr.io/flowtivo/tinfirm-runner-host",
           "context":".","file":"./deploy/release/runner-musl.Dockerfile","build_args":"CACHE_SCOPE=main"}]
       # Every job of reusable-release.yml but its `caller` check, the image build among them,
@@ -223,7 +222,6 @@ jobs:
         run: |
           deploy/release/sign-images.sh sign "${RUNNER_TEMP}/sbom" \
             "ghcr.io/flowtivo/tinfirm-server:v${VERSION}" \
-            "ghcr.io/flowtivo/tinfirm-model-api:v${VERSION}" \
             "ghcr.io/flowtivo/tinfirm-runner-host:v${VERSION}"
       # The chart reusable-release.yml published (ADR-0080), signed by digest too: no SBOM,
       # it is no image. Its version has no `v`.

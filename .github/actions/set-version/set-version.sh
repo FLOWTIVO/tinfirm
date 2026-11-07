@@ -3,7 +3,6 @@
 #
 #   set-version.sh <version> <<'EOF'
 #   pom:server/pom.xml:tinfirm-server
-#   pom:model-api/pom.xml:tinfirm-model-api
 #   npm:web
 #   cargo:runner
 #   EOF

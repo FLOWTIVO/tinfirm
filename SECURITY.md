@@ -11,7 +11,7 @@ Report it in either of two ways:
 
 Include in your report:
 
-- the affected component (server, web app, runner host, model port, Helm chart, Compose stack, release assets, CI workflows) and its version: the release (`v<x.y.z>`), the image tag (`sha-<commit>`), the version of a `rolling` asset, or the commit. The server reports its version and commit at `GET /api/system/info`; `tinfirm-runner-host --version` prints the runner host's;
+- the affected component (server, web app, runner host, Helm chart, Compose stack, release assets, CI workflows) and its version: the release (`v<x.y.z>`), the image tag (`sha-<commit>`), the version of a `rolling` asset, or the commit. The server reports its version and commit at `GET /api/system/info`; `tinfirm-runner-host --version` prints the runner host's;
 - the configuration the issue needs, if any, such as the sign-in method or the runner host's executor;
 - the steps to reproduce, and the impact you expect;
 - any known workaround;
@@ -32,11 +32,11 @@ Tinfirm ships in two ways. A release `v<x.y.z>` is cut by hand from `main`, or f
 
 | Version | Security fixes |
 |---|---|
-| `main`: its newest commit, the images tagged `main` and the prerelease `rolling` | Yes. A fix lands on `main` first, and CI publishes it with that commit. The image `sha-<commit>` of an older commit gets no fix: move to the newest. |
-| The latest release | Yes, in the next release. A fix that cannot wait for it can ship as a patch release from a hotfix branch cut at the release's tag (`.github/workflows/hotfix-branch.yml`). |
+| The latest release (today v1.0.0) | Yes, in the next release. A fix that cannot wait for it ships as a patch release, such as v1.0.1, from a hotfix branch cut at the release's tag (`.github/workflows/hotfix-branch.yml`). |
 | Older releases | No. Upgrade to the latest release. |
+| `main`: its newest commit, the images tagged `main` and the prerelease `rolling` | Yes. A fix lands on `main` first, and CI publishes it with that commit. The image `sha-<commit>` of an older commit gets no fix: move to the newest. This is the development channel: run a release in production. |
 
-No version is released yet: until the first release, `main`, its newest images and `rolling` are the supported versions.
+v1.0.0 is the first release. Run a release in production; the builds of `main` are for development and evaluation, and are not signed with the release key ([Verify your images](docs-site/content/operator-guide/verify-images.md#what-is-not-signed)).
 
 ## Known risks
 

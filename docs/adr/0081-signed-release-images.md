@@ -4,6 +4,7 @@
 - Date: 2026-10-21
 - Decided by: the owner, 2026-10-21
 - Amended by: [ADR-0106](0106-reusable-workflows-and-pinned-actions.md), under which the release workflow that builds and pushes the images it signs and the scan of its gate are `reusable-release.yml` and `reusable-security.yml` in `.github/workflows/`
+- Amended by: [ADR-0110](0110-no-model-port.md), under which the model port's image is gone: a release signs the server's and the runner host's images (decision 2)
 - Sources: [ADR-0077](0077-licence-editions-and-seats.md), decision 4 (the air-gapped installation of Enterprise) and decision 6 (one production install per key); `.github/workflows/release.yml` and `reusable-release.yml`, which builds and pushes the images; [ADR-0080](0080-helm-chart-published-to-ghcr.md), under which the release publishes the Helm chart to GHCR; the [threat model](../threat-model.md), §6.3 (supply chain)
 - Changes: `release.yml`'s jobs `signing-key` and `sign`, in the protected environment `release`; `deploy/release/sign-images.sh`; the public key `docs-site/content/cosign.pub` (SHA-256 of its DER `f3aa395d8207acf829d58ad3a8d64b2d72f34af38d90ffe177fe93e912106e53`), published at <https://docs.tinfirm.com/cosign.pub>; the docs site's page "Verify your images"; the threat model's asset A38, its §6.2 and §6.3; `.github/CODEOWNERS` on the public keys, the licence's verification and the release
 

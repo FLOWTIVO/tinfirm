@@ -30,12 +30,12 @@ class GatewayVariablesTest {
     void theNewNamesAreRead() throws IOException {
         StandardEnvironment environment = environment(Map.of("TINFIRM_MODEL_GATEWAY_ADMIN_URL", "http://gateway:4000",
                 "TINFIRM_MODEL_GATEWAY_ADMIN_KEY", "sk-TEST-ONLY-new", "TINFIRM_MODEL_GATEWAY_MODEL_URL",
-                "http://model-api:4001", "TINFIRM_LITELLM_ADMIN_URL", "http://old:4000", "TINFIRM_LITELLM_MASTER_KEY",
+                "http://models:4000", "TINFIRM_LITELLM_ADMIN_URL", "http://old:4000", "TINFIRM_LITELLM_MASTER_KEY",
                 "sk-TEST-ONLY-old"));
 
         assertThat(environment.getProperty("tinfirm.model.gateway-admin-url")).isEqualTo("http://gateway:4000");
         assertThat(environment.getProperty("tinfirm.model.gateway-admin-key")).isEqualTo("sk-TEST-ONLY-new");
-        assertThat(environment.getProperty("tinfirm.model.gateway-model-url")).isEqualTo("http://model-api:4001");
+        assertThat(environment.getProperty("tinfirm.model.gateway-model-url")).isEqualTo("http://models:4000");
         assertThat(environment.getProperty("tinfirm.model.gateway-vendor")).isEqualTo("LITELLM");
     }
 
@@ -43,11 +43,11 @@ class GatewayVariablesTest {
     void theLiteLlmNamesStillWork() throws IOException {
         StandardEnvironment environment = environment(Map.of("TINFIRM_LITELLM_ADMIN_URL", "http://litellm:4000",
                 "TINFIRM_LITELLM_MASTER_KEY", "sk-TEST-ONLY-old", "TINFIRM_LITELLM_MODEL_URL",
-                "http://model-api:4001"));
+                "http://models:4000"));
 
         assertThat(environment.getProperty("tinfirm.model.gateway-admin-url")).isEqualTo("http://litellm:4000");
         assertThat(environment.getProperty("tinfirm.model.gateway-admin-key")).isEqualTo("sk-TEST-ONLY-old");
-        assertThat(environment.getProperty("tinfirm.model.gateway-model-url")).isEqualTo("http://model-api:4001");
+        assertThat(environment.getProperty("tinfirm.model.gateway-model-url")).isEqualTo("http://models:4000");
     }
 
     @Test
@@ -56,5 +56,6 @@ class GatewayVariablesTest {
 
         assertThat(environment.getProperty("tinfirm.model.gateway-admin-url")).isEmpty();
         assertThat(environment.getProperty("tinfirm.model.gateway-admin-key")).isEmpty();
+        assertThat(environment.getProperty("tinfirm.model.gateway-model-url")).isEmpty();
     }
 }

@@ -10,7 +10,7 @@ The one exception to budgets is a member's own subscription (Claude, ChatGPT) on
 
 | Who | Does |
 |---|---|
-| You, the operator | Run LiteLLM, its database and the model port; keep its secrets; add the provider keys and models; upgrade and back it up |
+| You, the operator | Run LiteLLM and its database; keep its secrets; add the provider keys and models; decide which of the company's services reach it; upgrade and back it up |
 | A company's Owners and Admins | Choose and test the gateway on **Model access**, and set the budgets and models: [Model access and budgets](../admin-guide/model-access.md) |
 | Tinfirm | Creates a LiteLLM team per company and a key per member and service account, relays the runs' model requests, reads the spend, and repairs drift every 5 minutes |
 
@@ -22,14 +22,12 @@ Tinfirm never adds, changes or deletes a model or a provider key: that is yours.
 |---|---|---|
 | LiteLLM | Service `litellm`, LiteLLM's non-root image `ghcr.io/berriai/litellm-non_root`, pinned by digest | Deployment `<release>-litellm`, the same image (`litellm.image`), one replica |
 | Its address, every route, the admin API included | `http://litellm:4000` inside the stack; `http://127.0.0.1:4000` on the host (`TINFIRM_LITELLM_HOST_PORT`) | `http://<release>-litellm.<namespace>.svc:4000`, a ClusterIP Service |
-| Who reaches it | The server and the model port, and you on the host's loopback | The server pods only: the NetworkPolicy admits nothing else |
-| The model port | Service `model-api`: `http://model-api:4001`; `http://127.0.0.1:4001` on the host | Container `model-api` beside LiteLLM, the Service's port `model`: `…svc:4001` |
-| Who reaches the model port | Every service of the stack | The server pods, and the peers of `litellm.modelApi.from` |
+| Who reaches it | The server, the services you add to the network `gateway`, and you on the host's loopback | The server pods, and the peers you list in `litellm.from`: the NetworkPolicy admits nothing else |
 | Its database | `litellm` on the stack's PostgreSQL, created by the one-shot service `litellm-db` on every `up` | `litellm` on your external PostgreSQL: [Prepare PostgreSQL](database.md) |
 | Secrets | `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY`, `LITELLM_DB_PASSWORD` in `deploy/compose/.env` | The Secret `tinfirm-litellm`: `master-key`, `salt-key`, `database-password` |
 | Settings | `deploy/compose/litellm/config.yaml` | The ConfigMap `<release>-litellm` |
 
-The server gets four variables: `TINFIRM_MODEL_GATEWAY_VENDOR` (`LITELLM`), `TINFIRM_MODEL_GATEWAY_ADMIN_URL` (LiteLLM's own port, for its admin API), `TINFIRM_MODEL_GATEWAY_MODEL_URL` (the model port, for the requests it relays and its own) and `TINFIRM_MODEL_GATEWAY_ADMIN_KEY`. The deployment bundles a gateway only when the admin URL and the master key are both set; otherwise **Model access** says **This deployment bundles none.** and **Bundled** cannot be chosen. Without a model URL, the model requests go to the admin URL.
+The server gets three variables: `TINFIRM_MODEL_GATEWAY_VENDOR` (`LITELLM`), `TINFIRM_MODEL_GATEWAY_ADMIN_URL` (LiteLLM's own port, for its admin API and for the model requests the server relays and sends itself) and `TINFIRM_MODEL_GATEWAY_ADMIN_KEY`. The deployment bundles a gateway only when the admin URL and the master key are both set; otherwise **Model access** says **This deployment bundles none.** and **Bundled** cannot be chosen. `TINFIRM_MODEL_GATEWAY_MODEL_URL` would send the model requests to another address than the admin URL; the Compose file and the chart do not set it.
 
 Check that LiteLLM is up:
 
@@ -42,7 +40,7 @@ Its first start migrates an empty database, which can take several minutes.
 ## How it is secured
 
 - **Prompts and answers are never stored.** The settings file sets `store_prompts_in_spend_logs: false`, `disable_error_logs: true` and `turn_off_message_logging: true`. LiteLLM's spend logs keep the key, team, model, tokens, cost, time and status of each request, never its body or the answer. A setting in the file wins over the same setting stored through the admin API, so the master key cannot turn these back on: change them only in the file.
-- **Only the server reaches LiteLLM's own port.** Never publish it, and point no reverse proxy, tunnel or firewall rule at it. None of LiteLLM's management routes is in reach of a runner host or a sandbox.
+- **Only the server reaches LiteLLM's port**, and the company's services you admit ([The company's own services](#the-companys-own-services)). Never publish it, and point no reverse proxy, tunnel or firewall rule at it. None of LiteLLM's management routes is in reach of a runner host or a sandbox.
 - **The model relay carries the runs' traffic.** Each run gets the relay's address on your public URL and a token for that run alone. The relay accepts the token only while the run is active on the host it was sent to, and only with that host's own token. It strips LiteLLM's own fields from each request, refuses every request that asks the model's provider to run a tool itself (search or fetch the web, run code, call an MCP server), with no setting that allows one, passes only the formats' headers and the beta values the runtimes need, allows only the models the payer's key allows, has LiteLLM drop a parameter the model's provider does not take instead of failing the run, and tags each request with its run, conversation and agent in LiteLLM's spend logs.
 - **No LiteLLM key leaves the server.** The keys stay in Tinfirm's vault. A runner host holds only the run's token, and keeps it out of the sandbox behind its [model proxy](runner-hosts.md#the-model-proxy).
 - **The admin UI is off.** The admin API stays, reachable only inside the deployment.
@@ -82,7 +80,7 @@ curl -sS http://127.0.0.1:4000/v1/models -H @litellm-auth
 
 LiteLLM keeps each model in its database, the provider key encrypted with the salt key. Tinfirm reads the gateway's models at most once a minute: a new model shows in people's settings within a minute. To remove one, find its id (`model_info.id`) in `GET /model/info`, and send `{"id": "<id>"}` to `POST /model/delete`.
 
-With Helm, `litellm.adminUi: true` turns LiteLLM's admin UI on at `/ui`, reached like the admin API, through `kubectl port-forward`; the Service is never exposed. Compose keeps it off, and `/ui` says **Admin UI is Disabled**.
+With Helm, `litellm.adminUi: true` turns LiteLLM's admin UI on at `/ui`, reached like the admin API: through `kubectl port-forward`, and by the services you admit (`litellm.from`); the Service is never exposed. Compose keeps it off, and `/ui` says **Admin UI is Disabled**.
 
 ### Providers
 
@@ -160,23 +158,45 @@ A company can keep its gateway's admin API from Tinfirm: it chooses **Keys from 
 
 The server's own variables for the bundled gateway are `TINFIRM_MODEL_GATEWAY_VENDOR`, `TINFIRM_MODEL_GATEWAY_ADMIN_URL`, `TINFIRM_MODEL_GATEWAY_ADMIN_KEY` and `TINFIRM_MODEL_GATEWAY_MODEL_URL` ([Server configuration](../reference/configuration.md)); a provided gateway is a company's setting and needs none.
 
-## The model port and the company's own services
+## The company's own services
 
-The bundled gateway is the company's, not only Tinfirm's. Its **model port** serves LiteLLM's model routes alone, each by its exact path: chat completions, completions, responses, embeddings, messages and their token count, rerank, and the model list. Every other path is `404` without reaching LiteLLM, LiteLLM's own fields are removed from every body, and it holds no key: each caller sends its own LiteLLM key.
+The bundled gateway is the company's, not only Tinfirm's. The company's other services, such as a script or an internal application that embeds documents, may call it on LiteLLM's own port where you admit them, each with a LiteLLM key of its own.
 
-The model port also refuses (`400`) every request that asks the model's provider to run a tool itself: search or fetch the web, run code, call an MCP server. No setting lets one through: the former `MODEL_API_PROVIDER_TOOLS` (Helm `litellm.modelApi.providerTools`, Compose `TINFIRM_MODEL_API_PROVIDER_TOOLS`) is gone, and the chart's schema no longer takes `litellm.modelApi.providerTools`: remove it from your values. Agents search the web through a search MCP server the company registers ([Web search for agents](../admin-guide/mcp-servers.md#web-search-for-agents)), which the Tinfirm server calls with its audit and the agents' tool settings. Leave models that search the web by themselves, whatever the request says (Perplexity's Sonar models, OpenAI's `*-search-preview` models), out of the gateway's model list.
+Admit only services you trust with the company's provider keys:
 
-Give each service, such as a script or an internal application that embeds documents, a key of its own with its budget and models. Create it at LiteLLM's own port with the master key, from the header file of [Add providers and models](#add-providers-and-models):
+- **A service you admit reaches LiteLLM's admin API too.** Its key, not the network, keeps it out: give it a key that LiteLLM refuses on its management routes (`key_type` `llm_api`, below), never the master key. Such a key still reaches LiteLLM's pass-through routes to the providers' own APIs (`/anthropic/…`, `/openai/…`, `/bedrock/…` and more) and its file and batch routes, not only chat completions and embeddings: where LiteLLM holds provider credentials for them, in its environment or on a model marked `use_in_pass_through`, the service reaches the provider's API with them.
+- **LiteLLM's own request fields are not filtered for it.** LiteLLM takes some fields of a request's body as its own: where to send the request and with which credentials, its metadata, a canned answer. Tinfirm removes them, and the tools a provider would run, only from the requests its relay forwards, so a service you admit can steer LiteLLM with them, with the company's provider keys.
+- **It shares LiteLLM with the runs.** A service that floods it slows the model requests of every run.
+
+Tinfirm's own model traffic is filtered in its relay, whoever else you admit.
+
+To admit a service:
+
+- **Helm**: list it in `litellm.from`, as NetworkPolicy peers, for example the namespace of your services:
+
+    ```yaml
+    litellm:
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tools
+    ```
+
+    Its base URL is `http://<release>-litellm.<namespace>.svc:4000/v1`.
+
+- **Compose**: add it to the network `gateway`, and it calls `http://litellm:4000/v1`. A service in an override file of the stack lists `gateway` under its `networks`; a container of another Compose project joins the network by its full name, `tinfirm_gateway`, as an external network. The stack's PostgreSQL is on that network too, behind its passwords.
+
+Give each service a key of its own, with `key_type` `llm_api`, its budget and its models. Create it at LiteLLM's port with the master key, from the header file of [Add providers and models](#add-providers-and-models):
 
 ```sh
 curl -sS http://127.0.0.1:4000/key/generate \
   -H @litellm-auth \
   -H "Content-Type: application/json" \
-  -d '{"key_alias": "service-<name>", "models": ["<embedding model>"],
+  -d '{"key_alias": "service-<name>", "key_type": "llm_api", "models": ["<embedding model>"],
        "max_budget": 20, "budget_duration": "30d"}'
 ```
 
-The model must be one the gateway serves; an embedding model is added like any other. Put the answer's `key` into the service's own secret, and let it call the model port in OpenAI's or Anthropic's format. Unlike the relay, the model port passes `drop_params` as the caller sent it. Its base URL is `http://model-api:4001/v1` (Compose) or `http://<release>-litellm.<namespace>.svc:4001/v1` (Helm). In Kubernetes, admit the service's pods with `litellm.modelApi.from`. Its spend is in LiteLLM under that key, not in Tinfirm. A spent budget answers `429` until `budget_duration` resets it. To rotate a service's key, create a new one, put it into the service, then delete the old one (`POST /key/delete` with `{"keys": ["sk-…"]}`), since `/key/regenerate` is a feature of LiteLLM Enterprise; to revoke it, `/key/block` or `/key/delete`.
+The model must be one the gateway serves; an embedding model is added like any other. Put the answer's `key` into the service's own secret, and let it call LiteLLM in OpenAI's or Anthropic's format. Its spend is in LiteLLM under that key, not in Tinfirm. A spent budget answers `429` until `budget_duration` resets it. To rotate a service's key, create a new one, put it into the service, then delete the old one (`POST /key/delete` with `{"keys": ["sk-…"]}`), since `/key/regenerate` is a feature of LiteLLM Enterprise; to revoke it, `/key/block` or `/key/delete`.
 
 ## LiteLLM's database
 

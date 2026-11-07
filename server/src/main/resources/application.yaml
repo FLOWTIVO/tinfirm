@@ -258,7 +258,7 @@ tinfirm:
     # The model gateway bundled with the deployment (ADR-0059, ADR-0094, CONVENTIONS §4): its product, its address
     # inside the deployment's network, for its admin API, and its admin key (LiteLLM's master key). Unset, none is
     # bundled, and a company configures its own (EXTERNAL). Runner hosts never reach it. The model requests the server
-    # relays and its own go to the model port (ADR-0069), which serves the model API alone; unset, to the admin URL.
+    # relays and its own go to the admin URL too, unless the optional model URL names another address of the gateway.
     # The TINFIRM_LITELLM_* names of these variables are still read when the new ones are unset.
     gateway-vendor: ${TINFIRM_MODEL_GATEWAY_VENDOR:LITELLM}
     gateway-admin-url: ${TINFIRM_MODEL_GATEWAY_ADMIN_URL:${TINFIRM_LITELLM_ADMIN_URL:}}

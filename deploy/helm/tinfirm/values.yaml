@@ -341,12 +341,13 @@ httpRoute:
   # not attach to the same listener: give its parentRefs the https listener's sectionName.
   redirectParentRefs: []
 
-# LiteLLM, the model gateway (ADR-0059; docs/operations/litellm.md). Bundled by default: a
-# Deployment and a ClusterIP Service, with its own database on the external PostgreSQL. Only
-# the server reaches its own port (networkPolicy.litellm); nothing exposes it outside the
-# release, and runner hosts reach only the server, which relays their model requests. The
-# server gets its admin URL, its model port's URL and its master key (TINFIRM_MODEL_GATEWAY_*);
-# without the master key in the Secret, the server bundles no gateway. The operator adds the
+# LiteLLM, the model gateway (ADR-0059, ADR-0110; docs/operations/litellm.md). Bundled by
+# default: a Deployment and a ClusterIP Service, with its own database on the external
+# PostgreSQL. The server reaches its port, and the peers litellm.from names
+# (networkPolicy.litellm); nothing exposes it outside the release, and runner hosts reach
+# only the server, which relays their model requests. The server gets its URL, for the admin
+# API and the model requests alike, and its master key (TINFIRM_MODEL_GATEWAY_*); without
+# the master key in the Secret, the server bundles no gateway. The operator adds the
 # provider keys and models through LiteLLM's admin API; Tinfirm adds none. `enabled: false`
 # for a company that brings its own LiteLLM: an admin then enters its URL and key on
 # Tinfirm's Model access page, and networkPolicy.egress.systems (on the internet) or
@@ -424,58 +425,24 @@ litellm:
       url: ""
   # Always ClusterIP: LiteLLM is never exposed outside the release.
   service:
-    # LiteLLM itself, every route: the server's admin URL. Only the server reaches it.
+    # LiteLLM itself, every route: the server's URL for its admin API and its model
+    # requests, and the one the peers of litellm.from call.
     port: 4000
     annotations: {}
-  # The model port (ADR-0069; model-api/README.md): a container beside LiteLLM in its pod that
-  # serves LiteLLM's model routes alone, each by its exact path, with LiteLLM's own fields
-  # removed from every body, on the Service's port `model`. The company's services call it with
-  # LiteLLM keys of their own (docs/operations/litellm.md); the server sends its model requests
-  # here too (TINFIRM_MODEL_GATEWAY_MODEL_URL).
-  modelApi:
-    image:
-      repository: ghcr.io/flowtivo/tinfirm-model-api
-      # Empty = the server's tag (image.tag, else v<appVersion>): both are released together.
-      tag: ""
-      digest: ""
-      pullPolicy: IfNotPresent
-    # The Service's port of the model routes.
-    port: 4001
-    # The largest request body passed on (MODEL_API_MAX_REQUEST_BYTES); a larger one is 413.
-    maxRequestBytes: 67108864
-    # The most bytes of request bodies held at once (MODEL_API_MAX_INFLIGHT_BYTES), counted as they
-    # arrive, at least twice maxRequestBytes: LiteLLM checks a key only once its body is read, so a
-    # request that would pass it is 429. Keep it well within resources.limits.memory.
-    maxInflightBytes: 134217728
-    # The longest wait for LiteLLM's answer to start, and between two of its parts.
-    idleTimeout: PT10M
-    # Who else may call the model port, as NetworkPolicyPeers (networkPolicy.enabled): the
-    # server always may. E.g. a namespace of your services that call models:
-    #   - namespaceSelector:
-    #       matchLabels:
-    #         kubernetes.io/metadata.name: tools
-    from: []
-    javaToolOptions: "-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
-    # The model port's own user, 10001, as in its image; on OpenShift the SCC's.
-    securityContext:
-      allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: true
-      runAsNonRoot: true
-      runAsUser: 10001
-      runAsGroup: 10001
-      capabilities:
-        drop:
-          - ALL
-      seccompProfile:
-        type: RuntimeDefault
-    resources:
-      requests:
-        cpu: 50m
-        memory: 256Mi
-      limits:
-        memory: 384Mi
-    # More container env entries (name/value or name/valueFrom).
-    extraEnv: []
+  # Who else may call LiteLLM's port, as NetworkPolicyPeers (networkPolicy.enabled), beside
+  # the server, which always may: the company's other services that use the bundled LiteLLM
+  # with LiteLLM keys of their own, at the Service's URL (the install notes print it;
+  # docs/operations/litellm.md). Such a service reaches LiteLLM's admin API too, where only
+  # its key stops it: give it a key that LiteLLM refuses on its management routes
+  # (`key_type: llm_api`), with its budget and models; such a key still serves LiteLLM's
+  # pass-through routes to the providers' own APIs. LiteLLM's own request fields are not
+  # filtered for it, as the server's relay filters Tinfirm's: admit only services trusted
+  # with the company's provider keys.
+  # E.g. a namespace of your services that call models:
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: tools
+  from: []
   # The non-root image's user, 65534, with a read-only root filesystem: LiteLLM writes only
   # to /tmp (tmpVolume), its caches included (XDG_CACHE_HOME). On OpenShift the chart leaves
   # the user to the SCC.
@@ -917,10 +884,10 @@ networkPolicy:
     # own ingress controller), NodeLocal DNSCache.
     extra: []
   # The LiteLLM pods (litellm.enabled), a policy of their own. Ingress: LiteLLM's port 4000
-  # (every route) from the server pods only, and from nothing else: there is no value to
-  # admit more. Egress: DNS and the database as above (port: litellm.database.port, else as
-  # above; with litellm.database.secretKeys.url litellm.database.port only), the model
-  # providers, and litellm.egress.extra (not egress.extra: add NodeLocal DNSCache here too).
+  # (every route) from the server pods and the peers of litellm.from, and from nothing else.
+  # Egress: DNS and the database as above (port: litellm.database.port, else as above; with
+  # litellm.database.secretKeys.url litellm.database.port only), the model providers, and
+  # litellm.egress.extra (not egress.extra: add NodeLocal DNSCache here too).
   litellm:
     egress:
       # The providers' APIs (Anthropic, OpenAI, Bedrock, ...) and LiteLLM's model price list

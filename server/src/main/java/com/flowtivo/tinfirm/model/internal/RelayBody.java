@@ -8,10 +8,10 @@ import tools.jackson.databind.json.JsonMapper;
 
 /**
  * A relayed request's body as the gateway gets it (the package 2 contract, §6.1): without LiteLLM's own fields at its
- * top level ({@link LiteLlmRequests}, shared with the gateway's model port), whatever the gateway's vendor, and for a
- * LiteLLM with {@code "drop_params": true} added last, so that LiteLLM drops a parameter the model's provider does not
- * take (a runtime's {@code reasoning_effort} for a model LiteLLM does not know to reason, say) instead of refusing the
- * request and failing the turn; v1.105.1 does so by itself only for Claude Code and Codex, by their {@code User-Agent}.
+ * top level ({@link LiteLlmRequests}), whatever the gateway's vendor, and for a LiteLLM with
+ * {@code "drop_params": true} added last, so that LiteLLM drops a parameter the model's provider does not take (a
+ * runtime's {@code reasoning_effort} for a model LiteLLM does not know to reason, say) instead of refusing the request
+ * and failing the turn; v1.105.1 does so by itself only for Claude Code and Codex, by their {@code User-Agent}.
  * A run's own {@code drop_params} and {@code additional_drop_params} then do not count. Another vendor's gateway gets
  * no {@code drop_params} from Tinfirm: it is LiteLLM's own control, which a provider given the body as it came refuses.
  * The body must be one JSON object without a repeated top-level name (LiteLLM would take the last {@code model},

@@ -19,7 +19,7 @@ body:
         - Server (REST API, MCP endpoints, triggers, chats)
         - Web app
         - Runner host
-        - Model port or LiteLLM
+        - Model gateway (LiteLLM)
         - Outlook add-in or Gmail add-on
         - Helm chart
         - Compose stack
@@ -34,10 +34,10 @@ body:
     attributes:
       label: Version
       description: >-
-        The release (`v0.1.0`), the image tag (`sha-<commit>`), the version of a `rolling` asset, or the commit.
+        The release (`v1.0.0`), the image tag (`sha-<commit>`), the version of a `rolling` asset, or the commit.
         The server reports its version and commit at `GET /api/system/info`; `tinfirm-runner-host --version`
         prints the runner host's.
-      placeholder: v0.1.0
+      placeholder: v1.0.0
     validations:
       required: true
   - type: dropdown

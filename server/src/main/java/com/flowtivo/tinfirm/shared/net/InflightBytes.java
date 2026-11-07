@@ -4,11 +4,10 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The bytes of request bodies a process holds in memory at once, at most {@code max}: the server's model relay
- * ({@code tinfirm.model.relay-max-inflight-bytes}, CONVENTIONS §15.4) and the model port beside LiteLLM
- * ({@code MODEL_API_MAX_INFLIGHT_BYTES}, ADR-0069). A request takes its share as it reads its body, twice the body (as
- * received, and as written anew without LiteLLM's fields), keeps the body as written anew while the answer streams
- * (the forwarded request holds it), and gives all of it back when it ends. A share that would go beyond the cap is not
- * taken: the caller answers the request 429, before it reads more of it.
+ * ({@code tinfirm.model.relay-max-inflight-bytes}, CONVENTIONS §15.4). A request takes its share as it reads its body,
+ * twice the body (as received, and as written anew without LiteLLM's fields), keeps the body as written anew while the
+ * answer streams (the forwarded request holds it), and gives all of it back when it ends. A share that would go beyond
+ * the cap is not taken: the caller answers the request 429, before it reads more of it.
  */
 public final class InflightBytes {
 

@@ -2,9 +2,9 @@
 
 This page keeps a Tinfirm installation current and its secrets fresh: upgrading the Helm release and LiteLLM, backing up before you do, rotating each Secret, upgrading runner hosts, and the same tasks on the Compose stack. It is for the operators who installed Tinfirm with [Helm](helm.md) or [Docker Compose](quick-start.md).
 
-!!! warning "No release yet"
+!!! info "Read the release notes first"
 
-    No version of Tinfirm is released yet: the development branch publishes charts `0.0.0-sha-<commit>` and images tagged `sha-<commit>`, which are not releases ([What is not signed](verify-images.md#what-is-not-signed)). The steps below work the same for them.
+    Each release's notes, on its page of [Tinfirm's GitHub Releases](https://github.com/FLOWTIVO/tinfirm/releases), say what to do before and after you upgrade to it. v1.0.0 is the first release: its notes list the steps for an installation that ran a development build. The development branch's charts `0.0.0-sha-<commit>` and images tagged `sha-<commit>` are not releases ([What is not signed](verify-images.md#what-is-not-signed)); the steps below work the same for them.
 
 ## Before you upgrade
 
@@ -34,6 +34,8 @@ What happens:
 
 A change to the chart's non-secret configuration rolls the pods by itself: the pod template carries a checksum of the server's ConfigMap. A change to a Secret does not ([Rotate a Secret](#rotate-a-secret)).
 
+From a development chart with the model port (`model-api`, before the change that removed it), Helm refuses a values file that still sets `litellm.modelApi`: move its `from` to `litellm.from` and drop the rest. The services those peers run then call `http://<release>-litellm.<namespace>.svc:4000/v1` instead of port 4001, and reach LiteLLM's admin API there too: give each a key made with `key_type` `llm_api` before it moves ([The company's own services](model-gateway.md#the-companys-own-services)).
+
 ### Roll back
 
 `helm rollback` puts back the previous chart and image, but not the database: the older server may not start on a schema the newer one migrated. To go back after a migration:
@@ -46,7 +48,7 @@ When you can, fix forward with the next version instead.
 
 ### Upgrade LiteLLM
 
-The chart pins LiteLLM's image by tag and digest, and a Tinfirm release moves the pin: the server and the model port are checked against that version of LiteLLM. Keep the pinned version unless a release changes it.
+The chart pins LiteLLM's image by tag and digest, and a Tinfirm release moves the pin: the server is checked against that version of LiteLLM. Keep the pinned version unless a release changes it.
 
 LiteLLM migrates its own database when it starts with a new image, and does not start when the migration fails. Back up the `litellm` database before an upgrade that changes `litellm.image`. Its startup probe allows 10 minutes. The server keeps working while LiteLLM restarts, but model requests fail until LiteLLM is ready again: upgrade it when few turns run.
 
@@ -176,34 +178,30 @@ A dump is a backup of one moment, unlike point-in-time recovery: take one before
 
 ### Upgrade the stack
 
-From a checkout of the repository, take the new version and rebuild:
+From the Compose files of a release ([Try Tinfirm with Docker Compose](quick-start.md#1-start-the-stack)): download and check the new release's `tinfirm-compose-<version>.tar.gz` against its signed `SHA256SUMS` as there, and unpack it beside the old directory. Copy your `.env` into the new directory, and name the new release's image in it, by the digest you verified ([Verify your images](verify-images.md)):
+
+```sh title=".env"
+TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server@sha256:<digest>   # the image tagged v<version>
+```
+
+Then start the new version from the new directory. Compose recreates the containers that changed and keeps the volumes, which belong to the project `tinfirm` whatever the directory:
+
+```sh
+docker compose up -d --no-build --remove-orphans
+```
+
+From a checkout of the repository, for development, take the new commit and rebuild:
 
 ```sh
 git pull
 make up
 ```
 
-`make up` builds the server and the model port from the checkout, under the names `tinfirm-server:local` and `tinfirm-model-api:local`, and recreates the containers that changed.
+`make up` builds the server from the checkout, under the name `tinfirm-server:local`, and recreates the containers that changed. To run a published image from a checkout instead, name it in `deploy/compose/.env` as above and start without building: `docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env up -d --no-build --remove-orphans`. Do not mix the two ways: `make up` builds and tags whatever image `.env` names.
 
-To run published images instead, pull them by digest, name them in `.env`, and start without building:
+A stack that ran a development build with the model port (`model-api`) keeps that container running after `make up`: remove it with `--remove-orphans`, as in the commands above. Nothing reads the `TINFIRM_MODEL_API_*` lines of `.env` any more: remove them.
 
-```sh
-docker pull ghcr.io/flowtivo/tinfirm-server@sha256:<digest>
-docker pull ghcr.io/flowtivo/tinfirm-model-api@sha256:<digest>
-```
-
-```sh title="deploy/compose/.env"
-TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server@sha256:<digest>
-TINFIRM_MODEL_API_IMAGE=ghcr.io/flowtivo/tinfirm-model-api@sha256:<digest>
-```
-
-```sh
-docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env up -d --no-build --remove-orphans
-```
-
-Set both images: without `TINFIRM_MODEL_API_IMAGE`, the stack looks for a local build of the model port and cannot start it. Do not mix the two ways: `make up` builds and tags whatever images `.env` names.
-
-Use the Compose files of the same version as the images, and keep your `.env`. When Compose stops with `required variable … is missing a value`, the new version needs a setting your `.env` lacks: copy it from `.env.example`, with a value of your own for every secret.
+Use the Compose files of the same version as the image, and keep your `.env`. When Compose stops with `required variable … is missing a value`, the new version needs a setting your `.env` lacks: copy it from `.env.example`, with a value of your own for every secret.
 
 The server migrates the database when it starts, as on Kubernetes. Nothing rolls back by itself. To go back to an older version after a migration, restore the dump you took before the upgrade, then start the older version:
 

@@ -47,7 +47,7 @@ Changing any character of a key breaks its signature, and the server refuses it.
 | `auditExportUntil` | The last day the audit's export stays after the licence expired, 90 days after `graceEndsAt` |
 | `seats` | `licensed`, the seats of the key in force (empty when nothing is counted), and `used`, the people who hold Owner, Admin or Member in any company, each once |
 | `companiesLicensed` | The companies the instance may run: 1, except under Enterprise; empty for no cap |
-| `features` | The paid features in force now, such as `OUTLOOK_ADDIN`, `AUDIT_TOOLS` or `LEGAL_HOLDS` |
+| `features` | The paid features in force now, such as `OUTLOOK_ADDIN`, `AUDIT_TOOLS` or `LEGAL_HOLDS`. Under an Enterprise key it also lists `SIEM`, `HA` and `AIR_GAPPED`, which are planned and not built in 1.0 ([Editions and prices](../admin-guide/editions.md)) |
 
 | State | Meaning |
 |---|---|

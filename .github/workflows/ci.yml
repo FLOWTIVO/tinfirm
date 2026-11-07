@@ -26,7 +26,7 @@ name: CI
 # Beyond this workflow, the macOS build of the release assets needs a macOS runner
 # (runner-artifacts.yml). The release's signing and image builds take a label of their own
 # (release.yml: vars.CI_RELEASE_RUNNER, else `ubuntu-latest`).
-# BuildKit cache mounts are scoped: every `id=` in Dockerfile, model-api/Dockerfile and
+# BuildKit cache mounts are scoped: every `id=` in Dockerfile and
 # deploy/release/runner-musl.Dockerfile ends in the build argument CACHE_SCOPE, `main` for
 # builds of main and hotfix branches (pushes, the release gate, the release) and `pr` for
 # everything else (env CACHE_SCOPE below), so a pull request's build, or a dependency it
@@ -113,34 +113,6 @@ jobs:
           path: |
             server/target/surefire-reports/
             server/target/failsafe-reports/
-          if-no-files-found: ignore
-          retention-days: 14
-
-  model-api:
-    name: Model API · verify
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || vars.CI_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        with:
-          distribution: temurin
-          java-version: '25'
-          cache: maven
-          cache-dependency-path: model-api/pom.xml
-      # The model port (ADR-0069): its tests against a fake LiteLLM on localhost, and the shared
-      # libraries' own (libs/litellm, libs/net).
-      - name: Verify
-        working-directory: model-api
-        run: ./mvnw -B -ntp verify
-      - name: Keep the test reports
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: model-api-test-reports
-          path: model-api/target/surefire-reports/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -450,14 +422,12 @@ jobs:
           TINFIRM_ACME_ISSUER_URI=https://sso.example.com TINFIRM_ACME_CLIENT_ID=lint TINFIRM_ACME_CLIENT_SECRET=lint \
             "${compose[@]}" -f deploy/compose/compose.companies.example.yaml config --quiet
       # Dependabot bumps the Compose file's LiteLLM alone. The chart's goes with it, and the
-      # shared filter of LiteLLM's fields with both (libs/litellm, LiteLlmRequests, which the
-      # server's relay and the model port use): it removes the new version's
-      # all_litellm_params, which libs/litellm/src/test/resources/litellm/all-litellm-params.txt
-      # lists.
+      # filter of LiteLLM's fields with both (LiteLlmRequests, which the server's relay
+      # applies): it removes the new version's all_litellm_params, which
+      # server/src/test/resources/litellm/all-litellm-params.txt lists.
       - name: LiteLLM pin (the chart's is the Compose file's)
         run: |
           set -euo pipefail
-          # LiteLLM's container only: the model port (model-api) runs in the same pod.
           chart=$(helm template tinfirm deploy/helm/tinfirm --show-only templates/litellm-deployment.yaml \
             | sed -n 's/^ *image: "\(.*\/berriai\/litellm-non_root:.*\)"$/\1/p')
           compose=$(docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env.example \
@@ -500,7 +470,7 @@ jobs:
           "$dir/bin/actionlint" -version | head -n 1
       - name: Dockerfile lint (hadolint)
         timeout-minutes: 2
-        run: hadolint Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile model-api/Dockerfile docs-site/Dockerfile
+        run: hadolint Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile
       - name: Shell script lint (shellcheck)
         timeout-minutes: 2
         run: |
@@ -554,37 +524,10 @@ jobs:
         # a bean that cannot be created or a migration that fails (CONTRIBUTING §5).
         timeout-minutes: 8
         run: deploy/compose/smoke.sh "$TAG" 240
-      # The image of the model port (ADR-0069): the same runtime contract as the server's, with
-      # its own ports.
-      - name: Build the model port
-        run: |
-          set -euo pipefail
-          model_api="tinfirm-model-api:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "SERVICE_TAGS=$model_api" >> "$GITHUB_ENV"
-          check() {
-            local tag="$1" dockerfile="$2" first="$3" second="$4" user ports
-            docker build --progress=plain -f "$dockerfile" \
-              --build-arg "REVISION=${GITHUB_SHA}" \
-              --build-arg "CACHE_SCOPE=${CACHE_SCOPE}" \
-              -t "$tag" .
-            user="$(docker image inspect --format '{{.Config.User}}' "$tag")"
-            ports="$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$tag")"
-            echo "$tag: user=$user ports=$ports"
-            [ "$user" = "10001:10001" ] || { echo "::error::$tag runs as '$user', expected 10001:10001"; exit 1; }
-            case "$ports" in *"\"$first/tcp\""*"\"$second/tcp\""*) ;; *) echo "::error::$tag must expose $first and $second"; exit 1 ;; esac
-            docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
-              --security-opt no-new-privileges:true \
-              --entrypoint java "$tag" -version
-            docker run --rm --read-only --entrypoint test "$tag" -s /app/application.jar
-            docker run --rm --read-only --entrypoint sh "$tag" -c \
-              'for f in LICENSE THIRD-PARTY-model-api.txt; do test -s "/licenses/$f" || { echo "no /licenses/$f" >&2; exit 1; }; done'
-          }
-          check "$model_api" model-api/Dockerfile 4001 4002
-      - name: Remove the images
+      - name: Remove the image
         if: always()
         run: |
           if [ -n "${TAG:-}" ]; then docker image rm "$TAG" || true; fi
-          for tag in ${SERVICE_TAGS:-}; do docker image rm "$tag" || true; done
 
   runner:
     name: Runner · test, clippy, fmt
@@ -713,14 +656,14 @@ jobs:
             docker image rm "${IMAGE}:${tag}" 2>/dev/null || true
           done
 
-  # The images of the model port (ADR-0069) and of the runner host for the chart's runner pod
-  # (ADR-0101, decision 8, the last stage of runner-musl.Dockerfile), as `publish` does the
-  # server's: sha-<sha>, and `main` while main has not moved on. A job of its own, so that the
-  # server's publishing and rolling never wait on it; `main-complete` does, because the
-  # chart's model port and runner images follow `image.tag`.
+  # The image of the runner host for the chart's runner pod (ADR-0101, decision 8, the last
+  # stage of runner-musl.Dockerfile), as `publish` does the server's: sha-<sha>, and `main`
+  # while main has not moved on. A job of its own, so that the server's publishing and
+  # rolling never wait on it; `main-complete` does, because the chart's runner image follows
+  # `image.tag`.
   publish-services:
     name: Publish · ${{ matrix.name }} image (main)
-    needs: [model-api, helm, image, runner]
+    needs: [helm, image, runner]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
@@ -728,8 +671,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: model-api
-            dockerfile: model-api/Dockerfile
           - name: runner-host
             dockerfile: deploy/release/runner-musl.Dockerfile
     concurrency:
@@ -891,14 +832,14 @@ jobs:
       runner: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
 
   # `main-complete` marks the newest commit of main that is published whole: its server image
-  # (publish), its model port's and runner host's images (publish-services) and the rolling
-  # prerelease (rolling). It is a tag of the server image's own package,
+  # (publish), its runner host's image (publish-services) and the rolling prerelease
+  # (rolling). It is a tag of the server image's own package,
   # ghcr.io/flowtivo/tinfirm-server, beside sha-<sha> and `main`, on this commit's image,
   # whose label org.opencontainers.image.revision names the commit.
   # A deployment repository can follow it on its own schedule (ADR-0107); this repository
-  # holds no key to one. After `publish-services`: the chart's
-  # `litellm.modelApi.image.tag` and `runner.image.tag` default to `image.tag`, so a commit
-  # named before its model port image exists leaves the model port in ImagePullBackOff.
+  # holds no key to one. After `publish-services`: the chart's `runner.image.tag` defaults
+  # to `image.tag`, so a commit named before its runner host image exists leaves the runner
+  # pod in ImagePullBackOff.
   # After `rolling`: runner-only hosts on auto-deploy install the runner host of the
   # revision the server reports, from `rolling` (docs/operations/auto-deploy.md, section 8).
   # A failed `publish-services` or `rolling` skips this job (no `always()` here). Only while

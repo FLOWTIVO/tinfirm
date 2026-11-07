@@ -642,33 +642,7 @@
             "annotations": { "type": "object" }
           }
         },
-        "modelApi": {
-          "description": "The model port beside LiteLLM (ADR-0069).",
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "image": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["repository"],
-              "properties": {
-                "repository": { "type": "string", "minLength": 1 },
-                "tag": { "description": "Empty = the server's tag", "type": "string", "pattern": "^([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$" },
-                "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" },
-                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
-              }
-            },
-            "port": { "$ref": "#/definitions/port" },
-            "maxRequestBytes": { "type": "integer", "minimum": 1024 },
-            "maxInflightBytes": { "description": "At least twice maxRequestBytes", "type": "integer", "minimum": 2048 },
-            "idleTimeout": { "$ref": "#/definitions/isoDuration" },
-            "from": { "description": "More NetworkPolicyPeers that may call the model port", "$ref": "#/definitions/peers" },
-            "javaToolOptions": { "type": "string" },
-            "securityContext": { "type": "object" },
-            "resources": { "type": "object" },
-            "extraEnv": { "type": "array", "items": { "type": "object", "required": ["name"] } }
-          }
-        },
+        "from": { "description": "More NetworkPolicyPeers that may call LiteLLM's port, beside the server's pods", "$ref": "#/definitions/peers" },
         "podSecurityContext": { "type": "object" },
         "securityContext": { "type": "object" },
         "tmpVolume": {

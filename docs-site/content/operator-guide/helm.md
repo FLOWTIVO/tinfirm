@@ -2,11 +2,11 @@
 
 This page installs Tinfirm on Kubernetes with the Helm chart `tinfirm`: the Secrets to create first, the values that matter, the install itself, how to check it, and the network policy the chart puts around the server. It is for operators who know Kubernetes, Helm and PostgreSQL.
 
-The chart deploys the server and, unless you turn it off, the bundled LiteLLM with its model port, and, if you turn it on, a runner host whose sandboxes are VMs ([The runner pod](#the-runner-pod)). It deploys no database and creates no Secret: you prepare PostgreSQL ([Prepare PostgreSQL](database.md)) and create the Secrets yourself.
+The chart deploys the server and, unless you turn it off, the bundled LiteLLM, and, if you turn it on, a runner host whose sandboxes are VMs ([The runner pod](#the-runner-pod)). It deploys no database and creates no Secret: you prepare PostgreSQL ([Prepare PostgreSQL](database.md)) and create the Secrets yourself.
 
-!!! warning "No release yet"
+!!! info "Releases and development builds"
 
-    No version of Tinfirm is released yet. Each commit on the development branch publishes a chart `0.0.0-sha-<commit>` and images tagged `sha-<commit>`: they are not releases, and they are not signed as releases are ([What is not signed](verify-images.md#what-is-not-signed)). Use them to evaluate Tinfirm, and run a release in production once one exists.
+    This page installs a release. The current one is v1.0.0: chart `1.0.0`, whose defaults run the images tagged `v1.0.0`, all signed with FLOWTIVO's key ([Verify your images](verify-images.md)). Each commit on the development branch also publishes a chart `0.0.0-sha-<commit>` and images tagged `sha-<commit>`. That is a development channel for trying changes before they are released: those builds are not releases, and they are not signed as releases are ([What is not signed](verify-images.md#what-is-not-signed)). Run a release in production.
 
 ## Before you start
 
@@ -15,7 +15,7 @@ The chart deploys the server and, unless you turn it off, the bundled LiteLLM wi
 | Kubernetes | 1.29 or later |
 | Helm | 4 |
 | PostgreSQL | 18, outside the chart, with the roles `tinfirm_owner` and `tinfirm_app`, and a database and role of its own for LiteLLM: [Prepare PostgreSQL](database.md) |
-| A host name | For example `tinfirm.example.com`, with a TLS certificate. People, AI clients, runner hosts, chat platforms and webhook senders all reach the server there. LiteLLM needs none: only the server reaches it. |
+| A host name | For example `tinfirm.example.com`, with a TLS certificate. People, AI clients, runner hosts, chat platforms and webhook senders all reach the server there. LiteLLM needs none: it is reached inside the cluster only. |
 | An ingress controller or a Gateway | In the cluster: any Ingress controller, such as Traefik, NGINX, HAProxy, a cloud load balancer's or OpenShift's router, or a Gateway API implementation ([Gateway API](#gateway-api)). Name it in the network policy, so that nothing else reaches the server ([Ingress to the server](#ingress-to-the-server)). |
 | The Secrets | In the release's namespace, before you install ([Create the Secrets](#create-the-secrets)) |
 
@@ -74,19 +74,18 @@ Use the same passwords when you create the database roles, and sign in the first
 
 ## Choose the values
 
-Write your values into a file, such as `values-prod.yaml`. `helm show values oci://ghcr.io/flowtivo/charts/tinfirm --version <version>` prints every value of a version with its default, and the chart's schema refuses a value of the wrong shape before anything is applied. [Server configuration](../reference/configuration.md) lists the server variable behind each value.
+Write your values into a file, such as `values-prod.yaml`. `helm show values oci://ghcr.io/flowtivo/charts/tinfirm --version 1.0.0` prints every value of a version, here v1.0.0's, with its default, and the chart's schema refuses a value of the wrong shape before anything is applied. [Server configuration](../reference/configuration.md) lists the server variable behind each value.
 
 ### Image
 
 | Value | Default | Meaning |
 |---|---|---|
-| `image.tag` | empty | The server image's tag. Empty means the chart's own image: a release's chart runs that release's image, `v<version>`, and a development chart `0.0.0-sha-<commit>` the images `sha-<commit>`. |
+| `image.tag` | empty | The server image's tag. Leave it empty: the chart then runs its own image, so chart `1.0.0` runs `v1.0.0`, and a development chart `0.0.0-sha-<commit>` the images `sha-<commit>`. If you set it, name the chart's own version, `v1.0.0`. |
 | `image.repository` | `ghcr.io/flowtivo/tinfirm-server` | Point it at your registry when you mirror the images |
 | `image.digest` | empty | `sha256:…`. Set, the chart pulls the image as tag and digest. |
 | `imagePullSecrets` | `[]` | For a private registry |
-| `litellm.modelApi.image.repository`, `.tag`, `.digest` | `ghcr.io/flowtivo/tinfirm-model-api`, the server's tag, empty | The model port's image, released with the server |
 
-Deploy by digest, the digests you verified ([Verify your images](verify-images.md)): set both `image.digest` and `litellm.modelApi.image.digest`, or the model port's image is still pulled by its tag.
+Deploy by digest, the digests you verified ([Verify your images](verify-images.md)): set `image.digest`, and `runner.image.digest` with the runner pod, or an image is still pulled by its tag alone.
 
 ### Public URL
 
@@ -306,9 +305,9 @@ The server serves Prometheus metrics at `/actuator/prometheus` on port 8081, whi
 
 ## The bundled model gateway
 
-By default the chart deploys LiteLLM as the model gateway, beside the server: a Deployment and a Service named `<release>-litellm`. Its own port 4000, with every route, is for the server alone, which manages its keys and budgets through the admin API with the master key. The container `model-api` in the same pod serves LiteLLM's model routes alone on port 4001: the server sends its model requests there, and so may the company's other services, with LiteLLM keys of their own. Runner hosts never reach LiteLLM: the server relays their model requests.
+By default the chart deploys LiteLLM as the model gateway, beside the server: a Deployment and a Service named `<release>-litellm`. Its own port 4000, with every route, is the server's, which manages its keys and budgets through the admin API with the master key and sends its model requests there too. The company's other services reach it only where you admit them in `litellm.from`, with LiteLLM keys of their own ([The company's own services](model-gateway.md#the-companys-own-services)). Runner hosts never reach LiteLLM: the server relays their model requests.
 
-Nothing exposes LiteLLM outside the release: its Service is always `ClusterIP`, the chart has no Ingress for it, and its network policy admits the server to both ports and nobody else to port 4000. You add the provider keys and the models through its admin API: [Run the model gateway](model-gateway.md).
+Nothing exposes LiteLLM outside the release: its Service is always `ClusterIP`, the chart has no Ingress for it, and its network policy admits to its port the server's pods and the peers of `litellm.from`, and nobody else. You add the provider keys and the models through its admin API: [Run the model gateway](model-gateway.md).
 
 | Value | Default | Meaning |
 |---|---|---|
@@ -316,21 +315,16 @@ Nothing exposes LiteLLM outside the release: its Service is always `ClusterIP`, 
 | `litellm.image.repository`, `.tag`, `.digest` | LiteLLM's non-root image, `ghcr.io/berriai/litellm-non_root`, pinned by tag and digest | Change them only with a Tinfirm release that names the new version |
 | `litellm.tmpVolume.sizeLimit` | `256Mi` | `/tmp`, the only path LiteLLM writes to, its caches included |
 | `litellm.replicaCount` | `1` | Keep one: without a shared Redis, which the chart does not run, several replicas would each count request limits and recent spend on their own |
-| `litellm.adminUi` | `false` | LiteLLM's admin UI at `/ui`, reachable only through a port-forward. The admin API stays either way. |
+| `litellm.adminUi` | `false` | LiteLLM's admin UI at `/ui`, reached like the admin API: through a port-forward, and by the peers of `litellm.from`. The admin API stays either way. |
 | `litellm.existingSecret`, `litellm.secretKeys.*` | `tinfirm-litellm` | [Create the Secrets](#create-the-secrets) |
 | `litellm.database.*` | the database `litellm`, role `litellm`, on `database.host` with the same TLS settings | [Connect LiteLLM to its database](database.md#connect-litellm-to-its-database) |
 | `litellm.service.port` | `4000` | LiteLLM's own port on the Service, the one the server's admin address names |
 | `litellm.resources` | request 250m CPU and 1Gi, limit 2Gi | |
 | `litellm.probes.startup` | up to 10 minutes | The first start migrates LiteLLM's empty database |
 | `litellm.extraEnv` | `[]` | More LiteLLM variables, for example `LITELLM_LOCAL_MODEL_COST_MAP=True` where LiteLLM cannot fetch its price list from GitHub |
-| `litellm.modelApi.port` | `4001` | The model port on the Service |
-| `litellm.modelApi.maxRequestBytes` | 64 MiB | The largest request body passed on; larger is `413` |
-| `litellm.modelApi.maxInflightBytes` | 128 MiB | The most bytes of request bodies held at once, at least twice `maxRequestBytes`; beyond, `429`. Keep it within the container's memory limit. |
-| `litellm.modelApi.idleTimeout` | `PT10M` | The longest wait for LiteLLM's answer to start, and between two of its parts |
-| `litellm.modelApi.from` | `[]` | More network policy peers that may call the model port, such as the namespace of your services. The server always may. |
-| `litellm.modelApi.resources` | request 50m CPU and 256Mi, limit 384Mi | |
+| `litellm.from` | `[]` | More network policy peers that may call LiteLLM's port, such as the namespace of your services. The server always may. A peer reaches LiteLLM's admin API too, held off by its key alone, and LiteLLM's own request fields are not filtered for it: admit only services trusted with the company's provider keys ([The company's own services](model-gateway.md#the-companys-own-services)). |
 
-LiteLLM runs from its non-root image as user 65534, the model port as user 10001, both with a read-only root filesystem, no capabilities and no privilege escalation ([OpenShift and Pod Security](#openshift-and-pod-security)).
+LiteLLM runs from its non-root image as user 65534, with a read-only root filesystem, no capabilities and no privilege escalation ([OpenShift and Pod Security](#openshift-and-pod-security)).
 
 ## The runner pod
 
@@ -448,11 +442,11 @@ networkPolicy:
           app.kubernetes.io/name: ingress-nginx
 ```
 
-Install it with the chart's version, or with the chart's digest after you verified it ([Verify the Helm chart](verify-images.md#verify-the-helm-chart)):
+Install it with the release's chart version, `1.0.0` for v1.0.0, or with the chart's digest after you verified it ([Verify the Helm chart](verify-images.md#verify-the-helm-chart)):
 
 ```sh
 helm upgrade --install tinfirm oci://ghcr.io/flowtivo/charts/tinfirm \
-  --version <version> \
+  --version 1.0.0 \
   --namespace tinfirm \
   --values values-prod.yaml
 ```
@@ -525,7 +519,7 @@ An empty `podSelector` admits the whole namespace. `networkPolicy.ingress.extraF
 |---|---|---|
 | DNS | `networkPolicy.egress.dns` | The `kube-dns` pods in `kube-system`, port 53 |
 | PostgreSQL | `networkPolicy.egress.database.to`, `.port` | Any address on the database port. Narrow it to your database. |
-| The bundled LiteLLM | none | LiteLLM's pods, ports 4000 and 4001 |
+| The bundled LiteLLM | none | LiteLLM's pods, port 4000 |
 | Identity providers | `networkPolicy.egress.oidc.to`, `.ports` | Any address on port 443, only while `auth.oidc.providers` is not empty |
 | The internet over https | `networkPolicy.egress.systems.to`, `.ports` | Port 443 on every public IPv4 and IPv6 address: not the private, shared, unique local, site-local, loopback, link-local, unspecified, multicast or reserved ranges, nor the special-use ranges no internet host is in (documentation, benchmarking, IETF protocol assignments, discard-only), nor the local-use translation prefix `64:ff9b:1::/48`. `to: []` drops the rule. |
 | Everything else | `networkPolicy.egress.extra` | Nothing |
@@ -575,8 +569,7 @@ LiteLLM's pods have a policy of their own:
 
 | Direction | Peers | Ports |
 |---|---|---|
-| Ingress | The server's pods, and nothing else; no value adds a peer | 4000, LiteLLM itself |
-| Ingress | The server's pods and `litellm.modelApi.from` | 4001, the model port |
+| Ingress | The server's pods, and the peers of `litellm.from`, none by default | 4000, LiteLLM itself |
 | Egress | DNS, and PostgreSQL through `networkPolicy.egress.database.to` | 53, and LiteLLM's database port |
 | Egress | The model providers: `networkPolicy.litellm.egress.providers.to`, `.ports` | Any address on 443 by default: the providers' APIs and LiteLLM's price list on `raw.githubusercontent.com`. Narrow it to your proxy or private endpoints if you have them. |
 | Egress | `networkPolicy.litellm.egress.extra` | Nothing. `networkPolicy.egress.extra` does not apply here: add NodeLocal DNSCache here too. |

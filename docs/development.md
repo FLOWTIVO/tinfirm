@@ -3,7 +3,7 @@
 This guide explains how to work on the server and the web app on your machine.
 Setup steps and pre-PR checks are in [CONTRIBUTING.md](../CONTRIBUTING.md). The binding rules are in [CONVENTIONS.md](CONVENTIONS.md).
 
-`main` runs the redesign of 2026-10-12 ([PLATFORM.md](PLATFORM.md)). Nothing is released yet. The runner host and the model port have their own guides: [runner/README.md](../runner/README.md) and [model-api/README.md](../model-api/README.md).
+`main` runs the redesign of 2026-10-12 ([PLATFORM.md](PLATFORM.md)). Releases are cut by hand (`.github/workflows/release.yml`); v1.0.0 is the first, and [CHANGELOG.md](../CHANGELOG.md) records each. `main` is the development channel between them. The runner host has its own guide: [runner/README.md](../runner/README.md).
 
 ## 1. Layout
 
@@ -18,9 +18,8 @@ Setup steps and pre-PR checks are in [CONTRIBUTING.md](../CONTRIBUTING.md). The 
 | `web/e2e/` | Playwright end-to-end tests | Playwright |
 | `runner/` | The runner host (a Cargo workspace) and the sandbox images | Cargo |
 | `protocol/` | Runner protocol schemas: `runner-v1.schema.json`, `runner-v2.schema.json` | — |
-| `model-api/` | The model port, one Maven module (`tinfirm-model-api`) | Maven wrapper `./mvnw` |
-| `libs/` | Shared sources (`jira`, `net`, `litellm`) that the builds of the server and the model port compile in, with their tests | Maven, through each module |
-| `deploy/compose/compose.yaml` | Local stack: `postgres`, `litellm-db` (creates LiteLLM's database, then exits), `litellm`, `model-api`, `server`, and `keycloak` in profile `oidc` | Docker Compose |
+| `libs/jira/` | The shared Jira library, whose sources and tests the server's build compiles in | Maven, through `server/` |
+| `deploy/compose/compose.yaml` | Local stack: `postgres`, `litellm-db` (creates LiteLLM's database, then exits), `litellm`, `server`, and `keycloak` in profile `oidc` | Docker Compose |
 | `deploy/compose/compose.oidc.yaml` | The server's OIDC settings for the dev Keycloak. `make up-oidc` adds it. | Docker Compose |
 | `deploy/compose/compose.entra.yaml` | Example OIDC settings for a Microsoft Entra ID tenant ([operations/entra-id.md](operations/entra-id.md)) | Docker Compose |
 | `deploy/compose/.env.example` | Development-only defaults. `make` copies it to `.env` (git-ignored) when `.env` is missing. | — |
@@ -48,7 +47,7 @@ Server modules (Spring Modulith, CONVENTIONS §10) are the 20 top-level packages
 | Work on the server | `make dev-db`, plus `./mvnw spring-boot:run` in `server/` | <http://localhost:8080> |
 | Work on the web app | A running server (either way above), plus `npm start` in `web/` | <http://localhost:4200> |
 
-`make logs` follows the logs (`SERVICE=server|postgres|litellm|model-api|keycloak` for one service). `make down` stops and removes everything, Keycloak included, and keeps the volumes.
+`make logs` follows the logs (`SERVICE=server|postgres|litellm|keycloak` for one service). `make down` stops and removes everything, Keycloak included, and keeps the volumes.
 
 Compose publishes these ports on `127.0.0.1` only (CONVENTIONS §12):
 
@@ -56,13 +55,12 @@ Compose publishes these ports on `127.0.0.1` only (CONVENTIONS §12):
 |---|---|
 | 8080 | Server: API, OIDC endpoints, SPA |
 | 5432 | PostgreSQL |
-| 4000 | LiteLLM's admin and model API (the operator's) |
-| 4001 | The model port `model-api`: LiteLLM's model routes alone, for a service run from your IDE with a LiteLLM key of its own ([model-api/README.md](../model-api/README.md)) |
+| 4000 | LiteLLM's admin and model API: for the operator, and for a service you run from your IDE with a LiteLLM key of its own ([Run the model gateway](../docs-site/content/operator-guide/model-gateway.md#the-companys-own-services)) |
 | 8180 | Keycloak (profile `oidc`) |
 
-> **Port already in use?** Set `TINFIRM_HTTP_HOST_PORT`, `TINFIRM_DB_HOST_PORT`, `TINFIRM_LITELLM_HOST_PORT` and `TINFIRM_MODEL_API_HOST_PORT` in `deploy/compose/.env`, and set `TINFIRM_PUBLIC_URL` to the same HTTP port (for example `http://localhost:18080`). The Keycloak client's redirect URI follows `TINFIRM_PUBLIC_URL`. Keycloak itself must stay on 8180, because its issuer URL is fixed.
+> **Port already in use?** Set `TINFIRM_HTTP_HOST_PORT`, `TINFIRM_DB_HOST_PORT` and `TINFIRM_LITELLM_HOST_PORT` in `deploy/compose/.env`, and set `TINFIRM_PUBLIC_URL` to the same HTTP port (for example `http://localhost:18080`). The Keycloak client's redirect URI follows `TINFIRM_PUBLIC_URL`. Keycloak itself must stay on 8180, because its issuer URL is fixed.
 
-Compose does not publish the health and management ports: the server's 8081 and the model port's 4002.
+Compose does not publish the server's health and management port, 8081.
 
 ### 2.1 Server against the Compose database
 
@@ -173,7 +171,7 @@ Notes:
 | `TINFIRM_SESSION_MAX_AGE` | default `P7D` | Absolute session lifetime, checked on every request |
 | `SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES` | unset | Trusted proxies for `X-Forwarded-For`. Unset means Tomcat's default (private ranges). Never set it to an empty string: Spring Boot then trusts every peer. |
 | `SPRING_SECURITY_OAUTH2_CLIENT_…` | see section 2.3 | One registration per IdP |
-| `TINFIRM_MODEL_GATEWAY_ADMIN_URL`, `TINFIRM_MODEL_GATEWAY_ADMIN_KEY`, `TINFIRM_MODEL_GATEWAY_MODEL_URL` | unset | The bundled LiteLLM. Unset, the server bundles no gateway, and a company configures its own on Model access. To use the Compose LiteLLM from your IDE, start it (`make up`, then stop the Compose `server`) and set `http://localhost:4000`, `<LITELLM_MASTER_KEY>` and `http://localhost:4001` |
+| `TINFIRM_MODEL_GATEWAY_ADMIN_URL`, `TINFIRM_MODEL_GATEWAY_ADMIN_KEY` | unset | The bundled LiteLLM. Unset, the server bundles no gateway, and a company configures its own on Model access. To use the Compose LiteLLM from your IDE, start it (`make up`, then stop the Compose `server`) and set `http://localhost:4000` and `<LITELLM_MASTER_KEY>`. `TINFIRM_MODEL_GATEWAY_MODEL_URL`, unset, sends the model requests to the admin URL too |
 | `TINFIRM_ROLES` | default `api,worker` | `worker` runs the background work: the dispatcher and the reaper, polls, schedules, the outbox, retention and the other sweeps. Run both roles in one process locally. |
 
 To make a new development vault key:
@@ -320,11 +318,10 @@ make web-test             # npm ci, lint, test (Vitest) and build in web/
 
 Playwright end-to-end tests live in `web/e2e/`. `npm run e2e` in `web/` starts the harness's own stack (the server on a database it recreates, fakes of LiteLLM, Jira Data Center and GitHub, a scripted runner host and the web app), seeds it, runs the tests and stops it. It needs no Docker, but a PostgreSQL 18 it can reach as a superuser; [web/e2e/README.md](../web/e2e/README.md) says what it needs and lists its `E2E_*` variables. The tests share one stack and run on 3 workers by default (`E2E_WORKERS`). A test tagged `@serial` runs alone: no other test runs while it does. CI runs them in its `e2e` job.
 
-### 6.3 Runner host and the model port
+### 6.3 Runner host
 
 ```sh
 make runner-test          # cargo test, clippy and fmt in runner/; the tests in real containers need Docker
-make model-api-test       # cd model-api && ./mvnw -B -ntp verify; against a fake LiteLLM
 ```
 
 ### 6.4 Deployment artefacts
@@ -334,10 +331,9 @@ make helm-lint            # helm lint --strict and helm template, default and ci
 make deploy-lint          # compose config (with oidc, Entra ID), hadolint, shellcheck, actionlint
 make build-image          # docker build -t ghcr.io/flowtivo/tinfirm-server:dev .
 make smoke-image          # build-image, then start it against PostgreSQL until /api/system/info answers
-make model-api-image      # the model port's image, ghcr.io/flowtivo/tinfirm-model-api:dev
 ```
 
-`make ci` runs the checks of `ci.yml`, except the security scans, the check of the LiteLLM pin, the build of the model port's image and the publishing ([CONTRIBUTING §5](../CONTRIBUTING.md#5-checks-before-a-pull-request)).
+`make ci` runs the checks of `ci.yml`, except the security scans, the e2e tests, the check of the LiteLLM pin and the publishing ([CONTRIBUTING §5](../CONTRIBUTING.md#5-checks-before-a-pull-request)).
 
 ## 7. Troubleshooting
 
