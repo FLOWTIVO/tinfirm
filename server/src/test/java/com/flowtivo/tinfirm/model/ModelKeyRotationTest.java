@@ -334,6 +334,8 @@ class ModelKeyRotationTest extends IntegrationTest {
             ModelGateways.awaitStatus(owner, company, principal, principal.equals(suspended) ? "BLOCKED" : "OK");
             before.put(principal, litellm.key((String) row(company, principal).get("gateway_key_id")).orElseThrow());
         }
+        ModelGateways.awaitCompanyKey(owner, company, "OK");
+        FakeLiteLlm.Key companyBefore = litellm.keyOfAlias(ModelGateways.companyKeyAlias(company, 0)).orElseThrow();
 
         ApiClient member = loginAs(company.email("MEMBER"));
         assertThat(member.post(company.path("/model-settings/rotate-keys"), null).status()).isEqualTo(403);
@@ -355,6 +357,17 @@ class ModelKeyRotationTest extends IntegrationTest {
             assertThat(now.token).isNotEqualTo(old.token);
             assertThat(now.blocked).isEqualTo(principal.equals(suspended));
         }
+        // The company's own key is rotated after the commit as well, after every principal's (it is the last row the
+        // request locks): its rotation is done, and its audit written, only once its request is gone.
+        await().atMost(ModelGateways.WAIT).untilAsserted(() -> {
+            JsonNode access = owner.get(company.path("/model-access/company-key")).json();
+            assertThat(isNull(access, "keyRotationRequestedAt")).as("%s", access).isTrue();
+            assertThat(companyBefore.blocked).isTrue();
+        });
+        assertThat(callWith(companyBefore.key)).isEqualTo(401);
+        FakeLiteLlm.Key companyNow = litellm.keyOfAlias(ModelGateways.companyKeyAlias(company, 1)).orElseThrow();
+        assertThat(companyNow.token).isNotEqualTo(companyBefore.token);
+        assertThat(companyNow.blocked).isFalse();
         // The bot's earlier previous key did not wait for its grace: it is gone, and its successor is blocked.
         assertThat(litellm.key(previous.token)).isEmpty();
         assertThat(current.blocked).isTrue();
@@ -368,9 +381,9 @@ class ModelKeyRotationTest extends IntegrationTest {
             .isEqualTo("company"));
         assertThat(auditEvents(owner, company, "model_key.rotated")).hasSize(principals.size() + 2);
         ModelGateways.awaitCompanyKey(owner, company, "OK");
-        assertThat(litellm.keyOfAlias(ModelGateways.companyKeyAlias(company, 1))).isPresent();
         List<FakeLiteLlm.Key> all = new ArrayList<>(litellm.keysOfTeam("tinfirm-" + company.id()));
         all.add(previous);
+        all.add(companyBefore);
         assertNoKeyInAudit(owner, company, all.toArray(FakeLiteLlm.Key[]::new));
         assertThat(owner.get(company.path("/audit-events/verification")).json().get("valid").asBoolean()).isTrue();
     }
