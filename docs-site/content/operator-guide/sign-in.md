@@ -294,7 +294,7 @@ The login page shows one button per provider, **Continue with** and its name, an
 https://tinfirm.example.com/login?provider=<id>
 ```
 
-It offers only that provider and the password form. People whom an AI client sent to the login return to the client after signing in, through any provider.
+It offers only that provider and the password form. People whom an AI client sent to the login return to the client after signing in, through any provider. People who opened a page of Tinfirm without a session, such as a link to a conversation, return to that page after signing in, through any provider; a link to any other site or to Tinfirm's API is never followed, and a refused sign-in ends on the login page.
 
 ## Worked setups
 
