@@ -4,7 +4,7 @@ This guide tells you how to set up the repository, run it, check your change and
 The binding rules are in [docs/CONVENTIONS.md](docs/CONVENTIONS.md). If this guide and CONVENTIONS disagree, CONVENTIONS wins. Report the difference.
 Everyone who takes part in the project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-`main` runs the redesign of 2026-10-12 ([docs/PLATFORM.md](docs/PLATFORM.md), [ADR-0058](docs/adr/0058-authority-from-the-audience.md), [ADR-0059](docs/adr/0059-litellm-budgets-and-the-model-proxy.md)). Nothing is released yet.
+`main` runs the redesign of 2026-10-12 ([docs/PLATFORM.md](docs/PLATFORM.md), [ADR-0058](docs/adr/0058-authority-from-the-audience.md), [ADR-0059](docs/adr/0059-litellm-budgets-and-the-model-proxy.md)). The owner cuts releases by hand with `release.yml` (section 5); v1.0.0 is the first, and [CHANGELOG.md](CHANGELOG.md) records each release. Between releases, `main` and what CI publishes from it are a development channel, not a release.
 
 ## 1. Prerequisites
 

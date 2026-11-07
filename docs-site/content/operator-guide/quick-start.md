@@ -57,7 +57,7 @@ Claude Code also asks for a small, fast model for background work: add one too. 
 Agents' turns run on runner hosts, not in the server. Without one, no turn paid by a budget runs. The machine you are on can be the first.
 
 1. In Tinfirm, open **Runner hosts** in the sidebar's **Company** section, and choose **Register a runner host**. Give the host a name and choose **Register**.
-2. The dialog shows the host's token once, with the commands to run on the host. The host needs Docker and `tinfirm-runner-host`: install it from a release of the repository (today the prerelease `rolling`), or build it from your checkout with `make runner-install`, which needs Rust 1.89 or later.
+2. The dialog shows the host's token once, with the commands to run on the host. The host needs Docker and `tinfirm-runner-host`: install it from a release, the archive `tinfirm-runner-host-1.0.0-<platform>` of v1.0.0 with its signed `SHA256SUMS` ([Install and run runner hosts](runner-hosts.md#install)), or build it from your checkout with `make runner-install`, which needs Rust 1.89 or later.
 3. Run the commands the dialog shows:
 
     ```sh

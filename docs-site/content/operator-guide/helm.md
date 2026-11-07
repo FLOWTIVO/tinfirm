@@ -4,9 +4,9 @@ This page installs Tinfirm on Kubernetes with the Helm chart `tinfirm`: the Secr
 
 The chart deploys the server and, unless you turn it off, the bundled LiteLLM, and, if you turn it on, a runner host whose sandboxes are VMs ([The runner pod](#the-runner-pod)). It deploys no database and creates no Secret: you prepare PostgreSQL ([Prepare PostgreSQL](database.md)) and create the Secrets yourself.
 
-!!! warning "No release yet"
+!!! info "Releases and development builds"
 
-    No version of Tinfirm is released yet. Each commit on the development branch publishes a chart `0.0.0-sha-<commit>` and images tagged `sha-<commit>`: they are not releases, and they are not signed as releases are ([What is not signed](verify-images.md#what-is-not-signed)). Use them to evaluate Tinfirm, and run a release in production once one exists.
+    This page installs a release. The current one is v1.0.0: chart `1.0.0`, whose defaults run the images tagged `v1.0.0`, all signed with FLOWTIVO's key ([Verify your images](verify-images.md)). Each commit on the development branch also publishes a chart `0.0.0-sha-<commit>` and images tagged `sha-<commit>`. That is a development channel for trying changes before they are released: those builds are not releases, and they are not signed as releases are ([What is not signed](verify-images.md#what-is-not-signed)). Run a release in production.
 
 ## Before you start
 

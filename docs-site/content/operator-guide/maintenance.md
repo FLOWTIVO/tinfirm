@@ -2,9 +2,9 @@
 
 This page keeps a Tinfirm installation current and its secrets fresh: upgrading the Helm release and LiteLLM, backing up before you do, rotating each Secret, upgrading runner hosts, and the same tasks on the Compose stack. It is for the operators who installed Tinfirm with [Helm](helm.md) or [Docker Compose](quick-start.md).
 
-!!! warning "No release yet"
+!!! info "Read the release notes first"
 
-    No version of Tinfirm is released yet: the development branch publishes charts `0.0.0-sha-<commit>` and images tagged `sha-<commit>`, which are not releases ([What is not signed](verify-images.md#what-is-not-signed)). The steps below work the same for them.
+    Each release's notes, on its page of [Tinfirm's GitHub Releases](https://github.com/FLOWTIVO/tinfirm/releases), say what to do before and after you upgrade to it. v1.0.0 is the first release: its notes list the steps for an installation that ran a development build. The development branch's charts `0.0.0-sha-<commit>` and images tagged `sha-<commit>` are not releases ([What is not signed](verify-images.md#what-is-not-signed)); the steps below work the same for them.
 
 ## Before you upgrade
 

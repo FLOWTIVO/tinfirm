@@ -3,7 +3,7 @@
 This guide explains how to work on the server and the web app on your machine.
 Setup steps and pre-PR checks are in [CONTRIBUTING.md](../CONTRIBUTING.md). The binding rules are in [CONVENTIONS.md](CONVENTIONS.md).
 
-`main` runs the redesign of 2026-10-12 ([PLATFORM.md](PLATFORM.md)). Nothing is released yet. The runner host has its own guide: [runner/README.md](../runner/README.md).
+`main` runs the redesign of 2026-10-12 ([PLATFORM.md](PLATFORM.md)). Releases are cut by hand (`.github/workflows/release.yml`); v1.0.0 is the first, and [CHANGELOG.md](../CHANGELOG.md) records each. `main` is the development channel between them. The runner host has its own guide: [runner/README.md](../runner/README.md).
 
 ## 1. Layout
 
