@@ -5,6 +5,7 @@
 - Decided by: the owner, 2026-11-03
 - Sources: [ADR-0080](0080-helm-chart-published-to-ghcr.md) (the chart's publishing); [ADR-0081](0081-signed-release-images.md) (the signed release); [the security review of 2026-10-27](../reviews/2026-10-27-security-review-fixed.md), H3 (the deploy keys in environments) and M18 (every action pinned)
 - Amends: [ADR-0080](0080-helm-chart-published-to-ghcr.md) and [ADR-0081](0081-signed-release-images.md), on the files that hold the release and the chart's publishing
+- Amended by: [ADR-0110](0110-no-model-port.md), under which `model-api/pom.xml` is gone from the manifests the release and the hotfix cut version (decision 2)
 - Changes: `.github/workflows/reusable-release.yml`, `reusable-security.yml` and `reusable-hotfix-branch.yml`; `.github/actions/` (`set-version`, `helm-publish`, `docker-login`, `report-findings`); `.github/check-pins.sh`; the callers `release.yml`, `ci.yml` (`security`, `publish`, `publish-docs`), `security.yml` and `hotfix-branch.yml`; the `helm` job and `make deploy-lint`; `dependabot.yml`; the comments of `.gitleaks.toml`, `.semgrepignore`, `.trivyignore`, the chart's `Chart.yaml` and `deploy/release/assets.sh`; `runner-artifacts.yml` (its comments, its `check` job and the dispatch's choice of runner) and section 1 of `docs/operations/auto-deploy.md`; CONTRIBUTING §5; `.gitignore`; CONVENTIONS §12
 
 ## Context

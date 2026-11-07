@@ -38,7 +38,6 @@ jobs:
       # The same manifests as release.yml's, so that every one is on the hotfix's -SNAPSHOT.
       manifests: |
         pom:server/pom.xml:tinfirm-server
-        pom:model-api/pom.xml:tinfirm-model-api
         npm:web
         # The runner host's workspace (ADR-0109): its --version and hello.runnerVersion are
         # the release's version, as are its assets' names and its image's tag.

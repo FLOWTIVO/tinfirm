@@ -2,9 +2,9 @@
 // (`npm query ".prod"`), not the build tools. It fails on a package whose licence the policy does
 // not accept, or that names none, and lists them. Run after `npm ci`: `npm run licences`.
 //
-// The policy is ADR-0082's. server/pom.xml, model-api/pom.xml and runner/about.toml hold the same
-// accepted licences: change them together. A package whose package.json names its licence wrongly
-// gets a line in CLARIFIED, for its one version, after a look at the licence it ships.
+// The policy is ADR-0082's. server/pom.xml and runner/about.toml hold the same accepted licences:
+// change them together. A package whose package.json names its licence wrongly gets a line in
+// CLARIFIED, for its one version, after a look at the licence it ships.
 import { execFileSync } from 'node:child_process';
 
 /** The licences the policy accepts, as SPDX identifiers. */

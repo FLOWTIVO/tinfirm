@@ -1,6 +1,6 @@
 # helm lint/template with company MCP servers in another namespace (ADR-0066): their hosts as
-# internal hosts, the server's egress to them, and the bundled LiteLLM's model port open to their
-# namespace (ADR-0069).
+# internal hosts, the server's egress to them, and the bundled LiteLLM's port open to their
+# namespace (litellm.from).
 publicUrl: https://tinfirm.example.com
 connection:
   internalHosts:
@@ -22,8 +22,7 @@ networkPolicy:
           - protocol: TCP
             port: 8080
 litellm:
-  modelApi:
-    from:
-      - namespaceSelector:
-          matchLabels:
-            kubernetes.io/metadata.name: tools
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: tools

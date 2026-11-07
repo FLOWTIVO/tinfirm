@@ -16,12 +16,12 @@ Tinfirm is licensed in two parts. LICENSE states the scope of each:
 Third-party files in this repository
 ------------------------------------
 
-* The Maven wrapper scripts, server/mvnw, server/mvnw.cmd, model-api/mvnw and
-  model-api/mvnw.cmd, are Apache Maven Wrapper's, licensed under the Apache
-  License, Version 2.0, as their headers state. The two mvnw scripts
-  are changed: they log the URL they download, without its user info or
-  query, stop when the download by Java fails, and describe what arrived
-  when its checksum does not match. Apache Maven Wrapper's notice:
+* The Maven wrapper scripts, server/mvnw and server/mvnw.cmd, are Apache
+  Maven Wrapper's, licensed under the Apache License, Version 2.0, as their
+  headers state. server/mvnw is changed: it logs the URL it downloads,
+  without its user info or query, stops when the download by Java fails, and
+  describes what arrived when its checksum does not match. Apache Maven
+  Wrapper's notice:
 
     Apache Maven Wrapper
     Copyright 2013-2022 The Apache Software Foundation
@@ -50,9 +50,6 @@ artefact that includes them carries their notices:
     licences, as license-maven-plugin lists them in the Maven build
     (server/pom.xml). Each jar keeps its own licence files.
   - THIRD-PARTY-web.txt: the web app's 3rdpartylicenses.txt (below).
-* The model port's image, ghcr.io/flowtivo/tinfirm-model-api, in /licenses/,
-  beside LICENSE: THIRD-PARTY-model-api.txt, listed the same way from
-  model-api/pom.xml.
 * The runner host's archives, tinfirm-runner-host-<version>-<target>, beside
   LICENSE and ee/LICENSE: THIRD-PARTY-LICENSES.txt, the full licence text of
   every crate the binary is built with, of the Rust standard library and, in

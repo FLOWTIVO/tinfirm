@@ -128,8 +128,8 @@ A member's personal MCP server never gets the exceptions of the first three.
 | Variable | Default | Meaning | Helm value |
 |---|---|---|---|
 | `TINFIRM_MODEL_GATEWAY_VENDOR` | `LITELLM` | The product the bundled gateway is: `LITELLM`, the only value the server accepts. It does not start with `GENERIC`, which is for a company's own gateway whose keys its team provides | Set by the chart with `litellm.enabled` |
-| `TINFIRM_MODEL_GATEWAY_ADMIN_URL` | unset | The bundled LiteLLM's own port, inside the deployment, for its admin API. Without it, or without the master key, no gateway is bundled, and each company brings its own. | Set by the chart with `litellm.enabled` |
-| `TINFIRM_MODEL_GATEWAY_MODEL_URL` | unset: the admin URL | The bundled LiteLLM's model port, where the server sends the model requests it relays for runs, and its own | Set by the chart with `litellm.enabled` |
+| `TINFIRM_MODEL_GATEWAY_ADMIN_URL` | unset | The bundled LiteLLM's own port, inside the deployment, for its admin API and the model requests the server relays for runs, and its own. Without it, or without the master key, no gateway is bundled, and each company brings its own. | Set by the chart with `litellm.enabled` |
+| `TINFIRM_MODEL_GATEWAY_MODEL_URL` | unset: the admin URL | Another address of the bundled LiteLLM for the model requests the server relays for runs, and its own | `extraConfig` |
 | `TINFIRM_MODEL_GATEWAY_ADMIN_KEY` | unset | **Secret.** The bundled LiteLLM's master key | `litellm.existingSecret`, key `litellm.secretKeys.masterKey` |
 
 The bundled gateway's variables were called `TINFIRM_LITELLM_ADMIN_URL`, `TINFIRM_LITELLM_MODEL_URL` and `TINFIRM_LITELLM_MASTER_KEY` before Tinfirm could speak to more than one gateway. The server still reads each old name when its new name is unset.
@@ -293,9 +293,9 @@ Other properties of the server are internal schedules and are not part of this c
 | `LITELLM_SALT_KEY` | development value | **Secret.** Encrypts the provider keys in LiteLLM's database. Never change it once keys are stored. |
 | `LITELLM_DB_PASSWORD` | development value | **Secret.** The password of LiteLLM's database role |
 | `TINFIRM_HTTP_BIND`, `TINFIRM_HTTP_HOST_PORT` | `127.0.0.1`, `8080` | Where the server's port is published on the host |
-| `TINFIRM_DB_HOST_PORT`, `TINFIRM_LITELLM_HOST_PORT`, `TINFIRM_MODEL_API_HOST_PORT` | `5432`, `4000`, `4001` | PostgreSQL, LiteLLM and the model port, published on `127.0.0.1` only |
-| `TINFIRM_SERVER_IMAGE`, `TINFIRM_MODEL_API_IMAGE` | local builds | The images to run instead of building them |
-| `TINFIRM_SERVER_MEM_LIMIT`, `TINFIRM_LITELLM_MEM_LIMIT`, `TINFIRM_MODEL_API_MEM_LIMIT` | `2g`, `2g`, `512m` | Memory limits of the containers |
+| `TINFIRM_DB_HOST_PORT`, `TINFIRM_LITELLM_HOST_PORT` | `5432`, `4000` | PostgreSQL and LiteLLM, published on `127.0.0.1` only |
+| `TINFIRM_SERVER_IMAGE` | a local build | The image to run instead of building it |
+| `TINFIRM_SERVER_MEM_LIMIT`, `TINFIRM_LITELLM_MEM_LIMIT` | `2g`, `2g` | Memory limits of the containers |
 | `TINFIRM_JAVA_TOOL_OPTIONS` | as `JAVA_TOOL_OPTIONS` above | The server's JVM options |
 
 The server also receives `TINFIRM_PUBLIC_URL`, `TINFIRM_VAULT_KEYS`, `TINFIRM_VAULT_ACTIVE_KEY`, `TINFIRM_BOOTSTRAP_ADMIN_EMAIL`, `TINFIRM_BOOTSTRAP_ADMIN_PASSWORD`, `TINFIRM_CONNECTION_INTERNAL_HOSTS`, `TINFIRM_AUTH_LOCAL_ENABLED`, `TINFIRM_AUTH_OIDC_AUTO_PROVISION`, `TINFIRM_SESSION_IDLE_TIMEOUT`, `TINFIRM_SESSION_MAX_AGE`, `TINFIRM_ROLES` and the four `TINFIRM_ERROR_REPORTS*` from `.env`. Every value in `.env.example` is public: replace each secret before anyone else can reach the machine. When `TINFIRM_PUBLIC_URL` is not a localhost URL, the server refuses to start with the development vault key of `.env.example` as the active key, with its LiteLLM master key, or with its bootstrap password.

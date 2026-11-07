@@ -290,25 +290,9 @@ ingress.traefik.redirectHttps put first in traefik.ingress.kubernetes.io/router.
 {{- end }}
 {{- end }}
 
-{{/* The model port beside LiteLLM (ADR-0069): its image, the server's tag unless one is set. */}}
-{{- define "tinfirm.modelApi.image" -}}
-{{- $img := .Values.litellm.modelApi.image }}
-{{- $tag := $img.tag | default (include "tinfirm.imageTag" .) | toString }}
-{{- if $img.digest }}
-{{- printf "%s:%s@%s" $img.repository $tag $img.digest }}
-{{- else }}
-{{- printf "%s:%s" $img.repository $tag }}
-{{- end }}
-{{- end }}
-
-{{/* TINFIRM_MODEL_GATEWAY_MODEL_URL: the model port on LiteLLM's Service, for the server's model requests (ADR-0069). */}}
-{{- define "tinfirm.litellm.modelUrl" -}}
-{{- printf "http://%s.%s.svc:%v" (include "tinfirm.litellm.fullname" .) .Release.Namespace .Values.litellm.modelApi.port }}
-{{- end }}
-
-{{/* The base URL of the model port's OpenAI-compatible API, for the company's services. */}}
-{{- define "tinfirm.litellm.modelApiBaseUrl" -}}
-{{- printf "%s/v1" (include "tinfirm.litellm.modelUrl" .) }}
+{{/* The base URL of LiteLLM's OpenAI-compatible API, for the company's services of litellm.from. */}}
+{{- define "tinfirm.litellm.openAiBaseUrl" -}}
+{{- printf "%s/v1" (include "tinfirm.litellm.adminUrl" .) }}
 {{- end }}
 
 {{/*
@@ -418,7 +402,7 @@ app.kubernetes.io/part-of: tinfirm
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
-{{/* The runner pod's image: the server's tag unless one is set, as the model port's. */}}
+{{/* The runner pod's image: the server's tag unless one is set. */}}
 {{- define "tinfirm.runner.image" -}}
 {{- $img := .Values.runner.image }}
 {{- $tag := $img.tag | default (include "tinfirm.imageTag" .) | toString }}

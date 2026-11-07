@@ -68,11 +68,10 @@ data:
   JAVA_TOOL_OPTIONS: {{ . | quote }}
   {{- end }}
   {{- if .Values.litellm.enabled }}
-  # The bundled LiteLLM, inside the cluster: its admin API on its own port, and the model
-  # requests the server relays for runner hosts, and its own, on the model port (ADR-0069).
+  # The bundled LiteLLM, inside the cluster, on its one port: its admin API, and the model
+  # requests the server relays for runner hosts, and its own.
   TINFIRM_MODEL_GATEWAY_VENDOR: "LITELLM"
   TINFIRM_MODEL_GATEWAY_ADMIN_URL: {{ include "tinfirm.litellm.adminUrl" . | quote }}
-  TINFIRM_MODEL_GATEWAY_MODEL_URL: {{ include "tinfirm.litellm.modelUrl" . | quote }}
   {{- end }}
   {{- range .Values.auth.oidc.providers }}
   {{- $id := upper .id }}

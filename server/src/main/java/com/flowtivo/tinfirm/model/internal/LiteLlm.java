@@ -43,8 +43,8 @@ import tools.jackson.databind.node.ObjectNode;
  * {@code litellm/proxy/_types.py} and {@code litellm/models/team.py}, and {@code proxy_server.py}):
  * <ul>
  * <li>{@code POST /key/generate}: {@code key_alias}, {@code team_id}, {@code max_budget}, {@code budget_duration},
- * {@code models}, {@code metadata}, {@code blocked}, {@code key_type} ({@code llm_api}: the key may call the model
- * routes only), and {@code spend} for a rotation's next key, which starts with the spend of the key it replaces; the
+ * {@code models}, {@code metadata}, {@code blocked}, {@code key_type} ({@code llm_api}: never the management
+ * routes), and {@code spend} for a rotation's next key, which starts with the spend of the key it replaces; the
  * answer's {@code key} is the virtual key and {@code token} its SHA-256, LiteLLM's id of it. The alias is unique among
  * all keys (400 for a taken one). The budget's reset time is LiteLLM's own, from the period and the calendar
  * ({@code get_budget_reset_time}: {@code 30d} and {@code 1mo} on the 1st of the month, {@code 7d} on Mondays,

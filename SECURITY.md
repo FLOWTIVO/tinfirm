@@ -11,7 +11,7 @@ Report it in either of two ways:
 
 Include in your report:
 
-- the affected component (server, web app, runner host, model port, Helm chart, Compose stack, release assets, CI workflows) and its version: the release (`v<x.y.z>`), the image tag (`sha-<commit>`), the version of a `rolling` asset, or the commit. The server reports its version and commit at `GET /api/system/info`; `tinfirm-runner-host --version` prints the runner host's;
+- the affected component (server, web app, runner host, Helm chart, Compose stack, release assets, CI workflows) and its version: the release (`v<x.y.z>`), the image tag (`sha-<commit>`), the version of a `rolling` asset, or the commit. The server reports its version and commit at `GET /api/system/info`; `tinfirm-runner-host --version` prints the runner host's;
 - the configuration the issue needs, if any, such as the sign-in method or the runner host's executor;
 - the steps to reproduce, and the impact you expect;
 - any known workaround;

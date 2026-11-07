@@ -21,11 +21,11 @@ import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
- * A model request's body as LiteLLM gets it (the package 2 contract, §6.1; ADR-0069): the JSON object of the format's
- * API, written anew, without LiteLLM's own fields at its top level, which would let whoever holds a key choose where
+ * A model request's body as LiteLLM gets it (the package 2 contract, §6.1): the JSON object of the format's API,
+ * written anew, without LiteLLM's own fields at its top level, which would let whoever holds a key choose where
  * LiteLLM sends the request and with which credentials (an {@code api_base} of their own receives the company's
- * provider key), what it logs and where, what the request costs, or a canned answer. Shared by the server's model
- * relay and the gateway's model port ({@code model-api}), which pass the same requests on. Removed:
+ * provider key), what it logs and where, what the request costs, or a canned answer. The server's model relay
+ * applies it to every request it passes on, whichever the gateway. Removed:
  * <ul>
  * <li>the contract's list: {@code api_base}, {@code base_url}, {@code api_key}, {@code api_version},
  * {@code custom_llm_provider}, {@code organization}, {@code metadata}, {@code tags}, {@code user},
@@ -42,10 +42,10 @@ import tools.jackson.databind.json.JsonMapper;
  * {@code timeout}, {@code secret_key}, {@code access_token}.</li>
  * </ul>
  * {@code drop_params} and {@code additional_drop_params} only let LiteLLM drop a parameter the model's provider does
- * not take instead of refusing the request: the model port passes them as they came; the relay sets
- * {@code "drop_params": true} itself ({@link #clean} with {@code dropParams}). Everything else passes as it came,
- * numbers exactly. The body must be one JSON object without a repeated top-level name (LiteLLM would take the last
- * {@code model}, a caller checks one); its {@code model} is read for the caller's check.
+ * not take instead of refusing the request: for a LiteLLM the relay sets {@code "drop_params": true} itself
+ * ({@link #clean} with {@code dropParams}); without {@code dropParams} they pass as they came. Everything else passes
+ * as it came, numbers exactly. The body must be one JSON object without a repeated top-level name (LiteLLM would take
+ * the last {@code model}, a caller checks one); its {@code model} is read for the caller's check.
  * <p>
  * The provider is a channel for what the model emits, never a relay the agent directs (threat model 7.2, R13; the
  * security review of 2026-10-27, M1 and D8; ADR-0108): a request may never ask the model's provider to run a tool

@@ -20,7 +20,6 @@ SAML_DEV_DIR := $(COMPOSE_DIR)/.saml
 
 CHART    := deploy/helm/tinfirm
 IMAGE    ?= ghcr.io/flowtivo/tinfirm-server
-MODEL_API_IMAGE ?= ghcr.io/flowtivo/tinfirm-model-api
 TAG      ?= dev
 REVISION := $(shell git rev-parse --verify -q HEAD 2>/dev/null || echo unknown)
 
@@ -29,7 +28,7 @@ REVISION := $(shell git rev-parse --verify -q HEAD 2>/dev/null || echo unknown)
 HADOLINT_IMAGE   := hadolint/hadolint:v2.15.1
 ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
-DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile model-api/Dockerfile docs-site/Dockerfile
+DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile
 SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh ee/runner/images/vm/setup.sh \
                     .github/check-pins.sh .github/actions/set-version/*.sh
 
@@ -45,7 +44,7 @@ SERVICE ?=
 DOCS_DIR  := docs-site
 DOCS_VENV := $(DOCS_DIR)/.venv
 
-.PHONY: help dev-db up up-oidc up-saml down logs build-image smoke-image model-api-image server-test model-api-test web-test helm-lint deploy-lint ci runner-build runner-test runner-licences runner-licences-check runner-install deploy-host release-assets docs-serve docs-build docs-lock
+.PHONY: help dev-db up up-oidc up-saml down logs build-image smoke-image server-test web-test helm-lint deploy-lint ci runner-build runner-test runner-licences runner-licences-check runner-install deploy-host release-assets docs-serve docs-build docs-lock
 
 help: ## List the targets
 	@echo "Tinfirm make targets:"
@@ -84,14 +83,11 @@ down: | $(COMPOSE_ENV) ## Stop and remove all containers, Keycloak included; the
 	$(COMPOSE_OIDC) down --remove-orphans
 	@echo "Database volume kept. To wipe it: $(COMPOSE_OIDC) down -v"
 
-logs: | $(COMPOSE_ENV) ## Follow the logs (SERVICE=server|postgres|litellm|model-api|keycloak for one)
+logs: | $(COMPOSE_ENV) ## Follow the logs (SERVICE=server|postgres|litellm|keycloak for one)
 	$(COMPOSE_OIDC) logs -f --tail=200 $(SERVICE)
 
 build-image: ## Build the server image as $(IMAGE):$(TAG)
 	docker build --build-arg REVISION="$(REVISION)" -t $(IMAGE):$(TAG) .
-
-model-api-image: ## Build the model port's image as $(MODEL_API_IMAGE):$(TAG)
-	docker build -f model-api/Dockerfile --build-arg REVISION="$(REVISION)" -t $(MODEL_API_IMAGE):$(TAG) .
 
 smoke-image: build-image ## Build $(IMAGE):$(TAG), start it against PostgreSQL and wait for /api/system/info (ci.yml's image job)
 	deploy/compose/smoke.sh $(IMAGE):$(TAG)
@@ -123,9 +119,6 @@ runner-install: ## Runner: install tinfirm-runner-host into ~/.cargo/bin
 
 server-test: ## Server: ./mvnw verify (needs Docker for Testcontainers)
 	cd server && ./mvnw -B -ntp verify
-
-model-api-test: ## Model port: ./mvnw verify
-	cd model-api && ./mvnw -B -ntp verify
 
 web-test: ## Web: npm ci, the packages' licences, lint, test and build
 	cd web && npm ci && npm run licences && npm run lint && npm test && npm run build
@@ -170,4 +163,4 @@ deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second
 	docker run --rm -v "$(CURDIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color
 	.github/check-pins.sh
 
-ci: deploy-lint helm-lint server-test model-api-test web-test runner-test runner-licences-check docs-build smoke-image ## Everything ci.yml runs, except the security scans and the publishing (smoke-image builds the image first)
+ci: deploy-lint helm-lint server-test web-test runner-test runner-licences-check docs-build smoke-image ## Everything ci.yml runs, except the security scans and the publishing (smoke-image builds the image first)

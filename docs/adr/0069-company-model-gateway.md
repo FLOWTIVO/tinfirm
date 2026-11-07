@@ -1,6 +1,6 @@
 # ADR-0069: The bundled LiteLLM is the company's model gateway: a model port for its services, the admin port for Tinfirm's server only
 
-- Status: Accepted
+- Status: Superseded by [ADR-0110](0110-no-model-port.md) on 2026-11-06 (was Accepted): the model port is gone, and the bundled LiteLLM serves the server, and the services the operator admits, on its own port
 - Date: 2026-10-16
 - Decided by: the owner, 2026-10-16
 - Sources: [ADR-0059](0059-litellm-budgets-and-the-model-proxy.md); the security review of 2026-10-12, row 21 ([reviews/2026-10-12-platform-redesign.md](../reviews/2026-10-12-platform-redesign.md)); [operations/litellm.md](../operations/litellm.md); the [threat model](../threat-model.md)

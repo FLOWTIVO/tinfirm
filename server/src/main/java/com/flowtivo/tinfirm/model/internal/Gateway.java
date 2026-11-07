@@ -11,8 +11,8 @@ import java.util.UUID;
  * @param baseUrl  the gateway's root for its admin API, without a trailing slash
  * @param bundled  whether this is the deployment's gateway: its URL is the operator's, not a member's, so it is not
  *                 held to the outbound guard
- * @param modelUrl the gateway's root for model requests, without a trailing slash: the bundled gateway's model port
- *                 (ADR-0069), which serves the model API alone, or {@code baseUrl}
+ * @param modelUrl the gateway's root for model requests, without a trailing slash: {@code baseUrl}, unless the
+ *                 deployment sets another for its bundled gateway ({@code TINFIRM_MODEL_GATEWAY_MODEL_URL})
  * @param vendor   the product the gateway is, whose {@link GatewayAdapter} speaks to it (ADR-0094)
  */
 record Gateway(String baseUrl, String adminKey, boolean bundled, String modelUrl, GatewayVendor vendor) {

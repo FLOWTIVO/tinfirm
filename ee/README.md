@@ -1,6 +1,6 @@
 # ee/: Tinfirm's commercial part
 
-`ee/` holds the code that only Pro and Enterprise put in force ([ADR-0077](../docs/adr/0077-licence-editions-and-seats.md)). It is in every build and every image, beside the MIT core. The server's build compiles `ee/src/main/java` and its tests in, as it does `libs/*` (`server/pom.xml`, build-helper). Its licence is the Tinfirm Enterprise licence (ADR-0077, decision 1), whose text is [LICENSE](LICENSE) here. The server's image carries it as `/licenses/ee/LICENSE` ([ADR-0082](../docs/adr/0082-licence-notices-and-dependency-licences.md)).
+`ee/` holds the code that only Pro and Enterprise put in force ([ADR-0077](../docs/adr/0077-licence-editions-and-seats.md)). It is in every build and every image, beside the MIT core. The server's build compiles `ee/src/main/java` and its tests in, as it does `libs/jira` (`server/pom.xml`, build-helper). Its licence is the Tinfirm Enterprise licence (ADR-0077, decision 1), whose text is [LICENSE](LICENSE) here. The server's image carries it as `/licenses/ee/LICENSE` ([ADR-0082](../docs/adr/0082-licence-notices-and-dependency-licences.md)).
 
 | Path | Contents |
 |---|---|

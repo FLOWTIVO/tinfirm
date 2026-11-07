@@ -10,7 +10,7 @@ Everyone who takes part in the project follows the [Code of Conduct](CODE_OF_CON
 
 | Tool | Version | Used for |
 |---|---|---|
-| JDK | 25 | Builds and tests of the server and the model port. Each has its own Maven wrapper (`server/mvnw`, `model-api/mvnw`), which downloads Maven. |
+| JDK | 25 | Builds and tests of the server. Its Maven wrapper (`server/mvnw`) downloads Maven. |
 | Node.js | 24 LTS, with npm 11 or later (`engines` and `packageManager` in `web/package.json`) | Web build, tests, dev server; the runner host's end-to-end tests start a fake agent with it |
 | Rust | 1.89 or later (`rust-version` in `runner/Cargo.toml`), with clippy and rustfmt | The runner host: `make runner-build`, `make runner-test` |
 | Docker | Docker Engine or Docker Desktop, with Compose v2 | Compose stack, Testcontainers in the server tests, the runner host's tests in real containers, image builds, lint containers |
@@ -90,35 +90,33 @@ Run the checks for every area you changed. Put the exact result in the pull requ
 
 | Area | Command | Notes |
 |---|---|---|
-| Server | `make server-test` | `./mvnw -B -ntp verify`. Needs Docker, or an external PostgreSQL in `TINFIRM_TEST_JDBC_URL`. Includes Modulith verification, the tenant isolation test, RLS tests as `tinfirm_app` and the dependency licence check ([Dependency licences](#dependency-licences)). |
-| Model port | `make model-api-test` | `./mvnw -B -ntp verify` in `model-api/`, against a fake LiteLLM, with the tests of `libs/litellm` and `libs/net`. Needs no Docker. The dependency licence check runs in it too. |
+| Server | `make server-test` | `./mvnw -B -ntp verify`. Needs Docker, or an external PostgreSQL in `TINFIRM_TEST_JDBC_URL`. Includes Modulith verification, the tenant isolation test, RLS tests as `tinfirm_app`, the tests of `libs/jira` and of the relay's filter of LiteLLM's fields and bounded bodies (`LiteLlmRequestsTest`, `BoundedBodiesTest`, `InflightBytesTest`), and the dependency licence check ([Dependency licences](#dependency-licences)). |
 | Runner host | `make runner-test` | `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` in `runner/`. The tests in real containers run when Docker is available ([runner/README.md](runner/README.md)). |
 | Runner licences | `make runner-licences-check` | The crates' licences and `runner/THIRD-PARTY-LICENSES.txt`, with cargo-about in Docker, as CI's `runner` job checks them. `make runner-licences` writes the file again after a change to `runner/Cargo.lock` ([Dependency licences](#dependency-licences)). |
 | Web | `make web-test` | `npm ci`, `npm run licences` (the production packages' licences), `npm run lint`, `npm test` (Vitest) and `npm run build` |
 | Web e2e | `cd web && npm run e2e` | Playwright tests in `web/e2e/`, against a stack the command starts and seeds itself ([web/e2e/README.md](web/e2e/README.md)). CI runs them in its `e2e` job. |
 | Helm | `make helm-lint` | The chart's `LICENSE` against the root one, `helm lint --strict` and `helm template`, with the default values and each file in `deploy/helm/tinfirm/ci/` |
-| Deploy files | `make deploy-lint` | Compose config with and without the `oidc` profile and with the Entra ID and second-company examples; hadolint on the five Dockerfiles (the server's, `deploy/release/runner-musl.Dockerfile`, `runner/ci.Dockerfile`, `model-api/Dockerfile`, `docs-site/Dockerfile`); shellcheck on the deploy scripts; actionlint on the workflows |
+| Deploy files | `make deploy-lint` | Compose config with and without the `oidc` profile and with the Entra ID and second-company examples; hadolint on the four Dockerfiles (the server's, `deploy/release/runner-musl.Dockerfile`, `runner/ci.Dockerfile`, `docs-site/Dockerfile`); shellcheck on the deploy scripts; actionlint on the workflows |
 | Image | `make smoke-image` | Multi-stage build of web and server (`make build-image`, which it depends on), then the image started against PostgreSQL until `/api/system/info` answers (`deploy/compose/smoke.sh`), which catches what the unit tests cannot: a class missing from the jar, a bean that fails, a migration that fails |
 | Docs | Check that every relative link resolves | Follow the writing rules in section 7 |
 | Docs site | `make docs-build` | Strict Zensical build of `docs-site/`: a link to a page or an anchor that does not exist fails it. CI runs it as `docker build docs-site`, and its `publish-docs` job publishes the site's image once a change to `docs-site/` is merged ([docs-site/README.md](docs-site/README.md)) |
 
-`make ci` runs the checks of `ci.yml` except the security scans, the e2e tests, the check of the LiteLLM pin, the build of the model port's image (`make model-api-image`) and the publishing.
+`make ci` runs the checks of `ci.yml` except the security scans, the e2e tests, the check of the LiteLLM pin and the publishing.
 
 CI (`.github/workflows/ci.yml`) runs on every pull request to `main` or `hotfix/**` and on every push to `main`. Its jobs:
 
 | Job | What it does |
 |---|---|
 | `server` | `./mvnw -B -ntp verify`, with Testcontainers' PostgreSQL 18 and the dependency licence check |
-| `model-api` | The model port's `./mvnw -B -ntp verify`, with the dependency licence check |
 | `web` | `npm ci`, `npm run licences`, `npm run lint`, `npm test`, `npm run build` |
 | `e2e` | The Playwright tests of `web/e2e/`, with PostgreSQL 18 and the server built from the commit, which serves the app's production build ([web/e2e/README.md](web/e2e/README.md#in-ci)) |
 | `docs` | The docs site's strict build (Zensical, in `docs-site/Dockerfile`) and its image's runtime contract |
 | `helm` | The chart's `LICENSE`, Helm lint and template, the Compose configs, the check that the chart and the Compose file pin the same LiteLLM image, hadolint, shellcheck, actionlint and the action pins (`.github/check-pins.sh`) |
-| `image` | Builds the server image (no push), checks its runtime contract and its `/licenses/`, and starts it against PostgreSQL (`deploy/compose/smoke.sh`); builds the model port's image and checks its own |
+| `image` | Builds the server image (no push), checks its runtime contract and its `/licenses/`, and starts it against PostgreSQL (`deploy/compose/smoke.sh`) |
 | `runner` | `cargo fmt`, clippy, the tests and the crates' licences (cargo-about), each a stage of `runner/ci.Dockerfile`; not the tests in real containers |
 | `security` | `reusable-security.yml`: SAST (semgrep), secrets (gitleaks) and dependency CVEs (trivy) |
 | `publish` | After a push to `main`: the server image `ghcr.io/flowtivo/tinfirm-server`, tagged `sha-<commit>`, and `main` while that commit is still the tip of `main` |
-| `publish-services` | After a push to `main`: the model port's image `ghcr.io/flowtivo/tinfirm-model-api`, tagged the same way |
+| `publish-services` | After a push to `main`: the runner host's image for the chart's runner pod, `ghcr.io/flowtivo/tinfirm-runner-host`, tagged the same way |
 | `publish-docs` | After a push to `main` that changed `docs-site/`: the docs site's image `ghcr.io/flowtivo/tinfirm-docs`, tagged `sha-<commit>` and then `main` |
 | `rolling` | After `publish`: the prerelease `rolling` with the runner host binaries and the Compose files (`runner-artifacts.yml`) |
 | `main-complete` | After `publish`, `publish-services` and `rolling`: moves the server image's tag `ghcr.io/flowtivo/tinfirm-server:main-complete` to `sha-<commit>`, while that commit is still the tip of `main`. A deployment repository reads it on its own schedule to keep an environment on `main`; CI holds no key to it ([ADR-0107](docs/adr/0107-a-deployment-repository-follows-the-registry.md)) |
@@ -131,10 +129,10 @@ PR Agent (`.github/workflows/pr_agent.yml`, settings in `.pr_agent.toml`) review
 
 ### Dependency licences
 
-CI refuses a dependency that ships under a licence outside the policy of [ADR-0082](docs/adr/0082-licence-notices-and-dependency-licences.md): the Maven build of the server and of the model port (license-maven-plugin), `npm run licences` for the web app's production packages, and the `runner` job's `licences` stage for the runner host's crates. The failing check names the dependency and its licence.
+CI refuses a dependency that ships under a licence outside the policy of [ADR-0082](docs/adr/0082-licence-notices-and-dependency-licences.md): the server's Maven build (license-maven-plugin), `npm run licences` for the web app's production packages, and the `runner` job's `licences` stage for the runner host's crates. The failing check names the dependency and its licence.
 
-- **A licence outside the policy.** Choose another dependency, or ask the owner. A change of the policy changes ADR-0082 and its four lists together: `server/pom.xml`, `model-api/pom.xml`, `web/scripts/licences.mjs` and `runner/about.toml`.
-- **An accepted licence under a name the check does not know** (a pom's free text). Read the licence, then add the name to the `licenseMerges` of both poms.
+- **A licence outside the policy.** Choose another dependency, or ask the owner. A change of the policy changes ADR-0082 and its three lists together: `server/pom.xml`, `web/scripts/licences.mjs` and `runner/about.toml`.
+- **An accepted licence under a name the check does not know** (a pom's free text). Read the licence, then add the name to the `licenseMerges` of `server/pom.xml`.
 - **Metadata that names the wrong licence.** Correct it for that one version, with the reason: `server/src/license/override-THIRD-PARTY.properties`, `CLARIFIED` in `web/scripts/licences.mjs`, or a `clarify` entry in `runner/about.toml`.
 - **A change to `runner/Cargo.lock`.** Run `make runner-licences` and commit the new `runner/THIRD-PARTY-LICENSES.txt` with it: every runner host archive carries that file, and the `runner` job fails when it is not what `Cargo.lock` gives.
 - **A change to the root `LICENSE`.** Copy it to `deploy/helm/tinfirm/LICENSE`: the `helm` job checks that they are identical.

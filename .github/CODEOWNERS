@@ -29,7 +29,6 @@
 /deploy/** @JiriBalcar
 # The image builds.
 /Dockerfile @JiriBalcar
-/model-api/Dockerfile @JiriBalcar
 /docs-site/Dockerfile @JiriBalcar
 # The engineering contract and the platform design (CONVENTIONS §2 and §13): anyone, agents
 # included, may change them in a pull request, and the code owner reviews every change.

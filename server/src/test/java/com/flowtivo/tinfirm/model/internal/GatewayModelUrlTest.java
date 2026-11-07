@@ -11,10 +11,9 @@ import org.junit.jupiter.api.Test;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 
 /**
- * The bundled gateway's two addresses (ADR-0069): the admin API at {@code TINFIRM_MODEL_GATEWAY_ADMIN_URL}, the
- * model requests at the model port {@code TINFIRM_MODEL_GATEWAY_MODEL_URL}, or at the admin URL without one; a
- * company's own gateway has one URL for both. Neither shows the admin key. A model URL the keys could not safely go to
- * stops the server.
+ * The bundled gateway's addresses: the admin API at {@code TINFIRM_MODEL_GATEWAY_ADMIN_URL}, and the model requests
+ * there too, unless the optional {@code TINFIRM_MODEL_GATEWAY_MODEL_URL} names another; a company's own gateway has
+ * one URL for both. Neither shows the admin key. A model URL the keys could not safely go to stops the server.
  */
 class GatewayModelUrlTest {
 
@@ -30,25 +29,29 @@ class GatewayModelUrlTest {
     }
 
     @Test
-    void theBundledGatewaysModelRequestsGoToItsModelPort() {
-        Gateway gateway = bundled(properties("http://litellm:4000", " http://litellm:4001/ "));
+    void byDefaultTheModelRequestsGoToTheAdminUrl() {
+        Gateway gateway = bundled(properties("http://litellm:4000/", null));
 
         assertThat(gateway.baseUrl()).isEqualTo("http://litellm:4000");
-        assertThat(gateway.modelUrl()).isEqualTo("http://litellm:4001");
+        assertThat(gateway.modelUrl()).isEqualTo("http://litellm:4000");
         assertThat(gateway.bundled()).isTrue();
-        assertThat(gateway.toString()).contains("http://litellm:4001").doesNotContain("sk-TEST-ONLY-master-key");
-    }
-
-    @Test
-    void withoutAModelPortEverythingGoesToTheAdminUrl() {
-        assertThat(bundled(properties("http://litellm:4000/", null)).modelUrl()).isEqualTo("http://litellm:4000");
         assertThat(bundled(properties("http://litellm:4000", "  ")).modelUrl()).isEqualTo("http://litellm:4000");
     }
 
     @Test
+    void aModelUrlSetOverridesTheAdminUrlForTheModelRequestsOnly() {
+        Gateway gateway = bundled(properties("http://litellm:4000", " http://litellm-models:4000/ "));
+
+        assertThat(gateway.baseUrl()).isEqualTo("http://litellm:4000");
+        assertThat(gateway.modelUrl()).isEqualTo("http://litellm-models:4000");
+        assertThat(gateway.toString()).contains("http://litellm-models:4000")
+            .doesNotContain("sk-TEST-ONLY-master-key");
+    }
+
+    @Test
     void aModelUrlWithCredentialsAQueryOrAnotherSchemeStopsTheServer() {
-        for (String url : new String[] { "http://user:pass@model-api:4001", "http://model-api:4001?x=1",
-                "http://model-api:4001#f", "ftp://model-api:4001", "model-api:4001", "http://", "http://a b" }) {
+        for (String url : new String[] { "http://user:pass@litellm:4000", "http://litellm:4000?x=1",
+                "http://litellm:4000#f", "ftp://litellm:4000", "litellm:4000", "http://", "http://a b" }) {
             assertThatThrownBy(() -> properties("http://litellm:4000", url)).as(url)
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("TINFIRM_MODEL_GATEWAY_MODEL_URL");

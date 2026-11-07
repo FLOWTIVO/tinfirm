@@ -72,11 +72,8 @@ COPY server/pom.xml ./
 # The OpenAPI generator reads ../api/openapi.yaml.
 COPY api/ /src/api/
 COPY server/src/ src/
-# The shared libraries (libs/jira, libs/litellm, libs/net; CONVENTIONS §2), whose sources the server's build
-# compiles in.
+# The shared library (libs/jira; CONVENTIONS §2), whose sources the server's build compiles in.
 COPY libs/jira/src/main/ /src/libs/jira/src/main/
-COPY libs/litellm/src/main/ /src/libs/litellm/src/main/
-COPY libs/net/src/main/ /src/libs/net/src/main/
 # ee/, the commercial part (ADR-0077), whose sources the server's build compiles in: in every image.
 COPY ee/src/main/ /src/ee/src/main/
 # The server serves the SPA from classpath:/static/.

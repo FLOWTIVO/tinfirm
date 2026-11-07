@@ -2,10 +2,9 @@
 {{- include "tinfirm.litellm.validateDatabase" . }}
 {{- $np := .Values.networkPolicy }}
 {{- $l := $np.litellm }}
-# The LiteLLM pods. Ingress: LiteLLM's own port (every route: the admin API and the model API)
-# from the server pods only, and from nothing else: no ingress controller, no runner host
-# (security review 2026-10-12, row 21); the model port (its model routes alone, ADR-0069)
-# from the server and litellm.modelApi.from. Egress (when
+# The LiteLLM pods. Ingress: LiteLLM's port (every route: the admin API and the model API)
+# from the server pods and the peers of litellm.from (ADR-0110), and from nothing else: no
+# ingress controller, no runner host (security review 2026-10-12, row 21). Egress (when
 # enabled): DNS, PostgreSQL and the model providers, plus configured extras.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -23,26 +22,19 @@ spec:
     - Egress
     {{- end }}
   ingress:
-    # The Tinfirm server: the admin API, and the model requests it relays.
+    # The Tinfirm server: the admin API, and the model requests it relays and its own. And
+    # the company's services the operator names (litellm.from), which their LiteLLM keys
+    # limit: the admin API is on the same port.
     - from:
         - podSelector:
             matchLabels:
               {{- include "tinfirm.selectorLabels" . | nindent 14 }}
-      ports:
-        - protocol: TCP
-          port: 4000
-    # The model port: the server's model requests and the company services the operator names
-    # (litellm.modelApi.from).
-    - from:
-        - podSelector:
-            matchLabels:
-              {{- include "tinfirm.selectorLabels" . | nindent 14 }}
-        {{- with .Values.litellm.modelApi.from }}
+        {{- with .Values.litellm.from }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       ports:
         - protocol: TCP
-          port: 4001
+          port: 4000
   {{- if $np.egress.enabled }}
   egress:
     {{- include "tinfirm.networkPolicy.dnsEgress" . | nindent 4 }}

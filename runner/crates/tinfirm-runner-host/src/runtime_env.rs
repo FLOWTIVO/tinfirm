@@ -29,7 +29,7 @@
 //!
 //! No runtime asks the model's provider to run a tool itself, in any run (ADR-0108): a
 //! runtime's own switch for a provider-run tool is off whatever its model access, since through
-//! a gateway the model relay and the model port refuse such a request with 400, and with a
+//! a gateway the model relay refuses such a request with 400, and with a
 //! provider's own key or a subscription nothing else would stop it. Codex's web search is off in `CODEX_CONFIG`
 //! ([`codex_config`]); Claude Code's WebSearch, which is Anthropic's server-side `web_search`
 //! tool, is a disallowed tool of the session ([`session_meta`]). OpenCode 2.0.29 and pi 1.0.4
@@ -292,7 +292,7 @@ pub fn opencode_config(p: &ProviderKey<'_>, model: Option<&str>) -> Value {
 
 /// Claude Code's tools that no Tinfirm session offers the model: WebSearch is Anthropic's
 /// server-side `web_search` tool, a tool the provider runs itself, which no Tinfirm run may use
-/// (ADR-0108), whatever reaches the model: the model relay and the model port refuse it, and a
+/// (ADR-0108), whatever reaches the model: the model relay refuses it, and a
 /// key of Anthropic's own, a Claude login or Bedrock would let it run. WebFetch stays: Claude
 /// Code fetches in the sandbox, through its egress proxy.
 pub const CLAUDE_CODE_DISALLOWED_TOOLS: &[&str] = &["WebSearch"];
@@ -333,7 +333,7 @@ pub const CODEX_GATEWAY_PROVIDER: &str = "tinfirm";
 /// Codex's own web search is off in every run (`web_search = "disabled"`, the top-level key of
 /// Codex's config.toml, in Codex 0.156.1, the version the CODEX image pins; its default,
 /// `cached`, adds the provider-run `web_search` tool to every request): no Tinfirm run may have
-/// the provider run a tool (ADR-0108). Through a gateway the model relay and the model port
+/// the provider run a tool (ADR-0108). Through a gateway the model relay
 /// would refuse the request with 400; with a provider's own key or a ChatGPT login nothing
 /// would, so the config is the only guard there.
 fn codex_config(access: Access<'_>, model: Option<&str>, effort: Option<Effort>) -> String {

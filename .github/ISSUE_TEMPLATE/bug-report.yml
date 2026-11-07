@@ -19,7 +19,7 @@ body:
         - Server (REST API, MCP endpoints, triggers, chats)
         - Web app
         - Runner host
-        - Model port or LiteLLM
+        - Model gateway (LiteLLM)
         - Outlook add-in or Gmail add-on
         - Helm chart
         - Compose stack
