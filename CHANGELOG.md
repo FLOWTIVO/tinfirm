@@ -45,7 +45,6 @@ These are limits of 1.0, not features of it ([PLATFORM.md §14](docs/PLATFORM.md
 - **Not built either:** reusing agents (duplicate, templates, export and import as code), a GitHub App for installation and user tokens, webhooks as hints for the next poll, Jira's changelog for issues that are not yet subjects, reuse of the model proxy's connections, and Buzz, which is parked.
 - **Git credentials live as long as the account's** (Q41). A run uses the account's token, not a short-lived one per run, and a host does not revoke a run's git token when the server revokes the account.
 - **The server pod runs the migrations** (Q17), so it holds the `tinfirm_owner` password; there is no separate migration step, and no pre-upgrade backup hook in the chart.
-- **The Claude Code download is not checked against a pinned digest** when a runner host builds its images (Q16).
 - **The audit chain's heads are anchored only in the database** (Q6): no export or signature outside it yet.
 - **After a sign-in through an identity provider, the server returns to `/`** (Q44); the web app takes back the page that asked for a recent sign-in from the tab, within 15 minutes.
 - **The SAML and SCIM guides** for Entra ID, Okta and AD FS are checked against the providers' documentation, not yet against live tenants, and the SCIM endpoint has not yet run Microsoft's SCIM Validator or Okta's test suite.
