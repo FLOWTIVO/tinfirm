@@ -34,7 +34,7 @@ What happens:
 
 A change to the chart's non-secret configuration rolls the pods by itself: the pod template carries a checksum of the server's ConfigMap. A change to a Secret does not ([Rotate a Secret](#rotate-a-secret)).
 
-From a chart with the model port (`model-api`, before chart 0.9.0), Helm refuses a values file that still sets `litellm.modelApi`: move its `from` to `litellm.from` and drop the rest. The services those peers run then call `http://<release>-litellm.<namespace>.svc:4000/v1` instead of port 4001, and reach LiteLLM's admin API there too: give each a key made with `key_type` `llm_api` before it moves ([The company's own services](model-gateway.md#the-companys-own-services)).
+From a development chart with the model port (`model-api`, before the change that removed it), Helm refuses a values file that still sets `litellm.modelApi`: move its `from` to `litellm.from` and drop the rest. The services those peers run then call `http://<release>-litellm.<namespace>.svc:4000/v1` instead of port 4001, and reach LiteLLM's admin API there too: give each a key made with `key_type` `llm_api` before it moves ([The company's own services](model-gateway.md#the-companys-own-services)).
 
 ### Roll back
 
@@ -159,7 +159,7 @@ Keep the old host name pointing at Tinfirm, redirecting to the new one, for as l
 
 ## Upgrade runner hosts
 
-Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
+Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. The one exception is the move from a development build to v1.0.0, whose release notes say to upgrade the runner hosts first. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
 
 ## The Compose stack
 
@@ -178,32 +178,28 @@ A dump is a backup of one moment, unlike point-in-time recovery: take one before
 
 ### Upgrade the stack
 
-From a checkout of the repository, take the new version and rebuild:
+From the Compose files of a release ([Try Tinfirm with Docker Compose](quick-start.md#1-start-the-stack)): download and check the new release's `tinfirm-compose-<version>.tar.gz` against its signed `SHA256SUMS` as there, and unpack it beside the old directory. Copy your `.env` into the new directory, and name the new release's image in it, by the digest you verified ([Verify your images](verify-images.md)):
+
+```sh title=".env"
+TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server@sha256:<digest>   # the image tagged v<version>
+```
+
+Then start the new version from the new directory. Compose recreates the containers that changed and keeps the volumes, which belong to the project `tinfirm` whatever the directory:
+
+```sh
+docker compose up -d --no-build --remove-orphans
+```
+
+From a checkout of the repository, for development, take the new commit and rebuild:
 
 ```sh
 git pull
 make up
 ```
 
-`make up` builds the server from the checkout, under the name `tinfirm-server:local`, and recreates the containers that changed.
+`make up` builds the server from the checkout, under the name `tinfirm-server:local`, and recreates the containers that changed. To run a published image from a checkout instead, name it in `deploy/compose/.env` as above and start without building: `docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env up -d --no-build --remove-orphans`. Do not mix the two ways: `make up` builds and tags whatever image `.env` names.
 
-To run a published image instead, pull it by digest, name it in `.env`, and start without building:
-
-```sh
-docker pull ghcr.io/flowtivo/tinfirm-server@sha256:<digest>
-```
-
-```sh title="deploy/compose/.env"
-TINFIRM_SERVER_IMAGE=ghcr.io/flowtivo/tinfirm-server@sha256:<digest>
-```
-
-```sh
-docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env up -d --no-build --remove-orphans
-```
-
-Do not mix the two ways: `make up` builds and tags whatever image `.env` names.
-
-A stack that ran a version with the model port (`model-api`) keeps that container running after `make up`: remove it with `--remove-orphans`, as in the command above. Nothing reads the `TINFIRM_MODEL_API_*` lines of `.env` any more: remove them.
+A stack that ran a development build with the model port (`model-api`) keeps that container running after `make up`: remove it with `--remove-orphans`, as in the commands above. Nothing reads the `TINFIRM_MODEL_API_*` lines of `.env` any more: remove them.
 
 Use the Compose files of the same version as the image, and keep your `.env`. When Compose stops with `required variable … is missing a value`, the new version needs a setting your `.env` lacks: copy it from `.env.example`, with a value of your own for every secret.
 

@@ -23,7 +23,7 @@ A host is a company host or a personal host, chosen when it is registered and ne
 - Disk for the runner images, the repository mirrors and the workspaces.
 - On Linux, the agent runs as uid 1000. Without `--sandbox-bridge` the workspaces are directories of the host's user: run the host as uid 1000, or the agent may not write them (`doctor` warns). With the bridge they travel over it, and a company host's user needs no uid of the sandbox's.
 
-Each Tinfirm release, and the prerelease `rolling`, carries the binary for these platforms, with `SHA256SUMS`, which lists every archive, and `REVISION`, which names the commit:
+Each Tinfirm release carries the binary for these platforms on its [GitHub Release](https://github.com/FLOWTIVO/tinfirm/releases), with `SHA256SUMS`, which lists every archive, its signature `SHA256SUMS.sig`, and `REVISION`, which names the commit. The current release is v1.0.0, whose archives are `tinfirm-runner-host-1.0.0-<platform>`. The prerelease `rolling` carries the same files for every commit of the development branch: a development channel, not a release.
 
 | Archive | Platform |
 |---|---|
@@ -32,16 +32,20 @@ Each Tinfirm release, and the prerelease `rolling`, carries the binary for these
 | `tinfirm-runner-host-<version>-aarch64-apple-darwin.tar.gz` | macOS on Apple silicon |
 | `tinfirm-runner-host-<version>-x86_64-pc-windows-msvc.zip` | Windows: planned |
 
-`<version>` is `x.y.z` for a release `vx.y.z`, and `rolling-<short sha>` for `rolling`. Only the runner host is published, as these archives and as the image `ghcr.io/flowtivo/tinfirm-runner-host`; the runner images, which contain Claude Code, are built on your machine and never pushed to a registry.
+`<version>` is `x.y.z` for a release `vx.y.z`, such as `1.0.0`, and `rolling-<short sha>` for `rolling`. Only the runner host is published, as these archives and as the image `ghcr.io/flowtivo/tinfirm-runner-host` (`:v1.0.0` for v1.0.0); the runner images, which contain Claude Code, are built on your machine and never pushed to a registry.
 
 On Kubernetes, the Helm chart can run a company host for you, as a pod whose sandboxes are VMs, with no machine of its own and no registration in the app: [The runner pod](helm.md#the-runner-pod).
 
 ## Install
 
-1. Download the archive for your platform, `SHA256SUMS` and `SHA256SUMS.sig` from a Tinfirm release, then check the signature of `SHA256SUMS` with FLOWTIVO's public key `cosign.pub` ([Verify your images](verify-images.md); for `rolling`, the rolling key `deploy/compose/auto-deploy/cosign-rolling.pub` of the repository), the archive against `SHA256SUMS`, and install it:
+1. Download the archive for your platform, `SHA256SUMS` and `SHA256SUMS.sig` from a Tinfirm release, then check the signature of `SHA256SUMS` with FLOWTIVO's public key `cosign.pub` ([Verify your images](verify-images.md); for `rolling`, the rolling key `deploy/compose/auto-deploy/cosign-rolling.pub` of the repository), the archive against `SHA256SUMS`, and install it. For v1.0.0 on Linux x86_64:
 
     ```sh
+    version=1.0.0
     target=x86_64-unknown-linux-musl
+    base=https://github.com/FLOWTIVO/tinfirm/releases/download/v$version
+    curl -fsSL -O "$base/SHA256SUMS" -O "$base/SHA256SUMS.sig" \
+      -O "$base/tinfirm-runner-host-$version-$target.tar.gz"
     openssl base64 -d -A -in SHA256SUMS.sig -out SHA256SUMS.der
     openssl dgst -sha256 -verify cosign.pub -signature SHA256SUMS.der SHA256SUMS
     grep -- "-$target.tar.gz\$" SHA256SUMS | sha256sum -c -     # macOS: shasum -a 256 -c -
@@ -256,7 +260,7 @@ A **drain** lets the active runs finish instead of cancelling them:
 
 A drain can last as long as the longest turn. SIGTERM or `Ctrl-C` during a drain cancels what is still running. Closing the terminal of a foreground `run` drains it too.
 
-To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts.
+To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts, except from a development build to v1.0.0: then upgrade the hosts first, as its release notes say.
 
 ## Disk maintenance
 
