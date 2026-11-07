@@ -21,7 +21,7 @@ The key is never a file the deployment mounts, an environment variable or a Helm
 2. Sign in as an instance admin, and open **Licence** under **Instance admin**.
 3. Under **Paste a new key**, paste it into **Licence key**, and choose **Enter key**.
 
-The page confirms **Key entered**, **Key replaced** or **Next key entered**. The **This instance** card shows the edition and its state, the customer, the end, the end of the grace, the seats used of those licensed, and the paid features. Under **Key**, the page shows the key in force, marked **In force**, and a renewal held for later, marked **Next, from** its start date. The page lists no other keys, and a key cannot be removed. When the server refuses a key, the page says why; [Licence keys](../reference/licence.md#problems) lists every reason.
+The page confirms **Key entered**, **Key replaced** or **Next key entered**. The **This instance** card shows the edition and its state, the customer, the end, the end of the grace, the seats used of those licensed, and the paid features. Under an Enterprise key the list also names **Streaming the audit to a SIEM**, **High availability** and **Air-gapped installation**: they are planned, not built in Tinfirm 1.0 ([Editions and prices](../admin-guide/editions.md)). Under **Key**, the page shows the key in force, marked **In force**, and a renewal held for later, marked **Next, from** its start date. The page lists no other keys, and a key cannot be removed. When the server refuses a key, the page says why; [Licence keys](../reference/licence.md#problems) lists every reason.
 
 ## One key at a time
 

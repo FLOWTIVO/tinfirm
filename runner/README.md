@@ -70,7 +70,7 @@ taken from your checkout of the repository, never from the release. Download the
 assets from the release's page on GitHub, or with the GitHub CLI (`gh auth login`):
 
 ```sh
-tag=v0.1.0                          # or rolling
+tag=v1.0.0                          # or rolling, the development channel
 target=x86_64-unknown-linux-musl    # see the table
 key=deploy/compose/auto-deploy/cosign.pub   # for rolling: deploy/compose/auto-deploy/cosign-rolling.pub
 gh release download "$tag" -R FLOWTIVO/tinfirm -p SHA256SUMS -p SHA256SUMS.sig \

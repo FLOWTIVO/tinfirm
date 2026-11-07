@@ -23,14 +23,16 @@ Everything is recorded in the audit log in every edition. Proving it to an audit
 | The audit recorded, hash-chained | :lucide-check: | :lucide-check: | :lucide-check: |
 | The audit shown in the app | the last 90 days | all | all |
 | The audit's filters, export, chain verification and daily checks | – | :lucide-check: | :lucide-check: |
-| The audit streamed to a SIEM (planned) | – | – | :lucide-check: |
+| The audit streamed to a SIEM | – | – | planned |
 | Erasure of a person's content | :lucide-check: | :lucide-check: | :lucide-check: |
 | Retention | [everything kept](#retention-in-community) | the Owner's periods | the Owner's periods |
 | Legal holds | – | – | :lucide-check: |
 | Several companies in one instance | – | – | :lucide-check: |
-| High availability (planned) | – | – | :lucide-check: |
-| Air-gapped installation: an offline bundle of every image and update, with the runner images prebuilt (planned) | – | – | :lucide-check: |
+| High availability: several server replicas | – | – | planned |
+| Air-gapped installation: an offline bundle of every image and update, with the runner images prebuilt | – | – | planned |
 | Seats | unlimited | 5 to 150, as licensed | as the contract says |
+
+**Planned** means not in Tinfirm 1.0: the feature is part of Enterprise once it is built, and an Enterprise licence does not deliver it before then. Until then, Tinfirm runs as one server replica in every edition ([Scale and availability](../operator-guide/architecture.md#scale-and-availability)), the audit is read in the app or exported rather than streamed, and an air-gapped network copies the signed images itself ([On an air-gapped network](../operator-guide/verify-images.md#on-an-air-gapped-network)).
 
 Erasure stays free, so that no company pays to meet the GDPR. Budgets and kill switches stay free, because nobody should pay to stop an agent.
 
