@@ -34,7 +34,7 @@ class ReturnPathsTest {
             // Control characters and whitespace, raw.
             "/me\r\nSet-Cookie: x=y", "/me\n", "/me\t", "/me\u0000", "/me\u007f", "/me ", " /me", "/m e",
             // Non-ASCII, raw: browsers send it encoded.
-            "/café", "/ ", "/me‮",
+            "/caf\u00e9", "/\u2028", "/me\u202e",
             // Encoded variants of the above.
             "/%2Fevil.example", "/%2F%2Fevil.example", "/%5Cevil.example", "/%5cevil.example", "/me%5C..%5Capi",
             "/%0d%0aSet-Cookie:%20x=y", "/me%00", "/me%7F", "/me%C2%85", "/me%E2%80%A8", "/me%E2%80%AE",

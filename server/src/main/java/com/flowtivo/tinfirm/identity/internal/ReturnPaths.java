@@ -65,7 +65,7 @@ public final class ReturnPaths {
         for (int i = 0; i < whole.length(); i++) {
             char c = whole.charAt(i);
             if (Character.isISOControl(c) || c == '\\' || Character.getType(c) == Character.FORMAT
-                    || c == ' ' || c == ' ') {
+                    || c == '\u2028' || c == '\u2029') {
                 return null;
             }
         }
