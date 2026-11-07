@@ -180,8 +180,18 @@ public class SamlSignIns {
     }
 
     /**
-     * Where a SAML sign-in ends: as an OIDC login, on {@code /} or on the OAuth authorization request it interrupted
-     * (saved with the request, {@link #RETURN_TO}; threat model 3.4); {@code RelayState} is never a destination. The
+     * The checked page ({@link ReturnPaths}) the start of a sign-in names in {@code returnTo}, saved with the
+     * AuthnRequest; null for none or one that fails the check.
+     */
+    public @Nullable String returnPath(HttpServletRequest request) {
+        return ReturnPaths.check(request.getParameter(ReturnPaths.PARAMETER));
+    }
+
+    /**
+     * Where a SAML sign-in ends: as an OIDC login, on the OAuth authorization request it interrupted (saved with the
+     * request, {@link #RETURN_TO}), else on the page its start named (saved with the request too, and handed over as
+     * {@link ReturnPaths#REQUEST_ATTRIBUTE}), else on {@code /} (threat model 3.4); {@code RelayState} is never a
+     * destination. The
      * session ends at the earlier of {@code TINFIRM_SESSION_MAX_AGE} and the assertion's {@code SessionNotOnOrAfter}.
      */
     public AuthenticationSuccessHandler successHandler() {

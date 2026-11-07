@@ -110,6 +110,65 @@ class OidcLoginIntegrationTest extends OidcIntegrationTest {
         assertThat(plain.header("Location")).isEqualTo("http://localhost:" + PORT + "/");
     }
 
+    @Test
+    void anOidcLoginReturnsToThePageItsStartNamedOnce() {
+        ApiClient browser = new ApiClient(PORT);
+
+        ApiResponse callback = login(browser, DEFAULT_TRUST, "/me?tab=tokens",
+                new Identity("sub-" + UUID.randomUUID(), "back-" + UUID.randomUUID() + "@example.test", true,
+                        "Bea Back"),
+                true);
+
+        assertThat(callback.status()).isEqualTo(302);
+        assertThat(callback.header("Location")).isEqualTo("http://localhost:" + PORT + "/me?tab=tokens");
+        // Used once, with that login's authorization request: the browser's next sign-in without one ends on "/".
+        ApiResponse next = login(browser, new Identity("sub-" + UUID.randomUUID(),
+                "next-" + UUID.randomUUID() + "@example.test", true, "Nia Next"), false);
+        assertThat(next.header("Location")).isEqualTo("http://localhost:" + PORT + "/");
+    }
+
+    @Test
+    void anOidcLoginNeverReturnsToAnotherOriginOrAServerPath() {
+        for (String unsafe : new String[] { "https://evil.example/", "//evil.example", "/\\evil.example",
+                "/%2F%2Fevil.example", "/%5Cevil.example", "/me%0d%0aSet-Cookie:x", "/c/%2e%2e/api/me",
+                "/api/me" }) {
+            ApiClient browser = new ApiClient(PORT);
+            ApiResponse callback = login(browser, DEFAULT_TRUST, unsafe,
+                    new Identity("sub-" + UUID.randomUUID(), "unsafe-" + UUID.randomUUID() + "@example.test", true,
+                            "Una Safe"),
+                    false);
+            assertThat(callback.header("Location")).as(unsafe).isEqualTo("http://localhost:" + PORT + "/");
+        }
+    }
+
+    @Test
+    void aFailedOidcLoginDoesNotUseTheReturnPath() {
+        ApiClient browser = new ApiClient(PORT);
+
+        ApiResponse callback = login(browser, DEFAULT_TRUST, "/me",
+                new Identity("sub-" + UUID.randomUUID(), ADMIN_EMAIL, true, "Imposter"), false);
+
+        assertThat(callback.header("Location")).isEqualTo("http://localhost:" + PORT + "/login?error=EMAIL_IN_USE");
+        assertThat(browser.get("/api/me").status()).isEqualTo(401);
+    }
+
+    @Test
+    void anInterruptedAuthorizationRequestWinsOverTheReturnPath() {
+        ApiClient browser = new ApiClient(PORT);
+        String authorize = "/oauth2/authorize?response_type=code&client_id=mcp-inspector&redirect_uri="
+                + encode("http://localhost:6274/oauth/callback") + "&scope=tinfirm%3Aread&state=client-state"
+                + "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&resource="
+                + encode("http://localhost:" + PORT + "/api/companies/" + UUID.randomUUID() + "/mcp");
+        assertThat(browser.get(authorize).status()).isEqualTo(302);
+
+        ApiResponse callback = login(browser, DEFAULT_TRUST, "/me",
+                new Identity("sub-" + UUID.randomUUID(), "both-" + UUID.randomUUID() + "@example.test", true,
+                        "Bo Th"),
+                false);
+
+        assertThat(callback.header("Location")).isEqualTo("http://localhost:" + PORT + authorize);
+    }
+
     private static String encode(String value) {
         return java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8);
     }
@@ -466,8 +525,15 @@ class OidcLoginIntegrationTest extends OidcIntegrationTest {
      */
     private ApiResponse login(ApiClient browser, String registrationId, Identity identity,
             boolean checkSessionRotation) {
+        return login(browser, registrationId, null, identity, checkSessionRotation);
+    }
+
+    /** The flow with the start naming a page to return to ({@code returnTo}), or none for null. */
+    private ApiResponse login(ApiClient browser, String registrationId, @org.jspecify.annotations.Nullable String returnTo,
+            Identity identity, boolean checkSessionRotation) {
         IDP.nextLogin(identity);
-        ApiResponse start = browser.get("/oauth2/authorization/" + registrationId);
+        ApiResponse start = browser.get("/oauth2/authorization/" + registrationId
+                + (returnTo != null ? "?returnTo=" + encode(returnTo) : ""));
         assertThat(start.status()).isEqualTo(302);
         String anonymousSession = browser.cookie("TINFIRM_SESSION").orElseThrow().getValue();
 
