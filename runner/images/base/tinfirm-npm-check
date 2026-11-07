@@ -1,0 +1,37 @@
+#!/usr/bin/env node
+// Run in a directory after `npm ci --omit=dev`: checks that every package of its
+// package-lock.json that this platform needs is installed, at the version the lockfile locks.
+//
+// `npm ci` stops on a package whose download does not match the lockfile's integrity hash,
+// except for an optional one: that it skips with a warning ("seems to be corrupted"). The
+// runtimes' native binaries (Claude Code, Codex, OpenCode) are optional platform packages, so
+// without this check a tampered or corrupted download would surface later, if at all, as a
+// missing binary (threat model Q16).
+"use strict";
+const fs = require("fs");
+const path = require("path");
+
+const dir = process.argv[2] || ".";
+const lock = JSON.parse(fs.readFileSync(path.join(dir, "package-lock.json"), "utf8"));
+const missing = [];
+for (const [key, entry] of Object.entries(lock.packages || {})) {
+  if (key === "" || entry.dev || entry.link) continue;
+  if (entry.os && !entry.os.includes(process.platform)) continue;
+  if (entry.cpu && !entry.cpu.includes(process.arch)) continue;
+  let version;
+  try {
+    version = JSON.parse(fs.readFileSync(path.join(dir, key, "package.json"), "utf8")).version;
+  } catch {
+    version = undefined;
+  }
+  if (version !== entry.version) missing.push(`${key} (locked ${entry.version}, installed ${version || "none"})`);
+}
+if (missing.length > 0) {
+  console.error(
+    "ERROR: npm ci did not install these packages as package-lock.json locks them: " +
+      missing.join(", ") +
+      ". npm skips an optional package whose download fails its integrity check (\"seems to be corrupted\" above): do not use that registry or mirror (Q16).",
+  );
+  process.exit(1);
+}
+console.log(`tinfirm-npm-check: ${path.resolve(dir)} holds the packages of its package-lock.json`);

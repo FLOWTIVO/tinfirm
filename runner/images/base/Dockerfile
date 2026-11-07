@@ -135,8 +135,11 @@ RUN groupmod --new-name agent node \
  && chmod -R g=u /workspace /attachments /output /home/agent \
  && chmod g=u /etc/passwd
 
-COPY tinfirm-sandbox-entrypoint tinfirm-sandbox-setup /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/tinfirm-sandbox-entrypoint /usr/local/bin/tinfirm-sandbox-setup
+# tinfirm-npm-check: the runtime images run it after `npm ci`, which skips an optional package
+# (a runtime's native binary) whose download fails its integrity check (threat model Q16).
+COPY tinfirm-sandbox-entrypoint tinfirm-sandbox-setup tinfirm-npm-check /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/tinfirm-sandbox-entrypoint /usr/local/bin/tinfirm-sandbox-setup \
+      /usr/local/bin/tinfirm-npm-check
 
 ENV HOME=/home/agent \
     JAVA_HOME=/usr/lib/jvm/default-jdk \

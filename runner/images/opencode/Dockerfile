@@ -24,7 +24,9 @@ USER root
 # `--version` may print a name and a `v` before the version, as OpenCode's own installer expects.
 COPY package.json package-lock.json /opt/tinfirm/opencode/
 RUN cd /opt/tinfirm/opencode \
- && npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+ && { npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+      || { echo "ERROR: npm ci failed. An EINTEGRITY error above means a downloaded package is not the one package-lock.json locks: do not use that registry or mirror (Q16)." >&2; exit 1; }; } \
+ && tinfirm-npm-check \
  && (cd node_modules/@opencode/cli && node ./postinstall.mjs) \
  && npm cache clean --force \
  && ln -s /opt/tinfirm/opencode/node_modules/.bin/opencode /usr/local/bin/opencode \
