@@ -1,4 +1,4 @@
-# all_litellm_params of the pinned LiteLLM, v1.106.6 (litellm/types/utils.py): the request fields
+# all_litellm_params of the pinned LiteLLM, v1.108.0 (litellm/types/utils.py): the request fields
 # LiteLLM takes as its own, which LiteLlmRequests removes. On a LiteLLM bump, list the new version's anew.
 _agentic_loop_api_surface
 _agentic_loop_depth
@@ -7,13 +7,16 @@ _code_interpreter_interception_active
 _code_interpreter_interception_converted_stream
 _code_interpreter_interception_sandbox_key
 _code_interpreter_interception_session_scoped
+_code_interpreter_interception_stream_options
 _context_compaction_state
 _headroom_interception_converted_stream
+_headroom_interception_stream_options
 _litellm_addressed_response_id
 _litellm_strip_stream_usage
 _router_weights
 _websearch_interception_converted_stream
 _websearch_interception_emit_native_blocks
+_websearch_interception_stream_options
 acompletion
 adaptive_router_config
 adaptive_router_default_model
@@ -150,6 +153,8 @@ fireworks_forward_user_id
 force_timeout
 gcs_bucket_name
 gcs_path_service_account
+github_copilot_auth_type
+github_copilot_user_session
 google_maps_grounding_cost_per_query
 guardrails
 headers
@@ -169,6 +174,7 @@ input_cost_per_image_token_batches
 input_cost_per_pixel
 input_cost_per_query
 input_cost_per_second
+input_cost_per_text_message
 input_cost_per_token
 input_cost_per_token_above_100k_tokens
 input_cost_per_token_above_100k_tokens_batches
@@ -341,6 +347,10 @@ tenant_id
 text_completion
 tiered_pricing
 timeout_by_service_tier
+token_exchange_audience
+token_exchange_endpoint
+token_exchange_profile
+token_exchange_scope
 tpm
 ttl
 turn_off_message_logging
