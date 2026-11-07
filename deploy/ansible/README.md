@@ -68,7 +68,7 @@ tinfirm_runner_hosts:
     tinfirm_runner_host_binary_url: https://nexus.internal/repository/tinfirm/tinfirm-runner-host-<version>-x86_64-unknown-linux-musl.tar.gz
     # SHA256SUMS and SHA256SUMS.sig beside it: the role checks the signature, then the archive.
     tinfirm_runner_host_kata_download_url: https://nexus.internal/repository/kata-releases
-    tinfirm_runner_host_kata_checksum: "sha256:…"                   # required while the role knows none
+    tinfirm_runner_host_kata_checksum: "sha256:…"                   # only for a version the role knows no checksum of
     tinfirm_runner_host_max_concurrent_runs: 4
     # This VM's dockerd pulls the images' base image (Docker Hub) through this mirror.
     tinfirm_runner_host_docker_registry_mirrors: [https://nexus.internal:8443]
@@ -98,7 +98,7 @@ The main ones:
 |---|---|---|
 | `tinfirm_runner_host_binary_src` / `_binary_url` | — | The runner host binary: a file on the control node, or a release archive to download. Set exactly one. Any release works with a server that speaks its protocol ([runner/README.md](../../runner/README.md#compatibility-with-the-server)). No version is released yet: take the archive of the `rolling` prerelease, whose `<version>` is `rolling-<short sha>` ([docs/operations/auto-deploy.md](../../docs/operations/auto-deploy.md#1-what-ci-publishes)) |
 | `tinfirm_runner_host_server_url`, `tinfirm_runner_host_token` | — | Login, done once; `tinfirm_runner_host_relogin: true` repeats it. Use the server's public URL (`TINFIRM_PUBLIC_URL`): the model proxy sends the host's token only to that origin, and the relay refuses the model requests of a host without it |
-| `tinfirm_runner_host_kata_version` | `4.2.0` | Kata Containers static release |
+| `tinfirm_runner_host_kata_version` | `4.3.1` | Kata Containers static release. The role knows the checksum of 4.3.1; another version needs `tinfirm_runner_host_kata_checksum` |
 | `tinfirm_runner_host_kata_runtime_name` | `kata` | Docker runtime name; must start with `kata` |
 | `tinfirm_runner_host_sandbox_docker` | `true` | `run --sandbox-docker` |
 | `tinfirm_runner_host_egress_proxy` | `true` | `run --egress-proxy`: the sandboxes reach only the model, the mirrors of the sandbox settings and `tinfirm_runner_host_egress_allow` (ADR-0044). `false` is open egress (R24) |

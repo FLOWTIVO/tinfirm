@@ -9,15 +9,15 @@ _tinfirm_runner_host_kata_config: /etc/kata-containers/configuration.toml
 _tinfirm_runner_host_kata_marker: "/opt/kata/.tinfirm-kata-{{ tinfirm_runner_host_kata_version }}"
 _tinfirm_runner_host_cache_dir: /var/cache/tinfirm
 
-# The SHA-256 of each pinned Kata release's tarball, by version and architecture, from the
-# release's assets. Those of kata-go-static-4.2.0-amd64.tar.zst and -arm64.tar.zst
-# (https://github.com/kata-containers/kata-containers/releases/tag/4.2.0) are not filled in
-# here: the entries are empty, and the role stops unless tinfirm_runner_host_kata_checksum
-# is set.
+# The SHA-256 of each pinned Kata release's tarball, by version and architecture: the sha256
+# that https://github.com/kata-containers/kata-containers/releases/tag/<version> lists for
+# kata-go-static-<version>-<arch>.tar.zst, compared with the downloaded file (4.3.1: on
+# 2026-11-07). Add an entry only once both agree. A version missing here needs
+# tinfirm_runner_host_kata_checksum, or the role stops.
 _tinfirm_runner_host_kata_known_checksums:
-  "4.2.0":
-    amd64: ""
-    arm64: ""
+  "4.3.1":
+    amd64: "66b35b06f6b41b56f8606ddf3ed3e5660b0971d1e309d903457c4056a0b9eff0"
+    arm64: "2ff9b77869a902405c5d5b65fb38a5e93a18ae29e5e8891181e3a097f110741a"
 # The checksum the download is checked against: the site's, else the known one; empty when
 # neither exists (checks.yml stops the role then).
 _tinfirm_runner_host_kata_known_checksum: >-
