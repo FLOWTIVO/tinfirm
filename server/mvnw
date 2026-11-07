@@ -191,19 +191,14 @@ case "${MVNW_PASSWORD:+has-password}" in
 has-password) [ -n "${MVNW_USERNAME-}" ] || MVNW_USERNAME='' MVNW_PASSWORD='' ;;
 esac
 
-# The URL as the log shows it: without user info or a query, which a private repository's may carry.
-shownUrl="$(printf %s "$distributionUrl" | sed -e 's#//[^/@]*@#//#' -e 's/?.*$//')"
 if [ -z "${MVNW_USERNAME-}" ] && command -v wget >/dev/null; then
   verbose "Found wget ... using wget"
-  echo "Downloading $shownUrl with wget" >&2
   wget ${__MVNW_QUIET_WGET:+"$__MVNW_QUIET_WGET"} "$distributionUrl" -O "$TMP_DOWNLOAD_DIR/$distributionUrlName" || die "wget: Failed to fetch $distributionUrl"
 elif [ -z "${MVNW_USERNAME-}" ] && command -v curl >/dev/null; then
   verbose "Found curl ... using curl"
-  echo "Downloading $shownUrl with curl" >&2
   curl ${__MVNW_QUIET_CURL:+"$__MVNW_QUIET_CURL"} -f -L -o "$TMP_DOWNLOAD_DIR/$distributionUrlName" "$distributionUrl" || die "curl: Failed to fetch $distributionUrl"
 elif set_java_home; then
   verbose "Falling back to use Java to download"
-  echo "Downloading $shownUrl with Java (neither wget nor curl is installed)" >&2
   javaSource="$TMP_DOWNLOAD_DIR/Downloader.java"
   targetZip="$TMP_DOWNLOAD_DIR/$distributionUrlName"
   cat >"$javaSource" <<-END
@@ -224,8 +219,7 @@ elif set_java_home; then
   verbose " - Compiling Downloader.java ..."
   "$(native_path "$JAVACCMD")" "$(native_path "$javaSource")" || die "Failed to compile Downloader.java"
   verbose " - Running Downloader.java ..."
-  # Checked, unlike the wrapper's own script: a failed download is not a corrupted one.
-  "$(native_path "$JAVACMD")" -cp "$(native_path "$TMP_DOWNLOAD_DIR")" Downloader "$distributionUrl" "$(native_path "$targetZip")" || die "Java: Failed to fetch $distributionUrl"
+  "$(native_path "$JAVACMD")" -cp "$(native_path "$TMP_DOWNLOAD_DIR")" Downloader "$distributionUrl" "$(native_path "$targetZip")"
 fi
 
 # If specified, validate the SHA-256 sum of the Maven distribution zip file
@@ -251,17 +245,6 @@ if [ -n "${distributionSha256Sum-}" ]; then
   if [ $distributionSha256Result = false ]; then
     echo "Error: Failed to validate Maven distribution SHA-256, your Maven distribution might be compromised." >&2
     echo "If you updated your Maven version, you need to update the specified distributionSha256Sum property." >&2
-    # What arrived, for the build log: its size, its digest and its first bytes (an error page shows here).
-    if [ -f "$TMP_DOWNLOAD_DIR/$distributionUrlName" ]; then
-      if command -v sha256sum >/dev/null; then
-        gotSum="$(sha256sum "$TMP_DOWNLOAD_DIR/$distributionUrlName" | cut -d' ' -f1)"
-      else
-        gotSum="$(shasum -a 256 "$TMP_DOWNLOAD_DIR/$distributionUrlName" | cut -d' ' -f1)"
-      fi
-      echo "Downloaded $(wc -c <"$TMP_DOWNLOAD_DIR/$distributionUrlName") bytes, SHA-256 $gotSum, starting: $(head -c 160 "$TMP_DOWNLOAD_DIR/$distributionUrlName" | tr -c '[:print:]' '.')" >&2
-    else
-      echo "Nothing was downloaded to $TMP_DOWNLOAD_DIR/$distributionUrlName" >&2
-    fi
     exit 1
   fi
 fi
