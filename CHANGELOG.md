@@ -1,6 +1,6 @@
 # Changelog
 
-Every release of Tinfirm, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/). A release is cut by hand with `.github/workflows/release.yml`; its GitHub Release carries the section of its version below.
+Every release of Tinfirm, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/). A release is cut by hand with `.github/workflows/release.yml`, which dates the section of its version in the release commit; its GitHub Release carries that section.
 
 The server, the web app, the Helm chart and the runner host carry the release's version. The runner host and the server agree on the runner protocol and its features, never on a version number ([ADR-0109](docs/adr/0109-runner-version-is-the-release-version.md)).
 

@@ -118,9 +118,10 @@ on:
       changelog:
         description: |
           Path of a Keep a Changelog file in the repository, e.g. `CHANGELOG.md`. Set: the
-          GitHub Release's body starts with the section `## [<version>]` of that file as the
-          release commit holds it, followed by the generated notes. Empty (the default), or a
-          file without that section: the generated notes alone.
+          guard refuses a release whose file has no section `## [<version>]`, the release
+          commit replaces its heading `## [<version>] - unreleased` with today's date (UTC),
+          and the GitHub Release's body starts with that section, followed by the generated
+          notes. Empty (the default): the generated notes alone.
         required: false
         default: ''
         type: string
@@ -304,6 +305,23 @@ jobs:
         with:
           version: ${{ steps.check.outputs.next_version }}
           manifests: ${{ inputs.manifests }}
+      # The release notes, when the caller keeps a changelog: a release without its section
+      # `## [<version>]` stops here, before anything is tagged or pushed.
+      - name: Check the changelog's section
+        if: ${{ inputs.changelog != '' }}
+        env:
+          VERSION: ${{ steps.check.outputs.version }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "::error::$CHANGELOG does not exist on $GITHUB_REF_NAME."
+            exit 1
+          fi
+          if ! awk -v head="## [$VERSION]" 'index($0, head) == 1 { found = 1 } END { exit !found }' "$CHANGELOG"; then
+            echo "::error::$CHANGELOG has no section '## [$VERSION]'. Write the release notes in a pull request first (CONTRIBUTING §5)."
+            exit 1
+          fi
       # The charts too, when the caller publishes any: a chart that does not package under
       # this version, or that does not link its package to this repository, fails here
       # and not after the tag is pushed.
@@ -369,11 +387,27 @@ jobs:
         with:
           version: ${{ needs.guard.outputs.version }}
           manifests: ${{ inputs.manifests }}
+      # The release date goes into the release commit: the heading `## [<version>] -
+      # unreleased` becomes `## [<version>] - <today, UTC>`, so the tag and the GitHub
+      # Release carry the day the release ran. A heading with a date already stays.
+      - name: Date the changelog's section
+        id: date
+        if: ${{ inputs.changelog != '' }}
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          today=$(date -u +%Y-%m-%d)
+          awk -v head="## [$VERSION] - unreleased" -v dated="## [$VERSION] - $today" \
+            '$0 == head { print dated; next } { print }' "$CHANGELOG" > "$RUNNER_TEMP/changelog"
+          cat "$RUNNER_TEMP/changelog" > "$CHANGELOG"
+          echo "path=$CHANGELOG" >> "$GITHUB_OUTPUT"
       - name: Commit and tag
         id: commit
         env:
           VERSION: ${{ needs.guard.outputs.version }}
-          PATHS: ${{ steps.setv.outputs.paths }}
+          PATHS: ${{ steps.setv.outputs.paths }} ${{ steps.date.outputs.path }}
           # The repository name when the caller names no product, so the message never
           # starts with a bare " v<version>".
           PRODUCT: ${{ inputs.product_name || github.event.repository.name }}
