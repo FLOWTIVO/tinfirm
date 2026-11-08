@@ -208,3 +208,20 @@ errorReports:
     name: tinfirm-error-reports
   label: acme-prod
   proxy: http://proxy.acme.internal:3128
+
+# The audit anchor (ADR-0111): checkpoints to a MinIO bucket with object lock, signed by the
+# active key, a retired key still verifying.
+auditAnchor:
+  sink: s3
+  interval: PT30M
+  existingSecret: tinfirm-audit-anchor
+  activeKey: k2027
+  keys:
+    - kid: k2027
+    - kid: k2026
+      retired: true
+  s3:
+    endpoint: https://minio.acme.internal
+    bucket: tinfirm-audit-checkpoints
+    pathStyle: true
+    existingSecret: tinfirm-audit-anchor-s3

@@ -38,6 +38,31 @@ data:
   {{- with .Values.trustedProxies }}
   SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES: {{ . | quote }}
   {{- end }}
+  {{- with .Values.auditAnchor }}
+  # The audit anchor (ADR-0111); its keys and the bucket's key come from Secrets.
+  TINFIRM_AUDIT_ANCHOR_SINK: {{ .sink | quote }}
+  TINFIRM_AUDIT_ANCHOR_INTERVAL: {{ .interval | quote }}
+  {{- if ne .sink "none" }}
+  TINFIRM_AUDIT_ANCHOR_ACTIVE_KEY: {{ required "auditAnchor.activeKey is required with a sink" .activeKey | quote }}
+  {{- end }}
+  {{- if eq .sink "s3" }}
+  TINFIRM_AUDIT_ANCHOR_S3_ENDPOINT: {{ .s3.endpoint | quote }}
+  TINFIRM_AUDIT_ANCHOR_S3_REGION: {{ .s3.region | quote }}
+  TINFIRM_AUDIT_ANCHOR_S3_BUCKET: {{ required "auditAnchor.s3.bucket is required with the s3 sink" .s3.bucket | quote }}
+  TINFIRM_AUDIT_ANCHOR_S3_PATH_STYLE: {{ .s3.pathStyle | quote }}
+  TINFIRM_AUDIT_ANCHOR_S3_PREFIX: {{ .s3.prefix | quote }}
+  TINFIRM_AUDIT_ANCHOR_S3_RETENTION: {{ .s3.retention | quote }}
+  TINFIRM_AUDIT_ANCHOR_S3_REQUIRE_LOCK: {{ .s3.requireLock | quote }}
+  {{- end }}
+  {{- if eq .sink "file" }}
+  TINFIRM_AUDIT_ANCHOR_FILE_DIR: "/var/lib/tinfirm/audit-checkpoints"
+  {{- end }}
+  {{- if eq .sink "syslog" }}
+  TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST: {{ required "auditAnchor.syslog.host is required with the syslog sink" .syslog.host | quote }}
+  TINFIRM_AUDIT_ANCHOR_SYSLOG_PORT: {{ .syslog.port | quote }}
+  TINFIRM_AUDIT_ANCHOR_SYSLOG_PROTOCOL: {{ .syslog.protocol | quote }}
+  {{- end }}
+  {{- end }}
   {{- range .Values.companies }}
   {{- $key := upper .key }}
   # Company "{{ .key }}" (ADR-0075).

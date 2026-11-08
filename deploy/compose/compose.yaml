@@ -185,6 +185,13 @@ services:
         condition: service_healthy
     # The gateway network for LiteLLM: its admin API and the model requests.
     networks: [default, gateway]
+    # The audit anchor's keys (ADR-0111, docs-site's "Anchor the audit"), and nothing else:
+    # TINFIRM_AUDIT_ANCHOR_KEYS_<KID>_PRIVATE=<the PEM on one line, its breaks as \n>, and
+    # _PUBLIC for a retired key. Kept apart from .env, which the database's administrators
+    # may read; optional.
+    env_file:
+      - path: ./.env.audit-anchor
+        required: false
     # Explicit, not `env_file: .env`: the container gets exactly the §4 variables, and
     # not the Postgres superuser or Keycloak admin passwords that also live in .env.
     environment:
@@ -237,6 +244,26 @@ services:
       TINFIRM_SESSION_BUNDLES_S3_ACCESS_KEY_ID: ${TINFIRM_SESSION_BUNDLES_S3_ACCESS_KEY_ID:-}
       TINFIRM_SESSION_BUNDLES_S3_SECRET_ACCESS_KEY: ${TINFIRM_SESSION_BUNDLES_S3_SECRET_ACCESS_KEY:-}
       TINFIRM_SESSION_BUNDLES_RETENTION: ${TINFIRM_SESSION_BUNDLES_RETENTION:-P30D}
+      # The audit chains' heads anchored outside the database (ADR-0111, Pro): off unless .env
+      # sets the sink. `file` writes to the audit-checkpoints volume below, which protects
+      # nothing on a host whose administrators also run the database: prefer `s3` with object
+      # lock, or `syslog` to a collector of its own. The keys: .env.audit-anchor, above.
+      TINFIRM_AUDIT_ANCHOR_SINK: ${TINFIRM_AUDIT_ANCHOR_SINK:-none}
+      TINFIRM_AUDIT_ANCHOR_INTERVAL: ${TINFIRM_AUDIT_ANCHOR_INTERVAL:-PT1H}
+      TINFIRM_AUDIT_ANCHOR_ACTIVE_KEY: ${TINFIRM_AUDIT_ANCHOR_ACTIVE_KEY:-}
+      TINFIRM_AUDIT_ANCHOR_FILE_DIR: /var/lib/tinfirm/audit-checkpoints
+      TINFIRM_AUDIT_ANCHOR_S3_ENDPOINT: ${TINFIRM_AUDIT_ANCHOR_S3_ENDPOINT:-}
+      TINFIRM_AUDIT_ANCHOR_S3_REGION: ${TINFIRM_AUDIT_ANCHOR_S3_REGION:-us-east-1}
+      TINFIRM_AUDIT_ANCHOR_S3_BUCKET: ${TINFIRM_AUDIT_ANCHOR_S3_BUCKET:-}
+      TINFIRM_AUDIT_ANCHOR_S3_PATH_STYLE: ${TINFIRM_AUDIT_ANCHOR_S3_PATH_STYLE:-false}
+      TINFIRM_AUDIT_ANCHOR_S3_PREFIX: ${TINFIRM_AUDIT_ANCHOR_S3_PREFIX:-audit-checkpoints/}
+      TINFIRM_AUDIT_ANCHOR_S3_ACCESS_KEY_ID: ${TINFIRM_AUDIT_ANCHOR_S3_ACCESS_KEY_ID:-}
+      TINFIRM_AUDIT_ANCHOR_S3_SECRET_ACCESS_KEY: ${TINFIRM_AUDIT_ANCHOR_S3_SECRET_ACCESS_KEY:-}
+      TINFIRM_AUDIT_ANCHOR_S3_RETENTION: ${TINFIRM_AUDIT_ANCHOR_S3_RETENTION:-P400D}
+      TINFIRM_AUDIT_ANCHOR_S3_REQUIRE_LOCK: ${TINFIRM_AUDIT_ANCHOR_S3_REQUIRE_LOCK:-true}
+      TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST: ${TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST:-}
+      TINFIRM_AUDIT_ANCHOR_SYSLOG_PORT: ${TINFIRM_AUDIT_ANCHOR_SYSLOG_PORT:-6514}
+      TINFIRM_AUDIT_ANCHOR_SYSLOG_PROTOCOL: ${TINFIRM_AUDIT_ANCHOR_SYSLOG_PROTOCOL:-tls}
       JAVA_TOOL_OPTIONS: ${TINFIRM_JAVA_TOOL_OPTIONS:--XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError}
       # SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES is deliberately not set: no proxy sits in
       # front of the server here, and Tomcat's default (private ranges) is harmless on a
@@ -255,6 +282,8 @@ services:
     volumes:
       # The `filesystem` store of the session bundles; unused while the store is `none`.
       - session-bundles:/var/lib/tinfirm/session-bundles
+      # The `file` sink of the audit anchor; unused with another sink.
+      - audit-checkpoints:/var/lib/tinfirm/audit-checkpoints
     cap_drop:
       - ALL
     security_opt:
@@ -313,3 +342,5 @@ volumes:
   postgres-data:
   # Ciphertext only (ADR-0097); the image's directory is the server user's, so a new volume is too.
   session-bundles:
+  # Signed checkpoints of the audit chains' heads (ADR-0111); keep them, and copy them off the host.
+  audit-checkpoints:

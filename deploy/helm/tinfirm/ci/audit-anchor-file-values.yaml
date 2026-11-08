@@ -1,0 +1,10 @@
+# The audit anchor's file sink (ADR-0111): checkpoints on a volume of their own.
+publicUrl: https://tinfirm.example.com
+auditAnchor:
+  sink: file
+  existingSecret: tinfirm-audit-anchor
+  activeKey: k2027
+  keys:
+    - kid: k2027
+  file:
+    existingClaim: tinfirm-audit-checkpoints
