@@ -402,7 +402,9 @@ export function inboxRowView(item: InboxItem, reader: InboxReader): InboxRowView
             ? 'the log is shorter than at the last check'
             : check?.failure === 'HEAD_CHANGED'
               ? 'its last event changed since the last check'
-              : 'it does not verify';
+              : check?.failure === 'ANCHOR_MISMATCH'
+                ? `it disagrees with its checkpoint outside the database${check.firstInvalidSeq != null ? ` (#${check.firstInvalidSeq})` : ''}`
+                : 'it does not verify';
       return {
         kind: 'Audit log',
         title: 'The daily check of the audit log failed',

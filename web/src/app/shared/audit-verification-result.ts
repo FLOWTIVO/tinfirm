@@ -7,7 +7,7 @@ import {
   lucideShieldCheck,
 } from '@ng-icons/lucide';
 import { HlmAlertImports } from '@spartan-ng/helm/alert';
-import type { AuditVerification } from '../api/generated/models';
+import type { AuditCheckpointHead, AuditVerification } from '../api/generated/models';
 import { clockTime } from './audit-event-view';
 
 export interface AuditVerificationOutcome {
@@ -18,6 +18,16 @@ export interface AuditVerificationOutcome {
 }
 
 const numbers = new Intl.NumberFormat('en-GB');
+
+/**
+ * The checkpoint outside the database that the chain was compared with (ADR-0111), as a
+ * sentence an admin may note elsewhere: "Anchored outside the database at event 88123:
+ * checkpoint 1234 of 2026-11-07 10:00 UTC, key k2026."
+ */
+export function anchorSentence(checkpoint: AuditCheckpointHead): string {
+  const at = checkpoint.issuedAt.slice(0, 16).replace('T', ' ');
+  return `Anchored outside the database at event ${numbers.format(checkpoint.seq)}: checkpoint ${numbers.format(checkpoint.number)} of ${at} UTC, key ${checkpoint.keyId}.`;
+}
 
 /**
  * Shows the outcome of an audit hash-chain verification (company or instance chain): as an alert
@@ -64,6 +74,11 @@ const numbers = new Intl.NumberFormat('en-GB');
                 {{ v.result!.checkedEvents === 1 ? 'event' : 'events' }}. Every hash matches, so no
                 event was changed or removed.</span
               >
+              @if (v.result!.checkpoint; as c) {
+                <span class="text-muted-foreground block" data-testid="verification-anchor">{{
+                  anchor(c)
+                }}</span>
+              }
             </p>
           </div>
         } @else if (v.result) {
@@ -86,6 +101,9 @@ const numbers = new Intl.NumberFormat('en-GB');
                 The recomputed hashes do not match the stored ones.
               }
               Checked <span class="font-mono">{{ count(v.result.checkedEvents) }}</span> events.
+              @if (v.result.checkpoint; as c) {
+                <span class="block" data-testid="verification-anchor">{{ anchor(c) }}</span>
+              }
             </p>
           </div>
         }
@@ -103,6 +121,9 @@ const numbers = new Intl.NumberFormat('en-GB');
             Recomputed {{ v.result.checkedEvents }}
             {{ v.result.checkedEvents === 1 ? 'event' : 'events' }}. Every hash matches, so no event
             was changed or removed.
+            @if (v.result.checkpoint; as c) {
+              <span class="block" data-testid="verification-anchor">{{ anchor(c) }}</span>
+            }
           </p>
         </div>
       } @else if (v.result) {
@@ -117,6 +138,9 @@ const numbers = new Intl.NumberFormat('en-GB');
               The recomputed hashes do not match the stored ones.
             }
             Checked {{ v.result.checkedEvents }} events.
+            @if (v.result.checkpoint; as c) {
+              <span class="block" data-testid="verification-anchor">{{ anchor(c) }}</span>
+            }
           </p>
         </div>
       }
@@ -134,5 +158,9 @@ export class AuditVerificationResult {
 
   protected count(n: number): string {
     return numbers.format(n);
+  }
+
+  protected anchor(checkpoint: AuditCheckpointHead): string {
+    return anchorSentence(checkpoint);
   }
 }
