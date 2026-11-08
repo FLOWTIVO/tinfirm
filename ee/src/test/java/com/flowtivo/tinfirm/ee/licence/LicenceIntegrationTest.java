@@ -89,7 +89,7 @@ class LicenceIntegrationTest extends IntegrationTest {
         assertThat(licence.get("endsAt").asString()).isEqualTo(TestLicences.today().plusYears(1).toString());
         assertThat(licence.get("features")).extracting(JsonNode::asString)
             .containsExactlyInAnyOrder("OUTLOOK_ADDIN", "GMAIL_ADDON", "AUDIT_TOOLS", "AUDIT_FULL_HISTORY",
-                    "RETENTION_SETTINGS", "ELASTIC_RUNNERS");
+                    "AUDIT_ANCHOR", "RETENTION_SETTINGS", "ELASTIC_RUNNERS");
         assertThat(admin.get("/api/admin/licence").body()).doesNotContain("TINFIRM1.");
         JsonNode audited = admin.get("/api/admin/audit-events?limit=50").json().get("items");
         assertThat(audited).filteredOn(event -> event.get("action").asString().equals("licence.key.applied"))

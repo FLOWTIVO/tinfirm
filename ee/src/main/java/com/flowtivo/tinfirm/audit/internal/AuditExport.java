@@ -76,9 +76,13 @@ class AuditExport {
 
     private final Licensing licensing;
 
+    private final AuditAnchors anchors;
+
     AuditExport(AuditEventStore store, AuditToolsStore range, SystemTransactions transactions, AuditLog auditLog,
-            @Value("${tinfirm.audit.export-max-events:1000000}") long maxEvents, Licensing licensing) {
+            @Value("${tinfirm.audit.export-max-events:1000000}") long maxEvents, Licensing licensing,
+            AuditAnchors anchors) {
         this.licensing = licensing;
+        this.anchors = anchors;
         this.store = store;
         this.range = range;
         this.transactions = transactions;
@@ -91,7 +95,8 @@ class AuditExport {
      * chains from, and the chain's head at the start.
      */
     record Plan(UUID companyId, UUID userId, long fromSeq, long toSeq, long count, @Nullable String prevHash,
-            long headSeq, String headHash, @Nullable Instant from, @Nullable Instant to) {
+            long headSeq, String headHash, @Nullable Instant from, @Nullable Instant to,
+            AuditAnchors.@Nullable Anchored checkpoint) {
     }
 
     /** In the caller's transaction, after its access check ({@code VIEW_AUDIT}). */
@@ -136,7 +141,12 @@ class AuditExport {
             first = 0;
             last = 0;
         }
-        return new Plan(companyId, userId, first, last, count, prevHash, head.lastSeq(), head.lastHash(), from, to);
+        // ADR-0111, decision 6: the latest checkpoint outside the database that names the chain at or before the
+        // range's end, which the operator's tool checks against the sink; none without the anchor.
+        AuditAnchors.Anchored checkpoint = anchors.anchored(companyId, count > 0 ? last : head.lastSeq())
+            .orElse(null);
+        return new Plan(companyId, userId, first, last, count, prevHash, head.lastSeq(), head.lastHash(), from, to,
+                checkpoint);
     }
 
     /**
@@ -196,6 +206,16 @@ class AuditExport {
         header.put("prevHash", plan.prevHash());
         header.put("from", plan.from() != null ? plan.from().toString() : null);
         header.put("to", plan.to() != null ? plan.to().toString() : null);
+        Map<String, @Nullable Object> checkpoint = null;
+        if (plan.checkpoint() != null) {
+            checkpoint = new LinkedHashMap<>();
+            checkpoint.put("number", plan.checkpoint().checkpoint());
+            checkpoint.put("issuedAt", plan.checkpoint().issuedAt().toString());
+            checkpoint.put("keyId", plan.checkpoint().keyId());
+            checkpoint.put("seq", plan.checkpoint().seq());
+            checkpoint.put("hash", plan.checkpoint().hash());
+        }
+        header.put("checkpoint", checkpoint);
         line(out, AuditCanonicalForm.exportLine(header));
         long written = 0;
         if (plan.count() > 0) {

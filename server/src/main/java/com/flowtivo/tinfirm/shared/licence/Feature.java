@@ -13,6 +13,11 @@ public enum Feature {
     AUDIT_TOOLS(Edition.PRO),
     /** The audit shown in the app beyond its last 90 days. */
     AUDIT_FULL_HISTORY(Edition.PRO),
+    /**
+     * The audit chains' heads anchored outside the database (ADR-0111): signed checkpoints written to a sink, their
+     * comparison in the daily check, the anchored status, and the offline verification tool.
+     */
+    AUDIT_ANCHOR(Edition.PRO),
     /** The OWNER's retention periods; without them retention keeps everything (decision 8). */
     RETENTION_SETTINGS(Edition.PRO),
     /**

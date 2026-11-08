@@ -15,6 +15,7 @@ import com.flowtivo.tinfirm.audit.AuditTrail;
 import com.flowtivo.tinfirm.shared.access.CompanyAccess;
 import com.flowtivo.tinfirm.shared.access.CompanyAccessGuard;
 import com.flowtivo.tinfirm.shared.access.CompanyPermission;
+import com.flowtivo.tinfirm.shared.api.model.AuditAnchorStatus;
 import com.flowtivo.tinfirm.shared.api.model.AuditCheck;
 import com.flowtivo.tinfirm.shared.api.model.AuditCheckPage;
 import com.flowtivo.tinfirm.shared.api.model.AuditEventPage;
@@ -35,12 +36,15 @@ class AuditService implements AuditTrail, AuditReads {
 
     private final ObjectProvider<AuditTools> tools;
 
+    private final ObjectProvider<AuditAnchors> anchors;
+
     AuditService(AuditEventStore store, CompanyAccessGuard companyAccess, AuditPages pages,
-            ObjectProvider<AuditTools> tools) {
+            ObjectProvider<AuditTools> tools, ObjectProvider<AuditAnchors> anchors) {
         this.store = store;
         this.companyAccess = companyAccess;
         this.pages = pages;
         this.tools = tools;
+        this.anchors = anchors;
     }
 
     /**
@@ -112,6 +116,21 @@ class AuditService implements AuditTrail, AuditReads {
     public AuditCheck acknowledgeInstanceCheck(UUID checkId, String note) {
         CurrentActor.requireInstanceAdmin();
         return tools().acknowledge(null, checkId, note);
+    }
+
+    /**
+     * The anchor's status (ADR-0111), under {@code ee/}; without it the server answers as Community,
+     * {@code 403 EDITION_REQUIRED}, once the caller is known to be an instance admin.
+     */
+    @Override
+    @Transactional(readOnly = true)
+    public AuditAnchorStatus auditAnchorStatus() {
+        CurrentActor.requireInstanceAdmin();
+        AuditAnchors found = anchors.getIfAvailable();
+        if (found == null) {
+            throw Licensing.editionRequired(Feature.AUDIT_ANCHOR);
+        }
+        return found.status();
     }
 
     @Override

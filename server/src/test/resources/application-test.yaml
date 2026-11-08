@@ -62,6 +62,9 @@ tinfirm:
     # so that a test reaches it (1 000 000 in production).
     check-initial-delay: PT2H
     export-max-events: 200
+    anchor:
+      # The tests write checkpoints on demand (AuditAnchorTest); the writer itself does not run during a test run.
+      initial-delay: PT2H
   retention:
     # The tests sweep on demand, as of a time they choose; the job itself does not run during a test run.
     sweep-initial-delay: PT2H

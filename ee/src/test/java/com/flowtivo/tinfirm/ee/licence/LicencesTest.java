@@ -45,7 +45,8 @@ class LicencesTest {
         assertThat(status.graceEndsAt()).isEqualTo(END.plusDays(30));
         assertThat(status.auditExportUntil()).isEqualTo(END.plusDays(120));
         assertThat(status.features()).containsExactlyInAnyOrder(Feature.OUTLOOK_ADDIN, Feature.GMAIL_ADDON,
-                Feature.AUDIT_TOOLS, Feature.AUDIT_FULL_HISTORY, Feature.RETENTION_SETTINGS, Feature.ELASTIC_RUNNERS);
+                Feature.AUDIT_TOOLS, Feature.AUDIT_FULL_HISTORY, Feature.AUDIT_ANCHOR, Feature.RETENTION_SETTINGS,
+                Feature.ELASTIC_RUNNERS);
     }
 
     @Test

@@ -48,9 +48,12 @@ class AuditCheckServiceTest {
     @SuppressWarnings("unchecked")
     private final ObjectProvider<AuditTools> tools = mock(ObjectProvider.class);
 
+    @SuppressWarnings("unchecked")
+    private final ObjectProvider<AuditAnchors> anchors = mock(ObjectProvider.class);
+
     private final AuditCheckService service = new AuditCheckService(events, checks, transactions, time,
             new TinfirmProperties(URI.create("https://tinfirm.example.com"), Set.of("api")),
-            Duration.ofDays(1), tools);
+            Duration.ofDays(1), tools, anchors);
 
     @Test
     void aPassedCheckRecordsTheHeadItVerifiedNotAnEventAppendedMeanwhile() {
