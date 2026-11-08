@@ -67,7 +67,7 @@ The public guide has the values; the notes behind some of them:
 - `metrics.podMonitor.*` renders a `PodMonitor` (`templates/podmonitor.yaml`), not a ServiceMonitor: port 8081 is on no Service, by design (CONVENTIONS §12). In another namespace it selects the release's with a `namespaceSelector`.
 - `strategy` with `type: Recreate` loses `rollingUpdate` in the template: the chart's default carries one, and Helm merges a values file's `strategy` into it.
 - `openshift` (`auto`, `true`, `false`) drops `runAsUser`, `runAsGroup` and `fsGroup` from every security context the chart renders (`tinfirm.securityContext`), and adds OpenShift's DNS (namespace `openshift-dns`, port 5353 behind the Service's 53) to both policies' DNS rule (`tinfirm.networkPolicy.dnsEgress`). `auto` asks `.Capabilities.APIVersions` for `security.openshift.io/v1`, which Argo CD and `helm install` fill from the cluster; `ci/openshift-values.yaml` renders it with `true`.
-- `extraConfig` carries the add-ins' variables ([outlook-add-in.md](outlook-add-in.md), [gmail-add-on.md](gmail-add-on.md)); the log shipper beside the server is [alerts.md](alerts.md), section 7; `errorReports.*` is [error-reports.md](error-reports.md).
+- `extraConfig` carries the add-ins' variables ([outlook-add-in.md](outlook-add-in.md), [gmail-add-on.md](gmail-add-on.md)); the log shipper beside the server is [alerts.md](alerts.md), section 7; `errorReports.*` is [error-reports.md](error-reports.md). `auditAnchor.*` writes the audit's signed checkpoints outside the database (ADR-0111): the operator guide's [Anchor the audit](../../docs-site/content/operator-guide/audit-anchor.md).
 
 ### 2.7 LiteLLM
 

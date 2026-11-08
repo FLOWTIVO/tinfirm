@@ -61,6 +61,7 @@ Back up Tinfirm's and LiteLLM's databases together, with point-in-time recovery,
 | The vault's master keys (`tinfirm-vault`) | Without them, nobody can decrypt the company secrets in a restored database |
 | LiteLLM's salt key | Without it, a restored LiteLLM database cannot decrypt its provider keys |
 | Your values file | With the digests you deployed, so that you can deploy the same again |
+| The audit anchor's public keys, and its checkpoints if they are in a directory (Pro and Enterprise) | To verify the restored audit against the checkpoints written before the restore: [Anchor the audit](audit-anchor.md) |
 
 ## Rotate a Secret
 
@@ -82,6 +83,8 @@ kubectl -n tinfirm rollout restart deployment/tinfirm
 | Error reports DSN | Change it in its Secret, then restart the server: it reads the DSN when it starts |
 | Runner pod token | Put a new `tfr_…` token into the runner Secret, restart the server, which replaces the old token at its start and closes the pod's connection, then the pod: `kubectl -n tinfirm rollout restart deployment/tinfirm-runner` |
 | DigitalOcean API token | Create a new token, put it into its Secret, restart the runner pod, then revoke the old one |
+| Audit anchor key | Add the next key, make it active and restart, then keep the old one's public key only: [Rotate the key](audit-anchor.md#rotate-the-key) |
+| Audit anchor bucket key | Create a new key for the bucket, put it into `auditAnchor.s3.existingSecret`, restart the server, then revoke the old one |
 
 The LiteLLM keys of members and service accounts rotate by themselves, every 30 days by default: [Model access and budgets](../admin-guide/model-access.md).
 
@@ -225,3 +228,4 @@ Edit `.env`, then run `make up`, or the `docker compose … up -d` above: Compos
 | `LITELLM_DB_PASSWORD` | Change it and start the stack: the stack sets the new password on LiteLLM's role before LiteLLM starts |
 | `LITELLM_SALT_KEY` | **Never** |
 | `TINFIRM_BOOTSTRAP_ADMIN_*` | Nothing to rotate: they are read only while the instance has no user |
+| `TINFIRM_AUDIT_ANCHOR_KEYS_*` in `.env.audit-anchor` | As on Kubernetes: [Rotate the key](audit-anchor.md#rotate-the-key) |

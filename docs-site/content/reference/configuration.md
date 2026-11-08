@@ -229,11 +229,21 @@ The limits marked "seed" are the instance's starting values: each company's admi
 | `TINFIRM_AUDIT_CHECK_TICK` | `PT1H` | How often the server looks for chains due | `extraConfig` |
 | `TINFIRM_AUDIT_CHECK_INITIAL_DELAY` | `PT10M` | The first look after a start | `extraConfig` |
 | `TINFIRM_AUDIT_EXPORT_MAX_EVENTS` | `1000000` | The most events one export of the audit log holds | `extraConfig` |
+| `TINFIRM_AUDIT_ANCHOR_SINK` | `none` | Where signed checkpoints of the audit chains go, outside the database: `none`, `s3`, `file` or `syslog` ([Anchor the audit](../operator-guide/audit-anchor.md)) | `auditAnchor.sink` |
+| `TINFIRM_AUDIT_ANCHOR_INTERVAL` | `PT1H` | How often a checkpoint is written while the audit grows; `PT5M` to `P1D` | `auditAnchor.interval` |
+| `TINFIRM_AUDIT_ANCHOR_ACTIVE_KEY` | none | The key id that signs the checkpoints; required with a sink | `auditAnchor.activeKey` |
+| `TINFIRM_AUDIT_ANCHOR_KEYS_<KID>_PRIVATE` | none | A signing key, Ed25519, PKCS#8 PEM, from `tinfirm-audit-verify keygen` | `auditAnchor.keys`, from `auditAnchor.existingSecret` |
+| `TINFIRM_AUDIT_ANCHOR_KEYS_<KID>_PUBLIC` | none | A retired key's public key, X.509 PEM: it verifies the checkpoints it signed | `auditAnchor.keys[].retired` |
+| `TINFIRM_AUDIT_ANCHOR_S3_ENDPOINT`, `_REGION`, `_BUCKET`, `_PATH_STYLE`, `_PREFIX` | empty, `us-east-1`, empty, `false`, `audit-checkpoints/` | The `s3` sink's bucket, made with object lock | `auditAnchor.s3.*` |
+| `TINFIRM_AUDIT_ANCHOR_S3_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | empty | The bucket's key: write, read and list, never delete | `auditAnchor.s3.existingSecret` |
+| `TINFIRM_AUDIT_ANCHOR_S3_RETENTION`, `_REQUIRE_LOCK` | `P400D`, `true` | Each checkpoint's object lock; whether a bucket without object lock is refused | `auditAnchor.s3.retention`, `.requireLock` |
+| `TINFIRM_AUDIT_ANCHOR_FILE_DIR` | none | The `file` sink's directory | `auditAnchor.file.existingClaim`, mounted at `/var/lib/tinfirm/audit-checkpoints` |
+| `TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST`, `_PORT`, `_PROTOCOL` | none, `6514`, `tls` | The `syslog` sink's collector; `tls`, `tcp` or `udp` | `auditAnchor.syslog.*` |
 | `TINFIRM_RETENTION_SWEEP_INTERVAL` | `P1D` | How often each company is swept for retention | `extraConfig` |
 | `TINFIRM_RETENTION_SWEEP_TICK` | `PT1H` | How often the server looks for companies due | `extraConfig` |
 | `TINFIRM_RETENTION_SWEEP_INITIAL_DELAY` | `PT15M` | The first look after a start | `extraConfig` |
 
-The audit's checks and export, and retention periods, are part of Pro and Enterprise: [Editions and prices](../admin-guide/editions.md).
+The audit's checks, export and anchor, and retention periods, are part of Pro and Enterprise: [Editions and prices](../admin-guide/editions.md).
 
 ## Error reports
 
