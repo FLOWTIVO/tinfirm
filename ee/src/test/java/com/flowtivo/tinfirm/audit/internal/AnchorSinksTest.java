@@ -14,15 +14,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
 import java.net.InetAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyStore;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -30,6 +27,13 @@ import java.time.ZoneOffset;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,7 +45,7 @@ import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 
 /**
  * The sinks of ADR-0111, decision 3: a directory never overwrites a checkpoint and lists them as numbers; syslog sends
- * one RFC 5424 message per checkpoint, octet-counted over TCP and one datagram over UDP; S3 writes each object once
+ * one RFC 5424 message per checkpoint, octet-counted, over TLS only, and refuses a collector it does not trust; S3 writes each object once
  * ({@code If-None-Match}) under object lock in compliance mode, and the start refuses a bucket without object lock.
  */
 class AnchorSinksTest {
@@ -93,10 +97,12 @@ class AnchorSinksTest {
     }
 
     @Test
-    void theSyslogSinkSendsOneOctetCountedMessageOverTcp() throws Exception {
-        try (ServerSocket collector = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+    void theSyslogSinkSendsOneOctetCountedMessageOverTlsToACollectorItTrusts(@TempDir Path dir) throws Exception {
+        SSLContext tls = collectorTls(dir);
+        try (SSLServerSocket collector = (SSLServerSocket) tls.getServerSocketFactory()
+            .createServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
             CompletableFuture<String> received = CompletableFuture.supplyAsync(() -> {
-                try (Socket socket = collector.accept(); InputStream in = socket.getInputStream()) {
+                try (SSLSocket socket = (SSLSocket) collector.accept(); InputStream in = socket.getInputStream()) {
                     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
                     in.transferTo(bytes);
                     return bytes.toString(StandardCharsets.UTF_8);
@@ -105,8 +111,8 @@ class AnchorSinksTest {
                     throw new IllegalStateException(ex);
                 }
             });
-            SyslogAnchorSink sink = new SyslogAnchorSink(new AuditAnchorProperties.Syslog("127.0.0.1",
-                    collector.getLocalPort(), "tcp"), CLOCK);
+            SyslogAnchorSink sink = new SyslogAnchorSink(new AuditAnchorProperties.Syslog("localhost",
+                    collector.getLocalPort()), tls.getSocketFactory(), CLOCK);
 
             String location = sink.write(INSTANCE, 7, "{\"checkpoint\":{\"number\":7}}");
 
@@ -116,38 +122,71 @@ class AnchorSinksTest {
                 .isEqualTo(body.getBytes(StandardCharsets.UTF_8).length);
             assertThat(body).startsWith("<109>1 2026-11-07T10:00:00.000000Z ")
                 .contains(" tinfirm - audit-checkpoint - {\"checkpoint\":{\"number\":7}}");
-            assertThat(location).isEqualTo("syslog+tcp://127.0.0.1:" + collector.getLocalPort() + " #7");
+            assertThat(location).isEqualTo("syslog+tls://localhost:" + collector.getLocalPort() + " #7");
             assertThat(sink.readable()).isFalse();
         }
     }
 
     @Test
-    void theSyslogSinkSendsOneDatagramOverUdp() throws Exception {
-        try (DatagramSocket collector = new DatagramSocket(0, InetAddress.getLoopbackAddress())) {
-            collector.setSoTimeout(10_000);
-            SyslogAnchorSink sink = new SyslogAnchorSink(new AuditAnchorProperties.Syslog("127.0.0.1",
-                    collector.getLocalPort(), "udp"), CLOCK);
+    void theSyslogSinkRefusesACollectorWhoseCertificateItDoesNotTrust(@TempDir Path dir) throws Exception {
+        SSLContext tls = collectorTls(dir);
+        try (SSLServerSocket collector = (SSLServerSocket) tls.getServerSocketFactory()
+            .createServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            CompletableFuture.runAsync(() -> {
+                try (SSLSocket socket = (SSLSocket) collector.accept()) {
+                    socket.getInputStream().read();
+                }
+                catch (IOException ex) {
+                    // The client gives up on the handshake.
+                }
+            });
+            // The JVM's own trust store, which does not hold the collector's certificate.
+            SyslogAnchorSink sink = new SyslogAnchorSink(new AuditAnchorProperties.Syslog("localhost",
+                    collector.getLocalPort()), CLOCK);
 
-            sink.write(INSTANCE, 8, "{\"checkpoint\":{\"number\":8}}");
-
-            DatagramPacket packet = new DatagramPacket(new byte[4096], 4096);
-            collector.receive(packet);
-            assertThat(new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8))
-                .startsWith("<109>1 ")
-                .endsWith("audit-checkpoint - {\"checkpoint\":{\"number\":8}}");
+            assertThatThrownBy(() -> sink.write(INSTANCE, 8, "{}")).isInstanceOf(SSLException.class);
         }
     }
 
     @Test
-    void theSyslogSinkFailsWhenTheCollectorIsGone() throws IOException {
+    void theSyslogSinkFailsWhenTheCollectorIsGone(@TempDir Path dir) throws Exception {
+        SSLContext tls = collectorTls(dir);
         int port;
-        try (ServerSocket closed = new ServerSocket(0)) {
+        try (SSLServerSocket closed = (SSLServerSocket) tls.getServerSocketFactory().createServerSocket(0)) {
             port = closed.getLocalPort();
         }
-        SyslogAnchorSink sink = new SyslogAnchorSink(new AuditAnchorProperties.Syslog("127.0.0.1", port, "tcp"),
-                CLOCK);
+        SyslogAnchorSink sink = new SyslogAnchorSink(new AuditAnchorProperties.Syslog("localhost", port),
+                tls.getSocketFactory(), CLOCK);
 
         assertThatThrownBy(() -> sink.write(INSTANCE, 9, "{}")).isInstanceOf(IOException.class);
+    }
+
+    /**
+     * TEST FIXTURE ONLY: a collector's key pair and self-signed certificate for {@code localhost}, made with the JDK's
+     * keytool, as a TLS context that serves it and trusts it.
+     */
+    private static SSLContext collectorTls(Path dir) throws Exception {
+        Path store = dir.resolve("collector.p12");
+        char[] password = "collector-test".toCharArray();
+        Process keytool = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "keytool").toString(),
+                "-genkeypair", "-alias", "collector", "-keyalg", "EC", "-groupname", "secp256r1", "-dname",
+                "CN=localhost", "-ext", "SAN=dns:localhost", "-validity", "2", "-storetype", "PKCS12", "-keystore",
+                store.toString(), "-storepass", new String(password), "-keypass", new String(password))
+            .redirectErrorStream(true)
+            .start();
+        String output = new String(keytool.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        assertThat(keytool.waitFor()).as(output).isZero();
+        KeyStore keys = KeyStore.getInstance("PKCS12");
+        try (InputStream in = Files.newInputStream(store)) {
+            keys.load(in, password);
+        }
+        KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        keyManagers.init(keys, password);
+        TrustManagerFactory trust = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trust.init(keys);
+        SSLContext context = SSLContext.getInstance("TLS");
+        context.init(keyManagers.getKeyManagers(), trust.getTrustManagers(), null);
+        return context;
     }
 
     private S3AnchorSink s3Sink(boolean requireLock) {

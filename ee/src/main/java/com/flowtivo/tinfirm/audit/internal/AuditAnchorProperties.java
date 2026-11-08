@@ -86,12 +86,12 @@ record AuditAnchorProperties(@DefaultValue("none") Sink sink, @DefaultValue("PT1
     }
 
     /**
-     * @param host     the collector
-     * @param port     its port
-     * @param protocol {@code tls} (RFC 5425, the JVM's trust store), {@code tcp} (RFC 6587's octet counting) or
-     *                 {@code udp} (RFC 5426)
+     * The collector of {@code syslog}, reached over TLS only (RFC 5425, the JVM's trust store).
+     *
+     * @param host the collector
+     * @param port its port
      */
-    record Syslog(@Nullable String host, @DefaultValue("6514") int port, @DefaultValue("tls") String protocol) {
+    record Syslog(@Nullable String host, @DefaultValue("6514") int port) {
     }
 
     AuditAnchorProperties {
@@ -145,10 +145,6 @@ record AuditAnchorProperties(@DefaultValue("none") Sink sink, @DefaultValue("PT1
                 if (blank(syslog.host())) {
                     throw new IllegalArgumentException(
                             "tinfirm.audit.anchor.syslog.host (TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST) names the collector");
-                }
-                if (!java.util.Set.of("tls", "tcp", "udp").contains(syslog.protocol().toLowerCase(Locale.ROOT))) {
-                    throw new IllegalArgumentException(
-                            "tinfirm.audit.anchor.syslog.protocol is tls, tcp or udp, not " + syslog.protocol());
                 }
             }
             case NONE -> {

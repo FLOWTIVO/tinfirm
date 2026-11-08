@@ -238,7 +238,7 @@ The limits marked "seed" are the instance's starting values: each company's admi
 | `TINFIRM_AUDIT_ANCHOR_S3_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | empty | The bucket's key: write, read and list, never delete | `auditAnchor.s3.existingSecret` |
 | `TINFIRM_AUDIT_ANCHOR_S3_RETENTION`, `_REQUIRE_LOCK` | `P400D`, `true` | Each checkpoint's object lock; whether a bucket without object lock is refused | `auditAnchor.s3.retention`, `.requireLock` |
 | `TINFIRM_AUDIT_ANCHOR_FILE_DIR` | none | The `file` sink's directory | `auditAnchor.file.existingClaim`, mounted at `/var/lib/tinfirm/audit-checkpoints` |
-| `TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST`, `_PORT`, `_PROTOCOL` | none, `6514`, `tls` | The `syslog` sink's collector; `tls`, `tcp` or `udp` | `auditAnchor.syslog.*` |
+| `TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST`, `_PORT` | none, `6514` | The `syslog` sink's collector, over TLS only | `auditAnchor.syslog.*` |
 | `TINFIRM_RETENTION_SWEEP_INTERVAL` | `P1D` | How often each company is swept for retention | `extraConfig` |
 | `TINFIRM_RETENTION_SWEEP_TICK` | `PT1H` | How often the server looks for companies due | `extraConfig` |
 | `TINFIRM_RETENTION_SWEEP_INITIAL_DELAY` | `PT15M` | The first look after a start | `extraConfig` |

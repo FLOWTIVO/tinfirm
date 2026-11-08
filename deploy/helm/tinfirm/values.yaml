@@ -275,9 +275,8 @@ auditAnchor:
     existingClaim: ""
   syslog:
     host: ""
+    # Over TLS only (RFC 5425), checked against the JVM's trust store.
     port: 6514
-    # tls (RFC 5425, the JVM's trust store), tcp or udp.
-    protocol: tls
 
 # Proxies whose X-Forwarded-For the server trusts (SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES,
 # a Java regex matched against the connecting IP). The per-IP login throttle and the audit

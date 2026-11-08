@@ -36,7 +36,7 @@ final class AnchorFixtures {
         return new AuditAnchorProperties(sink, Duration.ofHours(1), keys, activeKey,
                 new AuditAnchorProperties.S3(null, "us-east-1", null, false, "audit-checkpoints/", null, null,
                         Duration.ofDays(400), true),
-                new AuditAnchorProperties.File(dir), new AuditAnchorProperties.Syslog(null, 6514, "tls"),
+                new AuditAnchorProperties.File(dir), new AuditAnchorProperties.Syslog(null, 6514),
                 Duration.ofMinutes(1), Duration.ofMinutes(1), Duration.ofMinutes(5));
     }
 

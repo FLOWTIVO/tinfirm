@@ -509,8 +509,7 @@
           "additionalProperties": false,
           "properties": {
             "host": { "type": "string" },
-            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
-            "protocol": { "enum": ["tls", "tcp", "udp"] }
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
           }
         }
       }

@@ -60,7 +60,6 @@ data:
   {{- if eq .sink "syslog" }}
   TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST: {{ required "auditAnchor.syslog.host is required with the syslog sink" .syslog.host | quote }}
   TINFIRM_AUDIT_ANCHOR_SYSLOG_PORT: {{ .syslog.port | quote }}
-  TINFIRM_AUDIT_ANCHOR_SYSLOG_PROTOCOL: {{ .syslog.protocol | quote }}
   {{- end }}
   {{- end }}
   {{- range .Values.companies }}
