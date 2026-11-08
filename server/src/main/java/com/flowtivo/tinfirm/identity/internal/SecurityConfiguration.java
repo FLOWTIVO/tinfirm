@@ -59,7 +59,8 @@ import com.flowtivo.tinfirm.shared.web.SpaConfiguration;
  * BFF security (CONVENTIONS §5): server-side JDBC sessions behind the {@code TINFIRM_SESSION} cookie, SPA-style CSRF
  * ({@code XSRF-TOKEN} cookie + {@code X-XSRF-TOKEN} header) on every mutating request, JSON login instead of form
  * login, OIDC login with PKCE, JSON 401/403 for {@code /api/**}, and the security headers. An OIDC login ends on
- * {@code /}, or on the OAuth authorization request it interrupted (ADR-0045, {@link OidcLoginSuccessHandler}).
+ * the OAuth authorization request it interrupted (ADR-0045), else on the page its start named ({@link ReturnPaths}),
+ * else on {@code /} ({@link OidcLoginSuccessHandler}).
  */
 @Configuration(proxyBeanMethods = false)
 @EnableWebSecurity
@@ -121,7 +122,8 @@ class SecurityConfiguration {
                 registrations, OAuth2AuthorizationRequestRedirectFilter.DEFAULT_AUTHORIZATION_REQUEST_BASE_URI);
         // PKCE for every registration, confidential clients included.
         resolver.setAuthorizationRequestCustomizer(OAuth2AuthorizationRequestCustomizers.withPkce());
-        // On "/", unless the login interrupted an OAuth authorization request (ADR-0045).
+        // On the OAuth authorization request the login interrupted (ADR-0045), else on the start's checked return
+        // path (ReturnPaths), else on "/".
         OidcLoginSuccessHandler success = new OidcLoginSuccessHandler(tinfirm.publicBaseUrl(),
                 AuthorizationServerConfiguration.authorizationRequestCache());
         String unknownProvider = tinfirm.publicBaseUrl() + "/login?error=" + OidcLoginDeniedException.OIDC_LOGIN_FAILED;
@@ -129,7 +131,9 @@ class SecurityConfiguration {
             // The SPA owns /login; Spring Security must not generate its own login page.
             .loginPage("/login")
             .clientRegistrationRepository(registrations)
-            .authorizationEndpoint(endpoint -> endpoint.authorizationRequestResolver(resolver))
+            // The start's checked return path travels with the authorization request in the session (Q44).
+            .authorizationEndpoint(endpoint -> endpoint.authorizationRequestResolver(OidcReturnPath.resolver(resolver))
+                .authorizationRequestRepository(OidcReturnPath.repository()))
             .userInfoEndpoint(userInfo -> userInfo.oidcUserService(new TinfirmOidcUserService(externalProvisioning,
                     registrationId -> {
                         AuthProperties.OidcProvider settings = authProperties.oidc().provider(registrationId);

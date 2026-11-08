@@ -23,7 +23,7 @@ import { getAuthProviders, getSystemInfo, login } from '../../api/generated/func
 import { isStatus, mapSubmissionError } from '../../api/problem';
 import { skipAuthRedirect } from '../../core/http-context';
 import { BrowserNavigation } from '../../core/browser-navigation';
-import { safeAuthorizationReturn, safeReturnUrl, takeSignInReturn } from '../../core/return-url';
+import { safeAuthorizationReturn, safeReturnUrl, ssoStartUrl } from '../../core/return-url';
 import { Session } from '../../core/session';
 import { ThemeService } from '../../core/theme';
 import { ErrorState } from '../../shared/error-state';
@@ -66,13 +66,17 @@ export class Login {
   private readonly navigation = inject(BrowserNavigation);
   protected readonly theme = inject(ThemeService);
 
-  /** Where to go after signing in (`?returnUrl=`), bound from the query string. */
+  /**
+   * Where to go after signing in (`?returnUrl=`), bound from the query string: after a local login
+   * the app navigates there; a sign-in with an identity provider names it to the server as
+   * `returnTo` on its start (`ssoStartUrl`), and the server returns there.
+   */
   readonly returnUrl = input<string>();
 
   /**
    * The OAuth authorization request this login interrupted (`?returnTo=/oauth2/authorize?...`,
    * ADR-0045), set by the server. After a local login the browser returns there; after single
-   * sign-on the server does it.
+   * sign-on the server does it, from the request it saved: it is never sent as a start's `returnTo`.
    */
   readonly returnTo = input<string>();
 
@@ -168,6 +172,11 @@ export class Login {
     return direct ? [direct] : all;
   });
 
+  /** Where each provider's button starts its sign-in, with this page's `returnUrl` (Q44). */
+  protected ssoHref(loginUrl: string): string {
+    return ssoStartUrl(loginUrl, this.returnUrl());
+  }
+
   /** Whether any button of an identity provider shows, for the separator above them. */
   protected readonly anySso = computed(() => this.ssoProviders().length > 0);
 
@@ -197,9 +206,7 @@ export class Login {
           this.navigation.assign(authorization);
           return undefined;
         }
-        // A page the app sent to sign in from wins once; it is forgotten either way.
-        const back = takeSignInReturn();
-        await this.router.navigateByUrl(safeReturnUrl(this.returnUrl()) ?? back ?? '/');
+        await this.router.navigateByUrl(safeReturnUrl(this.returnUrl()) ?? '/');
         return undefined;
       } catch (error) {
         if (isStatus(error, 403)) {

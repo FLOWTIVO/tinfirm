@@ -13,10 +13,17 @@ import org.springframework.security.web.savedrequest.RequestCache;
 import org.springframework.security.web.savedrequest.SavedRequest;
 
 /**
- * Where an OIDC login ends (CONVENTIONS §5, ADR-0008 as ADR-0045 changes it): on {@code /}, except when the login
- * interrupted an OAuth authorization request. Then the authorization server's chain saved that request in the
- * session's request cache, and the person returns to it. Only a same-origin path of the authorization endpoint is
- * honoured; anything else in the cache is ignored and removed.
+ * Where an OIDC or SAML sign-in ends (CONVENTIONS §5, ADR-0008 as ADR-0045 changes it, threat model 3.4):
+ * <ol>
+ * <li>on the OAuth authorization request the login interrupted: the authorization server's chain saved it in the
+ * session's request cache. Only a same-origin path of the authorization endpoint is honoured; anything else in the
+ * cache is ignored and removed;</li>
+ * <li>else on the page the sign-in's start named, kept server-side with that login's saved request and handed to this
+ * request as {@link ReturnPaths#REQUEST_ATTRIBUTE} ({@link OidcReturnPath}, the SAML AuthnRequest's row), checked
+ * again here;</li>
+ * <li>else on {@code /}.</li>
+ * </ol>
+ * Only a successful sign-in comes here: a failure handler never reads the return path.
  */
 final class OidcLoginSuccessHandler implements AuthenticationSuccessHandler {
 
@@ -39,6 +46,10 @@ final class OidcLoginSuccessHandler implements AuthenticationSuccessHandler {
         if (saved != null) {
             requestCache.removeRequest(request, response);
         }
+        if (target == null && request.getAttribute(ReturnPaths.REQUEST_ATTRIBUTE) instanceof String page) {
+            target = ReturnPaths.check(page);
+        }
+        request.removeAttribute(ReturnPaths.REQUEST_ATTRIBUTE);
         response.sendRedirect(publicBaseUrl + (target != null ? target : "/"));
     }
 

@@ -7214,7 +7214,12 @@ components:
         loginUrl:
           type: string
           example: /oauth2/authorization/keycloak
-          description: 'Where a sign-in starts: `/oauth2/authorization/{id}`, or `/saml2/authenticate/{id}`'
+          description: |
+            Where a sign-in starts: `/oauth2/authorization/{id}`, or `/saml2/authenticate/{id}`. A browser navigation, not
+            an API call. The start takes `?returnTo=<path>`, the page of the web app to land on after a successful
+            sign-in (threat model 3.4, Q44): only a same-origin page path is kept, with that one sign-in; anything else
+            is dropped, and the sign-in lands on `/`. An OAuth authorization request the sign-in interrupted wins
+            (ADR-0045).
     ProviderKind:
       type: string
       enum: [OIDC, SAML]

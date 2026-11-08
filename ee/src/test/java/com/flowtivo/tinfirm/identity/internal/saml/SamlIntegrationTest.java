@@ -131,7 +131,13 @@ abstract class SamlIntegrationTest {
     }
 
     static Started start(ApiClient browser, String id) {
-        ApiResponse start = browser.get("/saml2/authenticate/" + id);
+        return start(browser, id, null);
+    }
+
+    /** A start that names the page to return to ({@code returnTo}), or none for null. */
+    static Started start(ApiClient browser, String id, @org.jspecify.annotations.Nullable String returnTo) {
+        ApiResponse start = browser.get("/saml2/authenticate/" + id
+                + (returnTo != null ? "?returnTo=" + URLEncoder.encode(returnTo, StandardCharsets.UTF_8) : ""));
         assertThat(start.status()).as("%s", start).isEqualTo(302);
         String binding = start.setCookies()
             .stream()

@@ -24,7 +24,6 @@ import { Api } from '../../api/generated/api';
 import { createOwnToken } from '../../api/generated/functions';
 import type { PersonalAccessToken, TokenOwnerNotice, TokenScope } from '../../api/generated/models';
 import { hasProblemCode, mapSubmissionError } from '../../api/problem';
-import { rememberSignInReturn } from '../../core/return-url';
 import { Session } from '../../core/session';
 import { CopyButton } from '../../shared/copy-button';
 import { firstError } from '../../shared/forms';
@@ -476,9 +475,11 @@ export class CreateTokenDialog {
     this.companiesError.set(false);
   }
 
-  /** Signs out and opens the sign-in page; the next sign-in comes back to /me. */
+  /**
+   * Signs out and opens the sign-in page with `returnUrl=/me`: a local sign-in navigates back, and
+   * a sign-in with an identity provider names `/me` to the server, which returns there (Q44).
+   */
   protected async reSignIn(): Promise<void> {
-    rememberSignInReturn('/me');
     await this.session.logout();
     this.open.set(false);
     await this.router.navigateByUrl('/login?returnUrl=%2Fme');

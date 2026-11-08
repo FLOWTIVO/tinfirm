@@ -8,7 +8,10 @@ import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.authentication.TestingAuthenticationToken;
 import org.springframework.security.web.savedrequest.HttpSessionRequestCache;
 
-/** Where an OIDC login ends: on "/", or on the OAuth authorization request it interrupted (ADR-0045). */
+/**
+ * Where an OIDC login ends: on the OAuth authorization request it interrupted (ADR-0045), else on the start's checked
+ * return path (Q44), else on "/".
+ */
 class OidcLoginSuccessHandlerTest {
 
     private static final String PUBLIC_URL = "https://tinfirm.example";
@@ -42,6 +45,38 @@ class OidcLoginSuccessHandlerTest {
         assertThat(login(callback).getRedirectedUrl())
             .isEqualTo(PUBLIC_URL + "/oauth2/authorize?response_type=code&client_id=mcp-inspector&state=a%20b");
         assertThat(login(callback).getRedirectedUrl()).isEqualTo(PUBLIC_URL + "/");
+    }
+
+    @Test
+    void theStartsReturnPathIsTheDestinationWhenNoAuthorizationRequestWaits() throws Exception {
+        MockHttpServletRequest callback = new MockHttpServletRequest("GET", "/login/oauth2/code/idp");
+        callback.setAttribute(ReturnPaths.REQUEST_ATTRIBUTE, "/me?tab=tokens");
+
+        assertThat(login(callback).getRedirectedUrl()).isEqualTo(PUBLIC_URL + "/me?tab=tokens");
+        // Used once: the attribute is gone.
+        assertThat(callback.getAttribute(ReturnPaths.REQUEST_ATTRIBUTE)).isNull();
+    }
+
+    @Test
+    void theReturnPathIsCheckedAgainAtTheEnd() throws Exception {
+        for (String unsafe : new String[] { "//evil.example", "https://evil.example/", "/api/me", "/%2F%2Fevil" }) {
+            MockHttpServletRequest callback = new MockHttpServletRequest("GET", "/login/oauth2/code/idp");
+            callback.setAttribute(ReturnPaths.REQUEST_ATTRIBUTE, unsafe);
+            assertThat(login(callback).getRedirectedUrl()).as(unsafe).isEqualTo(PUBLIC_URL + "/");
+        }
+    }
+
+    @Test
+    void anInterruptedAuthorizationRequestWinsOverTheReturnPath() throws Exception {
+        MockHttpServletRequest authorize = new MockHttpServletRequest("GET", "/oauth2/authorize");
+        authorize.setQueryString("response_type=code&client_id=mcp-inspector");
+        cache.saveRequest(authorize, new MockHttpServletResponse());
+
+        MockHttpServletRequest callback = new MockHttpServletRequest("GET", "/login/oauth2/code/idp");
+        callback.setSession(authorize.getSession());
+        callback.setAttribute(ReturnPaths.REQUEST_ATTRIBUTE, "/me");
+        assertThat(login(callback).getRedirectedUrl())
+            .isEqualTo(PUBLIC_URL + "/oauth2/authorize?response_type=code&client_id=mcp-inspector");
     }
 
     @Test
