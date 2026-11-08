@@ -966,6 +966,14 @@ mod tests {
                 "node_modules/native-elsewhere": {
                     "version": "2.0.0", "optional": true, "os": ["win32"]
                 },
+                // npm's exclusions: installed everywhere but on the excluded platform.
+                "node_modules/not-on-win32": {
+                    "version": "4.0.0", "optional": true, "os": ["!win32"]
+                },
+                "node_modules/not-here": {
+                    "version": "4.0.0", "optional": true,
+                    "os": [format!("!{}", std::env::consts::OS)]
+                },
                 "node_modules/tool": { "version": "3.0.0", "dev": true }
             }
         });
@@ -986,8 +994,10 @@ mod tests {
         assert!(!out.status.success());
         assert!(
             stderr(&out).contains("node_modules/native-here (locked 2.0.0, installed none)")
+                && stderr(&out).contains("node_modules/not-on-win32 (locked 4.0.0")
                 && stderr(&out).contains("(Q16)")
                 && !stderr(&out).contains("native-elsewhere")
+                && !stderr(&out).contains("not-here")
                 && !stderr(&out).contains("node_modules/tool"),
             "{}",
             stderr(&out)
@@ -995,6 +1005,7 @@ mod tests {
         install("native-here", "2.0.1");
         assert!(stderr(&run()).contains("installed 2.0.1"));
         install("native-here", "2.0.0");
+        install("not-on-win32", "4.0.0");
         let out = run();
         assert!(out.status.success(), "{}", stderr(&out));
     }

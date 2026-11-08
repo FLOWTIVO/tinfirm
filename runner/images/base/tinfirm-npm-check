@@ -11,13 +11,29 @@
 const fs = require("fs");
 const path = require("path");
 
+// Whether npm installs a package with this `os`, `cpu` or `libc` constraint here: as npm reads
+// them, a `!value` excludes, and the plain values, if there are any, are the only ones allowed.
+function fits(rule, current) {
+  if (rule === undefined) return true;
+  const values = Array.isArray(rule) ? rule : [rule];
+  if (values.includes(`!${current}`)) return false;
+  const allowed = values.filter((value) => !value.startsWith("!"));
+  return allowed.length === 0 || allowed.includes(current);
+}
+
+const libc =
+  process.platform === "linux"
+    ? process.report.getReport().header.glibcVersionRuntime
+      ? "glibc"
+      : "musl"
+    : undefined;
 const dir = process.argv[2] || ".";
 const lock = JSON.parse(fs.readFileSync(path.join(dir, "package-lock.json"), "utf8"));
 const missing = [];
 for (const [key, entry] of Object.entries(lock.packages || {})) {
   if (key === "" || entry.dev || entry.link) continue;
-  if (entry.os && !entry.os.includes(process.platform)) continue;
-  if (entry.cpu && !entry.cpu.includes(process.arch)) continue;
+  if (!fits(entry.os, process.platform) || !fits(entry.cpu, process.arch)) continue;
+  if (entry.libc !== undefined && (libc === undefined || !fits(entry.libc, libc))) continue;
   let version;
   try {
     version = JSON.parse(fs.readFileSync(path.join(dir, key, "package.json"), "utf8")).version;
