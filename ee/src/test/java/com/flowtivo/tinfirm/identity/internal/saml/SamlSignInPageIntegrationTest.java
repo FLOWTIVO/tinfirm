@@ -17,7 +17,7 @@ import com.flowtivo.tinfirm.support.ApiResponse;
 
 /**
  * What the app shows of the SAML providers (ADR-0086, decisions 2 and 15): the login page's buttons, the company's
- * sign-in page with what the IdP's admin needs, and the service provider's metadata.
+ * sign-in page with what the IdP's admin needs, the service provider's metadata, and where a sign-in returns to.
  */
 class SamlSignInPageIntegrationTest extends SamlIntegrationTest {
 
@@ -100,6 +100,70 @@ class SamlSignInPageIntegrationTest extends SamlIntegrationTest {
         ApiResponse acs = post(browser, "stub", response.encoded());
 
         assertThat(acs.header("Location")).isEqualTo(BASE + authorize);
+    }
+
+    @Test
+    void aSignInReturnsToThePageItsStartNamedOnce() {
+        ApiClient browser = new ApiClient(PORT);
+        Started started = start(browser, "stub", "/me?tab=tokens");
+        SamlTestIdp.ResponseBuilder response = STUB.respond(spEntityId("stub"), acs("stub"), started.requestId());
+        response.attribute("email", "back-" + UUID.randomUUID() + "@example.com");
+        browser.removeCookie("TINFIRM_SESSION");
+        String encoded = response.encoded();
+
+        ApiResponse acs = post(browser, "stub", encoded);
+
+        assertThat(acs.header("Location")).isEqualTo(BASE + "/me?tab=tokens");
+        // The request, and the path with it, is used up: the same response again is refused, to the login page.
+        ApiResponse replay = post(browser, "stub", encoded);
+        assertThat(replay.header("Location")).startsWith(BASE + "/login?error=");
+    }
+
+    @Test
+    void aSignInNeverReturnsToAnotherOriginOrAServerPath() {
+        for (String unsafe : new String[] { "https://evil.example/", "//evil.example", "/\\evil.example",
+                "/%2F%2Fevil.example", "/%5Cevil.example", "/me%0d%0aSet-Cookie:x", "/c/%2e%2e/api/me",
+                "/api/me" }) {
+            ApiClient browser = new ApiClient(PORT);
+            Started started = start(browser, "stub", unsafe);
+            SamlTestIdp.ResponseBuilder response = STUB.respond(spEntityId("stub"), acs("stub"), started.requestId());
+            response.attribute("email", "unsafe-" + UUID.randomUUID() + "@example.com");
+            browser.removeCookie("TINFIRM_SESSION");
+
+            assertThat(post(browser, "stub", response.encoded()).header("Location")).as(unsafe)
+                .isEqualTo(BASE + "/");
+        }
+    }
+
+    @Test
+    void aRelayStateIsNeverTheDestination() {
+        ApiClient browser = new ApiClient(PORT);
+        Started started = start(browser, "stub");
+        SamlTestIdp.ResponseBuilder response = STUB.respond(spEntityId("stub"), acs("stub"), started.requestId());
+        response.attribute("email", "relay-" + UUID.randomUUID() + "@example.com");
+        browser.removeCookie("TINFIRM_SESSION");
+
+        ApiResponse acs = browser.send("POST", "/login/saml2/sso/stub",
+                "SAMLResponse=" + encode(response.encoded()) + "&RelayState=" + encode("/me") + "&returnTo="
+                        + encode("/me"),
+                java.util.Map.of("Content-Type", "application/x-www-form-urlencoded", "Accept", "text/html"));
+
+        assertThat(acs.header("Location")).isEqualTo(BASE + "/");
+    }
+
+    @Test
+    void aRefusedSignInDoesNotUseTheReturnPath() {
+        ApiClient browser = new ApiClient(PORT);
+        Started started = start(browser, "stub", "/me");
+        SamlTestIdp.ResponseBuilder response = STUB.respond(spEntityId("stub"), acs("stub"), started.requestId());
+        // The bootstrap admin's email: EMAIL_IN_USE, after every check of the response passed.
+        response.attribute("email", "admin@tinfirm.test");
+        browser.removeCookie("TINFIRM_SESSION");
+
+        ApiResponse acs = post(browser, "stub", response.encoded());
+
+        assertThat(acs.header("Location")).isEqualTo(BASE + "/login?error=EMAIL_IN_USE");
+        assertThat(browser.get("/api/me").status()).isEqualTo(401);
     }
 
     private static String encode(String value) {

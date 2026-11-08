@@ -104,7 +104,7 @@
           @if (ssoProviders().length > 0) {
             <div class="flex flex-col gap-2">
               @for (provider of ssoProviders(); track provider.id) {
-                <a hlmBtn variant="outline" class="w-full" [href]="provider.loginUrl">
+                <a hlmBtn variant="outline" class="w-full" [href]="ssoHref(provider.loginUrl)">
                   <ng-icon name="lucideKeyRound" aria-hidden="true" />
                   Continue with {{ provider.name }}
                 </a>

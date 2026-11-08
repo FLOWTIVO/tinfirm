@@ -31,6 +31,7 @@ import org.springframework.stereotype.Component;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.json.JsonMapper;
 
+import com.flowtivo.tinfirm.identity.internal.ReturnPaths;
 import com.flowtivo.tinfirm.identity.internal.SamlSignIns;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 
@@ -43,7 +44,9 @@ import com.flowtivo.tinfirm.shared.time.TimeSource;
  * only by that cookie, for the provider the response is posted to. It is deleted only once a response has passed
  * every check ({@link #consume}), so that it answers one response; a response that fails, such as one a page of another
  * site posts from the browser while its sign-in is under way, leaves the request and the cookie for the IdP's own
- * response. A new start in the same browser sets a new cookie (the old one never reaches the start's path), so the
+ * response. The row also keeps what the sign-in returns to: the OAuth authorization request it interrupted, and the
+ * checked page the start named ({@code returnTo}, {@link ReturnPaths}); {@code RelayState} carries neither. A new
+ * start in the same browser sets a new cookie (the old one never reaches the start's path), so the
  * earlier request is left to the sweep.
  */
 @Component
@@ -101,6 +104,8 @@ class SamlAuthnRequests implements Saml2AuthenticationRequestRepository<Abstract
         fields.put("sigAlg", redirect.getSigAlg());
         fields.put("signature", redirect.getSignature());
         fields.put("returnTo", signIns.pendingAuthorizationRequest(request, response));
+        // The page the start named, checked (Q44): kept here, with this one request, never read from the response.
+        fields.put("returnPath", signIns.returnPath(request));
         jdbc.sql("""
                 INSERT INTO saml_authn_request (id, registration_id, binding_hash, request, created_at)
                 VALUES (?, ?, ?, ?::jsonb, ?)
@@ -143,6 +148,10 @@ class SamlAuthnRequests implements Saml2AuthenticationRequestRepository<Abstract
         Map<String, String> fields = JSON.readValue(saved.get().request(), FIELDS);
         if (fields.get("returnTo") != null) {
             request.setAttribute(SamlSignIns.RETURN_TO, fields.get("returnTo"));
+        }
+        // Read only by the success handler, which checks it again; a refused response never goes there.
+        if (fields.get("returnPath") != null) {
+            request.setAttribute(ReturnPaths.REQUEST_ATTRIBUTE, fields.get("returnPath"));
         }
         return Saml2RedirectAuthenticationRequest.withRelyingPartyRegistration(registration)
             .id(saved.get().id())

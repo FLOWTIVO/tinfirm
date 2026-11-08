@@ -15,7 +15,7 @@ As an Owner or Admin, open **Settings**, **Sign-in**. **Identity providers** sho
 
 1. A person selects your provider on Tinfirm's login page, or a tile in your portal that opens the sign-on URL.
 2. Tinfirm sends them to your identity provider, which signs them in with its own rules, multi-factor authentication included.
-3. Your identity provider sends them back with a signed answer. Tinfirm checks it, then signs them in.
+3. Your identity provider sends them back with a signed answer. Tinfirm checks it, then signs them in, on the Tinfirm page they started from: the page a link opened, or their **Profile** when it asked them to sign in again. A sign-in from a portal's tile opens the home page.
 
 Sign-in always starts at Tinfirm: a tile that sends people straight to Tinfirm with an answer nobody asked for is refused. Set the tile to open the **Sign-on URL**, as each guide shows.
 

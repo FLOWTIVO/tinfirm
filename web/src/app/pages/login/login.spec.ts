@@ -258,6 +258,40 @@ describe('Login', () => {
     expect(saml?.textContent).toContain('Continue with Corp SAML');
   });
 
+  it('names the page to come back to on every single sign-on start (Q44)', async () => {
+    await create(
+      { returnUrl: '/me?tab=tokens' },
+      {
+        localEnabled: true,
+        providers: [
+          ...PROVIDERS.providers,
+          { id: 'corp', name: 'Corp SAML', kind: 'SAML', loginUrl: '/saml2/authenticate/corp' },
+        ],
+      },
+    );
+
+    const hrefs = Array.from(el.querySelectorAll<HTMLAnchorElement>('a[href^="/oauth2/"], a[href^="/saml2/"]')).map((a) =>
+      a.getAttribute('href'),
+    );
+    expect(hrefs).toEqual([
+      '/oauth2/authorization/keycloak?returnTo=%2Fme%3Ftab%3Dtokens',
+      '/saml2/authenticate/corp?returnTo=%2Fme%3Ftab%3Dtokens',
+    ]);
+  });
+
+  it.each(['https://evil.example/', '//evil.example', '/api/me', '/'])(
+    'names no page for %s, which another site or the server would own',
+    async (returnUrl) => {
+      await create({ returnUrl });
+      expect(el.querySelector('a[href="/oauth2/authorization/keycloak"]')).not.toBeNull();
+    },
+  );
+
+  it('leaves an interrupted authorization request to the server on single sign-on', async () => {
+    await create({ returnTo: '/oauth2/authorize?client_id=x&state=y' });
+    expect(el.querySelector('a[href="/oauth2/authorization/keycloak"]')).not.toBeNull();
+  });
+
   it('says a SAML sign-in needs the Enterprise edition', async () => {
     await create({ error: 'EDITION_REQUIRED' });
     expect(el.querySelector('[data-testid=sso-error]')?.textContent).toContain(

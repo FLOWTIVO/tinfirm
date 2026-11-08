@@ -28,42 +28,22 @@ export function safeAuthorizationReturn(value: string | null | undefined): strin
   return safe;
 }
 
-const SIGN_IN_RETURN_KEY = 'tinfirm.signInReturn';
-const SIGN_IN_RETURN_TTL_MS = 15 * 60 * 1000;
+/** Paths the server answers itself, not pages: it refuses them as a sign-in's return path. */
+const SERVER_PATHS = ['/api', '/oauth2', '/login', '/saml2', '/actuator', '/.well-known', '/scim'];
 
 /**
- * Remembers, in this tab, the in-app page a sign-in that the app asked for should come back to: a
- * sign-in with an identity provider lands on `/` (its callback keeps no page), so `/` takes it
- * from here (`takeSignInReturn`). Only a safe in-app path is kept, for 15 minutes; storage that
- * fails keeps nothing, and the sign-in lands on `/` as always.
+ * The start of a sign-in with an identity provider (`loginUrl`, `/oauth2/authorization/{id}` or
+ * `/saml2/authenticate/{id}`), with the in-app page to come back to as `returnTo` (threat model
+ * 3.4, Q44). The server checks it again, keeps it with that one sign-in, and returns there after
+ * a successful sign-in only. A page that is not safe, `/`, or a server path adds nothing: the
+ * sign-in lands on `/`, or on the authorization request it interrupted (ADR-0045).
  */
-export function rememberSignInReturn(path: string, now: number = Date.now()): void {
-  const safe = safeReturnUrl(path);
-  if (!safe) return;
-  try {
-    sessionStorage.setItem(SIGN_IN_RETURN_KEY, JSON.stringify({ path: safe, at: now }));
-  } catch {
-    // No session storage: the sign-in lands on `/`.
+export function ssoStartUrl(loginUrl: string, page: string | null | undefined): string {
+  const safe = safeReturnUrl(page);
+  if (!safe || safe === '/' || safe.startsWith('/?') || safe.includes('\\') || safe.includes('#')) {
+    return loginUrl;
   }
-}
-
-/** The page {@link rememberSignInReturn} kept, once: it is forgotten as it is read. */
-export function takeSignInReturn(now: number = Date.now()): string | null {
-  let raw: string | null;
-  try {
-    raw = sessionStorage.getItem(SIGN_IN_RETURN_KEY);
-    sessionStorage.removeItem(SIGN_IN_RETURN_KEY);
-  } catch {
-    return null;
-  }
-  if (!raw) return null;
-  try {
-    const kept = JSON.parse(raw) as { path?: unknown; at?: unknown };
-    if (typeof kept.at !== 'number' || now - kept.at > SIGN_IN_RETURN_TTL_MS || now < kept.at) {
-      return null;
-    }
-    return typeof kept.path === 'string' ? safeReturnUrl(kept.path) : null;
-  } catch {
-    return null;
-  }
+  const path = safe.split('?')[0].toLowerCase();
+  if (SERVER_PATHS.some((p) => path === p || path.startsWith(p + '/'))) return loginUrl;
+  return `${loginUrl}${loginUrl.includes('?') ? '&' : '?'}returnTo=${encodeURIComponent(safe)}`;
 }

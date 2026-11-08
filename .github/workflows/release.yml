@@ -7,12 +7,17 @@ name: Release
 # repository-specific half: the gate, the signing, the manifests to version, the images to
 # build and the assets.
 #
-# One run: gate (ci.yml) -> set version, commit, tag v<version> -> build and push
+# One run: gate (ci.yml, the security scan included) -> set version, commit, tag v<version> -> build and push
 # ghcr.io/flowtivo/tinfirm-server:v<version> and :sha-<sha> (and the runner host's
 # ghcr.io/flowtivo/tinfirm-runner-host, the same tags), and the chart
 # oci://ghcr.io/flowtivo/charts/tinfirm:<version> (ADR-0080) -> GitHub Release -> next
 # -SNAPSHOT version on the branch -> the release assets (runner-artifacts.yml) on the GitHub
 # Release.
+#
+# Every run passes the whole gate: no input skips it (L30 of the security review of
+# 2026-10-27), since the `release` environment's reviewers may not be required on every
+# plan. A release that fails after its gate passed: re-run the failed jobs of the same run,
+# which keeps that run's gate result, or start a new run, which runs the gate again.
 #
 # A release changes no environment. A version runs in one once that environment's deployment
 # repository names `image.tag: v<version>`, an edit made there (ADR-0107).
@@ -57,11 +62,6 @@ on:
         description: 'Development version after the release. Empty = derive (0.1.0 -> 0.1.1-SNAPSHOT)'
         required: false
         type: string
-      skip_checks:
-        description: 'Skip the CI gate. Only to re-run a release whose checks already passed on this exact commit.'
-        required: false
-        default: false
-        type: boolean
 
 # One release at a time, repo-wide, so that two releases from two branches never push their
 # tags, images, charts and next-version commits at the same time.
@@ -75,7 +75,6 @@ permissions:
 jobs:
   checks:
     name: Release gate
-    if: ${{ !inputs.skip_checks }}
     uses: ./.github/workflows/ci.yml
     # GitHub validates every permission a nested job requests against this calling job
     # BEFORE it evaluates any `if:`, so this grants what ci.yml's jobs request even where
@@ -97,7 +96,7 @@ jobs:
   signing-key:
     name: Image signing key
     needs: [checks]
-    if: ${{ always() && (needs.checks.result == 'success' || needs.checks.result == 'skipped') }}
+    if: ${{ needs.checks.result == 'success' }}
     runs-on: ${{ vars.CI_RELEASE_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     environment: release
@@ -115,13 +114,9 @@ jobs:
 
   release:
     needs: [checks, signing-key]
-    # `always()` so skip_checks (which makes `checks` skipped, not successful) does not
-    # cancel the release; a FAILED gate still stops it, and so does a signing key that is
-    # missing or wrong.
-    if: >-
-      ${{ always()
-        && (needs.checks.result == 'success' || needs.checks.result == 'skipped')
-        && needs.signing-key.result == 'success' }}
+    # Only after a successful gate and a good signing key: a failed gate stops the release,
+    # and so does a signing key that is missing or wrong.
+    if: ${{ needs.checks.result == 'success' && needs.signing-key.result == 'success' }}
     uses: ./.github/workflows/reusable-release.yml
     permissions:
       contents: write       # release commit, tag, next-version commit
