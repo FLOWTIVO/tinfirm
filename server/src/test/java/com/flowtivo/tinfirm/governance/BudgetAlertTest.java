@@ -23,6 +23,7 @@ import com.flowtivo.tinfirm.support.TenantSql;
 import com.flowtivo.tinfirm.support.TestConversations;
 import com.flowtivo.tinfirm.support.TestRuns;
 import com.flowtivo.tinfirm.support.TestTriggers;
+import com.flowtivo.tinfirm.support.TestTurns;
 
 import tools.jackson.databind.JsonNode;
 
@@ -101,11 +102,17 @@ class BudgetAlertTest extends IntegrationTest {
         assertThat(budgets(setup.admin(), company)).as("80 %% of a member's is the member's alone").isEmpty();
         assertThat(budgets(setup.owner(), company)).isEmpty();
 
-        // A turn waits for the spent budget: admins see how many, and nothing of it.
+        // A turn waits for the spent budget: admins see how many, and nothing of it. The dispatcher reads every queued
+        // run every 2 s and writes the reason it finds, so this run is one it holds for the budget too: written once the
+        // budget is spent, of a conversation it can plan (scripted, as the run module's tests script theirs). Otherwise
+        // a pass rewrites the reason before the inbox counts it: OTHER while the member may not use the agent, or
+        // NO_RUNNER_HOST while the key is still usable.
+        spent(setup, setup.memberKey(), 25);
         UUID agentId = TestRuns.agent(company.id());
         UUID conversationId = UUID.randomUUID();
         String key = "wait-" + conversationId.toString().substring(0, 8);
         TestConversations.bare(company.id(), conversationId, key, agentId, setup.memberP(), "CLAUDE_CODE");
+        TestTurns.conversation(conversationId);
         try (TenantSql sql = TenantSql.in(company.id())) {
             sql.accepted("""
                     INSERT INTO run (id, company_id, conversation_id, conversation_key, agent_id, runtime, turn_reason,
@@ -116,7 +123,6 @@ class BudgetAlertTest extends IntegrationTest {
                     setup.memberP(), setup.memberP(), "agent/" + key);
             sql.commit();
         }
-        spent(setup, setup.memberKey(), 25);
         assertThat(budgets(setup.member(), company)).singleElement()
             .satisfies(budget -> assertThat(budget.get("threshold").asInt()).isEqualTo(100));
         for (ApiClient admin : List.of(setup.admin(), setup.owner())) {
