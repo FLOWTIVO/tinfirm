@@ -13,7 +13,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -45,20 +44,17 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  * failure, counted in the status, and tried again after {@code retry}; a checkpoint's number is taken only once its
  * write succeeded.
  * <p>
- * <b>The comparison</b> ({@link #compare}), in the daily check of every chain: the latest checkpoint that names it,
- * read from the sink and its signature verified where the sink can be read (the database's record otherwise), must
- * agree with the chain: the event at its {@code seq} exists and has its hash.
+ * <b>The comparison</b> ({@link #compare}), in the daily check of every chain: every head the checkpoints name for
+ * it must agree with the chain (the event at its {@code seq} exists and has its hash), and no checkpoint may
+ * contradict an earlier one for it. Where the sink can be read, what was anchored, the writer's next number and its
+ * {@code prev} all come from the sink's verified checkpoints ({@link SinkIndex}), never from the database's record,
+ * which whoever the anchor defends against can write; only syslog, which cannot be read back, uses the record.
  */
 @Component
 @EnableConfigurationProperties(AuditAnchorProperties.class)
 class AuditAnchorService implements AuditAnchors, DisposableBean {
 
     private static final Logger log = LoggerFactory.getLogger(AuditAnchorService.class);
-
-    /** How long the sink's latest checkpoint is kept in memory for the daily checks of many chains. */
-    private static final Duration LATEST_KEPT = Duration.ofMinutes(1);
-
-    private static final int CACHED_CHECKPOINTS = 64;
 
     private final AuditAnchorProperties properties;
 
@@ -78,12 +74,8 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
 
     private final boolean worker;
 
-    private final Map<Long, Checkpoint.Signed> verified = new ConcurrentHashMap<>();
-
-    private volatile @Nullable Latest latest;
-
-    private record Latest(Instant readAt, Optional<Checkpoint.Signed> checkpoint) {
-    }
+    /** The sink's verified checkpoints, where the sink can be read; made at the first use. */
+    private volatile @Nullable SinkIndex index;
 
     @Autowired
     AuditAnchorService(AuditAnchorProperties properties, AuditCheckpointStore store, AuditEventStore events,
@@ -147,7 +139,6 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
     }
 
     // ---- the writer ------------------------------------------------------------------------------------------------
-
     @Scheduled(fixedDelayString = "${tinfirm.audit.anchor.tick:PT1M}",
             initialDelayString = "${tinfirm.audit.anchor.initial-delay:PT1M}")
     void scheduledWrite() {
@@ -226,15 +217,48 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
         UUID instance = state.instanceId();
         Instant issuedAt = time.now();
         List<Checkpoint.Head> heads = store.heads();
+        // What was anchored last, and what the next checkpoint follows: from the sink's verified checkpoints where
+        // the sink can be read, never from the database, which whoever the anchor defends against can write.
         Map<String, Checkpoint.Head> anchored = new HashMap<>();
-        for (Checkpoint.Head head : store.lastAnchored()) {
-            anchored.put(chainKey(head.companyId()), head);
+        long previousNumber;
+        String previousDigest;
+        SinkIndex index = null;
+        if (target.readable()) {
+            index = refreshedIndex(target, instance);
+            if (index.broken() != null) {
+                throw new IllegalStateException("The sink's checkpoints stop verifying (" + index.broken()
+                        + "): no checkpoint follows until they are put right");
+            }
+            Optional<AuditCheckpointStore.Written> recorded = store.latest();
+            if (index.lastNumber() == 0 && recorded.isPresent()) {
+                throw new IllegalStateException("The sink " + target.location() + " holds no checkpoint of instance "
+                        + instance + ", while checkpoints up to " + recorded.get().number() + " were written: restore"
+                        + " them to the sink (copy every checkpoint of the instance there) before the anchor"
+                        + " continues");
+            }
+            if (recorded.isPresent() && recorded.get().number() > index.lastNumber()) {
+                log.warn("The database records checkpoint {}, the sink's latest is {}: the next checkpoint follows"
+                        + " the sink", recorded.get().number(), index.lastNumber());
+            }
+            previousNumber = index.lastNumber();
+            previousDigest = index.lastDigest();
+            index.latestOfEach().forEach((companyId, anchor) -> anchored.put(chainKey(companyId),
+                    new Checkpoint.Head(companyId, anchor.seq(), anchor.hash())));
         }
-        Previous previous = previous(target, instance);
+        else {
+            // A sink that cannot be read back (syslog): the database's record is all there is (ADR-0111, decision 3).
+            Optional<AuditCheckpointStore.Written> recorded = Optional.ofNullable(state.lastNumber())
+                .flatMap(store::written);
+            previousNumber = recorded.map(AuditCheckpointStore.Written::number).orElse(0L);
+            previousDigest = recorded.map(AuditCheckpointStore.Written::digest).orElse(Checkpoint.NO_PREVIOUS);
+            for (Checkpoint.Head head : store.lastAnchored()) {
+                anchored.put(chainKey(head.companyId()), head);
+            }
+        }
         List<Checkpoint.Head> moved = new ArrayList<>();
         for (Checkpoint.Head head : heads) {
             Checkpoint.Head last = anchored.get(chainKey(head.companyId()));
-            if (previous.number() == 0 || last == null || last.seq() != head.seq()
+            if (previousNumber == 0 || last == null || last.seq() != head.seq()
                     || !last.hash().equals(head.hash())) {
                 moved.add(head);
             }
@@ -244,8 +268,7 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
             return Outcome.UNCHANGED;
         }
         String keyId = keys.activeId().orElseThrow();
-        Checkpoint checkpoint = new Checkpoint(instance, previous.number() + 1, issuedAt, previous.digest(), keyId,
-                moved);
+        Checkpoint checkpoint = new Checkpoint(instance, previousNumber + 1, issuedAt, previousDigest, keyId, moved);
         String document = checkpoint.signedDocument(keys);
         String location;
         try {
@@ -254,61 +277,30 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
         catch (IOException ex) {
             throw new IllegalStateException(ex.getMessage(), ex);
         }
+        if (index != null) {
+            index.written(checkpoint);
+        }
         store.insert(checkpoint, checkpoint.digest(), location, document, time.now());
         store.recordSuccess(checkpoint.number(), time.now());
-        verified.put(checkpoint.number(), new Checkpoint.Signed(checkpoint, true, null));
-        latest = null;
         log.info("Audit checkpoint {} written to {}: {} chains", checkpoint.number(), location,
                 checkpoint.chains().size());
         return Outcome.WRITTEN;
     }
 
-    /** The checkpoint the next one follows: its number and digest, 0 and no digest before the first. */
-    private record Previous(long number, String digest) {
-    }
-
-    /**
-     * From the sink where it can be read, its signature verified; the database's record only for a sink that cannot
-     * be read (syslog), and as a warning where the two disagree.
-     */
-    private Previous previous(AnchorSink target, UUID instance) {
-        Optional<AuditCheckpointStore.Written> recorded = store.latest();
-        if (!target.readable()) {
-            return recorded.map(written -> new Previous(written.number(), written.digest()))
-                .orElse(new Previous(0, Checkpoint.NO_PREVIOUS));
+    /** The index of the sink's verified checkpoints, read on from where it stopped. */
+    private SinkIndex refreshedIndex(AnchorSink target, UUID instance) {
+        SinkIndex current = index;
+        if (current == null || !current.instance().equals(instance)) {
+            current = new SinkIndex(instance);
+            index = current;
         }
-        long after = recorded.map(written -> Math.max(0, written.number() - 1)).orElse(0L);
-        List<Long> numbers;
         try {
-            numbers = target.numbers(instance, after);
-            if (numbers.isEmpty() && after > 0) {
-                numbers = target.numbers(instance, 0);
-            }
+            current.refresh(target, keys);
         }
         catch (IOException ex) {
             throw new IllegalStateException(ex.getMessage(), ex);
         }
-        if (numbers.isEmpty()) {
-            if (recorded.isPresent()) {
-                log.error("The audit anchor's sink {} holds no checkpoint of instance {}, while the database records"
-                        + " {}: the sink was changed or emptied; the next checkpoint follows the database's"
-                        + " (ADR-0111)", target.location(), instance, recorded.get().number());
-                return new Previous(recorded.get().number(), recorded.get().digest());
-            }
-            return new Previous(0, Checkpoint.NO_PREVIOUS);
-        }
-        long number = numbers.getLast();
-        Checkpoint.Signed last = readVerified(target, instance, number)
-            .orElseThrow(() -> new IllegalStateException("The checkpoint " + number + " vanished from the sink"));
-        if (!last.verified()) {
-            throw new IllegalStateException("The latest checkpoint in the sink, " + number + ", does not verify ("
-                    + last.reason() + "): no checkpoint follows it until it is understood");
-        }
-        if (recorded.isPresent() && recorded.get().number() != number) {
-            log.warn("The audit anchor's sink holds checkpoint {} as its latest, the database records {}; the next"
-                    + " checkpoint follows the sink's", number, recorded.get().number());
-        }
-        return new Previous(number, last.checkpoint().digest());
+        return current;
     }
 
     private static String chainKey(@Nullable UUID companyId) {
@@ -325,136 +317,69 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
 
     // ---- the comparison --------------------------------------------------------------------------------------------
 
+    /**
+     * Compares the chain with every head the checkpoints name for it: where the sink can be read, the sink's
+     * verified checkpoints (a later one that contradicts an earlier one for the chain is a mismatch at its own head);
+     * for syslog, the database's record. The first head whose event is gone or has another hash is the mismatch.
+     */
     @Override
     public Optional<Mismatch> compare(@Nullable UUID companyId) {
         if (!inForce()) {
             return Optional.empty();
         }
-        Optional<Anchored> candidate = anchoredFromSink(companyId);
-        if (candidate.isEmpty()) {
-            return Optional.empty();
+        List<SinkIndex.Anchor> anchors;
+        AnchorSink target = sink;
+        if (target.readable()) {
+            // In the chain's own context: the state is readable from any (V084), the checkpoints' table is not.
+            Optional<AuditCheckpointStore.State> state = store.state();
+            if (state.isEmpty()) {
+                return Optional.empty();
+            }
+            SinkIndex current;
+            try {
+                current = refreshedIndex(target, state.get().instanceId());
+            }
+            catch (RuntimeException ex) {
+                log.warn("The checkpoints cannot be read from {} for the daily check: {}", target.location(),
+                        reason(ex));
+                return Optional.empty();
+            }
+            if (current.broken() != null) {
+                log.error("The checkpoints in {} stop verifying: {}; the chains are compared with those before",
+                        target.location(), current.broken());
+            }
+            Optional<SinkIndex.Conflict> conflict = current.conflict(companyId);
+            if (conflict.isPresent()) {
+                log.error("A checkpoint contradicts an earlier one for the audit chain of {}: checkpoint {} {}"
+                        + " (ADR-0111)", chainName(companyId), conflict.get().checkpoint(), conflict.get().reason());
+                return Optional.of(new Mismatch(conflict.get().checkpoint(), conflict.get().seq()));
+            }
+            anchors = current.anchors(companyId);
         }
-        Anchored anchor = candidate.get();
-        if (anchor.seq() == 0) {
-            return Optional.empty();
+        else {
+            anchors = store.anchorsOf(companyId);
         }
-        Optional<StoredAuditEvent> event = events.at(companyId, anchor.seq());
-        if (event.isEmpty() || !event.get().hash().equals(anchor.hash())) {
-            log.error("The audit chain of {} disagrees with checkpoint {}: the event at seq {} is {} (ADR-0111)",
-                    companyId == null ? "the instance" : "company " + companyId, anchor.checkpoint(), anchor.seq(),
-                    event.isEmpty() ? "gone" : "another");
-            return Optional.of(new Mismatch(anchor.checkpoint(), anchor.seq()));
+        Map<Long, String> stored = store.hashesAt(companyId, anchors.stream()
+            .map(SinkIndex.Anchor::seq)
+            .filter(seq -> seq > 0)
+            .distinct()
+            .toList());
+        for (SinkIndex.Anchor anchor : anchors) {
+            if (anchor.seq() == 0) {
+                continue;
+            }
+            String hash = stored.get(anchor.seq());
+            if (!anchor.hash().equals(hash)) {
+                log.error("The audit chain of {} disagrees with checkpoint {}: the event at seq {} is {} (ADR-0111)",
+                        chainName(companyId), anchor.checkpoint(), anchor.seq(), hash == null ? "gone" : "another");
+                return Optional.of(new Mismatch(anchor.checkpoint(), anchor.seq()));
+            }
         }
         return Optional.empty();
     }
 
-    /**
-     * The latest checkpoint that names the chain, its head taken from the sink's signed document where the sink can
-     * be read: the database's record says which checkpoint to read, and the sink's latest is read as well, so that a
-     * record removed from the database does not hide the newest checkpoint. A recorded checkpoint the sink no longer
-     * holds is skipped with a warning; one that does not verify is a mismatch at its recorded head.
-     */
-    private Optional<Anchored> anchoredFromSink(@Nullable UUID companyId) {
-        Optional<Anchored> recorded = store.anchored(companyId, null);
-        AnchorSink target = sink;
-        if (target == null || !target.readable()) {
-            return recorded;
-        }
-        // In the chain's own context: the state is readable from any (V084), the checkpoints' table is not.
-        Optional<AuditCheckpointStore.State> state = store.state();
-        if (state.isEmpty()) {
-            return recorded;
-        }
-        UUID instance = state.get().instanceId();
-        Optional<Anchored> fromLatest = latestInSink(target, instance, state.get().lastNumber())
-            .filter(Checkpoint.Signed::verified)
-            .flatMap(signed -> signed.checkpoint().chain(companyId).map(head -> anchoredOf(signed.checkpoint(), head)));
-        if (recorded.isEmpty()
-                || fromLatest.isPresent() && fromLatest.get().checkpoint() >= recorded.get().checkpoint()) {
-            return fromLatest;
-        }
-        long number = recorded.get().checkpoint();
-        Optional<Checkpoint.Signed> read;
-        try {
-            read = readVerified(target, instance, number);
-        }
-        catch (RuntimeException ex) {
-            log.warn("The checkpoint {} cannot be read from {} for the daily check: {}", number, target.location(),
-                    reason(ex));
-            return Optional.empty();
-        }
-        if (read.isEmpty()) {
-            log.warn("The database records checkpoint {} for the chain of {}, which the sink {} no longer holds",
-                    number, companyId == null ? "the instance" : "company " + companyId, target.location());
-            return Optional.empty();
-        }
-        if (!read.get().verified()) {
-            log.error("The checkpoint {} in {} does not verify: {}", number, target.location(), read.get().reason());
-            return recorded;
-        }
-        return read.get().checkpoint().chain(companyId).map(head -> anchoredOf(read.get().checkpoint(), head));
-    }
-
-    private Optional<Checkpoint.Signed> latestInSink(AnchorSink target, UUID instance, @Nullable Long lastNumber) {
-        Latest known = latest;
-        Instant now = time.now();
-        if (known != null && known.readAt().plus(LATEST_KEPT).isAfter(now)) {
-            return known.checkpoint();
-        }
-        Optional<Checkpoint.Signed> found;
-        try {
-            long after = lastNumber != null ? Math.max(0, lastNumber - 1) : 0;
-            List<Long> numbers = target.numbers(instance, after);
-            if (numbers.isEmpty() && after > 0) {
-                numbers = target.numbers(instance, 0);
-            }
-            found = numbers.isEmpty() ? Optional.empty() : readVerified(target, instance, numbers.getLast());
-        }
-        catch (IOException | RuntimeException ex) {
-            log.warn("The latest checkpoint cannot be read from {}: {}", target.location(), reason(ex));
-            found = Optional.empty();
-        }
-        latest = new Latest(now, found);
-        return found;
-    }
-
-    private Optional<Checkpoint.Signed> readVerified(AnchorSink target, UUID instance, long number) {
-        Checkpoint.Signed cached = verified.get(number);
-        if (cached != null) {
-            return Optional.of(cached);
-        }
-        Optional<AnchorSink.Stored> stored;
-        try {
-            stored = target.read(instance, number);
-        }
-        catch (IOException ex) {
-            throw new IllegalStateException(ex.getMessage(), ex);
-        }
-        if (stored.isEmpty()) {
-            return Optional.empty();
-        }
-        Checkpoint.Signed signed;
-        try {
-            signed = Checkpoint.parse(stored.get().document(), keys);
-        }
-        catch (IllegalArgumentException ex) {
-            return Optional.empty();
-        }
-        if (signed.checkpoint().number() != number || !signed.checkpoint().instance().equals(instance)) {
-            signed = new Checkpoint.Signed(signed.checkpoint(), false,
-                    "it names another number or instance than its place in the sink");
-        }
-        if (signed.verified()) {
-            if (verified.size() >= CACHED_CHECKPOINTS) {
-                verified.clear();
-            }
-            verified.put(number, signed);
-        }
-        return Optional.of(signed);
-    }
-
-    private static Anchored anchoredOf(Checkpoint checkpoint, Checkpoint.Head head) {
-        return new Anchored(checkpoint.number(), checkpoint.issuedAt(), checkpoint.keyId(), head.seq(), head.hash());
+    private static String chainName(@Nullable UUID companyId) {
+        return companyId == null ? "the instance" : "company " + companyId;
     }
 
     @Override
@@ -462,7 +387,23 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
         if (!inForce()) {
             return Optional.empty();
         }
-        return store.anchored(companyId, atOrBeforeSeq);
+        AnchorSink target = sink;
+        if (!target.readable()) {
+            return store.anchored(companyId, atOrBeforeSeq);
+        }
+        Optional<AuditCheckpointStore.State> state = store.state();
+        if (state.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            return refreshedIndex(target, state.get().instanceId()).latest(companyId, atOrBeforeSeq)
+                .map(anchor -> new Anchored(anchor.checkpoint(), anchor.issuedAt(), anchor.keyId(), anchor.seq(),
+                        anchor.hash()));
+        }
+        catch (RuntimeException ex) {
+            log.warn("The checkpoints cannot be read from {}: {}", target.location(), reason(ex));
+            return Optional.empty();
+        }
     }
 
     // ---- the status ------------------------------------------------------------------------------------------------
@@ -483,9 +424,13 @@ class AuditAnchorService implements AuditAnchors, DisposableBean {
             .lastFailureAt(state.lastFailureAt() != null ? state.lastFailureAt().atOffset(ZoneOffset.UTC) : null)
             .lastFailure(state.lastFailure())
             .consecutiveFailures(state.consecutiveFailures()));
-        store.latest().ifPresent(written -> status.lastCheckpoint(new AuditCheckpointWritten(written.number(),
-                written.issuedAt().atOffset(ZoneOffset.UTC), written.keyId(), written.location(),
-                written.chains())));
+        // The writer's own latest write, not the newest row: a row is only a record (decision 2).
+        store.state()
+            .map(AuditCheckpointStore.State::lastNumber)
+            .flatMap(store::written)
+            .ifPresent(written -> status.lastCheckpoint(new AuditCheckpointWritten(written.number(),
+                    written.issuedAt().atOffset(ZoneOffset.UTC), written.keyId(), written.location(),
+                    written.chains())));
         return status;
     }
 }

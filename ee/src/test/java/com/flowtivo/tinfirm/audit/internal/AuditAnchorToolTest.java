@@ -153,7 +153,7 @@ class AuditAnchorToolTest {
 
         assertThat(result.status()).isEqualTo(1);
         assertThat(result.output()).contains("checkpoint 3        BAD SIGNATURE")
-            .contains("note          the checkpoints start at 2");
+            .contains("checkpoints        STARTS AT 2: checkpoints 1..1 are not in this source");
         Result onlyNewKey = run("verify", "--checkpoints", folder.toString(), "--public-key", "k2026=" + pub2027,
                 "--export", export(chain).toString());
         assertThat(onlyNewKey.output()).contains("checkpoint 2        BAD SIGNATURE");

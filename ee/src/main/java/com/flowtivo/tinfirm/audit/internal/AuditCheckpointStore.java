@@ -7,7 +7,9 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -104,18 +106,31 @@ class AuditCheckpointStore {
             .optional();
     }
 
+    /** A checkpoint as recorded, by its number. */
+    Optional<Written> written(long number) {
+        return jdbc.sql("""
+                SELECT number, issued_at, key_id, digest, location, document, chains
+                  FROM audit_checkpoint WHERE number = ?""")
+            .params(number)
+            .query((rs, row) -> new Written(rs.getLong("number"), instant(rs, "issued_at"), rs.getString("key_id"),
+                    rs.getString("digest"), rs.getString("location"), rs.getString("document"), rs.getInt("chains")))
+            .optional();
+    }
+
     void insert(Checkpoint checkpoint, String digest, String location, String document, Instant writtenAt) {
         jdbc.sql("""
                 INSERT INTO audit_checkpoint (number, issued_at, key_id, chains, digest, location, document,
                                               written_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""")
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (number) DO NOTHING""")
             .params(checkpoint.number(), ts(checkpoint.issuedAt()), checkpoint.keyId(), checkpoint.chains().size(),
                     digest, location, document, ts(writtenAt))
             .update();
         for (Checkpoint.Head head : checkpoint.chains()) {
             jdbc.sql("""
                     INSERT INTO audit_checkpoint_chain (number, company_id, seq, hash, issued_at, key_id)
-                    VALUES (?, ?, ?, ?, ?, ?)""")
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT DO NOTHING""")
                 .params(checkpoint.number(), uuid(head.companyId()), head.seq(), head.hash(),
                         ts(checkpoint.issuedAt()), checkpoint.keyId())
                 .update();
@@ -154,6 +169,32 @@ class AuditCheckpointStore {
             .query((rs, row) -> new AuditAnchors.Anchored(rs.getLong("number"), instant(rs, "issued_at"),
                     rs.getString("key_id"), rs.getLong("seq"), rs.getString("hash")))
             .optional();
+    }
+
+    /** Every head the database records for the chain, oldest first: the syslog sink's only record. */
+    List<SinkIndex.Anchor> anchorsOf(@Nullable UUID companyId) {
+        return jdbc.sql("SELECT number, seq, hash, issued_at, key_id FROM audit_checkpoint_chain WHERE "
+                + AuditEventStore.chain(companyId) + " ORDER BY number")
+            .params(AuditEventStore.chainParams(companyId))
+            .query((rs, row) -> new SinkIndex.Anchor(rs.getLong("number"), rs.getLong("seq"), rs.getString("hash"),
+                    instant(rs, "issued_at"), rs.getString("key_id")))
+            .list();
+    }
+
+    /** The hashes of the chain's events at these positions; a position without an event is absent. */
+    Map<Long, String> hashesAt(@Nullable UUID companyId, List<Long> seqs) {
+        Map<Long, String> hashes = new HashMap<>();
+        for (int from = 0; from < seqs.size(); from += 500) {
+            List<Long> part = seqs.subList(from, Math.min(seqs.size(), from + 500));
+            List<Object> params = new ArrayList<>(AuditEventStore.chainParams(companyId));
+            params.addAll(part);
+            jdbc.sql("SELECT seq, hash FROM audit_event WHERE " + AuditEventStore.chain(companyId) + " AND seq IN ("
+                    + String.join(", ", java.util.Collections.nCopies(part.size(), "?")) + ")")
+                .params(params)
+                .query((rs, row) -> hashes.put(rs.getLong("seq"), rs.getString("hash")))
+                .list();
+        }
+        return hashes;
     }
 
     private static @Nullable Instant instant(ResultSet rs, String column) throws SQLException {

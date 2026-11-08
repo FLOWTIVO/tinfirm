@@ -21,7 +21,7 @@ This page is for the operators who deploy Tinfirm. The decision behind it is [AD
 | Sink | Where the checkpoints go | Protection | Use it when |
 |---|---|---|---|
 | `s3` | One object per checkpoint in a bucket with object lock in compliance mode: nobody can delete or overwrite it before its retention ends, Tinfirm and the bucket's owner included | Strong | You have S3, MinIO, Ceph RGW or another store with object lock. Recommended |
-| `syslog` | One RFC 5424 message per checkpoint, over TLS, TCP or UDP, to a collector or SIEM | As strong as the collector is apart from the database | You already keep logs in a SIEM that the database's administrators cannot change |
+| `syslog` | One RFC 5424 message per checkpoint, over TLS only (RFC 5425), to a collector or SIEM whose certificate the server's JVM trusts | As strong as the collector is apart from the database | You already keep logs in a SIEM that the database's administrators cannot change |
 | `file` | One file per checkpoint in a directory | Only as strong as who else can write the volume | A small installation, with the directory on a volume of its own, ideally WORM or append-only, copied elsewhere by a job |
 | `none` | Nowhere | None: the server warns at every start | The default |
 
@@ -67,7 +67,7 @@ kubectl create secret generic tinfirm-audit-anchor-s3 \
   --from-literal=access-key-id=<id> --from-literal=secret-access-key=<secret>
 ```
 
-For the `file` sink, set `auditAnchor.file.existingClaim` to a PersistentVolumeClaim of its own; the chart mounts it at `/var/lib/tinfirm/audit-checkpoints`. For `syslog`, set `auditAnchor.syslog.host`, `port` and `protocol`. With `networkPolicy.egress.enabled`, add the bucket's or the collector's address to `networkPolicy.egress.extra` when it is not a public address on port 443.
+For the `file` sink, set `auditAnchor.file.existingClaim` to a PersistentVolumeClaim of its own; the chart mounts it at `/var/lib/tinfirm/audit-checkpoints`. For `syslog`, set `auditAnchor.syslog.host` and `port`: the server speaks TLS only, and its JVM must trust the collector's certificate. With `networkPolicy.egress.enabled`, add the bucket's or the collector's address to `networkPolicy.egress.extra` when it is not a public address on port 443.
 
 ### Docker Compose
 
@@ -136,7 +136,7 @@ curl -b cookies.txt https://tinfirm.example.com/api/admin/audit-anchor
 | `lastCheckpoint` | The latest checkpoint written: its number, time, key, place and how many chains it names |
 | `lastSuccessAt`, `lastFailureAt`, `lastFailure`, `consecutiveFailures` | The writer's health |
 
-A checkpoint is written every interval while some chain grew; an idle instance writes none. When a write fails, the server logs it at `ERROR`, counts it, and tries again after five minutes. **No audit event ever waits for the sink**: while it is down, the events since the last checkpoint are simply not anchored yet. Alert on `consecutiveFailures` above zero, or on the `ERROR` line `The audit anchor could not write a checkpoint`.
+A checkpoint is written every interval while some chain grew; an idle instance writes none. Where the sink can be read back (`s3`, `file`), what was last anchored and what the next checkpoint follows come from the sink's own checkpoints, never from the database. The writer stops, and says why in `lastFailure`, when a checkpoint in the sink does not verify or is missing, or when the sink holds none of the instance's checkpoints while some were written: after you move to another bucket, prefix or volume, copy the instance's checkpoints there first. When a write fails, the server logs it at `ERROR`, counts it, and tries again after five minutes. **No audit event ever waits for the sink**: while it is down, the events since the last checkpoint are simply not anchored yet. Alert on `consecutiveFailures` above zero, or on the `ERROR` line `The audit anchor could not write a checkpoint`.
 
 Where the anchor runs, a company's daily check fails **ANCHOR_MISMATCH** when its chain disagrees with a checkpoint, and its Owners and Admins see it in their inbox. Their verification names the checkpoint the chain was compared with.
 
@@ -167,10 +167,10 @@ Against exports, one chain each, which a company's Owner can give you (`--export
 | `MISMATCH at seq N: the hash differs from checkpoint C` | The event at a checkpoint's head has another hash: the chain was rewritten and recomputed |
 | `SHORTER: the last event is seq N, checkpoint C names seq M` | The chain was cut below a checkpoint |
 | `BROKEN at seq N` | The chain does not recompute from there |
-| `MISSING (N -> M)`, `BROKEN LINK` | A checkpoint is gone, or does not follow the one before |
+| `MISSING (N -> M)`, `BROKEN LINK`, `STARTS AT N` | A checkpoint is gone, does not follow the one before, or the first ones are not in the source |
 | `BAD SIGNATURE`, `OVERWRITTEN`, `DISTRUSTED` | A checkpoint does not verify with a key you gave, has a second version in the bucket, or was signed by a distrusted key after its compromise |
 
-It exits with `0` when everything verified, `1` on any finding, `2` when it was called wrongly or cannot read a source. A restored backup shows as `SHORTER` for every chain that grew since: record the restore, and the next checkpoint names the restored heads.
+A source that starts after checkpoint 1 is a finding (`STARTS AT N`): the sink lost the beginning of the chain. It exits with `0` when everything verified, `1` on any finding, `2` when it was called wrongly or cannot read a source. A restored backup shows as `SHORTER` for every chain that grew since: record the restore, and the next checkpoint names the restored heads.
 
 ## Rotate the key
 

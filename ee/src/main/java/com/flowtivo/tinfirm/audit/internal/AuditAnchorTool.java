@@ -313,8 +313,10 @@ public final class AuditAnchorTool {
             out.printf("checkpoints   %d..%d read (keys %s); %s to %s; the longest time between two: %s%n", first,
                     checkpoints.getLast().number(), String.join(", ", trusted.keySet()), firstAt, lastAt, longest);
             if (first != 1) {
-                out.printf("note          the checkpoints start at %d: the earlier ones are not in this source%n",
-                        first);
+                // The writer never starts a sink's chain anywhere but at 1 (ADR-0111, decision 2): the sink lost its
+                // beginning, or this is not the whole sink.
+                findings.add(String.format("checkpoints        STARTS AT %d: checkpoints 1..%d are not in this source",
+                        first, first - 1));
             }
         }
 

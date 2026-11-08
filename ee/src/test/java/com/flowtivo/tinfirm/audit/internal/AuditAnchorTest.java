@@ -114,7 +114,8 @@ class AuditAnchorTest extends IntegrationTest {
     }
 
     private long latestNumber() {
-        return transactions.instanceWide(store::latest).orElseThrow().number();
+        // The writer's own record of its latest write, not the newest row, which a test below forges.
+        return transactions.instanceWide(store::state).orElseThrow().lastNumber();
     }
 
     private long headSeq(UUID companyId) {
@@ -292,6 +293,79 @@ class AuditAnchorTest extends IntegrationTest {
         assertThat(transactions.instanceWide(store::state).orElseThrow().consecutiveFailures()).isZero();
         assertThat(checkpoint(before + 1).checkpoint().chain(company.id()).orElseThrow().seq())
             .isEqualTo(headSeq(company.id()));
+    }
+
+    @Test
+    void aDatabaseWriterCanNeitherHideACheckpointNorSuppressTheNext() throws Exception {
+        TestCompany company = companyWithRoles();
+        ApiClient owner = loginAs(company.email("OWNER"));
+        owner.patch(company.path(""), Map.of("name", unique("Before")));
+        assertThat(anchors.write()).isEqualTo(AuditAnchorService.Outcome.WRITTEN);
+        long number = latestNumber();
+        long anchoredSeq = checkpoint(number).checkpoint().chain(company.id()).orElseThrow().seq();
+
+        // Hide: the chain rewritten and recomputed, the database's record of its checkpoints deleted, and the next
+        // checkpoint left to anchor the rewritten head. The sink's earlier checkpoint still disagrees.
+        rewrite(company.id(), 2);
+        asOwner("DELETE FROM audit_checkpoint_chain WHERE company_id = '" + company.id() + "'");
+        owner.patch(company.path(""), Map.of("name", unique("After")));
+        assertThat(anchors.write()).isEqualTo(AuditAnchorService.Outcome.WRITTEN);
+        AuditCheckStore.CheckRow failed = checks.check(company.id()).orElseThrow();
+        assertThat(failed.failure()).isEqualTo("ANCHOR_MISMATCH");
+        assertThat(failed.anchorCheckpoint()).isEqualTo(number);
+        assertThat(failed.firstInvalidSeq()).isEqualTo(anchoredSeq);
+
+        // Suppress: a record that claims the current head was anchored already. The writer goes by the sink.
+        owner.patch(company.path(""), Map.of("name", unique("Again")));
+        long head = headSeq(company.id());
+        String headHash = transactions.inCompany(company.id(), () -> events.at(company.id(), head)).orElseThrow()
+            .hash();
+        asOwner("INSERT INTO audit_checkpoint (number, issued_at, key_id, chains, digest, location, document,"
+                + " written_at) VALUES (999999999, now(), 'k1test', 1, '" + "0".repeat(64) + "', 'forged', '{}', now())",
+                "INSERT INTO audit_checkpoint_chain (number, company_id, seq, hash, issued_at, key_id) VALUES"
+                        + " (999999999, '" + company.id() + "', " + head + ", '" + headHash + "', now(), 'k1test')");
+        long before = transactions.instanceWide(store::state).orElseThrow().lastNumber();
+        assertThat(anchors.write()).isEqualTo(AuditAnchorService.Outcome.WRITTEN);
+        Checkpoint.Signed next = checkpoint(before + 1);
+        assertThat(next.verified()).isTrue();
+        assertThat(next.checkpoint().chain(company.id()).orElseThrow().seq()).isEqualTo(head);
+        asOwner("DELETE FROM audit_checkpoint_chain WHERE number = 999999999",
+                "DELETE FROM audit_checkpoint WHERE number = 999999999");
+    }
+
+    @Test
+    void aSinkThatLostItsCheckpointsStopsTheWriter() throws IOException {
+        TestCompany company = companyWithRoles();
+        loginAs(company.email("OWNER")).patch(company.path(""), Map.of("name", unique("Before")));
+        assertThat(anchors.write()).isEqualTo(AuditAnchorService.Outcome.WRITTEN);
+        // Another directory, empty: a bucket or prefix changed, or a volume lost.
+        AuditAnchorService elsewhere = new AuditAnchorService(properties,
+                new FileAnchorSink(Files.createTempDirectory("audit-anchor-empty")), store, events, transactions,
+                licensing, time, tinfirm);
+
+        assertThat(elsewhere.write()).isEqualTo(AuditAnchorService.Outcome.FAILED);
+        assertThat(transactions.instanceWide(store::state).orElseThrow().lastFailure())
+            .contains("holds no checkpoint of instance");
+        // The sink that holds them goes on.
+        loginAs(company.email("OWNER")).patch(company.path(""), Map.of("name", unique("After")));
+        assertThat(anchors.write()).isEqualTo(AuditAnchorService.Outcome.WRITTEN);
+    }
+
+    /** As the database's owner, row-level security off for the anchor's tables while it runs. */
+    private static void asOwner(String... statements) throws SQLException {
+        try (Connection owner = TestDatabase.connectAsOwner()) {
+            owner.setAutoCommit(false);
+            try (Statement sql = owner.createStatement()) {
+                sql.execute("ALTER TABLE audit_checkpoint NO FORCE ROW LEVEL SECURITY");
+                sql.execute("ALTER TABLE audit_checkpoint_chain NO FORCE ROW LEVEL SECURITY");
+                for (String statement : statements) {
+                    sql.execute(statement);
+                }
+                sql.execute("ALTER TABLE audit_checkpoint FORCE ROW LEVEL SECURITY");
+                sql.execute("ALTER TABLE audit_checkpoint_chain FORCE ROW LEVEL SECURITY");
+            }
+            owner.commit();
+        }
     }
 
     @Test
