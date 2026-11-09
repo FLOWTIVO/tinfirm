@@ -20,6 +20,13 @@ import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
+import java.math.BigInteger;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
+import java.security.spec.ECGenParameterSpec;
+import java.util.Date;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -39,6 +46,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+
+import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.GeneralName;
+import org.bouncycastle.asn1.x509.GeneralNames;
+import org.bouncycastle.cert.X509v3CertificateBuilder;
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
@@ -162,29 +178,31 @@ class AnchorSinksTest {
     }
 
     /**
-     * TEST FIXTURE ONLY: a collector's key pair and self-signed certificate for {@code localhost}, made with the JDK's
-     * keytool, as a TLS context that serves it and trusts it.
+     * TEST FIXTURE ONLY: a collector's key pair and self-signed certificate for {@code localhost}, made in memory, as a
+     * TLS 1.3 context that serves it and trusts it.
      */
     private static SSLContext collectorTls(Path dir) throws Exception {
-        Path store = dir.resolve("collector.p12");
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("EC");
+        generator.initialize(new ECGenParameterSpec("secp256r1"));
+        KeyPair pair = generator.generateKeyPair();
+        X500Name name = new X500Name("CN=localhost");
+        Instant now = CLOCK.instant();
+        X509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(name, BigInteger.ONE,
+                Date.from(now.minus(Duration.ofDays(1))), Date.from(Instant.now().plus(Duration.ofDays(2))), name,
+                pair.getPublic())
+            .addExtension(Extension.subjectAlternativeName, false,
+                    new GeneralNames(new GeneralName(GeneralName.dNSName, "localhost")));
+        X509Certificate certificate = new JcaX509CertificateConverter()
+            .getCertificate(builder.build(new JcaContentSignerBuilder("SHA256withECDSA").build(pair.getPrivate())));
         char[] password = "collector-test".toCharArray();
-        Process keytool = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "keytool").toString(),
-                "-genkeypair", "-alias", "collector", "-keyalg", "EC", "-groupname", "secp256r1", "-dname",
-                "CN=localhost", "-ext", "SAN=dns:localhost", "-validity", "2", "-storetype", "PKCS12", "-keystore",
-                store.toString(), "-storepass", new String(password), "-keypass", new String(password))
-            .redirectErrorStream(true)
-            .start();
-        String output = new String(keytool.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        assertThat(keytool.waitFor()).as(output).isZero();
         KeyStore keys = KeyStore.getInstance("PKCS12");
-        try (InputStream in = Files.newInputStream(store)) {
-            keys.load(in, password);
-        }
+        keys.load(null, password);
+        keys.setKeyEntry("collector", pair.getPrivate(), password, new Certificate[] { certificate });
         KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
         keyManagers.init(keys, password);
         TrustManagerFactory trust = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
         trust.init(keys);
-        SSLContext context = SSLContext.getInstance("TLS");
+        SSLContext context = SSLContext.getInstance("TLSv1.3");
         context.init(keyManagers.getKeyManagers(), trust.getTrustManagers(), null);
         return context;
     }
