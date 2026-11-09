@@ -20,7 +20,9 @@ USER root
 # binary comes in its platform package, which bin/codex.js picks at run time.
 COPY package.json package-lock.json /opt/tinfirm/codex/
 RUN cd /opt/tinfirm/codex \
- && npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+ && { npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+      || { echo "ERROR: npm ci failed. An EINTEGRITY error above means a downloaded package is not the one package-lock.json locks: do not use that registry or mirror (Q16)." >&2; exit 1; }; } \
+ && tinfirm-npm-check \
  && npm cache clean --force \
  && acp_version="$(node -p 'require("./node_modules/@agentclientprotocol/codex-acp/package.json").version')" \
  && test "${acp_version}" = "${CODEX_ACP_VERSION}" \

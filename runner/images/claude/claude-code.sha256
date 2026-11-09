@@ -1,0 +1,20 @@
+# The SHA-256 of the Claude Code native binary (`claude`) in the Agent SDK's platform packages
+# (@anthropic-ai/claude-agent-sdk-linux-<arch>), by Claude Code version and platform. The
+# claude and multi images check the installed binary against this file before they use it, and
+# stop on a missing entry or a mismatch (threat model Q16).
+#
+# Where the values come from: Anthropic's release manifest of the version,
+# https://downloads.claude.ai/claude-code-releases/<version>/manifest.json,
+# `platforms.<platform>.checksum`, after its detached signature manifest.json.sig verified with
+# Anthropic's Claude Code release signing key, fingerprint
+# 31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE (code.claude.com/docs/en/setup, "Binary
+# integrity and code signing"). Add an entry only once the signature verifies and the value is
+# also the binary of the tarball that package-lock.json locks. runner/README.md, "Updating Claude
+# Code", gives the commands.
+#
+# 2.1.287: checked on 2026-11-07 (manifest signed 2026-10-01; equal to the binaries of
+# claude-agent-sdk-linux-x64 and -linux-arm64 0.3.287 from registry.npmjs.org).
+#
+# <sha256>  <version>  <platform>
+3920489a5109cff5786a1a392c25277408ff22bc796d5edb9c16a60e5a1718f0  2.1.287  linux-x64
+e4daf793d1e74fb0d9874dd09e98690bbfd7be515f78a87fd05b9e2b4bb33b03  2.1.287  linux-arm64

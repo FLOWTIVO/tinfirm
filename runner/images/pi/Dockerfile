@@ -25,7 +25,9 @@ COPY tinfirm-pi-acp.mjs /usr/local/lib/tinfirm/tinfirm-pi-acp.mjs
 # overrides moves it to 8.12.3, the version pi 1.5.0 pins.
 COPY package.json package-lock.json /opt/tinfirm/pi/
 RUN cd /opt/tinfirm/pi \
- && npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+ && { npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+      || { echo "ERROR: npm ci failed. An EINTEGRITY error above means a downloaded package is not the one package-lock.json locks: do not use that registry or mirror (Q16)." >&2; exit 1; }; } \
+ && tinfirm-npm-check \
  && npm cache clean --force \
  && ln -s /opt/tinfirm/pi/node_modules/.bin/pi /usr/local/bin/pi \
  && installed="$(HOME=/tmp/pi-version PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 pi --version | awk '{print $NF}')" \

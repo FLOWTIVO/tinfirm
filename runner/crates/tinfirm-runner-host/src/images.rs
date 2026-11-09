@@ -75,6 +75,11 @@ pub const BASE: ImageDef = ImageDef {
             "tinfirm-sandbox-setup",
             include_bytes!("../../../images/base/tinfirm-sandbox-setup"),
         ),
+        // Run by the runtime images after `npm ci` (threat model Q16).
+        (
+            "tinfirm-npm-check",
+            include_bytes!("../../../images/base/tinfirm-npm-check"),
+        ),
     ],
 };
 
@@ -93,6 +98,12 @@ pub const CLAUDE: ImageDef = ImageDef {
         (
             "package-lock.json",
             include_bytes!("../../../images/claude/package-lock.json"),
+        ),
+        // The SHA-256 of the Claude Code binary, from Anthropic's signed release manifest,
+        // which the build checks the installed binary against (threat model Q16).
+        (
+            "claude-code.sha256",
+            include_bytes!("../../../images/claude/claude-code.sha256"),
         ),
     ],
 };
@@ -179,6 +190,10 @@ pub const MULTI: ImageDef = ImageDef {
         (
             "claude/package-lock.json",
             include_bytes!("../../../images/claude/package-lock.json"),
+        ),
+        (
+            "claude/claude-code.sha256",
+            include_bytes!("../../../images/claude/claude-code.sha256"),
         ),
         (
             "codex/package.json",
@@ -798,6 +813,15 @@ mod tests {
                 "{}",
                 def.tag
             );
+            // Q16: npm ci skips an optional package whose download fails its integrity check,
+            // so every npm ci is followed by the check that the lockfile's packages are there.
+            let installs = def.dockerfile.matches("npm ci --ignore-scripts").count();
+            assert_eq!(
+                def.dockerfile.matches(" && tinfirm-npm-check \\\n").count(),
+                installs,
+                "{}",
+                def.tag
+            );
             let lock: serde_json::Value = serde_json::from_slice(
                 def.files
                     .iter()
@@ -837,6 +861,7 @@ mod tests {
             "docker.asc",
             "tinfirm-sandbox-entrypoint",
             "tinfirm-sandbox-setup",
+            "tinfirm-npm-check",
         ] {
             assert!(BASE.files.iter().any(|(path, _)| *path == name), "{name}");
             assert!(BASE.dockerfile.contains(name), "{name}");
@@ -848,6 +873,141 @@ mod tests {
             .unwrap()
             .1;
         assert!(key.starts_with(b"-----BEGIN PGP PUBLIC KEY BLOCK-----"));
+    }
+
+    /// Q16: the claude and multi images check the Claude Code binary against the SHA-256 that
+    /// claude-code.sha256 pins for their CLAUDE_CODE_VERSION, on each Linux platform the base
+    /// image runs on, before the binary runs.
+    #[test]
+    fn the_claude_code_binary_is_checked_against_a_pinned_sha256() {
+        let sums = std::str::from_utf8(
+            CLAUDE
+                .files
+                .iter()
+                .find(|(path, _)| *path == "claude-code.sha256")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        let entries: Vec<(&str, &str, &str)> = sums
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| {
+                let fields: Vec<&str> = l.split_whitespace().collect();
+                assert_eq!(fields.len(), 3, "{l}");
+                (fields[0], fields[1], fields[2])
+            })
+            .collect();
+        for (sum, _, _) in &entries {
+            assert!(
+                sum.len() == 64
+                    && sum
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{sum}"
+            );
+        }
+        for def in [&CLAUDE, &MULTI] {
+            let version = def
+                .dockerfile
+                .lines()
+                .find_map(|l| l.strip_prefix("ARG CLAUDE_CODE_VERSION="))
+                .unwrap();
+            for platform in ["linux-x64", "linux-arm64"] {
+                let pinned = entries
+                    .iter()
+                    .filter(|(_, v, p)| *v == version && *p == platform)
+                    .count();
+                assert_eq!(pinned, 1, "{} {version} {platform}", def.tag);
+            }
+            // The check runs before the binary does, and stops the build on a mismatch.
+            let check = def.dockerfile.find("sha256sum \"${claude_bin}\"").unwrap();
+            let mismatch = def.dockerfile.find("is not the pinned one").unwrap();
+            let first_run = def
+                .dockerfile
+                .find("/usr/local/bin/claude --version")
+                .unwrap();
+            assert!(check < mismatch && mismatch < first_run, "{}", def.tag);
+            assert!(
+                def.dockerfile
+                    .contains("claude-code.sha256 /opt/tinfirm/claude/")
+            );
+        }
+        assert!(MULTI.files.iter().any(|(path, bytes)| {
+            *path == "claude/claude-code.sha256" && *bytes == sums.as_bytes()
+        }));
+    }
+
+    /// tinfirm-npm-check fails when a package of the lockfile that this platform needs is
+    /// missing or at another version, as after npm ci skipped an optional package whose
+    /// download failed its integrity check (Q16), and ignores other platforms' and dev packages.
+    #[test]
+    fn the_npm_check_finds_a_skipped_package() {
+        let script = BASE
+            .files
+            .iter()
+            .find(|(p, _)| *p == "tinfirm-npm-check")
+            .unwrap()
+            .1;
+        assert!(script.starts_with(b"#!/usr/bin/env node\n"));
+        let dir = tempfile::tempdir().unwrap();
+        let check = dir.path().join("tinfirm-npm-check");
+        std::fs::write(&check, script).unwrap();
+        let app = dir.path().join("app");
+        let lock = serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app" },
+                "node_modules/a": { "version": "1.0.0" },
+                "node_modules/native-here": {
+                    "version": "2.0.0", "optional": true,
+                    "os": [std::env::consts::OS], "cpu": ["x64", "arm64"]
+                },
+                "node_modules/native-elsewhere": {
+                    "version": "2.0.0", "optional": true, "os": ["win32"]
+                },
+                // npm's exclusions: installed everywhere but on the excluded platform.
+                "node_modules/not-on-win32": {
+                    "version": "4.0.0", "optional": true, "os": ["!win32"]
+                },
+                "node_modules/not-here": {
+                    "version": "4.0.0", "optional": true,
+                    "os": [format!("!{}", std::env::consts::OS)]
+                },
+                "node_modules/tool": { "version": "3.0.0", "dev": true }
+            }
+        });
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package-lock.json"), lock.to_string()).unwrap();
+        let install = |name: &str, version: &str| {
+            let pkg = app.join("node_modules").join(name);
+            std::fs::create_dir_all(&pkg).unwrap();
+            std::fs::write(
+                pkg.join("package.json"),
+                serde_json::json!({ "name": name, "version": version }).to_string(),
+            )
+            .unwrap();
+        };
+        let run = || Command::new("node").arg(&check).arg(&app).output().unwrap();
+        install("a", "1.0.0");
+        let out = run();
+        assert!(!out.status.success());
+        assert!(
+            stderr(&out).contains("node_modules/native-here (locked 2.0.0, installed none)")
+                && stderr(&out).contains("node_modules/not-on-win32 (locked 4.0.0")
+                && stderr(&out).contains("(Q16)")
+                && !stderr(&out).contains("native-elsewhere")
+                && !stderr(&out).contains("not-here")
+                && !stderr(&out).contains("node_modules/tool"),
+            "{}",
+            stderr(&out)
+        );
+        install("native-here", "2.0.1");
+        assert!(stderr(&run()).contains("installed 2.0.1"));
+        install("native-here", "2.0.0");
+        install("not-on-win32", "4.0.0");
+        let out = run();
+        assert!(out.status.success(), "{}", stderr(&out));
     }
 
     /// The tests of the pi adapter (`node --test`), against a fake pi; they need Node, like the
@@ -1486,7 +1646,7 @@ mod tests {
                 .tag
                 .trim_start_matches("tinfirm-runner-")
                 .trim_end_matches(":local");
-            for (path, bytes) in def.files.iter().filter(|(p, _)| p.starts_with("package")) {
+            for (path, bytes) in def.files.iter().filter(|(p, _)| !p.ends_with(".mjs")) {
                 let multi_path = format!("{dir}/{path}");
                 let found = MULTI.files.iter().find(|(p, _)| *p == multi_path);
                 assert_eq!(found.map(|(_, b)| *b), Some(*bytes), "{multi_path}");

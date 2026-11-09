@@ -1,0 +1,53 @@
+#!/usr/bin/env node
+// Run in a directory after `npm ci --omit=dev`: checks that every package of its
+// package-lock.json that this platform needs is installed, at the version the lockfile locks.
+//
+// `npm ci` stops on a package whose download does not match the lockfile's integrity hash,
+// except for an optional one: that it skips with a warning ("seems to be corrupted"). The
+// runtimes' native binaries (Claude Code, Codex, OpenCode) are optional platform packages, so
+// without this check a tampered or corrupted download would surface later, if at all, as a
+// missing binary (threat model Q16).
+"use strict";
+const fs = require("fs");
+const path = require("path");
+
+// Whether npm installs a package with this `os`, `cpu` or `libc` constraint here: as npm reads
+// them, a `!value` excludes, and the plain values, if there are any, are the only ones allowed.
+function fits(rule, current) {
+  if (rule === undefined) return true;
+  const values = Array.isArray(rule) ? rule : [rule];
+  if (values.includes(`!${current}`)) return false;
+  const allowed = values.filter((value) => !value.startsWith("!"));
+  return allowed.length === 0 || allowed.includes(current);
+}
+
+const libc =
+  process.platform === "linux"
+    ? process.report.getReport().header.glibcVersionRuntime
+      ? "glibc"
+      : "musl"
+    : undefined;
+const dir = process.argv[2] || ".";
+const lock = JSON.parse(fs.readFileSync(path.join(dir, "package-lock.json"), "utf8"));
+const missing = [];
+for (const [key, entry] of Object.entries(lock.packages || {})) {
+  if (key === "" || entry.dev || entry.link) continue;
+  if (!fits(entry.os, process.platform) || !fits(entry.cpu, process.arch)) continue;
+  if (entry.libc !== undefined && (libc === undefined || !fits(entry.libc, libc))) continue;
+  let version;
+  try {
+    version = JSON.parse(fs.readFileSync(path.join(dir, key, "package.json"), "utf8")).version;
+  } catch {
+    version = undefined;
+  }
+  if (version !== entry.version) missing.push(`${key} (locked ${entry.version}, installed ${version || "none"})`);
+}
+if (missing.length > 0) {
+  console.error(
+    "ERROR: npm ci did not install these packages as package-lock.json locks them: " +
+      missing.join(", ") +
+      ". npm skips an optional package whose download fails its integrity check (\"seems to be corrupted\" above): do not use that registry or mirror (Q16).",
+  );
+  process.exit(1);
+}
+console.log(`tinfirm-npm-check: ${path.resolve(dir)} holds the packages of its package-lock.json`);
