@@ -11,11 +11,13 @@
 const fs = require("fs");
 const path = require("path");
 
-// Whether npm installs a package with this `os`, `cpu` or `libc` constraint here: as npm reads
-// them, a `!value` excludes, and the plain values, if there are any, are the only ones allowed.
+// Whether npm installs a package with this `os`, `cpu` or `libc` constraint here, as npm reads
+// them (npm-install-checks): `["any"]` fits everywhere, a `!value` excludes, and the plain
+// values, if there are any, are the only ones allowed.
 function fits(rule, current) {
   if (rule === undefined) return true;
   const values = Array.isArray(rule) ? rule : [rule];
+  if (values.length === 1 && values[0] === "any") return true;
   if (values.includes(`!${current}`)) return false;
   const allowed = values.filter((value) => !value.startsWith("!"));
   return allowed.length === 0 || allowed.includes(current);
