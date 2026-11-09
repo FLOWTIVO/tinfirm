@@ -12,7 +12,7 @@
 
   <groupId>com.flowtivo.tinfirm</groupId>
   <artifactId>tinfirm-server</artifactId>
-  <version>1.0.0-rc.1</version>
+  <version>1.0.0-rc.2-SNAPSHOT</version>
   <name>Tinfirm server</name>
   <description>Tinfirm control-plane server (API, OIDC, SPA host)</description>
 
