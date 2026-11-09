@@ -1,28 +1,4 @@
-import {
-  rememberSignInReturn,
-  safeAuthorizationReturn,
-  safeReturnUrl,
-  takeSignInReturn,
-} from './return-url';
-
-describe('rememberSignInReturn', () => {
-  afterEach(() => sessionStorage.clear());
-
-  it('keeps a safe in-app page once, for 15 minutes', () => {
-    rememberSignInReturn('/me', 1_000);
-    expect(takeSignInReturn(1_000 + 60_000)).toBe('/me');
-    expect(takeSignInReturn(1_000 + 60_000)).toBeNull();
-    rememberSignInReturn('/me', 1_000);
-    expect(takeSignInReturn(1_000 + 16 * 60_000)).toBeNull();
-  });
-
-  it('keeps nothing that would leave the app', () => {
-    rememberSignInReturn('https://evil.example/', 1_000);
-    expect(takeSignInReturn(1_000)).toBeNull();
-    sessionStorage.setItem('tinfirm.signInReturn', JSON.stringify({ path: '//evil', at: 1_000 }));
-    expect(takeSignInReturn(1_000)).toBeNull();
-  });
-});
+import { safeAuthorizationReturn, safeReturnUrl, ssoStartUrl } from './return-url';
 
 describe('safeReturnUrl', () => {
   it.each([
@@ -55,5 +31,36 @@ describe('safeAuthorizationReturn', () => {
     [undefined, null],
   ])('%s → %s', (input, expected) => {
     expect(safeAuthorizationReturn(input)).toBe(expected);
+  });
+});
+
+describe('ssoStartUrl', () => {
+  const start = '/oauth2/authorization/keycloak';
+
+  it.each([
+    ['/me', `${start}?returnTo=%2Fme`],
+    ['/me?tab=tokens', `${start}?returnTo=%2Fme%3Ftab%3Dtokens`],
+    ['/c/1/conversations/2?filter=a%2Fb', `${start}?returnTo=%2Fc%2F1%2Fconversations%2F2%3Ffilter%3Da%252Fb`],
+    // Nothing to come back to, or nothing the server would take: the start stays as it is.
+    [undefined, start],
+    ['', start],
+    ['/', start],
+    ['/?account=x', start],
+    ['//evil.example', start],
+    ['/\\evil.example', start],
+    ['https://evil.example/', start],
+    ['/me\nx', start],
+    ['/me#x', start],
+    ['/api/me', start],
+    ['/API/me', start],
+    ['/oauth2/authorize?client_id=x', start],
+    ['/login?returnUrl=/me', start],
+    ['/saml2/authenticate/kc', start],
+  ])('%s → %s', (page, expected) => {
+    expect(ssoStartUrl(start, page)).toBe(expected);
+  });
+
+  it('works for a SAML start too', () => {
+    expect(ssoStartUrl('/saml2/authenticate/kc', '/me')).toBe('/saml2/authenticate/kc?returnTo=%2Fme');
   });
 });

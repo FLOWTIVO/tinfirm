@@ -74,7 +74,7 @@ A personal access token lets a script, a CI job or an AI client without a browse
     Choose the lowest the work needs: **Read** for anything that runs unattended.
 
 4. Choose when it **Expires**: **7 days**, **30 days**, **90 days** (the default), **1 year** or **No expiry**.
-5. Choose **Create token**.
+5. Choose **Create token**. If you signed in through your organisation's identity provider more than 10 minutes ago, the dialog asks you to **Sign in again**; after the sign-in you are back on your **Profile**, in any browser tab, and create the token from there.
 
 The dialog shows the token once. Copy it now: Tinfirm keeps only a hash. If you lose it, revoke it and create another. Send it as `Authorization: Bearer` to the company's MCP endpoint, and keep it in an environment variable, never in a file you commit. [Without a browser: a personal access token](ai-clients.md#without-a-browser-a-personal-access-token) shows how to give it to Claude Code.
 
