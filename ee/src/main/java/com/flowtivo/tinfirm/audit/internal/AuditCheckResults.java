@@ -128,7 +128,8 @@ class AuditCheckResults {
         AuditCheck dto = new AuditCheck(row.id(), row.checkedAt().atOffset(ZoneOffset.UTC), row.ok(), row.fromSeq(),
                 row.headSeq(), row.headHash(), row.eventsChecked())
             .failure(row.failure() != null ? AuditCheck.FailureEnum.fromValue(row.failure()) : null)
-            .firstInvalidSeq(row.firstInvalidSeq());
+            .firstInvalidSeq(row.firstInvalidSeq())
+            .anchorCheckpoint(row.anchorCheckpoint());
         if (row.acknowledgedAt() != null) {
             dto.acknowledgedAt(row.acknowledgedAt().atOffset(ZoneOffset.UTC))
                 .acknowledgedByUserId(row.acknowledgedBy())

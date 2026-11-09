@@ -66,6 +66,7 @@ const PRO = {
     'GMAIL_ADDON',
     'AUDIT_TOOLS',
     'AUDIT_FULL_HISTORY',
+    'AUDIT_ANCHOR',
     'RETENTION_SETTINGS',
     'ELASTIC_RUNNERS',
   ],

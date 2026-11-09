@@ -205,7 +205,7 @@ An approved request covers this conversation or, when the approver may edit the 
 
 What a caller may not see is `404`, never `403`. **Kill switches**, on one page ([CONVENTIONS §15.13](CONVENTIONS.md#1513-package-6-kill-switches-suspension-break-glasss-view-and-a-member-who-leaves)): pause an agent, pause a trigger, suspend a principal (a member or a service account), stop the company's runs (`RUNS_STOPPED`), pause a system (`SYSTEM_PAUSED`) and turn personal MCP servers off (`PERSONAL_MCP_SERVERS_OFF`). **Budgets** (§11.2): a company default for every key, overridden per member or service account.
 
-**Audit** (the hash-chained log, [ADR-0010](adr/0010-hash-chained-audit-log.md)): every tool call with its conversation, the account or credential used and who acted through it, the tool's effect and its approval; every run with the model access that paid and the host that ran it; every choice of authority: a trigger's accounts and model access, grants and lendings, budgets, who may use a service account.
+**Audit** (the hash-chained log, [ADR-0010](adr/0010-hash-chained-audit-log.md), its chains' heads anchored outside the database in Pro and Enterprise, [ADR-0111](adr/0111-audit-chain-heads-anchored-outside-the-database.md)): every tool call with its conversation, the account or credential used and who acted through it, the tool's effect and its approval; every run with the model access that paid and the host that ran it; every choice of authority: a trigger's accounts and model access, grants and lendings, budgets, who may use a service account.
 
 ## 10. Prompt and tools
 

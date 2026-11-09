@@ -23,6 +23,7 @@ Everything is recorded in the audit log in every edition. Proving it to an audit
 | The audit recorded, hash-chained | :lucide-check: | :lucide-check: | :lucide-check: |
 | The audit shown in the app | the last 90 days | all | all |
 | The audit's filters, export, chain verification and daily checks | – | :lucide-check: | :lucide-check: |
+| The audit anchored outside the database, with signed checkpoints ([Anchor the audit](../operator-guide/audit-anchor.md)) | – | :lucide-check: | :lucide-check: |
 | The audit streamed to a SIEM | – | – | planned |
 | Erasure of a person's content | :lucide-check: | :lucide-check: | :lucide-check: |
 | Retention | [everything kept](#retention-in-community) | the Owner's periods | the Owner's periods |

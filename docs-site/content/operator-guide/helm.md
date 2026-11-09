@@ -32,6 +32,8 @@ The chart names Secrets and never holds a secret value. The pods do not start un
 | Each `auth.oidc.providers[].existingSecret` | `secretKeys.clientSecret` (`client-secret`) | The client secret at that identity provider | One per provider |
 | `database.caCertSecret.name` | `database.caCertSecret.key` (`ca.crt`) | The CA certificate of your database server | With `verify-ca` or `verify-full` |
 | `errorReports.dsnSecret.name` | `errorReports.dsnSecret.key` (`dsn`) | Where error reports are sent: [Error reports](error-reports.md) | No |
+| `auditAnchor.existingSecret` | `<kid>.key` for each key of `auditAnchor.keys`, `<kid>.pub` for a retired one | The Ed25519 keys that sign the audit's checkpoints: [Anchor the audit](audit-anchor.md) | With `auditAnchor.sink` |
+| `auditAnchor.s3.existingSecret` | `access-key-id`, `secret-access-key` | The key of the checkpoints' bucket, which may not delete | With the `s3` sink |
 | `runner.existingSecret` (`tinfirm-runner`) | `runner.secretKeys.token` (`token`) | The runner pod's token, `tfr_` and 43 base64url characters | With the runner pod |
 | `runner.vm.digitalocean.existingSecret` (`tinfirm-digitalocean`) | `runner.vm.digitalocean.secretKeys.token` (`token`) | The DigitalOcean API token that creates the runner pod's VMs | With the runner pod |
 
@@ -298,6 +300,10 @@ The server serves Prometheus metrics at `/actuator/prometheus` on port 8081, whi
 | `metrics.podMonitor.labels`, `.annotations` | `{}` | The labels your Prometheus selects PodMonitors by, such as `release: kube-prometheus-stack` |
 | `metrics.podMonitor.namespace` | the release's | Where to create it, when your Prometheus looks in its own namespace only |
 | `metrics.podMonitor.interval`, `.scrapeTimeout` | your Prometheus's | Such as `30s` |
+
+### The audit's anchor
+
+`auditAnchor.sink`, `.interval`, `.activeKey`, `.keys` and the sink's `s3`, `file` or `syslog` values write signed checkpoints of the audit chains outside the database (Pro and Enterprise): [Anchor the audit](audit-anchor.md).
 
 ### Error reports
 

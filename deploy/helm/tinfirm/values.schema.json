@@ -462,6 +462,58 @@
         "proxy": { "description": "TINFIRM_ERROR_REPORTS_PROXY: http://host:port", "type": "string", "pattern": "^(http://[^/:@]+:[0-9]{1,5}/?)?$" }
       }
     },
+    "auditAnchor": {
+      "description": "The audit chains' heads anchored outside the database (ADR-0111, Pro)",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sink": { "description": "TINFIRM_AUDIT_ANCHOR_SINK", "enum": ["none", "s3", "file", "syslog"] },
+        "interval": { "description": "TINFIRM_AUDIT_ANCHOR_INTERVAL, PT5M to P1D", "type": "string", "pattern": "^P" },
+        "existingSecret": { "description": "The Secret of the keys: <kid>.key, and <kid>.pub for a retired key", "type": "string" },
+        "activeKey": { "description": "TINFIRM_AUDIT_ANCHOR_ACTIVE_KEY", "type": "string", "pattern": "^([a-z0-9]{1,32})?$" },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kid"],
+            "properties": {
+              "kid": { "type": "string", "pattern": "^[a-z0-9]{1,32}$" },
+              "retired": { "description": "Only its public key, <kid>.pub: it verifies, never signs", "type": "boolean" }
+            }
+          }
+        },
+        "s3": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": { "type": "string" },
+            "region": { "type": "string", "minLength": 1 },
+            "bucket": { "type": "string" },
+            "pathStyle": { "type": "boolean" },
+            "prefix": { "type": "string" },
+            "retention": { "type": "string", "pattern": "^P" },
+            "requireLock": { "type": "boolean" },
+            "existingSecret": { "description": "access-key-id and secret-access-key of the bucket's key", "type": "string" }
+          }
+        },
+        "file": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingClaim": { "description": "The PersistentVolumeClaim of the file sink", "type": "string" }
+          }
+        },
+        "syslog": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "host": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          }
+        }
+      }
+    },
     "trustedProxies": {
       "description": "SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES regex. Empty = not set (Tomcat default).",
       "type": "string"

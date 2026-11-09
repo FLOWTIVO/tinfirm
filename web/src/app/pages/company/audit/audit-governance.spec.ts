@@ -124,6 +124,10 @@ describe('the daily checks, in words', () => {
       { ok: false, failure: 'BROKEN', firstInvalidSeq: 121 },
       'Failed: event 121 does not chain from the one before. It, or one before it, was changed.',
     ],
+    [
+      { ok: false, failure: 'ANCHOR_MISMATCH', firstInvalidSeq: 88, anchorCheckpoint: 12 },
+      'Failed: event 88 is gone or has another hash than checkpoint 12 outside the database names. The chain was rewritten or cut, and recomputed.',
+    ],
   ])('says %o', (change, text) => {
     expect(checkPhrase(anAuditCheck(change))).toBe(text);
   });

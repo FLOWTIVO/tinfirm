@@ -151,6 +151,27 @@ spec:
                   name: {{ $.Values.auth.saml.sp.existingSecret }}
                   key: {{ .certKey | default (printf "%s.crt" .kid) }}
             {{- end }}
+            {{- range .Values.auditAnchor.keys }}
+            # The audit anchor's keys (ADR-0111): the private key of a key that may sign, the
+            # public key of a retired one.
+            - name: TINFIRM_AUDIT_ANCHOR_KEYS_{{ upper .kid }}_{{ if .retired }}PUBLIC{{ else }}PRIVATE{{ end }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auditAnchor.existingSecret is required with auditAnchor.keys" $.Values.auditAnchor.existingSecret }}
+                  key: {{ .kid }}.{{ if .retired }}pub{{ else }}key{{ end }}
+            {{- end }}
+            {{- if eq .Values.auditAnchor.sink "s3" }}
+            - name: TINFIRM_AUDIT_ANCHOR_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auditAnchor.s3.existingSecret is required with the s3 sink" .Values.auditAnchor.s3.existingSecret }}
+                  key: access-key-id
+            - name: TINFIRM_AUDIT_ANCHOR_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auditAnchor.s3.existingSecret }}
+                  key: secret-access-key
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -198,6 +219,10 @@ spec:
               mountPath: /etc/tinfirm/saml
               readOnly: true
             {{- end }}
+            {{- if eq .Values.auditAnchor.sink "file" }}
+            - name: audit-checkpoints
+              mountPath: /var/lib/tinfirm/audit-checkpoints
+            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -223,6 +248,11 @@ spec:
         - name: saml-metadata
           configMap:
             name: {{ include "tinfirm.fullname" . }}-saml-metadata
+        {{- end }}
+        {{- if eq .Values.auditAnchor.sink "file" }}
+        - name: audit-checkpoints
+          persistentVolumeClaim:
+            claimName: {{ required "auditAnchor.file.existingClaim is required with the file sink" .Values.auditAnchor.file.existingClaim }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

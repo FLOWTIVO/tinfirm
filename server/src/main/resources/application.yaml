@@ -187,6 +187,30 @@ tinfirm:
       prefix: ${TINFIRM_SESSION_BUNDLES_S3_PREFIX:session-bundles/}
     # A bundle goes this long after its conversation's last turn, and when the conversation ends.
     retention: ${TINFIRM_SESSION_BUNDLES_RETENTION:P30D}
+  audit:
+    anchor:
+      # The audit chains' heads anchored outside the database (ADR-0111, Pro and Enterprise): signed checkpoints,
+      # written every interval while a head moved, to none (off), s3 (a bucket with object lock), file (a directory
+      # the database's writer cannot reach) or syslog (a collector, over TLS). The keys: TINFIRM_AUDIT_ANCHOR_KEYS_<KID>_PRIVATE
+      # (an Ed25519 PKCS#8 PEM) and, for retired keys, _PUBLIC (an X.509 PEM), bound from the environment.
+      sink: ${TINFIRM_AUDIT_ANCHOR_SINK:none}
+      interval: ${TINFIRM_AUDIT_ANCHOR_INTERVAL:PT1H}
+      active-key: ${TINFIRM_AUDIT_ANCHOR_ACTIVE_KEY:}
+      s3:
+        endpoint: ${TINFIRM_AUDIT_ANCHOR_S3_ENDPOINT:}
+        region: ${TINFIRM_AUDIT_ANCHOR_S3_REGION:us-east-1}
+        bucket: ${TINFIRM_AUDIT_ANCHOR_S3_BUCKET:}
+        path-style: ${TINFIRM_AUDIT_ANCHOR_S3_PATH_STYLE:false}
+        prefix: ${TINFIRM_AUDIT_ANCHOR_S3_PREFIX:audit-checkpoints/}
+        access-key-id: ${TINFIRM_AUDIT_ANCHOR_S3_ACCESS_KEY_ID:}
+        secret-access-key: ${TINFIRM_AUDIT_ANCHOR_S3_SECRET_ACCESS_KEY:}
+        retention: ${TINFIRM_AUDIT_ANCHOR_S3_RETENTION:P400D}
+        require-lock: ${TINFIRM_AUDIT_ANCHOR_S3_REQUIRE_LOCK:true}
+      file:
+        dir: ${TINFIRM_AUDIT_ANCHOR_FILE_DIR:}
+      syslog:
+        host: ${TINFIRM_AUDIT_ANCHOR_SYSLOG_HOST:}
+        port: ${TINFIRM_AUDIT_ANCHOR_SYSLOG_PORT:6514}
   attachment:
     # The files of a conversation (ADR-0014, the package 3 contract §3.13): the largest file, and how many files and
     # bytes one conversation holds in all, the documents of its outputs included.

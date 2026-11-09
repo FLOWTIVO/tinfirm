@@ -24,7 +24,7 @@ import org.springframework.stereotype.Repository;
 class AuditCheckStore {
 
     private static final String COLUMNS = "id, company_id, checked_at, ok, from_seq, failure, first_invalid_seq,"
-            + " head_seq, head_hash, events_checked, acknowledged_at, acknowledged_by, acknowledged_note";
+            + " head_seq, head_hash, events_checked, acknowledged_at, acknowledged_by, acknowledged_note, anchor_checkpoint";
 
     /** The checks kept per chain, beside the one the next check starts from. */
     static final int KEPT = 400;
@@ -39,12 +39,14 @@ class AuditCheckStore {
      * One check of a chain.
      *
      * @param companyId null for the instance chain
-     * @param failure   {@code BROKEN}, {@code SHORTER}, {@code HEAD_CHANGED}; null when it passed
+     * @param failure          {@code BROKEN}, {@code SHORTER}, {@code HEAD_CHANGED}, {@code ANCHOR_MISMATCH}
+     *                         (ADR-0111); null when it passed
+     * @param anchorCheckpoint for {@code ANCHOR_MISMATCH}, the number of the checkpoint the chain disagrees with
      */
     record CheckRow(UUID id, @Nullable UUID companyId, Instant checkedAt, boolean ok, long fromSeq,
             @Nullable String failure, @Nullable Long firstInvalidSeq, long headSeq, String headHash,
             long eventsChecked, @Nullable Instant acknowledgedAt, @Nullable UUID acknowledgedBy,
-            @Nullable String acknowledgedNote) {
+            @Nullable String acknowledgedNote, @Nullable Long anchorCheckpoint) {
 
         /** Whether the next check starts from this one's head: it passed, or its failure was acknowledged. */
         boolean anchors() {
@@ -55,10 +57,11 @@ class AuditCheckStore {
     void insert(CheckRow row) {
         jdbc.sql("""
                 INSERT INTO audit_check (id, company_id, checked_at, ok, from_seq, failure, first_invalid_seq,
-                                         head_seq, head_hash, events_checked)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
+                                         head_seq, head_hash, events_checked, anchor_checkpoint)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
             .params(row.id(), uuid(row.companyId()), ts(row.checkedAt()), row.ok(), row.fromSeq(), row.failure(),
-                    row.firstInvalidSeq(), row.headSeq(), row.headHash(), row.eventsChecked())
+                    row.firstInvalidSeq(), row.headSeq(), row.headHash(), row.eventsChecked(),
+                    new SqlParameterValue(Types.BIGINT, row.anchorCheckpoint()))
             .update();
     }
 
@@ -148,12 +151,14 @@ class AuditCheckStore {
         long firstInvalid = rs.getLong("first_invalid_seq");
         Long firstInvalidSeq = rs.wasNull() ? null : firstInvalid;
         OffsetDateTime acknowledged = rs.getObject("acknowledged_at", OffsetDateTime.class);
+        long checkpoint = rs.getLong("anchor_checkpoint");
+        Long anchorCheckpoint = rs.wasNull() ? null : checkpoint;
         return new CheckRow(rs.getObject("id", UUID.class), rs.getObject("company_id", UUID.class),
                 rs.getObject("checked_at", OffsetDateTime.class).toInstant(), rs.getBoolean("ok"),
                 rs.getLong("from_seq"), rs.getString("failure"), firstInvalidSeq, rs.getLong("head_seq"),
                 rs.getString("head_hash"), rs.getLong("events_checked"),
                 acknowledged != null ? acknowledged.toInstant() : null, rs.getObject("acknowledged_by", UUID.class),
-                rs.getString("acknowledged_note"));
+                rs.getString("acknowledged_note"), anchorCheckpoint);
     }
 
     private static String chain(@Nullable UUID companyId) {

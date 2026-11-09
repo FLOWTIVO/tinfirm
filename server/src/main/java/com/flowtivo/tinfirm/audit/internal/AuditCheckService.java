@@ -31,7 +31,11 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  * valid but shorter chain (ADR-0010) that a full verification does not notice;</li>
  * <li>{@code HEAD_CHANGED}: the event at the anchor has another hash: the chain was rewritten from there or before;</li>
  * <li>{@code BROKEN}: an event after the anchor does not verify (a changed event, a broken link, a gap, or a head row
- * that points past the last event or at another hash), {@code first_invalid_seq} the first.</li>
+ * that points past the last event or at another hash), {@code first_invalid_seq} the first;</li>
+ * <li>{@code ANCHOR_MISMATCH} (ADR-0111): the chain verifies, but the event at the latest checkpoint's {@code seq}
+ * outside the database is gone or has another hash: the chain was rewritten or cut, and recomputed, by someone who
+ * could write the database. {@code first_invalid_seq} is the checkpoint's {@code seq}, {@code anchor_checkpoint} its
+ * number. Compared only where the anchor is in force ({@link AuditAnchors}, under {@code ee/}).</li>
  * </ol>
  * A check that passed records the head it verified ({@code head_seq}, {@code head_hash}: the chain's head row as it
  * read it before the verification, which the verified events reach), and anchors the next check there; it never
@@ -67,10 +71,14 @@ class AuditCheckService implements AuditChecks {
 
     private final ObjectProvider<AuditTools> tools;
 
+    private final ObjectProvider<AuditAnchors> anchors;
+
     AuditCheckService(AuditEventStore events, AuditCheckStore checks, SystemTransactions transactions,
             TimeSource time, TinfirmProperties tinfirm,
-            @Value("${tinfirm.audit.check-interval:P1D}") Duration interval, ObjectProvider<AuditTools> tools) {
+            @Value("${tinfirm.audit.check-interval:P1D}") Duration interval, ObjectProvider<AuditTools> tools,
+            ObjectProvider<AuditAnchors> anchors) {
         this.tools = tools;
+        this.anchors = anchors;
         this.events = events;
         this.checks = checks;
         this.transactions = transactions;
@@ -121,9 +129,10 @@ class AuditCheckService implements AuditChecks {
                 : transactions.instanceWide(() -> checkLocked(null));
         result.filter(row -> !row.ok()).ifPresent(row -> log.error(
                 "The daily check of the audit chain of {} failed: {} (from seq {}, first invalid seq {}, {} events"
-                        + " checked); an OWNER acknowledges it on the audit page once it is understood",
+                        + " checked{}); an OWNER acknowledges it on the audit page once it is understood",
                 companyId == null ? "the instance" : "company " + companyId, row.failure(), row.fromSeq(),
-                row.firstInvalidSeq(), row.eventsChecked()));
+                row.firstInvalidSeq(), row.eventsChecked(),
+                row.anchorCheckpoint() != null ? ", checkpoint " + row.anchorCheckpoint() : ""));
         return result;
     }
 
@@ -183,6 +192,16 @@ class AuditCheckService implements AuditChecks {
                 failure = "BROKEN";
             }
         }
+        Long anchorCheckpoint = null;
+        if (failure == null) {
+            AuditAnchors found = anchors.getIfAvailable();
+            Optional<AuditAnchors.Mismatch> mismatch = found != null ? found.compare(companyId) : Optional.empty();
+            if (mismatch.isPresent()) {
+                failure = "ANCHOR_MISMATCH";
+                firstInvalid = mismatch.get().seq();
+                anchorCheckpoint = mismatch.get().checkpoint();
+            }
+        }
 
         // The head the next check starts from once this one is accepted. Passed: the head this check verified (the
         // head row as read above, which the verified events reached), never an event appended since, which it did
@@ -200,7 +219,8 @@ class AuditCheckService implements AuditChecks {
             headHash = last.map(StoredAuditEvent::hash).orElse(AuditCanonicalForm.GENESIS_HASH);
         }
         AuditCheckStore.CheckRow row = new AuditCheckStore.CheckRow(Ids.newId(), companyId, time.now(),
-                failure == null, fromSeq, failure, firstInvalid, headSeq, headHash, checked, null, null, null);
+                failure == null, fromSeq, failure, firstInvalid, headSeq, headHash, checked, null, null, null,
+                anchorCheckpoint);
         checks.insert(row);
         checks.prune(companyId);
         return Optional.of(row);

@@ -81,6 +81,8 @@ When a Pro or Enterprise licence has run out, the export keeps working for 90 da
 
 A full verification cannot see that the newest events were cut off the end: what remains is still a valid chain. The daily checks catch that.
 
+Where your operator anchors the audit outside the database (Pro and Enterprise: [Anchor the audit](../operator-guide/audit-anchor.md)), the verification also compares the chain with the latest signed checkpoint that names it, and says so: **Anchored outside the database at event 88,123: checkpoint 1,234 of 2026-11-07 10:00 UTC, key k2026.** Note that sentence somewhere of your own, such as your audit records: the checkpoint is kept where whoever can write Tinfirm's database cannot change it, so a chain rewritten and recomputed there no longer matches it. An export names the same checkpoint in its first line, as `checkpoint`.
+
 ## The daily checks
 
 Once a day, Tinfirm checks the chain from the head that the check before recorded. The page shows the latest result above the list, for example **Chain checked today at 03:12 · 18,204 events · none removed**, with the head's number and hash, which **Copy** lets you keep elsewhere. **Past checks** lists the last five.
@@ -92,6 +94,7 @@ A check fails when:
 | The chain ends before the head the last check recorded | Its newest events were removed |
 | The event at that head has another hash now | It was changed |
 | An event does not chain from the one before | It, or one before it, was changed |
+| An event is gone, or has another hash, than a signed checkpoint outside the database names (only where the audit is anchored) | The chain was rewritten or cut, and its hashes recomputed, by someone who could write the database |
 
 A failure goes to the inbox of every Owner and Admin, **The daily check of the audit log failed**, and stays there until a check passes or an Owner acknowledges it. Look into it first. Then an Owner chooses **Acknowledge the failure** and writes a **Note** saying why it is accepted. The note is kept on the check; the audit log records only that it was acknowledged. The next check starts from the head the failed one found.
 

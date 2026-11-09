@@ -140,9 +140,17 @@ ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
 ENV TINFIRM_REVISION="${REVISION}"
 # The session bundles' `filesystem` store (ADR-0097), the server user's alone, so that a volume
 # mounted here (Compose's session-bundles) starts with that owner. Unused with another store.
+# The audit anchor's `file` sink (ADR-0111), the same way; and the anchor's offline tool,
+# `tinfirm-audit-verify` (keygen, verify), which starts no server.
 RUN mkdir -p /var/lib/tinfirm/session-bundles \
  && chown 10001:10001 /var/lib/tinfirm/session-bundles \
- && chmod 700 /var/lib/tinfirm/session-bundles
+ && chmod 700 /var/lib/tinfirm/session-bundles \
+ && mkdir -p /var/lib/tinfirm/audit-checkpoints \
+ && chown 10001:10001 /var/lib/tinfirm/audit-checkpoints \
+ && chmod 700 /var/lib/tinfirm/audit-checkpoints \
+ && printf '#!/bin/sh\nexec java -cp /app/application.jar com.flowtivo.tinfirm.audit.internal.AuditAnchorTool "$@"\n' \
+      > /usr/local/bin/tinfirm-audit-verify \
+ && chmod 755 /usr/local/bin/tinfirm-audit-verify
 USER 10001:10001
 # 8080 application (API, OIDC, SPA); 8081 management (health, prometheus), never exposed
 # through an ingress.

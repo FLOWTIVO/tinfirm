@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.flowtivo.tinfirm.audit.AuditTrail;
 import com.flowtivo.tinfirm.shared.api.AdminApi;
+import com.flowtivo.tinfirm.shared.api.model.AuditAnchorStatus;
 import com.flowtivo.tinfirm.shared.api.model.AuditCheck;
 import com.flowtivo.tinfirm.shared.api.model.AuditCheckAcknowledgement;
 import com.flowtivo.tinfirm.shared.api.model.AuditCheckPage;
@@ -82,6 +83,11 @@ class AdminController implements AdminApi {
     @Override
     public ResponseEntity<AuditVerification> verifyInstanceAuditChain() {
         return ResponseEntity.ok(auditTrail.verifyInstanceChain());
+    }
+
+    @Override
+    public ResponseEntity<AuditAnchorStatus> getAuditAnchorStatus() {
+        return ResponseEntity.ok(auditTrail.auditAnchorStatus());
     }
 
     @Override

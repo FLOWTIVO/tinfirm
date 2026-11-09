@@ -101,6 +101,7 @@ nav = [
       "operator-guide/maintenance.md",
       "operator-guide/licence.md",
       "operator-guide/verify-images.md",
+      "operator-guide/audit-anchor.md",
       "operator-guide/instance-admin.md",
       "operator-guide/error-reports.md",
     ] },

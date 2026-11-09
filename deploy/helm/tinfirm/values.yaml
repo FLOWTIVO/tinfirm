@@ -238,6 +238,46 @@ errorReports:
   # TINFIRM_ERROR_REPORTS_PROXY: http://host:port of an HTTP proxy for the delivery.
   proxy: ""
 
+# The audit chains' heads anchored outside the database (ADR-0111, Pro and Enterprise;
+# docs-site: operator-guide/audit-anchor): signed checkpoints of every chain's head, written
+# every interval while a head moved, to a sink the database's writer cannot change.
+auditAnchor:
+  # TINFIRM_AUDIT_ANCHOR_SINK: none (off), s3 (a bucket with object lock), file (a volume) or
+  # syslog (a collector of its own).
+  sink: none
+  # TINFIRM_AUDIT_ANCHOR_INTERVAL: PT5M to P1D.
+  interval: PT1H
+  # The Ed25519 keys (`tinfirm-audit-verify keygen <kid>`), from this Secret: `<kid>.key`, the
+  # private key, for each key that signs or may sign; `<kid>.pub`, the public key, for a
+  # retired key that only verifies. activeKey signs; required with a sink.
+  existingSecret: ""
+  activeKey: ""
+  keys: []
+  #  - kid: k2027
+  #  - kid: k2026
+  #    retired: true
+  s3:
+    endpoint: ""
+    region: us-east-1
+    bucket: ""
+    pathStyle: false
+    prefix: audit-checkpoints/
+    # Object lock in compliance mode for this long; the start refuses a bucket without object
+    # lock unless requireLock is false.
+    retention: P400D
+    requireLock: true
+    # The bucket's key, which may write and read but never delete: access-key-id and
+    # secret-access-key in this Secret.
+    existingSecret: ""
+  file:
+    # A PersistentVolumeClaim of its own for the `file` sink, mounted at
+    # /var/lib/tinfirm/audit-checkpoints. Only as safe as who else can write that volume.
+    existingClaim: ""
+  syslog:
+    host: ""
+    # Over TLS only (RFC 5425), checked against the JVM's trust store.
+    port: 6514
+
 # Proxies whose X-Forwarded-For the server trusts (SERVER_TOMCAT_REMOTEIP_INTERNAL_PROXIES,
 # a Java regex matched against the connecting IP). The per-IP login throttle and the audit
 # trail key on the client IP this yields.

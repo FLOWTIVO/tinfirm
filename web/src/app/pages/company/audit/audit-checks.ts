@@ -42,6 +42,15 @@ export function failurePhrase(check: AuditCheck): string {
       return check.firstInvalidSeq
         ? `event ${check.firstInvalidSeq} does not chain from the one before. It, or one before it, was changed.`
         : 'an event after the last head does not chain from the one before.';
+    case 'ANCHOR_MISMATCH': {
+      // ADR-0111: the chain recomputes, but not to the head a signed checkpoint outside the
+      // database names.
+      const checkpoint =
+        check.anchorCheckpoint != null ? `checkpoint ${check.anchorCheckpoint}` : 'the checkpoint';
+      return check.firstInvalidSeq
+        ? `event ${check.firstInvalidSeq} is gone or has another hash than ${checkpoint} outside the database names. The chain was rewritten or cut, and recomputed.`
+        : `the chain disagrees with ${checkpoint} outside the database. It was rewritten or cut.`;
+    }
     default:
       return 'the chain does not verify.';
   }

@@ -3691,7 +3691,10 @@ paths:
         is the head. At most 1 000 000 events (`400 AUDIT_EXPORT_TOO_LARGE`).
 
         The first line states the range: `{"kind":"export","companyId","fromSeq","toSeq","count","prevHash","from",
-        "to"}`, where `prevHash` is the hash the first event chains from. Then one line per event: its canonical form
+        "to","checkpoint"}`, where `prevHash` is the hash the first event chains from and `checkpoint` the latest
+        checkpoint of ADR-0111 that names the chain at or before `toSeq` (`{number, issuedAt, keyId, seq, hash}`, or
+        null: none, or the anchor not in force), which the operator's `tinfirm-audit-verify` checks against the
+        checkpoints in the sink. Then one line per event: its canonical form
         (ADR-0010: `action`, `actor` `{id, type}`, `companyId`, `details`, `occurredAt`, `seq`, `targetId`,
         `targetType`) with `prevHash` and `hash` added, keys sorted. The last line is the chain's head at the export:
         `{"kind":"head","seq","hash"}`. Anyone holding it verifies it offline: drop `prevHash` and `hash` from each
@@ -4362,6 +4365,23 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/admin/audit-anchor:
+    get:
+      tags: [Admin]
+      operationId: getAuditAnchorStatus
+      summary: The anchor of the audit chains outside the database (instance admin, AUDIT_ANCHOR)
+      description: |
+        ADR-0111: the sink, the keys, the last checkpoint written and the writer's last failure. `403 EDITION_REQUIRED`
+        without `AUDIT_ANCHOR` (Pro).
+      responses:
+        '200':
+          description: The anchor's status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditAnchorStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
 
   /api/admin/vault/rewrap:
     post:
@@ -9909,9 +9929,66 @@ components:
       type: object
       required: [valid, checkedEvents]
       properties:
-        valid: { type: boolean }
+        valid: { type: boolean, description: "The chain recomputes, and agrees with its latest checkpoint (ADR-0111) where there is one" }
         checkedEvents: { type: integer, format: int64 }
         firstInvalidSeq: { type: integer, format: int64, nullable: true }
+        checkpoint:
+          nullable: true
+          description: The latest checkpoint outside the database that names the chain (ADR-0111); null without one, or while the anchor is not in force
+          allOf: [ { $ref: '#/components/schemas/AuditCheckpointHead' } ]
+    AuditCheckpointHead:
+      type: object
+      description: |
+        A chain's head as a signed checkpoint outside the database names it (ADR-0111). An admin may note it elsewhere;
+        the operator's `tinfirm-audit-verify` checks it against the checkpoints in the sink and the public keys.
+      required: [number, issuedAt, keyId, seq, hash]
+      properties:
+        number: { type: integer, format: int64, description: "The checkpoint's number, 1 for the first" }
+        issuedAt: { type: string, format: date-time }
+        keyId: { type: string, description: "The key that signed it" }
+        seq: { type: integer, format: int64, description: "The chain's head as the checkpoint names it" }
+        hash: { type: string }
+    AuditAnchorStatus:
+      type: object
+      description: |
+        The anchor of the audit chains outside the database (ADR-0111), for instance admins: where the checkpoints go,
+        the keys that sign and verify them, and the writer's last success and failure.
+      required: [inForce, sink, publicKeys, consecutiveFailures]
+      properties:
+        inForce: { type: boolean, description: "Whether the licence holds AUDIT_ANCHOR and a sink is configured: checkpoints are written" }
+        sink:
+          type: string
+          enum: [NONE, S3, FILE, SYSLOG]
+        location: { type: string, nullable: true, description: "The bucket and prefix, the directory, or the collector; never a credential" }
+        instanceId: { type: string, format: uuid, nullable: true, description: "The instance's folder in the sink; null before the first checkpoint" }
+        activeKeyId: { type: string, nullable: true }
+        publicKeys:
+          type: array
+          description: Every key the server trusts, the active one included; give them to whoever verifies, out of band
+          items: { $ref: '#/components/schemas/AuditAnchorKey' }
+        lastCheckpoint:
+          nullable: true
+          allOf: [ { $ref: '#/components/schemas/AuditCheckpointWritten' } ]
+        lastSuccessAt: { type: string, format: date-time, nullable: true }
+        lastFailureAt: { type: string, format: date-time, nullable: true }
+        lastFailure: { type: string, nullable: true, description: "Why the last write failed" }
+        consecutiveFailures: { type: integer, format: int32, description: "Writes that failed since the last success" }
+    AuditAnchorKey:
+      type: object
+      required: [keyId, publicKey, active]
+      properties:
+        keyId: { type: string }
+        publicKey: { type: string, description: "The Ed25519 public key, X.509 PEM" }
+        active: { type: boolean, description: "Whether it signs; the others only verify" }
+    AuditCheckpointWritten:
+      type: object
+      required: [number, issuedAt, keyId, location, chains]
+      properties:
+        number: { type: integer, format: int64 }
+        issuedAt: { type: string, format: date-time }
+        keyId: { type: string }
+        location: { type: string, description: "Where the sink put it" }
+        chains: { type: integer, format: int32, description: "How many chains' heads it names" }
     AuditCheck:
       type: object
       description: One daily check of a chain (the package 6 contract, §3.6, §5.8)
@@ -9924,8 +10001,10 @@ components:
         failure:
           type: string
           nullable: true
-          enum: [BROKEN, SHORTER, HEAD_CHANGED]
-        firstInvalidSeq: { type: integer, format: int64, nullable: true, description: "A BROKEN chain's first event that does not verify" }
+          enum: [BROKEN, SHORTER, HEAD_CHANGED, ANCHOR_MISMATCH]
+          description: "ANCHOR_MISMATCH: the event at a checkpoint's seq (ADR-0111) is gone or has another hash"
+        firstInvalidSeq: { type: integer, format: int64, nullable: true, description: "A BROKEN chain's first event that does not verify; for ANCHOR_MISMATCH the checkpoint's seq" }
+        anchorCheckpoint: { type: integer, format: int64, nullable: true, description: "For ANCHOR_MISMATCH: the checkpoint's number" }
         headSeq: { type: integer, format: int64, description: "The chain's last event as the check found it" }
         headHash: { type: string, description: "Its hash, which an admin may note elsewhere" }
         eventsChecked: { type: integer, format: int64 }
@@ -13192,11 +13271,12 @@ components:
         the grace, Community with decision 7's exceptions, until a new key is added or the expired keys removed.
     LicenceFeature:
       type: string
-      enum: [OUTLOOK_ADDIN, GMAIL_ADDON, AUDIT_TOOLS, AUDIT_FULL_HISTORY, RETENTION_SETTINGS, ELASTIC_RUNNERS,
-             LEGAL_HOLDS, SAML, SCIM, SIEM, MULTI_COMPANY, HA, AIR_GAPPED]
+      enum: [OUTLOOK_ADDIN, GMAIL_ADDON, AUDIT_TOOLS, AUDIT_FULL_HISTORY, AUDIT_ANCHOR, RETENTION_SETTINGS,
+             ELASTIC_RUNNERS, LEGAL_HOLDS, SAML, SCIM, SIEM, MULTI_COMPANY, HA, AIR_GAPPED]
       description: |
         A paid feature (ADR-0077, decision 4). Pro: `OUTLOOK_ADDIN`, `GMAIL_ADDON` (ADR-0083), `AUDIT_TOOLS` (the audit's filters,
         export, chain verification and daily checks), `AUDIT_FULL_HISTORY` (the audit shown beyond 90 days),
+        `AUDIT_ANCHOR` (the chains' heads anchored outside the database, ADR-0111),
         `RETENTION_SETTINGS`, `ELASTIC_RUNNERS` (runner hosts with the sandbox bridge or a VM per run, ready sandboxes
         and session bundles, ADR-0100). Enterprise adds `LEGAL_HOLDS`, `SAML`, `SCIM`, `SIEM`, `MULTI_COMPANY` (declared companies
         beyond the first), `HA` and `AIR_GAPPED`.

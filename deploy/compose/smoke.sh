@@ -34,6 +34,11 @@ grep -vE '^\s*(#|$)' "$here/.env.example" > "$env_file"
   echo "TINFIRM_PUBLIC_URL=http://localhost:$http_port"
 } >> "$env_file"
 
+# The audit anchor's offline tool in the image (ADR-0111): it starts no server, so it runs here on its own, with
+# the image's read-only root and only /tmp writable, as an operator runs it.
+echo "smoke: tinfirm-audit-verify keygen in $image"
+docker run --rm --read-only --tmpfs /tmp --entrypoint tinfirm-audit-verify "$image" keygen smoke /tmp >/dev/null
+
 echo "smoke: starting $image as project $project on 127.0.0.1:$http_port"
 docker compose --project-name "$project" --env-file "$env_file" -f "$here/compose.yaml" up -d --no-build postgres server
 

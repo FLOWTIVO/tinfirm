@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-26
 - Sources: CONVENTIONS §5, §6, §7, §8
+- Amended by: [ADR-0111](0111-audit-chain-heads-anchored-outside-the-database.md), under which, in Pro and Enterprise, signed checkpoints of the chains' heads outside the database are the external anchor the consequences ask for: a full rewrite or a cut before the latest checkpoint is detected
 
 ## Context
 
