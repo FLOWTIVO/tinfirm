@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/tinfirm-bridge", "crates/tinfirm-protocol", "crates/tinfirm-runner-host"]
 
 [workspace.package]
-version = "0.1.0-SNAPSHOT"
+version = "1.0.0-rc.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
