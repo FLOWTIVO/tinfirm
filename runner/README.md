@@ -1172,7 +1172,7 @@ is refused. For a host without internet access:
 | `PIP_INDEX_URL` | base | `https://pypi.org/simple` | The package index for uv (checked against pinned hashes) |
 | `MAVEN_REPOSITORY_URL` | base | `https://repo.maven.apache.org/maven2` | A repository with Maven Central's layout; Maven's distribution is downloaded from it (checked against a pinned SHA-512) |
 | `GRADLE_DOWNLOAD_URL` | base | `https://services.gradle.org/distributions` | Where `gradle-<version>-bin.zip` is (checked against a pinned SHA-256) |
-| `NPM_REGISTRY` | claude, codex, pi, opencode | `https://registry.npmjs.org/` | The npm registry for the ACP adapters and the CLIs. claude, codex, pi and opencode install exactly the packages of their committed `package-lock.json` with `npm ci --ignore-scripts` (integrity-checked; OpenCode's one install script, which links its native binary, runs by name afterwards). To move a version, change the `ARG` and the image's `package.json`, then run `npm install --package-lock-only --ignore-scripts` with npm 11 in its directory |
+| `NPM_REGISTRY` | claude, codex, pi, opencode | `https://registry.npmjs.org/` | The npm registry for the ACP adapters and the CLIs. claude, codex, pi and opencode install exactly the packages of their committed `package-lock.json` with `npm ci --ignore-scripts` (each tarball checked against the lockfile's SHA-512, then `tinfirm-npm-check`; OpenCode's one install script, which links its native binary, runs by name afterwards), so a mirror cannot change what is installed. To move a version, change the `ARG` and the image's `package.json`, then run `npm install --package-lock-only --ignore-scripts` with npm 11 in its directory; for Claude Code, [Updating Claude Code](#updating-claude-code) |
 | `JDK_PACKAGES`, `JDK_DEFAULT` | base | `openjdk-21-jdk-headless`, `21` | The JDKs and the default one (above) |
 
 The base image's `FROM` image (`node:…-trixie-slim`, pinned by digest) comes from Docker Hub: give this
@@ -1193,9 +1193,80 @@ tinfirm-runner-host images build \
 Claude Code is not installed separately: the Agent SDK's platform package (for example
 `@anthropic-ai/claude-agent-sdk-linux-arm64`) contains the native `claude` binary, and the
 adapter pins the SDK version exactly, so the adapter version fixes the Claude Code version.
-The build checks the bundled version and links it to `/usr/local/bin/claude`. Auto-update is
-off (`DISABLE_AUTOUPDATER=1`). The image label `dev.tinfirm.runtime-version` carries the
-pinned versions, which the host reports to the server in `hello`.
+The build checks the binary's SHA-256 and then its version, and links it to
+`/usr/local/bin/claude`. Auto-update is off (`DISABLE_AUTOUPDATER=1`). The image label
+`dev.tinfirm.runtime-version` carries the pinned versions, which the host reports to the
+server in `hello`.
+
+What the build checks before a runtime runs (threat model Q16):
+
+1. `npm ci` checks each tarball against the SHA-512 `integrity` of the committed
+   `package-lock.json`, and stops on a mismatch (`EINTEGRITY`).
+2. `tinfirm-npm-check` (from the base image) checks that every package the lockfile locks for
+   this platform is installed at its locked version. npm only warns (`seems to be corrupted`)
+   and skips an **optional** package whose download fails its integrity check, and the native
+   binaries of Claude Code, Codex and OpenCode are optional platform packages.
+3. For Claude Code, the `claude` and `multi` images then compare the binary's SHA-256 with the
+   entry for `CLAUDE_CODE_VERSION` and the platform (`linux-x64`, `linux-arm64`) in
+   [`images/claude/claude-code.sha256`](images/claude/claude-code.sha256). Those values come
+   from Anthropic's release manifest, whose signature is verified with Anthropic's release
+   key, so they do not depend on the npm registry. A missing entry or a mismatch stops the
+   build with an `ERROR:` line naming both values.
+
+Each failure ends the build with an `ERROR: … (Q16)` line, and the host keeps the images it
+had. Do not work around it with another mirror before you know why the download differs.
+
+### Updating Claude Code
+
+The Claude Code version moves with the adapter, `@agentclientprotocol/claude-agent-acp`,
+which pins the Agent SDK, whose platform packages hold the binary. Moving it is a deliberate
+change in one pull request:
+
+1. Set the adapter's version in `images/claude/package.json` and `CLAUDE_AGENT_ACP_VERSION`
+   in `images/claude/Dockerfile` and `images/multi/Dockerfile`; run
+   `npm install --package-lock-only --ignore-scripts` with npm 11 in `images/claude`.
+2. Find the Claude Code version that the new SDK bundles (`claude --version` of the binary in
+   its platform package, step 4; the build checks it too) and set `CLAUDE_CODE_VERSION` in
+   both Dockerfiles.
+3. Verify Anthropic's manifest of that version and take its checksums
+   ([Anthropic's instructions](https://code.claude.com/docs/en/setup#binary-integrity-and-code-signing)):
+
+   ```sh
+   VERSION=2.1.287
+   export GNUPGHOME="$(mktemp -d)"
+   curl -fsSL https://downloads.claude.ai/keys/claude-code.asc | gpg --import
+   gpg --fingerprint security@anthropic.com   # must be 31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE
+   REPO=https://downloads.claude.ai/claude-code-releases
+   curl -fsSLO "$REPO/$VERSION/manifest.json"
+   curl -fsSLO "$REPO/$VERSION/manifest.json.sig"
+   gpg --verify manifest.json.sig manifest.json  # Good signature, primary key fingerprint as above
+   jq -r '.platforms["linux-x64","linux-arm64"].checksum' manifest.json
+   ```
+
+4. Check that the locked npm tarballs hold the same binary, so the SDK and the manifest agree:
+
+   ```sh
+   SDK=0.3.287
+   for arch in x64 arm64; do
+     curl -fsSL -o "sdk-$arch.tgz" \
+       "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-linux-$arch/-/claude-agent-sdk-linux-$arch-$SDK.tgz"
+     echo "sha512-$(openssl dgst -sha512 -binary "sdk-$arch.tgz" | base64 -w0)"  # = the lockfile's integrity
+     tar -xzOf "sdk-$arch.tgz" package/claude | sha256sum                       # = the manifest's checksum
+   done
+   ```
+
+5. Add a line `<sha256>  <version>  linux-x64` and one for `linux-arm64` to
+   `images/claude/claude-code.sha256`, with the day you checked them in its comment, and remove
+   the old version's lines. The tests (`cargo test -p tinfirm-runner-host images`) fail
+   until both Dockerfiles' `CLAUDE_CODE_VERSION` has both entries.
+6. Build the image once (`tinfirm-runner-host images build --runtime claude`): the log line
+   `Claude Code <version> linux-<arch>: SHA-256 …, as pinned` shows the check passed.
+
+Dependabot does not update the runtimes' lockfiles (`.github/dependabot.yml` covers only
+the images' `FROM` lines). Were it set up for `images/claude`, its pull request would change
+the lockfile alone: the tests would fail on the adapter's version, and the build on the
+binary's checksum, until steps 1 to 5 are done by hand. The checksum file is the deliberate
+step.
 
 **Images with Claude Code are built on this machine and are never pushed to any registry.**
 `images build` only builds and tags locally, and so do the pi and OpenCode

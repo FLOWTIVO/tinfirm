@@ -26,10 +26,13 @@ COPY tinfirm-pi-acp.mjs /usr/local/lib/tinfirm/tinfirm-pi-acp.mjs
 # `npm ci` installs exactly them, checked against the lockfile's integrity hashes, and runs no
 # install script of any of them (I6 of the security review of 2026-10-27). The lockfiles are
 # the runtimes' images' own, so the versions are theirs by construction.
-# Claude Code: the adapter pins the Agent SDK, whose platform package holds the CLI.
-COPY claude/package.json claude/package-lock.json /opt/tinfirm/claude/
+# Claude Code: the adapter pins the Agent SDK, whose platform package holds the CLI, checked
+# against claude-code.sha256 (Anthropic's signed manifest, threat model Q16) before it runs.
+COPY claude/package.json claude/package-lock.json claude/claude-code.sha256 /opt/tinfirm/claude/
 RUN cd /opt/tinfirm/claude \
- && npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+ && { npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+      || { echo "ERROR: npm ci failed. An EINTEGRITY error above means a downloaded package is not the one package-lock.json locks: do not use that registry or mirror (Q16)." >&2; exit 1; }; } \
+ && tinfirm-npm-check \
  && npm cache clean --force \
  && acp_version="$(node -p 'require("./node_modules/@agentclientprotocol/claude-agent-acp/package.json").version')" \
  && test "${acp_version}" = "${CLAUDE_AGENT_ACP_VERSION}" \
@@ -37,6 +40,11 @@ RUN cd /opt/tinfirm/claude \
  && arch="$(dpkg --print-architecture | sed -e 's/amd64/x64/')" \
  && claude_bin="/opt/tinfirm/claude/node_modules/@anthropic-ai/claude-agent-sdk-linux-${arch}/claude" \
  && test -x "${claude_bin}" \
+ && expected="$(awk -v v="${CLAUDE_CODE_VERSION}" -v p="linux-${arch}" '!/^#/ && $2 == v && $3 == p { print $1 }' /opt/tinfirm/claude/claude-code.sha256)" \
+ && if [ -z "${expected}" ]; then echo "ERROR: claude-code.sha256 pins no SHA-256 for Claude Code ${CLAUDE_CODE_VERSION} on linux-${arch}: add it from Anthropic's signed manifest (runner/README.md, Updating Claude Code)." >&2; exit 1; fi \
+ && actual="$(sha256sum "${claude_bin}" | cut -d ' ' -f 1)" \
+ && if [ "${actual}" != "${expected}" ]; then echo "ERROR: the Claude Code binary ${claude_bin} is not the pinned one: SHA-256 ${actual}, claude-code.sha256 pins ${expected} for ${CLAUDE_CODE_VERSION} on linux-${arch}. Do not use this download (Q16)." >&2; exit 1; fi \
+ && echo "Claude Code ${CLAUDE_CODE_VERSION} linux-${arch}: SHA-256 ${actual}, as pinned" \
  && ln -s "${claude_bin}" /usr/local/bin/claude \
  && installed="$(/usr/local/bin/claude --version | awk '{print $1}')" \
  && echo "claude-agent-acp ${CLAUDE_AGENT_ACP_VERSION} bundles Claude Code ${installed}" \
@@ -45,7 +53,9 @@ RUN cd /opt/tinfirm/claude \
 # picks at run time.
 COPY codex/package.json codex/package-lock.json /opt/tinfirm/codex/
 RUN cd /opt/tinfirm/codex \
- && npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+ && { npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+      || { echo "ERROR: npm ci failed. An EINTEGRITY error above means a downloaded package is not the one package-lock.json locks: do not use that registry or mirror (Q16)." >&2; exit 1; }; } \
+ && tinfirm-npm-check \
  && npm cache clean --force \
  && acp_version="$(node -p 'require("./node_modules/@agentclientprotocol/codex-acp/package.json").version')" \
  && test "${acp_version}" = "${CODEX_ACP_VERSION}" \
@@ -57,7 +67,9 @@ RUN cd /opt/tinfirm/codex \
 # pi, with Tinfirm's adapter; the lockfile holds undici at 8.12.3 (package.json's overrides).
 COPY pi/package.json pi/package-lock.json /opt/tinfirm/pi/
 RUN cd /opt/tinfirm/pi \
- && npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+ && { npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+      || { echo "ERROR: npm ci failed. An EINTEGRITY error above means a downloaded package is not the one package-lock.json locks: do not use that registry or mirror (Q16)." >&2; exit 1; }; } \
+ && tinfirm-npm-check \
  && npm cache clean --force \
  && ln -s /opt/tinfirm/pi/node_modules/.bin/pi /usr/local/bin/pi \
  && installed="$(HOME=/tmp/pi-version PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 pi --version | awk '{print $NF}')" \
@@ -72,7 +84,9 @@ RUN cd /opt/tinfirm/pi \
 # placeholder: its postinstall.mjs, from the locked tarball, runs here by name, alone.
 COPY opencode/package.json opencode/package-lock.json /opt/tinfirm/opencode/
 RUN cd /opt/tinfirm/opencode \
- && npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+ && { npm ci --ignore-scripts --omit=dev --no-audit --no-fund --registry "${NPM_REGISTRY}" \
+      || { echo "ERROR: npm ci failed. An EINTEGRITY error above means a downloaded package is not the one package-lock.json locks: do not use that registry or mirror (Q16)." >&2; exit 1; }; } \
+ && tinfirm-npm-check \
  && (cd node_modules/@opencode/cli && node ./postinstall.mjs) \
  && npm cache clean --force \
  && ln -s /opt/tinfirm/opencode/node_modules/.bin/opencode /usr/local/bin/opencode \
