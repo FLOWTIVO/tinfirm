@@ -341,9 +341,15 @@ public final class AuditAnchorTool {
                 findings.add(String.format("chain %-20s %s", name, mismatch));
             }
             if (result.firstBroken() == null && result.mismatches().isEmpty()) {
-                out.printf("chain %-20s seq %d..%d OK%s%n", name, result.fromSeq(), result.toSeq(),
+                // A range that does not start at the chain's first event chains from the export's own prevHash:
+                // only the events up to a checkpoint inside the range are proven, never those before it.
+                String part = result.fromSeq() > 1
+                        ? "; a part of the chain, whose first event chains from the export's prevHash: only the events"
+                                + " up to a checkpoint in the range are proven"
+                        : "";
+                out.printf("chain %-20s seq %d..%d OK%s%s%n", name, result.fromSeq(), result.toSeq(),
                         result.anchoredSeq() != null ? ", anchored to seq " + result.anchoredSeq() + " (checkpoint "
-                                + result.anchoredBy() + ")" : ", no checkpoint names it in this range");
+                                + result.anchoredBy() + ")" : ", no checkpoint names it in this range", part);
             }
         }
         for (String finding : findings) {

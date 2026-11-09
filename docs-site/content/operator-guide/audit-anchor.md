@@ -67,7 +67,7 @@ kubectl create secret generic tinfirm-audit-anchor-s3 \
   --from-literal=access-key-id=<id> --from-literal=secret-access-key=<secret>
 ```
 
-For the `file` sink, set `auditAnchor.file.existingClaim` to a PersistentVolumeClaim of its own; the chart mounts it at `/var/lib/tinfirm/audit-checkpoints`. For `syslog`, set `auditAnchor.syslog.host` and `port`: the server speaks TLS only, and its JVM must trust the collector's certificate. With `networkPolicy.egress.enabled`, add the bucket's or the collector's address to `networkPolicy.egress.extra` when it is not a public address on port 443.
+For the `file` sink, set `auditAnchor.file.existingClaim` to a PersistentVolumeClaim of its own; the chart mounts it at `/var/lib/tinfirm/audit-checkpoints`. For `syslog`, set `auditAnchor.syslog.host` and `port`: the server speaks TLS only, and its JVM must trust the collector's certificate. Each checkpoint is one message, about 150 bytes per chain that moved plus 500: raise the collector's maximum message size (rsyslog's `$MaxMessageSize`, 8 KiB by default) above the largest you expect, or a cut message fails the verification. With `networkPolicy.egress.enabled`, add the bucket's or the collector's address to `networkPolicy.egress.extra` when it is not a public address on port 443.
 
 ### Docker Compose
 
@@ -117,6 +117,8 @@ Give the server a key that can write, read and list the bucket, and nothing else
 }
 ```
 
+Object lock keeps a checkpoint's first version, but does not by itself refuse a second version under the same name. Tinfirm writes with `If-None-Match: *` and reports a second version as `OVERWRITTEN`; on AWS, also deny `s3:PutObject` without that header in the bucket's policy (a `Null` condition on `s3:if-none-match`), so that a stolen key cannot add versions either.
+
 The server refuses to start when the bucket says it has no object lock. A store without object lock can still be used with `TINFIRM_AUDIT_ANCHOR_S3_REQUIRE_LOCK=false`; the checkpoints are then only as safe as the bucket's permissions.
 
 ## Check that it runs
@@ -158,7 +160,7 @@ docker run --rm -v "$PWD:/work" -e TINFIRM_AUDIT_VERIFY_JDBC_PASSWORD \
 
 The database role needs `SELECT` on `audit_event` and nothing else: `CREATE ROLE tinfirm_audit_reader LOGIN PASSWORD '…'; GRANT SELECT ON audit_event TO tinfirm_audit_reader;`. Give the S3 key read rights only.
 
-Against exports, one chain each, which a company's Owner can give you (`--export audit-<company>-1-88140.ndjson`, repeated for several). For a directory, `--checkpoints /var/lib/tinfirm/audit-checkpoints/<instance id>`; for syslog, `--checkpoints syslog:<file>` with the collector's messages exported to a file.
+Against exports, one chain each (an export of a range that does not start at the chain's first event is a part of the chain: the tool proves its events only up to a checkpoint inside the range, and says so), which a company's Owner can give you (`--export audit-<company>-1-88140.ndjson`, repeated for several). For a directory, `--checkpoints /var/lib/tinfirm/audit-checkpoints/<instance id>`; for syslog, `--checkpoints syslog:<file>` with the collector's messages exported to a file.
 
 | Line | Meaning |
 |---|---|

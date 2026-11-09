@@ -120,6 +120,15 @@ class AuditAnchorToolTest {
     }
 
     @Test
+    void anExportOfARangeIsReportedAsAPartOfTheChain() throws IOException {
+        Result result = verify(export(chain.subList(2, 6)));
+
+        assertThat(result.status()).as(result.output()).isZero();
+        assertThat(result.output()).contains("seq 3..6 OK, anchored to seq 5 (checkpoint 2); a part of the chain");
+        assertThat(verify(export(chain)).output()).doesNotContain("a part of the chain");
+    }
+
+    @Test
     void aChainCutBelowACheckpointIsShorter() throws IOException {
         Result result = verify(export(chain.subList(0, 4)));
 
