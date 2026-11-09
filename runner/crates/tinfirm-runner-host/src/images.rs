@@ -970,6 +970,10 @@ mod tests {
                 "node_modules/not-on-win32": {
                     "version": "4.0.0", "optional": true, "os": ["!win32"]
                 },
+                // npm's wildcard: installed on every platform.
+                "node_modules/anywhere": {
+                    "version": "5.0.0", "optional": true, "os": ["any"], "cpu": "any"
+                },
                 "node_modules/not-here": {
                     "version": "4.0.0", "optional": true,
                     "os": [format!("!{}", std::env::consts::OS)]
@@ -995,6 +999,7 @@ mod tests {
         assert!(
             stderr(&out).contains("node_modules/native-here (locked 2.0.0, installed none)")
                 && stderr(&out).contains("node_modules/not-on-win32 (locked 4.0.0")
+                && stderr(&out).contains("node_modules/anywhere (locked 5.0.0")
                 && stderr(&out).contains("(Q16)")
                 && !stderr(&out).contains("native-elsewhere")
                 && !stderr(&out).contains("not-here")
@@ -1006,6 +1011,7 @@ mod tests {
         assert!(stderr(&run()).contains("installed 2.0.1"));
         install("native-here", "2.0.0");
         install("not-on-win32", "4.0.0");
+        install("anywhere", "5.0.0");
         let out = run();
         assert!(out.status.success(), "{}", stderr(&out));
     }
