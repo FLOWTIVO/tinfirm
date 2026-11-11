@@ -139,6 +139,7 @@ The bin on the host's card removes it, after you confirm, from every company you
 | Back from a sign-in: *You declined at the system, so nothing was connected.* | You did not allow Tinfirm at the system | Sign in again and allow Tinfirm, or ask an Admin whether the system's app allows it |
 | Back from a sign-in: *The system did not hand over the account. Try again, or paste a token instead.* | The system's sign-in app is not set up as the system expects | Try again, or paste a token. If it keeps failing, an Admin checks the system's sign-in app |
 | Back from a sign-in: *The system refused the account.* | The system refused the account you signed in with | Try again, or paste a token |
+| Back from a sign-in: *The system refused its sign-in app* | The system's sign-in app has a client ID or secret the system does not know. Signing in again does not help | Ask an Admin to set up the system's sign-in app again. Meanwhile, paste a token where the system takes one |
 | Back from a sign-in: *The sign-in did not include this Jira site.* | You did not pick the system's site when you allowed Tinfirm at Atlassian | Sign in again and pick that site |
 | Back from a sign-in, on the start page, and nothing was connected | The sign-in was used already, or started in another browser or session | Start again from the same page, in the same browser, once |
 | *You may no longer connect this account.* | You were suspended, lost the right to manage the system, or the company switched personal MCP servers off | Ask an Admin |

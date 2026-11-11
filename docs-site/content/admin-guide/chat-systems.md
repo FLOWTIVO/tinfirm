@@ -107,7 +107,7 @@ A Slack system offers agents one tool, `history`: a read of a channel's latest m
 - in a member's personal conversation, the member's own Slack account, which they connect with **Sign in to Slack** under **Accounts**;
 - in a channel trigger's conversation, the Slack account its accounts name: the author's own, or a credential a service account borrows, added on the system's page by signing in. There, `history` reads only the thread the agent was asked in, since anyone in the channel may ask.
 
-For anyone to sign in, set up the **Sign-in app** on the Overview: **Set up the app** with the Slack app's client ID and client secret (Basic Information). The manifest already holds the callback URL, and the scopes are fixed: `channels:history groups:history`. Without it, the Overview says **Sign-in app: not set up — nobody signs in, so agents cannot read its channels**.
+For anyone to sign in, set up the **Sign-in app** on the Overview: **Set up the app** with the Slack app's client ID and client secret (Basic Information, under **App Credentials**). Take the **Client Secret**, not the **Signing Secret** or the **Verification Token** beside it: with another value, every sign-in comes back with *The system refused its sign-in app*, and the audit log's `account.refused` says *Slack's bad_client_secret*. The manifest already holds the callback URL, and the scopes are fixed: `channels:history groups:history`. Without it, the Overview says **Sign-in app: not set up — nobody signs in, so agents cannot read its channels**.
 
 An agent uses `history` once its editor adds the Slack system to it and allows the tool. A Teams system offers no tool.
 

@@ -296,7 +296,8 @@ Tinfirm calls a system from the Tinfirm server, never from a runner host. When t
 | *A Jira Cloud base URL is the site* | A path after the site | Register the site only, such as `https://acme.atlassian.net` |
 | *… answered 401 when asked whose the token is* | The token is wrong, expired or revoked. On Jira Cloud, the email or the colon is missing | A new token; on Jira Cloud `email:api-token` |
 | *The host … is unknown*, *… could not be reached*, *The TLS connection to … failed* | DNS, the network, or the certificate | Ask your operator |
-| Back from a sign-in: *The system did not hand over the account* | The callback URL is not registered exactly, or the client ID or secret is wrong | Check the app at the provider and on **Sign-in app** |
+| Back from a sign-in: *The system did not hand over the account* | The callback URL is not registered exactly, or the client ID or secret is wrong (a provider that says so in its own words, such as GitHub's `incorrect_client_credentials`) | Check the app at the provider and on **Sign-in app** |
+| Back from a sign-in: *The system refused its sign-in app* | The client ID or secret on **Sign-in app** is not the app's: mistyped, regenerated at the provider, or another value of the app's page (on Slack, the signing secret or the verification token in place of the client secret). The audit log's `account.refused` names the system's error | **Set up the app** again with the app's current client ID and client secret |
 | Back from a sign-in: *The sign-in did not include this Jira site* | The Atlassian grant left out the system's site | Sign in again and choose that site |
 | Back from a sign-in: *Another credential of the system took this name in the meantime, so nothing was added* | Someone added a credential of the same name while you signed in | Add it again under another name |
 | **Add credential** is greyed out | The system is paused | **Resume** it |
