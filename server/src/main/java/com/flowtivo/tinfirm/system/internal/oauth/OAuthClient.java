@@ -46,6 +46,18 @@ public class OAuthClient {
             "temporarily_unavailable", "server_error");
 
     /**
+     * Slack's own error codes of {@code oauth.v2.access} that a refusal names besides RFC 6749's nearest code: a fixed
+     * list, so that nothing else of Slack's answer reaches a refusal.
+     */
+    static final Set<String> SLACK_ERRORS = Set.of("invalid_code", "code_already_used", "code_expired",
+            "invalid_refresh_token", "token_revoked", "token_expired", "invalid_client_id", "bad_client_secret",
+            "invalid_client", "bad_redirect_uri", "invalid_grant_type", "pkce_not_allowed", "invalid_code_verifier",
+            "ratelimited", "internal_error", "fatal_error", "service_unavailable", "request_timeout");
+
+    /** The member of {@link #slackAnswer} that keeps Slack's own error code, one of {@link #SLACK_ERRORS}. */
+    static final String SLACK_ERROR = "slack_error";
+
+    /**
      * The longest access or refresh token taken, in UTF-8 bytes (the security review of 2026-10-27, L14): a token is
      * kept in the vault and sent as a header on every call; 16 KiB leaves room for Entra ID access tokens that carry many
      * group claims (often 6 to 10 KiB), which 4 KiB refused.
@@ -146,8 +158,9 @@ public class OAuthClient {
         Map<String, String> answer = profile.kind() == SystemKind.SLACK ? slackAnswer(response) : answer(response);
         String error = answer.get("error");
         if (!response.success() || error != null) {
-            return CallResult.failed(error != null ? errorKind(error, response.status())
-                    : OutboundHttp.kindOf(response.status()), refusal("The token endpoint", response, answer));
+            return CallResult.failed(new CallResult.Failure(error != null ? errorKind(error, response.status())
+                    : OutboundHttp.kindOf(response.status()), refusal("The token endpoint", response, answer), null,
+                    error != null && ERROR_CODES.contains(error) ? error : null));
         }
         String accessToken = answer.get("access_token");
         if (accessToken == null || accessToken.isBlank()) {
@@ -366,9 +379,11 @@ public class OAuthClient {
 
     /**
      * Slack's {@code oauth.v2.access} as the members of a token answer (the package 5 contract, open point 13). Slack
-     * answers {@code 200} with {@code ok} false and its own error, taken as RFC 6749's nearest code; on {@code ok}, the
-     * user token is {@code authed_user}'s, or, for a refresh, the answer's own when its {@code token_type} is
-     * {@code user}. A bot's token is never taken: without a user token the answer names no {@code access_token}.
+     * answers {@code 200} with {@code ok} false and its own error, taken as RFC 6749's nearest code, and kept as
+     * {@value #SLACK_ERROR} when it is one of {@link #SLACK_ERRORS}, so that a refusal can tell a wrong client secret
+     * from a wrong client ID; on {@code ok}, the user token is {@code authed_user}'s, or, for a refresh, the answer's
+     * own when its {@code token_type} is {@code user}. A bot's token is never taken: without a user token the answer
+     * names no {@code access_token}.
      */
     static Map<String, String> slackAnswer(OutboundHttp.Response response) {
         Map<String, String> members = new LinkedHashMap<>();
@@ -378,6 +393,9 @@ public class OAuthClient {
         }
         if (!Json.flag(body, "ok")) {
             String error = Objects.requireNonNullElse(Json.text(body, "error"), "");
+            if (SLACK_ERRORS.contains(error)) {
+                members.put(SLACK_ERROR, error);
+            }
             members.put("error", switch (error) {
                 case "invalid_code", "code_already_used", "code_expired", "invalid_refresh_token", "token_revoked",
                         "token_expired" -> "invalid_grant";
@@ -406,14 +424,21 @@ public class OAuthClient {
 
     /**
      * Why an endpoint refused: its status and its error code as RFC 6749 §5.2 names them, anything else as
-     * {@code unknown_error}. Never the {@code error_description} or another text of the answer: it ends in an
-     * account's {@code last_error}, the audit log and an agent's error, and a provider might reflect a token in it.
+     * {@code unknown_error}; for Slack, its own error code too when it is one of {@link #SLACK_ERRORS}, such as
+     * {@code (invalid_client, Slack's bad_client_secret)}. Never the {@code error_description} or another text of the
+     * answer: it ends in an account's {@code last_error}, the audit log and an agent's error, and a provider might
+     * reflect a token in it.
      */
     static String refusal(String what, OutboundHttp.Response response, Map<String, String> answer) {
         String error = answer.get("error");
         StringBuilder reason = new StringBuilder(what).append(" answered ").append(response.status());
         if (error != null) {
-            reason.append(" (").append(ERROR_CODES.contains(error) ? error : "unknown_error").append(')');
+            reason.append(" (").append(ERROR_CODES.contains(error) ? error : "unknown_error");
+            String slack = answer.get(SLACK_ERROR);
+            if (slack != null && SLACK_ERRORS.contains(slack)) {
+                reason.append(", Slack's ").append(slack);
+            }
+            reason.append(')');
         }
         return reason.toString();
     }

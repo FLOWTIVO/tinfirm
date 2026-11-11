@@ -15,8 +15,14 @@ public record CallResult<T>(@Nullable T value, @Nullable Failure failure) {
      * Why a call to a system failed, as a value.
      *
      * @param retryAfter how long to wait when the system said so, else null
+     * @param oauthError the error code of RFC 6749 §5.2 that an authorization server's token endpoint answered, such
+     *                   as {@code invalid_grant}; null for any other failure
      */
-    public record Failure(Kind kind, String message, @Nullable Duration retryAfter) {
+    public record Failure(Kind kind, String message, @Nullable Duration retryAfter, @Nullable String oauthError) {
+
+        public Failure(Kind kind, String message, @Nullable Duration retryAfter) {
+            this(kind, message, retryAfter, null);
+        }
 
         public static Failure of(Kind kind, String message) {
             return new Failure(kind, message, null);
@@ -25,6 +31,15 @@ public record CallResult<T>(@Nullable T value, @Nullable Failure failure) {
         /** Whether trying again later may help: the rate limit or the system's availability. */
         public boolean retryable() {
             return kind == Kind.RATE_LIMITED || kind == Kind.UNAVAILABLE;
+        }
+
+        /**
+         * Whether the token endpoint refused the client, the system's app, rather than the grant or the account:
+         * {@code invalid_client} or {@code unauthorized_client}. The app's client ID or secret is not the one the
+         * system knows, so signing in again does not help until whoever manages the system sets the app up again.
+         */
+        public boolean clientRefused() {
+            return "invalid_client".equals(oauthError) || "unauthorized_client".equals(oauthError);
         }
     }
 

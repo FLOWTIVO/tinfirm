@@ -101,6 +101,7 @@ Every sign-in, a member's or a credential's, comes back through one callback, `{
 | `expired` | *The sign-in took longer than ten minutes and expired. Start it again.* |
 | `exchange_failed` | *The system did not hand over the account. Try again, or paste a token instead.* |
 | `refused` | *The system refused the account.* |
+| `app_refused` | *The system refused its sign-in app: the app's client ID or secret is not the one the system knows. Ask whoever manages the system to set up its app again.*: the token endpoint answered `invalid_client` or `unauthorized_client`. The `account.refused` audit event's `reason` names the error, and for Slack its own code too, such as *The token endpoint answered 200 (invalid_client, Slack's bad_client_secret)* |
 | `site_not_granted` | *The sign-in did not include this Jira site. Try again, and choose that site when you allow Tinfirm at Atlassian.* |
 | `identity_in_use` | *That account on the system already belongs to someone else in this company.* |
 | `identity_shared` | *That account on the system is one of the company's credentials there, which groups use as a shared account. Ask an owner or admin to give the credential another user, such as a machine user; then connect yours.* |

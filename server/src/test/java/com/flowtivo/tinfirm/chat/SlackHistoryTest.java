@@ -148,6 +148,23 @@ class SlackHistoryTest extends ChatTestBench {
         assertThat(bench.member().get("/api/oauth/callback?code=" + refusedCode + "&state=" + againState)
             .header("Location")).startsWith("/accounts?account=refused");
         assertThat(account(bench, slack.systemId(), bench.memberPrincipal()).kind()).isEqualTo("OAUTH");
+
+        // The Slack app's client secret refused: the app's refusal, not the account's, and the audit names Slack's
+        // own error. Nothing changes.
+        String appCode = "test-slack-code-" + UUID.randomUUID();
+        workspace.refuseCode(appCode, "bad_client_secret");
+        ApiResponse appStart = bench.member().post(bench.path("/me/accounts/" + slack.systemId() + "/oauth"),
+                Map.of("returnTo", "/accounts"));
+        String appState = OAuthStubs.query(URI.create(appStart.json().get("authorizationUrl").asString())
+            .getRawQuery()).get("state");
+        assertThat(bench.member().get("/api/oauth/callback?code=" + appCode + "&state=" + appState)
+            .header("Location")).startsWith("/accounts?account=app_refused");
+        assertThat(rows(bench.id(), "SELECT details ->> 'reason' AS reason FROM audit_event WHERE company_id = ? "
+                + "AND action = 'account.refused' ORDER BY seq DESC LIMIT 1", bench.id()))
+            .singleElement()
+            .satisfies(row -> assertThat(row.get("reason")).isEqualTo("The token endpoint answered 200 "
+                    + "(invalid_client, Slack's bad_client_secret)"));
+        assertThat(account(bench, slack.systemId(), bench.memberPrincipal()).kind()).isEqualTo("OAUTH");
     }
 
     @Test

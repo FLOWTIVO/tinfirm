@@ -3344,7 +3344,8 @@ paths:
         303 to the sign-in's `returnTo` (a path of this site; `/` when the state is unknown) with
         `account=connected&system={systemId}`, or `account={reason}`: `denied` (the person declined), `invalid_state`
         (unknown, used, or another session's), `expired`, `exchange_failed`, `refused` (the system refused the grant),
-        `site_not_granted` (a Jira Cloud grant without the system's site), `identity_in_use`, `identity_shared` (a
+        `app_refused` (the system refused its sign-in app, `invalid_client` or `unauthorized_client`: the app's client
+        ID or secret is wrong), `site_not_granted` (a Jira Cloud grant without the system's site), `identity_in_use`, `identity_shared` (a
         member's sign-in as the user of one of the system's credentials, a shared account), `already_linked` (a
         member's Slack sign-in as another Slack user than the one they are linked to), `name_taken` (a new credential's
         name, which another credential of the system took meanwhile), `system_moved` (an MCP server moved to another

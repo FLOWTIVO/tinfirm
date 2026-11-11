@@ -541,7 +541,8 @@ class AccountService {
     /**
      * Completes a consumed sign-in in its company: the caller may still connect the account (a 403 or 404 otherwise,
      * which the callback answers as {@code forbidden}), the code is exchanged, the account read and stored. Answers the
-     * outcome the callback returns with: {@code connected}, {@code refused}, {@code exchange_failed},
+     * outcome the callback returns with: {@code connected}, {@code refused}, {@code app_refused} (the token endpoint
+     * refused the system's app, {@code invalid_client} or {@code unauthorized_client}), {@code exchange_failed},
      * {@code site_not_granted}, {@code identity_in_use}, {@code identity_shared} (a member's sign-in as the user of
      * one of the system's credentials), {@code already_linked} (a member's Slack sign-in as another Slack user than
      * their link), {@code name_taken} (a new credential's name, taken meanwhile), {@code system_moved} (an MCP server
@@ -602,7 +603,8 @@ class AccountService {
         if (exchanged.failure() != null) {
             if (exchanged.failure().kind() == CallResult.Kind.UNAUTHORIZED) {
                 refused(holder, Objects.requireNonNull(exchanged.failureMessage()));
-                return "refused";
+                // The system refused its app's client ID or secret, not the account: a sign-in again cannot help.
+                return exchanged.failure().clientRefused() ? "app_refused" : "refused";
             }
             requireStillThere(holder, exchanged.failure());
             log.info("The code exchange at the system {} failed: {}", holder.system().id(),

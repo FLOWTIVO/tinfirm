@@ -19,6 +19,8 @@ import java.util.function.Supplier;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -134,6 +136,27 @@ class AccountServiceTest {
         assertThat(outcome).isEqualTo("system_moved");
         verify(store, never()).insert(any(), any());
         verify(store, never()).reconnect(any(), any());
+    }
+
+    /**
+     * A token endpoint that refuses the system's app (its client ID or secret) is not the account's refusal: the
+     * callback says so, and the audit keeps the endpoint's reason either way.
+     */
+    @ParameterizedTest
+    @CsvSource({ "invalid_client, app_refused", "unauthorized_client, app_refused", "invalid_grant, refused" })
+    void aRefusedExchangeTellsTheAppFromTheAccount(String error, String expected) {
+        Instant now = Instant.now();
+        SignInStore.Request request = new SignInStore.Request("state-hash", COMPANY, SYSTEM, MEMBER, null, null, USER,
+                "session-hash", "/accounts", now, now.plus(Duration.ofMinutes(10)));
+        String reason = "The token endpoint answered 401 (" + error + ")";
+        when(calls.exchange(eq(atA), eq("code"), anyString())).thenReturn(CallResult.failed(new CallResult.Failure(
+                CallResult.Kind.UNAUTHORIZED, reason, null, error)));
+
+        String outcome = as(() -> service.completeSignIn(request, "verifier", "code"));
+
+        assertThat(outcome).isEqualTo(expected);
+        verify(refusals).refused(COMPANY, SYSTEM, MEMBER, null, reason);
+        verify(store, never()).insert(any(), any());
     }
 
     @Test
