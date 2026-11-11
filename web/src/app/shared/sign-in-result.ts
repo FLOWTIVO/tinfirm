@@ -14,6 +14,8 @@ const REASONS: Record<string, string> = {
   expired: 'The sign-in took longer than ten minutes and expired. Start it again.',
   exchange_failed: 'The system did not hand over the account. Try again, or paste a token instead.',
   refused: 'The system refused the account.',
+  app_refused:
+    'The system refused its sign-in app: the app’s client ID or secret is not the one the system knows. Ask whoever manages the system to set up its app again.',
   site_not_granted:
     'The sign-in did not include this Jira site. Try again, and choose that site when you allow Tinfirm at Atlassian.',
   identity_in_use: 'That account on the system already belongs to someone else in this company.',

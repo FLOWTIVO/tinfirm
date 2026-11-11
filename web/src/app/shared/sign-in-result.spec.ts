@@ -20,7 +20,8 @@ describe('signInResult', () => {
     ${'invalid_state'}    | ${'could not be matched'}
     ${'expired'}          | ${'expired'}
     ${'exchange_failed'}  | ${'paste a token'}
-    ${'refused'}          | ${'refused'}
+    ${'refused'}          | ${'refused the account'}
+    ${'app_refused'}      | ${'set up its app again'}
     ${'site_not_granted'} | ${'Jira site'}
     ${'identity_in_use'}  | ${'someone else'}
     ${'identity_shared'}  | ${'shared account'}
