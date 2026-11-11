@@ -36,6 +36,7 @@ import com.flowtivo.tinfirm.diagnostics.internal.ErrorCapture.Pending;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.BuildVersion;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 import com.flowtivo.tinfirm.support.SentryStub;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
@@ -106,7 +107,7 @@ class ErrorReportsIntegrationTest extends IntegrationTest {
         assertThat(report.get("message").asString()).isEqualTo("Issue <str> at <url>");
         assertThat(report.get("occurrences").asLong()).isEqualTo(3);
         assertThat(report.get("unreported").asLong()).isEqualTo(3);
-        assertThat(report.get("lastVersion").asString()).isEqualTo("0.1.0-SNAPSHOT");
+        assertThat(report.get("lastVersion").asString()).isEqualTo(BuildVersion.expected());
 
         ApiResponse detail = admin.get("/api/admin/error-reports/" + report.get("id").asString());
         assertThat(detail.status()).isEqualTo(200);

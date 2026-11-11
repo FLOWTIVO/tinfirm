@@ -21,6 +21,7 @@ import org.springframework.core.io.ClassPathResource;
 
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.BuildVersion;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 import com.flowtivo.tinfirm.support.TestDatabase;
 
@@ -34,7 +35,7 @@ class SystemIntegrationTest extends IntegrationTest {
         ApiResponse info = client().get("/api/system/info");
 
         assertThat(info.status()).isEqualTo(200);
-        assertThat(info.json().get("version").asString()).isEqualTo("0.1.0-SNAPSHOT");
+        assertThat(info.json().get("version").asString()).isEqualTo(BuildVersion.expected());
         assertThat(info.json().get("telemetryEnabled").asBoolean()).isFalse();
     }
 

@@ -505,6 +505,8 @@
             <tinfirm.openapi.spec>${openapi.spec}</tinfirm.openapi.spec>
             <tinfirm.runner.protocol.schema>${runner.protocol.schema}</tinfirm.runner.protocol.schema>
             <tinfirm.test.fork>${surefire.forkNumber}</tinfirm.test.fork>
+            <!-- The version the build reports (support/BuildVersion), which every release changes. -->
+            <tinfirm.test.version>${project.version}</tinfirm.test.version>
           </systemPropertyVariables>
         </configuration>
       </plugin>
