@@ -5,7 +5,7 @@
 #
 # In Docker, so that a CI runner needs no Python, as runner/ci.Dockerfile does for Rust.
 # The strict build fails on a link to a page or an anchor that does not exist.
-FROM python:3.15-slim-trixie@sha256:94d3426f1def7db4a106a232ac121bfd975393e5dfd40a619b955fae45fe7913 AS build
+FROM python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /site
