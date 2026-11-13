@@ -8,7 +8,7 @@ The public guides are [Run the model gateway](../../docs-site/content/operator-g
 
 The public guide's [The bundled gateway](../../docs-site/content/operator-guide/model-gateway.md#the-bundled-gateway) has the services, addresses, Secrets and settings in Compose and Helm. Beyond it:
 
-- The image is LiteLLM's non-root one, `ghcr.io/berriai/litellm-non_root:v1.108.0`, pinned by digest, the same in `deploy/compose/compose.yaml`, `compose.saml.yaml` (for its Python) and the chart's `litellm.image` ([helm.md, section 2.7](helm.md#27-litellm) for bumping it and how it runs).
+- The image is LiteLLM's non-root one, `ghcr.io/berriai/litellm-non_root:v1.109.1`, pinned by digest, the same in `deploy/compose/compose.yaml`, `compose.saml.yaml` (for its Python) and the chart's `litellm.image` ([helm.md, section 2.7](helm.md#27-litellm) for bumping it and how it runs).
 - In Compose, LiteLLM sits on the network `gateway` with the server and the PostgreSQL of its database, and nothing else until the operator adds a service to it (section 8). The one-shot service `litellm-db` creates its database and role and sets the password on every `up` (`deploy/compose/postgres/litellm.sql`). Its settings are `deploy/compose/litellm/config.yaml`; the chart's ConfigMap `<release>-litellm` carries the same.
 - With Helm, its database is on the external PostgreSQL ([external-database.md, section 4](external-database.md#4-litellms-database)), and its Secret is [helm.md, section 1](helm.md#1-create-the-secrets).
 
