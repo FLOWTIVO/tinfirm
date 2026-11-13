@@ -449,3 +449,95 @@ async fn forged_remote_tracking_refs_do_not_hide_a_credential_from_the_scan() {
     })
     .await;
 }
+
+/// Incompressible bytes, so that the bundle's pack is as large as they are.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_larger_than_the_pack_window_imports() {
+    with_timeout(120, async {
+        // A small repository: its mirror and the host's clone keep their objects loose
+        // (fewer than `transfer.unpackLimit`), as a fresh clone of a small repository does.
+        let repo = TestRepo::new();
+        let seed = repo.dir.path().join("seed");
+        for i in 0..20 {
+            std::fs::write(seed.join(format!("file{i:02}.txt")), format!("{i}\n")).unwrap();
+        }
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-q", "-m", "Add files"]);
+        git(&seed, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mirrors = Mirrors::new(scratch.path().join("mirrors"));
+        let workspace = scratch.path().join("workspace/repo");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        let spec = spec(&repo.url);
+        let mut host_git = Git::new(
+            &workspace,
+            &spec,
+            ("Host".into(), "host@tinfirm.invalid".into()),
+        );
+        let lease = mirrors.update(&repo.url, None).await.unwrap();
+        let base = host_git
+            .clone_from_mirror(&lease.path, &lease.refs, &spec)
+            .await
+            .unwrap();
+        drop(lease);
+        assert!(
+            entries(&workspace.join(".git/objects/pack"))
+                .iter()
+                .all(|name| !name.ends_with(".pack")),
+            "the host's clone has a pack"
+        );
+        // git's pack window, 1 GiB by default on 64-bit, at its smallest, so that a bundle of
+        // a few MiB is larger than it, as a sandbox's bundle of over 1 GiB is in a real run.
+        git(&workspace, &["config", "core.packedGitWindowSize", "1m"]);
+
+        // The "sandbox": a copy of the clone with a commit of 4 MiB that also changes a file,
+        // sent back as a bundle without the commits the host has. Its root tree is a delta
+        // against the host's, which `index-pack --fix-thin` appends to the end of the new
+        // pack, past the first window.
+        let sandbox = scratch.path().join("sandbox");
+        let workspace_arg = workspace.to_string_lossy().into_owned();
+        git(
+            scratch.path(),
+            &["clone", "-q", "--no-local", &workspace_arg, "sandbox"],
+        );
+        std::fs::write(sandbox.join("data.bin"), incompressible(4 << 20)).unwrap();
+        std::fs::write(sandbox.join("file07.txt"), "changed\n").unwrap();
+        git(&sandbox, &["add", "-A"]);
+        git(&sandbox, &["commit", "-q", "-m", "Add data"]);
+        let head = git(&sandbox, &["rev-parse", "HEAD"]).trim().to_string();
+        let bundle = scratch.path().join("repository-0.bundle");
+        let bundle_arg = bundle.to_string_lossy().into_owned();
+        git(
+            &sandbox,
+            &[
+                "bundle",
+                "create",
+                "-q",
+                &bundle_arg,
+                "HEAD",
+                &format!("^{base}"),
+            ],
+        );
+
+        // git's bundle transport (2.43 to 2.48) closes the bundle's descriptor a second time after the
+        // refs are updated, when the new pack has that number. The on-demand submodule check
+        // then reads HEAD's root tree, which git finds in the new pack before the loose copy,
+        // and mapping its window fails: "cannot be mapped: Bad file descriptor".
+        host_git.import_bundle(&bundle, &head).await.unwrap();
+        assert_eq!(git(&workspace, &["rev-parse", "HEAD"]).trim(), head);
+        git(&workspace, &["fsck", "--strict", "--no-dangling"]);
+    })
+    .await;
+}

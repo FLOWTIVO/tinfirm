@@ -66,6 +66,11 @@ pub const BUNDLE_LIMITS: Limits = Limits {
     max_file_bytes: 8 << 30,
 };
 
+// The host's git maps a fetched bundle's pack in one window (`crate::git::PACK_WINDOW_BYTES`
+// says why): the window stays far larger than a bundle.
+#[cfg(not(windows))]
+const _: () = assert!(BUNDLE_LIMITS.max_file_bytes * 16 <= crate::git::PACK_WINDOW_BYTES);
+
 /// One git step in the sandbox at most.
 const GIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// One directory back from the sandbox at most.

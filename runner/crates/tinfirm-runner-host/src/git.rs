@@ -70,6 +70,19 @@ const SAFE_SETTINGS: [&str; 12] = [
     "init.defaultBranch=main",
 ];
 
+/// git's pack window (`core.packedGitWindowSize`) on every host-side git command: larger than
+/// any pack the host fetches or makes, so that git maps a whole pack at once and closes its
+/// file descriptor right away. git's bundle transport (2.43 to 2.48; 2.49 is fixed) closes the bundle's descriptor a
+/// second time once a fetch from a bundle has updated the refs, and by then the new pack can
+/// hold that number: a later read past the pack's first window (1 GiB by default) then failed
+/// with "packfile … cannot be mapped: Bad file descriptor", and a sandbox's commits of over
+/// 1 GiB did not come back ([`Git::import_bundle`]). A bundle has 8 GiB at most
+/// (`BUNDLE_LIMITS` of the sandbox bridge), plus the bases `index-pack --fix-thin` appends;
+/// 1 TiB leaves room for both. git maps at most the pack's size, so the value costs only
+/// address space. Not on Windows, whose git reads the value into a 32-bit `unsigned long`.
+#[cfg(not(windows))]
+pub const PACK_WINDOW_BYTES: u64 = 1 << 40;
+
 /// A git command in `cwd`. With `authorization`, the `Authorization` header goes in through
 /// the `GIT_CONFIG_*` environment (never the command line or a config file).
 pub(crate) fn command(cwd: &Path, authorization: Option<&Secret>) -> Command {
@@ -89,6 +102,9 @@ fn configure(mut cmd: Command, cwd: &Path, authorization: Option<&Secret>) -> Co
     for setting in SAFE_SETTINGS {
         cmd.arg("-c").arg(setting);
     }
+    #[cfg(not(windows))]
+    cmd.arg("-c")
+        .arg(format!("core.packedGitWindowSize={PACK_WINDOW_BYTES}"));
     cmd.current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "true")
