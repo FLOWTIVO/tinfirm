@@ -13,7 +13,7 @@
 # Pinned by digest (the multi-platform index of the tag, I6 of the security review of
 # 2026-10-27): a moved tag cannot change what the sandboxes run. Change the tag and the digest
 # together: `docker buildx imagetools inspect node:<tag>` prints the index's digest.
-FROM node:26.13.0-trixie-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39
+FROM node:26.13.0-trixie-slim@sha256:5adad64f9a1fca2d51972caa65983634c8a774eb300d72b20f7f2a0f60368072
 
 ARG DEBIAN_FRONTEND=noninteractive
 
