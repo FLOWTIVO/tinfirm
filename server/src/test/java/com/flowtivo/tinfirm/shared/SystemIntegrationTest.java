@@ -16,6 +16,8 @@ import java.util.Base64;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.info.BuildProperties;
 import org.springframework.boot.test.web.server.LocalManagementPort;
 import org.springframework.core.io.ClassPathResource;
 
@@ -29,12 +31,17 @@ class SystemIntegrationTest extends IntegrationTest {
     @LocalManagementPort
     int managementPort;
 
+    @Autowired
+    BuildProperties build;
+
     @Test
     void systemInfoIsPublicAndReportsNoTelemetry() {
         ApiResponse info = client().get("/api/system/info");
 
         assertThat(info.status()).isEqualTo(200);
-        assertThat(info.json().get("version").asString()).isEqualTo("0.1.0-SNAPSHOT");
+        // The build's version, which every release sets (set-version.sh): no test names it.
+        assertThat(info.json().get("version").asString()).isEqualTo(build.getVersion())
+            .matches("\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?");
         assertThat(info.json().get("telemetryEnabled").asBoolean()).isFalse();
     }
 

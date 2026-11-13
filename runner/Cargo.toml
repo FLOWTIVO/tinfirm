@@ -33,7 +33,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 hyper = { version = "1.11", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"
-agent-client-protocol = "=5.0.0"
+agent-client-protocol = "=5.1.0"
 bollard = "0.21.1"
 clap = { version = "4.6", features = ["derive", "env"] }
 tracing = "0.1.44"
@@ -51,7 +51,7 @@ url = "2.5"
 hostname = "0.4"
 libc = "0.2"
 
-jsonschema = { version = "0.60", default-features = false }
+jsonschema = { version = "0.61", default-features = false }
 tempfile = "3.27"
 
 [workspace.lints.rust]

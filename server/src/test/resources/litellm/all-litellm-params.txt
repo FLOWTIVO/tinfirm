@@ -1,4 +1,4 @@
-# all_litellm_params of the pinned LiteLLM, v1.108.0 (litellm/types/utils.py): the request fields
+# all_litellm_params of the pinned LiteLLM, v1.109.1 (litellm/types/utils.py): the request fields
 # LiteLLM takes as its own, which LiteLlmRequests removes. On a LiteLLM bump, list the new version's anew.
 _agentic_loop_api_surface
 _agentic_loop_depth
@@ -9,9 +9,12 @@ _code_interpreter_interception_sandbox_key
 _code_interpreter_interception_session_scoped
 _code_interpreter_interception_stream_options
 _context_compaction_state
+_encrypted_content_affinity_pinned
 _headroom_interception_converted_stream
 _headroom_interception_stream_options
+_headroom_request_context
 _litellm_addressed_response_id
+_litellm_stream_usage_injected
 _litellm_strip_stream_usage
 _router_weights
 _websearch_interception_converted_stream
@@ -67,6 +70,7 @@ auto_router_max_input_chars
 auto_router_model_compression
 auto_router_routing_compression
 aws_batch_role_arn
+aws_bedrock_control_plane_endpoint
 azure
 azure_ad_token_provider
 azure_password
@@ -81,6 +85,16 @@ cache_creation_input_audio_token_cost
 cache_creation_input_token_cost
 cache_creation_input_token_cost_above_100k_tokens
 cache_creation_input_token_cost_above_100k_tokens_batches
+cache_creation_input_token_cost_above_12hr
+cache_creation_input_token_cost_above_12hr_above_272k_tokens
+cache_creation_input_token_cost_above_12hr_above_272k_tokens_batches
+cache_creation_input_token_cost_above_12hr_above_272k_tokens_flex
+cache_creation_input_token_cost_above_12hr_above_272k_tokens_priority
+cache_creation_input_token_cost_above_12hr_above_272k_tokens_ultrafast
+cache_creation_input_token_cost_above_12hr_batches
+cache_creation_input_token_cost_above_12hr_flex
+cache_creation_input_token_cost_above_12hr_priority
+cache_creation_input_token_cost_above_12hr_ultrafast
 cache_creation_input_token_cost_above_1hr
 cache_creation_input_token_cost_above_1hr_above_100k_tokens
 cache_creation_input_token_cost_above_200k_tokens
@@ -96,6 +110,9 @@ cache_creation_input_token_cost_priority
 cache_creation_input_token_cost_ultrafast
 cache_key
 cache_read_input_audio_token_cost
+cache_read_input_audio_token_cost_batches
+cache_read_input_audio_token_cost_flex
+cache_read_input_audio_token_cost_priority
 cache_read_input_image_token_cost
 cache_read_input_token_cost
 cache_read_input_token_cost_above_100k_tokens
@@ -116,6 +133,7 @@ cache_read_input_token_cost_priority
 cache_read_input_token_cost_ultrafast
 caching
 caching_groups
+chatgpt_auth_file
 citation_cost_per_token
 client
 client_id
@@ -132,6 +150,7 @@ cost_per_query
 cost_per_second
 custom_llm_provider
 custom_prompt_dict
+daily_reset_time
 data_residency
 dd_agent_host
 dd_agent_port
@@ -145,6 +164,7 @@ enable_prompt_caching
 enable_tag_filtering
 ensure_alternating_roles
 eos_token
+explicit_cache_read_input_token_cost
 fallback_depth
 fallbacks
 fastest_response
@@ -154,6 +174,7 @@ force_timeout
 gcs_bucket_name
 gcs_path_service_account
 github_copilot_auth_type
+github_copilot_host
 github_copilot_user_session
 google_maps_grounding_cost_per_query
 guardrails
@@ -161,10 +182,13 @@ headers
 hf_model_name
 humanloop_api_key
 id
+initial_prompt_value
 input_cost_per_audio_per_second
 input_cost_per_audio_per_second_above_128k_tokens
 input_cost_per_audio_token
 input_cost_per_audio_token_batches
+input_cost_per_audio_token_flex
+input_cost_per_audio_token_priority
 input_cost_per_character
 input_cost_per_character_above_128k_tokens
 input_cost_per_image
@@ -202,6 +226,7 @@ input_cost_per_video_token
 input_cost_per_video_token_batches
 itpm
 keepalive_seconds
+kubernetes_pod_discovery
 langfuse_environment
 langfuse_host
 langfuse_prompt_version
@@ -313,10 +338,12 @@ regional_endpoint_uplift_multiplier
 regional_processing_uplift_multiplier_eu
 regional_processing_uplift_multiplier_us
 request_timeout
+responses_api_version
 retry_policy
 retry_strategy
 roles
 routing_strategy
+rpd
 rpm
 rust
 s3_access_key_id
@@ -328,6 +355,7 @@ s3_output_bucket_name
 s3_region_name
 s3_secret_access_key
 search_context_cost_per_query
+search_queries_cost_per_query
 search_tool_name
 secret_fields
 self
@@ -345,12 +373,14 @@ tag_regex
 tags
 tenant_id
 text_completion
+thought_signature_in_tool_call_id
 tiered_pricing
 timeout_by_service_tier
 token_exchange_audience
 token_exchange_endpoint
 token_exchange_profile
 token_exchange_scope
+tpd
 tpm
 ttl
 turn_off_message_logging

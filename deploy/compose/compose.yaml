@@ -117,7 +117,7 @@ services:
   litellm:
     # LiteLLM's non-root image (user 65534), the same release as ghcr.io/berriai/litellm.
     # Digest-pinned; bump tag and digest together (and values.yaml of the Helm chart).
-    image: ghcr.io/berriai/litellm-non_root:v1.108.0@sha256:08d313a00c46509c875d84f60c1448a260c478f399ade3c2abb940d358d5b724
+    image: ghcr.io/berriai/litellm-non_root:v1.109.1@sha256:e9e15fe17b66fc8cda6ff7e18914e1d452785ca404fa20336ec447152f86daba
     restart: unless-stopped
     depends_on:
       litellm-db:
@@ -292,7 +292,7 @@ services:
 
   keycloak:
     profiles: [oidc]
-    image: quay.io/keycloak/keycloak:26.8.2@sha256:3879c623248408de29a5303178b5816c77e8dfef3890c361f8c0bbeaa979ba3b
+    image: quay.io/keycloak/keycloak:26.8.2@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0
     # Dev mode: HTTP, an in-container H2 database, and the realm imported on each start
     # (skipped when it exists; `make down` discards it).
     command: ["start-dev", "--import-realm"]
