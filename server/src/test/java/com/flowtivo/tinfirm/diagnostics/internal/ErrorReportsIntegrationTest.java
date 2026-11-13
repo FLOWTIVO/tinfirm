@@ -33,6 +33,7 @@ import tools.jackson.databind.JsonNode;
 import com.flowtivo.tinfirm.diagnostics.internal.CapturedError.CapturedException;
 import com.flowtivo.tinfirm.diagnostics.internal.CapturedError.Source;
 import com.flowtivo.tinfirm.diagnostics.internal.ErrorCapture.Pending;
+import com.flowtivo.tinfirm.shared.config.BuildInfo;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
@@ -70,6 +71,9 @@ class ErrorReportsIntegrationTest extends IntegrationTest {
     @Autowired
     JdbcClient jdbc;
 
+    @Autowired
+    BuildInfo build;
+
     @BeforeEach
     void attached() {
         // Another test context's start resets Logback, which drops the appender until the next flush.
@@ -106,7 +110,7 @@ class ErrorReportsIntegrationTest extends IntegrationTest {
         assertThat(report.get("message").asString()).isEqualTo("Issue <str> at <url>");
         assertThat(report.get("occurrences").asLong()).isEqualTo(3);
         assertThat(report.get("unreported").asLong()).isEqualTo(3);
-        assertThat(report.get("lastVersion").asString()).isEqualTo("0.1.0-SNAPSHOT");
+        assertThat(report.get("lastVersion").asString()).isEqualTo(build.version());
 
         ApiResponse detail = admin.get("/api/admin/error-reports/" + report.get("id").asString());
         assertThat(detail.status()).isEqualTo(200);
