@@ -501,7 +501,11 @@ hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is under `ee/r
   - After the agent, the host runs its git steps in the sandbox: the WIP commit, then a bundle of
     `HEAD`. It fetches the bundle into its own clone, which the agent never reached, with every
     object checked, and pushes from there with the usual checks. The host never runs git in a `.git`
-    that the agent wrote.
+    that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
+    `core.packedGitWindowSize` set to 1 TiB, so git maps a whole pack at once: the fetch from a
+    bundle of git 2.43 to 2.48 closes a file descriptor twice, and with git's default window of
+    1 GiB the fetch of a bundle over 1 GiB could fail with `packfile … cannot be mapped: Bad file
+    descriptor`.
   - The session home and `/output` come back, as directories and regular files only (links and
     devices are left out), at most 2 GiB and 4 GiB; then the sandbox goes.
   - The images need `/attachments` and `/output` writable by the agent: the images of this version
