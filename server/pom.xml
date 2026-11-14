@@ -44,7 +44,7 @@
     <bouncycastle.version>1.86</bouncycastle.version>
     <bucket4j.version>8.22.0</bucket4j.version>
     <!-- ShedLock's JDBC lock (CONVENTIONS §15.21): a scheduled job that one worker replica at a time runs. -->
-    <shedlock.version>7.10.1</shedlock.version>
+    <shedlock.version>7.11.0</shedlock.version>
     <uuid-creator.version>6.1.1</uuid-creator.version>
     <json-schema-validator.version>3.0.9</json-schema-validator.version>
     <wiremock.version>3.13.2</wiremock.version>
@@ -54,10 +54,10 @@
     <!-- Spring AI's MCP server starter (ADR-0001, ADR-0045): the MCP endpoint for people's clients. -->
     <spring-ai.version>2.0.2</spring-ai.version>
     <!-- The dependency licence check and the third-party list (ADR-0082). -->
-    <license-maven-plugin.version>2.7.1</license-maven-plugin.version>
+    <license-maven-plugin.version>2.9.0</license-maven-plugin.version>
     <!-- The S3 client of the session bundle store (ADR-0097): Spaces, Ceph RGW, MinIO and AWS through one API, over the
          JDK's own HTTP client (no Netty, no Apache client). -->
-    <aws-sdk.version>2.57.8</aws-sdk.version>
+    <aws-sdk.version>2.57.12</aws-sdk.version>
     <openapi.spec>${project.basedir}/../api/openapi.yaml</openapi.spec>
     <runner.protocol.schema>${project.basedir}/../protocol/runner-v1.schema.json</runner.protocol.schema>
   </properties>

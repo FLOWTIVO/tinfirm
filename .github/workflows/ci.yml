@@ -251,7 +251,7 @@ jobs:
             -e CI -e E2E_WEB -e E2E_STACK=external -e E2E_DB_PORT -e E2E_SERVER_PORT \
             -e E2E_MANAGEMENT_PORT -e E2E_WEB_PORT -e E2E_CONTROL_PORT -e E2E_LITELLM_PORT \
             -e E2E_STUBS_PORT -v "$PWD:/work" -w /work/web \
-            mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f \
+            mcr.microsoft.com/playwright:v1.65.0-noble@sha256:9beb546099e11f52d62e505537914870e01a67e0e6b00ae41da4775324e73dbe \
             npx playwright test
       # Each failed attempt, a flaky test's among them: its page's snapshot and the API requests
       # that failed or were slow, then the server's warnings and errors, in this log for a reader
@@ -360,7 +360,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.3.0
       # The release key's public half ships with the Compose files, where install.sh gives it

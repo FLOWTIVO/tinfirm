@@ -34,7 +34,7 @@
 ARG CACHE_SCOPE=pr
 
 # ---- 1. Toolchain: Rust, the two musl targets, zig, cargo-zigbuild ----------------------
-FROM --platform=$BUILDPLATFORM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS toolchain
+FROM --platform=$BUILDPLATFORM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS toolchain
 ARG BUILDARCH
 ARG ZIG_VERSION=0.16.0
 # From https://ziglang.org/download/index.json, "<arch>-linux".shasum of ZIG_VERSION.
@@ -105,7 +105,7 @@ COPY --from=build /out/tinfirm-runner-host /tinfirm-runner-host
 # (the binary reads the system's roots), procps for the `kill` that `drain` sends SIGHUP
 # with. The data, the run records (ADR-0101, decision 7) and the mirrors go to
 # /var/lib/tinfirm-runner, the volume the chart mounts there.
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS image
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS image
 ARG VERSION=0.1.0-SNAPSHOT
 ARG REVISION=unknown
 ARG DEBIAN_FRONTEND=noninteractive
