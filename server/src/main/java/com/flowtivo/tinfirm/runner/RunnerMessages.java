@@ -76,9 +76,9 @@ public final class RunnerMessages {
     public static final String UNKNOWN_CREDENTIAL_KIND = "UNKNOWN_CREDENTIAL_KIND";
 
     /**
-     * A {@code hello} that lists a feature the licence in force does not hold, before {@code welcome}: the sandbox
-     * bridge ({@link #FEATURE_SANDBOX_BRIDGE}) without elastic runners (ADR-0100). The connection is closed with 1008,
-     * and the host does not reconnect.
+     * A {@code hello} that lists a feature the licence in force does not hold, before {@code welcome}: ready sandboxes
+     * ({@link #FEATURE_SANDBOX_POOL}) or a paid VM driver ({@link #FEATURE_SANDBOX_ELASTIC}) without elastic runners
+     * (ADR-0100, ADR-0114). The connection is closed with 1008, and the host does not reconnect.
      */
     public static final String EDITION_REQUIRED = "EDITION_REQUIRED";
 
@@ -156,16 +156,25 @@ public final class RunnerMessages {
     /**
      * The optional feature of protocol 2 ({@code hello.features}) whose host keeps ready sandboxes (ADR-0098) and takes
      * Tinfirm's count of them (ADR-0099): it sends {@code hello.pool} and {@link HostPoolStatus}, takes
-     * {@code host.config.pool} and reports {@code host.config.applied.pool}.
+     * {@code host.config.pool} and reports {@code host.config.applied.pool}. A server whose licence does not hold
+     * elastic runners refuses the hello with {@link #EDITION_REQUIRED} (ADR-0100).
      */
     public static final String FEATURE_SANDBOX_POOL = "sandbox.pool";
 
     /**
      * The optional feature of protocol 2 ({@code hello.features}) whose host runs its agents over the sandbox bridge
-     * (ADR-0095): with {@code run --sandbox-bridge}, and always with a VM per run (ADR-0096). It adds no frame; a
-     * server whose licence does not hold elastic runners refuses the hello with {@link #EDITION_REQUIRED} (ADR-0100).
+     * (ADR-0095): with {@code run --sandbox-bridge}, and always with a VM per run (ADR-0096). It adds no frame. The
+     * bridge is in the core (ADR-0114): every edition accepts it.
      */
     public static final String FEATURE_SANDBOX_BRIDGE = "sandbox.bridge";
+
+    /**
+     * The optional feature of protocol 2 ({@code hello.features}) whose host's VM driver is one of the runner binary's
+     * paid ones: a provider's, DigitalOcean's today (ADR-0114, decision 3). It adds no frame; a server whose licence
+     * does not hold elastic runners refuses the hello with {@link #EDITION_REQUIRED}. A driver an operator wrote for
+     * the open driver protocol lists no such feature.
+     */
+    public static final String FEATURE_SANDBOX_ELASTIC = "sandbox.elastic";
 
     /** The largest session bundle, compressed ({@code run.assign.sessionBundle.sizeBytes} maximum): 32 MiB. */
     public static final int MAX_SESSION_BUNDLE_BYTES = 32 * 1024 * 1024;

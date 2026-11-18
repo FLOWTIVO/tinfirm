@@ -336,11 +336,11 @@ LiteLLM runs from its non-root image as user 65534, with a read-only root filesy
 
 With `runner.enabled: true` the chart also runs a runner host, as a pod: the company runner host of one company in `companies`, whose sandboxes are VMs that it creates and deletes, on DigitalOcean a Droplet per run. You need no machine for it, and nobody registers it in the app: the server registers it at its start, with the token you put in a Secret, and replaces the token when you change it. One pod serves many runs at once, each in a VM of its own; it needs no Docker and no privilege.
 
-Sandboxes as VMs are part of Pro and Enterprise ([Licence](licence.md)). Without such a key the server refuses the host, and the pod stops.
+The pod makes its VMs with DigitalOcean's driver, which is part of Pro and Enterprise ([Licence](licence.md)). Without such a key the server refuses the host, and the pod stops.
 
 Before you turn it on, prepare on DigitalOcean:
 
-- the VM image: a private snapshot that holds the runner images and the runner host of the same release (the repository's `ee/runner/images/vm`), rebuilt after every upgrade;
+- the VM image: a private snapshot that holds the runner images and the runner host of the same release (the recipe is the repository's `runner/images/vm`, and DigitalOcean's Packer template `ee/runner/images/vm/digitalocean.pkr.hcl` runs it), rebuilt after every upgrade;
 - a VPC of the sandboxes' own, peered with the cluster's when the pod reaches the VMs on their private addresses (`connect: private`);
 - a Cloud Firewall on the tag `tinfirm-sandbox` that lets in only the cluster's addresses, to the bridge's port 7443, and lets nothing out;
 - an API token that may create, read and delete Droplets and read the firewall and the VPC.
@@ -387,7 +387,7 @@ runner:
 | `runner.vm.digitalocean.connect` | `private` | `private`: the pod reaches the VMs on their VPC addresses; `public`: on their public addresses, which the firewall opens to the cluster's egress addresses alone |
 | `runner.vm.digitalocean.templates` | none | Each template's `region`, `size`, `image` (the snapshot id), `vpc`, `firewall` and optional `bridgePort` |
 | `runner.vm.port`, `.startTimeout`, `.imageVersion`, `.probes` | `7443`, `900`, `warn`, none | The bridge's port in the VM; how long a VM may take to come up, in seconds; what to do with a VM image of another release (`warn` or `refuse`); more addresses a VM must not reach |
-| `runner.pool.*` | at most 4 ready VMs, of Claude Code's image | The ready VMs that admins may ask for on **Runner hosts**; `pool.runtime: any` lets them serve every runtime |
+| `runner.pool.*` | no ready VMs (`maxReady: 0`); Claude Code's image | The most ready VMs that admins may ask for on **Runner hosts** (`pool.maxReady`; above 0 the server needs a key with elastic runners); `pool.runtime: any` lets them serve every runtime |
 | `runner.persistence.*` | a 20Gi claim | The pod's data: the records that let a restarted pod take its runs back, its repository mirrors and the runs' outputs. Disabled, a restart loses the runs in progress. |
 | `runner.terminationGracePeriodSeconds` | `3600` | How long an upgrade waits for the active runs to finish |
 | `runner.extraConfig` | `{}` | More settings of the runner host as its variables, such as `TINFIRM_RUNNER_EGRESS_ALLOW` (one host per line) for package registries the sandboxes may reach. Never credentials. |

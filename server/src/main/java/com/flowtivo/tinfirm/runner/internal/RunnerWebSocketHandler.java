@@ -36,11 +36,11 @@ import com.flowtivo.tinfirm.shared.security.SystemContext;
  * <li>Authentication: {@code Authorization: Bearer tfr_...}, outside the browser session. A missing, malformed,
  * unknown or revoked token closes the connection with 4401.</li>
  * <li>The first frame must be a valid {@code hello}, else the connection is closed with 1008; so is a hello that
- * lists {@code sandbox.bridge} or {@code sandbox.pool} while the licence in force does not hold
- * {@code ELASTIC_RUNNERS}, after an
- * {@code error} {@code EDITION_REQUIRED} (ADR-0100). Its
- * {@code protocolVersion} must be 1 or 2, else the connection is closed with 1002 after an {@code error}
- * {@code UNSUPPORTED_PROTOCOL}; the connection speaks that version from then on (CONVENTIONS §14.10). The hello
+ * lists {@code sandbox.pool} or {@code sandbox.elastic} while the licence in force does not hold
+ * {@code ELASTIC_RUNNERS}, after an {@code error} {@code EDITION_REQUIRED} (ADR-0100, ADR-0114).
+ * {@code sandbox.bridge} is accepted in every edition. Its {@code protocolVersion} must be 1 or 2, else the
+ * connection is closed with 1002 after an {@code error} {@code UNSUPPORTED_PROTOCOL}; the connection speaks that
+ * version from then on (CONVENTIONS §14.10). The hello
  * records the host, its ceiling and version, and a personal host's credentials ({@link RunnerHostSessions}; a company
  * host's are refused with an {@code error} {@code PERSONAL_HOST_CREDENTIAL_ONLY} after {@code host.config}), and is
  * answered with {@code welcome} (which names the version) and then {@code host.config}, before any other frame. Only
@@ -179,6 +179,41 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
         }
     }
 
+    /**
+     * The hello's gate of elastic runners (ADR-0100, as ADR-0114 decision 3 amends it): the {@code error} message for
+     * a hello that lists a paid feature of the runner host while the licence in force does not hold
+     * {@code ELASTIC_RUNNERS}, or null when it may connect. Paid are ready sandboxes ({@code sandbox.pool}) and a VM
+     * driver of the binary's paid ones ({@code sandbox.elastic}: a provider's, DigitalOcean's today). The sandbox bridge
+     * ({@code sandbox.bridge}), the VM executor and the driver protocol are the core's, so every edition accepts them.
+     * <p>
+     * What this gate is, and is not: it holds for Tinfirm's own paid drivers in Tinfirm's own runner binary, which
+     * list {@code sandbox.elastic}. It does not stop a driver an operator wrote for the open driver protocol (ADR-0096):
+     * such a host lists no paid feature, and the server cannot tell it from a host without a paid driver. What is paid
+     * is Tinfirm's drivers, their guards and their support, not the right to make VMs elsewhere (ADR-0114).
+     */
+    private @Nullable String unlicensedFeatures(Set<String> features) {
+        boolean pool = features.contains(RunnerMessages.FEATURE_SANDBOX_POOL);
+        boolean elastic = features.contains(RunnerMessages.FEATURE_SANDBOX_ELASTIC);
+        if ((!pool && !elastic) || licensing.has(Feature.ELASTIC_RUNNERS)) {
+            return null;
+        }
+        List<String> needs = new ArrayList<>();
+        List<String> instead = new ArrayList<>();
+        if (pool) {
+            needs.add("ready VMs (" + RunnerMessages.FEATURE_SANDBOX_POOL + ")");
+            instead.add("start the host with --pool-max-ready 0, and every run starts cold");
+        }
+        if (elastic) {
+            needs.add("a provider's VM driver (" + RunnerMessages.FEATURE_SANDBOX_ELASTIC + ")");
+            instead.add("run sandboxes with Docker, or with a VM driver of your own, since the driver protocol is "
+                    + "open");
+        }
+        return "This server's licence does not hold elastic runners (" + Feature.ELASTIC_RUNNERS.name() + ", the "
+                + Feature.ELASTIC_RUNNERS.edition().name() + " edition), which this runner host needs for "
+                + String.join(" and ", needs) + ". Instead, " + String.join("; ", instead)
+                + ". Or apply a Pro or Enterprise licence key";
+    }
+
     private void hello(WebSocketSession session, WebSocketSession out, ConnectedHost authenticated,
             RunnerMessages.Hello hello, List<String> unknownCredentialKinds) {
         if (!RunnerMessages.supported(hello.protocolVersion())) {
@@ -197,17 +232,10 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
             RunnerConnectionRegistry.close(out, CloseStatus.POLICY_VIOLATION.withReason("Invalid hello"));
             return;
         }
-        if ((hello.featureSet().contains(RunnerMessages.FEATURE_SANDBOX_BRIDGE)
-                || hello.featureSet().contains(RunnerMessages.FEATURE_SANDBOX_POOL))
-                && !licensing.has(Feature.ELASTIC_RUNNERS)) {
-            // Elastic runners are Pro's and Enterprise's (ADR-0100): the host stops rather than reconnects. Ready
-            // sandboxes are a VM per run's, which always lists the bridge: a pool without it is refused the same way,
-            // so that no hello re-evaluates Tinfirm's schedule for a host the licence does not cover.
-            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.EDITION_REQUIRED,
-                    "This server's licence does not hold elastic runners (" + Feature.ELASTIC_RUNNERS.name() + ", "
-                            + "the " + Feature.ELASTIC_RUNNERS.edition().name() + " edition), which a runner host "
-                            + "with the sandbox bridge or a VM per run needs. Run it with Docker and without "
-                            + "--sandbox-bridge, or apply a Pro or Enterprise licence key"));
+        String unlicensed = unlicensedFeatures(hello.featureSet());
+        if (unlicensed != null) {
+            // The host stops rather than reconnects. No hello of a refused pool re-evaluates Tinfirm's schedule.
+            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.EDITION_REQUIRED, unlicensed));
             RunnerConnectionRegistry.close(out, CloseStatus.POLICY_VIOLATION.withReason("Edition required"));
             return;
         }

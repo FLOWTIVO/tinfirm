@@ -230,7 +230,7 @@ class RunnerHostIntegrationTest extends IntegrationTest {
         }
     }
 
-    /** ADR-0100: a host that lists ready sandboxes without the bridge is refused as a bridged one is. */
+    /** ADR-0100, ADR-0114: ready sandboxes stay paid; a host that lists them stops at its hello under Community. */
     @Test
     void aCommunityServerRefusesAHostWithASandboxPool() {
         TestCompany company = companyWithRoles();
@@ -241,16 +241,56 @@ class RunnerHostIntegrationTest extends IntegrationTest {
             Map<String, Object> hello = FakeRunner.helloWithPool(2, 3);
             hello.put("features", List.of("run.steer", "session.bundle", "sandbox.pool"));
             runner.send(hello);
-            assertThat(runner.expect("error").get("code").asString()).isEqualTo("EDITION_REQUIRED");
+            JsonNode error = runner.expect("error");
+            assertThat(error.get("code").asString()).isEqualTo("EDITION_REQUIRED");
+            assertThat(error.get("message").asString()).contains("ELASTIC_RUNNERS", "sandbox.pool",
+                    "--pool-max-ready 0", "Pro or Enterprise licence key");
             assertThat(runner.awaitClose()).isEqualTo(1008);
             assertThat(runner.received()).noneMatch(frame -> frame.get("type").asString().equals("welcome"));
             runner.assertFramesValid();
         }
     }
 
-    /** ADR-0100: without elastic runners in the licence, a host with the sandbox bridge stops at its hello. */
+    /** ADR-0114, decision 3: a host with a paid VM driver of the runner binary stops at its hello under Community. */
     @Test
-    void aCommunityServerRefusesAHostWithTheSandboxBridge() {
+    void aCommunityServerRefusesAHostWithAPaidVmDriver() {
+        TestCompany company = companyWithRoles();
+        ApiClient admin = loginAs(company.email("ADMIN"));
+        RunnerHostRef host = registerRunnerHost(admin, company.id(), unique("elastic"), "COMPANY");
+
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of());
+            hello.put("features", List.of("run.steer", "session.bundle", "sandbox.bridge", "sandbox.elastic"));
+            runner.send(hello);
+            JsonNode error = runner.expect("error");
+            assertThat(error.get("code").asString()).isEqualTo("EDITION_REQUIRED");
+            assertThat(error.get("message").asString()).contains("ELASTIC_RUNNERS", "sandbox.elastic", "Docker",
+                    "driver protocol is open", "Pro or Enterprise licence key")
+                .doesNotContain("--pool-max-ready");
+            assertThat(runner.awaitClose()).isEqualTo(1008);
+            assertThat(runner.received()).noneMatch(frame -> frame.get("type").asString().equals("welcome"));
+            runner.assertFramesValid();
+        }
+        assertThat(admin.get(company.path("/runner-hosts")).json().get("items").get(0).get("online").asBoolean())
+            .isFalse();
+
+        // The same host with a VM driver of the operator's own, which lists no paid feature.
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of());
+            hello.put("features", List.of("run.steer", "session.bundle", "sandbox.bridge"));
+            runner.send(hello);
+            runner.expect("welcome");
+            runner.expect("host.config");
+            runner.assertFramesValid();
+        }
+    }
+
+    /**
+     * ADR-0114: the sandbox bridge is in the core. Community accepts a host that runs its agents over it, with
+     * {@code --sandbox-bridge} or with a VM driver that lists no paid feature, as it accepts a host with Docker alone.
+     */
+    @Test
+    void aCommunityServerAcceptsAHostWithTheSandboxBridge() {
         TestCompany company = companyWithRoles();
         ApiClient admin = loginAs(company.email("ADMIN"));
         RunnerHostRef host = registerRunnerHost(admin, company.id(), unique("bridged"), "COMPANY");
@@ -259,17 +299,15 @@ class RunnerHostIntegrationTest extends IntegrationTest {
             Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of());
             hello.put("features", List.of("run.steer", "session.bundle", "sandbox.bridge"));
             runner.send(hello);
-            JsonNode error = runner.expect("error");
-            assertThat(error.get("code").asString()).isEqualTo("EDITION_REQUIRED");
-            assertThat(error.get("message").asString()).contains("ELASTIC_RUNNERS", "--sandbox-bridge");
-            assertThat(runner.awaitClose()).isEqualTo(1008);
-            assertThat(runner.received()).noneMatch(frame -> frame.get("type").asString().equals("welcome"));
+            runner.expect("welcome");
+            runner.expect("host.config");
+            assertThat(runner.received()).noneMatch(frame -> frame.get("type").asString().equals("error"));
+            assertThat(admin.get(company.path("/runner-hosts")).json().get("items").get(0).get("online").asBoolean())
+                .isTrue();
             runner.assertFramesValid();
         }
-        assertThat(admin.get(company.path("/runner-hosts")).json().get("items").get(0).get("online").asBoolean())
-            .isFalse();
 
-        // The same host with Docker alone, as Community runs it.
+        // The same host with Docker alone.
         try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
             Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of());
             hello.put("features", List.of("run.steer", "session.bundle"));

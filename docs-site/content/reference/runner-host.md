@@ -10,7 +10,7 @@ A runner host and the server agree on the **runner protocol**, never on a versio
 |---|---|---|
 | The release version | `tinfirm-runner-host --version`, the host's card (such as `v1.0.0`), the release's file names and the image tag `v1.0.0` | Which release the host runs, for support. Tinfirm decides nothing from it |
 | The protocol version | The `protocol_version` of the host's `runner host starting` log line | Version 2 takes turns. A host on version 1 connects but takes none |
-| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), and with elastic runners ready sandboxes (`sandbox.pool`) and the sandbox bridge (`sandbox.bridge`). A host without one still takes turns |
+| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), the sandbox bridge (`sandbox.bridge`), and with elastic runners (Pro and Enterprise) ready sandboxes (`sandbox.pool`) and a provider's VM driver (`sandbox.elastic`). A host without one still takes turns |
 
 The server accepts protocol versions 1 and 2. Every host of protocol 2 keeps a run's model token out of the sandbox (its model proxy is always on) and sends its own token with the run's model requests, so turns paid by a budget go to any host of protocol 2. A build from the `rolling` prerelease shows what it was built from after its version, such as `0.1.0-SNAPSHOT (rolling-abc1234)`.
 
@@ -122,7 +122,7 @@ Asks the `run` of this config directory to drain: it sends SIGHUP to the process
 |---|---|
 | SIGTERM, SIGINT (`Ctrl-C`) | Cancels the active runs, pushes their work in progress, reports them cancelled, and exits. A second one exits at once. |
 | SIGHUP, `drain`, `systemctl reload` | Drains: takes no new run, lets the active ones finish, then exits with status 0. A second SIGHUP changes nothing. |
-| SIGKILL, a crash, an upgrade that kills `run` | With elastic runners (Pro and Enterprise): the next `run` on the same data directory takes back the runs whose sandboxes still live. It stops their agents, pushes their work, saves their sessions and reports them failed (`INFRA`), so the next message goes on from there. Without them, the runs are lost. |
+| SIGKILL, a crash, an upgrade that kills `run` | With the sandbox bridge: the next `run` on the same data directory takes back the runs whose sandboxes still live. It stops their agents, pushes their work, saves their sessions and reports them failed (`INFRA`), so the next message goes on from there. Without it, the runs are lost. |
 | The server closes with 4401 (bad or revoked token), 4409 (another connection of this host replaced this one), 1002 (unsupported protocol version) or 1008 (the server refused the host) | Stops its runs without pushing, does not reconnect, and exits non-zero |
 | Any other lost connection | Keeps its runs going and reconnects, after 1 second growing to 30, at most 5 while it holds runs |
 
@@ -169,7 +169,7 @@ The **data directory** (mode 0700):
 | `claude-logins/<label>` | A Claude login's own Claude Code configuration |
 | `codex-homes/<label>` | A Codex login's own `CODEX_HOME` |
 | `public_suffix_list.dat` | The Public Suffix List the server sent, which the egress proxy uses |
-| `runs/` | With elastic runners: a record of each run whose sandbox lives, with its credentials, and the sandbox bridge's identity (mode 0600), so that a restarted `run` takes the runs back. A record goes with its sandbox. |
+| `runs/` | With the sandbox bridge: a record of each run whose sandbox lives, with its credentials, and the sandbox bridge's identity (mode 0600), so that a restarted `run` takes the runs back. A record goes with its sandbox. |
 
 ## The sandbox
 

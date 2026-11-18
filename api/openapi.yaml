@@ -13277,8 +13277,9 @@ components:
         A paid feature (ADR-0077, decision 4). Pro: `OUTLOOK_ADDIN`, `GMAIL_ADDON` (ADR-0083), `AUDIT_TOOLS` (the audit's filters,
         export, chain verification and daily checks), `AUDIT_FULL_HISTORY` (the audit shown beyond 90 days),
         `AUDIT_ANCHOR` (the chains' heads anchored outside the database, ADR-0111),
-        `RETENTION_SETTINGS`, `ELASTIC_RUNNERS` (runner hosts with the sandbox bridge or a VM per run, ready sandboxes
-        and session bundles, ADR-0100). Enterprise adds `LEGAL_HOLDS`, `SAML`, `SCIM`, `SIEM`, `MULTI_COMPANY` (declared companies
+        `RETENTION_SETTINGS`, `ELASTIC_RUNNERS` (a provider's VMs per run, ready sandboxes and session bundles,
+        ADR-0100, ADR-0114; the sandbox bridge and a VM per run with a driver of the operator's own are in every
+        edition). Enterprise adds `LEGAL_HOLDS`, `SAML`, `SCIM`, `SIEM`, `MULTI_COMPANY` (declared companies
         beyond the first), `HA` and `AIR_GAPPED`.
     LicenceSeats:
       type: object

@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
 import com.flowtivo.tinfirm.support.FakeGoogle;
+import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 
 import tools.jackson.databind.JsonNode;
@@ -20,7 +21,8 @@ import tools.jackson.databind.JsonNode;
 /**
  * ADR-0077, decisions 4, 7 and 8: each paid feature refused under Community ({@code 403 EDITION_REQUIRED}, after the
  * access check), served under Enterprise; after a licence expired, the audit's export for 90 days, the retention
- * periods frozen, no new hold; Community's retention keeping everything; the admins' {@code LICENCE} notice.
+ * periods frozen, no new hold; Community's retention keeping everything; the admins' {@code LICENCE} notice; a runner
+ * host's paid features accepted under Pro.
  */
 class EditionGatesIntegrationTest extends IntegrationTest {
 
@@ -215,6 +217,37 @@ class EditionGatesIntegrationTest extends IntegrationTest {
                 Map.of("Authorization", "Bearer " + FakeGoogle.systemToken(endpoint)));
         assertThat(card.status()).as("%s", card).isEqualTo(200);
         assertThat(card.body()).contains("needs Tinfirm's Pro edition").doesNotContain("/gmail/link/");
+    }
+
+    /**
+     * ADR-0100, ADR-0114: under Pro a runner host connects with each feature of the hello's gate, the sandbox bridge
+     * that every edition accepts, ready sandboxes, and a paid VM driver, and with all three at once.
+     */
+    @Test
+    void proAcceptsARunnerHostWithTheBridgeReadySandboxesAndAPaidVmDriver() {
+        LocalDate today = TestLicences.today();
+        TestLicences.hold("PRO", 100_000, today.minusMonths(1), today.plusYears(1));
+        TestCompany company = companyWithRoles();
+        ApiClient owner = loginAs(company.email("OWNER"));
+        RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("vm-host"), "COMPANY");
+
+        for (List<String> features : List.of(List.of("sandbox.bridge"), List.of("sandbox.pool"),
+                List.of("sandbox.bridge", "sandbox.elastic"),
+                List.of("sandbox.bridge", "sandbox.pool", "sandbox.elastic"))) {
+            try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+                Map<String, Object> hello = FakeRunner.helloWithPool(2, 3);
+                hello.put("features", features);
+                if (!features.contains("sandbox.pool")) {
+                    hello.remove("pool");
+                }
+                runner.send(hello);
+                runner.expect("welcome");
+                runner.expect("host.config");
+                assertThat(runner.received()).as("%s", features)
+                    .noneMatch(frame -> frame.get("type").asString().equals("error"));
+                runner.assertFramesValid();
+            }
+        }
     }
 
     @Test

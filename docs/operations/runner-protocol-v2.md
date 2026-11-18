@@ -171,16 +171,27 @@ ships it.
   Enterprise licence ([ADR-0100](../adr/0100-elastic-runners-in-pro.md)). Without both, nothing
   changes.
 - **The sandbox bridge** ([ADR-0095](../adr/0095-sandbox-bridge.md),
-  [ADR-0100](../adr/0100-elastic-runners-in-pro.md)). A host with `run --sandbox-bridge` or a VM
-  per run lists `sandbox.bridge`, which adds no frame; both need protocol 2. Elastic runners are
-  Pro's and Enterprise's: a server whose licence does not hold them answers the `hello` with
-  `error` `EDITION_REQUIRED` and close code 1008, and the host stops with that message, without
-  reconnecting. Run the host with Docker and without `--sandbox-bridge`, or apply a Pro or
-  Enterprise key and start the host again.
+  [ADR-0114](../adr/0114-the-secure-sandbox-is-in-the-core.md)). A host with
+  `run --sandbox-bridge` or a VM per run lists `sandbox.bridge`, which adds no frame; both need
+  protocol 2. The bridge is in the core: every edition accepts it.
+- **Elastic runners** ([ADR-0100](../adr/0100-elastic-runners-in-pro.md),
+  [ADR-0114](../adr/0114-the-secure-sandbox-is-in-the-core.md)). Two features of the `hello`
+  are Pro's and Enterprise's:
+
+  | Feature | The host lists it when | Without a Pro or Enterprise licence, run instead |
+  |---|---|---|
+  | `sandbox.pool` | it keeps ready VMs | `run --pool-max-ready 0`: every run starts cold |
+  | `sandbox.elastic` | its VM driver is one of the binary's paid ones, a provider's (DigitalOcean's) | Docker, or a VM driver of your own: the driver protocol is open |
+
+  A server whose licence does not hold elastic runners answers such a `hello` with `error`
+  `EDITION_REQUIRED` and close code 1008, and the host stops with that message, without
+  reconnecting. Change the host as the table says, or apply a Pro or Enterprise key, and start
+  the host again.
 - **Ready sandboxes** ([ADR-0098](../adr/0098-ready-vms.md),
   [ADR-0099](../adr/0099-pool-settings.md)). A host with a VM per run (`run --executor vm`)
-  lists `sandbox.pool` and reports its operator's `--pool-max-ready` in `hello.pool`. An owner
-  or admin sets the schedule on the host's card (Runner hosts › Ready sandboxes); the server
+  and ready VMs lists `sandbox.pool` and reports its operator's `--pool-max-ready` in
+  `hello.pool`. An owner or admin sets the schedule on the host's card (Runner hosts › Ready
+  sandboxes); the server
   evaluates it every minute (`TINFIRM_RUNNER_POOL_TICK`) and sends the count now and its next
   change in `host.config.pool`. Until a schedule is set, none waits ready. The host reports its
   sandboxes in `host.pool.status`, which the card shows. Such a host may have up to 1000 slots
@@ -200,7 +211,7 @@ ships it.
   earlier session", or "Started a new session: …" with the reason), and
   `tinfirm_runs_finished_total{resumed, resume_outcome, runtime}` counts it. Many
   `NO_SESSION` runs mean that turns of a conversation land on another host than the turn before.
-- A host with a VM per run shows "Ready sandboxes" on its card once it connected; after a
+- A host that lists `sandbox.pool` shows "Ready sandboxes" on its card once it connected; after a
   schedule is saved, its `host.config.applied` carries `pool.readyTarget`, at most its
   `maxReadyCeiling`, and its card shows the ready, starting and busy sandboxes it reported.
 - `tinfirm_runner_refused_frames_total{frame, reason}` counts the requests and events the
