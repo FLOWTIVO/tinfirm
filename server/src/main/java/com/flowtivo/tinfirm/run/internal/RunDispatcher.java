@@ -470,6 +470,14 @@ class RunDispatcher {
             return waiting(run, QueueReason.noRunnerHost(run.runtime(), "No runner host that may run this "
                     + "conversation is registered."), now);
         }
+        // A host whose report changed between the plan and its lock is no longer of the plan's level (ADR-0113): it is
+        // left out, and with none left the next pass plans again on what the hosts report then.
+        locked = IsolationPlacement.stillPlaced(placement, locked, session);
+        if (locked.isEmpty()) {
+            return waiting(run, QueueReason.noRunnerHost(null, "The runner hosts of this conversation changed what "
+                    + "they report about their isolation; the turn is placed again.")
+                .withIsolationLevel(placement.level(), placement.chosen()), now);
+        }
         Map<UUID, Integer> used = runs.occupyingByHosts(locked.stream().map(RunnerHostInfo::id).toList());
         // A machine's slots are one across its presences in every company (ADR-0092): its runs elsewhere count.
         Map<UUID, Integer> usedOfMachines = runs.occupyingByMachines(locked.stream()
@@ -488,10 +496,11 @@ class RunDispatcher {
                 : runs.previousHost(run.conversationId(), run.id()).orElse(null);
         HostSelection.Host chosen;
         switch (HostSelection.select(candidates, previousHost, !effective.skills().isEmpty(),
-                placement.preferRestorers())) {
+                placement.preferRestorers() ? placement.level() : null)) {
             case HostSelection.Waits waits -> {
                 return waiting(run, placement.weakerLeftOut() || placement.chosen()
-                        ? waits.reason().withIsolationLevel(placement.level()) : waits.reason(), now);
+                        ? waits.reason().withIsolationLevel(placement.level(), placement.chosen()) : waits.reason(),
+                        now);
             }
             case HostSelection.Chosen found -> chosen = found.host();
         }

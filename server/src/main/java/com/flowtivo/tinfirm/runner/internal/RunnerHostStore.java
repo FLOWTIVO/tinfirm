@@ -443,13 +443,14 @@ class RunnerHostStore {
     // ---- the facts, capacity and configuration of a host ------------------------------------------------------
 
     /**
-     * What the host's row holds about its isolation now, its row locked until the transaction ends: read before a
+     * What the host's row holds about its isolation now, its row locked ({@code FOR NO KEY UPDATE}, CONVENTIONS §10:
+     * a run's assignment to the host, a foreign key, does not wait for it) until the transaction ends: read before a
      * {@code hello} replaces it, so that a change of the level is audited once. Empty when the host no longer exists;
      * an {@link Isolation} of no tiers before the first hello that stored them.
      */
     Optional<Isolation> lockIsolation(Target target) {
         return jdbc.sql("SELECT isolation_tiers, isolation_level, isolation_hardened, isolation_stated FROM "
-                + target.table() + " WHERE id = ? FOR UPDATE")
+                + target.table() + " WHERE id = ? FOR NO KEY UPDATE")
             .param(target.id())
             .query(RunnerHostStore::isolation)
             .optional()

@@ -24,8 +24,9 @@ import com.flowtivo.tinfirm.runner.RunnerHostInfo;
  * target ({@link PlacementNote#STAYED_ON_WEAKER_HOST}); when it cannot, the turn goes to the target level with a
  * fresh session ({@link PlacementNote#FRESH_SESSION_STRONGER_LEVEL}). A chosen level holds for every turn: a session
  * on a host of another level starts again on the chosen level ({@link PlacementNote#FRESH_SESSION_CHOSEN_LEVEL}).
- * Where a bundle of that session is kept (ADR-0097), the turn moves with it: hosts that restore bundles come first,
- * and a turn that restores the session gets no note.</li>
+ * Where a bundle of that session is kept (ADR-0097), the turn moves with it: a free host of the level that restores
+ * bundles comes first, then (automatic) the session's host, then the level's other hosts; a turn that restores the
+ * session gets no note.</li>
  * </ul>
  */
 final class IsolationPlacement {
@@ -49,8 +50,10 @@ final class IsolationPlacement {
      *
      * @param level           the target level
      * @param chosen          whether the level was chosen for the agent
-     * @param preferred       the session's host, which the selection takes first when it is free; null for none
-     * @param preferRestorers whether hosts that restore session bundles come first, for a session that moves
+     * @param preferred       the session's host, which the selection takes first when it is free (after a restorer of
+     *                        the level when {@code preferRestorers}); null for none
+     * @param preferRestorers whether the level's hosts that restore session bundles come first, for a session that
+     *                        moves with its bundle
      * @param weakerLeftOut   whether a weaker host that counts for the run was left out: the queue reason names the
      *                        level
      */
@@ -79,28 +82,45 @@ final class IsolationPlacement {
             }
             case Isolation.Level found -> level = found.level();
         }
-        List<RunnerHostInfo> tier = new ArrayList<>(counting.stream()
+        List<RunnerHostInfo> candidates = new ArrayList<>(counting.stream()
             .filter(host -> Isolation.placedAt(host) == level)
             .toList());
-        boolean weakerLeftOut = counting.stream().anyMatch(host -> Isolation.stronger(level, Isolation.placedAt(host)));
         boolean isChosen = chosen != null;
-        if (session == null) {
-            return new Plan(tier, level, isChosen, null, false, weakerLeftOut);
+        UUID preferred = null;
+        boolean preferRestorers = false;
+        if (session != null) {
+            RunnerHostInfo held = session.host();
+            if (Isolation.placedAt(held) == level) {
+                preferred = held.id();
+            }
+            else {
+                // A kept bundle moves the session with the turn: a free host of the level that restores it first.
+                preferRestorers = session.bundleCarried();
+                if (!isChosen) {
+                    // An automatic agent's conversation stays where its session is, while that host takes the turn
+                    // and no host of the level restores its session.
+                    candidates.add(held);
+                    preferred = held.id();
+                }
+            }
         }
-        RunnerHostInfo held = session.host();
-        if (Isolation.placedAt(held) == level) {
-            return new Plan(tier, level, isChosen, held.id(), false, weakerLeftOut);
-        }
-        if (session.bundleCarried()) {
-            // The session moves with the turn: a host of the level that restores the bundle first.
-            return new Plan(tier, level, isChosen, null, true, weakerLeftOut);
-        }
-        if (!isChosen) {
-            // An automatic agent's conversation stays where its session is, while that host takes the turn.
-            tier.add(held);
-            return new Plan(tier, level, false, held.id(), false, weakerLeftOut);
-        }
-        return new Plan(tier, level, true, null, false, weakerLeftOut);
+        // The weaker hosts that count and were left out: then the queue reason names the level.
+        boolean weakerLeftOut = counting.stream()
+            .anyMatch(host -> Isolation.stronger(level, Isolation.placedAt(host)) && !candidates.contains(host));
+        return new Plan(candidates, level, isChosen, preferred, preferRestorers, weakerLeftOut);
+    }
+
+    /**
+     * The plan's candidates as the dispatcher's lock read them again: those still placed at the plan's level, and an
+     * automatic agent's session host (ADR-0113, decision 4). A host whose report changed between the plan and the lock
+     * is left out, so that a run never goes to a level it was not planned for; with none left, it waits for the next
+     * pass, which plans again.
+     */
+    static List<RunnerHostInfo> stillPlaced(Plan plan, List<RunnerHostInfo> locked, @Nullable Session session) {
+        UUID held = !plan.chosen() && session != null ? session.host().id() : null;
+        return locked.stream()
+            .filter(host -> Isolation.placedAt(host) == plan.level() || host.id().equals(held))
+            .toList();
     }
 
     /**

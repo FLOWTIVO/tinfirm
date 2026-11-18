@@ -316,11 +316,13 @@ public final class RunnerMessages {
         }
 
         /**
-         * The isolation the host reports (ADR-0113): {@code isolation} while it lists {@link #FEATURE_HOST_ISOLATION},
-         * else null, the level of a host that reports none.
+         * The isolation the host reports (ADR-0113): {@code isolation} while a host of protocol 2 lists
+         * {@link #FEATURE_HOST_ISOLATION}, else null, the level of a host that reports none. The level is a feature of
+         * protocol 2 (decision 2): a hello of protocol 1 reports none, whatever it carries.
          */
         public @Nullable HelloIsolation reportedIsolation() {
-            return featureSet().contains(FEATURE_HOST_ISOLATION) ? isolation : null;
+            return protocolVersion != null && protocolVersion == PROTOCOL_V2
+                    && featureSet().contains(FEATURE_HOST_ISOLATION) ? isolation : null;
         }
 
         /** The operator's ceiling of ready sandboxes of a host with {@link #FEATURE_SANDBOX_POOL}; else null. */

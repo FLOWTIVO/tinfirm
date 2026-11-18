@@ -81,6 +81,9 @@ class IsolationPlacementTest {
         assertThat(plan.candidates()).containsExactly(VM, DOCKER);
         assertThat(plan.preferred()).isEqualTo(DOCKER.id());
         assertThat(plan.level()).isEqualTo(IsolationLevel.MACHINE);
+        // The weaker host is a candidate: nothing weaker is left out (the review, finding 5b).
+        assertThat(plan.weakerLeftOut()).isFalse();
+        assertThat(plan(List.of(VM, DOCKER, JAIL), null, session).weakerLeftOut()).isTrue();
         assertThat(IsolationPlacement.note(plan, DOCKER, session, false))
             .isEqualTo(PlacementNote.STAYED_ON_WEAKER_HOST);
         // The session's host could not take it: the stronger level, with a fresh session.
@@ -88,14 +91,22 @@ class IsolationPlacementTest {
             .isEqualTo(PlacementNote.FRESH_SESSION_STRONGER_LEVEL);
     }
 
+    /**
+     * The review of 2026-11-18, finding 1: a kept bundle moves the conversation to a restorer of the level, and the
+     * session's host stays a candidate, so that without a free restorer the turn stays with its session.
+     */
     @Test
-    void row6AKeptBundleMovesTheAutomaticConversationToTheStrongerLevel() {
+    void row6AKeptBundleMovesTheAutomaticConversationToARestorerElseItStays() {
         IsolationPlacement.Session session = new IsolationPlacement.Session(DOCKER, true);
         IsolationPlacement.Plan plan = plan(List.of(VM, DOCKER), null, session);
-        assertThat(plan.candidates()).containsExactly(VM);
+        assertThat(plan.candidates()).containsExactly(VM, DOCKER);
         assertThat(plan.preferRestorers()).isTrue();
-        assertThat(plan.preferred()).isNull();
+        assertThat(plan.preferred()).isEqualTo(DOCKER.id());
+        assertThat(plan.weakerLeftOut()).isFalse();
+        // The note follows what the selection chose.
         assertThat(IsolationPlacement.note(plan, VM, session, true)).isNull();
+        assertThat(IsolationPlacement.note(plan, DOCKER, session, false))
+            .isEqualTo(PlacementNote.STAYED_ON_WEAKER_HOST);
         assertThat(IsolationPlacement.note(plan, VM, session, false))
             .isEqualTo(PlacementNote.FRESH_SESSION_STRONGER_LEVEL);
     }
@@ -140,10 +151,32 @@ class IsolationPlacementTest {
     void aReasonAboutTheHostsOfTheLevelNamesItAndKeepsItWhenStored() {
         QueueReason full = QueueReason.hostsFull(VM, 2, 2);
         assertThat(full.text()).isEqualTo("Waiting for a free slot on vm (2 of 2 in use).");
-        QueueReason held = full.withIsolationLevel(IsolationLevel.MACHINE);
+        QueueReason held = full.withIsolationLevel(IsolationLevel.MACHINE, false);
         assertThat(held.text()).isEqualTo("Waiting for a free slot on vm (2 of 2 in use). This agent's runs go to "
                 + "hosts that report machine and do not move to a weaker one.");
         assertThat(QueueReason.fromColumns(held.code().name(), held.detailsJson())).isEqualTo(held);
+        // A chosen level names no weaker one: chosen container has none (the review, finding 5a).
+        QueueReason only = QueueReason.hostsFull(DOCKER, 1, 1).withIsolationLevel(IsolationLevel.CONTAINER, true);
+        assertThat(only.text()).isEqualTo("Waiting for a free slot on docker (1 of 1 in use). This agent's runs go "
+                + "only to hosts that report container.");
+        assertThat(QueueReason.fromColumns(only.code().name(), only.detailsJson())).isEqualTo(only);
         assertThat(QueueReason.fromColumns(full.code().name(), full.detailsJson())).isEqualTo(full);
+    }
+
+    /**
+     * The review of 2026-11-18, finding 2: the lock reads the hosts again, and a host whose report changed since the
+     * plan is no longer of its level; an automatic agent's session host stays.
+     */
+    @Test
+    void theLockedHostsAreKeptOnlyWhileStillOfThePlansLevel() {
+        IsolationPlacement.Session session = new IsolationPlacement.Session(DOCKER, false);
+        IsolationPlacement.Plan automatic = plan(List.of(VM, VM_2, DOCKER), null, session);
+        RunnerHostInfo dropped = new RunnerHostInfo(VM_2.id(), VM_2.companyId(), VM_2.name(), HostScope.COMPANY,
+                null, null, 2, 2, null, false, null, "1.0.0", Instant.now(), null, null, false);
+        assertThat(IsolationPlacement.stillPlaced(automatic, List.of(VM, dropped, DOCKER), session))
+            .containsExactly(VM, DOCKER);
+        IsolationPlacement.Plan chosen = plan(List.of(VM, VM_2, DOCKER), IsolationLevel.MACHINE, session);
+        assertThat(IsolationPlacement.stillPlaced(chosen, List.of(VM, dropped), session)).containsExactly(VM);
+        assertThat(IsolationPlacement.stillPlaced(chosen, List.of(dropped), session)).isEmpty();
     }
 }

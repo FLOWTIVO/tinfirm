@@ -36,7 +36,9 @@ This costs availability. A company whose one `machine` host is offline has its a
 - choose `container` for an agent that may run in a container;
 - remove the host that is gone: the strongest level is then what the remaining hosts report.
 
-A conversation of an automatic agent stays on the host that holds its session while that host takes its turns, even when it is weaker than the level its new conversations go to. The run's page and the conversation say so. When that host cannot take the turn, the turn goes to the strongest level with a fresh session of the runtime, and the conversation says why. With a chosen level, a turn whose session is on a host of another level starts a fresh session on the chosen level. Where a session bundle of the conversation is kept ([session-bundles.md](session-bundles.md)), the session moves with the turn instead.
+An agent with [skills](../../docs-site/content/user-guide/skills.md) waits the same way when the hosts of its level do not deliver skills (`NO_HOST_FOR_SKILLS`, naming the level): it does not go to a weaker host that does. Upgrade the runner hosts of that level, or choose a level for the agent whose hosts deliver them.
+
+A conversation of an automatic agent stays on the host that holds its session while that host takes its turns, even when it is weaker than the level its new conversations go to. The run's page and the conversation say so. When that host cannot take the turn, the turn goes to the strongest level with a fresh session of the runtime, and the conversation says why. With a chosen level, a turn whose session is on a host of another level starts a fresh session on the chosen level. Where a session bundle of the conversation is kept ([session-bundles.md](session-bundles.md)), the session moves with the turn to a free host of the level that restores bundles. Without such a host, an automatic agent's conversation stays on its session's host, and a chosen level starts a fresh session on another host of that level.
 
 ## 4. Removing the last host of a level
 

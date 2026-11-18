@@ -390,6 +390,28 @@ class RunnerHostIntegrationTest extends IntegrationTest {
         assertThat(downgraded.get("details").get("oldHardened").asString()).isEqualTo("none");
     }
 
+    /**
+     * The review of 2026-11-18, finding 3: the level is a feature of protocol 2. A hello of protocol 1 that carries
+     * {@code host.isolation} reports no level; its tier is stored as before.
+     */
+    @Test
+    void aHelloOfProtocol1ReportsNoLevelWhateverItCarries() {
+        TestCompany company = companyWithRoles();
+        ApiClient owner = loginAs(company.email("OWNER"));
+        RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("old"), "COMPANY");
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            Map<String, Object> hello = FakeRunner.helloWithIsolation("machine", "none");
+            hello.put("protocolVersion", 1);
+            hello.put("isolationTiers", List.of("microvm"));
+            runner.send(hello);
+            runner.expect("welcome");
+        }
+        JsonNode isolation = isolationOf(owner, company, host.id());
+        assertThat(isolation.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
+        assertThat(absent(isolation.path("level"))).isTrue();
+        assertThat(auditEvents(owner, company, "runner_host.isolation_changed")).isEmpty();
+    }
+
     /** ADR-0113: a personal host's report is its machine's, shown in its presence, with the operator's statement. */
     @Test
     void aPersonalHostsReportedIsolationIsShownWithTheOperatorsStatement() {

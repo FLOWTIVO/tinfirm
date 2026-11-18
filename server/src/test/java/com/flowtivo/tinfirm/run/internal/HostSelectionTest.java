@@ -133,11 +133,41 @@ class HostSelectionTest {
         assertThat(HostSelection.select(List.of(plain, hardened), plain.info().id(), false))
             .isInstanceOfSatisfying(HostSelection.Chosen.class,
                     chosen -> assertThat(chosen.host().info().name()).isEqualTo("plain"));
-        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false, true))
+        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false,
+                com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE))
             .isInstanceOfSatisfying(HostSelection.Chosen.class,
                     chosen -> assertThat(chosen.host().info().name()).isEqualTo("restoring"));
-        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false, false))
+        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false, null))
             .isInstanceOfSatisfying(HostSelection.Chosen.class,
                     chosen -> assertThat(chosen.host().info().name()).isEqualTo("hardened"));
+    }
+
+    /**
+     * ADR-0113, decision 4 (the review of 2026-11-18, finding 1): a moving session goes first to a free host of the
+     * level that restores it, before the session's or the previous run's host; a restorer of another level (the
+     * weaker session host itself) is not one; the session's host then comes before the level's other hosts.
+     */
+    @org.junit.jupiter.api.Test
+    void aFreeRestorerOfTheLevelComesFirstThenTheSessionsHostThenTheRest() {
+        com.flowtivo.tinfirm.runner.IsolationLevel machine = com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE;
+        HostSelection.Host session = leveled("session", null, null, 0, true);
+        HostSelection.Host other = leveled("other", machine, com.flowtivo.tinfirm.runner.Hardening.NONE, 0, false);
+        HostSelection.Host restorer = leveled("restorer", machine, com.flowtivo.tinfirm.runner.Hardening.NO, 3,
+                true);
+        assertThat(HostSelection.select(List.of(session, other, restorer), session.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("restorer"));
+        // No free restorer of the level: the session's host, though another host of the level is free.
+        HostSelection.Host busy = leveled("restorer", machine, com.flowtivo.tinfirm.runner.Hardening.NO, 4, true);
+        assertThat(HostSelection.select(List.of(session, other, busy), session.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("session"));
+        // A chosen level: no session host among the candidates, and the restorer before the previous run's host.
+        assertThat(HostSelection.select(List.of(other, restorer), other.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("restorer"));
+        assertThat(HostSelection.select(List.of(other, busy), other.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("other"));
     }
 }

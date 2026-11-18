@@ -121,6 +121,8 @@ class RunnerHostSessions {
      * {@code host.isolation} and not allowed without it, and {@code machine} or {@code vm-jail} come only with
      * {@code isolationTiers} that are all {@code microvm}. Nothing else about a level is refused: {@code container}
      * with a {@code microvm} tier (a Kata host), and any {@code hardened} with any level, are what a host may report.
+     * An explicit {@code null} ({@code "isolation": null}, {@code "stated": null}), which the schema refuses, is read
+     * as absent. A hello of protocol 1 reports no level ({@code Hello.reportedIsolation}).
      */
     static @Nullable String helloProblem(RunnerMessages.Hello hello) {
         Set<String> labels = new HashSet<>();

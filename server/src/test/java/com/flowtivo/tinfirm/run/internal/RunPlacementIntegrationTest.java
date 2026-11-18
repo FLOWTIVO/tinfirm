@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -178,6 +179,44 @@ class RunPlacementIntegrationTest extends RunTestBench {
             after.send(FakeRunner.helloWithIsolation("machine", "none"));
             after.expect("welcome");
             expectAssign(after, turn.runId());
+        }
+    }
+
+    /**
+     * The review of 2026-11-18: a run waits for its level's hosts while they drain or are offline, not only while they
+     * are full; and a host that drops its level at its next hello is placed again with the run still queued.
+     */
+    @Test
+    void aRunWaitsForItsLevelsHostsWhileTheyDrainOrAreOfflineAndFollowsAHostThatDropsItsLevel() {
+        Bench bench = bench(true);
+        RunnerHostRef vm = registerRunnerHost(bench.owner(), bench.companyId(), unique("vm"), "COMPANY");
+        try (FakeRunner container = companyHost(bench, RUNNER_VERSION, 4)) {
+            Turn turn;
+            try (FakeRunner machine = FakeRunner.connect(port, vm.token())) {
+                machine.send(FakeRunner.helloWithIsolation("machine", "none"));
+                machine.expect("welcome");
+                awaitConfigured(vm.id());
+                machine.startDraining();
+                await().atMost(WAIT).until(() -> "true".equals(String.valueOf(query(bench.companyId(),
+                        "SELECT draining FROM runner_host WHERE id = ?", vm.id()))));
+                turn = start(bench);
+                JsonNode draining = awaitQueueReason(bench, turn.runId(), "RUNNER_HOST_DRAINING");
+                assertThat(draining.get("isolationLevel").asString()).isEqualTo("MACHINE");
+                assertThat(draining.get("text").asString()).endsWith("do not move to a weaker one.");
+                container.expectNone("run.assign", Duration.ofMillis(500));
+            }
+            JsonNode offline = awaitQueueReason(bench, turn.runId(), "RUNNER_HOST_OFFLINE");
+            assertThat(offline.get("isolationLevel").asString()).isEqualTo("MACHINE");
+            container.expectNone("run.assign", Duration.ofMillis(300));
+
+            // The host comes back without the feature: it reports no level, and the queued run is placed again.
+            try (FakeRunner downgraded = FakeRunner.connect(port, vm.token())) {
+                downgraded.send(FakeRunner.helloV2(List.of(), List.of()));
+                downgraded.expect("welcome");
+                await().atMost(WAIT).until(() -> "ASSIGNED".equals(getRun(bench, turn.runId()).path("queueReason")
+                    .path("code").asString()));
+                assertThat(getRun(bench, turn.runId()).get("isolationLevel").asString()).isEqualTo("CONTAINER");
+            }
         }
     }
 

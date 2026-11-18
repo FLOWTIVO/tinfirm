@@ -2,23 +2,23 @@ package com.flowtivo.tinfirm.run.internal;
 
 import java.util.Comparator;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
 
 import com.flowtivo.tinfirm.runner.Isolation;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 
 /**
  * Picks the runner host of a run among those package 2's rule leaves it ({@code Hosts.eligible}): the dispatcher's
  * own choice (the package 3 contract, §5.7 step 4 and 5; open point 13). A host takes the run when it is connected and
  * has confirmed its capacity on that connection, speaks runner protocol v2, does not drain and has a free slot under
- * its dispatch limit. Of those, the conversation's previous host wins, so that the turn resumes its session there;
- * then, for a session that moves with its bundle, a host that restores it; then the stronger host by its level and
- * hardening ({@link Isolation#rank}, ADR-0113: the dispatcher hands it the hosts of one level, and the session's host);
- * else the one with the most free slots, then the first by name, so that runs spread over the hosts. When none takes
- * it, the queue reason says why, about the one eligible host when there is only one.
+ * its dispatch limit. Of those, for a session that moves with its bundle, a host of its level that restores it wins;
+ * then the conversation's previous host, so that the turn resumes its session there; then the stronger host by its
+ * level and hardening ({@link Isolation#rank}, ADR-0113: the dispatcher hands it the hosts of one level, and the
+ * session's host); else the one with the most free slots, then the first by name, so that runs spread over the hosts.
+ * When none takes it, the queue reason says why, about the one eligible host when there is only one.
  */
 final class HostSelection {
 
@@ -86,18 +86,18 @@ final class HostSelection {
      * @param needsSkills  whether the run has skills, which only a host that lists {@code run.skills} delivers
      */
     static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills) {
-        return select(eligible, previousHost, needsSkills, false);
+        return select(eligible, previousHost, needsSkills, null);
     }
 
     /**
      * @param eligible        the hosts package 2 allows and the level of isolation leaves, at least one
      * @param previousHost    the host that holds the conversation's session, or of its previous run; or null
      * @param needsSkills     whether the run has skills, which only a host that lists {@code run.skills} delivers
-     * @param preferRestorers whether a host that restores session bundles comes before the others: the session moves
-     *                        with its bundle (ADR-0113, decision 4)
+     * @param restorersOf     the level whose hosts that restore session bundles come first, even before the previous
+     *                        host: the session moves with its bundle (ADR-0113, decision 4); null for none
      */
     static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills,
-            boolean preferRestorers) {
+            @Nullable IsolationLevel restorersOf) {
         if (eligible.isEmpty()) {
             throw new IllegalArgumentException("No eligible host to select from");
         }
@@ -138,14 +138,17 @@ final class HostSelection {
             int limit = open.stream().mapToInt(Host::limit).sum();
             return new Waits(QueueReason.hostsFull(open.size() == 1 ? open.getFirst().info() : null, used, limit));
         }
-        Optional<Host> previous = previousHost != null
-                ? free.stream().filter(host -> host.info().id().equals(previousHost)).findFirst() : Optional.empty();
-        Comparator<Host> restoring = Comparator.comparing(host -> preferRestorers && !host.restores());
-        return new Chosen(previous.orElseGet(() -> free.stream()
-            .min(restoring.thenComparingInt(host -> Isolation.rank(host.info()))
+        // A free host of the level that restores a moving session first; then the session's (or previous) host; then
+        // the stronger by level and hardening, the one with more room, the name.
+        Comparator<Host> restoring = Comparator.comparing(host -> !(restorersOf != null && host.restores()
+                && Isolation.placedAt(host.info()) == restorersOf));
+        Comparator<Host> previous = Comparator.comparing(host -> !host.info().id().equals(previousHost));
+        return new Chosen(free.stream()
+            .min(restoring.thenComparing(previous)
+                .thenComparingInt(host -> Isolation.rank(host.info()))
                 .thenComparing(Comparator.comparingInt(Host::free).reversed())
                 .thenComparing(host -> host.info().name())
                 .thenComparing(host -> host.info().id()))
-            .orElseThrow()));
+            .orElseThrow());
     }
 }
