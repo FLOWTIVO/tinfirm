@@ -1,7 +1,8 @@
 #!/bin/sh
-# Provisions the image of the sandbox VMs (ADR-0096), as digitalocean.pkr.hcl runs it on a
-# build VM: Debian with Docker Engine, the runner host's binary, the runner images built from
-# its own Dockerfiles (ADR-0062), and the unit that starts the run's container at boot. It
+# Provisions the image of the sandbox VMs (ADR-0096) on a build VM, as DigitalOcean's Packer
+# template runs it (ee/runner/images/vm/digitalocean.pkr.hcl): Debian with Docker Engine, the
+# runner host's binary, the runner images built from its own Dockerfiles (ADR-0062), and the
+# unit that starts the run's container at boot. It
 # leaves no way in but the bridge, and nothing that holds a credential: no SSH key or server,
 # no provider agent.
 #

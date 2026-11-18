@@ -6,7 +6,6 @@
 //! Docker side (the mount, the container's settings) is covered by the unit tests of
 //! `sandbox.rs`.
 
-#[path = "../../../../runner/crates/tinfirm-runner-host/tests/common/mod.rs"]
 mod common;
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -72,7 +71,7 @@ async fn a_run_over_the_bridge_clones_runs_commits_and_pushes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_server_whose_licence_holds_no_elastic_runners_stops_the_host() {
+async fn a_server_that_refuses_the_hellos_features_stops_the_host() {
     with_timeout(60, async {
         let mut server = FakeServer::start().await;
         let mut setup = HostSetup::bridged();
@@ -87,7 +86,8 @@ async fn a_server_whose_licence_holds_no_elastic_runners_stops_the_host() {
                 .contains(&json!("sandbox.bridge")),
             "{hello}"
         );
-        // A Community server (ADR-0100): an error before the welcome, then 1008.
+        // A server whose licence does not take a feature of the hello: an error before the
+        // welcome, then 1008. A Community server before ADR-0114 refuses `sandbox.bridge` so.
         conn.send(json!({
             "type": "error",
             "code": "EDITION_REQUIRED",

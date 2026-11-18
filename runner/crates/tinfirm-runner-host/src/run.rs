@@ -590,9 +590,10 @@ pub async fn execute(
             sandbox: reader,
         },
     ];
-    // A VM per run (ADR-0096) comes from the VM pool (crate::pool, ADR-0098): a ready VM of
-    // the run's shape, or the next one that comes up. The VM's tunnels and its egress proxy
-    // listener are its own, so the run takes it before it sets up its listeners.
+    // A VM per run (ADR-0096) comes from the VM pool (crate::pool): one that its keeper holds
+    // (ready VMs, ADR-0098), or the next one of the run's shape that comes up. The VM's
+    // tunnels and its egress proxy listener are its own, so the run takes it before it sets up
+    // its listeners.
     let mut claimed: Option<crate::pool::Claimed> = None;
     let mut starting = false;
     if let Some(pool) = shared.pool()
@@ -615,7 +616,7 @@ pub async fn execute(
                         crate::pool::Served::Ready => format!(
                             "the run took a ready sandbox VM ({}), which waited {} s for it",
                             vm.vm.id,
-                            vm.ready_at.elapsed().as_secs()
+                            vm.up_at.elapsed().as_secs()
                         ),
                         crate::pool::Served::Cold => format!(
                             "the run started cold: no sandbox VM was ready, and it waited {} s for {}",
@@ -1624,8 +1625,9 @@ async fn start_model_proxy(
 /// reach the host-wide hosts and the run's model (`model`: what the runtime reaches it with; a
 /// gateway behind the model proxy needs no host), and points the sandbox's tools at it. The
 /// sandbox is on an internal network, so a run whose proxy cannot start has no network: it
-/// fails closed, and the log says why. A VM from the pool brings its own listener (`slot`),
-/// which its container's settings name already: the run binds its rules to that one.
+/// fails closed, and the log says why. A VM from the pool (crate::pool) brings its own
+/// listener (`slot`), which its container's settings name already: the run binds its rules to
+/// that one.
 #[allow(clippy::too_many_arguments)]
 async fn start_egress(
     shared: &Arc<Shared>,
@@ -1946,7 +1948,7 @@ async fn start_sandbox(
         return shared
             .opts
             .executor
-            .start_claimed(spec, claimed, shared.opts.pool.reprobe_after, tunnels, puts)
+            .start_claimed(spec, claimed, shared.opts.vm_reprobe_after, tunnels, puts)
             .await;
     }
     let listener = shared.bridge().await?.context(

@@ -539,8 +539,10 @@ litellm:
 # runner.existingSecret, so nobody registers it in the app. Its sandboxes are VMs that it
 # creates and deletes through its VM driver (`run --executor vm`, ADR-0096), on DigitalOcean a
 # Droplet per run from the VM image you build first (runner/README.md, "A VM per run"): the
-# pod needs no Docker and no privilege. VMs are Pro's and Enterprise's (elastic runners,
-# ADR-0100): without such a key the server refuses the host, which then stops.
+# pod needs no Docker and no privilege. The VM executor is in every edition, but DigitalOcean's
+# driver, the only one the chart runs today, and ready VMs are Pro's and Enterprise's (elastic
+# runners, ADR-0100, ADR-0114): without such a key the server refuses the host, which then
+# stops.
 #
 # One pod, which serves many runs at once (maxConcurrentRuns), each in a VM of its own. It
 # connects to the server's public URL, as any runner host, and keeps its runs' records and
@@ -579,7 +581,7 @@ runner:
   # The log filter (TINFIRM_RUNNER_LOG).
   log: info
   vm:
-    # The VM driver (run --vm-driver): `digitalocean`, the runner host's own.
+    # The VM driver (run --vm-driver): `digitalocean`, the runner host's own, which is paid.
     driver: digitalocean
     # The template every VM is created from (run --vm-template): a key of
     # vm.digitalocean.templates.
@@ -615,11 +617,12 @@ runner:
       #   vpc: VPC_UUID              # the sandboxes' own VPC
       #   firewall: FIREWALL_ID      # the Cloud Firewall on the tag tinfirm-sandbox
       #   bridgePort: 7443           # optional; vm.port
-  # Ready VMs (ADR-0098): the most that Tinfirm's admins may keep waiting (run
-  # --pool-max-ready; 0 turns them off), and the image they start (`any`: the multi-runtime
-  # image, so that they serve every runtime).
+  # Ready VMs (ADR-0098), Pro's and Enterprise's: the most that Tinfirm's admins may keep
+  # waiting (run --pool-max-ready). 0, the default, turns them off, and every run starts cold;
+  # above 0 the server needs a key with elastic runners. The image they start (`any`: the
+  # multi-runtime image, so that they serve every runtime).
   pool:
-    maxReady: 4
+    maxReady: 0
     runtime: claude
     headroom: 0
     maxAge: 360

@@ -28,8 +28,8 @@
 //! its own address, so an allowed name that points at the runner host reaches none of the
 //! host's listeners.
 //!
-//! A ready sandbox VM (crate::pool) gets its listener before any run: the VM's own settings
-//! name it when the VM is created. Such a listener ([`EgressProxy::start_slot`]) refuses every
+//! A sandbox VM (crate::pool) gets its listener before any run claims it: the VM's own
+//! settings name it when the VM is created. Such a listener ([`EgressProxy::start_slot`]) refuses every
 //! destination, the host-wide ones included, until the run that claims the VM binds its rules
 //! to it ([`EgressGuard::bind`]).
 
@@ -525,7 +525,7 @@ impl EgressProxy {
         Ok(guard)
     }
 
-    /// A listener of no run yet, for a sandbox that waits for one (a ready VM, crate::pool):
+    /// A listener of no run yet, for a sandbox VM that no run has claimed yet (crate::pool):
     /// it refuses every destination until [`EgressGuard::bind`].
     pub async fn start_slot(&self, sandbox_host: Option<&str>) -> Result<EgressGuard> {
         anyhow::ensure!(

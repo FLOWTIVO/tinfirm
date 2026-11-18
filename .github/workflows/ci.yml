@@ -474,7 +474,7 @@ jobs:
       - name: Shell script lint (shellcheck)
         timeout-minutes: 2
         run: |
-          shellcheck deploy/compose/deploy-host.sh deploy/compose/smoke.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh ee/runner/images/vm/setup.sh \
+          shellcheck deploy/compose/deploy-host.sh deploy/compose/smoke.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh \
             .github/check-pins.sh .github/actions/set-version/*.sh
       - name: Workflow lint (actionlint)
         timeout-minutes: 2

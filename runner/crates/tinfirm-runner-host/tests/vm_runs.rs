@@ -2,10 +2,11 @@
 //! `tests/fake-vm-driver`: the host creates a "VM" per run through the driver protocol, with
 //! the run's user data, dials its bridge, which listens on a loopback address of its own,
 //! probes it, puts the run's files in, starts the fake agent as the sandbox's own command,
-//! takes the work back and deletes the VM. The VMs here are processes on this machine
-//! (`VmOptions::on_this_machine`), so the layout is the local test executor's.
+//! takes the work back and deletes the VM. Every run starts cold: the host keeps no VM ready
+//! (that is ready VMs', `ee/runner/tinfirm-runner-host/tests/pool_runs.rs`). The VMs here are
+//! processes on this machine (`VmOptions::on_this_machine`), so the layout is the local test
+//! executor's.
 
-#[path = "../../../../runner/crates/tinfirm-runner-host/tests/common/mod.rs"]
 mod common;
 
 use std::time::Duration;
@@ -285,8 +286,15 @@ async fn a_vm_host_says_microvm_and_takes_skills() {
         }
         let features = hello["features"].as_array().unwrap();
         assert!(features.contains(&json!("run.skills")), "{features:?}");
-        // Every agent runs over the bridge, which the server's licence must hold (ADR-0100).
+        // Every agent runs over the bridge (ADR-0095). An operator's own driver and no ready
+        // VMs: nothing that a server's licence must hold (ADR-0114).
         assert!(features.contains(&json!("sandbox.bridge")), "{features:?}");
+        assert!(
+            !features.contains(&json!("sandbox.elastic")),
+            "{features:?}"
+        );
+        assert!(!features.contains(&json!("sandbox.pool")), "{features:?}");
+        assert!(hello.get("pool").is_none(), "{hello}");
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })
@@ -412,51 +420,6 @@ async fn a_cancelled_run_takes_its_work_back_and_deletes_its_vm() {
     .await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_builtin_digitalocean_driver_speaks_the_protocol() {
-    use tinfirm_runner_host::vm::{Driver, DriverCommand};
-    let dir = tempfile::tempdir().unwrap();
-    let token = dir.path().join("token");
-    std::fs::write(&token, "dop_v1_TEST-ONLY-fake-token\n").unwrap();
-    // An API that is not there: `hello` needs none, `verify` fails on it.
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let config = dir.path().join("digitalocean.json");
-    std::fs::write(
-        &config,
-        json!({
-            "apiUrl": format!("http://{closed}"),
-            "tokenFile": token,
-            "templates": {"sandbox-4c8g": {
-                "region": "fra1", "size": "s-4vcpu-8gb", "image": "123",
-                "vpc": "vpc-1", "firewall": "fw-1"
-            }}
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let driver = Driver::new(DriverCommand {
-        program: env!("CARGO_BIN_EXE_tinfirm-runner-host").into(),
-        args: vec![
-            "vm-driver".into(),
-            "digitalocean".into(),
-            "--config".into(),
-            config.to_string_lossy().into_owned(),
-        ],
-        env: vec![("TINFIRM_RUNNER_LOG".into(), "warn".into())],
-    });
-    let hello = driver.hello().await.unwrap();
-    assert_eq!(hello.driver, "digitalocean");
-    let error = format!("{:#}", driver.verify("sandbox-4c8g").await.unwrap_err());
-    assert!(error.contains("/v2/account"), "{error}");
-    let error = format!("{:#}", driver.verify("other").await.unwrap_err());
-    assert!(error.contains("no template `other`"), "{error}");
-    let error = format!("{:#}", driver.describe("1; rm").await.unwrap_err());
-    assert!(error.contains("not a Droplet id"), "{error}");
-}
-
 /// Where the VM restart test's host A keeps its directories, and its server.
 const RESTART_DIR: &str = "TINFIRM_TEST_VM_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_VM_RESTART_URL";
@@ -557,6 +520,60 @@ async fn a_host_that_restarted_takes_back_the_run_in_its_vm() {
         assert_eq!(calls_of(&calls, "create").len(), creates, "{calls:#?}");
         assert!(deleted(&calls, &vm_id), "{calls:#?}");
         assert!(!record.exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+// ----- cold starts (crate::pool) -----------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_ready_vms_each_run_creates_its_vm_and_none_is_kept() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::vm(&log, &[])).await;
+        assert!(host.host.ready_vms().is_none());
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        // Until a run asks, no VM is created.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(calls_of(&vm_driver_calls(&log), "create").is_empty());
+
+        // Two runs at once: each waits for a VM of its own. (The first's transcript takes the
+        // frames of both until it ends, the second's finish too if it came first.)
+        let first = AssignSpec::new("bridge-env", None);
+        let second = AssignSpec::new("bridge-env", None);
+        conn.send(first.to_json());
+        conn.send(second.to_json());
+        let t = conn.until_finished(first.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.text().contains("the run started cold"), "{}", t.text());
+        let second_id = second.run_id.to_string();
+        let finished = match t
+            .frames
+            .iter()
+            .find(|f| f["type"] == "run.finished" && f["runId"] == second_id)
+        {
+            Some(finished) => finished.clone(),
+            None => conn.take_run("run.finished", second.run_id).await,
+        };
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{finished}");
+        // Each VM is deleted after its run, and no other is created.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !(deleted(&vm_driver_calls(&log), "vm-1") && deleted(&vm_driver_calls(&log), "vm-2"))
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the VMs were not deleted"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let calls = vm_driver_calls(&log);
+        assert_eq!(calls_of(&calls, "create").len(), 2, "{calls:#?}");
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

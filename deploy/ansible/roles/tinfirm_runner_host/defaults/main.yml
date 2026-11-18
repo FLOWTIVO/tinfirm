@@ -125,7 +125,9 @@ tinfirm_runner_host_egress_allow: []
 # are on loopback, reached only through each sandbox's own bridge (R28), and the run's
 # credentials are not in the container's settings. Needs a static Linux build of the runner host
 # (the release archives are); a binary of your own build: set tinfirm_runner_host_bridge_binary.
-# false: the listeners are on Docker's bridge, reachable from every container on it.
+# false: the listeners are on Docker's bridge, reachable from every container on it. The bridge
+# is in every edition (ADR-0114): a Community server accepts such a host. The role runs the
+# Docker executor, so it keeps no ready VMs (`run --pool-max-ready`), which are paid.
 tinfirm_runner_host_sandbox_bridge: true
 # A static Linux build of the runner host for the sandboxes (TINFIRM_RUNNER_BRIDGE_BINARY).
 # Empty: the installed binary itself.

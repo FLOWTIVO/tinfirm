@@ -12,8 +12,12 @@
 //! the VM's one-time ticket and the host's pin, the image to run, and the sandbox's own
 //! settings. Anything in the VM can read it from the metadata service, so it holds no
 //! credential: those travel over the bridge, in `start`. It names no run either: every VM is
-//! created for whichever run claims it (crate::pool, ADR-0098), the one waiting now or a later
-//! one, and is deleted after that run.
+//! created for whichever run claims it (crate::pool), and is deleted after that run.
+//!
+//! The executor and the driver protocol are in the core (ADR-0114): an operator can bring a
+//! driver of their own. The drivers built into this binary for a provider are paid
+//! (DigitalOcean's, crate::digitalocean): a host with one lists the feature `sandbox.elastic`
+//! ([`DriverCommand::elastic`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -42,10 +46,11 @@ pub const DEFAULT_PORT: u16 = 7443;
 pub const HOST_LABEL: &str = "tinfirm-host";
 /// The label of a VM's own id at this host, which names no run (crate::pool).
 pub const VM_LABEL: &str = "tinfirm-vm";
-/// The label of the run a VM was for, on the VMs of runner hosts before ready VMs (ADR-0098):
-/// their leftovers are still recognised by it.
+/// The label of the run a VM was for, on the VMs of runner hosts before ADR-0098: their
+/// leftovers are still recognised by it.
 pub const RUN_LABEL: &str = "tinfirm-run";
-/// `--vm-driver digitalocean`: this binary's own driver (`vm-driver digitalocean`).
+/// `--vm-driver digitalocean`: this binary's own driver for DigitalOcean (`vm-driver
+/// digitalocean`, crate::digitalocean), which is paid (ADR-0114).
 pub const BUILTIN_DIGITALOCEAN: &str = "digitalocean";
 
 /// How long one call of the driver may take, by method.
@@ -67,11 +72,15 @@ pub struct DriverCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// One of this binary's paid drivers (ADR-0114): the host lists the feature
+    /// `sandbox.elastic`, which a server refuses without its licence's elastic runners. An
+    /// operator's own driver is not.
+    pub elastic: bool,
 }
 
 impl DriverCommand {
-    /// `--vm-driver`: `digitalocean` for this binary's own driver, or a command line, split at
-    /// white space (no quoting).
+    /// `--vm-driver`: `digitalocean` for this binary's own driver, which is paid, or a command
+    /// line of the operator's own driver, split at white space (no quoting).
     pub fn parse(value: &str) -> Result<DriverCommand> {
         let value = value.trim();
         if value == BUILTIN_DIGITALOCEAN {
@@ -79,6 +88,7 @@ impl DriverCommand {
                 program: std::env::current_exe().context("cannot find this executable")?,
                 args: vec!["vm-driver".into(), BUILTIN_DIGITALOCEAN.into()],
                 env: Vec::new(),
+                elastic: true,
             });
         }
         let mut words = value.split_whitespace();
@@ -89,6 +99,7 @@ impl DriverCommand {
             program: PathBuf::from(program),
             args: words.map(String::from).collect(),
             env: Vec::new(),
+            elastic: false,
         })
     }
 }
@@ -813,7 +824,7 @@ impl Vms {
     }
 
     /// Deletes this host's VMs that this process does not hold: those whose delete failed,
-    /// and those of an earlier process of this host. A VM of a host before ready VMs, which
+    /// and those of an earlier process of this host. A VM of a host before ADR-0098, which
     /// has no [`VM_LABEL`], is kept while its run is in `live`.
     pub async fn cleanup_orphans(&self, host: &str, live: &HashSet<Uuid>) -> Result<usize> {
         let labels = BTreeMap::from([(HOST_LABEL.to_string(), host.to_string())]);
@@ -900,7 +911,7 @@ impl Drop for VmGuard {
         if self.deleted {
             return;
         }
-        // A run's task that ends without the delete (it was aborted), or a ready VM that goes:
+        // A run's task that ends without the delete (it was aborted), or a VM that no run holds:
         // the VM goes anyway.
         let (vms, id, host, label) = (
             self.vms.clone(),
@@ -1090,6 +1101,7 @@ mod tests {
             program: PathBuf::from("sh"),
             args: vec!["-c".into(), script.into()],
             env: Vec::new(),
+            elastic: false,
         })
     }
 

@@ -1,10 +1,12 @@
-//! Ready VMs (ADR-0098) with the VM executor and the fake driver of `tests/fake-vm-driver`: the
-//! pool creates VMs for no run, up to Tinfirm's count and the operator's ceiling; a run takes
-//! a ready one, and its replacement starts at once; a run of another shape starts cold, unless
-//! the VMs run the multi-runtime image (ADR-0101), which every runtime's runs take; VMs
-//! above the target, and old ones, go; a VM that waited is probed again when a run claims it;
-//! and the ready VMs are deleted when the host stops. The VMs here are processes on this
-//! machine (`VmOptions::on_this_machine`).
+//! Ready VMs (ADR-0098, crate::ready_vms) with the VM executor and the fake driver of
+//! `runner/crates/tinfirm-runner-host/tests/fake-vm-driver`: the host creates VMs for no run,
+//! up to Tinfirm's count and the operator's ceiling; a run takes a ready one, and its
+//! replacement starts at once; a run of another shape starts cold, unless the VMs run the
+//! multi-runtime image (ADR-0101), which every runtime's runs take; VMs above the target, and
+//! old ones, go; a VM that waited is probed again when a run claims it; and the ready VMs are
+//! deleted when the host stops. The VMs here are processes on this machine
+//! (`VmOptions::on_this_machine`). Part of elastic runners, under the Tinfirm Enterprise
+//! licence (`ee/LICENSE`); the cold starts are tested with the core, in `vm_runs.rs`.
 
 #[path = "../../../../runner/crates/tinfirm-runner-host/tests/common/mod.rs"]
 mod common;
@@ -15,7 +17,7 @@ use std::time::Duration;
 use common::*;
 use serde_json::Value;
 use tinfirm_bridge::control::ProbeCheck;
-use tinfirm_runner_host::pool::{Pool, PoolOptions};
+use tinfirm_runner_host::ready_vms::{ReadyVmOptions, ReadyVms};
 
 fn calls_of(calls: &[Value], method: &str) -> Vec<Value> {
     calls
@@ -40,23 +42,39 @@ async fn until(what: &str, seconds: u64, mut check: impl FnMut() -> bool) {
     }
 }
 
-/// Pool options for tests: ready VMs above the target go at the next pass.
-fn quick() -> PoolOptions {
-    PoolOptions {
+/// Ready VMs' options for tests: on, up to 4, and those above the target go at the next pass.
+fn quick() -> ReadyVmOptions {
+    ReadyVmOptions {
+        max_ready: 4,
         cool_down: Duration::ZERO,
-        ..PoolOptions::default()
+        ..ReadyVmOptions::default()
     }
 }
 
-fn pool_host(options: tinfirm_runner_host::vm::VmOptions, pool: PoolOptions) -> HostSetup {
+fn pool_host(options: tinfirm_runner_host::vm::VmOptions, pool: ReadyVmOptions) -> HostSetup {
+    pool_host_reprobing(options, pool, tinfirm_runner_host::pool::REPROBE_AFTER)
+}
+
+/// [`pool_host`] whose VMs that came up `reprobe_after` before their claim are probed again.
+fn pool_host_reprobing(
+    options: tinfirm_runner_host::vm::VmOptions,
+    pool: ReadyVmOptions,
+    reprobe_after: Duration,
+) -> HostSetup {
     HostSetup {
-        pool: Some(pool),
+        options: Some(Box::new(move |opts| {
+            opts.ready_vms = pool;
+            opts.vm_reprobe_after = reprobe_after;
+        })),
         ..HostSetup::vm_with(options)
     }
 }
 
-fn pool_of(host: &TestHost) -> Arc<Pool> {
-    host.host.pool().expect("a VM host has a pool").clone()
+fn pool_of(host: &TestHost) -> Arc<ReadyVms> {
+    host.host
+        .ready_vms()
+        .expect("a VM host with --pool-max-ready has ready VMs")
+        .clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -195,7 +213,7 @@ async fn with_the_multi_runtime_image_a_run_of_any_runtime_takes_a_ready_vm() {
             std::env::var("PATH").unwrap_or_default()
         );
         let mut server = FakeServer::start().await;
-        let pool_options = PoolOptions {
+        let pool_options = ReadyVmOptions {
             multi_runtime: true,
             ..quick()
         };
@@ -251,7 +269,7 @@ async fn the_ceiling_bounds_the_count_and_vms_above_the_target_or_too_old_go() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("driver.log");
         let mut server = FakeServer::start().await;
-        let pool_options = PoolOptions {
+        let pool_options = ReadyVmOptions {
             max_ready: 2,
             ..quick()
         };
@@ -292,7 +310,7 @@ async fn a_ready_vm_older_than_its_max_age_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("driver.log");
         let mut server = FakeServer::start().await;
-        let pool_options = PoolOptions {
+        let pool_options = ReadyVmOptions {
             max_age: Duration::from_secs(2),
             ..quick()
         };
@@ -329,12 +347,12 @@ async fn a_vm_that_waited_is_probed_again_when_a_run_claims_it() {
         options.probe = vec![ProbeCheck::Tcp {
             addr: drift.clone(),
         }];
-        let pool_options = PoolOptions {
-            reprobe_after: Duration::from_millis(500),
-            ..quick()
-        };
         let mut server = FakeServer::start().await;
-        let host = start_host(&server.url, pool_host(options, pool_options)).await;
+        let host = start_host(
+            &server.url,
+            pool_host_reprobing(options, quick(), Duration::from_millis(500)),
+        )
+        .await;
         let mut conn = server.accept().await;
         conn.handshake(1).await;
         let pool = pool_of(&host);
@@ -506,7 +524,7 @@ async fn a_vm_that_cannot_be_created_pauses_the_pools_own_creations_but_not_a_ru
 
 // ----- Tinfirm's count (ADR-0099) ----------------------------------------------------------
 
-fn v2_pool_host(pool: PoolOptions) -> HostSetup {
+fn v2_pool_host(pool: ReadyVmOptions) -> HostSetup {
     HostSetup {
         protocol_version: 2,
         max_concurrent_runs: 3,
@@ -524,7 +542,7 @@ async fn tinfirms_count_comes_in_host_config_and_the_host_reports_its_pool() {
         let mut server = FakeServer::start().await;
         let host = start_host(
             &server.url,
-            v2_pool_host(PoolOptions {
+            v2_pool_host(ReadyVmOptions {
                 max_ready: 2,
                 ..quick()
             }),
@@ -583,7 +601,7 @@ async fn a_window_fills_early_and_its_end_is_followed_without_the_server() {
         let mut server = FakeServer::start().await;
         let host = start_host(
             &server.url,
-            v2_pool_host(PoolOptions {
+            v2_pool_host(ReadyVmOptions {
                 lead_time_max: Duration::from_secs(120),
                 ..quick()
             }),

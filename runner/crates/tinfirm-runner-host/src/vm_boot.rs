@@ -1,5 +1,5 @@
 //! `vm-boot`, in a sandbox VM (ADR-0096): the VM's image starts it once at boot
-//! (`ee/runner/images/vm/tinfirm-vm-boot.service`). It reads the VM's user data
+//! (`runner/images/vm/tinfirm-vm-boot.service`). It reads the VM's user data
 //! ([`crate::vm::UserData`]) from the metadata service or a file, and runs the run's container
 //! from the image the user data names, which the VM's image holds: this binary, mounted
 //! read-only, as `bridge`, listening for the runner host, on the VM's network. The bridge

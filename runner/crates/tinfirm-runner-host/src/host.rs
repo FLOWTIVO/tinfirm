@@ -107,9 +107,13 @@ pub struct HostOptions {
     /// run's credentials leave the sandbox's settings. `None`: the host attaches to the
     /// adapter's stdio.
     pub bridge: Option<crate::bridge::BridgeOptions>,
-    /// The VM executor's pool of ready VMs (crate::pool, ADR-0098): the operator's ceilings
-    /// and its tuning (`run --pool-*`). Other executors have no pool.
-    pub pool: crate::pool::PoolOptions,
+    /// Ready VMs of the VM executor (crate::ready_vms, paid, ADR-0098, ADR-0114): the
+    /// operator's ceilings and the tuning (`run --pool-*`). With `max_ready` 0, the default,
+    /// the host keeps no VM ready and every run starts cold. Other executors have none.
+    pub ready_vms: crate::ready_vms::ReadyVmOptions,
+    /// A VM that came up this long before a run claims it is probed again then
+    /// ([`crate::pool::REPROBE_AFTER`]; no flag sets it).
+    pub vm_reprobe_after: Duration,
     /// The largest file an upload reads (`save_artifact`, `upload_attachment`, `/output`):
     /// `run --upload-max-bytes`, by default the server's own default limit (25 MiB). A larger
     /// file is refused on its size before it is read.
@@ -148,7 +152,8 @@ impl HostOptions {
             tool_request_timeout: TOOL_REQUEST_TIMEOUT,
             maintenance: maintenance::Settings::from_env(),
             bridge: None,
-            pool: crate::pool::PoolOptions::default(),
+            ready_vms: crate::ready_vms::ReadyVmOptions::default(),
+            vm_reprobe_after: crate::pool::REPROBE_AFTER,
             upload_max_bytes: crate::attachments::DEFAULT_UPLOAD_MAX_BYTES,
             runner_version: crate::version::RUNNER_VERSION.to_string(),
         }
@@ -167,10 +172,16 @@ impl HostOptions {
             .unwrap_or_else(|| images::default_image(runtime).to_string())
     }
 
-    /// Whether every run starts from the multi-runtime image: the VM executor's pool with
+    /// Whether every run starts from the multi-runtime image: the VM executor with
     /// `--pool-runtime any` (ADR-0101).
     pub fn multi_runtime_image(&self) -> bool {
-        self.pool.multi_runtime && matches!(self.executor, Executor::Vm(_))
+        self.ready_vms.multi_runtime && matches!(self.executor, Executor::Vm(_))
+    }
+
+    /// Whether the host keeps ready VMs (crate::ready_vms): the VM executor with
+    /// `--pool-max-ready` above 0.
+    pub fn keeps_ready_vms(&self) -> bool {
+        self.ready_vms.max_ready > 0 && matches!(self.executor, Executor::Vm(_))
     }
 
     /// The command the host names for a run of `runtime`: its adapter, for the multi-runtime
@@ -327,6 +338,8 @@ pub struct Shared {
     model_proxy: tokio::sync::Mutex<Option<Arc<ModelProxy>>>,
     /// The VM executor's pool (crate::pool): every VM of its runs comes from it.
     pool: Option<Arc<crate::pool::Pool>>,
+    /// The pool's ready VMs (crate::ready_vms), with `--pool-max-ready` above 0.
+    ready_vms: Option<Arc<crate::ready_vms::ReadyVms>>,
     /// The Public Suffix List the server sent (`psl.update`), if the host holds one.
     public_suffix: Arc<PublicSuffixStore>,
     /// Bare mirrors of the task repositories.
@@ -371,16 +384,19 @@ impl Shared {
             Vec::new()
         });
         let mut capacity = Capacity::new(opts.max_concurrent_runs, &startup_credentials);
-        if matches!(opts.executor, Executor::Vm(_)) {
-            capacity = capacity.with_pool(opts.pool.max_ready);
+        if opts.keeps_ready_vms() {
+            capacity = capacity.with_pool(opts.ready_vms.max_ready);
         }
         let outbox = Arc::new(Outbox::with_retention(opts.finished_retention));
-        let pool = match &opts.executor {
-            Executor::Vm(vms) => Some(crate::pool::Pool::new(
-                vms.clone(),
-                opts.pool.clone(),
-                crate::pool::Shape::for_runtime(&opts, opts.pool.runtime),
-            )),
+        let ready_vms = opts.keeps_ready_vms().then(|| {
+            crate::ready_vms::ReadyVms::new(
+                opts.ready_vms.clone(),
+                crate::pool::Shape::for_runtime(&opts, opts.ready_vms.runtime),
+            )
+        });
+        let pool = match (&opts.executor, &ready_vms) {
+            (Executor::Vm(vms), Some(ready_vms)) => Some(ready_vms.pool(vms.clone())),
+            (Executor::Vm(vms), None) => Some(crate::pool::Pool::new(vms.clone(), None)),
             _ => None,
         };
         let shared = Arc::new(Shared {
@@ -408,6 +424,7 @@ impl Shared {
             egress_proxy: tokio::sync::Mutex::new(None),
             model_proxy: tokio::sync::Mutex::new(None),
             pool,
+            ready_vms,
             heartbeat_secs: AtomicU64::new(10),
             lease_ttl_secs: AtomicU64::new(30),
             runner_host_id: Mutex::new(state.runner_host_id),
@@ -979,13 +996,13 @@ impl Shared {
             },
             features: {
                 let mut features = features(v2, &self.opts.executor, self.opts.bridge.is_some());
-                if v2 && self.pool.is_some() {
+                if v2 && self.ready_vms.is_some() {
                     features.push(feature::SANDBOX_POOL.to_string());
                 }
                 features
             },
-            pool: (v2 && self.pool.is_some()).then_some(tinfirm_protocol::HelloPool {
-                max_ready: self.opts.pool.max_ready,
+            pool: (v2 && self.ready_vms.is_some()).then_some(tinfirm_protocol::HelloPool {
+                max_ready: self.opts.ready_vms.max_ready,
             }),
         }
     }
@@ -1009,11 +1026,17 @@ impl Shared {
         lock(&self.runs).len()
     }
 
-    // ----- the VM pool (crate::pool) -----------------------------------------------------
+    // ----- the VM pool (crate::pool) and its ready VMs (crate::ready_vms) ------------------
 
     /// The VM executor's pool; `None` for the other executors.
     pub fn pool(&self) -> Option<&Arc<crate::pool::Pool>> {
         self.pool.as_ref()
+    }
+
+    /// The pool's ready VMs; `None` without `--pool-max-ready` above 0, or for the other
+    /// executors.
+    pub fn ready_vms(&self) -> Option<&Arc<crate::ready_vms::ReadyVms>> {
+        self.ready_vms.as_ref()
     }
 
     /// `host.pool.status` (v2, the feature `sandbox.pool`, ADR-0099), on the current
@@ -1024,14 +1047,14 @@ impl Shared {
         }
     }
 
-    /// What the pool reads of this host in a pass: its effective `maxConcurrentRuns` (0
+    /// What the ready VMs read of this host in a pass: its effective `maxConcurrentRuns` (0
     /// while it drains), its active runs, and its connection.
-    pub fn pool_view(&self) -> crate::pool::HostView {
+    pub fn ready_vms_view(&self) -> crate::ready_vms::HostView {
         let (pool_size, draining) = {
             let capacity = lock(&self.capacity);
             (capacity.max_concurrent_runs(), capacity.is_draining())
         };
-        crate::pool::HostView {
+        crate::ready_vms::HostView {
             pool_size,
             active_runs: self.active_run_count(),
             draining: draining || self.is_shutting_down(),
@@ -1202,8 +1225,8 @@ impl Shared {
                 // meanwhile cannot be overtaken by this older state.
                 self.outbox
                     .push_control(Message::HostConfigApplied(applied));
-                if let Some(pool) = &self.pool {
-                    pool.apply_config(config.pool.as_ref());
+                if let Some(ready_vms) = &self.ready_vms {
+                    ready_vms.apply_config(config.pool.as_ref());
                 }
             }
             ApplyOutcome::Outdated { last } => {
@@ -1241,8 +1264,8 @@ impl Shared {
         }
         drop(capacity);
         // A draining host keeps no ready VM.
-        if let Some(pool) = &self.pool {
-            pool.poke();
+        if let Some(ready_vms) = &self.ready_vms {
+            ready_vms.poke();
         }
         // Before the log line: whatever happens to it, [`serve`] learns of the drain.
         self.drain_requested.cancel();
@@ -2122,8 +2145,9 @@ pub(crate) fn validate_model_access(access: &ModelAccess, runtime: Runtime) -> R
 /// The optional features of protocol v2 that a host with `executor` implements
 /// (`hello.features`): `run.steer`, `run.skills` when the skills reach the sandbox (Docker
 /// mounts them, a VM gets them over the bridge; the local test executor has no mounts,
-/// ADR-0064), and `session.bundle` (ADR-0097), which the server uses for company hosts only. A
-/// v1 host lists none.
+/// ADR-0064), `session.bundle` (ADR-0097), which the server uses for company hosts only,
+/// `sandbox.bridge` with the sandbox bridge (ADR-0095), and `sandbox.elastic` when the VM
+/// driver is one of this binary's paid ones (ADR-0114). A v1 host lists none.
 pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     if !v2 {
         return Vec::new();
@@ -2135,6 +2159,11 @@ pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     features.push(feature::SESSION_BUNDLE.to_string());
     if bridged {
         features.push(feature::SANDBOX_BRIDGE.to_string());
+    }
+    if let Executor::Vm(vms) = executor
+        && vms.options.driver.elastic
+    {
+        features.push(feature::SANDBOX_ELASTIC.to_string());
     }
     features
 }
@@ -2256,11 +2285,11 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
         host.clone(),
         maintenance_stop.clone(),
     ));
-    // The VM pool's passes; when they stop, its ready VMs are deleted.
+    // The ready VMs' passes (crate::ready_vms), with `--pool-max-ready` above 0.
     let pool_stop = CancellationToken::new();
-    let pool = host
-        .pool()
-        .map(|pool| tokio::spawn(pool.clone().run(host.clone(), pool_stop.clone())));
+    let ready_vms = host
+        .ready_vms()
+        .map(|ready_vms| tokio::spawn(ready_vms.clone().run(host.clone(), pool_stop.clone())));
     let ticker = {
         let host = host.clone();
         let stop = finish.clone();
@@ -2309,8 +2338,12 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     }
     let _ = maintenance.await;
     pool_stop.cancel();
-    if let Some(pool) = pool {
-        let _ = pool.await;
+    if let Some(ready_vms) = ready_vms {
+        let _ = ready_vms.await;
+    }
+    // No more claims; the VMs that no run holds are deleted.
+    if let Some(pool) = host.pool() {
+        pool.stop().await;
     }
     host.stop_git_proxy().await;
     match stop {
@@ -2889,9 +2922,37 @@ mod tests {
         );
         assert!(features(false, &docker, false).is_empty());
         assert!(features(false, &local, false).is_empty());
-        // A bridged host says so, for the server's licence (ADR-0100).
+        // A bridged host says so (ADR-0095).
         assert_eq!(
             features(true, &docker, true),
+            [
+                "run.steer",
+                "run.skills",
+                "session.bundle",
+                "sandbox.bridge"
+            ]
+        );
+        // A VM driver of this binary's paid ones says so, for the server's licence (ADR-0114);
+        // an operator's own driver does not.
+        let vm = |value: &str| {
+            let driver = crate::vm::DriverCommand::parse(value).unwrap();
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                driver,
+                "sandbox".into(),
+            )))
+        };
+        assert_eq!(
+            features(true, &vm("digitalocean"), true),
+            [
+                "run.steer",
+                "run.skills",
+                "session.bundle",
+                "sandbox.bridge",
+                "sandbox.elastic"
+            ]
+        );
+        assert_eq!(
+            features(true, &vm("/usr/local/bin/my-driver --region x"), true),
             [
                 "run.steer",
                 "run.skills",

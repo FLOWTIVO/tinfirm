@@ -310,7 +310,9 @@ struct VmArgs {
     executor: ExecutorChoice,
     /// The VM driver (--executor vm): `digitalocean`, this binary's own driver, or the command
     /// line of another (split at white space). It holds the provider's credential; this host
-    /// holds none.
+    /// holds none. DigitalOcean's driver is part of elastic runners (Pro and Enterprise): the
+    /// server refuses a host with it unless its licence holds them. Your own driver needs no
+    /// licence.
     #[arg(long, env = "TINFIRM_RUNNER_VM_DRIVER", value_name = "COMMAND")]
     vm_driver: Option<String>,
     /// The driver's template that every VM is created from (--executor vm): image, size,
@@ -354,12 +356,14 @@ struct VmArgs {
     vm_image_version: ImageVersionChoice,
     /// The most ready VMs that Tinfirm may ask this host to keep (--executor vm, ADR-0098):
     /// each is created, booted and probed before a run comes, which then starts in seconds,
-    /// and each costs while it waits. Tinfirm's admins set how many, never more than this; 0
-    /// turns the ready VMs off. They count against --max-concurrent-runs.
+    /// and each costs while it waits. Tinfirm's admins set how many, never more than this.
+    /// They count against --max-concurrent-runs. 0, the default, turns them off: every run
+    /// starts cold. Ready VMs are part of elastic runners (Pro and Enterprise): above 0, the
+    /// server refuses this host unless its licence holds them.
     #[arg(
         long,
         env = "TINFIRM_RUNNER_POOL_MAX_READY",
-        default_value_t = 4,
+        default_value_t = 0,
         value_parser = clap::value_parser!(u32).range(0..=1000)
     )]
     pool_max_ready: u32,
@@ -436,13 +440,13 @@ impl PoolRuntime {
 }
 
 impl VmArgs {
-    /// The VM executor's options and its pool's, with `--executor vm`.
+    /// The VM executor's options and its ready VMs', with `--executor vm`.
     fn options(
         &self,
     ) -> Result<
         Option<(
             tinfirm_runner_host::vm::VmOptions,
-            tinfirm_runner_host::pool::PoolOptions,
+            tinfirm_runner_host::ready_vms::ReadyVmOptions,
         )>,
     > {
         use tinfirm_runner_host::vm::{DriverCommand, VmOptions, parse_probe};
@@ -481,7 +485,7 @@ impl VmArgs {
                 .probe
                 .push(parse_probe(check).map_err(|e| anyhow::anyhow!("--vm-probe: {e}"))?);
         }
-        let pool = tinfirm_runner_host::pool::PoolOptions {
+        let pool = tinfirm_runner_host::ready_vms::ReadyVmOptions {
             max_ready: self.pool_max_ready,
             headroom: self.pool_headroom,
             max_age: std::time::Duration::from_secs(self.pool_max_age * 60),
@@ -489,7 +493,6 @@ impl VmArgs {
             runtime: self.pool_runtime.runtime().unwrap_or(Runtime::ClaudeCode),
             multi_runtime: self.pool_runtime.runtime().is_none(),
             lead_time_max: std::time::Duration::from_secs(self.pool_lead_time_max * 60),
-            ..tinfirm_runner_host::pool::PoolOptions::default()
         };
         Ok(Some((options, pool)))
     }
@@ -2046,7 +2049,7 @@ async fn docker_executor(
 async fn vm_executor(
     paths: &Paths,
     options: tinfirm_runner_host::vm::VmOptions,
-    pool: tinfirm_runner_host::pool::PoolOptions,
+    pool: tinfirm_runner_host::ready_vms::ReadyVmOptions,
     cfg: &HostConfig,
     max_concurrent_runs: u32,
     settings: &SandboxSettings,
@@ -2097,7 +2100,7 @@ async fn vm_executor(
     let mut bridge = BridgeOptions::new(BridgeOptions::binary_from_env()?);
     bridge.connect_timeout = start_timeout;
     opts.bridge = Some(bridge);
-    opts.pool = pool;
+    opts.ready_vms = pool;
     let endpoint = tinfirm_runner_host::git_proxy::endpoint(
         &opts.executor,
         opts.sandbox_network.as_deref(),

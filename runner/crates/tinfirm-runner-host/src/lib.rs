@@ -1,9 +1,13 @@
 //! Tinfirm runner host library. The binary (`main.rs`) is a thin CLI over it; the
 //! integration tests drive the same code in-process.
+//!
+//! The modules here are MIT. The binary also compiles in the paid modules of
+//! `ee/runner/tinfirm-runner-host/src` (the Tinfirm Enterprise licence, ADR-0100, ADR-0114):
+//! DigitalOcean's VM driver ([`digitalocean`]), ready VMs ([`ready_vms`]) and session bundles
+//! ([`session_bundles`]).
 
 pub mod acp;
 pub mod attachments;
-#[path = "../../../../ee/runner/tinfirm-runner-host/src/bridge.rs"]
 pub mod bridge;
 pub mod capacity;
 pub mod config;
@@ -27,14 +31,14 @@ pub mod model_proxy;
 pub mod outbox;
 pub mod output;
 pub mod paths;
-#[path = "../../../../ee/runner/tinfirm-runner-host/src/pool.rs"]
 pub mod pool;
 pub mod public_suffix;
+#[path = "../../../../ee/runner/tinfirm-runner-host/src/ready_vms.rs"]
+pub mod ready_vms;
 pub mod redact;
 pub mod run;
 pub mod runtime_env;
 pub mod sandbox;
-#[path = "../../../../ee/runner/tinfirm-runner-host/src/sandbox_files.rs"]
 pub mod sandbox_files;
 pub mod secret_eq;
 pub mod secure_fs;
@@ -42,12 +46,9 @@ pub mod secure_fs;
 pub mod session_bundles;
 pub mod skills;
 pub mod steer;
-#[path = "../../../../ee/runner/tinfirm-runner-host/src/takeback.rs"]
 pub mod takeback;
 pub mod usage;
 pub mod util;
 pub mod version;
-#[path = "../../../../ee/runner/tinfirm-runner-host/src/vm.rs"]
 pub mod vm;
-#[path = "../../../../ee/runner/tinfirm-runner-host/src/vm_boot.rs"]
 pub mod vm_boot;

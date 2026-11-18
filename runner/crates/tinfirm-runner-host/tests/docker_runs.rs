@@ -90,7 +90,7 @@ fn docker_setup(docker: Docker) -> HostSetup {
         bridge: None,
         egress: None,
         sandbox: None,
-        pool: None,
+        options: None,
     }
 }
 
@@ -776,7 +776,7 @@ async fn real_images_offline_smoke() {
             bridge: None,
             egress: None,
             sandbox: None,
-            pool: None,
+            options: None,
         };
         let host = start_host(&server.url, setup).await;
         let mut conn = server.accept().await;
@@ -881,7 +881,7 @@ async fn real_pi_and_opencode_images_offline_smoke() {
             bridge: None,
             egress: None,
             sandbox: None,
-            pool: None,
+            options: None,
         };
         let host = start_host(&server.url, setup).await;
         let mut conn = server.accept().await;

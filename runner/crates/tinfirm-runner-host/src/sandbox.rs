@@ -666,9 +666,9 @@ impl Executor {
             env: hide(env),
             cwd: Some(cwd),
         };
-        // A VM that has waited a while is probed again: the provider's firewall may have
-        // changed since its first probe.
-        let probe = if claimed.ready_at.elapsed() >= reprobe_after {
+        // A VM that has waited a while since it came up is probed again: the provider's
+        // firewall may have changed since its first probe.
+        let probe = if claimed.up_at.elapsed() >= reprobe_after {
             options.probe.clone()
         } else {
             Vec::new()

@@ -28,8 +28,15 @@ one of the two protocols per connection ([Protocol versions](#protocol-versions)
 | Path | Contents |
 |---|---|
 | `crates/tinfirm-protocol` | Message types of the runner protocol v1 and v2, with schema tests and samples |
+| `crates/tinfirm-bridge` | The [sandbox bridge](#sandbox-bridge): one pinned TLS stream per run between this host and its sandbox |
 | `crates/tinfirm-runner-host` | The `tinfirm-runner-host` binary (and the library the tests drive) |
-| `images/` | Dockerfiles of the runner images, embedded into the binary; the recipe of the sandbox VMs' image is `ee/runner/images/vm` |
+| `images/` | Dockerfiles of the runner images, embedded into the binary, and the recipe of the sandbox VMs' image (`images/vm`) |
+
+All of it is MIT. The binary also compiles in the paid code of elastic runners, from
+`ee/runner/` (the Tinfirm Enterprise licence; [ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md),
+[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)): DigitalOcean's VM driver and its
+Packer template, [ready VMs](#ready-vms) and [session bundles](#session-bundles-protocol-v2), with
+their tests.
 
 ## Install
 
@@ -87,11 +94,12 @@ tinfirm-runner-host --version
 The archive also holds `LICENSE` (MIT), `ee/LICENSE` and `THIRD-PARTY-LICENSES.txt`, the licences
 of the crates the binary is built with ([ADR-0082](../docs/adr/0082-licence-notices-and-dependency-licences.md)).
 The binary holds elastic runners' code too, under the Tinfirm Enterprise licence
-([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md)): the sandbox bridge, a VM per run, ready
+([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md),
+[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)): DigitalOcean's VM driver, ready
 VMs and session bundles. They are Pro's and Enterprise's: a server whose licence does not hold
-them refuses a host started with `--sandbox-bridge` or `--executor vm` (`EDITION_REQUIRED`, and
-the host stops), and hands out no session bundle. A host with Docker, as below, runs in every
-edition.
+them refuses a host started with `--vm-driver digitalocean` or `--pool-max-ready` above 0
+(`EDITION_REQUIRED`, and the host stops), and hands out no session bundle. The sandbox bridge and
+a VM per run with a driver of your own are in every edition, as is a host with Docker, as below.
 
 Then continue with the [Quickstart](#quickstart). To upgrade, install the
 new binary the same way and drain ([Drain and upgrades](#drain-and-upgrades)). A Compose host
@@ -463,9 +471,10 @@ mirror settings, and builds the images. By hand, on a machine with `/dev/kvm`:
 
 With `run --sandbox-bridge` (`TINFIRM_RUNNER_SANDBOX_BRIDGE`), the agent's adapter runs over the
 sandbox bridge ([ADR-0095](../docs/adr/0095-sandbox-bridge.md)) instead of Docker attach. It is opt-in
-for now, and Pro's and Enterprise's ([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md)): the host
-lists `sandbox.bridge` in its `hello`, which needs protocol 2, and a server whose licence does not
-hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is under `ee/runner/`.
+for now, and in every edition ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)):
+the host lists `sandbox.bridge` in its `hello`, which needs protocol 2. A server from before
+ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is
+`crates/tinfirm-bridge` and the host's modules `bridge.rs`, `sandbox_files.rs` and `takeback.rs`.
 
 - **How it runs.** The container runs this host's binary, mounted read-only at
   `/opt/tinfirm/tinfirm-runner-host`, as `bridge`; the image's entrypoint still runs first. The bridge
@@ -554,17 +563,23 @@ hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is under `ee/r
 With `run --executor vm` (`TINFIRM_RUNNER_EXECUTOR=vm`), every run gets a fresh VM from a template
 of a VM driver, and the VM is deleted when the run ends, never reused
 ([ADR-0096](../docs/adr/0096-a-vm-per-run.md)). This host needs no Docker and holds no cloud
-credential, and a VM costs only while its run runs, or while it waits ready for one
-([Ready VMs](#ready-vms)). Every agent runs over the [sandbox bridge](#sandbox-bridge), so a VM per
-run is Pro's and Enterprise's too ([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md)).
+credential, and a VM costs only while its run runs, or, with [ready VMs](#ready-vms), while it
+waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 
-- **How a run goes.**
-  1. The driver creates a VM from the template, for no run in particular: its user data names none.
+- **Editions** ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). The VM executor,
+  the driver protocol and the VM image's recipe are in every edition: with a driver of your own
+  (below), a Community server takes the host. DigitalOcean's driver (`--vm-driver digitalocean`) and
+  ready VMs are Pro's and Enterprise's (elastic runners): such a host lists `sandbox.elastic` or
+  `sandbox.pool` in its `hello`, and a server whose licence does not hold elastic runners refuses it
+  with `EDITION_REQUIRED`.
+- **How a run goes.** Without ready VMs, every run starts cold:
+  1. The run asks for a VM, and the driver creates one from the template. Its user data names no
+     run.
   2. Once the driver reports it running, this host dials the sandbox bridge in the VM, which listens
      on `--vm-port`. The VM's firewall lets in only this host, to that port, and lets nothing out.
-  3. The bridge probes the VM's network from inside (below). The VM is ready now.
-  4. A run takes a ready VM, or the next one that comes up. Its files go in, and the agent starts with
-     its credentials, over the bridge, as in [Sandbox bridge](#sandbox-bridge).
+  3. The bridge probes the VM's network from inside (below). The VM is up now.
+  4. The run takes the VM. Its files go in, and the agent starts with its credentials, over the
+     bridge, as in [Sandbox bridge](#sandbox-bridge).
   5. After the agent, the work comes back over the bridge, and the driver deletes the VM.
 - **The user data holds no credential.** It holds the bridge's settings (the VM's id, its one-time
   ticket, this host's certificate pin), the runner image of a runtime, the sandbox's own settings
@@ -599,7 +614,7 @@ run is Pro's and Enterprise's too ([ADR-0100](../docs/adr/0100-elastic-runners-i
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
 | `--executor docker\|vm` | `TINFIRM_RUNNER_EXECUTOR` | `docker` | Containers of this machine's Docker, or a VM per run |
-| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver, or the command line of another (split at white space) |
+| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver (Pro and Enterprise), or the command line of your own (split at white space) |
 | `--vm-template NAME` | `TINFIRM_RUNNER_VM_TEMPLATE` | | The driver's template: image, size, network and firewall |
 | `--vm-port PORT` | `TINFIRM_RUNNER_VM_PORT` | `7443` | Where the bridge listens in the VM |
 | `--vm-start-timeout SECONDS` | `TINFIRM_RUNNER_VM_START_TIMEOUT` | `900` | From the create to the bridge's first connection (30 to 3600) |
@@ -610,7 +625,11 @@ run is Pro's and Enterprise's too ([ADR-0100](../docs/adr/0100-elastic-runners-i
 
 A VM takes the provider's boot, its own start and its dockerd before a run can begin: minutes. Ready
 VMs wait for runs with all of that done, connected and probed, so a run that takes one starts in
-seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
+seconds. They are Pro's and Enterprise's, and off by default: `--pool-max-ready` above 0 turns them
+on, and the host then lists `sandbox.pool`, which a server refuses without elastic runners
+([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). Their code is
+`ee/runner/tinfirm-runner-host/src/ready_vms.rs`; it keeps VMs that the core's pool (`pool.rs`)
+creates, probes, hands to runs and deletes ([ADR-0098](../docs/adr/0098-ready-vms.md); the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#63-ready-sandboxes-a-start-in-seconds),
 §6.3).
 
@@ -621,8 +640,8 @@ seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
   `host.config.pool`; this host follows the change on time by itself, and starts filling a window
   early by its cold start (the 90th percentile of its last 20, 5 minutes before the first, at most
   `--pool-lead-time-max`). `--pool-headroom N` keeps one ready VM per N busy ones. The operator's
-  `--pool-max-ready` is the ceiling of both, and 0 turns ready VMs off. Ready VMs count against
-  `--max-concurrent-runs` (and the server's lower value, if any): with all slots busy, none waits.
+  `--pool-max-ready` is the ceiling of both, and 0, the default, turns ready VMs off. Ready VMs
+  count against `--max-concurrent-runs` (and the server's lower value, if any): with all slots busy, none waits.
   While this host drains, after 15 minutes without the server, and when it stops, it keeps none.
 - **What Tinfirm sees.** This host reports its ready, starting and busy VMs, its cold start and the
   runs of the last 24 hours that took a ready VM or started cold (`host.pool.status`), at most every 10
@@ -649,7 +668,7 @@ seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
 
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
-| `--pool-max-ready N` | `TINFIRM_RUNNER_POOL_MAX_READY` | `4` | The most ready VMs Tinfirm may ask for; 0 turns them off |
+| `--pool-max-ready N` | `TINFIRM_RUNNER_POOL_MAX_READY` | `0` | The most ready VMs Tinfirm may ask for; 0 turns them off. Above 0, the server needs elastic runners |
 | `--pool-runtime claude\|codex\|pi\|opencode\|any` | `TINFIRM_RUNNER_POOL_RUNTIME` | `claude` | The runtime whose image the ready VMs run; `any`: the image with every runtime, for every run |
 | `--pool-headroom BUSY` | `TINFIRM_RUNNER_POOL_HEADROOM` | `0` | One more ready VM per this many busy ones; 0 is off |
 | `--pool-max-age MINUTES` | `TINFIRM_RUNNER_POOL_MAX_AGE` | `360` | A ready VM older than this is replaced (10 to 10080) |
@@ -659,16 +678,19 @@ seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
 **A driver** is a program that this host starts and talks to with JSON-RPC 2.0 on stdin and stdout,
 one message per line: `hello`, `verify`, `create`, `describe`, `delete` and `list`
 ([ADR-0096](../docs/adr/0096-a-vm-per-run.md) has the methods). It holds the provider's credential, and
-deletes only VMs that carry this host's label. You can write one for another provider; a driver must
-keep the contract C1 to C7 of the
+deletes only VMs that carry this host's label. You can write one for another provider or your own
+hypervisor, in any edition: such a host lists no paid feature. A driver must keep the contract C1 to
+C7 of the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#62-any-provider-one-contract-a-driver-per-provider).
 
 ### In Kubernetes
 
 The Helm chart runs one host as a pod with `runner.enabled` ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
 decision 8; [the operator guide](../docs-site/content/operator-guide/helm.md#the-runner-pod)): a company host
-of one declared company, with `--executor vm --vm-driver digitalocean`, which the server registers
-itself from `TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_NAME` and `_TOKEN`. The pod runs the image
+of one declared company, which the server registers itself from
+`TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_NAME` and `_TOKEN`. It runs `--executor vm --vm-driver
+digitalocean`, which is Pro's and Enterprise's, and keeps no ready VMs unless
+`runner.pool.maxReady` is above 0. The pod runs the image
 `ghcr.io/flowtivo/tinfirm-runner-host` (the last stage of `deploy/release/runner-musl.Dockerfile`:
 this binary, git, the CA certificates and `kill`, user 10001), with `run --server <public URL>
 --token-file <the mounted Secret>`, its data directory on a volume, so that a restarted pod takes its
@@ -677,7 +699,8 @@ the same as below; the firewall lets in the cluster's addresses.
 
 ### DigitalOcean
 
-`--vm-driver digitalocean` creates a Droplet per run.
+`--vm-driver digitalocean` creates a Droplet per run. The driver and its Packer template are Pro's and
+Enterprise's (`ee/runner/`); the VM image's recipe that the template runs is `runner/images/vm`.
 
 1. **A VPC of the sandboxes' own** in the region, not the region's default VPC. Peer it with the VPC
    of this host (for example a DOKS cluster's), so that this host reaches the Droplets on their VPC
@@ -700,7 +723,7 @@ the same as below; the firewall lets in the cluster's addresses.
    export DIGITALOCEAN_TOKEN=...   # may create Droplets and snapshots; not the driver's token
    packer init ee/runner/images/vm/digitalocean.pkr.hcl
    packer build -var binary=./tinfirm-runner-host -var version=1.0.0 -var region=fra1 \
-     ee/runner/images/vm/digitalocean.pkr.hcl
+     ee/runner/images/vm/digitalocean.pkr.hcl   # from the repository's root
    ```
 
    `region` has no default: build in a region where the sandboxes run. A snapshot is only in the
@@ -756,8 +779,8 @@ At start the driver checks, and `run` refuses to start on any finding:
 
 Before each create it reads the firewall and the VPC's range again (at most once a minute). It gives
 a Droplet no SSH key, no IPv6, no monitoring, no backups and no DigitalOcean agent, and tags it
-`tinfirm-sandbox`, `tinfirm-host:<this host's id>` and `tinfirm-vm:<the VM's id>` (a VM is created
-for no run: [Ready VMs](#ready-vms)); this host's log names the run that takes it. It deletes a Droplet
+`tinfirm-sandbox`, `tinfirm-host:<this host's id>` and `tinfirm-vm:<the VM's id>` (a VM's user data
+names no run); this host's log names the run that takes it. It deletes a Droplet
 only by its id, after reading it: it must carry `tinfirm-sandbox` and this host's tag, and never a
 cluster's tag (`k8s…`). It never deletes by tag. Every create and delete is in this host's log with
 the Droplet's id.
@@ -847,8 +870,9 @@ Three numbers, each moved by something else
 | The features | `hello.features` | A new optional capability within protocol 2, whatever release ships it | Sends a feature's frames only to a host that lists it |
 
 **This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
-It uses the features `run.steer`, `run.skills`, `session.bundle`, `sandbox.pool` and
-`sandbox.bridge` (the last two only with elastic runners, Pro and Enterprise). A host that lists none of them
+It uses the features `run.steer`, `run.skills`, `session.bundle`, `sandbox.bridge`, `sandbox.pool`
+and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
+[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). A host that lists none of them
 still takes turns; it only misses what they add.
 
 **Every host of protocol 2** has the always-on [model proxy](#model-proxy) and sends its own
@@ -1889,6 +1913,14 @@ cargo fmt --check
   `tinfirm-runner-fake:test` and repeats the key scenarios in real containers, including the
   real binary receiving SIGTERM, SIGHUP and `drain`. The Docker tests skip themselves when
   Docker is not reachable, or with `TINFIRM_SKIP_DOCKER_TESTS=1`.
+- `bridge_runs.rs` runs the agent over the [sandbox bridge](#sandbox-bridge) with the local test
+  executor, and `vm_runs.rs` with the VM executor and the fake driver
+  (`tests/fake-vm-driver/fake-driver.mjs`), whose "VMs" are this binary as `bridge` on a loopback
+  address of their own; every run there starts cold. `TINFIRM_TEST_SANDBOX_BRIDGE=1` or
+  `TINFIRM_TEST_VM_EXECUTOR=1` runs `local_runs.rs` again over the bridge or in such VMs. The paid
+  features' tests are under `ee/runner/tinfirm-runner-host/tests` and run with the rest:
+  `pool_runs.rs` (ready VMs) and `digitalocean_runs.rs` (DigitalOcean's driver and the feature
+  `sandbox.elastic`).
 - The git proxy tests (`tests/git_proxy.rs` and the `fetch` scenario in `local_runs.rs` and
   `docker_runs.rs`), the mirror tests (`tests/mirror.rs`) and the multi-repository runs serve
   repositories over smart HTTP with `git http-backend` and require the host's `Authorization`

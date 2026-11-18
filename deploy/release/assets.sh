@@ -113,7 +113,7 @@ cmd_package() {
   # The licence and the notices of the crates the binary is built with (ADR-0082), the same
   # for every target: runner/THIRD-PARTY-LICENSES.txt, which CI keeps as Cargo.lock gives it.
   cp "$ROOT/LICENSE" "$ROOT/runner/THIRD-PARTY-LICENSES.txt" "$stage/$name/"
-  # The binary holds the paid code of ee/runner (ADR-0100), under ee/LICENSE.
+  # The binary holds the paid code of ee/runner (ADR-0100, ADR-0114), under ee/LICENSE.
   mkdir "$stage/$name/ee"
   cp "$ROOT/ee/LICENSE" "$stage/$name/ee/LICENSE"
   chmod 644 "$stage/$name/LICENSE" "$stage/$name/THIRD-PARTY-LICENSES.txt" "$stage/$name/ee/LICENSE"

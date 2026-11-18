@@ -55,10 +55,9 @@ pub fn local_executor() -> Executor {
     }
 }
 
-/// The fake VM driver (`ee/runner/tinfirm-runner-host/tests/fake-vm-driver`, the driver protocol of ADR-0096).
+/// The fake VM driver (`tests/fake-vm-driver`, the driver protocol of ADR-0096).
 pub fn fake_vm_driver_script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../ee/runner/tinfirm-runner-host/tests/fake-vm-driver/fake-driver.mjs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-vm-driver/fake-driver.mjs")
 }
 
 /// The VM executor with the fake driver, whose "VMs" are this crate's binary as `bridge` on a
@@ -94,6 +93,7 @@ pub fn vm_options(log: &Path, env: &[(&str, &str)]) -> tinfirm_runner_host::vm::
             program: PathBuf::from("node"),
             args: vec![fake_vm_driver_script().to_string_lossy().into_owned()],
             env: driver_env,
+            elastic: false,
         },
         template.to_string(),
     );
@@ -1143,9 +1143,13 @@ pub struct HostSetup {
     pub egress: Option<EgressSettings>,
     /// The sandboxes' settings (`run --sandbox-*`); `None`: the defaults.
     pub sandbox: Option<SandboxSettings>,
-    /// The VM pool's ceilings and tuning (`run --pool-*`, ADR-0098); `None`: the defaults.
-    pub pool: Option<tinfirm_runner_host::pool::PoolOptions>,
+    /// Sets more of the host's options, after all of the above: the paid features' tests
+    /// (`ee/runner/tinfirm-runner-host/tests`) set theirs here.
+    pub options: Option<SetOptions>,
 }
+
+/// More of a test host's options ([`HostSetup::options`]).
+pub type SetOptions = Box<dyn FnOnce(&mut HostOptions) + Send>;
 
 /// With this variable set, every test host runs its agents over the sandbox bridge
 /// (`run --sandbox-bridge`, ADR-0095): the local tests then run with the files and the
@@ -1210,7 +1214,7 @@ impl HostSetup {
             bridge,
             egress: None,
             sandbox: None,
-            pool: None,
+            options: None,
         }
     }
 
@@ -1331,9 +1335,6 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
     if let Some(sandbox) = setup.sandbox {
         opts.sandbox = sandbox;
     }
-    if let Some(pool) = setup.pool {
-        opts.pool = pool;
-    }
     if let Some(binary) = setup.bridge {
         let mut bridge = BridgeOptions::new(binary);
         bridge.connect_timeout = Duration::from_secs(30);
@@ -1357,6 +1358,9 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
     opts.reconnect_min_backoff = Duration::from_millis(100);
     opts.reconnect_max_backoff = Duration::from_millis(500);
     opts.cancel_grace = Duration::from_secs(5);
+    if let Some(options) = setup.options {
+        options(&mut opts);
+    }
     let mut config = HostConfig::load(&paths).unwrap();
     // As `run --protocol-version` would.
     config.protocol_version = setup.protocol_version;

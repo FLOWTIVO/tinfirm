@@ -701,10 +701,15 @@ pub mod feature {
     /// and [`super::HostPoolStatus`].
     pub const SANDBOX_POOL: &str = "sandbox.pool";
     /// The host runs its agents over the sandbox bridge (ADR-0095): with `run
-    /// --sandbox-bridge`, and always with a VM per run (ADR-0096). It adds no frame: it tells a
-    /// server whose licence does not hold elastic runners (ADR-0100) to refuse the hello with
-    /// `EDITION_REQUIRED` ([`EDITION_REQUIRED`](super::EDITION_REQUIRED)).
+    /// --sandbox-bridge`, and always with a VM per run (ADR-0096). It adds no frame. The
+    /// bridge is in the core (ADR-0114).
     pub const SANDBOX_BRIDGE: &str = "sandbox.bridge";
+    /// The host's VM driver is one of the runner host's paid ones (ADR-0114): a provider's,
+    /// such as `--vm-driver digitalocean`. It adds no frame: it tells a server whose licence
+    /// does not hold elastic runners (ADR-0100) to refuse the hello with `EDITION_REQUIRED`
+    /// ([`EDITION_REQUIRED`](super::EDITION_REQUIRED)). An operator's own driver does not
+    /// list it.
+    pub const SANDBOX_ELASTIC: &str = "sandbox.elastic";
 }
 
 /// `error.code` before `welcome`: the server's licence does not hold a feature the hello
