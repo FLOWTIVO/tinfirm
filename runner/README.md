@@ -629,7 +629,9 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 - **The user data holds no credential.** It holds the bridge's settings (the VM's id, its one-time
   ticket, this host's certificate pin), the runner image of a runtime, the sandbox's own settings
   (`--sandbox-env`), and the URL of the VM's own egress proxy listener. Anything in the VM can read it
-  from the metadata service.
+  from the metadata service. In the VM, `vm-boot` reads it from the source that the kernel command
+  line names (`tinfirm.user-data=disk:/dev/vdb`: a sandbox node's VM gets it on a small read-only
+  disk, ADR-0112), or else from DigitalOcean's metadata service; one VM image serves both.
 - **Always on:** the sandbox bridge, and the [egress proxy](#egress-proxy), which is the VM's only way
   to the network (`--egress-allow` works as with Docker). The tier is `microvm`.
 - **No images on this host**: the VM's image holds the runner images, built when the image is

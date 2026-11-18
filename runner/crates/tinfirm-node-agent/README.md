@@ -17,7 +17,7 @@ It is a binary of its own, licensed under MIT like the rest of `runner/` outside
 | A single machine: the runner host and the node agent on one machine (ADR-0112 decision 5) | Planned. The local-socket transport is built. The single machine's own firewall table is not (refuse every packet from a VMM's user, and from the listener's user but for its port; check it before each VM). Until it is, the helper refuses a configuration whose control host is the node itself (its address or loopback): the prerouting DNAT never sees a connection that the node's own stack makes, and an output-hook DNAT matched on the source address alone would admit every local user |
 | `verify` trying the node's own egress (the server, the model gateway, the code hosts, a metadata service) | Planned: the listener has no network but its sockets, so this needs a design of its own |
 | The runner host's `node` driver (`--vm-driver node`), which relays the driver protocol to this listener | Planned, in the runner host |
-| `vm-boot` reading the user data from the user-data disk | Planned, in the runner host |
+| `vm-boot` reading the user data from the user-data disk | Built, in the runner host (`vm_boot.rs`), tested on files standing in for the device; not run in a real guest |
 | Metrics for the operator | Planned. The agent logs to stderr (the service manager's journal) |
 | The service units, the Ansible role, the release's signed binary | Planned |
 
@@ -294,7 +294,9 @@ It then opens `<spool>/<id>.userdata`, a name derived from the id and never take
 | One hard link | A file with a second name, or none |
 | 1 to 65536 bytes | An empty or larger file |
 
-Only then does it read the bytes, at most 65537, and refuse them if their count differs from the `fstat`'s. It never parses them or uses them as a name. The Linux backend puts them on a read-only disk of the VM: `TFUDATA1`, the length as 8 bytes little-endian, the bytes, and zeros to a multiple of 4096 (`vm-boot` reading it is planned).
+Only then does it read the bytes, at most 65537, and refuse them if their count differs from the `fstat`'s. It never parses them or uses them as a name. The Linux backend puts them on a read-only disk of the VM: `TFUDATA1`, the length as 8 bytes little-endian, the bytes, and zeros to a multiple of 4096.
+
+**Where the guest finds it.** The disk is the VM's second drive, after the root disk, so the guest's `/dev/vdb`. The VMM's kernel command line names it: `tinfirm.user-data=disk:/dev/vdb` (`USER_DATA_CMDLINE` in `src/linux.rs`). `vm-boot` in the guest, run with its default `--user-data auto`, takes the source from that entry, and reads the disk: at most one byte more than the largest disk (64 KiB of user data and the header, padded to 4096), refusing a wrong magic, a length of 0, beyond 64 KiB or beyond the disk, and any byte after the user data that is not zero (`runner/crates/tinfirm-runner-host/src/vm_boot.rs`, `read_disk`). Without that entry, `vm-boot` asks DigitalOcean's metadata service, as before: one image serves both. The two crates must not link each other, so the layout's constants are written in both; a test on each side checks the same fixture bytes, so that they cannot drift apart.
 
 ## The Linux backend (planning built, execution planned)
 

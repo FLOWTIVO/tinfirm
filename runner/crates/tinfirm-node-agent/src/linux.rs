@@ -36,10 +36,20 @@ pub const NS_VETH: &str = "veth0";
 pub const NS_TAP: &str = "tap0";
 /// What the VMM's process may use beyond the guest's memory, in MiB.
 pub const VMM_OVERHEAD_MIB: u64 = 128;
-/// The user-data disk's header: a magic and the length, little-endian.
+/// The user-data disk's header: a magic and the length, little-endian. `vm-boot` in the guest
+/// reads this layout (`runner/crates/tinfirm-runner-host/src/vm_boot.rs`, `read_disk`); the two
+/// crates must not link each other, so the constants are written twice, and a test on each side
+/// checks the same fixture bytes.
 pub const USER_DATA_MAGIC: &[u8; 8] = b"TFUDATA1";
 /// The user-data disk is padded with zeros to a multiple of this.
 pub const DISK_BLOCK: usize = 4096;
+/// The guest's device of the user-data disk: Firecracker attaches the drives as virtio block
+/// devices in the order of its configuration, the root disk first (`/dev/vda`), so the
+/// user-data disk is the second.
+pub const USER_DATA_DEVICE: &str = "/dev/vdb";
+/// The kernel command line's entry that tells `vm-boot` where the user data is
+/// (`vm_boot.rs`, `CMDLINE_KEY`: `tinfirm.user-data=disk:/dev/vdb`).
+pub const USER_DATA_CMDLINE: &str = "tinfirm.user-data=disk:/dev/vdb";
 
 /// The jailer's argument vector: the VMM as the slot's own user and group, in a chroot of its
 /// own, in the VM's network namespace and a new PID namespace, under a cgroup with the
@@ -92,14 +102,15 @@ pub fn guest_mac(guest: Ipv4Addr) -> String {
 }
 
 /// The VMM's configuration file (`--config-file`), with paths inside the chroot. The guest's
-/// address comes on its kernel's command line, so the guest needs no DHCP.
+/// address comes on its kernel's command line, so the guest needs no DHCP, and so does where
+/// `vm-boot` finds the user data ([`USER_DATA_CMDLINE`]).
 pub fn firecracker_config(plan: &VmPlan) -> Value {
     let a = &plan.addresses;
     json!({
         "boot-source": {
             "kernel_image_path": KERNEL,
             "boot_args": format!(
-                "console=ttyS0 reboot=k panic=1 pci=off ip={}::{}:255.255.255.252::eth0:off",
+                "console=ttyS0 reboot=k panic=1 pci=off ip={}::{}:255.255.255.252::eth0:off {USER_DATA_CMDLINE}",
                 a.guest, a.tap
             ),
         },
@@ -479,7 +490,14 @@ mod tests {
         assert_eq!(c["network-interfaces"][0]["guest_mac"], "06:00:0a:e7:00:06");
         assert_eq!(
             c["boot-source"]["boot_args"],
-            "console=ttyS0 reboot=k panic=1 pci=off ip=10.231.0.6::10.231.0.5:255.255.255.252::eth0:off"
+            "console=ttyS0 reboot=k panic=1 pci=off ip=10.231.0.6::10.231.0.5:255.255.255.252::eth0:off tinfirm.user-data=disk:/dev/vdb"
+        );
+        // The user-data disk is the second drive, so the guest's /dev/vdb, which the command
+        // line names for `vm-boot`.
+        assert_eq!(drives[1]["drive_id"], "userdata");
+        assert_eq!(
+            USER_DATA_CMDLINE,
+            format!("tinfirm.user-data=disk:{USER_DATA_DEVICE}")
         );
         // Every path is inside the chroot: none names a file of the node.
         let text = c.to_string();
@@ -618,6 +636,18 @@ mod tests {
             .collect();
         assert_eq!(new_accepts.len(), 1, "{ns}");
         assert!(!ns.contains("iifname \"tap0\""), "{ns}");
+    }
+
+    /// The fixture of the user-data disk's layout, the same bytes as `vm-boot`'s test of
+    /// `read_disk_bytes` (`runner/crates/tinfirm-runner-host/src/vm_boot.rs`): the magic, the
+    /// length 13 little-endian, `{"tinfirm":1}`, and zeros to 4096 bytes.
+    const DISK_FIXTURE_HEAD: &[u8] = b"TFUDATA1\x0d\x00\x00\x00\x00\x00\x00\x00{\"tinfirm\":1}";
+
+    #[test]
+    fn the_user_data_disk_is_the_layout_that_vm_boot_reads() {
+        let mut fixture = DISK_FIXTURE_HEAD.to_vec();
+        fixture.resize(4096, 0);
+        assert_eq!(user_data_disk(br#"{"tinfirm":1}"#).unwrap(), fixture);
     }
 
     #[test]

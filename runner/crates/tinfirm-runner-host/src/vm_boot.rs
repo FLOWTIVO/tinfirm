@@ -1,6 +1,7 @@
 //! `vm-boot`, in a sandbox VM (ADR-0096): the VM's image starts it once at boot
 //! (`runner/images/vm/tinfirm-vm-boot.service`). It reads the VM's user data
-//! ([`crate::vm::UserData`]) from the metadata service or a file, and runs the run's container
+//! ([`crate::vm::UserData`]) from the metadata service, a file, or the user-data disk of a sandbox
+//! node's VM (ADR-0112: [`read_disk`]), and runs the run's container
 //! from the image the user data names, which the VM's image holds: this binary, mounted
 //! read-only, as `bridge`, listening for the runner host, on the VM's network. The bridge
 //! then starts the image's own command (`TINFIRM_BRIDGE_COMMAND`) when the host says so.
@@ -27,8 +28,104 @@ pub const CONTAINER: &str = "tinfirm-sandbox";
 const FETCH_WAIT: Duration = Duration::from_secs(180);
 const MAX_USER_DATA: usize = 64 * 1024;
 
-/// The user data: from `source`, an `http://` URL (a metadata service) or a file.
+// ----- the user-data disk (ADR-0112) ---------------------------------------------------------
+//
+// A sandbox node's VM gets its user data on a small read-only disk, so that the node agent
+// serves nothing in the VM's network. The node agent writes it
+// (`runner/crates/tinfirm-node-agent/src/linux.rs`, `user_data_disk`), and the two crates must
+// not link each other: these constants are the same as that file's, and a test on each side
+// reads or writes the same fixture bytes, so that the two cannot drift apart.
+
+/// The disk's first 8 bytes.
+pub const DISK_MAGIC: &[u8; 8] = b"TFUDATA1";
+/// The disk is the magic, the length as 8 bytes little-endian, the bytes, and zeros to a
+/// multiple of this.
+pub const DISK_BLOCK: usize = 4096;
+/// A `--user-data` source that is a user-data disk: `disk:/dev/vdb`.
+pub const DISK_SOURCE: &str = "disk:";
+/// The default `--user-data`: the source the kernel's command line names
+/// ([`CMDLINE_KEY`]), which a sandbox node's VMM writes, or else DigitalOcean's metadata
+/// service. One image serves both (ADR-0112, "One image for cloud and node").
+pub const AUTO: &str = "auto";
+/// The kernel command line's entry that names the user data's source:
+/// `tinfirm.user-data=disk:/dev/vdb`. The node agent's Firecracker configuration writes it
+/// (`runner/crates/tinfirm-node-agent/src/linux.rs`, `firecracker_config`).
+pub const CMDLINE_KEY: &str = "tinfirm.user-data=";
+
+/// The largest user-data disk: the header and the most user data, padded.
+pub const fn max_disk_len() -> usize {
+    (16 + MAX_USER_DATA).div_ceil(DISK_BLOCK) * DISK_BLOCK
+}
+
+/// The user data on a user-data disk's bytes: a disk of at most [`max_disk_len`] bytes that
+/// starts with [`DISK_MAGIC`], whose length is 1 to 64 KiB and within the disk, and whose every
+/// byte after the user data is zero.
+pub fn read_disk_bytes(disk: &[u8]) -> Result<String> {
+    if disk.len() > max_disk_len() {
+        bail!("the user-data disk is larger than {} bytes", max_disk_len());
+    }
+    if disk.len() < 16 || &disk[..8] != DISK_MAGIC {
+        bail!("the user-data disk does not start with {DISK_MAGIC:?}");
+    }
+    let len = u64::from_le_bytes(disk[8..16].try_into().expect("8 bytes"));
+    if len == 0 || len > MAX_USER_DATA as u64 {
+        bail!("the user-data disk's length is {len}, not 1 to {MAX_USER_DATA}");
+    }
+    let end = 16 + len as usize;
+    if end > disk.len() {
+        bail!("the user-data disk's length {len} is beyond the disk");
+    }
+    if disk[end..].iter().any(|b| *b != 0) {
+        bail!("the user-data disk has bytes after its user data that are not zero padding");
+    }
+    String::from_utf8(disk[16..end].to_vec()).context("the user data is not UTF-8")
+}
+
+/// The user data on the user-data disk at `path` (a block device, or a file in its place):
+/// reads at most one byte more than [`max_disk_len`].
+pub fn read_disk(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open the user-data disk {}", path.display()))?;
+    let mut disk = Vec::new();
+    file.take(max_disk_len() as u64 + 1)
+        .read_to_end(&mut disk)
+        .with_context(|| format!("cannot read the user-data disk {}", path.display()))?;
+    read_disk_bytes(&disk)
+}
+
+/// The source that the kernel command line `cmdline` names: `disk:/dev/NAME`, NAME of
+/// lower-case letters and digits, and nothing else.
+pub fn source_from_cmdline(cmdline: &str) -> Option<String> {
+    let value = cmdline
+        .split_ascii_whitespace()
+        .find_map(|word| word.strip_prefix(CMDLINE_KEY))?;
+    let device = value.strip_prefix(DISK_SOURCE)?.strip_prefix("/dev/")?;
+    let ok = !device.is_empty()
+        && device.len() <= 32
+        && device
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    ok.then(|| value.to_string())
+}
+
+/// The source of `--user-data`: [`AUTO`] is the one the kernel command line names, or else
+/// DigitalOcean's metadata service; any other is itself.
+pub fn resolve(source: &str, cmdline: Option<&str>) -> String {
+    if source != AUTO {
+        return source.to_string();
+    }
+    cmdline
+        .and_then(source_from_cmdline)
+        .unwrap_or_else(|| DIGITALOCEAN_USER_DATA.to_string())
+}
+
+/// The user data: from `source`, an `http://` URL (a metadata service), a user-data disk
+/// (`disk:PATH`) or a file.
 pub async fn fetch(source: &str) -> Result<String> {
+    if let Some(path) = source.strip_prefix(DISK_SOURCE) {
+        return read_disk(Path::new(path));
+    }
     if !source.starts_with("http://") {
         return std::fs::read_to_string(source)
             .with_context(|| format!("cannot read the user data from {source}"));
@@ -225,7 +322,9 @@ pub async fn run(source: &str, bridge: Option<PathBuf>) -> Result<i32> {
         Some(path) => path,
         None => std::env::current_exe().context("cannot find this executable")?,
     };
-    let data = parse(&fetch(source).await?)?;
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok();
+    let source = resolve(source, cmdline.as_deref());
+    let data = parse(&fetch(&source).await?)?;
     let command = image_command(&data.image)?;
     let DockerRun { args, env } = docker_run(&data, &bridge, &command)?;
     eprintln!(
@@ -354,6 +453,94 @@ mod tests {
         );
         assert!(!line.contains("--cap-drop"), "{line}");
         assert!(env.contains(&(AGENT_USER_ENV.to_string(), USER.to_string())));
+    }
+
+    /// The fixture of the user-data disk's layout, the same bytes as the node agent's test of
+    /// `user_data_disk` (`runner/crates/tinfirm-node-agent/src/linux.rs`): the magic, the
+    /// length 13 little-endian, `{"tinfirm":1}`, and zeros to 4096 bytes.
+    const DISK_FIXTURE_HEAD: &[u8] = b"TFUDATA1\x0d\x00\x00\x00\x00\x00\x00\x00{\"tinfirm\":1}";
+
+    fn disk_fixture() -> Vec<u8> {
+        let mut disk = DISK_FIXTURE_HEAD.to_vec();
+        disk.resize(4096, 0);
+        disk
+    }
+
+    #[test]
+    fn the_user_data_disk_of_the_node_agents_layout_is_read() {
+        assert_eq!(
+            read_disk_bytes(&disk_fixture()).unwrap(),
+            r#"{"tinfirm":1}"#
+        );
+        // The most user data, padded to the block: read.
+        let mut full = DISK_MAGIC.to_vec();
+        full.extend_from_slice(&(MAX_USER_DATA as u64).to_le_bytes());
+        full.extend(std::iter::repeat_n(b'x', MAX_USER_DATA));
+        full.resize(max_disk_len(), 0);
+        assert_eq!(read_disk_bytes(&full).unwrap().len(), MAX_USER_DATA);
+    }
+
+    #[test]
+    fn a_user_data_disk_out_of_its_layout_is_refused() {
+        let with = |change: &dyn Fn(&mut Vec<u8>)| {
+            let mut disk = disk_fixture();
+            change(&mut disk);
+            read_disk_bytes(&disk).unwrap_err().to_string()
+        };
+        assert!(with(&|d| d[0] = b'X').contains("does not start"));
+        assert!(with(&|d| d.truncate(10)).contains("does not start"));
+        // A length beyond the disk, of none, beyond 64 KiB.
+        assert!(
+            with(&|d| d[8..16].copy_from_slice(&5000u64.to_le_bytes())).contains("beyond the disk")
+        );
+        assert!(with(&|d| d[8..16].copy_from_slice(&0u64.to_le_bytes())).contains("not 1 to"));
+        assert!(
+            with(&|d| d[8..16].copy_from_slice(&(MAX_USER_DATA as u64 + 1).to_le_bytes()))
+                .contains("not 1 to")
+        );
+        assert!(with(&|d| d[8..16].copy_from_slice(&u64::MAX.to_le_bytes())).contains("not 1 to"));
+        // Trailing bytes that are not zero padding, at once after the data and at the end.
+        assert!(with(&|d| d[29] = b' ').contains("not zero padding"));
+        assert!(with(&|d| d[4095] = 1).contains("not zero padding"));
+        // A disk larger than any user-data disk.
+        assert!(with(&|d| d.resize(max_disk_len() + 1, 0)).contains("larger than"));
+        // Not UTF-8.
+        assert!(with(&|d| d[16] = 0xff).contains("not UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn the_user_data_comes_from_a_disk_named_by_the_kernel_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("vdb");
+        std::fs::write(&disk, disk_fixture()).unwrap();
+        let source = format!("{DISK_SOURCE}{}", disk.display());
+        assert_eq!(fetch(&source).await.unwrap(), r#"{"tinfirm":1}"#);
+        // A device larger than any user-data disk is refused, reading no more than the bound.
+        let large = dir.path().join("large");
+        std::fs::write(&large, vec![0u8; max_disk_len() * 4]).unwrap();
+        assert!(
+            read_disk(&large)
+                .unwrap_err()
+                .to_string()
+                .contains("larger than")
+        );
+
+        // `auto`: the kernel command line's source, or DigitalOcean's metadata service.
+        let cmdline =
+            "console=ttyS0 reboot=k panic=1 pci=off tinfirm.user-data=disk:/dev/vdb ip=10.0.0.6";
+        assert_eq!(resolve(AUTO, Some(cmdline)), "disk:/dev/vdb");
+        assert_eq!(resolve(AUTO, Some("console=ttyS0")), DIGITALOCEAN_USER_DATA);
+        assert_eq!(resolve(AUTO, None), DIGITALOCEAN_USER_DATA);
+        assert_eq!(resolve("/tmp/user-data", Some(cmdline)), "/tmp/user-data");
+        for bad in [
+            "tinfirm.user-data=disk:/etc/shadow",
+            "tinfirm.user-data=disk:/dev/../etc/shadow",
+            "tinfirm.user-data=http://169.254.169.254/",
+            "tinfirm.user-data=disk:/dev/",
+            "tinfirm.user-data=disk:/dev/VDB",
+        ] {
+            assert_eq!(source_from_cmdline(bad), None, "{bad}");
+        }
     }
 
     #[tokio::test]

@@ -154,8 +154,10 @@ enum Command {
     /// the sandbox bridge. The VM's image starts it at boot; it is not run by hand.
     #[command(hide = true)]
     VmBoot {
-        /// Where the user data is: the metadata service's URL (http://), or a file.
-        #[arg(long, default_value = tinfirm_runner_host::vm_boot::DIGITALOCEAN_USER_DATA)]
+        /// Where the user data is: the metadata service's URL (http://), a user-data disk
+        /// (`disk:/dev/vdb`), a file, or `auto`: the source that the kernel command line names
+        /// (`tinfirm.user-data=`, a sandbox node's VM) or else DigitalOcean's metadata service.
+        #[arg(long, default_value = tinfirm_runner_host::vm_boot::AUTO)]
         user_data: String,
         /// The bridge binary to mount into the container (default: this one).
         #[arg(long)]
