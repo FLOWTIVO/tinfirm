@@ -35,6 +35,15 @@ pub fn build_id() -> &'static str {
     }
 }
 
+/// The release of a build id: what comes before its build metadata (`+…`), as semantic
+/// versioning compares. The runner host's build id carries a digest of its runner images
+/// there (`1.0.0+images.1a2b3c4d5e6f`), which is no concern of the agent's: two builds of one
+/// release are the same to the wire's check. The `node` driver of the runner host compares the
+/// same way (`runner/crates/tinfirm-runner-host/src/node.rs`).
+pub fn release_of(build: &str) -> &str {
+    build.split('+').next().unwrap_or(build)
+}
+
 /// A JSON-RPC error: its code, and a message that never holds user data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RpcError {
@@ -422,6 +431,17 @@ mod tests {
                 method
             );
         }
+    }
+
+    #[test]
+    fn builds_of_one_release_are_the_same_to_the_check() {
+        assert_eq!(release_of("1.0.0+images.1a2b3c4d5e6f"), "1.0.0");
+        assert_eq!(release_of("1.0.0-rc.2-SNAPSHOT"), "1.0.0-rc.2-SNAPSHOT");
+        assert_eq!(
+            release_of(&format!("{}+images.000000000000", build_id())),
+            release_of(build_id())
+        );
+        assert_ne!(release_of("1.0.1+images.x"), release_of("1.0.0+images.x"));
     }
 
     #[test]

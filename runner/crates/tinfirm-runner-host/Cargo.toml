@@ -54,6 +54,10 @@ libc.workspace = true
 [dev-dependencies]
 jsonschema.workspace = true
 tempfile.workspace = true
+# The node driver's tests start real node agents (listener and helper, on the fake backend) from
+# the agent's library. A dev-dependency only: the runner host's binary does not link the node
+# agent, nor the agent the runner host (ADR-0112 decision 4).
+tinfirm-node-agent.workspace = true
 
 [lints]
 workspace = true

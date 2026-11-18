@@ -2464,6 +2464,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tinfirm-bridge",
+ "tinfirm-node-agent",
  "tinfirm-protocol",
  "tokio",
  "tokio-rustls",

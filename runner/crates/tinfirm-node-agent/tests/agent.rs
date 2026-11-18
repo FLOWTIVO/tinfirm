@@ -110,7 +110,11 @@ async fn helper_half() -> HelperHalf {
     let task = tokio::spawn(async move {
         helper::run(helper).await.unwrap();
     });
-    while !config.socket.exists() {
+    // The socket's file is there a moment before it takes connections: wait for one.
+    while tokio::net::UnixStream::connect(&config.socket)
+        .await
+        .is_err()
+    {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     HelperHalf {
@@ -735,7 +739,10 @@ async fn the_helper_refuses_a_process_of_another_user_and_serves_the_listeners()
         let config = helper_config(root, listener_uid);
         let helper = Helper::start(config.clone(), FakeBackend::new()).unwrap();
         let task = tokio::spawn(async move { helper::run(helper).await.unwrap() });
-        while !config.socket.exists() {
+        while tokio::net::UnixStream::connect(&config.socket)
+            .await
+            .is_err()
+        {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let output = tokio::process::Command::new("/usr/bin/setpriv")

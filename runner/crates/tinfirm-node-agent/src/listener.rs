@@ -651,7 +651,7 @@ impl Listener {
             ));
         }
         let own = wire::build_id();
-        if params.build != own {
+        if wire::release_of(&params.build) != wire::release_of(own) {
             let build: String = params
                 .build
                 .chars()

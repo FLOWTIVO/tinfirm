@@ -30,6 +30,7 @@ one of the two protocols per connection ([Protocol versions](#protocol-versions)
 | `crates/tinfirm-protocol` | Message types of the runner protocol v1 and v2, with schema tests and samples |
 | `crates/tinfirm-bridge` | The [sandbox bridge](#sandbox-bridge): one pinned TLS stream per run between this host and its sandbox |
 | `crates/tinfirm-runner-host` | The `tinfirm-runner-host` binary (and the library the tests drive) |
+| `crates/tinfirm-node-agent` | The `tinfirm-node-agent` binary of a [sandbox node](#sandbox-nodes): an unprivileged listener and a root helper that make and delete jailed Firecracker VMs ([its README](crates/tinfirm-node-agent/README.md)). It links no other crate of the workspace |
 | `images/` | Dockerfiles of the runner images, embedded into the binary, and the recipe of the sandbox VMs' image (`images/vm`) |
 
 All of it is MIT. The binary also compiles in the paid code of elastic runners, from
@@ -661,7 +662,7 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
 | `--executor docker\|vm` | `TINFIRM_RUNNER_EXECUTOR` | `docker` | Containers of this machine's Docker, or a VM per run |
-| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver (Pro and Enterprise), or the command line of your own (split at white space) |
+| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver (Pro and Enterprise), `node`, its driver for [sandbox nodes](#sandbox-nodes) (every edition), or the command line of your own (split at white space) |
 | `--vm-template NAME` | `TINFIRM_RUNNER_VM_TEMPLATE` | | The driver's template: image, size, network and firewall |
 | `--vm-port PORT` | `TINFIRM_RUNNER_VM_PORT` | `7443` | Where the bridge listens in the VM |
 | `--vm-start-timeout SECONDS` | `TINFIRM_RUNNER_VM_START_TIMEOUT` | `900` | From the create to the bridge's first connection (30 to 3600) |
@@ -737,6 +738,70 @@ same; a record without one, such as one written before the field existed, means 
 hypervisor, in any edition: such a host lists no paid feature. A driver must keep the contract C1 to
 C7 of the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#62-any-provider-one-contract-a-driver-per-provider).
+
+### Sandbox nodes
+
+`--vm-driver node` is this binary's second built-in driver
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4). This host is then a
+**control host**: it holds the credentials and runs no agent code, and the VMs run on **sandbox
+nodes**, machines that hold nothing, each with the node agent (`crates/tinfirm-node-agent`). The
+driver relays `verify`, `create`, `describe`, `delete` and `list` to each node agent's listener, over
+TLS with pinned certificates both ways, or over the listener's local socket when the agent runs on
+this host's own machine (a single machine).
+
+**Not usable yet.** The node agent's execution (its jail, network, disks and VMM) is not built: its
+`verify` reports that as a problem, so `run` refuses to start with this driver, and no VM runs through
+it today. The driver, the agent's wire and the agent's checks are built and tested against node agents
+with a fake backend; no run has gone through a node.
+
+- **Editions.** In the core, in every edition: the driver lists no paid feature
+  ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)).
+- **Its configuration**, `/etc/tinfirm/node-driver.json` (or `TINFIRM_NODE_DRIVER_CONFIG`):
+
+  ```json
+  {
+    "nodes": [
+      {
+        "name": "node-1",
+        "address": "10.0.0.20:7700",
+        "nodeSha256": "the SHA-256 of the node's certificate, 64 hex digits",
+        "certificate": "/etc/tinfirm/node-driver/client.crt",
+        "key": "/etc/tinfirm/node-driver/client.key",
+        "templates": ["sandbox-4c8g"]
+      }
+    ],
+    "peerBuild": "warn"
+  }
+  ```
+
+  A node is reached either at `address` (`HOST:PORT`, the listener's TLS port) with the node's
+  certificate pinned by `nodeSha256` and this host's client certificate and key (DER; the key must be
+  this host's user's alone, 0600, or the driver refuses to start), or at `socket`, the listener's local
+  socket, with no certificate. All the nodes are reached one way: sockets and TLS at once are refused,
+  since a runner host has one isolation level. `templates` names the templates of the node agent's own
+  configuration that the node offers; `--vm-template` must be one of them. `tinfirm-node-agent
+  identity` makes a certificate and its key and prints its SHA-256.
+- **Placement.** A new VM goes to the node with the most free slots, by each node's `verify`, among the
+  nodes that offer the template, answer and report no problem; the first in the file's order on a tie.
+- **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer with no
+  problem. A node that does not answer is not counted and is named in the start's log; a node that
+  reports a problem, or a template that no node offers, refuses the start.
+- **Ids.** A VM's id is `<node>:<the agent's id>`, so the driver, which this host starts again at will,
+  finds the node of each.
+- **A node that is down.** `describe` and `delete` of its VMs fail (never `gone`), and the run that
+  waits on one ends as `INFRA` when its timeouts expire. `list` lists the VMs of the nodes that answer:
+  this host deletes only leftovers it is shown, so a node that does not answer keeps its VMs until it
+  answers again.
+- **The port.** Each node publishes each VM's bridge on a port of its own address, which `describe`
+  names (above); the VM's bridge listens on `--vm-port` inside it, and its user data comes on a small
+  read-only disk that `vm-boot` reads.
+- **Builds.** The driver and the agent exchange their build ids when they connect; another release
+  is a warning (`peerBuild: warn`) or refused (`refuse`). The images' digest after `+` is not
+  compared. A connection that was lost (an agent that was restarted) is made again at the next call.
+
+```sh
+tinfirm-runner-host run --executor vm --vm-driver node --vm-template sandbox-4c8g
+```
 
 ### In Kubernetes
 

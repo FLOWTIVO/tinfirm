@@ -178,6 +178,17 @@ enum VmDriverCommand {
         )]
         config: PathBuf,
     },
+    /// Sandbox nodes (ADR-0112): relays to the node agent of each node, over TLS with a pinned
+    /// certificate or over a local socket.
+    Node {
+        /// The driver's configuration: its nodes and their templates (runner/README.md).
+        #[arg(
+            long,
+            env = "TINFIRM_NODE_DRIVER_CONFIG",
+            default_value = "/etc/tinfirm/node-driver.json"
+        )]
+        config: PathBuf,
+    },
 }
 
 /// How `run` creates the sandboxes (docs/archive/v1/CONVENTIONS.md §15.3, ADR-0025).
@@ -360,11 +371,11 @@ struct VmArgs {
         default_value_t = ExecutorChoice::Docker
     )]
     executor: ExecutorChoice,
-    /// The VM driver (--executor vm): `digitalocean`, this binary's own driver, or the command
-    /// line of another (split at white space). It holds the provider's credential; this host
-    /// holds none. DigitalOcean's driver is part of elastic runners (Pro and Enterprise): the
-    /// server refuses a host with it unless its licence holds them. Your own driver needs no
-    /// licence.
+    /// The VM driver (--executor vm): `digitalocean` or `node`, this binary's own drivers, or
+    /// the command line of another (split at white space). It holds the provider's credential;
+    /// this host holds none. DigitalOcean's driver is part of elastic runners (Pro and
+    /// Enterprise): the server refuses a host with it unless its licence holds them. The `node`
+    /// driver (sandbox nodes, ADR-0112) and your own driver need no licence.
     #[arg(long, env = "TINFIRM_RUNNER_VM_DRIVER", value_name = "COMMAND")]
     vm_driver: Option<String>,
     /// The driver's template that every VM is created from (--executor vm): image, size,
@@ -703,12 +714,22 @@ fn main() -> ExitCode {
         return bridge();
     }
     if let Command::VmDriver { driver } = &cli.command {
-        let VmDriverCommand::Digitalocean { config } = driver;
-        let config = config.clone();
-        return in_runtime(async move {
-            tinfirm_runner_host::digitalocean::run(&config).await?;
-            Ok(0)
-        });
+        return match driver {
+            VmDriverCommand::Digitalocean { config } => {
+                let config = config.clone();
+                in_runtime(async move {
+                    tinfirm_runner_host::digitalocean::run(&config).await?;
+                    Ok(0)
+                })
+            }
+            VmDriverCommand::Node { config } => {
+                let config = config.clone();
+                in_runtime(async move {
+                    tinfirm_runner_host::node::run(&config).await?;
+                    Ok(0)
+                })
+            }
+        };
     }
     if let Command::VmBoot { user_data, bridge } = &cli.command {
         let (source, bridge) = (user_data.clone(), bridge.clone());

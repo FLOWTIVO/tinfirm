@@ -29,6 +29,7 @@ pub mod mapper;
 pub mod mcp;
 pub mod mirror;
 pub mod model_proxy;
+pub mod node;
 pub mod outbox;
 pub mod output;
 pub mod paths;

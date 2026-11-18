@@ -84,6 +84,15 @@ impl DriverCommand {
     /// line of the operator's own driver, split at white space (no quoting).
     pub fn parse(value: &str) -> Result<DriverCommand> {
         let value = value.trim();
+        // The driver for sandbox nodes (crate::node, ADR-0112): in the core, and paid nowhere.
+        if value == crate::node::BUILTIN_NODE {
+            return Ok(DriverCommand {
+                program: std::env::current_exe().context("cannot find this executable")?,
+                args: vec!["vm-driver".into(), crate::node::BUILTIN_NODE.into()],
+                env: Vec::new(),
+                elastic: false,
+            });
+        }
         if value == BUILTIN_DIGITALOCEAN {
             return Ok(DriverCommand {
                 program: std::env::current_exe().context("cannot find this executable")?,
@@ -1066,6 +1075,11 @@ mod tests {
         let builtin = DriverCommand::parse("digitalocean").unwrap();
         assert_eq!(builtin.args, ["vm-driver", "digitalocean"]);
         assert_eq!(builtin.program, std::env::current_exe().unwrap());
+        // The driver for sandbox nodes is this binary's too, and in the core: no paid feature.
+        let node = DriverCommand::parse(" node ").unwrap();
+        assert_eq!(node.args, ["vm-driver", "node"]);
+        assert_eq!(node.program, std::env::current_exe().unwrap());
+        assert!(!node.elastic);
         let own = DriverCommand::parse("  /opt/drivers/hetzner --project sandboxes ").unwrap();
         assert_eq!(own.program, PathBuf::from("/opt/drivers/hetzner"));
         assert_eq!(own.args, ["--project", "sandboxes"]);
