@@ -5454,7 +5454,8 @@ paths:
         repository of the agent. The message is the first turn, queued at once; the workspace's systems are bound
         (§5.3). Audited as `conversation.started`. Problems: 400 VALIDATION_FAILED; 403 AGENT_NOT_USABLE; 409
         TOO_MANY_REPOSITORIES (more than 20 without a choice), MODEL_ACCESS_UNAVAILABLE and NO_HOST_FOR_CONVERSATION
-        (with `details.reason`: what can never run). A spent budget or an offline host does not refuse the start: the first turn waits.
+        (with `details.reason`: what can never run, `NO_HOST_OF_LEVEL` when no runner host that may run it reports the
+        level of isolation chosen for the agent, ADR-0113). A spent budget or an offline host does not refuse the start: the first turn waits.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -9332,6 +9333,7 @@ components:
             Whether the people who use the agent, and its triggers' authors, may turn its memory on (ADR-0063; true
             unless its editor forbids it). Memory is opt-in (`AgentSettings.memory`): each person's notes are theirs,
             each trigger's are reviewed by its audience. Not a widening
+        isolation: { $ref: '#/components/schemas/AgentIsolation' }
         status: { $ref: '#/components/schemas/AgentStatus' }
         pausedAt: { type: string, format: date-time, nullable: true }
         ownerPrincipalId: { type: string, format: uuid, nullable: true }
@@ -9440,6 +9442,11 @@ components:
         memoryAllowed:
           type: boolean
           description: Whether its people and triggers may turn its memory on (`Agent.memoryAllowed`); absent is true
+        isolation:
+          allOf: [{ $ref: '#/components/schemas/AgentIsolationSetting' }]
+          description: |
+            Where its runs go (ADR-0113, decision 4); absent is `AUTOMATIC`. A level must be one the company's runner
+            hosts that serve one of its runtimes report (`AgentIsolation.offered`), else 400 VALIDATION_FAILED
         systems:
           type: array
           maxItems: 100
@@ -9487,6 +9494,53 @@ components:
           description: |
             Whether its people and triggers may turn its memory on (`Agent.memoryAllowed`). Forbidding it keeps the
             notes, unread and unwritten, until their owner deletes them or retention does
+        isolation:
+          allOf: [{ $ref: '#/components/schemas/AgentIsolationSetting' }]
+          description: |
+            Where its runs go (ADR-0113, decision 4); absent keeps it. `AUTOMATIC` is always accepted; a level must be
+            one of `AgentIsolation.offered`, else 400 VALIDATION_FAILED. A change makes a version that is not a
+            widening, and reaches every conversation's next turn: one whose session is on a host of another level
+            starts a fresh session of the runtime on the chosen level
+    AgentIsolationSetting:
+      type: string
+      description: |
+        Where an agent's runs go (ADR-0113, decision 4). AUTOMATIC: the strongest level of isolation among the runner
+        hosts that may run each turn, never a weaker one by itself. MACHINE, VM_JAIL, CONTAINER: only hosts that report
+        that level (`RunnerHostIsolation.level`; a host that reports none counts as CONTAINER)
+      enum: [AUTOMATIC, MACHINE, VM_JAIL, CONTAINER]
+    AgentIsolation:
+      type: object
+      description: |
+        The agent's isolation (ADR-0113, decision 4) over the company's runner hosts that serve one of its runtimes,
+        whose levels are what those hosts report, never checked. A member's personal hosts are not counted here, though
+        they count for their owner's own runs
+      required: [setting, offered, chosenUnavailable, outsideStarts, containerWarning]
+      properties:
+        setting: { $ref: '#/components/schemas/AgentIsolationSetting' }
+        level:
+          allOf: [{ $ref: '#/components/schemas/RunnerIsolationLevel' }]
+          nullable: true
+          description: |
+            Where its new conversations' runs go now: the chosen level, or the strongest the company's hosts report;
+            absent when no company host serves its runtimes, or the chosen level is not offered
+        offered:
+          type: array
+          items: { $ref: '#/components/schemas/RunnerIsolationLevel' }
+          description: The levels its editor may choose, strongest first; choosing matters where there are two or more
+        chosenUnavailable:
+          type: boolean
+          description: |
+            A level is chosen that no company host reports any more: new conversations with the agent are refused
+            (409 NO_HOST_FOR_CONVERSATION, reason NO_HOST_OF_LEVEL) and turns of open ones wait until a host reports it
+            or another level is chosen
+        outsideStarts:
+          type: boolean
+          description: |
+            Its runs can start from outside the company: it has a trigger, live or paused, on a tracker, a chat
+            channel or a webhook. Schedules and members' own starts do not count
+        containerWarning:
+          type: boolean
+          description: Its runs can start from outside the company and go to `CONTAINER` hosts
     AgentSystemsRequest:
       type: object
       required: [systems]
@@ -9848,7 +9902,7 @@ components:
       properties:
         runnable: { type: boolean, description: Whether a runner host may take a run of it now }
         eligible: { type: integer, format: int32, description: The runner hosts that may take it }
-        reason: { type: string, nullable: true, description: 'Why none may, for people' }
+        reason: { type: string, nullable: true, description: 'Why none may, for people: also when none of the hosts that may run it reports the level of isolation chosen for the agent (ADR-0113)' }
     AgentReadiness:
       type: object
       required: [settings, payer, systems, hosts]

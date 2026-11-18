@@ -23,6 +23,7 @@ import com.flowtivo.tinfirm.model.ModelAccess;
 import com.flowtivo.tinfirm.model.ModelAccessChoice;
 import com.flowtivo.tinfirm.model.RunModelAccess;
 import com.flowtivo.tinfirm.model.RunModelContext;
+import com.flowtivo.tinfirm.runner.Isolation;
 import com.flowtivo.tinfirm.runner.RunnerConnections;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
@@ -118,6 +119,12 @@ class ReadinessService {
                     if (!effective.skills().isEmpty() && noConnectedHostDeliversSkills(eligible.hosts())) {
                         hostView.runnable(false).reason("The agent has skills, and none of the connected runner hosts "
                                 + "that may run it delivers skills yet: its turns wait for one that does.");
+                    }
+                    // ADR-0113, decision 4: a chosen level none of them reports, as the start refuses it.
+                    if (!eligible.hosts().isEmpty() && Isolation.target(eligible.hosts(),
+                            effective.agent().agent().isolationLevel()) instanceof Isolation.NoHostOfLevel none) {
+                        hostView.runnable(false).reason("This agent's runs go to runner hosts that report "
+                                + none.chosen().wire() + ", and none of the runner hosts that may run it reports it.");
                     }
                 }
                 case Hosts.Eligibility.Nowhere nowhere -> hostView.reason(nowhere.refusal().detail());

@@ -119,6 +119,12 @@ import {
   wideningOf,
 } from './agent-draft';
 import { AGENT_SKILLS_MAX } from '../skills/skill-labels';
+import {
+  chosenUnavailableText,
+  ISOLATION_CHANGE_WARNING,
+  isolationOptions,
+  showsIsolationChoice,
+} from '../../../shared/runner-hosts/isolation-view';
 import { namesText, runtimesText } from './agent-labels';
 import { suggestedRuntime, type SuggestedRuntime } from './default-runtime';
 
@@ -996,6 +1002,51 @@ interface Loaded<T> {
                               </span>
                             </label>
                           </div>
+                          @if (isolation(); as iso) {
+                            <div
+                              class="flex min-w-0 flex-col gap-1.5"
+                              data-field="isolation"
+                              data-testid="agent-isolation"
+                            >
+                              <label class="text-sm font-medium" for="agent-isolation-select"
+                                >Isolation</label
+                              >
+                              <hlm-native-select
+                                class="max-w-full min-w-0"
+                                selectId="agent-isolation-select"
+                                data-testid="agent-isolation-select"
+                                [value]="d.isolation"
+                                (valueChange)="patch({ isolation: $any($event) ?? 'AUTOMATIC' })"
+                              >
+                                @for (o of iso.options; track o.value) {
+                                  <option hlmNativeSelectOption [value]="o.value">
+                                    {{ o.label }}
+                                  </option>
+                                }
+                              </hlm-native-select>
+                              <span class="text-muted-foreground text-xs text-pretty">
+                                Where its turns run. A turn never moves to a weaker host by itself:
+                                it waits for a host of its level.
+                              </span>
+                              @if (iso.unavailable; as notice) {
+                                <p
+                                  class="text-destructive text-sm text-pretty"
+                                  data-testid="agent-isolation-unavailable"
+                                >
+                                  {{ notice }}
+                                </p>
+                              }
+                              @if (d.isolation !== iso.saved && d.isolation !== 'AUTOMATIC') {
+                                <p
+                                  class="text-warning text-sm text-pretty"
+                                  role="status"
+                                  data-testid="agent-isolation-warning"
+                                >
+                                  {{ isolationWarning }}
+                                </p>
+                              }
+                            </div>
+                          }
                         }
 
                         @case ('instructions') {
@@ -2196,6 +2247,21 @@ export class AgentEditor {
     () => this.saved()?.defaultTurnTimeLimitMinutes ?? null,
   );
   protected readonly draft = signal<AgentDraft>(EMPTY_DRAFT);
+
+  /**
+   * The agent's isolation in the editor (ADR-0113): shown where its company's hosts report more
+   * than one level, or one is chosen; a new agent is automatic.
+   */
+  protected readonly isolation = computed(() => {
+    const iso = this.saved()?.isolation;
+    if (!iso || !showsIsolationChoice(iso)) return null;
+    return {
+      options: isolationOptions(iso),
+      saved: iso.setting,
+      unavailable: chosenUnavailableText(iso),
+    };
+  });
+  protected readonly isolationWarning = ISOLATION_CHANGE_WARNING;
   protected readonly errors = signal<EditorErrors>({});
   /** What a refused save named, shown where it stands on the page. */
   protected readonly errorAt = signal<EditorErrorAt | null>(null);

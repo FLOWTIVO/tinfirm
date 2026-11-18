@@ -85,7 +85,9 @@ A conversation that lives in a chat, such as a direct message to the Tinfirm bot
 
 ### The run page
 
-**View run** opens a turn on its own page: the agent and the turn, who it worked for and who paid (**For whom, paid by whom**), the runner host, whether it resumed its earlier session, its tokens and branch, each repository with what git did, the full transcript as it happens, and the agent's **Result** with its **Next steps** and **Open questions**. While the turn is queued or running, **Cancel run** stops it.
+**View run** opens a turn on its own page: the agent and the turn, who it worked for and who paid (**For whom, paid by whom**), the runner host and the level of isolation it reports (**Isolation**), whether it resumed its earlier session, its tokens and branch, each repository with what git did, the full transcript as it happens, and the agent's **Result** with its **Next steps** and **Open questions**. While the turn is queued or running, **Cancel run** stops it.
+
+**Where a turn ran.** When a turn runs elsewhere than the level of isolation the agent's turns go to, the conversation says so. It says once that the conversation stays on the weaker runner host that holds its session, while that host can take its turns. When a turn starts a new session of the runtime on another level, because the agent's level is chosen or the session's host could not take it, the conversation says so each time; the conversation and its workspace are kept.
 
 ## Write while a turn runs
 

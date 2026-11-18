@@ -23,6 +23,8 @@ import com.flowtivo.tinfirm.principal.PrincipalInfo;
 import com.flowtivo.tinfirm.principal.Principals;
 import com.flowtivo.tinfirm.runner.HostCredentialInfo;
 import com.flowtivo.tinfirm.runner.HostScope;
+import com.flowtivo.tinfirm.runner.Isolation;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerActivity;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.shared.access.CompanyAccess;
@@ -356,12 +358,27 @@ class RunnerHostService {
         AfterCommit.run(() -> connections.removePresence(hostId));
     }
 
-    private static AuditRecord.Builder removed(UUID companyId, RunnerHostStore.HostRow host, @Nullable String cause) {
+    /**
+     * {@code runner_host.removed}, with the level the host was placed at (ADR-0113) and, for a company host, whether
+     * no other company host of that level remains ({@code lastOfLevel}): removing the last host of a level changes
+     * where automatic agents' runs go, and leaves an agent with that level chosen without a host. Called after the
+     * company host's row is deleted, or before a machine's.
+     */
+    private AuditRecord.Builder removed(UUID companyId, RunnerHostStore.HostRow host, @Nullable String cause) {
+        IsolationLevel level = host.isolation() != null && host.isolation().level() != null ? host.isolation().level()
+                : IsolationLevel.CONTAINER;
         AuditRecord.Builder audit = AuditRecord
             .company(companyId, AuditAction.RUNNER_HOST_REMOVED, CurrentActor.actor())
             .target(TARGET, host.id())
             .detail("name", host.name())
-            .detail("scope", host.scope().name());
+            .detail("scope", host.scope().name())
+            .detail("isolationLevel", level.name());
+        if (host.scope() == HostScope.COMPANY) {
+            audit.detail("lastOfLevel", store.hostInfos(companyId)
+                .stream()
+                .noneMatch(other -> other.company() && !other.id().equals(host.id())
+                        && Isolation.placedAt(other) == level));
+        }
         if (host.personalHostId() != null) {
             audit.detail("personalHostId", host.personalHostId().toString());
         }

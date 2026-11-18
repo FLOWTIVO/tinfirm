@@ -66,7 +66,7 @@ On every level, a flaw in the runner host's code that reads what a sandbox sends
 
 A host that reports no level shows **Reports no level** with its tier: a runner host before the release that reports levels, or one with a VM driver of the operator's own that states none.
 
-**Where turns run.** An agent's turns go to the strongest level among the hosts that may run them, and a host that reports no level counts as **container**. Within a level, a hardened host comes first. When every host of that level is busy or offline, the turn waits for one: it never goes to a weaker host by itself. A conversation whose session is on a weaker host stays there while that host can take its turns; the run's page says so. Choosing a level for an agent is planned.
+**Where turns run.** An agent's turns go to the strongest level among the hosts that may run them, and a host that reports no level counts as **container**. Within a level, a hardened host comes first. When every host of that level is busy or offline, the turn waits for one: it never goes to a weaker host by itself. A conversation whose session is on a weaker host stays there while that host can take its turns, and says so. Whoever edits an agent can choose a level for it among those the company's hosts report; its turns then run on hosts of that level only.
 
 ## Runs at a time
 
@@ -77,6 +77,8 @@ The change saves at once and applies without a restart. While the host has not c
 ## Remove a host
 
 Choose :lucide-trash-2: on the card, then **Remove runner host**. Its token stops working at once, and it takes no more turns. A host cannot be removed while turns are queued for it or running on it: cancel or let them end first. You can register the machine again later, with a new token.
+
+Removing the last host of a level of isolation changes where turns run: agents set to **Automatic** go to the strongest level that is left, and an agent whose level is chosen keeps it, has its new conversations refused and its turns waiting until a host reports that level again. The audit log records the host's level and whether it was the last of it.
 
 ## Why a turn waits for a host
 
@@ -89,6 +91,7 @@ A turn paid by a budget goes to a company host that is online, not draining, new
 | **Host busy** | Every slot of the hosts that may run it is in use | Wait, raise **Runs at a time** up to the ceiling, or add a host |
 | **Host restarting** | The host drains before it restarts | Wait: it takes turns again after the restart |
 | **No host may run it** | Only personal hosts are connected, and they run their owners' work only | Start a company host |
+| **No host of its level** | The agent's level of isolation is chosen, and no runner host that may run it reports that level | Add or upgrade a host that reports it, or choose another level for the agent |
 | **No host for its skills** | The agent has [skills](../user-guide/skills.md), and none of the connected hosts that may run it delivers skills. A host delivers them when it runs with Docker and speaks runner protocol 2, as the current runner host does; it says so when it connects. | Upgrade the runner host, or start one that delivers skills. The turn never runs without its skills. |
 | **Subscription busy** | The subscription that pays already runs as many turns as its owner allows | Wait |
 

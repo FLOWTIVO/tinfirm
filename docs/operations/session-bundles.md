@@ -11,6 +11,7 @@ Bundles are off by default (`TINFIRM_SESSION_BUNDLES_STORE=none`). Turn them on 
 - Each bundle is sealed on the server with a data key of its own, which the vault's master key (`TINFIRM_VAULT_KEYS`) wraps. The store holds ciphertext only, under random names. Only the server reaches it; runner hosts never do.
 - A bundle goes when a newer one replaces it, when its conversation ends, when its conversation's content is purged (retention, erasure), and 30 days after the conversation's last turn (`TINFIRM_SESSION_BUNDLES_RETENTION`). Worker replicas sweep every hour, and delete the store's objects that no bundle names.
 - Only company hosts get bundles. A member's personal host keeps its homes on its own machine.
+- A kept bundle also moves a turn between levels of isolation ([runner-isolation.md](runner-isolation.md), ADR-0113). Without it, an automatic agent's conversation stays on the weaker host that holds its session, and a turn with a chosen level on another level starts a fresh session. With it, the turn goes to a host of its level that restores bundles, with the session, and the conversation gets no notice.
 
 ## 2. Make a bucket
 

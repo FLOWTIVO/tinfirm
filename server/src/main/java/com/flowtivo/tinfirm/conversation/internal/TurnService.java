@@ -4,9 +4,11 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -29,6 +31,7 @@ import com.flowtivo.tinfirm.conversation.ConversationInfo;
 import com.flowtivo.tinfirm.principal.Principals;
 import com.flowtivo.tinfirm.run.ActiveRun;
 import com.flowtivo.tinfirm.run.NewTurn;
+import com.flowtivo.tinfirm.run.PlacementNote;
 import com.flowtivo.tinfirm.run.QueueReasonCode;
 import com.flowtivo.tinfirm.run.RunEvents;
 import com.flowtivo.tinfirm.run.RunInfo;
@@ -39,6 +42,7 @@ import com.flowtivo.tinfirm.run.TurnReason;
 import com.flowtivo.tinfirm.run.TurnSteered;
 import com.flowtivo.tinfirm.run.Turns;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
+import com.flowtivo.tinfirm.shared.api.model.Run;
 import com.flowtivo.tinfirm.shared.security.AuthenticatedUser;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
@@ -371,8 +375,55 @@ class TurnService implements ConversationTurns, TurnEnded, TurnSteered {
                     steer(conversation, waiting.id(), waiting.authorPrincipalId(), waiting.body());
                 }
             }
+            announcePlacement(event.companyId(), event.conversationId(), event.runId());
         }
         refreshWaiting(event.companyId(), event.conversationId());
+    }
+
+    /**
+     * A turn whose session was on a host of another level of isolation than its agent's runs go to says where it ran
+     * and why (ADR-0113, decision 4; {@code run.placement_note}): a fresh session on the chosen or the stronger level,
+     * each time; staying on the weaker host of its session, once, until a turn runs elsewhere.
+     */
+    private void announcePlacement(UUID companyId, UUID conversationId, UUID runId) {
+        List<RunInfo> ofConversation = runs.ofConversation(companyId, conversationId);
+        RunInfo run = ofConversation.stream().filter(each -> each.id().equals(runId)).findFirst().orElse(null);
+        if (run == null || run.placementNote() == null || run.isolationLevel() == null) {
+            return;
+        }
+        List<RunInfo> earlier = ofConversation.stream()
+            .filter(each -> !each.id().equals(runId) && !each.createdAt().isAfter(run.createdAt()))
+            .toList();
+        RunInfo previous = earlier.stream().filter(each -> each.runnerHostId() != null).reduce((a, b) -> b)
+            .orElse(null);
+        if (run.placementNote() == PlacementNote.STAYED_ON_WEAKER_HOST && previous != null
+                && previous.placementNote() == PlacementNote.STAYED_ON_WEAKER_HOST) {
+            return;
+        }
+        RunInfo session = earlier.stream().filter(each -> each.sessionId() != null).reduce((a, b) -> b).orElse(null);
+        Map<UUID, Run> views = new HashMap<>();
+        runs.views(companyId, conversationId).forEach(view -> views.put(view.getId(), view));
+        String host = hostName(views.get(run.id()));
+        String level = run.isolationLevel().wire();
+        String held = session != null ? hostName(views.get(session.id())) : "another host";
+        String heldLevel = session != null && session.isolationLevel() != null
+                ? " (" + session.isolationLevel().wire() + ")" : "";
+        String text = switch (run.placementNote()) {
+            case STAYED_ON_WEAKER_HOST -> "This turn ran on " + host + ", which reports " + level
+                    + " and holds this conversation's session. The agent's new conversations run on hosts of a "
+                    + "stronger level; this one stays where its session is while that host can take its turns.";
+            case FRESH_SESSION_CHOSEN_LEVEL -> "This turn started a new session of the runtime on " + host + " ("
+                    + level + "): the agent is set to " + level + ", and the session was on " + held + heldLevel
+                    + ". The conversation and its workspace are kept.";
+            case FRESH_SESSION_STRONGER_LEVEL -> "This turn started a new session of the runtime on " + host + " ("
+                    + level + "): " + held + heldLevel + ", which holds the session, could not take the turn, and this "
+                    + "agent's runs do not move to a weaker host. The conversation and its workspace are kept.";
+        };
+        messages.system(companyId, conversationId, text, null);
+    }
+
+    private static String hostName(@Nullable Run view) {
+        return view != null && view.getRunnerHostName() != null ? view.getRunnerHostName() : "a runner host";
     }
 
     @EventListener

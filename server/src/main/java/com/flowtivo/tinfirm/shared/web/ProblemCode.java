@@ -167,7 +167,8 @@ public enum ProblemCode {
     MODEL_ACCESS_UNAVAILABLE,
     /**
      * 409: no registered runner host, connected or not, may run the conversation's credentials ({@code details.reason}:
-     * {@code NO_RUNNER_HOST}, {@code NO_HOST_FOR_CREDENTIALS}, {@code CANNOT_RUN_ANYWHERE}; contract §5.7).
+     * {@code NO_RUNNER_HOST}, {@code NO_HOST_FOR_CREDENTIALS}, {@code CANNOT_RUN_ANYWHERE}, and from ADR-0113
+     * {@code NO_HOST_OF_LEVEL}; contract §5.7).
      */
     NO_HOST_FOR_CONVERSATION,
     /** 409: more than 20 repositories would start the workspace without a choice of them (contract §5.6). */

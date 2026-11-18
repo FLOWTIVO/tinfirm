@@ -36,6 +36,7 @@ import com.flowtivo.tinfirm.audit.AuditAction;
 import com.flowtivo.tinfirm.audit.AuditLog;
 import com.flowtivo.tinfirm.audit.AuditRecord;
 import com.flowtivo.tinfirm.company.GroupMembership;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
 import com.flowtivo.tinfirm.principal.PrincipalInfo;
 import com.flowtivo.tinfirm.principal.PrincipalStatus;
@@ -149,10 +150,13 @@ class AgentService {
 
     private final Skills library;
 
+    private final AgentIsolations isolations;
+
     AgentService(AgentStore store, SettingsStore settings, AgentVersions versions, AgentCallers callers,
             AgentViews views, CompanyAccessGuard companyAccess, Systems systems, GroupMembership groups,
             ObjectProvider<AgentRuns> runs, AuditLog auditLog, ApplicationEventPublisher events, TimeSource time,
-            Principals principals, AgentSkills skills, Skills library) {
+            Principals principals, AgentSkills skills, Skills library, AgentIsolations isolations) {
+        this.isolations = isolations;
         this.skills = skills;
         this.library = library;
         this.principals = principals;
@@ -235,10 +239,12 @@ class AgentService {
             throw duplicateName();
         }
         String handle = handle(companyId, input.getHandle(), name, null);
+        IsolationLevel isolation = input.getIsolation() != null
+                ? isolations.requireOffered(companyId, runtimes, input.getIsolation(), null) : null;
         Instant now = time.now();
         AgentStore.AgentRow row = new AgentStore.AgentRow(Ids.newId(), companyId, name, handle, description,
                 instructions, runtimes, turnTimeLimit, memoryAllowed, owner, AgentStatus.ACTIVE, null, null, 1, null, now,
-                now, caller.userId(), null);
+                now, caller.userId(), isolation);
         try {
             store.insert(row);
         }
@@ -287,8 +293,9 @@ class AgentService {
     }
 
     /**
-     * Renames the agent, or changes its handle, description, instructions, runtimes, time limit of a turn or whether
-     * memory is allowed; absent fields stay. A change of the instructions widens where the ceiling can act (ADR-0103,
+     * Renames the agent, or changes its handle, description, instructions, runtimes, time limit of a turn, whether
+     * memory is allowed or its isolation (ADR-0113: a level its company's hosts report, which widens nothing); absent
+     * fields stay. A change of the instructions widens where the ceiling can act (ADR-0103,
      * {@link AgentVersions}).
      */
     @Transactional
@@ -304,6 +311,9 @@ class AgentService {
         Integer turnTimeLimit = input.getTurnTimeLimitMinutes() != null
                 ? turnTimeLimit(input.getTurnTimeLimitMinutes()) : row.turnTimeLimitMinutes();
         boolean memoryAllowed = input.getMemoryAllowed() != null ? input.getMemoryAllowed() : row.memoryAllowed();
+        IsolationLevel isolation = input.getIsolation() != null
+                ? isolations.requireOffered(companyId, runtimes, input.getIsolation(), row.isolationLevel())
+                : row.isolationLevel();
         String handle = row.handle();
         if (input.getHandle() != null) {
             handle = input.getHandle().isBlank() ? handle(companyId, null, name, agentId)
@@ -332,6 +342,10 @@ class AgentService {
         if (memoryAllowed != row.memoryAllowed()) {
             changed.add("memoryAllowed");
         }
+        // Isolation is not a widening (ADR-0113): it chooses which hosts run the turns, never what they reach.
+        if (isolation != row.isolationLevel()) {
+            changed.add("isolation");
+        }
         if (changed.isEmpty()) {
             return views.agent(edit.caller(), row);
         }
@@ -342,16 +356,19 @@ class AgentService {
         Instant now = time.now();
         try {
             store.update(companyId, agentId, name, handle, description, instructions, runtimes, turnTimeLimit,
-                    memoryAllowed, now);
+                    memoryAllowed, isolation, now);
         }
         catch (DataIntegrityViolationException ex) {
             throw duplicate(ex);
         }
         AgentVersions.Versioned versioned = versions.next(row, before, name, handle, runtimes, null, now);
         AgentStore.AgentRow after = store.findLive(companyId, agentId).orElseThrow();
-        auditLog.record(agentAudit(AuditAction.AGENT_CHANGED, CurrentActor.actor(), after)
-            .detail("changed", changed)
-            .build());
+        AuditRecord.Builder changedAudit = agentAudit(AuditAction.AGENT_CHANGED, CurrentActor.actor(), after)
+            .detail("changed", changed);
+        if (changed.contains("isolation")) {
+            changedAudit.detail("previousIsolation", AgentIsolations.audited(row.isolationLevel()));
+        }
+        auditLog.record(changedAudit.build());
         versions.announce(companyId, agentId, row.version(), versioned, edit.caller().principalId());
         return views.agent(edit.caller(), after);
     }
@@ -957,6 +974,7 @@ class AgentService {
             .detail("runtimes", row.runtimes().stream().map(Enum::name).toList())
             .detail("turnTimeLimitMinutes", row.turnTimeLimitMinutes())
             .detail("memoryAllowed", row.memoryAllowed())
+            .detail("isolation", AgentIsolations.audited(row.isolationLevel()))
             .detail("ownerPrincipalId", row.ownerPrincipalId() != null ? row.ownerPrincipalId().toString() : null)
             .detail("version", row.version());
     }

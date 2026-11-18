@@ -537,7 +537,9 @@ export function scanMatches(
  * `details.reason` (CONVENTIONS §6): package 2's refusal (`GATEWAY_NOT_CONFIGURED`,
  * `PRINCIPAL_INACTIVE`, `SUBSCRIPTION_GONE`, `PERSONAL_HOST_CREDENTIAL_ONLY`, and for a budget
  * `MODEL_REQUIRED`, `MODEL_NOT_ALLOWED`), or why no host may
- * run it (`NO_RUNNER_HOST`, `NO_HOST_FOR_CREDENTIALS`, `CANNOT_RUN_ANYWHERE`). Undefined otherwise.
+ * run it (`NO_RUNNER_HOST`, `NO_HOST_FOR_CREDENTIALS`, `CANNOT_RUN_ANYWHERE`, and `NO_HOST_OF_LEVEL`
+ * for a level of isolation chosen for the agent that no such host reports, ADR-0113). Undefined
+ * otherwise.
  */
 export function problemReason(error: unknown): string | undefined {
   return problemDetail(error, 'reason');

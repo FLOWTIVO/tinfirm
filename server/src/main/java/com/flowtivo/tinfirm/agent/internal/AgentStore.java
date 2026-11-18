@@ -109,12 +109,13 @@ class AgentStore {
         jdbc.sql("""
                 INSERT INTO agent (id, company_id, name, handle, description, instructions, runtimes,
                                    turn_time_limit_minutes, memory_allowed, owner_principal_id, status, version, created_at,
-                                   updated_at, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, CAST(? AS varchar(16)[]), ?, ?, ?, ?, ?, ?, ?, ?)""")
+                                   updated_at, created_by, isolation_level)
+                VALUES (?, ?, ?, ?, ?, ?, CAST(? AS varchar(16)[]), ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
             .params(row.id(), row.companyId(), row.name(), row.handle(), row.description(), row.instructions(),
                     names(row.runtimes()), row.turnTimeLimitMinutes(), row.memoryAllowed(), row.ownerPrincipalId(),
                     row.status().name(),
-                    row.version(), ts(row.createdAt()), ts(row.updatedAt()), row.createdBy())
+                    row.version(), ts(row.createdAt()), ts(row.updatedAt()), row.createdBy(),
+                    row.isolationLevel() != null ? row.isolationLevel().name() : null)
             .update();
     }
 
@@ -211,14 +212,14 @@ class AgentStore {
 
     void update(UUID companyId, UUID id, String name, String handle, @Nullable String description,
             String instructions, List<RuntimeKind> runtimes, @Nullable Integer turnTimeLimitMinutes,
-            boolean memoryAllowed, Instant at) {
+            boolean memoryAllowed, @Nullable IsolationLevel isolationLevel, Instant at) {
         jdbc.sql("""
                 UPDATE agent SET name = ?, handle = ?, description = ?, instructions = ?,
                                  runtimes = CAST(? AS varchar(16)[]), turn_time_limit_minutes = ?, memory_allowed = ?,
-                                 updated_at = ?
+                                 isolation_level = ?, updated_at = ?
                  WHERE company_id = ? AND id = ?""")
-            .params(name, handle, description, instructions, names(runtimes), turnTimeLimitMinutes, memoryAllowed, ts(at),
-                    companyId, id)
+            .params(name, handle, description, instructions, names(runtimes), turnTimeLimitMinutes, memoryAllowed,
+                    isolationLevel != null ? isolationLevel.name() : null, ts(at), companyId, id)
             .update();
     }
 

@@ -205,7 +205,7 @@ ships it.
   level (ADR-0113, decision 4; [CONVENTIONS §15.6](../CONVENTIONS.md#156-runs-and-turns)):
   an agent's runs go to the strongest level among the hosts that may run them and wait for
   those hosts rather than go to a weaker one, and a host without the feature is placed as
-  `container`. Choosing a level for an agent is planned (ADR-0113, decision 4).
+  `container`. An agent's editor can choose a level for it ([runner-isolation.md](runner-isolation.md)).
 - **Ready sandboxes** ([ADR-0098](../adr/0098-ready-vms.md),
   [ADR-0099](../adr/0099-pool-settings.md)). A host with a VM per run (`run --executor vm`)
   and ready VMs lists `sandbox.pool` and reports its operator's `--pool-max-ready` in

@@ -2,6 +2,8 @@ import type {
   Agent,
   AgentCreateRequest,
   AgentHostInput,
+  AgentHostsRequest,
+  AgentIsolationSetting,
   AgentRepositoriesRequest,
   AgentRepositoryAccess,
   AgentRuntime,
@@ -11,7 +13,6 @@ import type {
   AgentSystemInput,
   AgentSystemsRequest,
   AgentToolMode,
-  AgentHostsRequest,
   AgentUpdateRequest,
   SystemKind,
   SystemTool,
@@ -87,6 +88,8 @@ export interface AgentDraft {
   readonly turnTimeLimitMinutes: string;
   /** Whether its people and triggers may turn its memory on (ADR-0063). */
   readonly memoryAllowed: boolean;
+  /** Where its runs go (ADR-0113): automatic, or a level its company's hosts report. */
+  readonly isolation: AgentIsolationSetting;
   readonly systems: readonly DraftSystem[];
   readonly repositories: readonly DraftRepository[];
   readonly hosts: readonly DraftHost[];
@@ -127,6 +130,7 @@ export const EMPTY_DRAFT: AgentDraft = {
   runtimes: ['CLAUDE_CODE'],
   turnTimeLimitMinutes: '',
   memoryAllowed: true,
+  isolation: 'AUTOMATIC',
   systems: [],
   repositories: [],
   hosts: [],
@@ -147,6 +151,7 @@ export function draftOf(agent: Agent | null): AgentDraft {
     turnTimeLimitMinutes:
       agent.turnTimeLimitMinutes != null ? String(agent.turnTimeLimitMinutes) : '',
     memoryAllowed: agent.memoryAllowed !== false,
+    isolation: agent.isolation?.setting ?? 'AUTOMATIC',
     systems: agent.systems.map((s) => ({
       systemId: s.systemId,
       name: s.name,
@@ -349,6 +354,8 @@ export function createRequest(draft: AgentDraft): AgentCreateRequest {
     // Left out for the deployment's default.
     ...(limit !== null ? { turnTimeLimitMinutes: limit } : {}),
     memoryAllowed: draft.memoryAllowed,
+    // Left out for automatic, which a new agent is anyway.
+    ...(draft.isolation !== 'AUTOMATIC' ? { isolation: draft.isolation } : {}),
     systems: systemInputs(draft),
     repositories: repositoryInputs(draft),
     hosts: hostInputs(draft),
@@ -414,6 +421,8 @@ function aboutChange(saved: AgentDraft, draft: AgentDraft): AgentUpdateRequest |
     body.turnTimeLimitMinutes = limit ?? 0;
   }
   if (draft.memoryAllowed !== saved.memoryAllowed) body.memoryAllowed = draft.memoryAllowed;
+  // Isolation is not a widening either (ADR-0113): it chooses which hosts run its turns.
+  if (draft.isolation !== saved.isolation) body.isolation = draft.isolation;
   return Object.keys(body).length > 0 ? body : undefined;
 }
 

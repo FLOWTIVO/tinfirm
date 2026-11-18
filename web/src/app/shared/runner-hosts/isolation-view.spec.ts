@@ -1,5 +1,12 @@
 import type { RunnerHostIsolation } from '../../api/generated/models';
-import { isolationLines, placementText } from './isolation-view';
+import {
+  chosenUnavailableText,
+  containerWarningText,
+  isolationLines,
+  isolationOptions,
+  placementText,
+  showsIsolationChoice,
+} from './isolation-view';
 
 function isolation(overrides: Partial<RunnerHostIsolation> = {}): RunnerHostIsolation {
   return { tiers: ['MICROVM'], level: 'MACHINE', hardened: 'NONE', stated: false, ...overrides };
@@ -63,5 +70,54 @@ describe('a run’s placement (ADR-0113)', () => {
       'level chosen for the agent',
     );
     expect(placementText('MACHINE', 'FRESH_SESSION_STRONGER_LEVEL')).toContain('could not take it');
+  });
+});
+
+describe('an agent’s isolation (ADR-0113)', () => {
+  const base = {
+    setting: 'AUTOMATIC' as const,
+    level: 'MACHINE' as const,
+    offered: ['MACHINE' as const, 'CONTAINER' as const],
+    chosenUnavailable: false,
+    outsideStarts: false,
+    containerWarning: false,
+  };
+
+  it('offers automatic, which names where runs go now, and each level the hosts report', () => {
+    expect(isolationOptions(base).map((o) => o.label)).toEqual([
+      'Automatic: the strongest level your company’s hosts report (now: machine)',
+      'Only hosts that report machine',
+      'Only hosts that report container',
+    ]);
+    expect(showsIsolationChoice(base)).toBe(true);
+    expect(showsIsolationChoice({ ...base, offered: ['CONTAINER'] })).toBe(false);
+    expect(showsIsolationChoice(null)).toBe(false);
+  });
+
+  it('keeps a chosen level no host reports any more, and says so', () => {
+    const gone = {
+      ...base,
+      setting: 'VM_JAIL' as const,
+      level: null,
+      chosenUnavailable: true,
+      offered: ['CONTAINER' as const],
+    };
+    expect(showsIsolationChoice(gone)).toBe(true);
+    expect(isolationOptions(gone).map((o) => o.value)).toEqual([
+      'AUTOMATIC',
+      'CONTAINER',
+      'VM_JAIL',
+    ]);
+    expect(chosenUnavailableText(gone)).toContain(
+      'No company runner host reports vm-jail any more',
+    );
+    expect(chosenUnavailableText(base)).toBeNull();
+  });
+
+  it('warns only where outside input meets a container', () => {
+    expect(containerWarningText({ ...base, containerWarning: true })).toContain(
+      'run in a container',
+    );
+    expect(containerWarningText(base)).toBeNull();
   });
 });
