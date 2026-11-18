@@ -73,13 +73,17 @@ pub enum SandboxRecord {
     /// A container of this machine's Docker, by its name.
     Docker { container: String },
     /// A VM of the VM executor: the driver's id, the host label it was created with, its own
-    /// label, and where its bridge listens.
+    /// label, and where its bridge is dialed: the address, and the port the driver named in
+    /// `describe`. A record without a port (one written before the driver protocol had it, or
+    /// of a driver that names none) means `--vm-port`.
     Vm {
         id: String,
         host: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
         address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
     },
     /// The local test executor's bridge, a process of this machine's.
     Local,
@@ -386,6 +390,36 @@ mod tests {
 
         handle.remove();
         assert!(records.load_all().is_empty());
+    }
+
+    #[test]
+    fn a_vms_record_keeps_its_port_and_one_without_a_port_reads_as_before() {
+        let with = SandboxRecord::Vm {
+            id: "vm-1".into(),
+            host: "h".into(),
+            label: Some("l".into()),
+            address: "10.0.0.20".into(),
+            port: Some(20001),
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains("\"port\":20001"), "{text}");
+        assert_eq!(serde_json::from_str::<SandboxRecord>(&text).unwrap(), with);
+        // A record written before the port existed: no port, which means `--vm-port`.
+        let before: SandboxRecord = serde_json::from_str(
+            r#"{"kind":"vm","id":"vm-1","host":"h","label":"l","address":"10.0.0.20"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            before,
+            SandboxRecord::Vm {
+                id: "vm-1".into(),
+                host: "h".into(),
+                label: Some("l".into()),
+                address: "10.0.0.20".into(),
+                port: None,
+            }
+        );
+        assert!(!serde_json::to_string(&before).unwrap().contains("port"));
     }
 
     #[test]

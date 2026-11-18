@@ -97,9 +97,49 @@ async fn a_run_in_a_vm_clones_runs_commits_pushes_and_deletes_its_vm() {
             assert!(!text.contains(secret), "a credential in the user data");
         }
         assert!(env.get("CLAUDE_CODE_OAUTH_TOKEN").is_none(), "{env}");
+        // The driver named no port: the host dialed `--vm-port`, where the bridge listens.
+        assert!(calls_of(&calls, "published").is_empty(), "{calls:#?}");
         // The run's registration ended with the run.
         let listener = host.host.bridge().await.unwrap().expect("a listener");
         assert_eq!(listener.server.run_count(), 0);
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// ADR-0112: a driver that names a `port` in `describe` (a node publishes each VM's bridge on a
+/// port of its own address) is dialed there, while the bridge in the VM still listens where its
+/// user data says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_described_with_a_port_is_dialed_at_that_port() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        let host = start_host(
+            &server.url,
+            HostSetup::vm(&log, &[("FAKE_VM_PUBLISH", "1")]),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("bridge-env", None);
+        conn.send(spec.to_json());
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        let calls = vm_driver_calls(&log);
+        let published = calls_of(&calls, "published");
+        assert_eq!(published.len(), 1, "{calls:#?}");
+        let port = published[0]["params"]["port"].as_u64().unwrap();
+        assert_ne!(port, 7443, "the published port is not --vm-port");
+        // The user data is unchanged: the bridge's own port in the VM is still --vm-port.
+        let create = calls_of(&calls, "create")[0];
+        assert_eq!(
+            create["params"]["userData"]["env"]["TINFIRM_BRIDGE_LISTEN"],
+            "0.0.0.0:7443"
+        );
+        assert!(deleted(&calls, "vm-1"));
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })
@@ -465,110 +505,145 @@ async fn a_cancelled_run_takes_its_work_back_and_deletes_its_vm() {
     .await;
 }
 
-/// Where the VM restart test's host A keeps its directories, and its server.
+/// Where the VM restart test's host A keeps its directories, and its server; and whether its
+/// driver publishes each VM's bridge on a port of its own.
 const RESTART_DIR: &str = "TINFIRM_TEST_VM_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_VM_RESTART_URL";
+const RESTART_PUBLISH: &str = "TINFIRM_TEST_VM_RESTART_PUBLISH";
 
 /// The hosts of the VM restart test: the fake driver keeps its VMs in a file, so the driver
-/// of the host that restarted has them, and they outlive the host that is killed.
-fn restart_setup(dir: &std::path::Path) -> HostSetup {
+/// of the host that restarted has them, and they outlive the host that is killed. With
+/// `publish`, the driver names each VM's port in `describe` (ADR-0112).
+fn restart_setup(dir: &std::path::Path, publish: bool) -> HostSetup {
     let state = dir.join("vms.json").to_string_lossy().into_owned();
-    HostSetup::vm(&dir.join("driver.log"), &[("FAKE_VM_STATE", &state)])
+    let mut env = vec![("FAKE_VM_STATE", state.as_str())];
+    if publish {
+        env.push(("FAKE_VM_PUBLISH", "1"));
+    }
+    HostSetup::vm(&dir.join("driver.log"), &env)
 }
 
-/// Host A of [`a_host_that_restarted_takes_back_the_run_in_its_vm`], in a process of its own
-/// that the test kills as a crash would (SIGKILL): run only by that test.
+/// Host A of the VM restart tests, in a process of its own that the test kills as a crash
+/// would (SIGKILL): run only by those tests.
 #[test]
-#[ignore = "host A of the VM restart test, which starts it"]
+#[ignore = "host A of the VM restart tests, which start it"]
 fn vm_restart_test_host_a() {
     let (Ok(dir), Ok(url)) = (std::env::var(RESTART_DIR), std::env::var(RESTART_URL)) else {
         return;
     };
+    let publish = std::env::var(RESTART_PUBLISH).is_ok();
     let dir = std::path::PathBuf::from(dir);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
-            let _host = start_host_at(&dir.join("host"), &url, restart_setup(&dir)).await;
+            let _host = start_host_at(&dir.join("host"), &url, restart_setup(&dir, publish)).await;
             std::future::pending::<()>().await;
         });
 }
 
+/// A run in a VM whose host is killed and started again: host B takes it back. With `publish`,
+/// the run's record keeps the VM's port and host B dials it there; without, the record has no
+/// port, as one written before the port existed, and host B dials `--vm-port`.
+async fn a_host_that_restarted_takes_back_the_run(publish: bool) {
+    let repo = TestRepo::new();
+    let mut server = FakeServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "vm_restart_test_host_a",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(RESTART_DIR, dir.path())
+        .env(RESTART_URL, &server.url)
+        .stdout(std::process::Stdio::null());
+    if publish {
+        command.env(RESTART_PUBLISH, "1");
+    }
+    let mut host_a = command.spawn().unwrap();
+    let mut conn = server.accept().await;
+    conn.handshake(1).await;
+    let spec = AssignSpec::new("slow", Some(&repo.url));
+    conn.send(spec.to_json());
+    conn.wait_running(spec.run_id).await;
+    let record = dir
+        .path()
+        .join(format!("host/data/runs/{}.json", spec.run_id));
+    assert!(record.exists(), "no record of the run");
+    conn.until_seq(spec.run_id, 3).await;
+    host_a.kill().unwrap();
+    host_a.wait().unwrap();
+    let log = dir.path().join("driver.log");
+    let creates = calls_of(&vm_driver_calls(&log), "create").len();
+    let vm_id = {
+        let state: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("vms.json")).unwrap()).unwrap();
+        let running: Vec<&Value> = state.iter().filter(|vm| vm["state"] == "running").collect();
+        assert_eq!(running.len(), 1, "{state:#?}");
+        running[0]["id"].as_str().unwrap().to_string()
+    };
+    // The record keeps the port the driver named, or none.
+    let kept: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    let published = calls_of(&vm_driver_calls(&log), "published")
+        .first()
+        .map(|c| c["params"]["port"].clone());
+    match published {
+        Some(port) => {
+            assert!(publish);
+            assert_eq!(kept["sandbox"]["port"], port, "{kept}");
+            assert_ne!(port, 7443);
+        }
+        None => {
+            assert!(!publish);
+            assert!(kept["sandbox"].get("port").is_none(), "{kept}");
+        }
+    }
+
+    // Host B dials the VM's bridge, as A did, and takes the run back.
+    let host = start_host_at(
+        &dir.path().join("host"),
+        &server.url,
+        restart_setup(dir.path(), publish),
+    )
+    .await;
+    let mut conn = server.accept().await;
+    let hello = conn.handshake(1).await;
+    assert_eq!(
+        hello["activeRuns"][0]["runId"],
+        spec.run_id.to_string(),
+        "{hello}"
+    );
+    let t = conn.until_finished(spec.run_id).await;
+    t.assert_no_secrets();
+    let finished = t.finished();
+    assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+    assert_eq!(finished["failureClass"], "INFRA");
+    assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+    assert_eq!(
+        repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+        Some("work in progress\n")
+    );
+    // The same VM, deleted by host B; no other was created for the run.
+    let calls = vm_driver_calls(&log);
+    assert_eq!(calls_of(&calls, "create").len(), creates, "{calls:#?}");
+    assert!(deleted(&calls, &vm_id), "{calls:#?}");
+    assert!(!record.exists());
+    host.shutdown.cancel();
+    host.handle.await.unwrap().unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_restarted_takes_back_the_run_in_its_vm() {
-    with_timeout(180, async {
-        let repo = TestRepo::new();
-        let mut server = FakeServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let mut host_a = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "vm_restart_test_host_a",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(RESTART_DIR, dir.path())
-            .env(RESTART_URL, &server.url)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut conn = server.accept().await;
-        conn.handshake(1).await;
-        let spec = AssignSpec::new("slow", Some(&repo.url));
-        conn.send(spec.to_json());
-        conn.wait_running(spec.run_id).await;
-        let record = dir
-            .path()
-            .join(format!("host/data/runs/{}.json", spec.run_id));
-        assert!(record.exists(), "no record of the run");
-        conn.until_seq(spec.run_id, 3).await;
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
-        let log = dir.path().join("driver.log");
-        let creates = calls_of(&vm_driver_calls(&log), "create").len();
-        let vm_id = {
-            let state: Vec<Value> =
-                serde_json::from_slice(&std::fs::read(dir.path().join("vms.json")).unwrap())
-                    .unwrap();
-            let running: Vec<&Value> = state.iter().filter(|vm| vm["state"] == "running").collect();
-            assert_eq!(running.len(), 1, "{state:#?}");
-            running[0]["id"].as_str().unwrap().to_string()
-        };
+    with_timeout(180, a_host_that_restarted_takes_back_the_run(false)).await;
+}
 
-        // Host B dials the VM's bridge, as A did, and takes the run back.
-        let host = start_host_at(
-            &dir.path().join("host"),
-            &server.url,
-            restart_setup(dir.path()),
-        )
-        .await;
-        let mut conn = server.accept().await;
-        let hello = conn.handshake(1).await;
-        assert_eq!(
-            hello["activeRuns"][0]["runId"],
-            spec.run_id.to_string(),
-            "{hello}"
-        );
-        let t = conn.until_finished(spec.run_id).await;
-        t.assert_no_secrets();
-        let finished = t.finished();
-        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
-        assert_eq!(finished["failureClass"], "INFRA");
-        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
-        assert_eq!(
-            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
-            Some("work in progress\n")
-        );
-        // The same VM, deleted by host B; no other was created for the run.
-        let calls = vm_driver_calls(&log);
-        assert_eq!(calls_of(&calls, "create").len(), creates, "{calls:#?}");
-        assert!(deleted(&calls, &vm_id), "{calls:#?}");
-        assert!(!record.exists());
-        host.shutdown.cancel();
-        host.handle.await.unwrap().unwrap();
-    })
-    .await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_restarted_dials_the_port_its_record_keeps() {
+    with_timeout(180, a_host_that_restarted_takes_back_the_run(true)).await;
 }
 
 // ----- cold starts (crate::pool) -----------------------------------------------------------

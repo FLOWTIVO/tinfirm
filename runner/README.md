@@ -619,6 +619,9 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
      run.
   2. Once the driver reports it running, this host dials the sandbox bridge in the VM, which listens
      on `--vm-port`. The VM's firewall lets in only this host, to that port, and lets nothing out.
+     A driver that names a `port` in `describe` is dialed at that port of the VM's address instead:
+     a sandbox node publishes each VM's bridge on a port of its own address and forwards it to
+     `--vm-port` in the VM ([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)).
   3. The bridge probes the VM's network from inside (below). The VM is up now.
   4. The run takes the VM. Its files go in, and the agent starts with its credentials, over the
      bridge, as in [Sandbox bridge](#sandbox-bridge).
@@ -722,7 +725,13 @@ creates, probes, hands to runs and deletes ([ADR-0098](../docs/adr/0098-ready-vm
 **A driver** is a program that this host starts and talks to with JSON-RPC 2.0 on stdin and stdout,
 one message per line: `hello`, `verify`, `create`, `describe`, `delete` and `list`
 ([ADR-0096](../docs/adr/0096-a-vm-per-run.md) has the methods). It holds the provider's credential, and
-deletes only VMs that carry this host's label. You can write one for another provider or your own
+deletes only VMs that carry this host's label. The protocol is version 1. `describe` (and each VM of
+`list`) answers `id`, `name`, `state` (`starting`, `running`, `gone` or `failed`), `address`,
+`labels`, and an optional `port`
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)): with a `port`, this host dials the
+VM's bridge at `address:port`; without one, at `address:--vm-port`. The bridge in the VM listens on
+`--vm-port` either way. A run's take-back record keeps the port, so that a restarted host dials the
+same; a record without one, such as one written before the field existed, means `--vm-port`. You can write one for another provider or your own
 hypervisor, in any edition: such a host lists no paid feature. A driver must keep the contract C1 to
 C7 of the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#62-any-provider-one-contract-a-driver-per-provider).

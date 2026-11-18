@@ -1133,9 +1133,18 @@ impl TakenBack {
                     host,
                     label,
                     address,
+                    port,
                 },
             ) => SandboxKind::Vm {
-                vm: vms.adopt(id, host, label.as_deref(), address),
+                vm: vms.adopt(
+                    id,
+                    host,
+                    label.as_deref(),
+                    crate::vm::Reach {
+                        address: address.clone(),
+                        port: *port,
+                    },
+                ),
                 busy: None,
             },
             (Executor::Local { .. }, SandboxRecord::Local) => SandboxKind::Adopted,

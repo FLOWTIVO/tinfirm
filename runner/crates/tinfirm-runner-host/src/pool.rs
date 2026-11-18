@@ -417,16 +417,19 @@ impl Pool {
         let name = format!("tinfirm-vm-{}", &id[..8]);
         let deadline = Instant::now() + options.start_timeout;
         let mut vm = self.vms.create(&name, &data, &labels).await?;
-        let address = match self.vms.address(&vm.id, deadline).await {
-            Ok(address) => address,
+        let reach = match self.vms.reach(&vm.id, deadline).await {
+            Ok(reach) => reach,
             Err(e) => {
                 vm.delete().await;
                 return Err(e);
             }
         };
-        vm.set_address(&address);
-        tracing::debug!(vm = %vm.id, %address, "dialing the sandbox VM's bridge");
-        registration.dial(crate::git_proxy::host_port(&address, options.port));
+        // The driver's port, if it names one (a node's published port, ADR-0112); else
+        // `--vm-port`, where the bridge listens in the VM.
+        let target = reach.dial(options.port);
+        vm.set_reach(reach);
+        tracing::debug!(vm = %vm.id, %target, "dialing the sandbox VM's bridge");
+        registration.dial(target);
         // `--vm-start-timeout` bounds the time from the create to the bridge's connection.
         let wait = deadline.saturating_duration_since(Instant::now());
         let connected = tokio::select! {

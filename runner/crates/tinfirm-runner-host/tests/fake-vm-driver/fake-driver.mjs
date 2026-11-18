@@ -15,6 +15,10 @@
 //   FAKE_VM_STATE      a file that keeps the VMs: a driver started again (by a host that
 //                      restarted, ADR-0101) has them, and they outlive the driver, as real
 //                      VMs outlive their host
+//   FAKE_VM_PUBLISH    when set, each "VM"'s bridge listens on a port of its own, not the
+//                      user data's, and `describe` names it in `port`, as a sandbox node
+//                      publishes each VM's bridge (ADR-0112); the log gets a line
+//                      {method: "published", params: {id, port}}
 // Templates: `stuck` never comes up; `failing` fails at its start; any other comes up.
 
 import { spawn } from "node:child_process";
@@ -55,13 +59,15 @@ function random(n) {
 }
 
 function view(vm) {
-  return {
+  const described = {
     id: vm.id,
     name: vm.name,
     state: vm.state,
     address: vm.state === "running" ? vm.address : null,
     labels: vm.labels,
   };
+  if (vm.port) described.port = vm.port;
+  return described;
 }
 
 const methods = {
@@ -82,8 +88,15 @@ const methods = {
     const id = statePath ? `vm-${process.pid}-${++created}` : `vm-${++created}`;
     // A loopback address of its own: the "VM"s of parallel tests never share a port.
     const address = `127.${200 + random(50)}.${1 + random(250)}.${1 + random(250)}`;
-    const port = (data.env.TINFIRM_BRIDGE_LISTEN || "").split(":").pop();
+    const listen = (data.env.TINFIRM_BRIDGE_LISTEN || "").split(":").pop();
+    // A published port: never the user data's, so a host that dialed `--vm-port` would miss.
+    const published = env.FAKE_VM_PUBLISH ? 20000 + random(40000) : null;
+    const port = published && String(published) !== listen ? published : published && published + 1;
     const vm = { id, name, labels: { ...labels, "tinfirm-sandbox": "1" }, state: "starting", address, child: null };
+    if (port) {
+      vm.port = port;
+      log("published", { id, port });
+    }
     vms.set(id, vm);
     if (template === "failing") {
       vm.state = "failed";
@@ -98,7 +111,7 @@ const methods = {
       env: {
         PATH: env.PATH,
         ...data.env,
-        TINFIRM_BRIDGE_LISTEN: `${address}:${port}`,
+        TINFIRM_BRIDGE_LISTEN: `${address}:${port || listen}`,
         TINFIRM_BRIDGE_COMMAND: env.FAKE_VM_AGENT,
       },
       // A "VM" that outlives the driver writes to no pipe of the driver's.

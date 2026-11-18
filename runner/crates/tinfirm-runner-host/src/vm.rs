@@ -304,8 +304,27 @@ pub struct Vm {
     /// Where the host dials the bridge: an IP address or a host name, without the port.
     #[serde(default)]
     pub address: Option<String>,
+    /// The port at `address` where the host dials this VM's bridge, when the driver names one:
+    /// a node publishes each VM's bridge on a port of its own address (ADR-0112). Without it,
+    /// the host dials [`VmOptions::port`]. The bridge in the VM listens on that port either way.
+    #[serde(default)]
+    pub port: Option<u16>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+}
+
+/// Where the host dials a VM's bridge: its address, and the port the driver named, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reach {
+    pub address: String,
+    pub port: Option<u16>,
+}
+
+impl Reach {
+    /// `host:port` to dial: the driver's port, or `default` (`--vm-port`) without one.
+    pub fn dial(&self, default: u16) -> String {
+        crate::git_proxy::host_port(&self.address, self.port.unwrap_or(default))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -712,7 +731,7 @@ impl Vms {
             id,
             host: labels.get(HOST_LABEL).cloned().unwrap_or_default(),
             label,
-            address: None,
+            reach: None,
             deleted: false,
         })
     }
@@ -724,7 +743,7 @@ impl Vms {
         id: &str,
         host: &str,
         label: Option<&str>,
-        address: &str,
+        reach: Reach,
     ) -> VmGuard {
         if let Some(label) = label {
             lock(&self.live).insert(label.to_string());
@@ -734,7 +753,7 @@ impl Vms {
             id: id.to_string(),
             host: host.to_string(),
             label: label.map(str::to_string),
-            address: Some(address.to_string()),
+            reach: Some(reach),
             deleted: false,
         }
     }
@@ -745,8 +764,8 @@ impl Vms {
     }
 
     /// Waits until the VM is up and has an address, until `deadline`, which bounds each of the
-    /// driver's answers too.
-    pub async fn address(&self, id: &str, deadline: tokio::time::Instant) -> Result<String> {
+    /// driver's answers too: where to dial its bridge, with the port the driver named, if any.
+    pub async fn reach(&self, id: &str, deadline: tokio::time::Instant) -> Result<Reach> {
         loop {
             let Ok(described) = tokio::time::timeout_at(deadline, self.driver.describe(id)).await
             else {
@@ -758,8 +777,14 @@ impl Vms {
             match described {
                 Ok(vm) => match vm.state {
                     VmState::Running => {
+                        if vm.port == Some(0) {
+                            bail!("the VM driver described the VM {id} with the port 0");
+                        }
                         if let Some(address) = vm.address.filter(|a| !a.is_empty()) {
-                            return Ok(address);
+                            return Ok(Reach {
+                                address,
+                                port: vm.port,
+                            });
                         }
                     }
                     VmState::Starting => {}
@@ -867,7 +892,7 @@ pub struct VmGuard {
     /// Its [`VM_LABEL`].
     label: Option<String>,
     /// Where it is reached, once the provider has said.
-    address: Option<String>,
+    reach: Option<Reach>,
     deleted: bool,
 }
 
@@ -876,22 +901,30 @@ impl VmGuard {
         &self.vms
     }
 
-    /// The VM's address, once the provider has said ([`VmGuard::set_address`]).
+    /// The VM's address, once the provider has said ([`VmGuard::set_reach`]).
     pub fn address(&self) -> Option<&str> {
-        self.address.as_deref()
+        self.reach.as_ref().map(|r| r.address.as_str())
     }
 
-    pub fn set_address(&mut self, address: &str) {
-        self.address = Some(address.to_string());
+    /// The port the driver named for the VM's bridge, if any.
+    pub fn port(&self) -> Option<u16> {
+        self.reach.as_ref().and_then(|r| r.port)
     }
 
-    /// What a host that restarted needs to take the VM's run back.
+    pub fn set_reach(&mut self, reach: Reach) {
+        self.reach = Some(reach);
+    }
+
+    /// What a host that restarted needs to take the VM's run back: the port too, so that it
+    /// dials the VM's own.
     pub fn record(&self) -> Option<crate::takeback::SandboxRecord> {
+        let reach = self.reach.clone()?;
         Some(crate::takeback::SandboxRecord::Vm {
             id: self.id.clone(),
             host: self.host.clone(),
             label: self.label.clone(),
-            address: self.address.clone()?,
+            address: reach.address,
+            port: reach.port,
         })
     }
 
@@ -997,6 +1030,35 @@ mod tests {
             "{error}"
         );
         assert!(refuse.check_image("vm-1", None).is_err());
+    }
+
+    #[test]
+    fn a_vm_is_dialed_at_the_port_its_driver_names_or_at_the_vm_port() {
+        let vm: Vm = serde_json::from_value(json!({
+            "id": "vm-1", "state": "running", "address": "10.0.0.20", "port": 20003
+        }))
+        .unwrap();
+        assert_eq!(vm.port, Some(20003));
+        let without: Vm = serde_json::from_value(json!({
+            "id": "vm-1", "state": "running", "address": "10.0.0.20"
+        }))
+        .unwrap();
+        assert_eq!(without.port, None);
+        let reach = |port| Reach {
+            address: "10.0.0.20".into(),
+            port,
+        };
+        assert_eq!(reach(Some(20003)).dial(7443), "10.0.0.20:20003");
+        assert_eq!(reach(None).dial(7443), "10.0.0.20:7443");
+        let v6 = Reach {
+            address: "fd00::5".into(),
+            port: Some(20003),
+        };
+        assert_eq!(v6.dial(7443), "[fd00::5]:20003");
+        assert!(
+            serde_json::from_value::<Vm>(json!({"id": "x", "state": "running", "port": 70000}))
+                .is_err()
+        );
     }
 
     #[test]

@@ -686,11 +686,15 @@ impl Shared {
         }
         for ((record, sandbox), registration) in held.into_iter().zip(registrations) {
             let (run_id, epoch) = (record.run_id(), record.assign.epoch);
-            if let crate::takeback::SandboxRecord::Vm { address, .. } = &record.sandbox
+            if let crate::takeback::SandboxRecord::Vm { address, port, .. } = &record.sandbox
                 && let Executor::Vm(vms) = &self.opts.executor
             {
-                // The VM's bridge listens: this host dials it, as it did before.
-                registration.dial(git_proxy::host_port(address, vms.options.port));
+                // The VM's bridge listens: this host dials it, as it did before, at the port the
+                // driver named, or at `--vm-port` for a record without one.
+                registration.dial(git_proxy::host_port(
+                    address,
+                    port.unwrap_or(vms.options.port),
+                ));
             }
             tracing::info!(%run_id, epoch, "taking back a run of the process before this one");
             let (stop_tx, stop_rx) = watch::channel(None);
