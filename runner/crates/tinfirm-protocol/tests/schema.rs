@@ -290,6 +290,7 @@ fn constructed_messages() -> Vec<Message> {
             public_suffix_list: None,
             features: vec![],
             pool: None,
+            isolation: None,
         }),
         Message::Welcome(Welcome {
             protocol_version: None,
@@ -1514,6 +1515,7 @@ fn constructed_messages_v2() -> Vec<Message> {
             }),
             features: vec![feature::RUN_STEER.into(), feature::RUN_SKILLS.into()],
             pool: None,
+            isolation: None,
         }),
         // A host that keeps ready sandboxes (ADR-0098, ADR-0099), above the 16 of a host with
         // Docker (D12).
@@ -1532,6 +1534,72 @@ fn constructed_messages_v2() -> Vec<Message> {
             public_suffix_list: None,
             features: vec![feature::SANDBOX_POOL.into()],
             pool: Some(HelloPool { max_ready: 4 }),
+            isolation: None,
+        }),
+        // A host that reports its level of isolation (ADR-0113): a VM per run at a provider,
+        // and a level that the operator stated.
+        Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION_V2,
+            runner_version: "1.0.0".into(),
+            hostname: None,
+            os: None,
+            arch: None,
+            executors: vec![Executor::Docker],
+            isolation_tiers: vec![IsolationTier::Microvm],
+            max_concurrent_runs: 4,
+            credentials: vec![],
+            runtimes: vec![],
+            active_runs: None,
+            public_suffix_list: None,
+            features: vec![feature::HOST_ISOLATION.into()],
+            pool: None,
+            isolation: Some(HostIsolation {
+                level: IsolationLevel::Machine,
+                hardened: Hardened::None,
+                stated: false,
+            }),
+        }),
+        Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION_V2,
+            runner_version: "1.0.0".into(),
+            hostname: None,
+            os: None,
+            arch: None,
+            executors: vec![Executor::Docker],
+            isolation_tiers: vec![IsolationTier::Gvisor],
+            max_concurrent_runs: 2,
+            credentials: vec![],
+            runtimes: vec![],
+            active_runs: None,
+            public_suffix_list: None,
+            features: vec![feature::HOST_ISOLATION.into()],
+            pool: None,
+            isolation: Some(HostIsolation {
+                level: IsolationLevel::Container,
+                hardened: Hardened::No,
+                stated: false,
+            }),
+        }),
+        Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION_V2,
+            runner_version: "1.0.0".into(),
+            hostname: None,
+            os: None,
+            arch: None,
+            executors: vec![Executor::Docker],
+            isolation_tiers: vec![IsolationTier::Microvm],
+            max_concurrent_runs: 4,
+            credentials: vec![],
+            runtimes: vec![],
+            active_runs: None,
+            public_suffix_list: None,
+            features: vec![feature::HOST_ISOLATION.into()],
+            pool: None,
+            isolation: Some(HostIsolation {
+                level: IsolationLevel::VmJail,
+                hardened: Hardened::Yes,
+                stated: true,
+            }),
         }),
         Message::HostConfig(HostConfig {
             version: 9,
@@ -2573,5 +2641,73 @@ fn skill_name_helper_matches_the_schema() {
             v.is_valid(&frame),
             "the helper and the schema disagree on {name:?}"
         );
+    }
+}
+
+#[test]
+fn hello_isolation_comes_with_its_feature_and_a_vm_tier() {
+    let v2 = validator_v2();
+    let hello = sample_v2("hello-isolation.json");
+    assert_valid(&v2, &hello, "hello with host.isolation");
+    let Message::Hello(parsed) = Message::from_value(hello.clone()).unwrap() else {
+        panic!("not hello");
+    };
+    assert_eq!(
+        parsed.isolation,
+        Some(HostIsolation {
+            level: IsolationLevel::Machine,
+            hardened: Hardened::None,
+            stated: false,
+        })
+    );
+    // `stated` is left out when false, and written when true.
+    let out = serde_json::to_value(Message::Hello(parsed.clone())).unwrap();
+    assert_eq!(
+        out["isolation"],
+        json!({"level": "machine", "hardened": "none"})
+    );
+    let mut stated = parsed.clone();
+    stated.isolation = Some(HostIsolation {
+        level: IsolationLevel::VmJail,
+        hardened: Hardened::No,
+        stated: true,
+    });
+    let out = serde_json::to_value(Message::Hello(stated)).unwrap();
+    assert_eq!(
+        out["isolation"],
+        json!({"level": "vm-jail", "hardened": "no", "stated": true})
+    );
+    assert_valid(&v2, &out, "a stated level");
+
+    // The feature without the object, and the object without the feature.
+    let mut no_object = hello.clone();
+    no_object.as_object_mut().unwrap().remove("isolation");
+    assert!(
+        !v2.is_valid(&no_object),
+        "host.isolation without hello.isolation"
+    );
+    let mut no_feature = hello.clone();
+    no_feature["features"] = json!(["run.steer"]);
+    assert!(
+        !v2.is_valid(&no_feature),
+        "hello.isolation without host.isolation"
+    );
+    // `machine` and `vm-jail` only with VM tiers; `container` with any.
+    for level in ["machine", "vm-jail"] {
+        let mut container = hello.clone();
+        container["isolation"]["level"] = json!(level);
+        container["isolationTiers"] = json!(["container"]);
+        assert!(!v2.is_valid(&container), "{level} with a container tier");
+    }
+    let mut gvisor = hello.clone();
+    gvisor["isolation"] = json!({"level": "container", "hardened": "no"});
+    gvisor["isolationTiers"] = json!(["gvisor"]);
+    assert_valid(&v2, &gvisor, "container with a gvisor tier");
+    // Only the schema's values.
+    for (key, bad) in [("level", "vm"), ("hardened", "maybe")] {
+        let mut frame = hello.clone();
+        frame["isolation"][key] = json!(bad);
+        assert!(!v2.is_valid(&frame), "{key} {bad}");
+        assert!(Message::from_value(frame).is_err(), "{key} {bad}");
     }
 }

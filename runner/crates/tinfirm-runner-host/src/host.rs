@@ -111,6 +111,9 @@ pub struct HostOptions {
     /// operator's ceilings and the tuning (`run --pool-*`). With `max_ready` 0, the default,
     /// the host keeps no VM ready and every run starts cold. Other executors have none.
     pub ready_vms: crate::ready_vms::ReadyVmOptions,
+    /// The operator's statement of the level of isolation (`run --isolation-level`,
+    /// `--isolation-hardened`, ADR-0113), for a VM driver of their own; `None`: none.
+    pub isolation_stated: Option<crate::isolation::Stated>,
     /// A VM that came up this long before a run claims it is probed again then
     /// ([`crate::pool::REPROBE_AFTER`]; no flag sets it).
     pub vm_reprobe_after: Duration,
@@ -154,6 +157,7 @@ impl HostOptions {
             bridge: None,
             ready_vms: crate::ready_vms::ReadyVmOptions::default(),
             vm_reprobe_after: crate::pool::REPROBE_AFTER,
+            isolation_stated: None,
             upload_max_bytes: crate::attachments::DEFAULT_UPLOAD_MAX_BYTES,
             runner_version: crate::version::RUNNER_VERSION.to_string(),
         }
@@ -176,6 +180,16 @@ impl HostOptions {
     /// `--pool-runtime any` (ADR-0101).
     pub fn multi_runtime_image(&self) -> bool {
         self.ready_vms.multi_runtime && matches!(self.executor, Executor::Vm(_))
+    }
+
+    /// The level of isolation the host reports (crate::isolation, ADR-0113): derived from
+    /// its executor, or the operator's statement for a VM driver of their own. An error
+    /// when the statement contradicts what the host can see.
+    pub fn isolation(&self) -> Result<Option<tinfirm_protocol::HostIsolation>, String> {
+        crate::isolation::derive(
+            crate::isolation::Sandboxes::of(&self.executor),
+            self.isolation_stated,
+        )
     }
 
     /// Whether the host keeps ready VMs (crate::ready_vms): the VM executor with
@@ -973,6 +987,13 @@ impl Shared {
         } else {
             vec![IsolationTier::Container]
         };
+        // The level of isolation (ADR-0113), with protocol 2 only. `run` refused a statement
+        // that contradicts what the host can see before it started.
+        let isolation = if v2 {
+            self.opts.isolation().ok().flatten()
+        } else {
+            None
+        };
         Hello {
             protocol_version: self.protocol_version(),
             runner_version: self.opts.runner_version.clone(),
@@ -999,11 +1020,15 @@ impl Shared {
                 if v2 && self.ready_vms.is_some() {
                     features.push(feature::SANDBOX_POOL.to_string());
                 }
+                if isolation.is_some() {
+                    features.push(feature::HOST_ISOLATION.to_string());
+                }
                 features
             },
             pool: (v2 && self.ready_vms.is_some()).then_some(tinfirm_protocol::HelloPool {
                 max_ready: self.opts.ready_vms.max_ready,
             }),
+            isolation,
         }
     }
 
@@ -2894,6 +2919,103 @@ mod tests {
             plain.hello().await.isolation_tiers,
             vec![IsolationTier::Container]
         );
+    }
+
+    #[tokio::test]
+    async fn hello_reports_the_level_of_isolation_under_v2_only() {
+        use crate::config::HostConfig;
+        use crate::isolation::Stated;
+        use crate::sandbox::SandboxSettings;
+        use tinfirm_protocol::{Hardened, HostIsolation, IsolationLevel};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let mut config = HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYhosttokenforthehelloframe00000123"),
+        );
+        let hello = |executor: Executor, sandbox: SandboxSettings, stated, config: &HostConfig| {
+            let mut opts = HostOptions::new(paths.clone(), executor);
+            opts.sandbox = sandbox;
+            opts.isolation_stated = stated;
+            let host = Shared::new(opts, config.clone());
+            async move { host.hello().await }
+        };
+        let has_feature =
+            |hello: &Hello| hello.features.iter().any(|f| f == feature::HOST_ISOLATION);
+        // Never contacted: the hello's image checks fail at once.
+        let docker = || {
+            Executor::Docker(
+                bollard::Docker::connect_with_http(
+                    "http://127.0.0.1:9",
+                    1,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .unwrap(),
+            )
+        };
+        let vm = |driver: &str| {
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                crate::vm::DriverCommand::parse(driver).unwrap(),
+                "sandbox".into(),
+            )))
+        };
+        let vms = || SandboxSettings::for_vms(None, false, Vec::new()).unwrap();
+        let kata = SandboxSettings::new(Some("kata".into()), false, Vec::new()).unwrap();
+
+        // Docker, whatever its runtime: `container`, and the tier stays the runtime's.
+        let h = hello(docker(), kata.clone(), None, &config).await;
+        assert_eq!(h.isolation_tiers, vec![IsolationTier::Microvm]);
+        assert_eq!(
+            h.isolation,
+            Some(HostIsolation {
+                level: IsolationLevel::Container,
+                hardened: Hardened::No,
+                stated: false,
+            })
+        );
+        assert!(has_feature(&h));
+        // A provider's VM per run: `machine`, and no machine of the host's own.
+        let h = hello(vm("digitalocean"), vms(), None, &config).await;
+        assert_eq!(h.isolation_tiers, vec![IsolationTier::Microvm]);
+        assert_eq!(
+            h.isolation,
+            Some(HostIsolation {
+                level: IsolationLevel::Machine,
+                hardened: Hardened::None,
+                stated: false,
+            })
+        );
+        // The operator's own driver: no level, unless the operator states one.
+        let h = hello(vm("/usr/local/bin/my-driver"), vms(), None, &config).await;
+        assert_eq!(h.isolation, None);
+        assert!(!has_feature(&h));
+        let stated = Stated {
+            level: IsolationLevel::VmJail,
+            hardened: Hardened::Yes,
+        };
+        let h = hello(vm("/usr/local/bin/my-driver"), vms(), Some(stated), &config).await;
+        assert_eq!(
+            h.isolation,
+            Some(HostIsolation {
+                level: IsolationLevel::VmJail,
+                hardened: Hardened::Yes,
+                stated: true,
+            })
+        );
+        assert!(has_feature(&h));
+        // The local test executor reports none.
+        let local = Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        let h = hello(local, SandboxSettings::default(), None, &config).await;
+        assert_eq!(h.isolation, None);
+        assert!(!has_feature(&h));
+        // Protocol 1 has no level.
+        config.protocol_version = 1;
+        let h = hello(docker(), SandboxSettings::default(), None, &config).await;
+        assert_eq!(h.isolation, None);
+        assert!(h.features.is_empty());
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{
+  "type": "hello",
+  "protocolVersion": 2,
+  "runnerVersion": "1.0.0",
+  "hostname": "runner-vm",
+  "os": "linux",
+  "arch": "x86_64",
+  "executors": ["docker"],
+  "isolationTiers": ["microvm"],
+  "maxConcurrentRuns": 4,
+  "credentials": [],
+  "runtimes": [
+    {"runtime": "CLAUDE_CODE", "image": "tinfirm-runner-claude:local", "version": "VM template sandbox-4c8g"}
+  ],
+  "features": ["run.steer", "run.skills", "session.bundle", "sandbox.bridge", "sandbox.elastic", "host.isolation"],
+  "isolation": {"level": "machine", "hardened": "none"}
+}

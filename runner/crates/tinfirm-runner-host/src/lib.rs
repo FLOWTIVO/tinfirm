@@ -22,6 +22,7 @@ pub mod git_proxy;
 pub mod homes;
 pub mod host;
 pub mod images;
+pub mod isolation;
 pub mod limits;
 pub mod maintenance;
 pub mod mapper;

@@ -74,6 +74,13 @@ async fn a_host_with_a_paid_driver_lists_it_and_a_community_server_stops_the_hos
         let features = hello["features"].as_array().unwrap();
         assert!(features.contains(&json!("sandbox.elastic")), "{hello}");
         assert!(features.contains(&json!("sandbox.bridge")), "{hello}");
+        // A provider's VM per run: the host reports `machine`, and runs no machine of its own
+        // for its VMs (ADR-0113).
+        assert!(features.contains(&json!("host.isolation")), "{hello}");
+        assert_eq!(
+            hello["isolation"],
+            json!({"level": "machine", "hardened": "none"})
+        );
         // A Community server (ADR-0114): an error before the welcome, then 1008.
         conn.send(json!({
             "type": "error",

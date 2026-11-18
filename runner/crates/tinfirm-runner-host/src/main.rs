@@ -16,6 +16,7 @@ use tinfirm_runner_host::credentials::{
 };
 use tinfirm_runner_host::egress_proxy::EgressSettings;
 use tinfirm_runner_host::host::{self, Host, HostOptions, Shared};
+use tinfirm_runner_host::isolation::{self, Sandboxes};
 use tinfirm_runner_host::maintenance::{self, DeleteReason, MirrorReport, Policy};
 use tinfirm_runner_host::mirror::Mirrors;
 use tinfirm_runner_host::model_proxy::ModelProxySettings;
@@ -294,6 +295,55 @@ enum ImageVersionChoice {
     Refuse,
 }
 
+/// `--isolation-level`: the levels an operator may state (ADR-0113); `container` is the
+/// Docker executor's, which the host derives itself.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StatedLevel {
+    /// The VMs run on other machines than this host, which hold no credential.
+    Machine,
+    /// Each VM's VMM runs in a jail of its own on this machine.
+    VmJail,
+}
+
+/// `--isolation-hardened`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HardenedChoice {
+    Yes,
+    No,
+    /// No machine of yours runs the VMs.
+    None,
+}
+
+impl StatedLevel {
+    fn level(self) -> tinfirm_protocol::IsolationLevel {
+        match self {
+            StatedLevel::Machine => tinfirm_protocol::IsolationLevel::Machine,
+            StatedLevel::VmJail => tinfirm_protocol::IsolationLevel::VmJail,
+        }
+    }
+}
+
+impl HardenedChoice {
+    fn hardened(self) -> tinfirm_protocol::Hardened {
+        match self {
+            HardenedChoice::Yes => tinfirm_protocol::Hardened::Yes,
+            HardenedChoice::No => tinfirm_protocol::Hardened::No,
+            HardenedChoice::None => tinfirm_protocol::Hardened::None,
+        }
+    }
+}
+
+/// The operator's statement of the level, from `level` and `hardened` (`no` by default).
+fn stated_isolation(
+    level: Option<StatedLevel>,
+    hardened: Option<HardenedChoice>,
+) -> Option<isolation::Stated> {
+    level.map(|level| isolation::Stated {
+        level: level.level(),
+        hardened: hardened.unwrap_or(HardenedChoice::No).hardened(),
+    })
+}
+
 /// Where `run` creates the sandboxes: Docker on this machine, or a VM per run (ADR-0096).
 #[derive(Args)]
 struct VmArgs {
@@ -354,6 +404,29 @@ struct VmArgs {
         default_value_t = ImageVersionChoice::Warn
     )]
     vm_image_version: ImageVersionChoice,
+    /// The level of isolation this host reports with a VM driver of your own, which it cannot
+    /// see itself (ADR-0113): `machine` when the VMs run on other machines than this host,
+    /// which hold no credential; `vm-jail` when each VM's VMM runs in a jail of its own on this
+    /// machine. Without it such a host reports no level, and the server places its runs as on
+    /// a container host. Refused with the Docker executor and with `--vm-driver digitalocean`,
+    /// whose level this host derives itself.
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_ISOLATION_LEVEL",
+        value_enum,
+        value_name = "LEVEL"
+    )]
+    isolation_level: Option<StatedLevel>,
+    /// Whether the machines that run those VMs are hardened beyond the jail (ADR-0113): `yes`,
+    /// `no`, or `none` when no machine of yours runs them. Only with --isolation-level
+    /// [default: no].
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_ISOLATION_HARDENED",
+        value_enum,
+        requires = "isolation_level"
+    )]
+    isolation_hardened: Option<HardenedChoice>,
     /// The most ready VMs that Tinfirm may ask this host to keep (--executor vm, ADR-0098):
     /// each is created, booted and probed before a run comes, which then starts in seconds,
     /// and each costs while it waits. Tinfirm's admins set how many, never more than this.
@@ -1297,6 +1370,8 @@ async fn doctor(paths: &Paths) -> Result<()> {
         ),
         Err(e) => checks.warn("mirrors", format!("{e:#}")),
     }
+    // The level of isolation that `run` reports with the environment's settings (ADR-0113).
+    doctor_isolation(&mut checks);
     // git.
     match git::git_version().await {
         Some(v) => checks.ok("git", v),
@@ -1548,6 +1623,67 @@ async fn doctor(paths: &Paths) -> Result<()> {
     }
     println!("All checks passed.");
     Ok(())
+}
+
+/// The level of isolation that `run` would report with `TINFIRM_RUNNER_EXECUTOR`,
+/// `TINFIRM_RUNNER_VM_DRIVER` and `TINFIRM_RUNNER_ISOLATION_*`, and what an escape from a
+/// sandbox reaches on such a host (ADR-0112, decision 7). `run`'s flags are not seen here.
+fn doctor_isolation(checks: &mut Checks) {
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let sandboxes = match var("TINFIRM_RUNNER_EXECUTOR").as_deref() {
+        Some("vm") => match var("TINFIRM_RUNNER_VM_DRIVER")
+            .as_deref()
+            .map(tinfirm_runner_host::vm::DriverCommand::parse)
+        {
+            Some(Ok(driver)) => Sandboxes::of_driver(&driver),
+            _ => Sandboxes::OwnDriverVms,
+        },
+        _ => Sandboxes::Docker,
+    };
+    let level = var("TINFIRM_RUNNER_ISOLATION_LEVEL");
+    let hardened = var("TINFIRM_RUNNER_ISOLATION_HARDENED");
+    let parsed_level = level
+        .as_deref()
+        .map(|v| StatedLevel::from_str(v, false))
+        .transpose();
+    let parsed_hardened = hardened
+        .as_deref()
+        .map(|v| HardenedChoice::from_str(v, false))
+        .transpose();
+    let (level, hardened) = match (parsed_level, parsed_hardened) {
+        (Ok(level), Ok(hardened)) => (level, hardened),
+        (Err(e), _) | (_, Err(e)) => {
+            checks.fail("isolation", format!("TINFIRM_RUNNER_ISOLATION_*: {e}"));
+            return;
+        }
+    };
+    if level.is_none() && hardened.is_some() {
+        checks.fail(
+            "isolation",
+            "TINFIRM_RUNNER_ISOLATION_HARDENED needs TINFIRM_RUNNER_ISOLATION_LEVEL",
+        );
+        return;
+    }
+    match isolation::derive(sandboxes, stated_isolation(level, hardened)) {
+        Ok(reported) => {
+            let escape = isolation::what_an_escape_reaches(sandboxes, reported.as_ref());
+            let detail = format!(
+                "reports {} (as `run` with this environment; its flags are not seen here). {escape}",
+                isolation::describe(reported.as_ref())
+            );
+            if reported.is_some() {
+                checks.info("isolation", detail);
+            } else {
+                checks.warn("isolation", detail);
+            }
+        }
+        Err(e) => checks.fail("isolation", e),
+    }
 }
 
 /// `2026-09-26 10:00 UTC`, or `fallback`.
@@ -1802,6 +1938,13 @@ async fn run(
 ) -> Result<()> {
     // First: a forbidden combination is refused before anything else happens.
     let vm_options = vm_args.options()?;
+    // The level of isolation (ADR-0113): a statement never overrides what the host sees.
+    let sandboxes = match &vm_options {
+        Some((options, _)) => Sandboxes::of_driver(&options.driver),
+        None => Sandboxes::Docker,
+    };
+    let isolation_stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);
+    let reported = isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
     if vm_options.is_none() && max_concurrent_runs > MAX_CAPACITY {
         bail!(
             "--max-concurrent-runs is at most {MAX_CAPACITY} with Docker: the machine runs every sandbox; more need --executor vm, a VM per run"
@@ -1936,6 +2079,8 @@ async fn run(
     opts.max_concurrent_runs = max_concurrent_runs;
     opts.upload_max_bytes = upload_max_bytes;
     opts.sandbox = settings;
+    opts.isolation_stated = isolation_stated;
+    log_isolation(sandboxes, reported.as_ref(), cfg.protocol_version);
     let host = Shared::new(opts, cfg);
     host.warn_operator_public_suffix_wildcards();
     let shutdown = CancellationToken::new();
@@ -1943,6 +2088,26 @@ async fn run(
     let result = host::serve(host, shutdown).await;
     lock.hold_until_exit();
     result
+}
+
+/// The level of isolation the host reports, and what an escape from a sandbox reaches on a
+/// host of that level (ADR-0112, decision 7; ADR-0113).
+fn log_isolation(
+    sandboxes: Sandboxes,
+    reported: Option<&tinfirm_protocol::HostIsolation>,
+    protocol_version: u32,
+) {
+    let escape = isolation::what_an_escape_reaches(sandboxes, reported);
+    if protocol_version < tinfirm_protocol::PROTOCOL_VERSION_V2 {
+        tracing::info!(
+            isolation = "none",
+            "runner protocol 1 reports no level of isolation (protocol 2 does). {escape}"
+        );
+    } else if reported.is_none() {
+        tracing::warn!(isolation = "none", "{escape}");
+    } else {
+        tracing::info!(isolation = %isolation::describe(reported), "{escape}");
+    }
 }
 
 /// The host's options and its sandboxes' endpoint with this machine's Docker: Docker and its

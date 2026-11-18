@@ -508,6 +508,8 @@ fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("TINFIRM_RUNNER_VM_DRIVER")
         .env_remove("TINFIRM_RUNNER_VM_TEMPLATE")
         .env_remove("TINFIRM_RUNNER_VM_PROBE")
+        .env_remove("TINFIRM_RUNNER_ISOLATION_LEVEL")
+        .env_remove("TINFIRM_RUNNER_ISOLATION_HARDENED")
         .envs(env.iter().copied())
         .stdin(Stdio::null());
     cmd.output().unwrap()
@@ -984,4 +986,120 @@ fn vm_boot_refuses_user_data_that_is_not_tinfirms() {
         assert!(!out.status.success());
         assert!(text(&out).contains(expected), "{}", text(&out));
     }
+}
+
+#[test]
+fn a_stated_level_of_isolation_is_only_for_a_driver_of_ones_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let vm = |driver: &'static str| -> Vec<&'static str> {
+        vec![
+            "run",
+            "--executor",
+            "vm",
+            "--vm-driver",
+            driver,
+            "--vm-template",
+            "sandbox-4c8g",
+        ]
+    };
+    let with = |mut args: Vec<&'static str>, more: &[&'static str]| {
+        args.extend_from_slice(more);
+        args
+    };
+    for (args, env, expected) in [
+        (
+            vec!["run", "--isolation-level", "machine"],
+            &[][..],
+            "with the Docker executor this host reports `container` itself",
+        ),
+        (
+            with(vm("digitalocean"), &["--isolation-level", "vm-jail"]),
+            &[][..],
+            "with --vm-driver digitalocean this host reports `machine` itself",
+        ),
+        (
+            vm("/usr/local/bin/my-driver"),
+            &[("TINFIRM_RUNNER_ISOLATION_HARDENED", "yes")][..],
+            "--isolation-level",
+        ),
+        (
+            with(
+                vm("/usr/local/bin/my-driver"),
+                &["--isolation-level", "container"],
+            ),
+            &[][..],
+            "invalid value 'container'",
+        ),
+    ] {
+        let out = run_with_env(dir, &args, env);
+        assert!(!out.status.success(), "{args:?} {env:?}");
+        let message = text(&out);
+        assert!(message.contains(expected), "{args:?}: {message}");
+        // Refused at once, before the login is even read.
+        assert!(!message.contains("not logged in"), "{message}");
+    }
+    // With a driver of one's own, the statement passes the checks; this `run` then stops
+    // because it is not logged in.
+    let out = run_with_env(
+        dir,
+        &with(
+            vm("/usr/local/bin/my-driver"),
+            &[
+                "--isolation-level",
+                "vm-jail",
+                "--isolation-hardened",
+                "yes",
+            ],
+        ),
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(text(&out).contains("not logged in"), "{}", text(&out));
+}
+
+#[test]
+fn doctor_says_what_an_escape_reaches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let doctor = |env: &[(&str, &str)]| text(&run_with_env(dir, &["doctor"], env));
+    let report = doctor(&[]);
+    assert!(
+        report.contains("[info] isolation: reports container, hardened no"),
+        "{report}"
+    );
+    assert!(
+        report.contains("the host's token and every run's git token"),
+        "{report}"
+    );
+    let report = doctor(&[
+        ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+        ("TINFIRM_RUNNER_VM_DRIVER", "digitalocean"),
+    ]);
+    assert!(
+        report.contains("[info] isolation: reports machine, hardened none"),
+        "{report}"
+    );
+    assert!(report.contains("nothing of Tinfirm's"), "{report}");
+    let own = [
+        ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+        ("TINFIRM_RUNNER_VM_DRIVER", "/usr/local/bin/my-driver"),
+    ];
+    let report = doctor(&own);
+    assert!(
+        report.contains("[warn] isolation: reports none"),
+        "{report}"
+    );
+    assert!(report.contains("as on a container host"), "{report}");
+    let report = doctor(&[
+        own[0],
+        own[1],
+        ("TINFIRM_RUNNER_ISOLATION_LEVEL", "vm-jail"),
+    ]);
+    assert!(
+        report.contains("[info] isolation: reports vm-jail, hardened no, stated by the operator"),
+        "{report}"
+    );
+    let report = doctor(&[("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine")]);
+    assert!(report.contains("[FAIL] isolation"), "{report}");
 }

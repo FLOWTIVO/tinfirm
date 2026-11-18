@@ -674,6 +674,67 @@ pub struct Hello {
     /// v2, the feature [`feature::SANDBOX_POOL`]: the operator's ceiling of ready sandboxes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<HelloPool>,
+    /// v2, the feature [`feature::HOST_ISOLATION`] (ADR-0113): the host's level of isolation
+    /// and its hardening. Present exactly when `features` lists it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<HostIsolation>,
+}
+
+/// `hello.isolation` (ADR-0113, decisions 1 to 3): what the host reports of its isolation.
+/// The server stores and shows it as reported, and checks neither value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostIsolation {
+    pub level: IsolationLevel,
+    pub hardened: Hardened,
+    /// The level rests on the operator's statement, not on what the host can see. Left out
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stated: bool,
+}
+
+/// The strongest wall between an agent's code and the credentials (ADR-0113, decision 1).
+/// `Machine` and `VmJail` come only with `isolationTiers` that are all `microvm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationLevel {
+    /// The credentials are on another machine than the VM.
+    Machine,
+    /// A jail around each VM; the credentials on the same machine, out of a VMM's user's reach.
+    VmJail,
+    /// The container and the kernel; the credentials on the same machine behind the kernel.
+    Container,
+}
+
+impl IsolationLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationLevel::Machine => "machine",
+            IsolationLevel::VmJail => "vm-jail",
+            IsolationLevel::Container => "container",
+        }
+    }
+}
+
+/// Whether the machine that runs the host's VMs is hardened beyond the jail (ADR-0113,
+/// decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hardened {
+    Yes,
+    No,
+    /// The host runs no machine of its own for its VMs (a VM per run at a provider).
+    None,
+}
+
+impl Hardened {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Hardened::Yes => "yes",
+            Hardened::No => "no",
+            Hardened::None => "none",
+        }
+    }
 }
 
 /// `hello.pool` (ADR-0099).
@@ -696,6 +757,9 @@ pub mod feature {
     /// [`super::RunFinished::session_bundle`] (ADR-0097): it restores the conversation's
     /// session folders from the server's bundle, and uploads them again when the run ends.
     pub const SESSION_BUNDLE: &str = "session.bundle";
+    /// The host reports its level of isolation and its hardening in
+    /// [`super::Hello::isolation`] (ADR-0113). It adds no frame.
+    pub const HOST_ISOLATION: &str = "host.isolation";
     /// The host keeps ready sandboxes (ADR-0098) and takes Tinfirm's count of them (ADR-0099):
     /// [`super::Hello::pool`], [`super::HostConfig::pool`], [`super::HostConfigApplied::pool`]
     /// and [`super::HostPoolStatus`].

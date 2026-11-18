@@ -295,6 +295,51 @@ async fn a_vm_host_says_microvm_and_takes_skills() {
         );
         assert!(!features.contains(&json!("sandbox.pool")), "{features:?}");
         assert!(hello.get("pool").is_none(), "{hello}");
+        // The host cannot see where an operator's own driver runs the VMs: it reports no
+        // level of isolation unless the operator states one (ADR-0113).
+        assert!(!features.contains(&json!("host.isolation")), "{features:?}");
+        assert!(hello.get("isolation").is_none(), "{hello}");
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_host_reports_the_level_its_operator_states() {
+    use tinfirm_protocol::{Hardened, IsolationLevel};
+    use tinfirm_runner_host::isolation::Stated;
+    with_timeout(60, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        let setup = HostSetup {
+            protocol_version: 2,
+            options: Some(Box::new(|opts| {
+                opts.isolation_stated = Some(Stated {
+                    level: IsolationLevel::Machine,
+                    hardened: Hardened::Yes,
+                });
+            })),
+            ..HostSetup::vm(&log, &[])
+        };
+        let host = start_host(&server.url, setup).await;
+        let mut conn = server.accept().await;
+        // The fake server checks the hello against the schema: the object with its feature,
+        // and `machine` with the `microvm` tier.
+        let hello = conn.handshake(1).await;
+        assert!(
+            hello["features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("host.isolation")),
+            "{hello}"
+        );
+        assert_eq!(
+            hello["isolation"],
+            json!({"level": "machine", "hardened": "yes", "stated": true})
+        );
+        assert_eq!(hello["isolationTiers"], json!(["microvm"]));
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

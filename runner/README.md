@@ -467,6 +467,48 @@ mirror settings, and builds the images. By hand, on a machine with `/dev/kvm`:
    `runner host starting` shows `sandbox_runtime`, `isolation_tier`, `sandbox_docker` and
    the names of the extra variables.
 
+## Isolation level
+
+A host with protocol 2 reports its level of isolation: the strongest wall between an agent's code
+and the credentials ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md)). It lists the
+feature `host.isolation` in its `hello` and sends `hello.isolation`: the level, and whether the
+machine that runs its VMs is hardened beyond the jail (`yes`, `no`, or `none` when the host runs no
+machine of its own for its VMs).
+
+| Level | The wall | Where the credentials are | What an escape from a sandbox reaches |
+|---|---|---|---|
+| `machine` | Another machine | On another machine than the VM | The machine that runs the VM, and the other runs there; with a provider's VM per run, the provider's machine, with nothing of Tinfirm's |
+| `vm-jail` | A jail around each VM | On the same machine, out of a VMM's user's reach | Through the VMM, one jailed user that reads no credential; through a flaw of the kernel under the VMs, the machine with every credential |
+| `container` | The container and the kernel | On the same machine, behind the kernel alone | This machine, which holds the host's token and every run's git token, and the other runs on it |
+
+The host derives its level from what it can see, and only takes your word where it cannot:
+
+| This host | Reports | Hardened |
+|---|---|---|
+| Docker, whatever `--sandbox-runtime` (runc, `runsc…`, `kata…`; the tier stays `container`, `gvisor` or `microvm`) | `container` | `no` |
+| `--executor vm --vm-driver digitalocean` | `machine` | `none` |
+| `--executor vm` with a driver of your own | What `--isolation-level` states, marked as stated (`"stated": true`), or no level | `--isolation-hardened` |
+| Protocol 1 | No level | |
+
+- **A driver of your own.** The host cannot see where your driver runs the VMs. State the level
+  with `--isolation-level machine` (the VMs run on other machines than this host, which hold no
+  credential) or `vm-jail` (each VM's VMM runs in a jail of its own on this machine), and
+  `--isolation-hardened yes|no|none`. Without them the host reports no level and says so at its
+  start; the server then places its runs as on a container host.
+- **A statement never overrides what the host can see:** `run` refuses `--isolation-level` with
+  the Docker executor and with `--vm-driver digitalocean`.
+- **Where it shows.** `run` logs the level at its start, with what an escape from a sandbox reaches
+  on such a host. `doctor` says the same for the settings in its environment
+  (`TINFIRM_RUNNER_EXECUTOR`, `TINFIRM_RUNNER_VM_DRIVER`, `TINFIRM_RUNNER_ISOLATION_*`; it does not
+  see `run`'s flags). The server stores the level and shows it on the host's page as reported; it
+  checks neither value. Placing an agent's runs by level is planned on the server
+  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 4).
+
+| Option | Environment | Default | Meaning |
+|---|---|---|---|
+| `--isolation-level machine\|vm-jail` | `TINFIRM_RUNNER_ISOLATION_LEVEL` | | The level this host reports with a VM driver of your own; refused where the host derives its own |
+| `--isolation-hardened yes\|no\|none` | `TINFIRM_RUNNER_ISOLATION_HARDENED` | `no` | Whether the machines that run those VMs are hardened; only with `--isolation-level` |
+
 ## Sandbox bridge
 
 With `run --sandbox-bridge` (`TINFIRM_RUNNER_SANDBOX_BRIDGE`), the agent's adapter runs over the
@@ -620,6 +662,8 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 | `--vm-start-timeout SECONDS` | `TINFIRM_RUNNER_VM_START_TIMEOUT` | `900` | From the create to the bridge's first connection (30 to 3600) |
 | `--vm-probe CHECK` | `TINFIRM_RUNNER_VM_PROBE` (one per line) | | `tcp:HOST:PORT`, `dns:NAME` or `http://HOST[:PORT]/PATH`, repeatable |
 | `--vm-image-version warn\|refuse` | `TINFIRM_RUNNER_VM_IMAGE_VERSION` | `warn` | What to do with a VM whose image another build of the runner host made |
+| `--isolation-level machine\|vm-jail` | `TINFIRM_RUNNER_ISOLATION_LEVEL` | | With a driver of your own: the level this host reports ([Isolation level](#isolation-level)) |
+| `--isolation-hardened yes\|no\|none` | `TINFIRM_RUNNER_ISOLATION_HARDENED` | `no` | With `--isolation-level`: whether the machines that run the VMs are hardened |
 
 ### Ready VMs
 
@@ -870,8 +914,8 @@ Three numbers, each moved by something else
 | The features | `hello.features` | A new optional capability within protocol 2, whatever release ships it | Sends a feature's frames only to a host that lists it |
 
 **This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
-It uses the features `run.steer`, `run.skills`, `session.bundle`, `sandbox.bridge`, `sandbox.pool`
-and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
+It uses the features `run.steer`, `run.skills`, `session.bundle`, `host.isolation`,
+`sandbox.bridge`, `sandbox.pool` and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
 [ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). A host that lists none of them
 still takes turns; it only misses what they add.
 

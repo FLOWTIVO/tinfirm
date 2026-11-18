@@ -195,8 +195,14 @@ ships it.
   feature without the object or sends the object without the feature, and one that reports
   `machine` or `vm-jail` with a tier other than `microvm`. It stores the report at every `hello`
   and shows it on the host's card as reported; it checks none of it. A host without the feature
-  shows its tier and no level. The runner host does not send the feature yet, and placement by
-  level is planned (ADR-0113, decision 4): today the level decides nothing.
+  shows its tier and no level. The runner host derives its level from what it can see: a host
+  with Docker reports `container`, and one with `--vm-driver digitalocean` reports `machine`
+  with `hardened` `none`. With a VM driver of the operator's own it reports a level only when
+  the operator states one (`run --isolation-level machine|vm-jail`, `--isolation-hardened
+  yes|no|none`), marked `stated`; a statement where the host derives its own level stops
+  `run`. Its startup log and `doctor` say the level and what an escape from a sandbox reaches
+  ([runner/README.md](../../runner/README.md#isolation-level)). Placement by level is planned
+  (ADR-0113, decision 4): today the level decides nothing.
 - **Ready sandboxes** ([ADR-0098](../adr/0098-ready-vms.md),
   [ADR-0099](../adr/0099-pool-settings.md)). A host with a VM per run (`run --executor vm`)
   and ready VMs lists `sandbox.pool` and reports its operator's `--pool-max-ready` in

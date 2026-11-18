@@ -74,7 +74,8 @@ pub struct DriverCommand {
     pub env: Vec<(String, String)>,
     /// One of this binary's paid drivers (ADR-0114): the host lists the feature
     /// `sandbox.elastic`, which a server refuses without its licence's elastic runners. An
-    /// operator's own driver is not.
+    /// operator's own driver is not. Each of them is a provider's VM per run today, so the
+    /// host reports the level `machine` with it (crate::isolation).
     pub elastic: bool,
 }
 
