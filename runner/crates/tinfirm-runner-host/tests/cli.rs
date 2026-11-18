@@ -510,6 +510,7 @@ fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("TINFIRM_RUNNER_VM_PROBE")
         .env_remove("TINFIRM_RUNNER_ISOLATION_LEVEL")
         .env_remove("TINFIRM_RUNNER_ISOLATION_HARDENED")
+        .env_remove("TINFIRM_NODE_DRIVER_CONFIG")
         .envs(env.iter().copied())
         .stdin(Stdio::null());
     cmd.output().unwrap()
@@ -1102,4 +1103,98 @@ fn doctor_says_what_an_escape_reaches() {
     );
     let report = doctor(&[("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine")]);
     assert!(report.contains("[FAIL] isolation"), "{report}");
+}
+
+#[test]
+fn the_node_driver_reports_what_its_nodes_configuration_reaches() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let sockets = dir.join("sockets.json");
+    std::fs::write(
+        &sockets,
+        r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox-4c8g"]}]}"#,
+    )
+    .unwrap();
+    let (cert, key) = (dir.join("client.crt"), dir.join("client.key"));
+    std::fs::write(&cert, b"certificate").unwrap();
+    std::fs::write(&key, b"key").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mixed = dir.join("mixed.json");
+    std::fs::write(
+        &mixed,
+        serde_json::json!({"nodes": [
+            {"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox-4c8g"]},
+            {"name": "node-1", "address": "192.0.2.10:7700", "nodeSha256": "ab".repeat(32),
+             "certificate": cert, "key": key, "templates": ["sandbox-4c8g"]}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let node = [
+        "run",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "node",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    let sockets = sockets.to_string_lossy().into_owned();
+    let mixed = mixed.to_string_lossy().into_owned();
+    let stated: Vec<&str> = node
+        .iter()
+        .copied()
+        .chain(["--isolation-level", "machine"])
+        .collect();
+    for (args, config, expected) in [
+        (
+            &stated[..],
+            sockets.as_str(),
+            "with --vm-driver node this host reports `vm-jail` itself",
+        ),
+        (
+            &node[..],
+            mixed.as_str(),
+            "the nodes are reached over sockets and over TLS at once",
+        ),
+        (
+            &node[..],
+            "/nonexistent/node-driver.json",
+            "--vm-driver node: cannot read",
+        ),
+    ] {
+        let out = run_with_env(dir, args, &[("TINFIRM_NODE_DRIVER_CONFIG", config)]);
+        assert!(!out.status.success(), "{args:?} {config}");
+        let message = text(&out);
+        assert!(message.contains(expected), "{config}: {message}");
+        assert!(!message.contains("not logged in"), "{message}");
+    }
+    // A configuration of sockets passes the checks; this `run` then stops: not logged in.
+    let out = run_with_env(dir, &node, &[("TINFIRM_NODE_DRIVER_CONFIG", &sockets)]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("not logged in"), "{}", text(&out));
+    // `doctor` says what such a host reports, and fails on a mixed configuration.
+    let doctor = |config: &str| {
+        text(&run_with_env(
+            dir,
+            &["doctor"],
+            &[
+                ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+                ("TINFIRM_RUNNER_VM_DRIVER", "node"),
+                ("TINFIRM_NODE_DRIVER_CONFIG", config),
+            ],
+        ))
+    };
+    let report = doctor(&sockets);
+    assert!(
+        report.contains("[info] isolation: reports vm-jail, hardened no"),
+        "{report}"
+    );
+    assert!(report.contains("(KVM)"), "{report}");
+    let report = doctor(&mixed);
+    assert!(
+        report.contains("[FAIL] isolation: --vm-driver node:"),
+        "{report}"
+    );
 }

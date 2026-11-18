@@ -71,6 +71,18 @@ use crate::vm::{DRIVER_PROTOCOL, HOST_LABEL};
 
 /// `--vm-driver node`.
 pub const BUILTIN_NODE: &str = "node";
+/// Where the driver's configuration is when neither `--config` nor
+/// `TINFIRM_NODE_DRIVER_CONFIG` names it.
+pub const DEFAULT_CONFIG: &str = "/etc/tinfirm/node-driver.json";
+
+/// The configuration `vm-driver node` reads without `--config`: `TINFIRM_NODE_DRIVER_CONFIG`,
+/// or [`DEFAULT_CONFIG`]. `--vm-driver node` names it to the driver, and the host reads the
+/// same file for its level of isolation (crate::isolation).
+pub fn config_path() -> PathBuf {
+    std::env::var_os("TINFIRM_NODE_DRIVER_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from(DEFAULT_CONFIG), PathBuf::from)
+}
 /// The version of the agent's wire this driver speaks.
 pub const WIRE: u32 = 1;
 /// The name in the node's certificate, which the driver sends; nothing resolves it.

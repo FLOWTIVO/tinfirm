@@ -11,13 +11,17 @@
 //! |---|---|---|---|
 //! | Docker, whatever its runtime (runc, `runsc…`, `kata…`) | `container` | `no` | no |
 //! | A VM per run through a provider's driver of this binary (`digitalocean`) | `machine` | `none` | no |
+//! | The `node` driver (crate::node), every node over its local socket | `vm-jail` | `no` | no |
+//! | The `node` driver, every node over TLS at an address that is not this host's own | `machine` | `no` | no |
 //! | A VM per run through the operator's own driver | what `--isolation-level` states, or none | `--isolation-hardened` | yes |
 //! | The local test executor | none | | |
 //!
 //! A statement never overrides what the host can see: [`derive`] refuses one where the host
-//! derives its own level. The `node` driver of ADR-0112 (not built yet) will be derived here
-//! too: `vm-jail` when it speaks to the node agent over the local socket, `machine` when every
-//! node is reached over TLS on another machine, with the hardening the node agent checks.
+//! derives its own level. The `node` driver's level comes from its configuration
+//! ([`crate::node::NodeConfig::isolation`]), the one file the driver reads too; a configuration
+//! that mixes sockets and TLS, or reaches this host's own address over TLS, is refused. Its
+//! hardening is `no` for now: the node agent's checks of a hardened machine (ADR-0113,
+//! decision 5), which must pass before a host reports `yes`, are not built.
 
 use tinfirm_protocol::{Hardened, HostIsolation, IsolationLevel};
 
@@ -30,6 +34,9 @@ pub enum Sandboxes {
     Docker,
     /// A VM per run at a provider, through a driver of this binary (`--vm-driver digitalocean`).
     ProviderVms,
+    /// Sandbox nodes through this binary's `node` driver (`--vm-driver node`, ADR-0112), as
+    /// its configuration reaches them.
+    Nodes(crate::node::Isolation),
     /// A VM per run through the operator's own driver: where the VMs run cannot be seen here.
     OwnDriverVms,
     /// The local test executor: the agent is a process of this machine.
@@ -37,21 +44,25 @@ pub enum Sandboxes {
 }
 
 impl Sandboxes {
-    pub fn of(executor: &Executor) -> Sandboxes {
+    /// An error when the `node` driver's configuration cannot be read, or is refused.
+    pub fn of(executor: &Executor) -> Result<Sandboxes, String> {
         match executor {
-            Executor::Docker(_) => Sandboxes::Docker,
+            Executor::Docker(_) => Ok(Sandboxes::Docker),
             Executor::Vm(vms) => Sandboxes::of_driver(&vms.options.driver),
-            Executor::Local { .. } => Sandboxes::LocalTest,
+            Executor::Local { .. } => Ok(Sandboxes::LocalTest),
         }
     }
 
-    /// The VM executor with `driver`. This binary's own drivers are each a provider's VM per
-    /// run ([`crate::vm::DriverCommand::elastic`]).
-    pub fn of_driver(driver: &crate::vm::DriverCommand) -> Sandboxes {
-        if driver.elastic {
-            Sandboxes::ProviderVms
-        } else {
-            Sandboxes::OwnDriverVms
+    /// The VM executor with `driver`: this binary's own drivers by their kind
+    /// ([`crate::vm::Builtin`]); the `node` driver as its configuration reaches the nodes.
+    pub fn of_driver(driver: &crate::vm::DriverCommand) -> Result<Sandboxes, String> {
+        match &driver.builtin {
+            Some(crate::vm::Builtin::Digitalocean) => Ok(Sandboxes::ProviderVms),
+            Some(crate::vm::Builtin::Node { config }) => crate::node::NodeConfig::load(config)
+                .and_then(|config| config.isolation())
+                .map(Sandboxes::Nodes)
+                .map_err(|e| format!("--vm-driver node: {e:#}")),
+            None => Ok(Sandboxes::OwnDriverVms),
         }
     }
 }
@@ -79,6 +90,13 @@ pub fn derive(
     match (sandboxes, stated) {
         (Sandboxes::Docker, None) => Ok(Some(seen(IsolationLevel::Container, Hardened::No))),
         (Sandboxes::ProviderVms, None) => Ok(Some(seen(IsolationLevel::Machine, Hardened::None))),
+        // `no` until the node agent checks the hardening (ADR-0113, decision 5).
+        (Sandboxes::Nodes(crate::node::Isolation::VmJail), None) => {
+            Ok(Some(seen(IsolationLevel::VmJail, Hardened::No)))
+        }
+        (Sandboxes::Nodes(crate::node::Isolation::Machine), None) => {
+            Ok(Some(seen(IsolationLevel::Machine, Hardened::No)))
+        }
         (Sandboxes::OwnDriverVms, Some(stated)) => Ok(Some(HostIsolation {
             level: stated.level,
             hardened: stated.hardened,
@@ -93,6 +111,10 @@ pub fn derive(
             "--isolation-level is for a VM driver of your own: with --vm-driver digitalocean this host reports `machine` itself, and a statement never overrides what the host can see"
                 .into(),
         ),
+        (Sandboxes::Nodes(nodes), Some(_)) => Err(format!(
+            "--isolation-level is for a VM driver of your own: with --vm-driver node this host reports `{}` itself, from its nodes' configuration, and a statement never overrides what the host can see",
+            nodes.as_str()
+        )),
         (Sandboxes::LocalTest, Some(_)) => {
             Err("--isolation-level is for a VM driver of your own, not the local test executor".into())
         }
@@ -134,6 +156,8 @@ pub fn what_an_escape_reaches(sandboxes: Sandboxes, isolation: Option<&HostIsola
     match isolation.level {
         IsolationLevel::Container => "An agent that escapes its sandbox reaches this machine, which holds the host's token and every run's git token, and the other runs on it.".into(),
         IsolationLevel::Machine if sandboxes == Sandboxes::ProviderVms => "An agent that escapes its VM reaches the provider's machine, which holds nothing of Tinfirm's.".into(),
+        IsolationLevel::Machine if matches!(sandboxes, Sandboxes::Nodes(_)) => "An agent that escapes its VM reaches its sandbox node, which holds no credential, and the other runs on that node.".into(),
+        IsolationLevel::VmJail if matches!(sandboxes, Sandboxes::Nodes(_)) => "An agent that leaves its VM through the VMM is one jailed user that reads no credential; a flaw of the kernel under the VMs (KVM) reaches this machine, with every credential.".into(),
         IsolationLevel::Machine => format!(
             "An agent that escapes its VM reaches the machine that runs it{stated}: no credential is there, but the other runs on that machine are."
         ),
@@ -167,6 +191,44 @@ mod tests {
         );
         assert_eq!(derive(Sandboxes::OwnDriverVms, None), Ok(None));
         assert_eq!(derive(Sandboxes::LocalTest, None), Ok(None));
+    }
+
+    #[test]
+    fn the_node_driver_reports_what_its_configuration_reaches() {
+        use crate::node::Isolation;
+        assert_eq!(
+            derive(Sandboxes::Nodes(Isolation::VmJail), None),
+            Ok(seen(IsolationLevel::VmJail, Hardened::No))
+        );
+        assert_eq!(
+            derive(Sandboxes::Nodes(Isolation::Machine), None),
+            Ok(seen(IsolationLevel::Machine, Hardened::No))
+        );
+        let stated = Stated {
+            level: IsolationLevel::Machine,
+            hardened: Hardened::Yes,
+        };
+        let error = derive(Sandboxes::Nodes(Isolation::VmJail), Some(stated)).unwrap_err();
+        assert!(
+            error.contains("with --vm-driver node this host reports `vm-jail` itself"),
+            "{error}"
+        );
+        let jail = derive(Sandboxes::Nodes(Isolation::VmJail), None).unwrap();
+        let text = what_an_escape_reaches(Sandboxes::Nodes(Isolation::VmJail), jail.as_ref());
+        assert!(
+            text.contains("one jailed user that reads no credential"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(KVM) reaches this machine, with every credential"),
+            "{text}"
+        );
+        let machine = derive(Sandboxes::Nodes(Isolation::Machine), None).unwrap();
+        let text = what_an_escape_reaches(Sandboxes::Nodes(Isolation::Machine), machine.as_ref());
+        assert!(
+            text.contains("reaches its sandbox node, which holds no credential"),
+            "{text}"
+        );
     }
 
     #[test]

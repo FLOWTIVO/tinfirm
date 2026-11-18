@@ -185,7 +185,7 @@ enum VmDriverCommand {
         #[arg(
             long,
             env = "TINFIRM_NODE_DRIVER_CONFIG",
-            default_value = "/etc/tinfirm/node-driver.json"
+            default_value = tinfirm_runner_host::node::DEFAULT_CONFIG
         )]
         config: PathBuf,
     },
@@ -1649,7 +1649,8 @@ async fn doctor(paths: &Paths) -> Result<()> {
 }
 
 /// The level of isolation that `run` would report with `TINFIRM_RUNNER_EXECUTOR`,
-/// `TINFIRM_RUNNER_VM_DRIVER` and `TINFIRM_RUNNER_ISOLATION_*`, and what an escape from a
+/// `TINFIRM_RUNNER_VM_DRIVER` (with `node`, `TINFIRM_NODE_DRIVER_CONFIG`) and
+/// `TINFIRM_RUNNER_ISOLATION_*`, and what an escape from a
 /// sandbox reaches on such a host (ADR-0112, decision 7). `run`'s flags are not seen here.
 fn doctor_isolation(checks: &mut Checks) {
     let var = |name: &str| {
@@ -1664,9 +1665,16 @@ fn doctor_isolation(checks: &mut Checks) {
             .map(tinfirm_runner_host::vm::DriverCommand::parse)
         {
             Some(Ok(driver)) => Sandboxes::of_driver(&driver),
-            _ => Sandboxes::OwnDriverVms,
+            _ => Ok(Sandboxes::OwnDriverVms),
         },
-        _ => Sandboxes::Docker,
+        _ => Ok(Sandboxes::Docker),
+    };
+    let sandboxes = match sandboxes {
+        Ok(sandboxes) => sandboxes,
+        Err(e) => {
+            checks.fail("isolation", e);
+            return;
+        }
     };
     let level = var("TINFIRM_RUNNER_ISOLATION_LEVEL");
     let hardened = var("TINFIRM_RUNNER_ISOLATION_HARDENED");
@@ -1963,7 +1971,7 @@ async fn run(
     let vm_options = vm_args.options()?;
     // The level of isolation (ADR-0113): a statement never overrides what the host sees.
     let sandboxes = match &vm_options {
-        Some((options, _)) => Sandboxes::of_driver(&options.driver),
+        Some((options, _)) => Sandboxes::of_driver(&options.driver).map_err(anyhow::Error::msg)?,
         None => Sandboxes::Docker,
     };
     let isolation_stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);

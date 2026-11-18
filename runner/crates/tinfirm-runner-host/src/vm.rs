@@ -17,7 +17,8 @@
 //! The executor and the driver protocol are in the core (ADR-0114): an operator can bring a
 //! driver of their own. The drivers built into this binary for a provider are paid
 //! (DigitalOcean's, crate::digitalocean): a host with one lists the feature `sandbox.elastic`
-//! ([`DriverCommand::elastic`]).
+//! ([`DriverCommand::elastic`]). The driver for sandbox nodes (crate::node) is this binary's
+//! too, and in the core ([`Builtin::Node`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -72,33 +73,35 @@ pub struct DriverCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// One of this binary's paid drivers (ADR-0114): the host lists the feature
-    /// `sandbox.elastic`, which a server refuses without its licence's elastic runners. An
-    /// operator's own driver is not. Each of them is a provider's VM per run today, so the
-    /// host reports the level `machine` with it (crate::isolation).
-    pub elastic: bool,
+    /// Which of this binary's own drivers the command is; `None`: the operator's own driver.
+    /// The host derives what it reports from it: the feature `sandbox.elastic`
+    /// ([`DriverCommand::elastic`]) and its level of isolation (crate::isolation).
+    pub builtin: Option<Builtin>,
+}
+
+/// A driver built into this binary (`vm-driver <name>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Builtin {
+    /// DigitalOcean's (crate::digitalocean): a provider's VM per run, paid (ADR-0114).
+    Digitalocean,
+    /// Sandbox nodes (crate::node, ADR-0112), in the core, with the configuration it reads.
+    Node { config: PathBuf },
 }
 
 impl DriverCommand {
-    /// `--vm-driver`: `digitalocean` for this binary's own driver, which is paid, or a command
-    /// line of the operator's own driver, split at white space (no quoting).
+    /// `--vm-driver`: `digitalocean` or `node` for this binary's own drivers, or a command line
+    /// of the operator's own driver, split at white space (no quoting).
     pub fn parse(value: &str) -> Result<DriverCommand> {
         let value = value.trim();
-        // The driver for sandbox nodes (crate::node, ADR-0112): in the core, and paid nowhere.
         if value == crate::node::BUILTIN_NODE {
-            return Ok(DriverCommand {
-                program: std::env::current_exe().context("cannot find this executable")?,
-                args: vec!["vm-driver".into(), crate::node::BUILTIN_NODE.into()],
-                env: Vec::new(),
-                elastic: false,
-            });
+            return DriverCommand::node(crate::node::config_path());
         }
         if value == BUILTIN_DIGITALOCEAN {
             return Ok(DriverCommand {
                 program: std::env::current_exe().context("cannot find this executable")?,
                 args: vec!["vm-driver".into(), BUILTIN_DIGITALOCEAN.into()],
                 env: Vec::new(),
-                elastic: true,
+                builtin: Some(Builtin::Digitalocean),
             });
         }
         let mut words = value.split_whitespace();
@@ -109,8 +112,31 @@ impl DriverCommand {
             program: PathBuf::from(program),
             args: words.map(String::from).collect(),
             env: Vec::new(),
-            elastic: false,
+            builtin: None,
         })
+    }
+
+    /// The driver for sandbox nodes (crate::node, ADR-0112) with its configuration at
+    /// `config`, which it gets as `--config`: the host and the driver read one file.
+    pub fn node(config: PathBuf) -> Result<DriverCommand> {
+        Ok(DriverCommand {
+            program: std::env::current_exe().context("cannot find this executable")?,
+            args: vec![
+                "vm-driver".into(),
+                crate::node::BUILTIN_NODE.into(),
+                "--config".into(),
+                config.to_string_lossy().into_owned(),
+            ],
+            env: Vec::new(),
+            builtin: Some(Builtin::Node { config }),
+        })
+    }
+
+    /// One of this binary's paid drivers (ADR-0114), DigitalOcean's today: the host lists the
+    /// feature `sandbox.elastic`, which a server refuses without its licence's elastic
+    /// runners. The node driver and an operator's own driver are not.
+    pub fn elastic(&self) -> bool {
+        matches!(self.builtin, Some(Builtin::Digitalocean))
     }
 }
 
@@ -1076,10 +1102,16 @@ mod tests {
         assert_eq!(builtin.args, ["vm-driver", "digitalocean"]);
         assert_eq!(builtin.program, std::env::current_exe().unwrap());
         // The driver for sandbox nodes is this binary's too, and in the core: no paid feature.
+        assert!(builtin.elastic());
         let node = DriverCommand::parse(" node ").unwrap();
-        assert_eq!(node.args, ["vm-driver", "node"]);
+        let config = crate::node::config_path();
+        assert_eq!(
+            node.args,
+            ["vm-driver", "node", "--config", &config.to_string_lossy()]
+        );
         assert_eq!(node.program, std::env::current_exe().unwrap());
-        assert!(!node.elastic);
+        assert_eq!(node.builtin, Some(Builtin::Node { config }));
+        assert!(!node.elastic());
         let own = DriverCommand::parse("  /opt/drivers/hetzner --project sandboxes ").unwrap();
         assert_eq!(own.program, PathBuf::from("/opt/drivers/hetzner"));
         assert_eq!(own.args, ["--project", "sandboxes"]);
@@ -1178,7 +1210,7 @@ mod tests {
             program: PathBuf::from("sh"),
             args: vec!["-c".into(), script.into()],
             env: Vec::new(),
-            elastic: false,
+            builtin: None,
         })
     }
 

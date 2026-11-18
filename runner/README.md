@@ -488,6 +488,8 @@ The host derives its level from what it can see, and only takes your word where 
 |---|---|---|
 | Docker, whatever `--sandbox-runtime` (runc, `runsc…`, `kata…`; the tier stays `container`, `gvisor` or `microvm`) | `container` | `no` |
 | `--executor vm --vm-driver digitalocean` | `machine` | `none` |
+| `--executor vm --vm-driver node`, every node over its local socket ([Sandbox nodes](#sandbox-nodes)) | `vm-jail` | `no` |
+| `--executor vm --vm-driver node`, every node over TLS at an address that is not this host's own | `machine` | `no` |
 | `--executor vm` with a driver of your own | What `--isolation-level` states, marked as stated (`"stated": true`), or no level | `--isolation-hardened` |
 | Protocol 1 | No level | |
 
@@ -497,7 +499,10 @@ The host derives its level from what it can see, and only takes your word where 
   `--isolation-hardened yes|no|none`. Without them the host reports no level and says so at its
   start; the server then places its runs as on a container host.
 - **A statement never overrides what the host can see:** `run` refuses `--isolation-level` with
-  the Docker executor and with `--vm-driver digitalocean`.
+  the Docker executor, with `--vm-driver digitalocean` and with `--vm-driver node`.
+- **The node driver's hardening** is `no` for now: the node agent's checks of a hardened machine,
+  which must pass before a host reports `yes`
+  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 5), are not built.
 - **Where it shows.** `run` logs the level at its start, with what an escape from a sandbox reaches
   on such a host. `doctor` says the same for the settings in its environment
   (`TINFIRM_RUNNER_EXECUTOR`, `TINFIRM_RUNNER_VM_DRIVER`, `TINFIRM_RUNNER_ISOLATION_*`; it does not
@@ -756,6 +761,16 @@ with a fake backend; no run has gone through a node.
 
 - **Editions.** In the core, in every edition: the driver lists no paid feature
   ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)).
+- **Its level of isolation** ([Isolation level](#isolation-level)). This host reads the driver's
+  configuration at its start (the same file: it names it to the driver with `--config`) and reports
+  `vm-jail` when every node is reached over its local socket, and `machine` when every node is reached
+  over TLS at an address that is not this host's own; hardened `no`. An agent that leaves its VM
+  through the VMM is then one jailed user that reads no credential, and a flaw of the kernel under the
+  VMs (KVM) reaches the machine with every credential (`vm-jail`), or the node, which holds no
+  credential, and the other runs on it (`machine`). A configuration that cannot be read, that mixes
+  sockets and TLS, or that reaches this host's own address over TLS stops `run` at its start, and
+  `--isolation-level` is refused. Since no VM runs through a node yet (above), this is what such a host
+  would report.
 - **Its configuration**, `/etc/tinfirm/node-driver.json` (or `TINFIRM_NODE_DRIVER_CONFIG`):
 
   ```json

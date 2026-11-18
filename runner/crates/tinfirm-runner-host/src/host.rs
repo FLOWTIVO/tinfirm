@@ -183,13 +183,12 @@ impl HostOptions {
     }
 
     /// The level of isolation the host reports (crate::isolation, ADR-0113): derived from
-    /// its executor, or the operator's statement for a VM driver of their own. An error
-    /// when the statement contradicts what the host can see.
+    /// its executor (with `--vm-driver node`, its nodes' configuration), or the operator's
+    /// statement for a VM driver of their own. An error when the statement contradicts what
+    /// the host can see, or the node driver's configuration cannot be read or is refused.
     pub fn isolation(&self) -> Result<Option<tinfirm_protocol::HostIsolation>, String> {
-        crate::isolation::derive(
-            crate::isolation::Sandboxes::of(&self.executor),
-            self.isolation_stated,
-        )
+        crate::isolation::Sandboxes::of(&self.executor)
+            .and_then(|sandboxes| crate::isolation::derive(sandboxes, self.isolation_stated))
     }
 
     /// Whether the host keeps ready VMs (crate::ready_vms): the VM executor with
@@ -354,6 +353,10 @@ pub struct Shared {
     pool: Option<Arc<crate::pool::Pool>>,
     /// The pool's ready VMs (crate::ready_vms), with `--pool-max-ready` above 0.
     ready_vms: Option<Arc<crate::ready_vms::ReadyVms>>,
+    /// The level of isolation the host reports (crate::isolation), derived once at its start:
+    /// the node driver's configuration is read then. `run` refused a host whose level is an
+    /// error before it started; such a host reports none.
+    isolation: Option<tinfirm_protocol::HostIsolation>,
     /// The Public Suffix List the server sent (`psl.update`), if the host holds one.
     public_suffix: Arc<PublicSuffixStore>,
     /// Bare mirrors of the task repositories.
@@ -402,6 +405,10 @@ impl Shared {
             capacity = capacity.with_pool(opts.ready_vms.max_ready);
         }
         let outbox = Arc::new(Outbox::with_retention(opts.finished_retention));
+        let isolation = opts.isolation().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "this host reports no level of isolation");
+            None
+        });
         let ready_vms = opts.keeps_ready_vms().then(|| {
             crate::ready_vms::ReadyVms::new(
                 opts.ready_vms.clone(),
@@ -439,6 +446,7 @@ impl Shared {
             model_proxy: tokio::sync::Mutex::new(None),
             pool,
             ready_vms,
+            isolation,
             heartbeat_secs: AtomicU64::new(10),
             lease_ttl_secs: AtomicU64::new(30),
             runner_host_id: Mutex::new(state.runner_host_id),
@@ -991,13 +999,9 @@ impl Shared {
         } else {
             vec![IsolationTier::Container]
         };
-        // The level of isolation (ADR-0113), with protocol 2 only. `run` refused a statement
-        // that contradicts what the host can see before it started.
-        let isolation = if v2 {
-            self.opts.isolation().ok().flatten()
-        } else {
-            None
-        };
+        // The level of isolation (ADR-0113), with protocol 2 only, as the host derived it
+        // when it started.
+        let isolation = if v2 { self.isolation } else { None };
         Hello {
             protocol_version: self.protocol_version(),
             runner_version: self.opts.runner_version.clone(),
@@ -2190,7 +2194,7 @@ pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
         features.push(feature::SANDBOX_BRIDGE.to_string());
     }
     if let Executor::Vm(vms) = executor
-        && vms.options.driver.elastic
+        && vms.options.driver.elastic()
     {
         features.push(feature::SANDBOX_ELASTIC.to_string());
     }
@@ -3007,6 +3011,63 @@ mod tests {
             })
         );
         assert!(has_feature(&h));
+        // The node driver (ADR-0112): what its configuration reaches, never a statement.
+        let node = |config: &std::path::Path| {
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                crate::vm::DriverCommand::node(config.to_path_buf()).unwrap(),
+                "sandbox".into(),
+            )))
+        };
+        let sockets = dir.path().join("sockets.json");
+        std::fs::write(
+            &sockets,
+            r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox"]}]}"#,
+        )
+        .unwrap();
+        let h = hello(node(&sockets), vms(), None, &config).await;
+        assert_eq!(
+            h.isolation,
+            Some(HostIsolation {
+                level: IsolationLevel::VmJail,
+                hardened: Hardened::No,
+                stated: false,
+            })
+        );
+        assert!(has_feature(&h));
+        assert!(!h.features.iter().any(|f| f == feature::SANDBOX_ELASTIC));
+        // TLS nodes at addresses that are not this host's own (TEST-NET-1).
+        let (cert, key) = (dir.path().join("client.crt"), dir.path().join("client.key"));
+        std::fs::write(&cert, b"not parsed until the driver dials").unwrap();
+        std::fs::write(&key, b"not parsed until the driver dials").unwrap();
+        std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let tls = dir.path().join("tls.json");
+        std::fs::write(
+            &tls,
+            serde_json::json!({"nodes": [{
+                "name": "node-1",
+                "address": "192.0.2.10:7700",
+                "nodeSha256": "ab".repeat(32),
+                "certificate": cert,
+                "key": key,
+                "templates": ["sandbox"]
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let h = hello(node(&tls), vms(), None, &config).await;
+        assert_eq!(
+            h.isolation,
+            Some(HostIsolation {
+                level: IsolationLevel::Machine,
+                hardened: Hardened::No,
+                stated: false,
+            })
+        );
+        // A statement with the node driver: the host reports none (`run` refuses it at start).
+        let h = hello(node(&tls), vms(), Some(stated), &config).await;
+        assert_eq!(h.isolation, None);
+        assert!(!has_feature(&h));
         // The local test executor reports none.
         let local = Executor::Local {
             program: "false".into(),

@@ -180,7 +180,7 @@ fn driver_at(config: &Path) -> Driver {
             config.to_string_lossy().into_owned(),
         ],
         env: Vec::new(),
-        elastic: false,
+        builtin: None,
     })
 }
 

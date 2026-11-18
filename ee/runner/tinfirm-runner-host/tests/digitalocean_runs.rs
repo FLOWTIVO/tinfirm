@@ -12,7 +12,7 @@ use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_builtin_digitalocean_driver_speaks_the_protocol() {
-    use tinfirm_runner_host::vm::{Driver, DriverCommand};
+    use tinfirm_runner_host::vm::{Builtin, Driver, DriverCommand};
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("token");
     std::fs::write(&token, "dop_v1_TEST-ONLY-fake-token\n").unwrap();
@@ -44,7 +44,7 @@ async fn the_builtin_digitalocean_driver_speaks_the_protocol() {
             config.to_string_lossy().into_owned(),
         ],
         env: vec![("TINFIRM_RUNNER_LOG".into(), "warn".into())],
-        elastic: true,
+        builtin: Some(Builtin::Digitalocean),
     });
     let hello = driver.hello().await.unwrap();
     assert_eq!(hello.driver, "digitalocean");
@@ -62,7 +62,7 @@ async fn a_host_with_a_paid_driver_lists_it_and_a_community_server_stops_the_hos
         let dir = tempfile::tempdir().unwrap();
         // The fake driver, standing in for one of this binary's paid drivers.
         let mut options = vm_options(&dir.path().join("driver.log"), &[]);
-        options.driver.elastic = true;
+        options.driver.builtin = Some(tinfirm_runner_host::vm::Builtin::Digitalocean);
         let mut server = FakeServer::start().await;
         let setup = HostSetup {
             protocol_version: 2,

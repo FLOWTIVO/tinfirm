@@ -93,7 +93,7 @@ pub fn vm_options(log: &Path, env: &[(&str, &str)]) -> tinfirm_runner_host::vm::
             program: PathBuf::from("node"),
             args: vec![fake_vm_driver_script().to_string_lossy().into_owned()],
             env: driver_env,
-            elastic: false,
+            builtin: None,
         },
         template.to_string(),
     );
