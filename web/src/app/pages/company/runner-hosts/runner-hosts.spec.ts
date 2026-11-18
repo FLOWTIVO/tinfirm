@@ -254,20 +254,18 @@ describe('RunnerHosts', () => {
     );
     expect(words(q('isolation-reaches', machine))).toContain('credentials are on another machine');
     expect(words(q('isolation-tiers', machine))).toBe('Tier microvm');
-    expect(q('isolation-planned', machine)).toBeNull();
 
     const jail = q('host-isolation', host('single'))!;
     expect(words(q('isolation-reports', jail))).toBe('Reports vm-jail, stated by the operator');
     expect(words(q('isolation-hardening', jail))).toMatch(/^Hardened/);
 
-    // A host without the feature: its tier and no level, placed as a container host once placement is built.
+    // A host without the feature: its tier and no level, placed as a container host.
     const kata = q('host-isolation', host('kata-01'))!;
     expect(words(q('isolation-reports', kata))).toBe(
       'Reports no level: its runs are placed as on a container host.',
     );
     expect(words(q('isolation-tiers', kata))).toBe('Tier microvm');
     expect(q('isolation-hardening', kata)).toBeNull();
-    expect(words(q('isolation-planned', kata))).toContain('planned');
 
     // Before its first report, nothing.
     expect(q('host-isolation', host('never-seen'))).toBeNull();

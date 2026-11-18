@@ -12,6 +12,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -34,9 +35,12 @@ import com.flowtivo.tinfirm.model.ModelEvents;
 import com.flowtivo.tinfirm.model.RunModelAccess;
 import com.flowtivo.tinfirm.model.RunModelContext;
 import com.flowtivo.tinfirm.principal.PrincipalEvents;
+import com.flowtivo.tinfirm.run.PlacementNote;
 import com.flowtivo.tinfirm.run.RunStatus;
 import com.flowtivo.tinfirm.run.TurnSource;
 import com.flowtivo.tinfirm.runner.HostCredentialInfo;
+import com.flowtivo.tinfirm.runner.Isolation;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerConnections;
 import com.flowtivo.tinfirm.runner.RunnerDirectory;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
@@ -69,10 +73,15 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  * name no model ({@code MODEL_REQUIRED}) or one the key does not allow ({@code MODEL_NOT_ALLOWED}) fail the run;</li>
  * <li>the hosts that may carry the run's credentials ({@link Hosts#eligible}, I13): none while the company has hosts
  * for the runtime ({@code NO_HOST_FOR_CREDENTIALS}), none at all ({@code NO_RUNNER_HOST});</li>
+ * <li>the level of isolation ({@link IsolationPlacement}, ADR-0113 decision 4): of those hosts, the ones of the level
+ * chosen for the agent ({@code NO_HOST_OF_LEVEL} when none reports it), else of the strongest level they report; the
+ * session's host first, and with an automatic agent the weaker host that holds the conversation's session too. A
+ * reason of the next steps names the level where it left a weaker host out;</li>
  * <li>a subscription's label still reported by its host; then, with the eligible hosts locked in the order of their
  * ids so that concurrent dispatchers count one at a time, on every replica, a subscription's pool on its host
  * ({@code CREDENTIAL_POOL_FULL}) and the host ({@link HostSelection}): connected and configured, of protocol v2, not
- * draining, with a free slot, the conversation's previous host first (open point 13). A host's runner version decides
+ * draining, with a free slot, the session's host first (open point 13), then the stronger by level and hardening.
+ * The run records the level its host was placed at and its placement's note. A host's runner version decides
  * nothing (ADR-0109): every host of protocol v2 has the always-on model proxy;</li>
  * <li>assign: a new epoch, the host and its kind, {@code ASSIGNED}; the assignment is delivered after the commit
  * ({@link RunDelivery}), outside any transaction.</li>
@@ -124,6 +133,11 @@ class RunDispatcher {
 
     private final CompanySwitches companySwitches;
 
+    /** Keeping session bundles, under {@code ee/} (ADR-0097): without it, no session moves with its turn. */
+    private final ObjectProvider<SessionBundles> bundles;
+
+    private final RunMetrics metrics;
+
     private final ReentrantLock pass = new ReentrantLock();
 
     private final AtomicBoolean again = new AtomicBoolean();
@@ -132,8 +146,11 @@ class RunDispatcher {
             ModelAccess modelAccess, Hosts hosts, RunnerDirectory runners, RunnerConnections connections,
             RunDelivery delivery, RunCompletion completion, SystemTransactions transactions, RunWorkers workers,
             RunProperties properties, TinfirmProperties tinfirm, TimeSource time, RunEventHub hub,
-            ApplicationEventPublisher publisher, CompanySwitches companySwitches) {
+            ApplicationEventPublisher publisher, CompanySwitches companySwitches,
+            ObjectProvider<SessionBundles> bundles, RunMetrics metrics) {
         this.companySwitches = companySwitches;
+        this.bundles = bundles;
+        this.metrics = metrics;
         this.runs = runs;
         this.locks = locks;
         this.ports = ports;
@@ -406,6 +423,20 @@ class RunDispatcher {
             }
         }
 
+        // 4b. The level of isolation (ADR-0113, decision 4): the hosts of the target level, the session's host first.
+        RunStore.RunRow sessionRun = runs.previousWithSession(run.conversationId(), run.id(), run.createdAt())
+            .orElse(null);
+        IsolationLevel chosenLevel = effective.agent().agent().isolationLevel();
+        IsolationPlacement.Session session = session(run, sessionRun, eligible, chosenLevel);
+        IsolationPlacement.Plan placement;
+        switch (IsolationPlacement.plan(eligible, chosenLevel, session)) {
+            case IsolationPlacement.Waits waits -> {
+                return waiting(run, waits.reason(), now);
+            }
+            case IsolationPlacement.Plan found -> placement = found;
+        }
+        eligible = placement.candidates();
+
         // 5. A subscription's label still reported; then, under the eligible hosts' locks, its pool and the hosts'
         // slots.
         HostCredentialInfo credential = null;
@@ -450,13 +481,17 @@ class RunDispatcher {
                     connections.protocolVersion(host.id()),
                     host.personalHostId() != null ? usedOfMachines.getOrDefault(host.personalHostId(), 0)
                             : used.getOrDefault(host.id(), 0),
-                    connections.supports(host.id(), RunnerMessages.FEATURE_RUN_SKILLS)))
+                    connections.supports(host.id(), RunnerMessages.FEATURE_RUN_SKILLS),
+                    host.company() && connections.supports(host.id(), RunnerMessages.FEATURE_SESSION_BUNDLE)))
             .toList();
-        UUID previousHost = runs.previousHost(run.conversationId(), run.id()).orElse(null);
+        UUID previousHost = placement.preferred() != null ? placement.preferred()
+                : runs.previousHost(run.conversationId(), run.id()).orElse(null);
         HostSelection.Host chosen;
-        switch (HostSelection.select(candidates, previousHost, !effective.skills().isEmpty())) {
+        switch (HostSelection.select(candidates, previousHost, !effective.skills().isEmpty(),
+                placement.preferRestorers())) {
             case HostSelection.Waits waits -> {
-                return waiting(run, waits.reason(), now);
+                return waiting(run, placement.weakerLeftOut() || placement.chosen()
+                        ? waits.reason().withIsolationLevel(placement.level()) : waits.reason(), now);
             }
             case HostSelection.Chosen found -> chosen = found.host();
         }
@@ -465,18 +500,44 @@ class RunDispatcher {
         RunnerHostInfo host = chosen.info();
         long epoch = run.epoch() + 1;
         QueueReason assigned = QueueReason.assigned(host, label);
+        IsolationLevel placedAt = Isolation.placedAt(host);
+        PlacementNote note = IsolationPlacement.note(placement, host, session,
+                session != null && session.bundleCarried() && chosen.restores());
         runs.markDispatched(run.id(), epoch, host.id(), host.name(), host.scope(), assigned, now,
-                now.plus(properties.prepareTimeout()));
+                now.plus(properties.prepareTimeout()), placedAt, note);
+        metrics.runAssigned(placedAt, placement.chosen(), note);
         publisher.publishEvent(TurnStarter.queueReasonChanged(run, assigned));
         hub.changedAfterCommit(run.id());
-        TurnSource.PreviousRun previous = runs.previousWithSession(run.conversationId(), run.id(), run.createdAt())
-            .map(prior -> new TurnSource.PreviousRun(prior.id(), prior.sessionId(), prior.createdAt(),
-                    prior.runnerHostId()))
-            .orElse(null);
+        TurnSource.PreviousRun previous = sessionRun != null ? new TurnSource.PreviousRun(sessionRun.id(),
+                sessionRun.sessionId(), sessionRun.createdAt(), sessionRun.runnerHostId()) : null;
         log.info("Run {} of conversation {} assigned to runner host {} (epoch {})", run.id(), run.conversationKey(),
                 host.id(), epoch);
         return Optional.of(new Assignment(run, epoch, host, chosen.protocol(), choice, label, turn, previous,
                 effective));
+    }
+
+    /**
+     * The conversation's session for the level's step: the host of its latest run that reported a session, when that
+     * host still counts for this run, and whether a bundle of the session is kept (asked only when the session's host
+     * is of another level than the run may go to, where a kept bundle moves the turn).
+     */
+    private IsolationPlacement.@Nullable Session session(RunStore.RunRow run, RunStore.@Nullable RunRow sessionRun,
+            List<RunnerHostInfo> eligible, @Nullable IsolationLevel chosen) {
+        if (sessionRun == null || sessionRun.runnerHostId() == null) {
+            return null;
+        }
+        RunnerHostInfo held = eligible.stream()
+            .filter(candidate -> candidate.id().equals(sessionRun.runnerHostId()))
+            .findFirst()
+            .orElse(null);
+        if (held == null) {
+            return null;
+        }
+        IsolationLevel target = chosen != null ? chosen : Isolation.strongest(eligible).orElseThrow();
+        SessionBundles kept = Isolation.placedAt(held) != target ? bundles.getIfAvailable() : null;
+        boolean carried = kept != null && kept.carries(run.conversationId(), run.agentId(), run.runtime().name(),
+                sessionRun.sessionId());
+        return new IsolationPlacement.Session(held, carried);
     }
 
     static TurnSource.TurnRef turnRef(RunStore.RunRow run, ModelAccessChoice choice) {

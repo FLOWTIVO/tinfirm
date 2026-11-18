@@ -22,13 +22,14 @@ final class RunViews {
             @Nullable String branch, List<RepositoryDetails> repositories, @Nullable UsageDetails usage,
             @Nullable RelayDetails relay, @Nullable CountsDetails counts, @Nullable Boolean resumed,
             @Nullable String resumeOutcome, long lastEventSeq, @Nullable Instant textsPurgedAt,
-            @Nullable Instant eventsPurgedAt) {
+            @Nullable Instant eventsPurgedAt, @Nullable String isolationLevel, @Nullable String placementNote) {
     }
 
     record QueueReasonDetails(String code, Instant since, String text, @Nullable UUID runnerHostId,
             @Nullable String runnerHostName, @Nullable String credentialLabel, @Nullable Integer used,
             @Nullable Integer limit, @Nullable Instant lastSeenAt, @Nullable Instant retryAt, @Nullable String reason,
-            @Nullable String rejectCode, @Nullable String message, @Nullable String runtime) {
+            @Nullable String rejectCode, @Nullable String message, @Nullable String runtime,
+            @Nullable String isolationLevel) {
     }
 
     record RepositoryDetails(@Nullable UUID repositoryId, @Nullable UUID systemId, String repositoryName, String dir,

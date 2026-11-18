@@ -93,7 +93,9 @@ class RunPresenter {
                 counts != null ? new RunViews.CountsDetails(counts.toolCalls(), counts.messages(), counts.thoughts())
                         : null,
                 run.resumed(), run.resumeOutcome() != null ? run.resumeOutcome().name() : null, run.lastEventSeq(),
-                run.textsPurgedAt(), run.eventsPurgedAt());
+                run.textsPurgedAt(), run.eventsPurgedAt(),
+                run.isolationLevel() != null ? run.isolationLevel().name() : null,
+                run.placementNote() != null ? run.placementNote().name() : null);
     }
 
     /** The run's result, whose summary is the run's summary; null without {@code finish}. */
@@ -116,7 +118,8 @@ class RunPresenter {
         return new RunViews.QueueReasonDetails(reason.code().name(), since, reason.text(), reason.runnerHostId(),
                 reason.runnerHostName(), reason.credentialLabel(), reason.used(), reason.limit(), reason.lastSeenAt(),
                 reason.retryAt(), reason.reason(), reason.rejectCode(), reason.message(),
-                reason.runtime() != null ? reason.runtime().name() : null);
+                reason.runtime() != null ? reason.runtime().name() : null,
+                reason.isolationLevel() != null ? reason.isolationLevel().name() : null);
     }
 
     private static Long orZero(@Nullable Long value) {

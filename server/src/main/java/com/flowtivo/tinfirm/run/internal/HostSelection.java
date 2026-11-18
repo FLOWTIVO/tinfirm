@@ -7,6 +7,7 @@ import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
 
+import com.flowtivo.tinfirm.runner.Isolation;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 
 /**
@@ -14,6 +15,8 @@ import com.flowtivo.tinfirm.runner.RunnerHostInfo;
  * own choice (the package 3 contract, §5.7 step 4 and 5; open point 13). A host takes the run when it is connected and
  * has confirmed its capacity on that connection, speaks runner protocol v2, does not drain and has a free slot under
  * its dispatch limit. Of those, the conversation's previous host wins, so that the turn resumes its session there;
+ * then, for a session that moves with its bundle, a host that restores it; then the stronger host by its level and
+ * hardening ({@link Isolation#rank}, ADR-0113: the dispatcher hands it the hosts of one level, and the session's host);
  * else the one with the most free slots, then the first by name, so that runs spread over the hosts. When none takes
  * it, the queue reason says why, about the one eligible host when there is only one.
  */
@@ -29,12 +32,19 @@ final class HostSelection {
      * @param protocol   the runner protocol of its current connection
      * @param used       runs that hold a slot of the host
      * @param skills     whether its connection lists {@code run.skills} (ADR-0064)
+     * @param restores   whether it restores session bundles: a company host whose connection lists
+     *                   {@code session.bundle} (ADR-0097)
      */
-    record Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills) {
+    record Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills, boolean restores) {
+
+        /** A host that restores no session bundle. */
+        Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills) {
+            this(info, configured, protocol, used, skills, false);
+        }
 
         /** A host as one that does not deliver skills. */
         Host(RunnerHostInfo info, boolean configured, int protocol, int used) {
-            this(info, configured, protocol, used, false);
+            this(info, configured, protocol, used, false, false);
         }
 
         boolean v2() {
@@ -76,6 +86,18 @@ final class HostSelection {
      * @param needsSkills  whether the run has skills, which only a host that lists {@code run.skills} delivers
      */
     static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills) {
+        return select(eligible, previousHost, needsSkills, false);
+    }
+
+    /**
+     * @param eligible        the hosts package 2 allows and the level of isolation leaves, at least one
+     * @param previousHost    the host that holds the conversation's session, or of its previous run; or null
+     * @param needsSkills     whether the run has skills, which only a host that lists {@code run.skills} delivers
+     * @param preferRestorers whether a host that restores session bundles comes before the others: the session moves
+     *                        with its bundle (ADR-0113, decision 4)
+     */
+    static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills,
+            boolean preferRestorers) {
         if (eligible.isEmpty()) {
             throw new IllegalArgumentException("No eligible host to select from");
         }
@@ -118,9 +140,10 @@ final class HostSelection {
         }
         Optional<Host> previous = previousHost != null
                 ? free.stream().filter(host -> host.info().id().equals(previousHost)).findFirst() : Optional.empty();
+        Comparator<Host> restoring = Comparator.comparing(host -> preferRestorers && !host.restores());
         return new Chosen(previous.orElseGet(() -> free.stream()
-            .min(Comparator.comparingInt(Host::free)
-                .reversed()
+            .min(restoring.thenComparingInt(host -> Isolation.rank(host.info()))
+                .thenComparing(Comparator.comparingInt(Host::free).reversed())
                 .thenComparing(host -> host.info().name())
                 .thenComparing(host -> host.info().id()))
             .orElseThrow()));

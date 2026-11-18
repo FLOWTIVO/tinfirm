@@ -238,7 +238,7 @@ class AgentService {
         Instant now = time.now();
         AgentStore.AgentRow row = new AgentStore.AgentRow(Ids.newId(), companyId, name, handle, description,
                 instructions, runtimes, turnTimeLimit, memoryAllowed, owner, AgentStatus.ACTIVE, null, null, 1, null, now,
-                now, caller.userId());
+                now, caller.userId(), null);
         try {
             store.insert(row);
         }

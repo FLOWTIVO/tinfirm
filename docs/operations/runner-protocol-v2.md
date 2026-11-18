@@ -201,8 +201,11 @@ ships it.
   the operator states one (`run --isolation-level machine|vm-jail`, `--isolation-hardened
   yes|no|none`), marked `stated`; a statement where the host derives its own level stops
   `run`. Its startup log and `doctor` say the level and what an escape from a sandbox reaches
-  ([runner/README.md](../../runner/README.md#isolation-level)). Placement by level is planned
-  (ADR-0113, decision 4): today the level decides nothing.
+  ([runner/README.md](../../runner/README.md#isolation-level)). The server places runs by
+  level (ADR-0113, decision 4; [CONVENTIONS §15.6](../CONVENTIONS.md#156-runs-and-turns)):
+  an agent's runs go to the strongest level among the hosts that may run them and wait for
+  those hosts rather than go to a weaker one, and a host without the feature is placed as
+  `container`. Choosing a level for an agent is planned (ADR-0113, decision 4).
 - **Ready sandboxes** ([ADR-0098](../adr/0098-ready-vms.md),
   [ADR-0099](../adr/0099-pool-settings.md)). A host with a VM per run (`run --executor vm`)
   and ready VMs lists `sandbox.pool` and reports its operator's `--pool-max-ready` in

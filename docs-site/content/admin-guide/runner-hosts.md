@@ -64,7 +64,9 @@ A host reports how well its sandboxes keep an agent's code away from the credent
 
 On every level, a flaw in the runner host's code that reads what a sandbox sends reaches the runner host's credentials. A change of a host's level or hardening is recorded in the audit log.
 
-A host that reports no level shows **Reports no level** with its tier; runner hosts do not report a level yet. Placement by level is planned: today a host's level does not decide where a turn runs.
+A host that reports no level shows **Reports no level** with its tier: a runner host before the release that reports levels, or one with a VM driver of the operator's own that states none.
+
+**Where turns run.** An agent's turns go to the strongest level among the hosts that may run them, and a host that reports no level counts as **container**. Within a level, a hardened host comes first. When every host of that level is busy or offline, the turn waits for one: it never goes to a weaker host by itself. A conversation whose session is on a weaker host stays there while that host can take its turns; the run's page says so. Choosing a level for an agent is planned.
 
 ## Runs at a time
 

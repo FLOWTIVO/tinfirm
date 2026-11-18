@@ -42,6 +42,7 @@ const RUNNER_REASONS: Record<string, string> = {
   MODEL_ACCESS_UNAVAILABLE: 'Nobody can pay',
   NO_HOST_FOR_CREDENTIALS: 'No host may run it',
   NO_RUNNER_HOST: 'No runner host',
+  NO_HOST_OF_LEVEL: 'No host of its level',
   RUNNER_HOST_OFFLINE: 'Host offline',
   RUNNER_HOST_DRAINING: 'Host restarting',
   CREDENTIAL_POOL_FULL: 'Subscription busy',

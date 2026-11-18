@@ -2,6 +2,7 @@ import type {
   RunnerHardening,
   RunnerHostIsolation,
   RunnerIsolationLevel,
+  RunPlacementNote,
 } from '../../api/generated/models';
 
 /**
@@ -19,8 +20,6 @@ export interface IsolationLines {
   readonly reaches: string | null;
   /** "Tier microvm": the technology, as the host named it. */
   readonly tiers: string;
-  /** Placement by level is not built yet: said where a reader could assume it. */
-  readonly planned: string | null;
 }
 
 const LEVEL_WORDS: Record<RunnerIsolationLevel, string> = {
@@ -57,7 +56,6 @@ export function isolationLines(
       hardening: null,
       reaches: null,
       tiers,
-      planned: 'Placement by level is planned (ADR-0113): runs do not go by it yet.',
     };
   }
   const stated = isolation.stated ? ', stated by the operator' : '';
@@ -66,6 +64,32 @@ export function isolationLines(
     hardening: isolation.hardened ? HARDENING_WORDS[isolation.hardened] : null,
     reaches: REACHES[level],
     tiers,
-    planned: null,
   };
+}
+
+/** A level in its protocol name: "machine", "vm-jail", "container". */
+export function levelWord(level: RunnerIsolationLevel): string {
+  return LEVEL_WORDS[level];
+}
+
+const PLACEMENT_NOTES: Record<RunPlacementNote, string> = {
+  STAYED_ON_WEAKER_HOST:
+    'It stayed on the host that holds the conversation’s session; the agent’s new conversations go to a stronger level.',
+  FRESH_SESSION_CHOSEN_LEVEL:
+    'It started a new session of the runtime on the level chosen for the agent; the session was on a host of another level.',
+  FRESH_SESSION_STRONGER_LEVEL:
+    'It started a new session of the runtime: the weaker host that held the session could not take it.',
+};
+
+/**
+ * A run's level of isolation on its page (ADR-0113, decision 4): "Placed on a host that reports
+ * machine", and why it ran there when its conversation's session was on another level.
+ */
+export function placementText(
+  level: RunnerIsolationLevel | null | undefined,
+  note: RunPlacementNote | null | undefined,
+): string | null {
+  if (!level) return null;
+  const placed = `Placed on a host that reports ${LEVEL_WORDS[level]}.`;
+  return note ? `${placed} ${PLACEMENT_NOTES[note]}` : placed;
 }

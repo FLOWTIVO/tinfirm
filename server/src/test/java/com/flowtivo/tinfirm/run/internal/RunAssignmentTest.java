@@ -59,7 +59,7 @@ class RunAssignmentTest {
                 RuntimeKind.CODEX, TurnReason.MESSAGE, 3, UUID.randomUUID(), UUID.randomUUID(), modelAccess, null,
                 null, null, null, null, RunStatus.QUEUED, 0, null, null, null, null, Instant.now(), null, null, null,
                 null, null, null, "agent/shop-123-dev-2", null, null, null, null, null, 0, 0, null, null, null, null,
-                null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null);
     }
 
     /** The person's settings: the agent Builder with its hosts, a model and an effort. */

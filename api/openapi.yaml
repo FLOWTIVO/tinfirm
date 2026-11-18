@@ -10869,7 +10869,8 @@ components:
         What a runner host reports about its isolation (ADR-0113, decisions 1 to 3): the tiers of
         `hello.isolationTiers`, and with the protocol's feature `host.isolation` its level, its hardening and whether
         the level is its operator's statement. A host without the feature reports no level (`level` and `hardened`
-        absent). Placement by level is planned (ADR-0113, decision 4): runs do not go by it yet.
+        absent) and is placed as `CONTAINER`: an agent's runs go to the strongest level among the hosts that may run
+        them (ADR-0113, decision 4; the run's `isolationLevel`).
       required: [tiers, stated]
       properties:
         tiers:
@@ -11111,8 +11112,9 @@ components:
         payer has none yet), HOST_OFFLINE (a subscription's personal host is offline) and MODEL_ACCESS_UNAVAILABLE
         (`reason`: the model
         access module's refusal, such as PRINCIPAL_INACTIVE or SUBSCRIPTION_GONE); NO_HOST_FOR_CREDENTIALS (the
-        company has hosts for the runtime, but none may carry the run's credentials), NO_RUNNER_HOST,
-        RUNNER_HOST_OFFLINE and RUNNER_HOST_DRAINING; CREDENTIAL_POOL_FULL (a subscription's pool) and
+        company has hosts for the runtime, but none may carry the run's credentials), NO_RUNNER_HOST, NO_HOST_OF_LEVEL
+        (ADR-0113: no host that may run the conversation reports the level of isolation chosen for its agent,
+        `isolationLevel`), RUNNER_HOST_OFFLINE and RUNNER_HOST_DRAINING; CREDENTIAL_POOL_FULL (a subscription's pool) and
         RUNNER_HOST_FULL. ASSIGNED: sent to the host, waiting for it to accept. PREVIOUS_RUN_ACTIVE and
         RUNNER_HOST_REJECTED: the host rejected the run, which waits until `retryAt`. TRIGGER_PAUSED (package 4): the
         conversation's trigger is paused, and its turns wait until it is resumed. NO_HOST_FOR_SKILLS (ADR-0064): the
@@ -11120,7 +11122,7 @@ components:
         RETRY_SCHEDULED (ADR-0073), before every check: an automatic retry of a turn that failed for a reason that may
         pass waits until `retryAt`, the `used`th of at most `limit` in a row (`AgentSettings.autoRetry`).
         OTHER: anything else, in `message`.
-      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, RETRY_SCHEDULED, OTHER]
+      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, RETRY_SCHEDULED, OTHER]
     QueueReason:
       type: object
       description: |
@@ -11150,6 +11152,13 @@ components:
         rejectCode: { type: string, nullable: true, description: "RUNNER_HOST_REJECTED: the host's code" }
         message: { type: string, nullable: true, description: Text from the runner host or the server; never a secret }
         runtime: { type: string, nullable: true, enum: [CLAUDE_CODE, CODEX, PI, OPENCODE] }
+        isolationLevel:
+          allOf: [{ $ref: '#/components/schemas/RunnerIsolationLevel' }]
+          nullable: true
+          description: |
+            ADR-0113, decision 4: the level of isolation the run goes to, where the level held it back. Always set for
+            NO_HOST_OF_LEVEL; for a reason about the hosts of its level when a weaker host that could run the
+            conversation was left out, since the run does not move to a weaker host by itself
     RunUsage:
       type: object
       required: [inputTokens, outputTokens]
@@ -11785,7 +11794,26 @@ components:
           type: string
           nullable: true
           enum: [FIRST_RUN, NO_SESSION, LOAD_FAILED, NOT_SUPPORTED]
+        isolationLevel:
+          allOf: [{ $ref: '#/components/schemas/RunnerIsolationLevel' }]
+          nullable: true
+          description: |
+            The level of isolation its host was placed at when it was last assigned (ADR-0113, decision 4): the level
+            the host reported, `CONTAINER` for a host that reports none. Null before its first assignment
+        placementNote:
+          allOf: [{ $ref: '#/components/schemas/RunPlacementNote' }]
+          nullable: true
+          description: Why it ran where it did, when its conversation's session was on a host of another level
         lastEventSeq: { type: integer, format: int64 }
+    RunPlacementNote:
+      type: string
+      description: |
+        ADR-0113, decision 4. STAYED_ON_WEAKER_HOST: the agent's isolation is automatic, and its conversation stayed on
+        the weaker host that holds its session. FRESH_SESSION_CHOSEN_LEVEL: the level chosen for the agent holds, and
+        the turn started a fresh session of the runtime on a host of that level. FRESH_SESSION_STRONGER_LEVEL: the
+        weaker host that held the session could not take the turn, which started a fresh session on the strongest
+        level. A turn that moved with its session's bundle (ADR-0097) has no note.
+      enum: [STAYED_ON_WEAKER_HOST, FRESH_SESSION_CHOSEN_LEVEL, FRESH_SESSION_STRONGER_LEVEL]
     RunEventType:
       type: string
       enum: [AGENT_MESSAGE, AGENT_THOUGHT, TOOL_CALL, TOOL_CALL_UPDATE, PLAN, USAGE, RATE_LIMIT, STATUS, GIT, LOG, ERROR]

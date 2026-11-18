@@ -198,6 +198,7 @@ export const WAITING_TEXTS: Record<QueueReasonCode, string> = {
   MODEL_ACCESS_UNAVAILABLE: 'Nobody can pay for it as your settings stand.',
   NO_HOST_FOR_CREDENTIALS: 'No runner host may carry its credentials.',
   NO_RUNNER_HOST: 'No runner host can run it.',
+  NO_HOST_OF_LEVEL: 'No runner host reports the level of isolation chosen for its agent.',
   RUNNER_HOST_OFFLINE: 'Its runner host is offline.',
   RUNNER_HOST_DRAINING: 'Its runner host is restarting.',
   CREDENTIAL_POOL_FULL: 'Its subscription is busy with other turns.',

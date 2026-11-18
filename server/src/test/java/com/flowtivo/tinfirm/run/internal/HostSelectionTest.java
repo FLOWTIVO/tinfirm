@@ -106,4 +106,38 @@ class HostSelectionTest {
             .isInstanceOfSatisfying(HostSelection.Waits.class,
                     waits -> assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.NO_HOST_FOR_SKILLS));
     }
+
+    private static HostSelection.Host leveled(String name, com.flowtivo.tinfirm.runner.@Nullable IsolationLevel level,
+            com.flowtivo.tinfirm.runner.@Nullable Hardening hardened, int used, boolean restores) {
+        RunnerHostInfo info = new RunnerHostInfo(UUID.randomUUID(), UUID.randomUUID(), name, HostScope.COMPANY, null,
+                null, 4, 4, null, false, null, "1.0.0", Instant.now(), level, hardened, false);
+        return new HostSelection.Host(info, true, 2, used, false, restores);
+    }
+
+    /**
+     * ADR-0113, decision 4: among the free hosts the dispatcher hands it, the stronger by level and hardening comes
+     * before the one with more room; the session's host comes before both; a host that restores a moving session's
+     * bundle before all others.
+     */
+    @org.junit.jupiter.api.Test
+    void theStrongerHostByLevelAndHardeningComesBeforeTheFreerOne() {
+        HostSelection.Host hardened = leveled("hardened", com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE,
+                com.flowtivo.tinfirm.runner.Hardening.YES, 3, false);
+        HostSelection.Host plain = leveled("plain", com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE,
+                com.flowtivo.tinfirm.runner.Hardening.NO, 0, false);
+        HostSelection.Host restoring = leveled("restoring", com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE,
+                com.flowtivo.tinfirm.runner.Hardening.NO, 2, true);
+        assertThat(HostSelection.select(List.of(plain, hardened), null, false))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("hardened"));
+        assertThat(HostSelection.select(List.of(plain, hardened), plain.info().id(), false))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("plain"));
+        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false, true))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("restoring"));
+        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false, false))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("hardened"));
+    }
 }

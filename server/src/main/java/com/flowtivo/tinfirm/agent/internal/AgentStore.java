@@ -27,6 +27,7 @@ import com.flowtivo.tinfirm.agent.AgentInfo;
 import com.flowtivo.tinfirm.agent.AgentStatus;
 import com.flowtivo.tinfirm.agent.RepositoryAccess;
 import com.flowtivo.tinfirm.agent.ToolMode;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
 import com.flowtivo.tinfirm.system.ToolEffect;
 
@@ -40,7 +41,7 @@ class AgentStore {
 
     private static final String COLUMNS = "id, company_id, name, handle, description, instructions, runtimes,"
             + " turn_time_limit_minutes, memory_allowed, owner_principal_id, status, paused_at, paused_by, version,"
-            + " deleted_at, created_at, updated_at, created_by";
+            + " deleted_at, created_at, updated_at, created_by, isolation_level";
 
     private final JdbcClient jdbc;
 
@@ -59,7 +60,7 @@ class AgentStore {
             String instructions, List<RuntimeKind> runtimes, @Nullable Integer turnTimeLimitMinutes,
             boolean memoryAllowed, @Nullable UUID ownerPrincipalId, AgentStatus status,
             @Nullable Instant pausedAt, @Nullable UUID pausedBy, int version, @Nullable Instant deletedAt,
-            Instant createdAt, Instant updatedAt, @Nullable UUID createdBy) {
+            Instant createdAt, Instant updatedAt, @Nullable UUID createdBy, @Nullable IsolationLevel isolationLevel) {
 
         AgentRow {
             runtimes = List.copyOf(runtimes);
@@ -67,7 +68,7 @@ class AgentStore {
 
         AgentInfo info() {
             return new AgentInfo(id, companyId, name, handle, description, instructions, runtimes,
-                    turnTimeLimitMinutes, memoryAllowed, status, ownerPrincipalId, version, deletedAt);
+                    turnTimeLimitMinutes, memoryAllowed, status, ownerPrincipalId, version, deletedAt, isolationLevel);
         }
     }
 
@@ -649,7 +650,8 @@ class AgentStore {
                 rs.getObject("owner_principal_id", UUID.class),
                 AgentStatus.valueOf(rs.getString("status")), nullableInstant(rs, "paused_at"),
                 rs.getObject("paused_by", UUID.class), rs.getInt("version"), nullableInstant(rs, "deleted_at"),
-                instant(rs, "created_at"), instant(rs, "updated_at"), rs.getObject("created_by", UUID.class));
+                instant(rs, "created_at"), instant(rs, "updated_at"), rs.getObject("created_by", UUID.class),
+                IsolationLevel.ofName(rs.getString("isolation_level")));
     }
 
     private static String[] names(List<RuntimeKind> runtimes) {

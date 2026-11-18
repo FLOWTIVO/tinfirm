@@ -347,7 +347,7 @@
               "description": "True when the level rests on the operator's statement in the host's configuration and not on what the host can see (ADR-0113, decision 3); absent means false."
             }
           },
-          "description": "v2, the optional feature `host.isolation` (ADR-0113, decisions 1 to 3): the host's level of isolation and its hardening, as it reports them. Present exactly when `features` lists `host.isolation`. The server stores and shows them as reported and checks neither: it refuses only a hello where the object and the feature disagree, or where `level` is `machine` or `vm-jail` and `isolationTiers` are not all `microvm` (`error` `BAD_MESSAGE`, close code 1008). A host without the feature reports no level, and is placed as `container` once placement by level is built (planned, ADR-0113 decision 4)."
+          "description": "v2, the optional feature `host.isolation` (ADR-0113, decisions 1 to 3): the host's level of isolation and its hardening, as it reports them. Present exactly when `features` lists `host.isolation`. The server stores and shows them as reported and checks neither: it refuses only a hello where the object and the feature disagree, or where `level` is `machine` or `vm-jail` and `isolationTiers` are not all `microvm` (`error` `BAD_MESSAGE`, close code 1008). A host without the feature reports no level, and is placed as `container` when the server places runs by level (ADR-0113, decision 4)."
         }
       },
       "allOf": [

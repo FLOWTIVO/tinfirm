@@ -20,11 +20,13 @@ import org.springframework.stereotype.Repository;
 import com.flowtivo.tinfirm.model.ModelAccessChoice;
 import com.flowtivo.tinfirm.model.ModelRelay;
 import com.flowtivo.tinfirm.run.ActiveRun;
+import com.flowtivo.tinfirm.run.PlacementNote;
 import com.flowtivo.tinfirm.run.RunInfo;
 import com.flowtivo.tinfirm.run.RunStatus;
 import com.flowtivo.tinfirm.run.RunTokens;
 import com.flowtivo.tinfirm.run.TurnReason;
 import com.flowtivo.tinfirm.runner.HostScope;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
 
@@ -55,7 +57,7 @@ class RunStore {
             last_event_seq, event_count, queue_reason, queue_reason_details, queue_reason_since, lost_cause,
             result_outcome, result_next_steps, result_open_questions, tool_call_count, message_count, thought_count,
             resumed, resume_outcome, relay_requests, relay_request_bytes, relay_response_bytes, texts_purged_at,
-            events_purged_at, trigger_id""";
+            events_purged_at, trigger_id, isolation_level, placement_note""";
 
     private static final TypeReference<List<String>> STRINGS = new TypeReference<>() {
     };
@@ -94,7 +96,8 @@ class RunStore {
             @Nullable Instant queueReasonSince, @Nullable LostCause lostCause, @Nullable Result result,
             @Nullable Counts counts, @Nullable Boolean resumed, RunnerMessages.@Nullable ResumeOutcome resumeOutcome,
             ModelRelay.@Nullable RelayUsage relay, @Nullable Instant textsPurgedAt,
-            @Nullable Instant eventsPurgedAt, @Nullable UUID triggerId) {
+            @Nullable Instant eventsPurgedAt, @Nullable UUID triggerId, @Nullable IsolationLevel isolationLevel,
+            @Nullable PlacementNote placementNote) {
 
         boolean budget() {
             return BUDGET.equals(modelAccess);
@@ -118,7 +121,7 @@ class RunStore {
                     turnNumber, actingPrincipalId, payerPrincipalId, choice(), status, runnerHostId,
                     runnerHostKind, reason != null ? reason.code() : null, reason != null ? reason.retryAt() : null,
                     failureClass, failureMessage, summary, publicResult(), sessionId, epoch, createdAt, startedAt,
-                    finishedAt);
+                    finishedAt, isolationLevel, placementNote);
         }
 
         RunInfo.@Nullable Result publicResult() {
@@ -479,17 +482,21 @@ class RunStore {
 
     /**
      * Assignment: a new epoch fences every earlier assignment of the run; the queue reason becomes {@code assigned},
-     * since now; the accept timeout waits until {@code prepareUntil} while the assignment is prepared.
+     * since now; the accept timeout waits until {@code prepareUntil} while the assignment is prepared. The run records
+     * the level its host was placed at and, where its session was on a host of another level, why it ran there
+     * (ADR-0113, decision 4).
      */
     void markDispatched(UUID runId, long epoch, UUID hostId, String hostName, HostScope hostKind, QueueReason assigned,
-            Instant now, Instant prepareUntil) {
+            Instant now, Instant prepareUntil, IsolationLevel isolationLevel, @Nullable PlacementNote placementNote) {
         jdbc.sql("""
                 UPDATE run SET epoch = ?, dispatched_at = ?, dispatch_after = NULL, lease_expires_at = ?,
                                runner_host_id = ?, runner_host_name = ?, runner_host_kind = ?, queue_reason = ?,
-                               queue_reason_details = CAST(? AS jsonb), queue_reason_since = ?
+                               queue_reason_details = CAST(? AS jsonb), queue_reason_since = ?, isolation_level = ?,
+                               placement_note = ?
                  WHERE id = ? AND status = 'QUEUED'""")
             .params(epoch, ts(now), ts(prepareUntil), hostId, hostName, hostKind.name(), assigned.code().name(),
-                    assigned.detailsJson(), ts(now), runId)
+                    assigned.detailsJson(), ts(now), isolationLevel.name(),
+                    placementNote != null ? placementNote.name() : null, runId)
             .update();
     }
 
@@ -782,7 +789,8 @@ class RunStore {
                 relayRequests != null ? new ModelRelay.RelayUsage(relayRequests, rs.getLong("relay_request_bytes"),
                         rs.getLong("relay_response_bytes")) : null,
                 instant(rs, "texts_purged_at"), instant(rs, "events_purged_at"),
-                rs.getObject("trigger_id", UUID.class));
+                rs.getObject("trigger_id", UUID.class), IsolationLevel.ofName(rs.getString("isolation_level")),
+                enumOrNull(PlacementNote.class, rs.getString("placement_note")));
     }
 
     private static @Nullable Counts counts(ResultSet rs) throws SQLException {

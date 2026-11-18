@@ -1,0 +1,208 @@
+package com.flowtivo.tinfirm.run.internal;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.UUID;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import com.flowtivo.tinfirm.model.ModelAccessChoice;
+import com.flowtivo.tinfirm.run.TurnReason;
+import com.flowtivo.tinfirm.support.FakeRunner;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import tools.jackson.databind.JsonNode;
+
+/**
+ * ADR-0113, decision 4: a run goes to the hosts of the strongest level among those that count, or of the level chosen
+ * for its agent, and never to a weaker host by itself; a host without a level is placed as {@code container}; an
+ * automatic agent's conversation stays on the weaker host of its session, and a chosen level moves it with a fresh
+ * session; the run records the level and the note, and the metric counts it.
+ */
+@Timeout(value = 300, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+class RunPlacementIntegrationTest extends RunTestBench {
+
+    @Autowired
+    MeterRegistry meters;
+
+    /** A company host that reports a level ({@code host.isolation}), with these slots, configured. */
+    FakeRunner leveledHost(Bench bench, String level, String hardened, int slots) {
+        RunnerHostRef host = registerRunnerHost(bench.owner(), bench.companyId(), unique(level), "COMPANY");
+        FakeRunner runner = FakeRunner.connect(port, host.token());
+        Map<String, Object> hello = FakeRunner.helloWithIsolation(level, hardened);
+        hello.put("maxConcurrentRuns", slots);
+        runner.send(hello);
+        runner.expect("welcome");
+        awaitConfigured(host.id());
+        return runner;
+    }
+
+    private void chooseLevel(Bench bench, String level) {
+        update(bench.companyId(), "UPDATE agent SET isolation_level = ? WHERE id = ?", level, bench.agentId());
+    }
+
+    private void finish(FakeRunner runner, Bench bench, UUID runId, String session) {
+        runner.accepted(runId, 1);
+        awaitRun(bench, runId, "RUNNING");
+        runner.send(finished(runId, 1, "SUCCEEDED", 0, "Done.", session));
+        awaitRun(bench, runId, "SUCCEEDED");
+    }
+
+    private double assigned(String level, String isolation, String note) {
+        var counter = meters.find(RunMetrics.RUNS_ASSIGNED)
+            .tag("isolation_level", level)
+            .tag("isolation", isolation)
+            .tag("placement_note", note)
+            .counter();
+        return counter != null ? counter.count() : 0;
+    }
+
+    @Test
+    void aRunGoesToTheStrongestLevelAndWaitsForItRatherThanAWeakerFreeHost() {
+        Bench bench = bench(true);
+        double before = assigned("MACHINE", "automatic", "none");
+        try (FakeRunner container = companyHost(bench, RUNNER_VERSION, 4);
+                FakeRunner machine = leveledHost(bench, "machine", "none", 1)) {
+            Turn first = start(bench);
+            expectAssign(machine, first.runId());
+            JsonNode run = getRun(bench, first.runId());
+            assertThat(run.get("isolationLevel").asString()).isEqualTo("MACHINE");
+            assertThat(run.has("placementNote")).isFalse();
+            await().atMost(WAIT).until(() -> assigned("MACHINE", "automatic", "none") > before);
+
+            // The machine host's one slot is taken: the next conversation waits for it, the container host idle.
+            Turn second = start(bench);
+            JsonNode reason = awaitQueueReason(bench, second.runId(), "RUNNER_HOST_FULL");
+            assertThat(reason.get("isolationLevel").asString()).isEqualTo("MACHINE");
+            assertThat(reason.get("text").asString()).endsWith("This agent's runs go to hosts that report machine "
+                    + "and do not move to a weaker one.");
+            container.expectNone("run.assign", Duration.ofMillis(500));
+
+            // It goes on as soon as the machine host has a free slot.
+            finish(machine, bench, first.runId(), "session-1");
+            expectAssign(machine, second.runId());
+            container.assertFramesValid();
+            machine.assertFramesValid();
+        }
+    }
+
+    @Test
+    void aChosenLevelNoHostReportsWaitsAndGoesOnOnceOneIsRegistered() {
+        Bench bench = bench(true);
+        chooseLevel(bench, "VM_JAIL");
+        try (FakeRunner container = companyHost(bench, RUNNER_VERSION, 4)) {
+            Turn turn = start(bench);
+            JsonNode reason = awaitQueueReason(bench, turn.runId(), "NO_HOST_OF_LEVEL");
+            assertThat(reason.get("isolationLevel").asString()).isEqualTo("VM_JAIL");
+            assertThat(reason.get("text").asString()).isEqualTo("This agent's runs go to hosts that report vm-jail, "
+                    + "and no runner host that may run this conversation reports it.");
+            container.expectNone("run.assign", Duration.ofMillis(500));
+            try (FakeRunner jail = leveledHost(bench, "vm-jail", "no", 2)) {
+                expectAssign(jail, turn.runId());
+                assertThat(getRun(bench, turn.runId()).get("isolationLevel").asString()).isEqualTo("VM_JAIL");
+                jail.assertFramesValid();
+            }
+        }
+    }
+
+    @Test
+    void aChosenContainerLevelRunsOnAHostWithoutALevel() {
+        Bench bench = bench(true);
+        chooseLevel(bench, "CONTAINER");
+        try (FakeRunner machine = leveledHost(bench, "machine", "none", 4);
+                FakeRunner container = companyHost(bench, RUNNER_VERSION, 1)) {
+            Turn turn = start(bench);
+            expectAssign(container, turn.runId());
+            assertThat(getRun(bench, turn.runId()).get("isolationLevel").asString()).isEqualTo("CONTAINER");
+            machine.expectNone("run.assign", Duration.ofMillis(500));
+        }
+    }
+
+    @Test
+    void anAutomaticConversationStaysOnTheWeakerHostOfItsSessionAndAChosenLevelMovesIt() {
+        Bench bench = bench(true);
+        try (FakeRunner container = companyHost(bench, RUNNER_VERSION, 4)) {
+            Turn first = start(bench);
+            expectAssign(container, first.runId());
+            finish(container, bench, first.runId(), "session-first");
+
+            try (FakeRunner machine = leveledHost(bench, "machine", "none", 4)) {
+                // Automatic: the conversation stays where its session is, and says so.
+                UUID second = startTurn(bench, first.conversationId(), first.key(), TurnReason.MESSAGE, 2,
+                        ModelAccessChoice.BUDGET).orElseThrow();
+                JsonNode assign = expectAssign(container, second);
+                assertThat(assign.get("resumeSessionId").asString()).isEqualTo("session-first");
+                JsonNode stayed = getRun(bench, second);
+                assertThat(stayed.get("isolationLevel").asString()).isEqualTo("CONTAINER");
+                assertThat(stayed.get("placementNote").asString()).isEqualTo("STAYED_ON_WEAKER_HOST");
+                finish(container, bench, second, "session-first");
+
+                // A new conversation goes to the strongest level.
+                Turn other = start(bench);
+                expectAssign(machine, other.runId());
+
+                // Chosen machine: the next turn starts a fresh session there, and says so.
+                chooseLevel(bench, "MACHINE");
+                UUID third = startTurn(bench, first.conversationId(), first.key(), TurnReason.MESSAGE, 3,
+                        ModelAccessChoice.BUDGET).orElseThrow();
+                expectAssign(machine, third);
+                JsonNode moved = getRun(bench, third);
+                assertThat(moved.get("isolationLevel").asString()).isEqualTo("MACHINE");
+                assertThat(moved.get("placementNote").asString()).isEqualTo("FRESH_SESSION_CHOSEN_LEVEL");
+                assertThat(query(bench.companyId(), "SELECT placement_note FROM run WHERE id = ?", third))
+                    .isEqualTo("FRESH_SESSION_CHOSEN_LEVEL");
+                container.expectNone("run.assign", Duration.ofMillis(300));
+                machine.assertFramesValid();
+            }
+            container.assertFramesValid();
+        }
+    }
+
+    @Test
+    void aQueuedRunGoesToTheLevelAHostReportsAtItsNextHello() {
+        Bench bench = bench(true);
+        chooseLevel(bench, "MACHINE");
+        RunnerHostRef host = registerRunnerHost(bench.owner(), bench.companyId(), unique("upgraded"), "COMPANY");
+        Turn turn;
+        try (FakeRunner before = connect(host, RUNNER_VERSION, 4)) {
+            turn = start(bench);
+            awaitQueueReason(bench, turn.runId(), "NO_HOST_OF_LEVEL");
+        }
+        // The same host, upgraded: it reports machine now, and the queued run goes to it.
+        try (FakeRunner after = FakeRunner.connect(port, host.token())) {
+            after.send(FakeRunner.helloWithIsolation("machine", "none"));
+            after.expect("welcome");
+            expectAssign(after, turn.runId());
+        }
+    }
+
+    @Test
+    void theRunsColumnsHoldOnlyALevelAndANoteWithIt() throws Exception {
+        Bench bench = bench(false);
+        try (com.flowtivo.tinfirm.support.TenantSql sql = com.flowtivo.tinfirm.support.TenantSql
+            .in(bench.companyId())) {
+            assertThat(sql.refused("UPDATE agent SET isolation_level = 'CLOUD' WHERE id = ?", bench.agentId()))
+                .isEqualTo("agent_isolation_level_ck");
+            sql.accepted("UPDATE agent SET isolation_level = 'VM_JAIL' WHERE id = ?", bench.agentId());
+        }
+        Turn turn = start(bench);
+        try (com.flowtivo.tinfirm.support.TenantSql sql = com.flowtivo.tinfirm.support.TenantSql
+            .in(bench.companyId())) {
+            assertThat(sql.refused("UPDATE run SET isolation_level = 'KATA' WHERE id = ?", turn.runId()))
+                .isEqualTo("run_isolation_level_ck");
+            assertThat(sql.refused("UPDATE run SET placement_note = 'STAYED_ON_WEAKER_HOST' WHERE id = ?",
+                    turn.runId())).isEqualTo("run_placement_note_ck");
+            assertThat(sql.refused("UPDATE run SET isolation_level = 'MACHINE', placement_note = 'MOVED' WHERE id = ?",
+                    turn.runId())).isEqualTo("run_placement_note_ck");
+            assertThat(sql.refused("UPDATE run SET queue_reason = 'NO_SUCH_REASON' WHERE id = ?", turn.runId()))
+                .isEqualTo("run_queue_reason_ck");
+            sql.accepted("UPDATE run SET isolation_level = 'MACHINE', placement_note = 'FRESH_SESSION_CHOSEN_LEVEL' "
+                    + "WHERE id = ?", turn.runId());
+        }
+    }
+}

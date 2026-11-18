@@ -124,9 +124,6 @@ import { isolationLines } from './isolation-view';
         <p class="text-muted-foreground font-mono text-xs" data-testid="isolation-tiers">
           {{ iso.tiers }}
         </p>
-        @if (iso.planned; as planned) {
-          <p class="text-muted-foreground text-xs" data-testid="isolation-planned">{{ planned }}</p>
-        }
       </section>
     }
 

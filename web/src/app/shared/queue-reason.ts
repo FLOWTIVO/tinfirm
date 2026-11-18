@@ -138,6 +138,9 @@ function fixFor(
     case 'NO_RUNNER_HOST':
     case 'NO_HOST_FOR_SKILLS':
       return companyHosts ?? ownHosts;
+    // ADR-0113: a host that reports the level chosen for the agent, or another level for the agent.
+    case 'NO_HOST_OF_LEVEL':
+      return companyHosts ?? { label: 'Open the agent', commands: ['agents', run.agentId] };
     default:
       return RUNNER_HOST_CODES.has(reason.code) ? companyHosts : null;
   }
