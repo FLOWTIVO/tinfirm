@@ -44,8 +44,27 @@ The page updates every 10 seconds. Each host's card shows:
 | The version, platform and machine name | Such as `v1.0.0 · linux/x86_64 · build-01` |
 | **… of … slots in use** | The turns running now, of the slots it has |
 | **Up to … on this machine** | Its ceiling: the most turns at a time the machine's owner allows |
+| **Isolation**: **Reports machine**, **vm-jail** or **container** | The level of isolation the host reports, with what an escape from a sandbox reaches on a host of that kind. See [Isolation levels](#isolation-levels) |
+| **stated by the operator** | The level rests on what the host's operator configured, not on what the host can see |
+| **Hardened**, **Not hardened**, **No machine of its own** | Whether the machine that runs the host's VMs is hardened. **No machine of its own**: a VM per run at a provider, whose hypervisor is the boundary |
+| **Tier** and a name | The technology of its sandboxes: `container`, `gvisor` or `microvm` |
+| **Reports no level** | The host does not report a level. Its turns will be placed as on a container host |
 
 The version is the runner host's release, shown for support: any release that speaks runner protocol 2 takes turns ([Runner host reference](../reference/runner-host.md#compatibility)). When hosts are registered but none takes turns, because none is online and not draining, the page warns **No company host takes turns now**.
+
+## Isolation levels
+
+A host reports how well its sandboxes keep an agent's code away from the credentials. Tinfirm shows the report as it is and checks none of it: a company host is trusted with its own report, and a personal host runs only its owner's work.
+
+| Level | The wall between an agent's code and the credentials | What an escape reaches |
+|---|---|---|
+| **machine** | Another machine: the credentials are not on the machine that runs the VM | No credential. Through the VM's monitor, no other run either; through the kernel's hypervisor, the other runs on that machine |
+| **vm-jail** | A jail around each VM, on the machine that holds the credentials | Through the VM's monitor, no credential and no other run; through the kernel's hypervisor, every credential |
+| **container** | The container and the kernel | Every credential and the other runs, after one kernel flaw |
+
+On every level, a flaw in the runner host's code that reads what a sandbox sends reaches the runner host's credentials. A change of a host's level or hardening is recorded in the audit log.
+
+A host that reports no level shows **Reports no level** with its tier; runner hosts do not report a level yet. Placement by level is planned: today a host's level does not decide where a turn runs.
 
 ## Runs at a time
 

@@ -192,6 +192,31 @@ public final class FakeRunner implements AutoCloseable {
         return hello;
     }
 
+    /**
+     * A {@code hello} of protocol v2 from a host that reports its isolation (the feature {@code host.isolation},
+     * ADR-0113): {@code level} ({@code machine}, {@code vm-jail} or {@code container}) and {@code hardened}
+     * ({@code yes}, {@code no} or {@code none}) in {@code hello.isolation}, with {@code stated} when not null. A
+     * {@code container} host reports the tier {@code container}, any other {@code microvm}, as the schema requires.
+     */
+    public static Map<String, Object> helloWithIsolation(String level, String hardened, Boolean stated) {
+        Map<String, Object> hello = helloV2(List.of(), List.of());
+        hello.put("isolationTiers", List.of("container".equals(level) ? "container" : "microvm"));
+        hello.put("features", List.of("run.steer", "host.isolation"));
+        Map<String, Object> isolation = new LinkedHashMap<>();
+        isolation.put("level", level);
+        isolation.put("hardened", hardened);
+        if (stated != null) {
+            isolation.put("stated", stated);
+        }
+        hello.put("isolation", isolation);
+        return hello;
+    }
+
+    /** {@link #helloWithIsolation(String, String, Boolean)} without {@code stated}. */
+    public static Map<String, Object> helloWithIsolation(String level, String hardened) {
+        return helloWithIsolation(level, hardened, null);
+    }
+
     /** Sends a {@code hello} of protocol v2 of this runner version and slots, and waits for welcome. */
     public JsonNode helloV2AndWelcome(List<Map<String, Object>> credentials, List<Map<String, Object>> activeRuns,
             String runnerVersion, int maxConcurrentRuns) {

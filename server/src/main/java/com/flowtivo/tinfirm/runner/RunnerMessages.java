@@ -3,6 +3,7 @@ package com.flowtivo.tinfirm.runner;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -176,6 +177,13 @@ public final class RunnerMessages {
      */
     public static final String FEATURE_SANDBOX_ELASTIC = "sandbox.elastic";
 
+    /**
+     * The optional feature of protocol 2 ({@code hello.features}) whose host reports its level of isolation and its
+     * hardening in {@code hello.isolation} (ADR-0113, decisions 1 to 3). It adds no frame. {@code hello.isolation} is
+     * required with it and not allowed without it; a host without it reports no level.
+     */
+    public static final String FEATURE_HOST_ISOLATION = "host.isolation";
+
     /** The largest session bundle, compressed ({@code run.assign.sessionBundle.sizeBytes} maximum): 32 MiB. */
     public static final int MAX_SESSION_BUNDLE_BYTES = 32 * 1024 * 1024;
 
@@ -258,7 +266,9 @@ public final class RunnerMessages {
      * The first frame of a runner host after connecting. {@code maxConcurrentRuns} and each credential's
      * {@code poolSize} are the host's ceilings (archived v1 CONVENTIONS §14.8): 1 to 16 for a credential and a host
      * with Docker, up to 1000 for a host that creates a sandbox per run. {@code pool} comes with the feature
-     * {@link #FEATURE_SANDBOX_POOL}.
+     * {@link #FEATURE_SANDBOX_POOL}, {@code isolation} with {@link #FEATURE_HOST_ISOLATION} (ADR-0113): the schema
+     * says both, and {@code RunnerHostSessions.helloProblem} refuses a hello where the object and the feature, or the
+     * level and {@code isolationTiers}, disagree.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Hello(@NotNull Integer protocolVersion,
@@ -272,7 +282,17 @@ public final class RunnerMessages {
             @Nullable List<@Valid @NotNull ActiveRun> activeRuns,
             @Nullable @Valid PublicSuffixListVersion publicSuffixList,
             @Nullable @Size(max = 50) List<@NotNull @Pattern(regexp = "^[a-z][a-z0-9._-]{0,63}$") String> features,
-            @Nullable @Valid HelloPool pool) implements Inbound {
+            @Nullable @Valid HelloPool pool, @Nullable @Valid HelloIsolation isolation) implements Inbound {
+
+        /** A hello of a host before {@code hello.isolation}. */
+        public Hello(Integer protocolVersion, String runnerVersion, @Nullable String hostname, @Nullable String os,
+                @Nullable String arch, List<String> executors, List<String> isolationTiers, Integer maxConcurrentRuns,
+                List<HelloCredential> credentials, List<HelloRuntime> runtimes, @Nullable List<ActiveRun> activeRuns,
+                @Nullable PublicSuffixListVersion publicSuffixList, @Nullable List<String> features,
+                @Nullable HelloPool pool) {
+            this(protocolVersion, runnerVersion, hostname, os, arch, executors, isolationTiers, maxConcurrentRuns,
+                    credentials, runtimes, activeRuns, publicSuffixList, features, pool, null);
+        }
 
         /** A hello of a host before {@code hello.pool}. */
         public Hello(Integer protocolVersion, String runnerVersion, @Nullable String hostname, @Nullable String os,
@@ -280,12 +300,27 @@ public final class RunnerMessages {
                 List<HelloCredential> credentials, List<HelloRuntime> runtimes, @Nullable List<ActiveRun> activeRuns,
                 @Nullable PublicSuffixListVersion publicSuffixList, @Nullable List<String> features) {
             this(protocolVersion, runnerVersion, hostname, os, arch, executors, isolationTiers, maxConcurrentRuns,
-                    credentials, runtimes, activeRuns, publicSuffixList, features, null);
+                    credentials, runtimes, activeRuns, publicSuffixList, features, null, null);
         }
 
         /** The optional features the host lists; empty when it lists none. */
         public Set<String> featureSet() {
             return features != null ? Set.copyOf(features) : Set.of();
+        }
+
+        /** The tiers of {@code isolationTiers}, which the schema and the constraints allow only by name. */
+        public Set<IsolationTier> tiers() {
+            Set<IsolationTier> tiers = EnumSet.noneOf(IsolationTier.class);
+            isolationTiers.forEach(tier -> tiers.add(IsolationTier.ofWire(tier)));
+            return tiers;
+        }
+
+        /**
+         * The isolation the host reports (ADR-0113): {@code isolation} while it lists {@link #FEATURE_HOST_ISOLATION},
+         * else null, the level of a host that reports none.
+         */
+        public @Nullable HelloIsolation reportedIsolation() {
+            return featureSet().contains(FEATURE_HOST_ISOLATION) ? isolation : null;
         }
 
         /** The operator's ceiling of ready sandboxes of a host with {@link #FEATURE_SANDBOX_POOL}; else null. */
@@ -296,6 +331,22 @@ public final class RunnerMessages {
 
     /** {@code hello.pool} (ADR-0099): the operator's {@code --pool-max-ready}; 0 turns ready sandboxes off. */
     public record HelloPool(@NotNull @Min(0) @Max(MAX_HOST_CAPACITY) Integer maxReady) {
+    }
+
+    /**
+     * {@code hello.isolation} (ADR-0113, the feature {@link #FEATURE_HOST_ISOLATION}): the host's level of isolation
+     * and whether the machine that runs its VMs is hardened, as it reports them. Reported, never checked (decision 3).
+     *
+     * @param stated true when the level rests on the operator's statement in the host's configuration and not on what
+     *               the host can see; absent is false
+     */
+    public record HelloIsolation(@NotNull IsolationLevel level, @NotNull Hardening hardened,
+            @Nullable Boolean stated) {
+
+        /** Whether the operator stated the level ({@code stated}, absent: false). */
+        public boolean statedByOperator() {
+            return Boolean.TRUE.equals(stated);
+        }
     }
 
     /**

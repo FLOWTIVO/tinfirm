@@ -10855,7 +10855,62 @@ components:
             The host's sandbox pool (ADR-0098, ADR-0099): its settings, the count now and the week ahead, and the
             host's last report. Null for a host that keeps no ready sandboxes (a personal host, a host with Docker, or
             a host that has not connected since it could).
+        isolation:
+          allOf:
+            - $ref: '#/components/schemas/RunnerHostIsolation'
+          nullable: true
+          description: |
+            What the host reported about its isolation at its latest hello (ADR-0113), stored and shown as reported:
+            the server checks none of it. Absent before the host's first hello to a server that stores it.
         createdAt: { type: string, format: date-time }
+    RunnerHostIsolation:
+      type: object
+      description: |
+        What a runner host reports about its isolation (ADR-0113, decisions 1 to 3): the tiers of
+        `hello.isolationTiers`, and with the protocol's feature `host.isolation` its level, its hardening and whether
+        the level is its operator's statement. A host without the feature reports no level (`level` and `hardened`
+        absent). Placement by level is planned (ADR-0113, decision 4): runs do not go by it yet.
+      required: [tiers, stated]
+      properties:
+        tiers:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/RunnerIsolationTier' }
+          description: The technology of the host's sandboxes, as its hello named it
+        level:
+          allOf: [{ $ref: '#/components/schemas/RunnerIsolationLevel' }]
+          nullable: true
+          description: The level the host reports; absent for a host that reports none
+        hardened:
+          allOf: [{ $ref: '#/components/schemas/RunnerHardening' }]
+          nullable: true
+          description: Whether the machine that runs the host's VMs is hardened, as reported; absent exactly when `level` is
+        stated:
+          type: boolean
+          description: |
+            True when the level rests on the operator's statement in the host's configuration and not on what the host
+            can see; false without a level
+    RunnerIsolationTier:
+      type: string
+      description: |
+        The isolation tier of a host's sandboxes (ADR-0006): `CONTAINER` (runc), `GVISOR` (runsc) or `MICROVM` (Kata
+        Containers, or a VM). It names a technology, not what an escape reaches.
+      enum: [CONTAINER, GVISOR, MICROVM]
+    RunnerIsolationLevel:
+      type: string
+      description: |
+        A runner host's level of isolation (ADR-0113, decision 1), named for the strongest wall between an agent's code
+        and the credentials. `MACHINE`: the credentials are on another machine (a VM per run at a provider, a control
+        host with sandbox nodes). `VM_JAIL`: a jail around each VM, the credentials on the same machine out of a VMM's
+        user's reach. `CONTAINER`: the container and the kernel, the credentials on the same machine behind the kernel
+        alone.
+      enum: [MACHINE, VM_JAIL, CONTAINER]
+    RunnerHardening:
+      type: string
+      description: |
+        Whether the machine that runs a host's VMs is hardened beyond the jail (ADR-0113, decision 5). `NONE`: the host
+        runs no machine of its own for its VMs (a VM per run at a provider), whose hypervisor is the boundary.
+      enum: ['YES', 'NO', 'NONE']
     RunnerHostPool:
       type: object
       description: |

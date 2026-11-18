@@ -230,6 +230,49 @@ describe('RunnerHosts', () => {
     expect(notify.success).toHaveBeenCalledWith('office removed', 'Its token no longer works.');
   });
 
+  it('shows what each host reports about its isolation, as reported (ADR-0113)', async () => {
+    await open([
+      aPoolRunnerHost({
+        isolation: { tiers: ['MICROVM'], level: 'MACHINE', hardened: 'NONE', stated: false },
+      }),
+      aRunnerHost({
+        id: 'h-jail',
+        name: 'single',
+        isolation: { tiers: ['MICROVM'], level: 'VM_JAIL', hardened: 'YES', stated: true },
+      }),
+      aRunnerHost({
+        id: 'h-kata',
+        name: 'kata-01',
+        isolation: { tiers: ['MICROVM'], stated: false },
+      }),
+      aRunnerHost({ id: 'h-new', name: 'never-seen', isolation: null }),
+    ]);
+    const machine = q('host-isolation', host('droplets'))!;
+    expect(words(q('isolation-reports', machine))).toBe('Reports machine');
+    expect(words(q('isolation-hardening', machine))).toContain(
+      'provider’s hypervisor is the boundary',
+    );
+    expect(words(q('isolation-reaches', machine))).toContain('credentials are on another machine');
+    expect(words(q('isolation-tiers', machine))).toBe('Tier microvm');
+    expect(q('isolation-planned', machine)).toBeNull();
+
+    const jail = q('host-isolation', host('single'))!;
+    expect(words(q('isolation-reports', jail))).toBe('Reports vm-jail, stated by the operator');
+    expect(words(q('isolation-hardening', jail))).toMatch(/^Hardened/);
+
+    // A host without the feature: its tier and no level, placed as a container host once placement is built.
+    const kata = q('host-isolation', host('kata-01'))!;
+    expect(words(q('isolation-reports', kata))).toBe(
+      'Reports no level: its runs are placed as on a container host.',
+    );
+    expect(words(q('isolation-tiers', kata))).toBe('Tier microvm');
+    expect(q('isolation-hardening', kata)).toBeNull();
+    expect(words(q('isolation-planned', kata))).toContain('planned');
+
+    // Before its first report, nothing.
+    expect(q('host-isolation', host('never-seen'))).toBeNull();
+  });
+
   describe('ready sandboxes (ADR-0099)', () => {
     const dialog = () => document.querySelector<HTMLElement>('hlm-dialog-content');
     const inDialog = (testId: string) =>

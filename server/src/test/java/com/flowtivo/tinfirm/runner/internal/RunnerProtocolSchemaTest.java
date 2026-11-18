@@ -18,6 +18,9 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 
 import com.flowtivo.tinfirm.runner.EffortLevel;
+import com.flowtivo.tinfirm.runner.Hardening;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
+import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
 import com.flowtivo.tinfirm.support.ProtocolSchema;
@@ -468,6 +471,83 @@ class RunnerProtocolSchemaTest {
             .decode(Files.readString(V2_SAMPLES.resolve("run.finished-failed.json")), 2);
         assertThat(failed.resumed()).isFalse();
         assertThat(failed.resumeOutcome()).isEqualTo(RunnerMessages.ResumeOutcome.NO_SESSION);
+    }
+
+    /** A v2 hello of a Kata-like host with these tiers, features and {@code isolation} (raw JSON, or nothing). */
+    private static String isolationHello(String tiers, String features, String isolation) {
+        return """
+                {"type":"hello","protocolVersion":2,"runnerVersion":"1.0.0","executors":["docker"],
+                 "isolationTiers":%s,"maxConcurrentRuns":2,"runtimes":[],"credentials":[],
+                 "features":%s%s}""".formatted(tiers, features, isolation.isEmpty() ? "" : ",\"isolation\":" + isolation);
+    }
+
+    /**
+     * ADR-0113, decision 2: {@code hello.isolation} comes exactly with the feature {@code host.isolation}, and
+     * {@code machine} or {@code vm-jail} only with tiers that are all {@code microvm}. The schema says both, and the
+     * server refuses a hello where they disagree ({@code helloProblem}, a {@code BAD_MESSAGE}); nothing else.
+     */
+    @Test
+    void theIsolationComesWithItsFeatureAndALevelAboveContainerWithMicrovmTiers() {
+        String machine = isolationHello("[\"microvm\"]", "[\"run.steer\",\"host.isolation\"]",
+                "{\"level\":\"machine\",\"hardened\":\"none\"}");
+        assertThat(ProtocolSchema.violations(2, machine)).isEmpty();
+        RunnerMessages.Hello hello = (RunnerMessages.Hello) codec.decode(machine, 2);
+        assertThat(RunnerHostSessions.helloProblem(hello)).isNull();
+        assertThat(hello.reportedIsolation()).isEqualTo(new RunnerMessages.HelloIsolation(IsolationLevel.MACHINE,
+                Hardening.NONE, null));
+        RunnerHostStore.Isolation stored = RunnerHostSessions.isolation(hello);
+        assertThat(stored.tiers()).containsExactly(IsolationTier.MICROVM);
+        assertThat(stored.stated()).isFalse();
+
+        // Allowed: a stated vm-jail; container with a microvm tier (a Kata host derives container from Docker); any
+        // hardening with any level; unknown fields of the object.
+        for (String allowed : List.of(
+                isolationHello("[\"microvm\"]", "[\"host.isolation\"]",
+                        "{\"level\":\"vm-jail\",\"hardened\":\"no\",\"stated\":true}"),
+                isolationHello("[\"microvm\"]", "[\"host.isolation\"]",
+                        "{\"level\":\"container\",\"hardened\":\"none\"}"),
+                isolationHello("[\"gvisor\"]", "[\"host.isolation\"]",
+                        "{\"level\":\"container\",\"hardened\":\"yes\",\"future\":1}"),
+                isolationHello("[\"container\"]", "[\"run.steer\"]", ""))) {
+            assertThat(ProtocolSchema.violations(2, allowed)).as(allowed).isEmpty();
+            assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(allowed, 2))).as(allowed)
+                .isNull();
+        }
+        RunnerMessages.Hello stated = (RunnerMessages.Hello) codec.decode(isolationHello("[\"microvm\"]",
+                "[\"host.isolation\"]", "{\"level\":\"vm-jail\",\"hardened\":\"no\",\"stated\":true}"), 2);
+        assertThat(RunnerHostSessions.isolation(stated).stated()).isTrue();
+        RunnerMessages.Hello none = (RunnerMessages.Hello) codec.decode(
+                isolationHello("[\"container\"]", "[\"run.steer\"]", ""), 2);
+        assertThat(RunnerHostSessions.isolation(none).level()).isNull();
+
+        // Refused by the schema and by the server, each with a message that names the fields.
+        String featureAlone = isolationHello("[\"microvm\"]", "[\"host.isolation\"]", "");
+        String objectAlone = isolationHello("[\"microvm\"]", "[\"run.steer\"]",
+                "{\"level\":\"machine\",\"hardened\":\"none\"}");
+        String machineInAContainer = isolationHello("[\"container\"]", "[\"host.isolation\"]",
+                "{\"level\":\"machine\",\"hardened\":\"yes\"}");
+        String jailBesideAContainer = isolationHello("[\"microvm\",\"container\"]", "[\"host.isolation\"]",
+                "{\"level\":\"vm-jail\",\"hardened\":\"yes\"}");
+        for (String refused : List.of(featureAlone, objectAlone, machineInAContainer, jailBesideAContainer)) {
+            assertThat(ProtocolSchema.violations(2, refused)).as(refused).isNotEmpty();
+        }
+        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(featureAlone, 2)))
+            .contains("hello.features", "host.isolation", "hello.isolation");
+        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(objectAlone, 2)))
+            .contains("hello.isolation", "host.isolation", "hello.features");
+        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(machineInAContainer, 2)))
+            .contains("hello.isolation.level machine", "hello.isolationTiers", "microvm", "container");
+        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(jailBesideAContainer, 2)))
+            .contains("hello.isolation.level vm-jail", "hello.isolationTiers");
+
+        // A level or a hardening the protocol does not name, and an object without one, are bad frames.
+        String unknown = isolationHello("[\"microvm\"]", "[\"host.isolation\"]",
+                "{\"level\":\"cloud\",\"hardened\":\"none\"}");
+        assertThat(ProtocolSchema.violations(2, unknown)).isNotEmpty();
+        assertThat(code(unknown, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        String noHardening = isolationHello("[\"microvm\"]", "[\"host.isolation\"]", "{\"level\":\"machine\"}");
+        assertThat(ProtocolSchema.violations(2, noHardening)).isNotEmpty();
+        assertThat(code(noHardening, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
     }
 
     @Test

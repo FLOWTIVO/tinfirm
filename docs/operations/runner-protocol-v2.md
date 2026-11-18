@@ -187,6 +187,16 @@ ships it.
   `EDITION_REQUIRED` and close code 1008, and the host stops with that message, without
   reconnecting. Change the host as the table says, or apply a Pro or Enterprise key, and start
   the host again.
+- **Isolation level** ([ADR-0113](../adr/0113-levels-of-isolation-and-placement.md)). A host
+  that knows its level lists `host.isolation` and sends `hello.isolation`: `level` (`machine`,
+  `vm-jail` or `container`), `hardened` (`yes`, `no`, or `none` for a VM per run at a provider)
+  and `stated` (true when the level rests on the operator's statement). It adds no frame. The
+  server refuses, with `error` `BAD_MESSAGE` and close code 1008, a `hello` that lists the
+  feature without the object or sends the object without the feature, and one that reports
+  `machine` or `vm-jail` with a tier other than `microvm`. It stores the report at every `hello`
+  and shows it on the host's card as reported; it checks none of it. A host without the feature
+  shows its tier and no level. The runner host does not send the feature yet, and placement by
+  level is planned (ADR-0113, decision 4): today the level decides nothing.
 - **Ready sandboxes** ([ADR-0098](../adr/0098-ready-vms.md),
   [ADR-0099](../adr/0099-pool-settings.md)). A host with a VM per run (`run --executor vm`)
   and ready VMs lists `sandbox.pool` and reports its operator's `--pool-max-ready` in
@@ -201,7 +211,8 @@ ships it.
 
 - `run`'s log line `runner host starting` shows `protocol_version`.
 - A v2 host's `hello` lists `isolationTiers: ["microvm"]` on a Kata host, which the server
-  accepts (it does not store the tier yet).
+  accepts and stores; the host's card shows "Tier microvm" and, without `host.isolation`,
+  "Reports no level".
 - The company's audit log has a `tool.called` event per server-executed tool call, and a
   `secret.accessed` event with purpose `run-tool:{runId}` for each.
 - After a run, the conversation's outputs hold the files the agent left in `/output`; the run's

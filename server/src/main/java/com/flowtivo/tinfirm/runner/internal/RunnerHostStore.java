@@ -20,8 +20,11 @@ import org.springframework.stereotype.Repository;
 
 import com.flowtivo.tinfirm.runner.CredentialKind;
 import com.flowtivo.tinfirm.runner.CredentialState;
+import com.flowtivo.tinfirm.runner.Hardening;
 import com.flowtivo.tinfirm.runner.HostCredentialInfo;
 import com.flowtivo.tinfirm.runner.HostScope;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
+import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
@@ -53,7 +56,27 @@ class RunnerHostStore {
             coalesce(m.runtimes, h.runtimes) AS runtimes,
             coalesce(m.runner_version, h.runner_version) AS runner_version,
             coalesce(m.hostname, h.hostname) AS hostname, coalesce(m.os, h.os) AS os, coalesce(m.arch, h.arch) AS arch,
+            coalesce(m.isolation_tiers, h.isolation_tiers) AS isolation_tiers,
+            coalesce(m.isolation_level, h.isolation_level) AS isolation_level,
+            coalesce(m.isolation_hardened, h.isolation_hardened) AS isolation_hardened,
+            coalesce(m.isolation_stated, h.isolation_stated) AS isolation_stated,
             coalesce(m.last_seen_at, h.last_seen_at) AS last_seen_at, h.created_at""";
+
+    /**
+     * What {@link RunnerHostInfo} needs of a host, for the other modules' reads and the dispatcher's lock: no more, so
+     * that a statement stays short enough to be read whole where the database shows what waits for a lock.
+     */
+    private static final String INFO_COLUMNS = """
+            h.id, h.company_id, h.name, h.scope, h.owner_principal_id, h.personal_host_id,
+            coalesce(m.max_concurrent_runs, h.max_concurrent_runs) AS max_concurrent_runs,
+            coalesce(m.max_concurrent_runs_ceiling, h.max_concurrent_runs_ceiling) AS max_concurrent_runs_ceiling,
+            coalesce(m.desired_max_concurrent_runs, h.desired_max_concurrent_runs) AS desired_max_concurrent_runs,
+            coalesce(m.draining, h.draining) AS draining, coalesce(m.runtimes, h.runtimes) AS runtimes,
+            coalesce(m.runner_version, h.runner_version) AS runner_version,
+            coalesce(m.isolation_level, h.isolation_level) AS isolation_level,
+            coalesce(m.isolation_hardened, h.isolation_hardened) AS isolation_hardened,
+            coalesce(m.isolation_stated, h.isolation_stated) AS isolation_stated,
+            coalesce(m.last_seen_at, h.last_seen_at) AS last_seen_at""";
 
     private static final String HOSTS = " FROM runner_host h LEFT JOIN personal_runner_host m ON m.id = h.personal_host_id";
 
@@ -77,12 +100,15 @@ class RunnerHostStore {
      * @param maxConcurrentRuns      the effective slots as last confirmed (after hello: the expected value)
      * @param draining               as last reported; meaningful only while the host is connected
      * @param appliedConfigVersion   the highest {@code config_version} the host confirmed, or null
+     * @param isolation              what its latest {@code hello} reported about its isolation (ADR-0113); null before
+     *                               a hello of a server that stores it
      */
     record HostRow(UUID id, UUID companyId, String name, HostScope scope, @Nullable UUID ownerPrincipalId,
             @Nullable UUID personalHostId, int maxConcurrentRuns, int maxConcurrentRunsCeiling,
             @Nullable Integer desiredMaxConcurrentRuns, boolean draining, long configVersion,
             @Nullable Long appliedConfigVersion, @Nullable String runnerVersion, @Nullable String hostname,
-            @Nullable String os, @Nullable String arch, @Nullable Instant lastSeenAt, Instant createdAt) {
+            @Nullable String os, @Nullable String arch, @Nullable Instant lastSeenAt, Instant createdAt,
+            @Nullable Isolation isolation) {
 
         /** The host has not confirmed the latest change of a desired value yet. */
         boolean configPending() {
@@ -137,11 +163,32 @@ class RunnerHostStore {
 
     /**
      * Host facts reported in {@code hello}; {@code maxConcurrentRunsCeiling} is its {@code maxConcurrentRuns},
-     * {@code runtimes} the runtimes of its {@code runtimes} (those whose images it found), and {@code poolCeiling}
-     * its {@code pool.maxReady} when it lists {@code sandbox.pool} (else null).
+     * {@code runtimes} the runtimes of its {@code runtimes} (those whose images it found), {@code poolCeiling}
+     * its {@code pool.maxReady} when it lists {@code sandbox.pool} (else null), and {@code isolation} its tiers and
+     * the level it reports (ADR-0113).
      */
     record HelloFacts(String runnerVersion, @Nullable String hostname, @Nullable String os, @Nullable String arch,
-            int maxConcurrentRunsCeiling, Set<RuntimeKind> runtimes, @Nullable Integer poolCeiling) {
+            int maxConcurrentRunsCeiling, Set<RuntimeKind> runtimes, @Nullable Integer poolCeiling,
+            Isolation isolation) {
+    }
+
+    /**
+     * What a host reports about its isolation (ADR-0113, decisions 1 to 3): the tiers of {@code isolationTiers}, and
+     * with the feature {@code host.isolation} its level, its hardening and whether the operator stated the level. A
+     * host without the feature has no level, no hardening, and {@code stated} false.
+     */
+    record Isolation(Set<IsolationTier> tiers, @Nullable IsolationLevel level, @Nullable Hardening hardened,
+            boolean stated) {
+
+        Isolation {
+            tiers = Set.copyOf(tiers);
+        }
+
+        /** Whether the level, the hardening or the operator's statement differ: a change to audit. */
+        boolean levelDiffers(@Nullable Isolation other) {
+            return other == null ? level != null
+                    : level != other.level || hardened != other.hardened || stated != other.stated;
+        }
     }
 
     /**
@@ -347,14 +394,14 @@ class RunnerHostStore {
 
     /** Every host of the company, by name. */
     List<RunnerHostInfo> hostInfos(UUID companyId) {
-        return jdbc.sql("SELECT " + HOST_COLUMNS + HOSTS + " WHERE h.company_id = ? ORDER BY h.name, h.id")
+        return jdbc.sql("SELECT " + INFO_COLUMNS + HOSTS + " WHERE h.company_id = ? ORDER BY h.name, h.id")
             .param(companyId)
             .query(RunnerHostStore::hostInfo)
             .list();
     }
 
     Optional<RunnerHostInfo> hostInfo(UUID companyId, UUID hostId) {
-        return jdbc.sql("SELECT " + HOST_COLUMNS + HOSTS + " WHERE h.company_id = ? AND h.id = ?")
+        return jdbc.sql("SELECT " + INFO_COLUMNS + HOSTS + " WHERE h.company_id = ? AND h.id = ?")
             .params(companyId, hostId)
             .query(RunnerHostStore::hostInfo)
             .optional();
@@ -382,7 +429,7 @@ class RunnerHostStore {
                 .query(UUID.class)
                 .list();
         }
-        return jdbc.sql("SELECT " + HOST_COLUMNS + HOSTS + " WHERE h.id IN (:ids) ORDER BY h.id FOR NO KEY UPDATE OF h")
+        return jdbc.sql("SELECT " + INFO_COLUMNS + HOSTS + " WHERE h.id IN (:ids) ORDER BY h.id FOR NO KEY UPDATE OF h")
             .param("ids", hostIds)
             .query(RunnerHostStore::hostInfo)
             .list();
@@ -396,19 +443,53 @@ class RunnerHostStore {
     // ---- the facts, capacity and configuration of a host ------------------------------------------------------
 
     /**
+     * What the host's row holds about its isolation now, its row locked until the transaction ends: read before a
+     * {@code hello} replaces it, so that a change of the level is audited once. Empty when the host no longer exists;
+     * an {@link Isolation} of no tiers before the first hello that stored them.
+     */
+    Optional<Isolation> lockIsolation(Target target) {
+        return jdbc.sql("SELECT isolation_tiers, isolation_level, isolation_hardened, isolation_stated FROM "
+                + target.table() + " WHERE id = ? FOR UPDATE")
+            .param(target.id())
+            .query(RunnerHostStore::isolation)
+            .optional()
+            .map(found -> found.orElse(new Isolation(Set.of(), null, null, false)));
+    }
+
+    /** The isolation of a row's columns; empty when the host reported no tiers yet (before V085's first hello). */
+    private static Optional<Isolation> isolation(ResultSet rs, int row) throws SQLException {
+        Array tiers = rs.getArray("isolation_tiers");
+        if (tiers == null) {
+            return Optional.empty();
+        }
+        Set<IsolationTier> stored = EnumSet.noneOf(IsolationTier.class);
+        for (Object tier : (Object[]) tiers.getArray()) {
+            stored.add(IsolationTier.valueOf((String) tier));
+        }
+        return Optional.of(new Isolation(stored, IsolationLevel.ofName(rs.getString("isolation_level")),
+                Hardening.ofName(rs.getString("isolation_hardened")), rs.getBoolean("isolation_stated")));
+    }
+
+    /**
      * Records {@code hello}: the ceiling, and as effective value the one the server expects, {@code min(desired,
      * ceiling)}, until the host confirms it; a new connection does not drain. False when the host no longer exists
      * (deleted after the token check).
      */
     boolean recordHello(Target target, HelloFacts facts, Instant now) {
+        Isolation isolation = facts.isolation();
         boolean found = jdbc.sql("UPDATE " + target.table() + """
                    SET runner_version = ?, hostname = ?, os = ?, arch = ?, max_concurrent_runs_ceiling = ?,
                        max_concurrent_runs = least(coalesce(desired_max_concurrent_runs, ?), ?), draining = false,
-                       runtimes = CAST(? AS varchar(16)[]), last_seen_at = ?
+                       runtimes = CAST(? AS varchar(16)[]), isolation_tiers = CAST(? AS varchar(16)[]),
+                       isolation_level = ?, isolation_hardened = ?, isolation_stated = ?, last_seen_at = ?
                  WHERE id = ?""")
             .params(facts.runnerVersion(), facts.hostname(), facts.os(), facts.arch(),
                     facts.maxConcurrentRunsCeiling(), facts.maxConcurrentRunsCeiling(),
-                    facts.maxConcurrentRunsCeiling(), names(facts.runtimes()), ts(now), target.id())
+                    facts.maxConcurrentRunsCeiling(), names(facts.runtimes()),
+                    isolation.tiers().stream().map(Enum::name).sorted().toArray(String[]::new),
+                    isolation.level() != null ? isolation.level().name() : null,
+                    isolation.hardened() != null ? isolation.hardened().name() : null, isolation.stated(), ts(now),
+                    target.id())
             .update() == 1;
         if (found && target.companyHost()) {
             // Only a company host keeps ready sandboxes (ADR-0099): its ceiling, or none without the feature.
@@ -545,7 +626,8 @@ class RunnerHostStore {
                 rs.getObject("desired_max_concurrent_runs", Integer.class), rs.getBoolean("draining"),
                 rs.getLong("config_version"), rs.getObject("applied_config_version", Long.class),
                 rs.getString("runner_version"), rs.getString("hostname"), rs.getString("os"), rs.getString("arch"),
-                nullableInstant(rs, "last_seen_at"), rs.getObject("created_at", OffsetDateTime.class).toInstant());
+                nullableInstant(rs, "last_seen_at"), rs.getObject("created_at", OffsetDateTime.class).toInstant(),
+                isolation(rs, row).orElse(null));
     }
 
     private static RunnerHostInfo hostInfo(ResultSet rs, int row) throws SQLException {
@@ -554,7 +636,9 @@ class RunnerHostStore {
                 rs.getObject("owner_principal_id", UUID.class), rs.getObject("personal_host_id", UUID.class),
                 rs.getInt("max_concurrent_runs"), rs.getInt("max_concurrent_runs_ceiling"),
                 rs.getObject("desired_max_concurrent_runs", Integer.class), rs.getBoolean("draining"),
-                runtimes(rs.getArray("runtimes")), rs.getString("runner_version"), nullableInstant(rs, "last_seen_at"));
+                runtimes(rs.getArray("runtimes")), rs.getString("runner_version"), nullableInstant(rs, "last_seen_at"),
+                IsolationLevel.ofName(rs.getString("isolation_level")),
+                Hardening.ofName(rs.getString("isolation_hardened")), rs.getBoolean("isolation_stated"));
     }
 
     private static Machine machine(ResultSet rs, int row) throws SQLException {

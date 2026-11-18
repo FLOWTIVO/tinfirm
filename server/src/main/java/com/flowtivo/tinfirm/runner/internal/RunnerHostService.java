@@ -154,7 +154,7 @@ class RunnerHostService {
                 throw duplicateName();
             }
             RunnerHostStore.HostRow host = new RunnerHostStore.HostRow(Ids.newId(), companyId, name, scope, null,
-                    null, 1, 1, null, false, 0, null, null, null, null, null, null, time.now());
+                    null, 1, 1, null, false, 0, null, null, null, null, null, null, time.now(), null);
             try {
                 store.insertHost(host, RunnerTokens.hash(token));
             }
@@ -205,7 +205,7 @@ class RunnerHostService {
         UUID id = Ids.newId();
         store.insertPresence(id, companyId, machine.name(), principalId, machine.id(), now);
         RunnerHostStore.HostRow host = new RunnerHostStore.HostRow(id, companyId, machine.name(), HostScope.PERSONAL,
-                principalId, machine.id(), 1, 1, null, false, 0, null, null, null, null, null, null, now);
+                principalId, machine.id(), 1, 1, null, false, 0, null, null, null, null, null, null, now, null);
         auditLog.record(registered(companyId, host, cause).build());
         UUID machineId = machine.id();
         AfterCommit.run(() -> connections.addPresence(machineId, companyId, id));
@@ -443,8 +443,19 @@ class RunnerHostService {
                     host.arch(),
                     host.maxConcurrentRuns(), host.maxConcurrentRunsCeiling(), host.desiredMaxConcurrentRuns(),
                     host.configPending(), activeRuns.getOrDefault(host.id(), 0), hostCredentials, host.createdAt(),
-                    host.scope() == HostScope.COMPANY ? poolDetails.get(host.id()) : null);
+                    host.scope() == HostScope.COMPANY ? poolDetails.get(host.id()) : null,
+                    isolationView(host.isolation()));
         }).toList();
+    }
+
+    /** A host's reported isolation for its page: the tiers in their order, the level and hardening by name. */
+    private static RunnerViews.@Nullable IsolationView isolationView(RunnerHostStore.@Nullable Isolation isolation) {
+        if (isolation == null) {
+            return null;
+        }
+        return new RunnerViews.IsolationView(isolation.tiers().stream().sorted().map(Enum::name).toList(),
+                isolation.level() != null ? isolation.level().name() : null,
+                isolation.hardened() != null ? isolation.hardened().name() : null, isolation.stated());
     }
 
     /**

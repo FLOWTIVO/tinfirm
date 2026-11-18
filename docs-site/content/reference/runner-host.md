@@ -10,7 +10,7 @@ A runner host and the server agree on the **runner protocol**, never on a versio
 |---|---|---|
 | The release version | `tinfirm-runner-host --version`, the host's card (such as `v1.0.0`), the release's file names and the image tag `v1.0.0` | Which release the host runs, for support. Tinfirm decides nothing from it |
 | The protocol version | The `protocol_version` of the host's `runner host starting` log line | Version 2 takes turns. A host on version 1 connects but takes none |
-| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), the sandbox bridge (`sandbox.bridge`), and with elastic runners (Pro and Enterprise) ready sandboxes (`sandbox.pool`) and a provider's VM driver (`sandbox.elastic`). A host without one still takes turns |
+| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), the sandbox bridge (`sandbox.bridge`), its level of isolation (`host.isolation`, with `hello.isolation`; the server stores and shows it, and the runner host does not send it yet), and with elastic runners (Pro and Enterprise) ready sandboxes (`sandbox.pool`) and a provider's VM driver (`sandbox.elastic`). A host without one still takes turns |
 
 The server accepts protocol versions 1 and 2. Every host of protocol 2 keeps a run's model token out of the sandbox (its model proxy is always on) and sends its own token with the run's model requests, so turns paid by a budget go to any host of protocol 2. A build from the `rolling` prerelease shows what it was built from after its version, such as `0.1.0-SNAPSHOT (rolling-abc1234)`.
 

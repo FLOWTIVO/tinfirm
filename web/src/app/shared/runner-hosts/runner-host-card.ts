@@ -24,10 +24,12 @@ import {
   poolServed,
   poolZone,
 } from './pool-view';
+import { isolationLines } from './isolation-view';
 
 /**
  * One runner host as a sheet (package 2): online or offline and since when, draining, its version
- * and machine, its slots (in use, effective, the machine's ceiling, the desired value Tinfirm sets
+ * and machine, what it reports about its isolation (ADR-0113: its level, its hardening, what an
+ * escape reaches there, its tier), its slots (in use, effective, the machine's ceiling, the desired value Tinfirm sets
  * and whether the host confirmed it), for a company host that keeps ready sandboxes its pool
  * (ADR-0099: the count now and next, the week, the host's last report), and for a personal host
  * the subscriptions it reported. Its page saves a capacity, edits the pool's schedule and confirms
@@ -100,6 +102,33 @@ import {
         </button>
       }
     </div>
+
+    @if (isolation(); as iso) {
+      <section
+        class="flex flex-col gap-0.5 border-t px-4 py-3"
+        data-testid="host-isolation"
+        [attr.aria-labelledby]="'host-isolation-' + h.id"
+      >
+        <h4 class="text-sm font-semibold" [id]="'host-isolation-' + h.id">Isolation</h4>
+        <p class="text-sm" data-testid="isolation-reports">{{ iso.reports }}</p>
+        @if (iso.hardening; as hardening) {
+          <p class="text-muted-foreground text-xs text-pretty" data-testid="isolation-hardening">
+            {{ hardening }}
+          </p>
+        }
+        @if (iso.reaches; as reaches) {
+          <p class="text-muted-foreground text-xs text-pretty" data-testid="isolation-reaches">
+            {{ reaches }}
+          </p>
+        }
+        <p class="text-muted-foreground font-mono text-xs" data-testid="isolation-tiers">
+          {{ iso.tiers }}
+        </p>
+        @if (iso.planned; as planned) {
+          <p class="text-muted-foreground text-xs" data-testid="isolation-planned">{{ planned }}</p>
+        }
+      </section>
+    }
 
     <div
       class="flex flex-col gap-3 border-t px-4 py-3 sm:flex-row sm:items-start sm:justify-between"
@@ -335,6 +364,9 @@ export class RunnerHostCard {
   protected opacity(count: number): number {
     return count === 0 ? 0 : 0.35 + (0.65 * count) / this.highest();
   }
+
+  /** What the host reports about its isolation (ADR-0113), as reported; null before its first report. */
+  protected readonly isolation = computed(() => isolationLines(this.host().isolation));
 
   protected readonly kindLabels = SUBSCRIPTION_KIND_LABELS;
   protected readonly statusLabels = SUBSCRIPTION_STATUS_LABELS;

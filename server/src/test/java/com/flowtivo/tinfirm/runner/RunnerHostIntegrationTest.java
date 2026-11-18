@@ -318,6 +318,165 @@ class RunnerHostIntegrationTest extends IntegrationTest {
         }
     }
 
+    /** A detail the audit holds as null, or leaves out. */
+    private static boolean absent(JsonNode value) {
+        return value.isNull() || value.isMissingNode();
+    }
+
+    /** The host's {@code isolation} as {@code GET /runner-hosts} shows it to the reader. */
+    private static JsonNode isolationOf(ApiClient reader, TestCompany company, UUID hostId) {
+        for (JsonNode host : reader.get(company.path("/runner-hosts")).json().get("items")) {
+            if (host.get("id").asString().equals(hostId.toString())) {
+                return host.path("isolation");
+            }
+        }
+        throw new AssertionError("No host " + hostId);
+    }
+
+    /**
+     * ADR-0113, decisions 1 to 3: a company host's report of its isolation is stored at each hello and shown as
+     * reported; a later hello without the feature clears the level and keeps the tier. A change of the level is
+     * audited once, by SYSTEM, not at every hello.
+     */
+    @Test
+    void aCompanyHostsReportedIsolationIsStoredShownAndItsChangesAudited() {
+        TestCompany company = companyWithRoles();
+        ApiClient owner = loginAs(company.email("OWNER"));
+        RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("vm"), "COMPANY");
+        assertThat(absent(isolationOf(owner, company, host.id()))).as("before its first hello").isTrue();
+
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            runner.send(FakeRunner.helloWithIsolation("machine", "none"));
+            runner.expect("welcome");
+            runner.expect("host.config");
+            runner.assertFramesValid();
+        }
+        JsonNode machine = isolationOf(owner, company, host.id());
+        assertThat(machine.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
+        assertThat(machine.get("level").asString()).isEqualTo("MACHINE");
+        assertThat(machine.get("hardened").asString()).isEqualTo("NONE");
+        assertThat(machine.get("stated").asBoolean()).isFalse();
+        JsonNode reported = auditEvents(owner, company, "runner_host.isolation_changed").getFirst();
+        assertThat(reported.get("targetId").asString()).isEqualTo(host.id().toString());
+        assertThat(reported.get("actor").get("type").asString()).isEqualTo("SYSTEM");
+        assertThat(absent(reported.get("details").path("oldLevel"))).isTrue();
+        assertThat(reported.get("details").get("newLevel").asString()).isEqualTo("machine");
+        assertThat(reported.get("details").get("newHardened").asString()).isEqualTo("none");
+
+        // The same report again changes nothing and is not audited again.
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            runner.send(FakeRunner.helloWithIsolation("machine", "none"));
+            runner.expect("welcome");
+        }
+        assertThat(auditEvents(owner, company, "runner_host.isolation_changed")).hasSize(1);
+
+        // Downgraded: a hello without the feature reports no level; the tier it sends stays.
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            runner.send(FakeRunner.helloV2(List.of(), List.of()));
+            runner.expect("welcome");
+        }
+        JsonNode cleared = isolationOf(owner, company, host.id());
+        assertThat(cleared.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
+        assertThat(absent(cleared.path("level"))).isTrue();
+        assertThat(absent(cleared.path("hardened"))).isTrue();
+        assertThat(cleared.get("stated").asBoolean()).isFalse();
+        List<JsonNode> changes = auditEvents(owner, company, "runner_host.isolation_changed");
+        assertThat(changes).hasSize(2);
+        JsonNode downgraded = changes.stream()
+            .filter(event -> absent(event.get("details").path("newLevel")))
+            .findFirst()
+            .orElseThrow();
+        assertThat(downgraded.get("details").get("oldLevel").asString()).isEqualTo("machine");
+        assertThat(downgraded.get("details").get("oldHardened").asString()).isEqualTo("none");
+    }
+
+    /** ADR-0113: a personal host's report is its machine's, shown in its presence, with the operator's statement. */
+    @Test
+    void aPersonalHostsReportedIsolationIsShownWithTheOperatorsStatement() {
+        TestCompany company = companyWithRoles();
+        ApiClient member = loginAs(company.email("MEMBER"));
+        RunnerHostRef host = registerRunnerHost(member, company.id(), unique("laptop"));
+
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            runner.send(FakeRunner.helloWithIsolation("vm-jail", "no", true));
+            runner.expect("welcome");
+            runner.expect("host.config");
+            runner.assertFramesValid();
+        }
+        JsonNode isolation = isolationOf(member, company, host.id());
+        assertThat(isolation.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
+        assertThat(isolation.get("level").asString()).isEqualTo("VM_JAIL");
+        assertThat(isolation.get("hardened").asString()).isEqualTo("NO");
+        assertThat(isolation.get("stated").asBoolean()).isTrue();
+        JsonNode reported = auditEvents(loginAs(company.email("OWNER")), company, "runner_host.isolation_changed")
+            .getFirst();
+        assertThat(reported.get("targetId").asString()).isEqualTo(host.id().toString());
+        assertThat(reported.get("details").get("newStated").asBoolean()).isTrue();
+
+        // A container host: its own level, with the container tier.
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            runner.send(FakeRunner.helloWithIsolation("container", "no"));
+            runner.expect("welcome");
+        }
+        JsonNode container = isolationOf(member, company, host.id());
+        assertThat(container.get("tiers")).extracting(JsonNode::asString).containsExactly("CONTAINER");
+        assertThat(container.get("level").asString()).isEqualTo("CONTAINER");
+        assertThat(container.get("stated").asBoolean()).isFalse();
+    }
+
+    /** ADR-0113, decision 2: a hello whose isolation and feature, or level and tiers, disagree stops at the hello. */
+    @Test
+    void aHelloWhoseIsolationDisagreesIsRefused() {
+        TestCompany company = companyWithRoles();
+        ApiClient admin = loginAs(company.email("ADMIN"));
+        RunnerHostRef host = registerRunnerHost(admin, company.id(), unique("liar"), "COMPANY");
+        Map<String, Object> featureAlone = FakeRunner.helloWithIsolation("machine", "none");
+        featureAlone.remove("isolation");
+        Map<String, Object> objectAlone = FakeRunner.helloWithIsolation("machine", "none");
+        objectAlone.put("features", List.of("run.steer"));
+        Map<String, Object> machineInAContainer = FakeRunner.helloWithIsolation("machine", "yes");
+        machineInAContainer.put("isolationTiers", List.of("container"));
+        for (Map<String, Object> hello : List.of(featureAlone, objectAlone, machineInAContainer)) {
+            try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+                runner.send(hello);
+                JsonNode error = runner.expect("error");
+                assertThat(error.get("code").asString()).isEqualTo("BAD_MESSAGE");
+                assertThat(error.get("message").asString()).as("%s", hello).contains("hello.isolation");
+                assertThat(runner.awaitClose()).isEqualTo(1008);
+                assertThat(runner.received()).noneMatch(frame -> frame.get("type").asString().equals("welcome"));
+            }
+        }
+        assertThat(absent(isolationOf(admin, company, host.id()))).as("nothing stored").isTrue();
+    }
+
+    /** V085's checks: a level comes with its hardening and tiers, the operator's statement only with a level. */
+    @Test
+    void theIsolationColumnsHoldOnlyWhatAHostCanReport() throws SQLException {
+        TestCompany company = companyWithRoles();
+        RunnerHostRef host = registerRunnerHost(loginAs(company.email("OWNER")), company.id(), unique("ck"),
+                "COMPANY");
+        try (TenantSql sql = TenantSql.in(company.id())) {
+            Map<String, String> refused = Map.of(
+                    "isolation_tiers = ARRAY['KATA']", "runner_host_isolation_tiers_ck",
+                    "isolation_tiers = ARRAY[]::varchar(16)[]", "runner_host_isolation_tiers_ck",
+                    "isolation_tiers = ARRAY['MICROVM'], isolation_level = 'CLOUD', isolation_hardened = 'NO'",
+                    "runner_host_isolation_level_ck",
+                    "isolation_tiers = ARRAY['MICROVM'], isolation_level = 'MACHINE', isolation_hardened = 'MAYBE'",
+                    "runner_host_isolation_hardened_ck",
+                    "isolation_tiers = ARRAY['MICROVM'], isolation_level = 'MACHINE'", "runner_host_isolation_ck",
+                    "isolation_tiers = ARRAY['MICROVM'], isolation_stated = true", "runner_host_isolation_ck",
+                    "isolation_level = 'MACHINE', isolation_hardened = 'NONE'", "runner_host_isolation_ck");
+            for (Map.Entry<String, String> values : refused.entrySet()) {
+                assertThat(sql.refused("UPDATE runner_host SET " + values.getKey() + " WHERE id = ?", host.id()))
+                    .as(values.getKey())
+                    .isEqualTo(values.getValue());
+            }
+            sql.accepted("""
+                    UPDATE runner_host SET isolation_tiers = ARRAY['MICROVM'], isolation_level = 'VM_JAIL',
+                           isolation_hardened = 'YES', isolation_stated = true WHERE id = ?""", host.id());
+        }
+    }
+
     @Test
     void aRunTheServerDoesNotKnowIsCancelled() {
         TestCompany company = companyWithRoles();

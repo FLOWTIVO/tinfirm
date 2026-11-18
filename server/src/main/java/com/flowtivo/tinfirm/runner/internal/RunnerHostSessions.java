@@ -17,9 +17,16 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
+import com.flowtivo.tinfirm.audit.AuditAction;
+import com.flowtivo.tinfirm.audit.AuditLog;
+import com.flowtivo.tinfirm.audit.AuditRecord;
 import com.flowtivo.tinfirm.runner.ConnectedHost;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
+import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
+import com.flowtivo.tinfirm.shared.security.Actor;
+import com.flowtivo.tinfirm.shared.tenant.TenantScope;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 
@@ -47,12 +54,18 @@ class RunnerHostSessions {
     /** Tinfirm's schedule of ready sandboxes, under {@code ee/} (ADR-0100): without it, a pool's count stays. */
     private final ObjectProvider<RunnerPools> pools;
 
+    private final AuditLog auditLog;
+
+    private final TenantScope tenantScope;
+
     RunnerHostSessions(RunnerHostStore store, SystemTransactions transactions, TimeSource time,
-            ObjectProvider<RunnerPools> pools) {
+            ObjectProvider<RunnerPools> pools, AuditLog auditLog, TenantScope tenantScope) {
         this.store = store;
         this.transactions = transactions;
         this.time = time;
         this.pools = pools;
+        this.auditLog = auditLog;
+        this.tenantScope = tenantScope;
     }
 
     /** The host of the token: a company host, placed, or a machine with its presences, unplaced. */
@@ -102,13 +115,33 @@ class RunnerHostSessions {
         return host.withPresences(presences);
     }
 
-    /** A problem with the hello that the schema cannot express, or null. */
+    /**
+     * A problem with the hello beyond its fields' constraints, or null: a credential label listed twice, and the
+     * schema's conditions on {@code isolation} (ADR-0113, decision 2): it is required with the feature
+     * {@code host.isolation} and not allowed without it, and {@code machine} or {@code vm-jail} come only with
+     * {@code isolationTiers} that are all {@code microvm}. Nothing else about a level is refused: {@code container}
+     * with a {@code microvm} tier (a Kata host), and any {@code hardened} with any level, are what a host may report.
+     */
     static @Nullable String helloProblem(RunnerMessages.Hello hello) {
         Set<String> labels = new HashSet<>();
         for (RunnerMessages.HelloCredential credential : hello.credentials()) {
             if (!labels.add(credential.label())) {
                 return "Duplicate credential label " + credential.label();
             }
+        }
+        boolean feature = hello.featureSet().contains(RunnerMessages.FEATURE_HOST_ISOLATION);
+        RunnerMessages.HelloIsolation isolation = hello.isolation();
+        if (feature && isolation == null) {
+            return "hello.features lists " + RunnerMessages.FEATURE_HOST_ISOLATION + " without hello.isolation";
+        }
+        if (!feature && isolation != null) {
+            return "hello.isolation is present without " + RunnerMessages.FEATURE_HOST_ISOLATION
+                    + " in hello.features";
+        }
+        if (isolation != null && isolation.level() != IsolationLevel.CONTAINER
+                && !hello.tiers().equals(EnumSet.of(IsolationTier.MICROVM))) {
+            return "hello.isolation.level " + isolation.level().wire()
+                    + " needs hello.isolationTiers to be all microvm, not " + hello.isolationTiers();
         }
         return null;
     }
@@ -151,7 +184,11 @@ class RunnerHostSessions {
     }
 
     /**
-     * Records the host facts, its ceiling, the runtimes it can run and its version, and a machine's credentials.
+     * Records the host facts, its ceiling, the runtimes it can run, its version and what it reports about its isolation
+     * (ADR-0113: its tiers, and with {@code host.isolation} its level; a hello without the feature clears the level),
+     * and a machine's credentials. A change of the level, the hardening or the operator's statement is audited
+     * {@code runner_host.isolation_changed} by SYSTEM, once per change and not at every hello, in the chain of each
+     * company the host is in: a host's own report changes where its runs may go (decision 4), with no admin's act.
      *
      * @return the host's {@code host.config} as of this transaction; empty when the host has been deleted since
      *         its token was checked
@@ -162,11 +199,13 @@ class RunnerHostSessions {
             Set<RuntimeKind> served = EnumSet.noneOf(RuntimeKind.class);
             hello.runtimes().forEach(runtime -> served.add(runtime.runtime()));
             // A personal host keeps no ready sandboxes for the company (ADR-0099): its pool is not stored.
+            RunnerHostStore.Isolation isolation = isolation(hello);
             RunnerHostStore.HelloFacts facts = new RunnerHostStore.HelloFacts(hello.runnerVersion(),
                     hello.hostname(), hello.os(), hello.arch(), hello.maxConcurrentRuns(), served,
-                    host.personal() ? null : hello.poolCeiling());
+                    host.personal() ? null : hello.poolCeiling(), isolation);
             RunnerHostStore.Target target = target(host);
-            if (!store.recordHello(target, facts, now)) {
+            Optional<RunnerHostStore.Isolation> before = store.lockIsolation(target);
+            if (before.isEmpty() || !store.recordHello(target, facts, now)) {
                 return Optional.empty();
             }
             if (!host.personal()) {
@@ -181,7 +220,53 @@ class RunnerHostSessions {
                 refused = !hello.credentials().isEmpty();
             }
             boolean credentialsRefused = refused;
-            return store.desiredConfig(target).map(config -> new HelloOutcome(hostConfig(config), credentialsRefused));
+            Optional<HelloOutcome> outcome = store.desiredConfig(target)
+                .map(config -> new HelloOutcome(hostConfig(config), credentialsRefused));
+            if (isolation.levelDiffers(before.get())) {
+                auditIsolationChanged(host, before.get(), isolation);
+            }
+            return outcome;
+        });
+    }
+
+    /** What the hello reports about the host's isolation: its tiers, and its level only with the feature. */
+    static RunnerHostStore.Isolation isolation(RunnerMessages.Hello hello) {
+        RunnerMessages.HelloIsolation reported = hello.reportedIsolation();
+        return reported == null ? new RunnerHostStore.Isolation(hello.tiers(), null, null, false)
+                : new RunnerHostStore.Isolation(hello.tiers(), reported.level(), reported.hardened(),
+                        reported.statedByOperator());
+    }
+
+    /**
+     * {@code runner_host.isolation_changed} in each company the host is in: a company host's own, or each presence of
+     * a machine, in that company's tenant context, as the machine's other events are (ADR-0092). Last in the hello's
+     * transaction, after every write of the machine's own rows.
+     */
+    private void auditIsolationChanged(ConnectedHost host, RunnerHostStore.Isolation before,
+            RunnerHostStore.Isolation after) {
+        Map<UUID, UUID> presences = new LinkedHashMap<>();
+        if (host.personal()) {
+            store.presences(Objects.requireNonNull(host.personalHostId()))
+                .forEach(presence -> presences.put(presence.companyId(), presence.runnerHostId()));
+        }
+        else {
+            presences.put(host.company(), host.runnerHostId());
+        }
+        Map<String, @Nullable Object> details = new LinkedHashMap<>();
+        details.put("oldLevel", before.level() != null ? before.level().wire() : null);
+        details.put("newLevel", after.level() != null ? after.level().wire() : null);
+        details.put("oldHardened", before.hardened() != null ? before.hardened().wire() : null);
+        details.put("newHardened", after.hardened() != null ? after.hardened().wire() : null);
+        details.put("oldStated", before.stated());
+        details.put("newStated", after.stated());
+        presences.forEach((companyId, hostId) -> {
+            if (host.personal()) {
+                tenantScope.enterCompany(companyId);
+            }
+            auditLog.record(AuditRecord.company(companyId, AuditAction.RUNNER_HOST_ISOLATION_CHANGED, Actor.SYSTEM)
+                .target(RunnerHostService.TARGET, hostId)
+                .details(details)
+                .build());
         });
     }
 

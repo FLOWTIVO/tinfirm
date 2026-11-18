@@ -130,6 +130,12 @@ public enum AuditAction {
     RUNNER_HOST_REMOVED("runner_host.removed"),
     RUNNER_HOST_UPDATED("runner_host.updated"),
     /**
+     * What a runner host reports about its isolation changed at its {@code hello} (ADR-0113): {@code oldLevel},
+     * {@code newLevel}, {@code oldHardened}, {@code newHardened}, {@code oldStated}, {@code newStated} (a level and a
+     * hardening in their protocol names, null for none). By SYSTEM, in the chain of each company the host is in.
+     */
+    RUNNER_HOST_ISOLATION_CHANGED("runner_host.isolation_changed"),
+    /**
      * A turn's run was created QUEUED (the package 3 contract, §8): {@code conversationId}, {@code agentId},
      * {@code turn}, {@code turnReason}, {@code payerPrincipalId}, {@code modelAccess} ({@code BUDGET} or
      * {@code SUBSCRIPTION}).
