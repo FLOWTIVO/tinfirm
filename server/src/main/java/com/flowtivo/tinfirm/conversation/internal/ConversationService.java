@@ -527,8 +527,9 @@ class ConversationService {
                 }
             }
         }
-        // ADR-0113, decision 4: a level chosen for the agent that none of these hosts reports never runs until one
-        // does; an automatic agent goes to the strongest they report.
+        // ADR-0113, decision 4: a level chosen for the agent that none of these hosts takes (a company host of it, or
+        // the person's own host of it or a stronger one) never runs until one does; an automatic agent goes to the
+        // strongest the company's hosts among them report, and never waits for a personal host.
         if (Isolation.target(counting, effective.agent().agent().isolationLevel())
                 instanceof Isolation.NoHostOfLevel none) {
             throw noHost("NO_HOST_OF_LEVEL", "This agent's runs go to runner hosts that report "

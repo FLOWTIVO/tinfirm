@@ -447,7 +447,8 @@ class RunnerProtocolSchemaTest {
         RunnerMessages.Hello hello = (RunnerMessages.Hello) codec
             .decode(Files.readString(V2_SAMPLES.resolve("hello.json")), RunnerMessageCodec.ANY_VERSION);
         assertThat(hello.protocolVersion()).isEqualTo(2);
-        assertThat(hello.isolationTiers()).containsExactly("microvm");
+        assertThat(hello.isolationTiers()).isNotEmpty();
+        assertThat(hello.carriesMicrovm()).as("a host of this release never sends microvm").isFalse();
         RunnerMessages.RunRequest tool = (RunnerMessages.RunRequest) codec
             .decode(Files.readString(V2_SAMPLES.resolve("run.request-tool.json")), 2);
         assertThat(tool.kind()).isEqualTo("TOOL");
@@ -473,81 +474,114 @@ class RunnerProtocolSchemaTest {
         assertThat(failed.resumeOutcome()).isEqualTo(RunnerMessages.ResumeOutcome.NO_SESSION);
     }
 
-    /** A v2 hello of a Kata-like host with these tiers, features and {@code isolation} (raw JSON, or nothing). */
-    private static String isolationHello(String tiers, String features, String isolation) {
+    /** A hello of this version with these tiers and these extra fields (raw JSON after a comma, or nothing). */
+    private static String isolationHello(int version, String tiers, String extra) {
         return """
-                {"type":"hello","protocolVersion":2,"runnerVersion":"1.0.0","executors":["docker"],
-                 "isolationTiers":%s,"maxConcurrentRuns":2,"runtimes":[],"credentials":[],
-                 "features":%s%s}""".formatted(tiers, features, isolation.isEmpty() ? "" : ",\"isolation\":" + isolation);
+                {"type":"hello","protocolVersion":%d,"runnerVersion":"1.0.0","executors":["docker"],
+                 "isolationTiers":%s,"maxConcurrentRuns":2,"runtimes":[],"credentials":[]%s}"""
+            .formatted(version, tiers, extra.isEmpty() ? "" : "," + extra);
+    }
+
+    /** What the server stores of a hello of protocol 2 with these tiers and extra fields. */
+    private RunnerHostStore.Isolation stored(String tiers, String extra) {
+        return RunnerHostSessions.isolation((RunnerMessages.Hello) codec.decode(isolationHello(2, tiers, extra), 2));
     }
 
     /**
-     * ADR-0113, decision 2: {@code hello.isolation} comes exactly with the feature {@code host.isolation}, and
-     * {@code machine} or {@code vm-jail} only with tiers that are all {@code microvm}. The schema says both, and the
-     * server refuses a hello where they disagree ({@code helloProblem}, a {@code BAD_MESSAGE}); nothing else.
+     * ADR-0113, decision 1 as the owner settled it on 2026-11-14: {@code hello.isolationTiers} carries the level,
+     * {@code hello.hardened} the hardening (absent {@code no}) and {@code hello.isolationStated} the operator's
+     * statement (absent false). The server stores them as reported and refuses none for its content.
      */
     @Test
-    void theIsolationComesWithItsFeatureAndALevelAboveContainerWithMicrovmTiers() {
-        String machine = isolationHello("[\"microvm\"]", "[\"run.steer\",\"host.isolation\"]",
-                "{\"level\":\"machine\",\"hardened\":\"none\"}");
-        assertThat(ProtocolSchema.violations(2, machine)).isEmpty();
-        RunnerMessages.Hello hello = (RunnerMessages.Hello) codec.decode(machine, 2);
-        assertThat(RunnerHostSessions.helloProblem(hello)).isNull();
-        assertThat(hello.reportedIsolation()).isEqualTo(new RunnerMessages.HelloIsolation(IsolationLevel.MACHINE,
-                Hardening.NONE, null));
-        RunnerHostStore.Isolation stored = RunnerHostSessions.isolation(hello);
-        assertThat(stored.tiers()).containsExactly(IsolationTier.MICROVM);
-        assertThat(stored.stated()).isFalse();
-
-        // Allowed: a stated vm-jail; container with a microvm tier (a Kata host derives container from Docker); any
-        // hardening with any level; unknown fields of the object.
+    void theLevelIsTheTierWithTheHardeningAndTheStatementBesideIt() {
         for (String allowed : List.of(
-                isolationHello("[\"microvm\"]", "[\"host.isolation\"]",
-                        "{\"level\":\"vm-jail\",\"hardened\":\"no\",\"stated\":true}"),
-                isolationHello("[\"microvm\"]", "[\"host.isolation\"]",
-                        "{\"level\":\"container\",\"hardened\":\"none\"}"),
-                isolationHello("[\"gvisor\"]", "[\"host.isolation\"]",
-                        "{\"level\":\"container\",\"hardened\":\"yes\",\"future\":1}"),
-                isolationHello("[\"container\"]", "[\"run.steer\"]", ""))) {
+                isolationHello(2, "[\"machine\"]", "\"hardened\":\"none\""),
+                isolationHello(2, "[\"vm-jail\"]", "\"hardened\":\"no\",\"isolationStated\":true"),
+                isolationHello(2, "[\"container\"]", ""),
+                isolationHello(2, "[\"gvisor\"]", "\"hardened\":\"yes\""))) {
             assertThat(ProtocolSchema.violations(2, allowed)).as(allowed).isEmpty();
-            assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(allowed, 2))).as(allowed)
-                .isNull();
+            RunnerMessages.Hello hello = (RunnerMessages.Hello) codec.decode(allowed, 2);
+            assertThat(hello.carriesMicrovm()).as(allowed).isFalse();
+            assertThat(RunnerHostSessions.helloProblem(hello)).as(allowed).isNull();
         }
-        RunnerMessages.Hello stated = (RunnerMessages.Hello) codec.decode(isolationHello("[\"microvm\"]",
-                "[\"host.isolation\"]", "{\"level\":\"vm-jail\",\"hardened\":\"no\",\"stated\":true}"), 2);
-        assertThat(RunnerHostSessions.isolation(stated).stated()).isTrue();
-        RunnerMessages.Hello none = (RunnerMessages.Hello) codec.decode(
-                isolationHello("[\"container\"]", "[\"run.steer\"]", ""), 2);
-        assertThat(RunnerHostSessions.isolation(none).level()).isNull();
+        assertThat(stored("[\"machine\"]", "\"hardened\":\"none\""))
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.MACHINE, false, Hardening.NONE, false));
+        assertThat(stored("[\"vm-jail\"]", "\"hardened\":\"no\",\"isolationStated\":true"))
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.VM_JAIL, false, Hardening.NO, true));
+        assertThat(stored("[\"container\"]", ""))
+            .as("absent hardening is no, absent statement false")
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, false, Hardening.NO, false));
+        assertThat(stored("[\"gvisor\"]", "\"hardened\":\"yes\""))
+            .as("gVisor is placed as container")
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, true, Hardening.YES, false));
+        assertThat(stored("[\"container\"]", "\"hardened\":null,\"isolationStated\":null"))
+            .as("an explicit null is read as absent")
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, false, Hardening.NO, false));
 
-        // Refused by the schema and by the server, each with a message that names the fields.
-        String featureAlone = isolationHello("[\"microvm\"]", "[\"host.isolation\"]", "");
-        String objectAlone = isolationHello("[\"microvm\"]", "[\"run.steer\"]",
-                "{\"level\":\"machine\",\"hardened\":\"none\"}");
-        String machineInAContainer = isolationHello("[\"container\"]", "[\"host.isolation\"]",
-                "{\"level\":\"machine\",\"hardened\":\"yes\"}");
-        String jailBesideAContainer = isolationHello("[\"microvm\",\"container\"]", "[\"host.isolation\"]",
-                "{\"level\":\"vm-jail\",\"hardened\":\"yes\"}");
-        for (String refused : List.of(featureAlone, objectAlone, machineInAContainer, jailBesideAContainer)) {
-            assertThat(ProtocolSchema.violations(2, refused)).as(refused).isNotEmpty();
+        // A host sends one value; one that sends several is placed by the weakest wall it reports.
+        assertThat(ProtocolSchema.violations(2, isolationHello(2, "[\"machine\",\"container\"]", ""))).isEmpty();
+        assertThat(stored("[\"machine\",\"container\"]", "").level()).isEqualTo(IsolationLevel.CONTAINER);
+        assertThat(stored("[\"machine\",\"vm-jail\"]", "").level()).isEqualTo(IsolationLevel.VM_JAIL);
+        assertThat(stored("[\"vm-jail\",\"gvisor\"]", ""))
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, true, Hardening.NO, false));
+        assertThat(stored("[\"gvisor\",\"container\"]", "").gvisor()).as("runc is the weaker wall").isFalse();
+
+        // The draft's feature host.isolation and object hello.isolation are an unknown feature and field: ignored.
+        RunnerMessages.Hello draft = (RunnerMessages.Hello) codec.decode(isolationHello(2, "[\"container\"]",
+                "\"features\":[\"host.isolation\"],\"isolation\":{\"level\":\"machine\",\"hardened\":\"none\"}"), 2);
+        assertThat(RunnerHostSessions.helloProblem(draft)).isNull();
+        assertThat(RunnerHostSessions.isolation(draft).level()).isEqualTo(IsolationLevel.CONTAINER);
+
+        // A level or a hardening the protocol does not name is a bad frame.
+        String cloud = isolationHello(2, "[\"cloud\"]", "");
+        assertThat(ProtocolSchema.violations(2, cloud)).isNotEmpty();
+        assertThat(code(cloud, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        String maybe = isolationHello(2, "[\"machine\"]", "\"hardened\":\"maybe\"");
+        assertThat(ProtocolSchema.violations(2, maybe)).isNotEmpty();
+        assertThat(code(maybe, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+    }
+
+    /**
+     * ADR-0113, decision 2: {@code microvm} is no value of protocol 2. The schema refuses it, and the server decodes
+     * it only to refuse the hello by name ({@code UPGRADE_REQUIRED}), with a message that names what to install.
+     */
+    @Test
+    void microvmIsNoTierOfProtocol2AndItsHostIsToldToUpgrade() {
+        for (String tiers : List.of("[\"microvm\"]", "[\"container\",\"microvm\"]")) {
+            String hello = isolationHello(2, tiers, "\"features\":[\"sandbox.bridge\"]");
+            assertThat(ProtocolSchema.violations(2, hello)).as(hello).isNotEmpty();
+            assertThat(((RunnerMessages.Hello) codec.decode(hello, 2)).carriesMicrovm()).as(hello).isTrue();
         }
-        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(featureAlone, 2)))
-            .contains("hello.features", "host.isolation", "hello.isolation");
-        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(objectAlone, 2)))
-            .contains("hello.isolation", "host.isolation", "hello.features");
-        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(machineInAContainer, 2)))
-            .contains("hello.isolation.level machine", "hello.isolationTiers", "microvm", "container");
-        assertThat(RunnerHostSessions.helloProblem((RunnerMessages.Hello) codec.decode(jailBesideAContainer, 2)))
-            .contains("hello.isolation.level vm-jail", "hello.isolationTiers");
+        assertThat(RunnerWebSocketHandler.microvmRefusal("0.42.0"))
+            .contains("microvm", "version 0.42.0", "Upgrade tinfirm-runner-host on this host to version 0.42.0",
+                    "container for Kata Containers", "machine or vm-jail for a VM per run");
+        assertThat(RunnerWebSocketHandler.microvmRefusal(null))
+            .contains("Upgrade tinfirm-runner-host on this host to this server's version");
+    }
 
-        // A level or a hardening the protocol does not name, and an object without one, are bad frames.
-        String unknown = isolationHello("[\"microvm\"]", "[\"host.isolation\"]",
-                "{\"level\":\"cloud\",\"hardened\":\"none\"}");
-        assertThat(ProtocolSchema.violations(2, unknown)).isNotEmpty();
-        assertThat(code(unknown, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
-        String noHardening = isolationHello("[\"microvm\"]", "[\"host.isolation\"]", "{\"level\":\"machine\"}");
-        assertThat(ProtocolSchema.violations(2, noHardening)).isNotEmpty();
-        assertThat(code(noHardening, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+    /**
+     * Protocol 1 does not change: its tiers ({@code container}, {@code gvisor}, {@code microvm}) are what its schema
+     * allows. They are read as the level {@code container} ({@code microvm}, which no host of protocol 1 sent, is the
+     * level of a Kata host), and protocol 2's fields and levels are not protocol 1's.
+     */
+    @Test
+    void protocol1KeepsItsTiersAndReportsContainer() {
+        for (String tiers : List.of("[\"container\"]", "[\"gvisor\"]", "[\"microvm\"]")) {
+            String hello = isolationHello(1, tiers, "\"hardened\":\"yes\",\"isolationStated\":true");
+            RunnerMessages.Hello decoded = (RunnerMessages.Hello) codec.decode(hello, RunnerMessageCodec.ANY_VERSION);
+            assertThat(decoded.carriesMicrovm()).as(hello).isFalse();
+            RunnerHostStore.Isolation isolation = RunnerHostSessions.isolation(decoded);
+            assertThat(isolation.level()).as(hello).isEqualTo(IsolationLevel.CONTAINER);
+            assertThat(isolation.hardened()).as(hello).isEqualTo(Hardening.NO);
+            assertThat(isolation.stated()).as(hello).isFalse();
+        }
+        assertThat(ProtocolSchema.violations(isolationHello(1, "[\"microvm\"]", ""))).isEmpty();
+        for (String tiers : List.of("[\"machine\"]", "[\"vm-jail\",\"container\"]")) {
+            String hello = isolationHello(1, tiers, "");
+            assertThat(ProtocolSchema.violations(hello)).as(hello).isNotEmpty();
+            assertThat(code(hello)).as(hello).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        }
+        assertThat(IsolationTier.ofWire("vm-jail")).isEqualTo(IsolationTier.VM_JAIL);
     }
 
     @Test
@@ -776,7 +810,7 @@ class RunnerProtocolSchemaTest {
         assertThat(hello.featureSet()).containsExactly(RunnerMessages.FEATURE_RUN_STEER);
         String plain = """
                 {"type":"hello","protocolVersion":2,"runnerVersion":"1","executors":["docker"],
-                 "isolationTiers":["microvm"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]%s}""";
+                 "isolationTiers":["container"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]%s}""";
         assertThat(((RunnerMessages.Hello) codec.decode(plain.formatted(""))).featureSet()).isEmpty();
         assertThat(((RunnerMessages.Hello) codec.decode(plain.formatted(",\"features\":[\"run.steer\",\"later.x\"]")))
             .featureSet()).containsExactlyInAnyOrder("run.steer", "later.x");
@@ -798,14 +832,14 @@ class RunnerProtocolSchemaTest {
 
         String hello = """
                 {"type":"hello","protocolVersion":2,"runnerVersion":"1","executors":["docker"],
-                 "isolationTiers":["microvm"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[],
+                 "isolationTiers":["container"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[],
                  "publicSuffixList":{"sha256":"%s"}}""".formatted(sha);
         assertThat(ProtocolSchema.violations(2, hello)).isEmpty();
         RunnerMessages.Hello decoded = (RunnerMessages.Hello) codec.decode(hello);
         assertThat(decoded.publicSuffixList().sha256()).isEqualTo(sha);
         assertThat(((RunnerMessages.Hello) codec.decode("""
                 {"type":"hello","protocolVersion":2,"runnerVersion":"1","executors":["docker"],
-                 "isolationTiers":["microvm"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]}""")).publicSuffixList())
+                 "isolationTiers":["container"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]}""")).publicSuffixList())
             .isNull();
         assertThat(code(hello.replace(sha, "XYZ"))).isEqualTo(RunnerMessages.BAD_MESSAGE);
     }

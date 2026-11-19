@@ -35,6 +35,12 @@ class IsolationPlacementTest {
                 null, false, null, "1.0.0", Instant.now(), level, hardened, false);
     }
 
+    /** The payer's personal host at this level. */
+    private static RunnerHostInfo personal(String name, IsolationLevel level) {
+        return new RunnerHostInfo(UUID.randomUUID(), UUID.randomUUID(), name, HostScope.PERSONAL, UUID.randomUUID(),
+                UUID.randomUUID(), 2, 2, null, false, null, "1.0.0", Instant.now(), level, Hardening.NO, false);
+    }
+
     private static IsolationPlacement.Plan plan(List<RunnerHostInfo> counting, @Nullable IsolationLevel chosen,
             IsolationPlacement.@Nullable Session session) {
         return (IsolationPlacement.Plan) IsolationPlacement.plan(counting, chosen, session);
@@ -178,5 +184,84 @@ class IsolationPlacementTest {
         IsolationPlacement.Plan chosen = plan(List.of(VM, VM_2, DOCKER), IsolationLevel.MACHINE, session);
         assertThat(IsolationPlacement.stillPlaced(chosen, List.of(VM, dropped), session)).containsExactly(VM);
         assertThat(IsolationPlacement.stillPlaced(chosen, List.of(dropped), session)).isEmpty();
+    }
+
+    // ---- the owner's rule of 2026-11-19: the company's hosts set the level, a personal host follows ------------------
+
+    @Test
+    void aStrongerPersonalHostTakesTheCompanysLevelBesideItsHostsAndNoRunWaitsForIt() {
+        RunnerHostInfo laptop = personal("laptop", IsolationLevel.VM_JAIL);
+        IsolationPlacement.Plan plan = plan(List.of(DOCKER, laptop), null, null);
+        assertThat(plan.level()).isEqualTo(IsolationLevel.CONTAINER);
+        assertThat(plan.candidates()).containsExactly(DOCKER, laptop);
+        assertThat(plan.weakerLeftOut()).isFalse();
+        assertThat(IsolationPlacement.note(plan, laptop, null, false)).isNull();
+    }
+
+    @Test
+    void aWeakerPersonalHostDoesNotTakeTheCompanysLevel() {
+        RunnerHostInfo laptop = personal("laptop", IsolationLevel.CONTAINER);
+        IsolationPlacement.Plan plan = plan(List.of(VM, laptop), null, null);
+        assertThat(plan.level()).isEqualTo(IsolationLevel.MACHINE);
+        assertThat(plan.candidates()).containsExactly(VM);
+        assertThat(plan.weakerLeftOut()).isTrue();
+    }
+
+    @Test
+    void aPersonalHostOfTheLevelTakesItToo() {
+        RunnerHostInfo laptop = personal("laptop", IsolationLevel.MACHINE);
+        assertThat(plan(List.of(VM, DOCKER, laptop), null, null).candidates()).containsExactly(VM, laptop);
+    }
+
+    @Test
+    void withoutACompanyHostThePersonalHostsSetTheLevel() {
+        RunnerHostInfo strong = personal("strong", IsolationLevel.VM_JAIL);
+        RunnerHostInfo weak = personal("weak", IsolationLevel.CONTAINER);
+        IsolationPlacement.Plan plan = plan(List.of(weak, strong), null, null);
+        assertThat(plan.level()).isEqualTo(IsolationLevel.VM_JAIL);
+        assertThat(plan.candidates()).containsExactly(strong);
+    }
+
+    @Test
+    void aChosenLevelTakesTheCompanyHostsOfItAndThePersonalHostsOfItOrStronger() {
+        RunnerHostInfo strong = personal("strong", IsolationLevel.MACHINE);
+        RunnerHostInfo weak = personal("weak", IsolationLevel.CONTAINER);
+        IsolationPlacement.Plan plan = plan(List.of(VM, JAIL, DOCKER, strong, weak), IsolationLevel.VM_JAIL, null);
+        assertThat(plan.candidates()).containsExactly(JAIL, strong);
+        assertThat(plan.chosen()).isTrue();
+        // Only a personal host of it or stronger: still a level that runs.
+        assertThat(plan(List.of(DOCKER, strong), IsolationLevel.VM_JAIL, null).candidates()).containsExactly(strong);
+        IsolationPlacement.Outcome none = IsolationPlacement.plan(List.of(DOCKER, weak), IsolationLevel.VM_JAIL,
+                null);
+        assertThat(none).isInstanceOf(IsolationPlacement.Waits.class);
+        assertThat(((IsolationPlacement.Waits) none).reason().code()).isEqualTo(QueueReasonCode.NO_HOST_OF_LEVEL);
+    }
+
+    @Test
+    void anAutomaticConversationStaysOnAWeakerPersonalHostThatHoldsItsSession() {
+        RunnerHostInfo laptop = personal("laptop", IsolationLevel.CONTAINER);
+        IsolationPlacement.Session session = new IsolationPlacement.Session(laptop, false);
+        IsolationPlacement.Plan plan = plan(List.of(VM, laptop), null, session);
+        assertThat(plan.candidates()).containsExactly(VM, laptop);
+        assertThat(plan.preferred()).isEqualTo(laptop.id());
+        assertThat(IsolationPlacement.note(plan, laptop, session, false))
+            .isEqualTo(PlacementNote.STAYED_ON_WEAKER_HOST);
+        assertThat(IsolationPlacement.note(plan, VM, session, false))
+            .isEqualTo(PlacementNote.FRESH_SESSION_STRONGER_LEVEL);
+    }
+
+    @Test
+    void aSessionOnAStrongerPersonalHostIsPreferredAndAMoveToTheCompanysLevelSaysNothing() {
+        RunnerHostInfo laptop = personal("laptop", IsolationLevel.VM_JAIL);
+        IsolationPlacement.Session session = new IsolationPlacement.Session(laptop, false);
+        IsolationPlacement.Plan plan = plan(List.of(DOCKER, laptop), null, session);
+        assertThat(plan.preferred()).isEqualTo(laptop.id());
+        assertThat(plan.preferRestorers()).isFalse();
+        assertThat(IsolationPlacement.note(plan, laptop, session, false)).isNull();
+        // The laptop is busy or offline: a company host of the level takes the turn, as between two hosts of a level.
+        assertThat(IsolationPlacement.note(plan, DOCKER, session, false)).isNull();
+        // The lock keeps it while it still takes the level.
+        assertThat(IsolationPlacement.stillPlaced(plan, List.of(DOCKER, laptop), session))
+            .containsExactly(DOCKER, laptop);
     }
 }

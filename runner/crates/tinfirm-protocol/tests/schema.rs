@@ -290,7 +290,8 @@ fn constructed_messages() -> Vec<Message> {
             public_suffix_list: None,
             features: vec![],
             pool: None,
-            isolation: None,
+            hardened: None,
+            isolation_stated: false,
         }),
         Message::Welcome(Welcome {
             protocol_version: None,
@@ -1505,7 +1506,7 @@ fn constructed_messages_v2() -> Vec<Message> {
             os: None,
             arch: None,
             executors: vec![Executor::Docker],
-            isolation_tiers: vec![IsolationTier::Microvm],
+            isolation_tiers: vec![IsolationTier::Container],
             max_concurrent_runs: 4,
             credentials: vec![],
             runtimes: vec![],
@@ -1515,7 +1516,8 @@ fn constructed_messages_v2() -> Vec<Message> {
             }),
             features: vec![feature::RUN_STEER.into(), feature::RUN_SKILLS.into()],
             pool: None,
-            isolation: None,
+            hardened: None,
+            isolation_stated: false,
         }),
         // A host that keeps ready sandboxes (ADR-0098, ADR-0099), above the 16 of a host with
         // Docker (D12).
@@ -1526,7 +1528,7 @@ fn constructed_messages_v2() -> Vec<Message> {
             os: None,
             arch: None,
             executors: vec![Executor::Docker],
-            isolation_tiers: vec![IsolationTier::Microvm],
+            isolation_tiers: vec![IsolationTier::Machine],
             max_concurrent_runs: MAX_HOST_CAPACITY,
             credentials: vec![],
             runtimes: vec![],
@@ -1534,10 +1536,11 @@ fn constructed_messages_v2() -> Vec<Message> {
             public_suffix_list: None,
             features: vec![feature::SANDBOX_POOL.into()],
             pool: Some(HelloPool { max_ready: 4 }),
-            isolation: None,
+            hardened: Some(Hardened::None),
+            isolation_stated: false,
         }),
-        // A host that reports its level of isolation (ADR-0113): a VM per run at a provider,
-        // and a level that the operator stated.
+        // Each level of isolation (ADR-0113): a node host's `vm-jail`, gVisor, and a level
+        // that the operator stated.
         Message::Hello(Hello {
             protocol_version: PROTOCOL_VERSION_V2,
             runner_version: "1.0.0".into(),
@@ -1545,19 +1548,16 @@ fn constructed_messages_v2() -> Vec<Message> {
             os: None,
             arch: None,
             executors: vec![Executor::Docker],
-            isolation_tiers: vec![IsolationTier::Microvm],
+            isolation_tiers: vec![IsolationTier::VmJail],
             max_concurrent_runs: 4,
             credentials: vec![],
             runtimes: vec![],
             active_runs: None,
             public_suffix_list: None,
-            features: vec![feature::HOST_ISOLATION.into()],
+            features: vec![],
             pool: None,
-            isolation: Some(HostIsolation {
-                level: IsolationLevel::Machine,
-                hardened: Hardened::None,
-                stated: false,
-            }),
+            hardened: None,
+            isolation_stated: false,
         }),
         Message::Hello(Hello {
             protocol_version: PROTOCOL_VERSION_V2,
@@ -1572,13 +1572,10 @@ fn constructed_messages_v2() -> Vec<Message> {
             runtimes: vec![],
             active_runs: None,
             public_suffix_list: None,
-            features: vec![feature::HOST_ISOLATION.into()],
+            features: vec![],
             pool: None,
-            isolation: Some(HostIsolation {
-                level: IsolationLevel::Container,
-                hardened: Hardened::No,
-                stated: false,
-            }),
+            hardened: None,
+            isolation_stated: false,
         }),
         Message::Hello(Hello {
             protocol_version: PROTOCOL_VERSION_V2,
@@ -1587,19 +1584,16 @@ fn constructed_messages_v2() -> Vec<Message> {
             os: None,
             arch: None,
             executors: vec![Executor::Docker],
-            isolation_tiers: vec![IsolationTier::Microvm],
+            isolation_tiers: vec![IsolationTier::VmJail],
             max_concurrent_runs: 4,
             credentials: vec![],
             runtimes: vec![],
             active_runs: None,
             public_suffix_list: None,
-            features: vec![feature::HOST_ISOLATION.into()],
+            features: vec![],
             pool: None,
-            isolation: Some(HostIsolation {
-                level: IsolationLevel::VmJail,
-                hardened: Hardened::Yes,
-                stated: true,
-            }),
+            hardened: Some(Hardened::Yes),
+            isolation_stated: true,
         }),
         Message::HostConfig(HostConfig {
             version: 9,
@@ -1903,10 +1897,13 @@ fn the_versions_refuse_each_others_frames() {
     assert_eq!(assign.platform_tools, None);
     let out = serde_json::to_value(Message::RunAssign(assign)).unwrap();
     assert!(out.get("platformTools").is_none());
-    // `microvm` is a v2 tier, and an additive change of the v1 schema.
+    // The v1 schema still has `microvm` (an additive change of protocol v2's first release),
+    // which no host of this release sends, and this crate no longer reads (ADR-0113, decision
+    // 2): a v1 host reports `container`.
     let mut hello = sample("hello.json");
     hello["isolationTiers"] = json!(["microvm"]);
-    assert_valid(&v1, &hello, "microvm in v1");
+    assert_valid(&v1, &hello, "microvm in the v1 schema");
+    assert!(Message::from_value(hello.clone()).is_err());
     hello["isolationTiers"] = json!(["vm"]);
     assert!(!v1.is_valid(&hello));
     assert!(Message::from_value(hello).is_err());
@@ -2645,69 +2642,64 @@ fn skill_name_helper_matches_the_schema() {
 }
 
 #[test]
-fn hello_isolation_comes_with_its_feature_and_a_vm_tier() {
+fn hello_reports_its_level_of_isolation_in_its_tiers() {
     let v2 = validator_v2();
     let hello = sample_v2("hello-isolation.json");
-    assert_valid(&v2, &hello, "hello with host.isolation");
+    assert_valid(&v2, &hello, "hello with machine and hardened none");
     let Message::Hello(parsed) = Message::from_value(hello.clone()).unwrap() else {
         panic!("not hello");
     };
-    assert_eq!(
-        parsed.isolation,
-        Some(HostIsolation {
-            level: IsolationLevel::Machine,
-            hardened: Hardened::None,
-            stated: false,
-        })
-    );
-    // `stated` is left out when false, and written when true.
+    assert_eq!(parsed.isolation_tiers, vec![IsolationTier::Machine]);
+    assert_eq!(parsed.hardened, Some(Hardened::None));
+    assert!(!parsed.isolation_stated);
+    // `isolationStated` is left out when false, and written when true; `hardened` is left
+    // out when absent.
     let out = serde_json::to_value(Message::Hello(parsed.clone())).unwrap();
-    assert_eq!(
-        out["isolation"],
-        json!({"level": "machine", "hardened": "none"})
-    );
+    assert_eq!(out["isolationTiers"], json!(["machine"]));
+    assert_eq!(out["hardened"], json!("none"));
+    assert!(out.get("isolationStated").is_none(), "{out}");
     let mut stated = parsed.clone();
-    stated.isolation = Some(HostIsolation {
-        level: IsolationLevel::VmJail,
-        hardened: Hardened::No,
-        stated: true,
-    });
+    stated.isolation_tiers = vec![IsolationTier::VmJail];
+    stated.hardened = Some(Hardened::No);
+    stated.isolation_stated = true;
     let out = serde_json::to_value(Message::Hello(stated)).unwrap();
-    assert_eq!(
-        out["isolation"],
-        json!({"level": "vm-jail", "hardened": "no", "stated": true})
-    );
+    assert_eq!(out["isolationTiers"], json!(["vm-jail"]));
+    assert_eq!(out["hardened"], json!("no"));
+    assert_eq!(out["isolationStated"], json!(true));
     assert_valid(&v2, &out, "a stated level");
+    let mut container = parsed;
+    container.isolation_tiers = vec![IsolationTier::Container];
+    container.hardened = None;
+    let out = serde_json::to_value(Message::Hello(container)).unwrap();
+    assert!(out.get("hardened").is_none(), "{out}");
+    assert_valid(&v2, &out, "container, hardened left out");
 
-    // The feature without the object, and the object without the feature.
-    let mut no_object = hello.clone();
-    no_object.as_object_mut().unwrap().remove("isolation");
-    assert!(
-        !v2.is_valid(&no_object),
-        "host.isolation without hello.isolation"
-    );
-    let mut no_feature = hello.clone();
-    no_feature["features"] = json!(["run.steer"]);
-    assert!(
-        !v2.is_valid(&no_feature),
-        "hello.isolation without host.isolation"
-    );
-    // `machine` and `vm-jail` only with VM tiers; `container` with any.
-    for level in ["machine", "vm-jail"] {
-        let mut container = hello.clone();
-        container["isolation"]["level"] = json!(level);
-        container["isolationTiers"] = json!(["container"]);
-        assert!(!v2.is_valid(&container), "{level} with a container tier");
+    // Every level, `gvisor` included, and each hardening.
+    for tier in ["machine", "vm-jail", "container", "gvisor"] {
+        for hardened in ["yes", "no", "none"] {
+            let mut frame = hello.clone();
+            frame["isolationTiers"] = json!([tier]);
+            frame["hardened"] = json!(hardened);
+            assert_valid(&v2, &frame, &format!("{tier}, hardened {hardened}"));
+            assert!(Message::from_value(frame).is_ok(), "{tier} {hardened}");
+        }
     }
-    let mut gvisor = hello.clone();
-    gvisor["isolation"] = json!({"level": "container", "hardened": "no"});
-    gvisor["isolationTiers"] = json!(["gvisor"]);
-    assert_valid(&v2, &gvisor, "container with a gvisor tier");
-    // Only the schema's values.
-    for (key, bad) in [("level", "vm"), ("hardened", "maybe")] {
+    // `microvm` is no value any more (ADR-0113, decision 2).
+    let mut microvm = hello.clone();
+    microvm["isolationTiers"] = json!(["microvm"]);
+    microvm.as_object_mut().unwrap().remove("hardened");
+    assert!(!v2.is_valid(&microvm), "microvm");
+    assert!(Message::from_value(microvm).is_err(), "microvm");
+    // Only the schema's values of `hardened` and `isolationStated`.
+    for bad in [json!("maybe"), json!("No"), json!(true), json!(null)] {
         let mut frame = hello.clone();
-        frame["isolation"][key] = json!(bad);
-        assert!(!v2.is_valid(&frame), "{key} {bad}");
-        assert!(Message::from_value(frame).is_err(), "{key} {bad}");
+        frame["hardened"] = bad.clone();
+        assert!(!v2.is_valid(&frame), "hardened {bad}");
     }
+    let mut frame = hello.clone();
+    frame["hardened"] = json!("maybe");
+    assert!(Message::from_value(frame).is_err(), "hardened maybe");
+    let mut frame = hello.clone();
+    frame["isolationStated"] = json!("yes");
+    assert!(!v2.is_valid(&frame), "isolationStated yes");
 }

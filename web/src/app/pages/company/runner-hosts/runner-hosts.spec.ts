@@ -233,17 +233,22 @@ describe('RunnerHosts', () => {
   it('shows what each host reports about its isolation, as reported (ADR-0113)', async () => {
     await open([
       aPoolRunnerHost({
-        isolation: { tiers: ['MICROVM'], level: 'MACHINE', hardened: 'NONE', stated: false },
+        isolation: { level: 'MACHINE', gvisor: false, hardened: 'NONE', stated: false },
       }),
       aRunnerHost({
         id: 'h-jail',
         name: 'single',
-        isolation: { tiers: ['MICROVM'], level: 'VM_JAIL', hardened: 'YES', stated: true },
+        isolation: { level: 'VM_JAIL', gvisor: false, hardened: 'YES', stated: true },
       }),
       aRunnerHost({
         id: 'h-kata',
         name: 'kata-01',
-        isolation: { tiers: ['MICROVM'], stated: false },
+        isolation: { level: 'CONTAINER', gvisor: false, hardened: 'NO', stated: false },
+      }),
+      aRunnerHost({
+        id: 'h-gvisor',
+        name: 'sandboxed',
+        isolation: { level: 'CONTAINER', gvisor: true, hardened: 'NO', stated: false },
       }),
       aRunnerHost({ id: 'h-new', name: 'never-seen', isolation: null }),
     ]);
@@ -253,21 +258,22 @@ describe('RunnerHosts', () => {
       'provider’s hypervisor is the boundary',
     );
     expect(words(q('isolation-reaches', machine))).toContain('credentials are on another machine');
-    expect(words(q('isolation-tiers', machine))).toBe('Tier microvm');
 
     const jail = q('host-isolation', host('single'))!;
     expect(words(q('isolation-reports', jail))).toBe('Reports vm-jail, stated by the operator');
     expect(words(q('isolation-hardening', jail))).toMatch(/^Hardened/);
 
-    // A host without the feature: its tier and no level, placed as a container host.
+    // A Kata host reports container, as a host with Docker does.
     const kata = q('host-isolation', host('kata-01'))!;
-    expect(words(q('isolation-reports', kata))).toBe(
-      'Reports no level: its runs are placed as on a container host.',
-    );
-    expect(words(q('isolation-tiers', kata))).toBe('Tier microvm');
-    expect(q('isolation-hardening', kata)).toBeNull();
+    expect(words(q('isolation-reports', kata))).toBe('Reports container');
+    expect(words(q('isolation-hardening', kata))).toMatch(/^Not hardened/);
+    expect(words(q('isolation-reaches', kata))).toContain('behind the kernel alone');
 
-    // Before its first report, nothing.
+    const gvisor = q('host-isolation', host('sandboxed'))!;
+    expect(words(q('isolation-reports', gvisor))).toBe('Reports container with gVisor');
+    expect(words(q('isolation-reaches', gvisor))).toContain('behind gVisor and the kernel');
+
+    // Before its first hello to a server of this release, nothing.
     expect(q('host-isolation', host('never-seen'))).toBeNull();
   });
 

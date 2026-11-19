@@ -9504,16 +9504,19 @@ components:
     AgentIsolationSetting:
       type: string
       description: |
-        Where an agent's runs go (ADR-0113, decision 4). AUTOMATIC: the strongest level of isolation among the runner
-        hosts that may run each turn, never a weaker one by itself. MACHINE, VM_JAIL, CONTAINER: only hosts that report
-        that level (`RunnerHostIsolation.level`; a host that reports none counts as CONTAINER)
+        Where an agent's runs go (ADR-0113, decision 4). AUTOMATIC: the strongest level of isolation among the
+        company's runner hosts that may run each turn (among the member's own hosts only where no company host may,
+        as for a subscription's turn), never a weaker one by itself; the member's own host takes the turn too when it
+        reports that level or a stronger one. MACHINE, VM_JAIL, CONTAINER: the company's hosts that report that level
+        (`RunnerHostIsolation.level`; a host that has not reported one yet counts as CONTAINER), and the member's own
+        hosts that report it or a stronger one
       enum: [AUTOMATIC, MACHINE, VM_JAIL, CONTAINER]
     AgentIsolation:
       type: object
       description: |
         The agent's isolation (ADR-0113, decision 4) over the company's runner hosts that serve one of its runtimes,
-        whose levels are what those hosts report, never checked. A member's personal hosts are not counted here, though
-        they count for their owner's own runs
+        whose levels are what those hosts report, never checked. A member's personal hosts are not counted here: the
+        company's hosts set the level, and a member's own host takes their runs only at that level or a stronger one
       required: [setting, offered, chosenUnavailable, outsideStarts, containerWarning]
       properties:
         setting: { $ref: '#/components/schemas/AgentIsolationSetting' }
@@ -10915,42 +10918,30 @@ components:
           nullable: true
           description: |
             What the host reported about its isolation at its latest hello (ADR-0113), stored and shown as reported:
-            the server checks none of it. Absent before the host's first hello to a server that stores it.
+            the server checks none of it. Absent before the host's first hello to a server of this release; such a
+            host is placed as `CONTAINER`.
         createdAt: { type: string, format: date-time }
     RunnerHostIsolation:
       type: object
       description: |
-        What a runner host reports about its isolation (ADR-0113, decisions 1 to 3): the tiers of
-        `hello.isolationTiers`, and with the protocol's feature `host.isolation` its level, its hardening and whether
-        the level is its operator's statement. A host without the feature reports no level (`level` and `hardened`
-        absent) and is placed as `CONTAINER`: an agent's runs go to the strongest level among the hosts that may run
-        them (ADR-0113, decision 4; the run's `isolationLevel`).
-      required: [tiers, stated]
+        What a runner host reports about its isolation (ADR-0113, decisions 1 to 3): its level, from
+        `hello.isolationTiers`; whether that was `gvisor`, a container host whose runtime is runsc; its hardening; and
+        whether the level is its operator's statement. An agent's runs go to the strongest level among the company's
+        hosts that may run them (ADR-0113, decision 4; the run's `isolationLevel`).
+      required: [level, gvisor, hardened, stated]
       properties:
-        tiers:
-          type: array
-          minItems: 1
-          items: { $ref: '#/components/schemas/RunnerIsolationTier' }
-          description: The technology of the host's sandboxes, as its hello named it
-        level:
-          allOf: [{ $ref: '#/components/schemas/RunnerIsolationLevel' }]
-          nullable: true
-          description: The level the host reports; absent for a host that reports none
+        level: { $ref: '#/components/schemas/RunnerIsolationLevel' }
+        gvisor:
+          type: boolean
+          description: True when the host reported `gvisor`; its level is then `CONTAINER`
         hardened:
           allOf: [{ $ref: '#/components/schemas/RunnerHardening' }]
-          nullable: true
-          description: Whether the machine that runs the host's VMs is hardened, as reported; absent exactly when `level` is
+          description: Whether the machine that runs the host's VMs is hardened, as reported; `NO` when it said nothing
         stated:
           type: boolean
           description: |
             True when the level rests on the operator's statement in the host's configuration and not on what the host
-            can see; false without a level
-    RunnerIsolationTier:
-      type: string
-      description: |
-        The isolation tier of a host's sandboxes (ADR-0006): `CONTAINER` (runc), `GVISOR` (runsc) or `MICROVM` (Kata
-        Containers, or a VM). It names a technology, not what an escape reaches.
-      enum: [CONTAINER, GVISOR, MICROVM]
+            can see
     RunnerIsolationLevel:
       type: string
       description: |
@@ -11853,7 +11844,8 @@ components:
           nullable: true
           description: |
             The level of isolation its host was placed at when it was last assigned (ADR-0113, decision 4): the level
-            the host reported, `CONTAINER` for a host that reports none. Null before its first assignment
+            the host reported, `CONTAINER` for a host that had not reported one to a server of this release. Null before
+            its first assignment
         placementNote:
           allOf: [{ $ref: '#/components/schemas/RunPlacementNote' }]
           nullable: true

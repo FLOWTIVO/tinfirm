@@ -15,7 +15,7 @@ and [`protocol/runner-v2.schema.json`](../../protocol/runner-v2.schema.json), an
 | Documents | `upload_attachment` only | `/output` in the sandbox, saved as outputs of the conversation when the run ends (`run.finished.artifacts`), and `save_artifact` for files elsewhere and for links. The host refuses a file above `run --upload-max-bytes` (default 25 MiB, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE`) before it reads it; set the two alike |
 | `run.assign` | `task {id, key, title}` | `workItem {id, key, title}` and `job {id}`, which carry the conversation (PLATFORM.md §11.1); `tools[]`; `platformTools[]`, the platform tools the agent may use (`finish` and `list_repositories` always); `allowedHosts[]`, the network hosts approved for the conversation or the agent; `skills[]` (feature `run.skills`, below); and `agent.effort` unless it is the runtime's default |
 | `hello.features` | none | The optional features the host implements: `run.steer` and `run.skills` (below) |
-| `hello.isolationTiers` | `container`, `gvisor` | also `microvm` (a Kata runtime) |
+| `hello.isolationTiers` | `container`, `gvisor` (and `microvm`, which no v1 host sends); all placed as `container` | The host's level of isolation: `machine`, `vm-jail`, `container`, or `gvisor` (placed as `container`); `microvm` is refused. Beside it `hardened` and `isolationStated` (below) |
 | `welcome` | no version | `protocolVersion`: the version the server speaks |
 | Usage (USAGE events, `run.finished.usage`) | cache writes counted in `inputTokens` | `cacheWriteTokens` apart from `inputTokens` |
 | A run stopped at `limits.maxWallClockSeconds` | `GUARD_STOPPED`, as the other guards | `TIME_LIMIT`, which the server shows as a stop that a retry goes on from |
@@ -187,25 +187,38 @@ ships it.
   `EDITION_REQUIRED` and close code 1008, and the host stops with that message, without
   reconnecting. Change the host as the table says, or apply a Pro or Enterprise key, and start
   the host again.
-- **Isolation level** ([ADR-0113](../adr/0113-levels-of-isolation-and-placement.md)). A host
-  that knows its level lists `host.isolation` and sends `hello.isolation`: `level` (`machine`,
-  `vm-jail` or `container`), `hardened` (`yes`, `no`, or `none` for a VM per run at a provider)
-  and `stated` (true when the level rests on the operator's statement). It adds no frame. The
-  server refuses, with `error` `BAD_MESSAGE` and close code 1008, a `hello` that lists the
-  feature without the object or sends the object without the feature, and one that reports
-  `machine` or `vm-jail` with a tier other than `microvm`. It stores the report at every `hello`
-  and shows it on the host's card as reported; it checks none of it. A host without the feature
-  shows its tier and no level. The runner host derives its level from what it can see: a host
-  with Docker reports `container`, and one with `--vm-driver digitalocean` reports `machine`
-  with `hardened` `none`. With a VM driver of the operator's own it reports a level only when
-  the operator states one (`run --isolation-level machine|vm-jail`, `--isolation-hardened
-  yes|no|none`), marked `stated`; a statement where the host derives its own level stops
-  `run`. Its startup log and `doctor` say the level and what an escape from a sandbox reaches
-  ([runner/README.md](../../runner/README.md#isolation-level)). The server places runs by
-  level (ADR-0113, decision 4; [CONVENTIONS §15.6](../CONVENTIONS.md#156-runs-and-turns)):
-  an agent's runs go to the strongest level among the hosts that may run them and wait for
-  those hosts rather than go to a weaker one, and a host without the feature is placed as
-  `container`. An agent's editor can choose a level for it ([runner-isolation.md](runner-isolation.md)).
+- **Isolation level** ([ADR-0113](../adr/0113-levels-of-isolation-and-placement.md)). A v2
+  host sends its level in `hello.isolationTiers`, one value: `machine`, `vm-jail`, `container`,
+  or `gvisor` for a host with a `runsc` runtime, which is placed as `container`. A host that
+  sends several values is placed by the weakest. Beside it, optional: `hardened` (`yes`, `no`, or
+  `none` for a VM per run at a provider; absent is `no`) and `isolationStated` (true when the
+  level rests on the operator's statement; absent is false). They add no frame. The server
+  stores the report at every `hello` and shows it on the host's card as reported; it checks none
+  of it. A host of this release derives its level from what it can see: a host with Docker
+  reports `container`, Kata Containers included, and one with `--vm-driver digitalocean` reports
+  `machine` with `hardened` `none`. With a VM driver of the operator's own it reports
+  `container` unless the operator states a level (`run --isolation-level machine|vm-jail`,
+  `--isolation-hardened yes|no|none`), marked `isolationStated`; a statement where the host
+  derives its own level stops `run`. Its startup log and `doctor` say the level and what an
+  escape from a sandbox reaches ([runner/README.md](../../runner/README.md#isolation-level)).
+
+  `microvm` is no value of v2 any more. A host of an older release sends it for Kata Containers
+  and for a VM per run, two different levels, so the server refuses its `hello` with `error`
+  `UPGRADE_REQUIRED` and close code 1008. The message names the server's version and says to
+  upgrade `tinfirm-runner-host` to it. The host logs the message and stops, without
+  reconnecting. Upgrade the server first, then at once every host with a VM per run or Kata;
+  Docker hosts keep working and can follow at any time
+  ([runner-isolation.md](runner-isolation.md#5-upgrading-the-server-then-the-vm-hosts-at-once)).
+  This is the one exception to "compatibility is the protocol and its features" (ADR-0113,
+  decision 2, which amends ADR-0109 for this change).
+
+  The server places runs by level (ADR-0113, decision 4;
+  [CONVENTIONS §15.6](../CONVENTIONS.md#156-runs-and-turns)): an agent's runs go to the
+  strongest level among the company's hosts that may run them, and a member's own host takes
+  their runs too when it reports that level or a stronger one. They wait for those hosts rather
+  than go to a weaker one. A host that has not connected to a server of this release yet is
+  placed as `container`. An agent's editor can choose a level for it
+  ([runner-isolation.md](runner-isolation.md)).
 - **Ready sandboxes** ([ADR-0098](../adr/0098-ready-vms.md),
   [ADR-0099](../adr/0099-pool-settings.md)). A host with a VM per run (`run --executor vm`)
   and ready VMs lists `sandbox.pool` and reports its operator's `--pool-max-ready` in
@@ -219,9 +232,10 @@ ships it.
 ## Checks
 
 - `run`'s log line `runner host starting` shows `protocol_version`.
-- A v2 host's `hello` lists `isolationTiers: ["microvm"]` on a Kata host, which the server
-  accepts and stores; the host's card shows "Tier microvm" and, without `host.isolation`,
-  "Reports no level".
+- A v2 host's `hello` lists its level in `isolationTiers`, `["container"]` on a Kata host, and
+  the host's card says "Reports container". A host of an older release with Kata or a VM per
+  run sends `["microvm"]`; its log ends with the server's `UPGRADE_REQUIRED` message and close
+  1008.
 - The company's audit log has a `tool.called` event per server-executed tool call, and a
   `secret.accessed` event with purpose `run-tool:{runId}` for each.
 - After a run, the conversation's outputs hold the files the agent left in `/output`; the run's

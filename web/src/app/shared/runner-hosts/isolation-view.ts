@@ -9,19 +9,18 @@ import type {
 
 /**
  * The words of a runner host's isolation on its page (ADR-0113, decisions 1 to 3): what the host
- * reports, never what Tinfirm checked. The level in its protocol name, the hardening mark, and what
- * an escape reaches on a host of that kind, in the words of ADR-0112's three paths (through the
- * VMM, through KVM, through the bridge) and ADR-0113's table, kept short.
+ * reports, never what Tinfirm checked. The level in its protocol name, gVisor where the host runs
+ * it, the hardening mark, and what an escape reaches on a host of that kind, in the words of
+ * ADR-0112's three paths (through the VMM, through KVM, through the bridge) and ADR-0113's table,
+ * kept short.
  */
 export interface IsolationLines {
-  /** "Reports machine", "Reports vm-jail, stated by the operator", "Reports no level: …". */
+  /** "Reports machine", "Reports vm-jail, stated by the operator", "Reports container with gVisor". */
   readonly reports: string;
-  /** The hardening mark; null for a host that reports no level. */
-  readonly hardening: string | null;
-  /** What an escape reaches; null for a host that reports no level. */
-  readonly reaches: string | null;
-  /** "Tier microvm": the technology, as the host named it. */
-  readonly tiers: string;
+  /** The hardening mark. */
+  readonly hardening: string;
+  /** What an escape reaches. */
+  readonly reaches: string;
 }
 
 const LEVEL_WORDS: Record<RunnerIsolationLevel, string> = {
@@ -45,27 +44,24 @@ const REACHES: Record<RunnerIsolationLevel, string> = {
     'The credentials are on this machine, behind the kernel alone. An escape from a container reaches every credential and the other runs.',
 };
 
-/** The host page's lines for what a host reports; null before its first report. */
+const GVISOR_REACHES =
+  'The credentials are on this machine, behind gVisor and the kernel. An escape past both reaches every credential and the other runs.';
+
+/**
+ * The host page's lines for what a host reports; null for a host that has not said hello to a
+ * server of this release.
+ */
 export function isolationLines(
   isolation: RunnerHostIsolation | null | undefined,
 ): IsolationLines | null {
   if (!isolation) return null;
-  const tiers = `Tier ${isolation.tiers.map((t) => t.toLowerCase()).join(', ')}`;
   const level = isolation.level;
-  if (!level) {
-    return {
-      reports: 'Reports no level: its runs are placed as on a container host.',
-      hardening: null,
-      reaches: null,
-      tiers,
-    };
-  }
+  const gvisor = isolation.gvisor && level === 'CONTAINER';
   const stated = isolation.stated ? ', stated by the operator' : '';
   return {
-    reports: `Reports ${LEVEL_WORDS[level]}${stated}`,
-    hardening: isolation.hardened ? HARDENING_WORDS[isolation.hardened] : null,
-    reaches: REACHES[level],
-    tiers,
+    reports: `Reports ${LEVEL_WORDS[level]}${gvisor ? ' with gVisor' : ''}${stated}`,
+    hardening: HARDENING_WORDS[isolation.hardened],
+    reaches: gvisor ? GVISOR_REACHES : REACHES[level],
   };
 }
 

@@ -15,13 +15,16 @@ import com.flowtivo.tinfirm.runner.RunnerHostInfo;
  * The dispatcher's step for the level of isolation (ADR-0113, decision 4), a pure function of the hosts that count for
  * the run (package 2's rule, {@code Hosts.eligible}), the level chosen for its agent and the conversation's session.
  * <ul>
- * <li>The target is the chosen level, else the strongest the hosts report ({@link Isolation#target}). A chosen level
- * that none of them reports makes the run wait ({@code NO_HOST_OF_LEVEL}).</li>
- * <li>The candidates are the hosts of the target level: a run never goes to a weaker host by itself, and waits for
- * these as it waits for any host today.</li>
+ * <li>The target is the chosen level, else the strongest the company's hosts that count report, or the payer's
+ * personal hosts' where no company host counts ({@link Isolation#target}). A chosen level that no host takes makes the
+ * run wait ({@code NO_HOST_OF_LEVEL}).</li>
+ * <li>The candidates are the hosts that take the target level ({@link Isolation#takes}): the company hosts of the
+ * level, and the payer's personal hosts of the level or a stronger one. A run never goes to a weaker host by itself,
+ * waits for these as it waits for any host today, and never waits for a personal host alone while a company host of
+ * the level counts.</li>
  * <li>The session's host (the host of the conversation's latest run that reported a session) is preferred, as
- * today. An automatic agent's conversation stays on it while it takes the turn, even when it is weaker than the
- * target ({@link PlacementNote#STAYED_ON_WEAKER_HOST}); when it cannot, the turn goes to the target level with a
+ * today. An automatic agent's conversation stays on it while it takes the turn, even when it does not take the
+ * target level (a weaker host, a personal one included) ({@link PlacementNote#STAYED_ON_WEAKER_HOST}); when it cannot, the turn goes to the target level with a
  * fresh session ({@link PlacementNote#FRESH_SESSION_STRONGER_LEVEL}). A chosen level holds for every turn: a session
  * on a host of another level starts again on the chosen level ({@link PlacementNote#FRESH_SESSION_CHOSEN_LEVEL}).
  * Where a bundle of that session is kept (ADR-0097), the turn moves with it: a free host of the level that restores
@@ -83,14 +86,14 @@ final class IsolationPlacement {
             case Isolation.Level found -> level = found.level();
         }
         List<RunnerHostInfo> candidates = new ArrayList<>(counting.stream()
-            .filter(host -> Isolation.placedAt(host) == level)
+            .filter(host -> Isolation.takes(host, level))
             .toList());
         boolean isChosen = chosen != null;
         UUID preferred = null;
         boolean preferRestorers = false;
         if (session != null) {
             RunnerHostInfo held = session.host();
-            if (Isolation.placedAt(held) == level) {
+            if (Isolation.takes(held, level)) {
                 preferred = held.id();
             }
             else {
@@ -111,7 +114,7 @@ final class IsolationPlacement {
     }
 
     /**
-     * The plan's candidates as the dispatcher's lock read them again: those still placed at the plan's level, and an
+     * The plan's candidates as the dispatcher's lock read them again: those that still take the plan's level, and an
      * automatic agent's session host (ADR-0113, decision 4). A host whose report changed between the plan and the lock
      * is left out, so that a run never goes to a level it was not planned for; with none left, it waits for the next
      * pass, which plans again.
@@ -119,7 +122,7 @@ final class IsolationPlacement {
     static List<RunnerHostInfo> stillPlaced(Plan plan, List<RunnerHostInfo> locked, @Nullable Session session) {
         UUID held = !plan.chosen() && session != null ? session.host().id() : null;
         return locked.stream()
-            .filter(host -> Isolation.placedAt(host) == plan.level() || host.id().equals(held))
+            .filter(host -> Isolation.takes(host, plan.level()) || host.id().equals(held))
             .toList();
     }
 
@@ -134,12 +137,13 @@ final class IsolationPlacement {
         if (session == null) {
             return null;
         }
-        IsolationLevel held = Isolation.placedAt(session.host());
+        // The session's host took the level itself: a move between hosts that take it is as before ADR-0113.
+        boolean heldTakes = Isolation.takes(session.host(), plan.level());
         if (host.id().equals(session.host().id())) {
-            return held != plan.level() ? PlacementNote.STAYED_ON_WEAKER_HOST : null;
+            return heldTakes ? null : PlacementNote.STAYED_ON_WEAKER_HOST;
         }
-        if (held == plan.level() || restored) {
-            // Another host of the same level, as before ADR-0113; or the session moved with its bundle.
+        if (heldTakes || restored) {
+            // Another host that takes the level; or the session moved with its bundle.
             return null;
         }
         return plan.chosen() ? PlacementNote.FRESH_SESSION_CHOSEN_LEVEL : PlacementNote.FRESH_SESSION_STRONGER_LEVEL;

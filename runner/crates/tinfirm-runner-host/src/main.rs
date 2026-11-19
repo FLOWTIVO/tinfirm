@@ -308,8 +308,9 @@ enum ImageVersionChoice {
     Refuse,
 }
 
-/// `--isolation-level`: the levels an operator may state (ADR-0113); `container` is the
-/// Docker executor's, which the host derives itself.
+/// `--isolation-level`: the levels an operator may state (ADR-0113); `container` is what a
+/// host of a driver of the operator's own reports without a statement, and the Docker
+/// executor's, which the host derives itself.
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum StatedLevel {
     /// The VMs run on other machines than this host, which hold no credential.
@@ -328,10 +329,10 @@ enum HardenedChoice {
 }
 
 impl StatedLevel {
-    fn level(self) -> tinfirm_protocol::IsolationLevel {
+    fn level(self) -> tinfirm_protocol::IsolationTier {
         match self {
-            StatedLevel::Machine => tinfirm_protocol::IsolationLevel::Machine,
-            StatedLevel::VmJail => tinfirm_protocol::IsolationLevel::VmJail,
+            StatedLevel::Machine => tinfirm_protocol::IsolationTier::Machine,
+            StatedLevel::VmJail => tinfirm_protocol::IsolationTier::VmJail,
         }
     }
 }
@@ -420,9 +421,9 @@ struct VmArgs {
     /// The level of isolation this host reports with a VM driver of your own, which it cannot
     /// see itself (ADR-0113): `machine` when the VMs run on other machines than this host,
     /// which hold no credential; `vm-jail` when each VM's VMM runs in a jail of its own on this
-    /// machine. Without it such a host reports no level, and the server places its runs as on
-    /// a container host. Refused with the Docker executor and with `--vm-driver digitalocean`,
-    /// whose level this host derives itself.
+    /// machine. Without it such a host reports `container`, and the server places its runs as
+    /// on a container host. Refused with the Docker executor, `--vm-driver digitalocean` and
+    /// `--vm-driver node`, whose level this host derives itself.
     #[arg(
         long,
         env = "TINFIRM_RUNNER_ISOLATION_LEVEL",
@@ -1649,7 +1650,8 @@ async fn doctor(paths: &Paths) -> Result<()> {
 }
 
 /// The level of isolation that `run` would report with `TINFIRM_RUNNER_EXECUTOR`,
-/// `TINFIRM_RUNNER_VM_DRIVER` (with `node`, `TINFIRM_NODE_DRIVER_CONFIG`) and
+/// `TINFIRM_RUNNER_SANDBOX_RUNTIME`, `TINFIRM_RUNNER_VM_DRIVER` (with `node`,
+/// `TINFIRM_NODE_DRIVER_CONFIG`) and
 /// `TINFIRM_RUNNER_ISOLATION_*`, and what an escape from a
 /// sandbox reaches on such a host (ADR-0112, decision 7). `run`'s flags are not seen here.
 fn doctor_isolation(checks: &mut Checks) {
@@ -1667,7 +1669,12 @@ fn doctor_isolation(checks: &mut Checks) {
             Some(Ok(driver)) => Sandboxes::of_driver(&driver),
             _ => Ok(Sandboxes::OwnDriverVms),
         },
-        _ => Ok(Sandboxes::Docker),
+        // Docker's runtime by its name, as `run` reads it; a name that `run` would refuse
+        // reads as runc here.
+        _ => Ok(Sandboxes::docker(
+            &SandboxSettings::new(var("TINFIRM_RUNNER_SANDBOX_RUNTIME"), false, Vec::new())
+                .unwrap_or_default(),
+        )),
     };
     let sandboxes = match sandboxes {
         Ok(sandboxes) => sandboxes,
@@ -1702,15 +1709,17 @@ fn doctor_isolation(checks: &mut Checks) {
     }
     match isolation::derive(sandboxes, stated_isolation(level, hardened)) {
         Ok(reported) => {
-            let escape = isolation::what_an_escape_reaches(sandboxes, reported.as_ref());
+            let escape = isolation::what_an_escape_reaches(sandboxes, &reported);
             let detail = format!(
                 "reports {} (as `run` with this environment; its flags are not seen here). {escape}",
-                isolation::describe(reported.as_ref())
+                isolation::describe(&reported)
             );
-            if reported.is_some() {
-                checks.info("isolation", detail);
-            } else {
+            // A VM host of a driver of your own, shown as a container host until you state its
+            // level.
+            if isolation::unstated(sandboxes, &reported) {
                 checks.warn("isolation", detail);
+            } else {
+                checks.info("isolation", detail);
             }
         }
         Err(e) => checks.fail("isolation", e),
@@ -1969,13 +1978,6 @@ async fn run(
 ) -> Result<()> {
     // First: a forbidden combination is refused before anything else happens.
     let vm_options = vm_args.options()?;
-    // The level of isolation (ADR-0113): a statement never overrides what the host sees.
-    let sandboxes = match &vm_options {
-        Some((options, _)) => Sandboxes::of_driver(&options.driver).map_err(anyhow::Error::msg)?,
-        None => Sandboxes::Docker,
-    };
-    let isolation_stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);
-    let reported = isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
     if vm_options.is_none() && max_concurrent_runs > MAX_CAPACITY {
         bail!(
             "--max-concurrent-runs is at most {MAX_CAPACITY} with Docker: the machine runs every sandbox; more need --executor vm, a VM per run"
@@ -1999,6 +2001,13 @@ async fn run(
             sandbox_env,
         )?
     };
+    // The level of isolation (ADR-0113): a statement never overrides what the host sees.
+    let sandboxes = match &vm_options {
+        Some((options, _)) => Sandboxes::of_driver(&options.driver).map_err(anyhow::Error::msg)?,
+        None => Sandboxes::docker(&settings),
+    };
+    let isolation_stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);
+    let reported = isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
     // A VM's firewall lets nothing out: the egress proxy is its only way to the network.
     let egress_on = sandbox_args.egress_proxy || vm_options.is_some();
     // `--egress-allow-private` lets the model proxy, which is always on, reach a gateway inside
@@ -2111,7 +2120,7 @@ async fn run(
     opts.upload_max_bytes = upload_max_bytes;
     opts.sandbox = settings;
     opts.isolation_stated = isolation_stated;
-    log_isolation(sandboxes, reported.as_ref(), cfg.protocol_version);
+    log_isolation(sandboxes, &reported, cfg.protocol_version);
     let host = Shared::new(opts, cfg);
     host.warn_operator_public_suffix_wildcards();
     let shutdown = CancellationToken::new();
@@ -2123,19 +2132,17 @@ async fn run(
 
 /// The level of isolation the host reports, and what an escape from a sandbox reaches on a
 /// host of that level (ADR-0112, decision 7; ADR-0113).
-fn log_isolation(
-    sandboxes: Sandboxes,
-    reported: Option<&tinfirm_protocol::HostIsolation>,
-    protocol_version: u32,
-) {
+fn log_isolation(sandboxes: Sandboxes, reported: &isolation::Reported, protocol_version: u32) {
     let escape = isolation::what_an_escape_reaches(sandboxes, reported);
     if protocol_version < tinfirm_protocol::PROTOCOL_VERSION_V2 {
         tracing::info!(
-            isolation = "none",
-            "runner protocol 1 reports no level of isolation (protocol 2 does). {escape}"
+            isolation = "container",
+            "runner protocol 1 reports `container`, whatever the host (protocol 2 reports its level). {escape}"
         );
-    } else if reported.is_none() {
-        tracing::warn!(isolation = "none", "{escape}");
+    } else if isolation::unstated(sandboxes, reported) {
+        // A VM host of a driver of your own, shown as a container host until you state its
+        // level.
+        tracing::warn!(isolation = %isolation::describe(reported), "{escape}");
     } else {
         tracing::info!(isolation = %isolation::describe(reported), "{escape}");
     }
@@ -2181,7 +2188,7 @@ async fn docker_executor(
         max_concurrent_runs,
         executor = "docker",
         sandbox_runtime = %runtime,
-        isolation_tier = settings.tier().as_str(),
+        sandbox_family = settings.family().as_str(),
         sandbox_docker = settings.docker,
         sandbox_bridge = bridge.is_some(),
         sandbox_env = ?settings.env_keys(),
@@ -2278,7 +2285,7 @@ async fn vm_executor(
         pool_max_ready = pool.max_ready,
         pool_runtime = if pool.multi_runtime { "any" } else { pool.runtime.as_str() },
         vm_checked = ?verified.checked,
-        isolation_tier = settings.tier().as_str(),
+        sandbox_family = settings.family().as_str(),
         sandbox_docker = settings.docker,
         sandbox_env = ?settings.env_keys(),
         "runner host starting"

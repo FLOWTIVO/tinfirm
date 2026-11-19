@@ -333,10 +333,26 @@ class RunnerHostIntegrationTest extends IntegrationTest {
         throw new AssertionError("No host " + hostId);
     }
 
+    /** Connects with this hello, takes the welcome, and closes. */
+    private void helloOnce(RunnerHostRef host, Map<String, Object> hello) {
+        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+            runner.send(hello);
+            runner.expect("welcome");
+            runner.expect("host.config");
+            runner.assertFramesValid();
+        }
+    }
+
+    /** The host's isolation as shown: level, gVisor, hardening and the operator's statement. */
+    private static String shown(JsonNode isolation) {
+        return isolation.get("level").asString() + " gvisor=" + isolation.get("gvisor").asBoolean() + " "
+                + isolation.get("hardened").asString() + " stated=" + isolation.get("stated").asBoolean();
+    }
+
     /**
-     * ADR-0113, decisions 1 to 3: a company host's report of its isolation is stored at each hello and shown as
-     * reported; a later hello without the feature clears the level and keeps the tier. A change of the level is
-     * audited once, by SYSTEM, not at every hello.
+     * ADR-0113, decisions 1 to 3, as the owner settled them on 2026-11-14: a company host's level is the one of
+     * {@code hello.isolationTiers}, stored at each hello and shown as reported, with gVisor, the hardening (absent:
+     * {@code NO}) and the operator's statement. A change of any of them is audited once, by SYSTEM, not at every hello.
      */
     @Test
     void aCompanyHostsReportedIsolationIsStoredShownAndItsChangesAudited() {
@@ -345,71 +361,113 @@ class RunnerHostIntegrationTest extends IntegrationTest {
         RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("vm"), "COMPANY");
         assertThat(absent(isolationOf(owner, company, host.id()))).as("before its first hello").isTrue();
 
-        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-            runner.send(FakeRunner.helloWithIsolation("machine", "none"));
-            runner.expect("welcome");
-            runner.expect("host.config");
-            runner.assertFramesValid();
-        }
-        JsonNode machine = isolationOf(owner, company, host.id());
-        assertThat(machine.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
-        assertThat(machine.get("level").asString()).isEqualTo("MACHINE");
-        assertThat(machine.get("hardened").asString()).isEqualTo("NONE");
-        assertThat(machine.get("stated").asBoolean()).isFalse();
+        helloOnce(host, FakeRunner.helloWithIsolation("machine", "none"));
+        assertThat(shown(isolationOf(owner, company, host.id()))).isEqualTo("MACHINE gvisor=false NONE stated=false");
         JsonNode reported = auditEvents(owner, company, "runner_host.isolation_changed").getFirst();
         assertThat(reported.get("targetId").asString()).isEqualTo(host.id().toString());
         assertThat(reported.get("actor").get("type").asString()).isEqualTo("SYSTEM");
         assertThat(absent(reported.get("details").path("oldLevel"))).isTrue();
         assertThat(reported.get("details").get("newLevel").asString()).isEqualTo("machine");
         assertThat(reported.get("details").get("newHardened").asString()).isEqualTo("none");
+        assertThat(reported.get("details").get("newGvisor").asBoolean()).isFalse();
 
         // The same report again changes nothing and is not audited again.
-        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-            runner.send(FakeRunner.helloWithIsolation("machine", "none"));
-            runner.expect("welcome");
-        }
+        helloOnce(host, FakeRunner.helloWithIsolation("machine", "none"));
         assertThat(auditEvents(owner, company, "runner_host.isolation_changed")).hasSize(1);
 
-        // Downgraded: a hello without the feature reports no level; the tier it sends stays.
-        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-            runner.send(FakeRunner.helloV2(List.of(), List.of()));
-            runner.expect("welcome");
-        }
-        JsonNode cleared = isolationOf(owner, company, host.id());
-        assertThat(cleared.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
-        assertThat(absent(cleared.path("level"))).isTrue();
-        assertThat(absent(cleared.path("hardened"))).isTrue();
-        assertThat(cleared.get("stated").asBoolean()).isFalse();
+        // Each level, gVisor and the operator's statement, as the host reports them; each change audited once.
+        helloOnce(host, FakeRunner.helloWithIsolation("vm-jail", "yes", true));
+        assertThat(shown(isolationOf(owner, company, host.id()))).isEqualTo("VM_JAIL gvisor=false YES stated=true");
+        helloOnce(host, FakeRunner.helloV2(List.of(), List.of()));
+        assertThat(shown(isolationOf(owner, company, host.id()))).isEqualTo("CONTAINER gvisor=false NO stated=false");
+        helloOnce(host, FakeRunner.helloWithIsolation("gvisor", null));
+        assertThat(shown(isolationOf(owner, company, host.id()))).isEqualTo("CONTAINER gvisor=true NO stated=false");
         List<JsonNode> changes = auditEvents(owner, company, "runner_host.isolation_changed");
-        assertThat(changes).hasSize(2);
-        JsonNode downgraded = changes.stream()
-            .filter(event -> absent(event.get("details").path("newLevel")))
+        assertThat(changes).hasSize(4);
+        JsonNode toGvisor = changes.stream()
+            .filter(event -> event.get("details").get("newGvisor").asBoolean())
             .findFirst()
             .orElseThrow();
-        assertThat(downgraded.get("details").get("oldLevel").asString()).isEqualTo("machine");
-        assertThat(downgraded.get("details").get("oldHardened").asString()).isEqualTo("none");
+        assertThat(toGvisor.get("details").get("oldLevel").asString()).isEqualTo("container");
+        assertThat(toGvisor.get("details").get("newLevel").asString()).isEqualTo("container");
+        assertThat(toGvisor.get("details").get("oldGvisor").asBoolean()).isFalse();
+    }
+
+    /** A host sends one tier; a hello with several is placed by the weakest wall it reports. */
+    @Test
+    void aHelloWithSeveralTiersIsStoredAtTheWeakest() {
+        TestCompany company = companyWithRoles();
+        ApiClient owner = loginAs(company.email("OWNER"));
+        RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("mixed"), "COMPANY");
+        Map<String, Object> hello = FakeRunner.helloWithIsolation("machine", "none");
+        hello.put("isolationTiers", List.of("machine", "gvisor", "vm-jail"));
+        helloOnce(host, hello);
+        assertThat(shown(isolationOf(owner, company, host.id()))).isEqualTo("CONTAINER gvisor=true NONE stated=false");
     }
 
     /**
-     * The review of 2026-11-18, finding 3: the level is a feature of protocol 2. A hello of protocol 1 that carries
-     * {@code host.isolation} reports no level; its tier is stored as before.
+     * ADR-0113, decision 2: {@code microvm} is no value of protocol 2. A Kata host or a host with a VM per run of an
+     * older release sends it: the server refuses its hello with {@code UPGRADE_REQUIRED} and a message that names the
+     * release to install, and closes with 1008, at which a released host stops. Nothing is stored. A host of an older
+     * Docker release, which sends {@code container}, keeps working; so does a hello with the draft's feature
+     * {@code host.isolation} and object {@code hello.isolation}, which are ignored.
      */
     @Test
-    void aHelloOfProtocol1ReportsNoLevelWhateverItCarries() {
+    void aHelloWithMicrovmIsRefusedWithWhatToInstall() {
+        TestCompany company = companyWithRoles();
+        ApiClient admin = loginAs(company.email("ADMIN"));
+        RunnerHostRef host = registerRunnerHost(admin, company.id(), unique("kata"), "COMPANY");
+        for (List<String> tiers : List.of(List.of("microvm"), List.of("container", "microvm"))) {
+            Map<String, Object> hello = FakeRunner.helloV2(List.of(), List.of());
+            hello.put("isolationTiers", tiers);
+            hello.put("features", List.of("sandbox.bridge"));
+            try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
+                runner.send(hello);
+                JsonNode error = runner.expect("error");
+                assertThat(error.get("code").asString()).isEqualTo("UPGRADE_REQUIRED");
+                assertThat(error.get("message").asString()).as("%s", tiers)
+                    .contains("microvm", "Upgrade tinfirm-runner-host on this host to", "the server's",
+                            "container for Kata Containers", "machine or vm-jail for a VM per run");
+                assertThat(runner.awaitClose()).isEqualTo(1008);
+                assertThat(runner.received()).noneMatch(frame -> frame.get("type").asString().equals("welcome"));
+                runner.assertFramesValid();
+            }
+        }
+        assertThat(absent(isolationOf(admin, company, host.id()))).as("nothing stored").isTrue();
+
+        Map<String, Object> draft = FakeRunner.helloV2(List.of(), List.of());
+        draft.put("features", List.of("run.steer", "host.isolation"));
+        draft.put("isolation", Map.of("level", "machine", "hardened", "none"));
+        helloOnce(host, draft);
+        assertThat(shown(isolationOf(admin, company, host.id()))).isEqualTo("CONTAINER gvisor=false NO stated=false");
+    }
+
+    /**
+     * Protocol 1 does not change: its tiers are read as before, as the level {@code container} ({@code microvm}, which
+     * its schema allows and no host of protocol 1 sent, included), and protocol 2's fields are not read.
+     */
+    @Test
+    void aHelloOfProtocol1IsAContainerHostWhateverItCarries() {
         TestCompany company = companyWithRoles();
         ApiClient owner = loginAs(company.email("OWNER"));
         RunnerHostRef host = registerRunnerHost(owner, company.id(), unique("old"), "COMPANY");
+        Map<String, Object> hello = FakeRunner.hello(List.of(), List.of());
+        hello.put("isolationTiers", List.of("microvm"));
+        hello.put("hardened", "yes");
+        hello.put("isolationStated", true);
+        helloOnce(host, hello);
+        assertThat(shown(isolationOf(owner, company, host.id()))).isEqualTo("CONTAINER gvisor=false NO stated=false");
+
+        // The levels are protocol 2's: a hello of protocol 1 with one is a bad hello.
+        Map<String, Object> machine = FakeRunner.hello(List.of(), List.of());
+        machine.put("isolationTiers", List.of("machine"));
         try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-            Map<String, Object> hello = FakeRunner.helloWithIsolation("machine", "none");
-            hello.put("protocolVersion", 1);
-            hello.put("isolationTiers", List.of("microvm"));
-            runner.send(hello);
-            runner.expect("welcome");
+            runner.send(machine);
+            JsonNode error = runner.expect("error");
+            assertThat(error.get("code").asString()).isEqualTo("BAD_MESSAGE");
+            assertThat(error.get("message").asString()).contains("not in runner protocol 1");
+            assertThat(runner.awaitClose()).isEqualTo(1008);
         }
-        JsonNode isolation = isolationOf(owner, company, host.id());
-        assertThat(isolation.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
-        assertThat(absent(isolation.path("level"))).isTrue();
-        assertThat(auditEvents(owner, company, "runner_host.isolation_changed")).isEmpty();
     }
 
     /** ADR-0113: a personal host's report is its machine's, shown in its presence, with the operator's statement. */
@@ -419,59 +477,18 @@ class RunnerHostIntegrationTest extends IntegrationTest {
         ApiClient member = loginAs(company.email("MEMBER"));
         RunnerHostRef host = registerRunnerHost(member, company.id(), unique("laptop"));
 
-        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-            runner.send(FakeRunner.helloWithIsolation("vm-jail", "no", true));
-            runner.expect("welcome");
-            runner.expect("host.config");
-            runner.assertFramesValid();
-        }
-        JsonNode isolation = isolationOf(member, company, host.id());
-        assertThat(isolation.get("tiers")).extracting(JsonNode::asString).containsExactly("MICROVM");
-        assertThat(isolation.get("level").asString()).isEqualTo("VM_JAIL");
-        assertThat(isolation.get("hardened").asString()).isEqualTo("NO");
-        assertThat(isolation.get("stated").asBoolean()).isTrue();
+        helloOnce(host, FakeRunner.helloWithIsolation("vm-jail", "no", true));
+        assertThat(shown(isolationOf(member, company, host.id()))).isEqualTo("VM_JAIL gvisor=false NO stated=true");
         JsonNode reported = auditEvents(loginAs(company.email("OWNER")), company, "runner_host.isolation_changed")
             .getFirst();
         assertThat(reported.get("targetId").asString()).isEqualTo(host.id().toString());
         assertThat(reported.get("details").get("newStated").asBoolean()).isTrue();
 
-        // A container host: its own level, with the container tier.
-        try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-            runner.send(FakeRunner.helloWithIsolation("container", "no"));
-            runner.expect("welcome");
-        }
-        JsonNode container = isolationOf(member, company, host.id());
-        assertThat(container.get("tiers")).extracting(JsonNode::asString).containsExactly("CONTAINER");
-        assertThat(container.get("level").asString()).isEqualTo("CONTAINER");
-        assertThat(container.get("stated").asBoolean()).isFalse();
+        helloOnce(host, FakeRunner.helloWithIsolation("container", "no"));
+        assertThat(shown(isolationOf(member, company, host.id()))).isEqualTo("CONTAINER gvisor=false NO stated=false");
     }
 
-    /** ADR-0113, decision 2: a hello whose isolation and feature, or level and tiers, disagree stops at the hello. */
-    @Test
-    void aHelloWhoseIsolationDisagreesIsRefused() {
-        TestCompany company = companyWithRoles();
-        ApiClient admin = loginAs(company.email("ADMIN"));
-        RunnerHostRef host = registerRunnerHost(admin, company.id(), unique("liar"), "COMPANY");
-        Map<String, Object> featureAlone = FakeRunner.helloWithIsolation("machine", "none");
-        featureAlone.remove("isolation");
-        Map<String, Object> objectAlone = FakeRunner.helloWithIsolation("machine", "none");
-        objectAlone.put("features", List.of("run.steer"));
-        Map<String, Object> machineInAContainer = FakeRunner.helloWithIsolation("machine", "yes");
-        machineInAContainer.put("isolationTiers", List.of("container"));
-        for (Map<String, Object> hello : List.of(featureAlone, objectAlone, machineInAContainer)) {
-            try (FakeRunner runner = FakeRunner.connect(port, host.token())) {
-                runner.send(hello);
-                JsonNode error = runner.expect("error");
-                assertThat(error.get("code").asString()).isEqualTo("BAD_MESSAGE");
-                assertThat(error.get("message").asString()).as("%s", hello).contains("hello.isolation");
-                assertThat(runner.awaitClose()).isEqualTo(1008);
-                assertThat(runner.received()).noneMatch(frame -> frame.get("type").asString().equals("welcome"));
-            }
-        }
-        assertThat(absent(isolationOf(admin, company, host.id()))).as("nothing stored").isTrue();
-    }
-
-    /** V085's checks: a level comes with its hardening and tiers, the operator's statement only with a level. */
+    /** V085's checks: a level comes with its hardening; gVisor only with container; the statement only with a level. */
     @Test
     void theIsolationColumnsHoldOnlyWhatAHostCanReport() throws SQLException {
         TestCompany company = companyWithRoles();
@@ -479,22 +496,21 @@ class RunnerHostIntegrationTest extends IntegrationTest {
                 "COMPANY");
         try (TenantSql sql = TenantSql.in(company.id())) {
             Map<String, String> refused = Map.of(
-                    "isolation_tiers = ARRAY['KATA']", "runner_host_isolation_tiers_ck",
-                    "isolation_tiers = ARRAY[]::varchar(16)[]", "runner_host_isolation_tiers_ck",
-                    "isolation_tiers = ARRAY['MICROVM'], isolation_level = 'CLOUD', isolation_hardened = 'NO'",
-                    "runner_host_isolation_level_ck",
-                    "isolation_tiers = ARRAY['MICROVM'], isolation_level = 'MACHINE', isolation_hardened = 'MAYBE'",
-                    "runner_host_isolation_hardened_ck",
-                    "isolation_tiers = ARRAY['MICROVM'], isolation_level = 'MACHINE'", "runner_host_isolation_ck",
-                    "isolation_tiers = ARRAY['MICROVM'], isolation_stated = true", "runner_host_isolation_ck",
-                    "isolation_level = 'MACHINE', isolation_hardened = 'NONE'", "runner_host_isolation_ck");
+                    "isolation_level = 'CLOUD', isolation_hardened = 'NO'", "runner_host_isolation_level_ck",
+                    "isolation_level = 'MACHINE', isolation_hardened = 'MAYBE'", "runner_host_isolation_hardened_ck",
+                    "isolation_level = 'MACHINE'", "runner_host_isolation_ck",
+                    "isolation_hardened = 'NO'", "runner_host_isolation_ck",
+                    "isolation_stated = true", "runner_host_isolation_ck",
+                    "isolation_gvisor = true", "runner_host_isolation_ck",
+                    "isolation_level = 'VM_JAIL', isolation_hardened = 'NO', isolation_gvisor = true",
+                    "runner_host_isolation_ck");
             for (Map.Entry<String, String> values : refused.entrySet()) {
                 assertThat(sql.refused("UPDATE runner_host SET " + values.getKey() + " WHERE id = ?", host.id()))
                     .as(values.getKey())
                     .isEqualTo(values.getValue());
             }
             sql.accepted("""
-                    UPDATE runner_host SET isolation_tiers = ARRAY['MICROVM'], isolation_level = 'VM_JAIL',
+                    UPDATE runner_host SET isolation_level = 'CONTAINER', isolation_gvisor = true,
                            isolation_hardened = 'YES', isolation_stated = true WHERE id = ?""", host.id());
         }
     }

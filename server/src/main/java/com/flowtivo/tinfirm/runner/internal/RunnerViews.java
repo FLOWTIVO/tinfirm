@@ -16,7 +16,7 @@ final class RunnerViews {
      * {@code maxConcurrentRuns} is the effective value as last confirmed (0 while draining); {@code draining} is
      * true only while the host is connected. A company host has no owner; a personal host lists the credentials it
      * reported (a company host holds none). {@code isolation} is null before the host's first {@code hello} to a
-     * server that stores it.
+     * server of this release.
      */
     record HostDetails(UUID id, String name, String scope, @Nullable UUID ownerPrincipalId,
             @Nullable String ownerDisplay, boolean online, boolean draining, @Nullable Instant lastSeenAt,
@@ -28,11 +28,10 @@ final class RunnerViews {
     }
 
     /**
-     * What the host reported about its isolation at its latest {@code hello} (ADR-0113), shown as reported: its tiers,
-     * and with the feature {@code host.isolation} its level, its hardening and whether the operator stated the level
-     * ({@code level} and {@code hardened} null for a host that reports no level).
+     * What the host reported about its isolation at its latest {@code hello} (ADR-0113), shown as reported: its level
+     * by name, whether its tier was {@code gvisor}, its hardening by name, and whether the operator stated the level.
      */
-    record IsolationView(List<String> tiers, @Nullable String level, @Nullable String hardened, boolean stated) {
+    record IsolationView(String level, boolean gvisor, String hardened, boolean stated) {
     }
 
     /**

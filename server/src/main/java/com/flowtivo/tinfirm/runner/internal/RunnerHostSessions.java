@@ -21,7 +21,6 @@ import com.flowtivo.tinfirm.audit.AuditAction;
 import com.flowtivo.tinfirm.audit.AuditLog;
 import com.flowtivo.tinfirm.audit.AuditRecord;
 import com.flowtivo.tinfirm.runner.ConnectedHost;
-import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
@@ -116,13 +115,11 @@ class RunnerHostSessions {
     }
 
     /**
-     * A problem with the hello beyond its fields' constraints, or null: a credential label listed twice, and the
-     * schema's conditions on {@code isolation} (ADR-0113, decision 2): it is required with the feature
-     * {@code host.isolation} and not allowed without it, and {@code machine} or {@code vm-jail} come only with
-     * {@code isolationTiers} that are all {@code microvm}. Nothing else about a level is refused: {@code container}
-     * with a {@code microvm} tier (a Kata host), and any {@code hardened} with any level, are what a host may report.
-     * An explicit {@code null} ({@code "isolation": null}, {@code "stated": null}), which the schema refuses, is read
-     * as absent. A hello of protocol 1 reports no level ({@code Hello.reportedIsolation}).
+     * A problem with the hello beyond its fields' constraints, or null: a credential label listed twice. What a host
+     * reports about its isolation is never refused for its content (ADR-0113, decision 3): {@code microvm} is refused
+     * apart, before this, as a host to upgrade ({@link RunnerMessages#UPGRADE_REQUIRED}), and the feature
+     * {@code host.isolation} and the object {@code hello.isolation} of an earlier draft are ignored as any unknown
+     * feature and field are.
      */
     static @Nullable String helloProblem(RunnerMessages.Hello hello) {
         Set<String> labels = new HashSet<>();
@@ -130,20 +127,6 @@ class RunnerHostSessions {
             if (!labels.add(credential.label())) {
                 return "Duplicate credential label " + credential.label();
             }
-        }
-        boolean feature = hello.featureSet().contains(RunnerMessages.FEATURE_HOST_ISOLATION);
-        RunnerMessages.HelloIsolation isolation = hello.isolation();
-        if (feature && isolation == null) {
-            return "hello.features lists " + RunnerMessages.FEATURE_HOST_ISOLATION + " without hello.isolation";
-        }
-        if (!feature && isolation != null) {
-            return "hello.isolation is present without " + RunnerMessages.FEATURE_HOST_ISOLATION
-                    + " in hello.features";
-        }
-        if (isolation != null && isolation.level() != IsolationLevel.CONTAINER
-                && !hello.tiers().equals(EnumSet.of(IsolationTier.MICROVM))) {
-            return "hello.isolation.level " + isolation.level().wire()
-                    + " needs hello.isolationTiers to be all microvm, not " + hello.isolationTiers();
         }
         return null;
     }
@@ -187,8 +170,8 @@ class RunnerHostSessions {
 
     /**
      * Records the host facts, its ceiling, the runtimes it can run, its version and what it reports about its isolation
-     * (ADR-0113: its tiers, and with {@code host.isolation} its level; a hello without the feature clears the level),
-     * and a machine's credentials. A change of the level, the hardening or the operator's statement is audited
+     * (ADR-0113: the level of {@code isolationTiers}, gVisor, the hardening and the operator's statement), and a
+     * machine's credentials. A change of the level, gVisor, the hardening or the operator's statement is audited
      * {@code runner_host.isolation_changed} by SYSTEM, once per change and not at every hello, in the chain of each
      * company the host is in: a host's own report changes where its runs may go (decision 4), with no admin's act.
      *
@@ -224,19 +207,21 @@ class RunnerHostSessions {
             boolean credentialsRefused = refused;
             Optional<HelloOutcome> outcome = store.desiredConfig(target)
                 .map(config -> new HelloOutcome(hostConfig(config), credentialsRefused));
-            if (isolation.levelDiffers(before.get())) {
+            if (isolation.differs(before.get())) {
                 auditIsolationChanged(host, before.get(), isolation);
             }
             return outcome;
         });
     }
 
-    /** What the hello reports about the host's isolation: its tiers, and its level only with the feature. */
+    /**
+     * What the hello reports about the host's isolation: the level of its tier, the weakest of {@code isolationTiers}
+     * ({@code gvisor} is {@code container}, and so is each tier of protocol 1), and in protocol 2 its hardening and the
+     * operator's statement.
+     */
     static RunnerHostStore.Isolation isolation(RunnerMessages.Hello hello) {
-        RunnerMessages.HelloIsolation reported = hello.reportedIsolation();
-        return reported == null ? new RunnerHostStore.Isolation(hello.tiers(), null, null, false)
-                : new RunnerHostStore.Isolation(hello.tiers(), reported.level(), reported.hardened(),
-                        reported.statedByOperator());
+        IsolationTier tier = hello.tier();
+        return new RunnerHostStore.Isolation(tier.level(), tier.gvisor(), hello.hardening(), hello.stated());
     }
 
     /**
@@ -257,6 +242,8 @@ class RunnerHostSessions {
         Map<String, @Nullable Object> details = new LinkedHashMap<>();
         details.put("oldLevel", before.level() != null ? before.level().wire() : null);
         details.put("newLevel", after.level() != null ? after.level().wire() : null);
+        details.put("oldGvisor", before.gvisor());
+        details.put("newGvisor", after.gvisor());
         details.put("oldHardened", before.hardened() != null ? before.hardened().wire() : null);
         details.put("newHardened", after.hardened() != null ? after.hardened().wire() : null);
         details.put("oldStated", before.stated());

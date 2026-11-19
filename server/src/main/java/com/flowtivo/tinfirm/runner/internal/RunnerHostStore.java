@@ -24,7 +24,6 @@ import com.flowtivo.tinfirm.runner.Hardening;
 import com.flowtivo.tinfirm.runner.HostCredentialInfo;
 import com.flowtivo.tinfirm.runner.HostScope;
 import com.flowtivo.tinfirm.runner.IsolationLevel;
-import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
@@ -56,8 +55,8 @@ class RunnerHostStore {
             coalesce(m.runtimes, h.runtimes) AS runtimes,
             coalesce(m.runner_version, h.runner_version) AS runner_version,
             coalesce(m.hostname, h.hostname) AS hostname, coalesce(m.os, h.os) AS os, coalesce(m.arch, h.arch) AS arch,
-            coalesce(m.isolation_tiers, h.isolation_tiers) AS isolation_tiers,
             coalesce(m.isolation_level, h.isolation_level) AS isolation_level,
+            coalesce(m.isolation_gvisor, h.isolation_gvisor) AS isolation_gvisor,
             coalesce(m.isolation_hardened, h.isolation_hardened) AS isolation_hardened,
             coalesce(m.isolation_stated, h.isolation_stated) AS isolation_stated,
             coalesce(m.last_seen_at, h.last_seen_at) AS last_seen_at, h.created_at""";
@@ -101,7 +100,7 @@ class RunnerHostStore {
      * @param draining               as last reported; meaningful only while the host is connected
      * @param appliedConfigVersion   the highest {@code config_version} the host confirmed, or null
      * @param isolation              what its latest {@code hello} reported about its isolation (ADR-0113); null before
-     *                               a hello of a server that stores it
+     *                               its first hello to a server of this release
      */
     record HostRow(UUID id, UUID companyId, String name, HostScope scope, @Nullable UUID ownerPrincipalId,
             @Nullable UUID personalHostId, int maxConcurrentRuns, int maxConcurrentRunsCeiling,
@@ -164,8 +163,8 @@ class RunnerHostStore {
     /**
      * Host facts reported in {@code hello}; {@code maxConcurrentRunsCeiling} is its {@code maxConcurrentRuns},
      * {@code runtimes} the runtimes of its {@code runtimes} (those whose images it found), {@code poolCeiling}
-     * its {@code pool.maxReady} when it lists {@code sandbox.pool} (else null), and {@code isolation} its tiers and
-     * the level it reports (ADR-0113).
+     * its {@code pool.maxReady} when it lists {@code sandbox.pool} (else null), and {@code isolation} what it reports
+     * about its isolation (ADR-0113).
      */
     record HelloFacts(String runnerVersion, @Nullable String hostname, @Nullable String os, @Nullable String arch,
             int maxConcurrentRunsCeiling, Set<RuntimeKind> runtimes, @Nullable Integer poolCeiling,
@@ -173,21 +172,19 @@ class RunnerHostStore {
     }
 
     /**
-     * What a host reports about its isolation (ADR-0113, decisions 1 to 3): the tiers of {@code isolationTiers}, and
-     * with the feature {@code host.isolation} its level, its hardening and whether the operator stated the level. A
-     * host without the feature has no level, no hardening, and {@code stated} false.
+     * What a host reports about its isolation (ADR-0113, decisions 1 to 3): the level of {@code isolationTiers},
+     * whether that tier was {@code gvisor}, the hardening ({@code hello.hardened}, absent {@code NO}) and whether the
+     * operator stated the level ({@code hello.isolationStated}). {@link #NONE} before the host's first hello to a
+     * server of this release: no level, no hardening, neither mark.
      */
-    record Isolation(Set<IsolationTier> tiers, @Nullable IsolationLevel level, @Nullable Hardening hardened,
-            boolean stated) {
+    record Isolation(@Nullable IsolationLevel level, boolean gvisor, @Nullable Hardening hardened, boolean stated) {
 
-        Isolation {
-            tiers = Set.copyOf(tiers);
-        }
+        static final Isolation NONE = new Isolation(null, false, null, false);
 
-        /** Whether the level, the hardening or the operator's statement differ: a change to audit. */
-        boolean levelDiffers(@Nullable Isolation other) {
-            return other == null ? level != null
-                    : level != other.level || hardened != other.hardened || stated != other.stated;
+        /** Whether the level, gVisor, the hardening or the operator's statement differ: a change to audit. */
+        boolean differs(Isolation other) {
+            return level != other.level || gvisor != other.gvisor || hardened != other.hardened
+                    || stated != other.stated;
         }
     }
 
@@ -445,29 +442,25 @@ class RunnerHostStore {
     /**
      * What the host's row holds about its isolation now, its row locked ({@code FOR NO KEY UPDATE}, CONVENTIONS §10:
      * a run's assignment to the host, a foreign key, does not wait for it) until the transaction ends: read before a
-     * {@code hello} replaces it, so that a change of the level is audited once. Empty when the host no longer exists;
-     * an {@link Isolation} of no tiers before the first hello that stored them.
+     * {@code hello} replaces it, so that a change is audited once. Empty when the host no longer exists;
+     * {@link Isolation#NONE} before its first hello to a server of this release.
      */
     Optional<Isolation> lockIsolation(Target target) {
-        return jdbc.sql("SELECT isolation_tiers, isolation_level, isolation_hardened, isolation_stated FROM "
+        return jdbc.sql("SELECT isolation_level, isolation_gvisor, isolation_hardened, isolation_stated FROM "
                 + target.table() + " WHERE id = ? FOR NO KEY UPDATE")
             .param(target.id())
             .query(RunnerHostStore::isolation)
             .optional()
-            .map(found -> found.orElse(new Isolation(Set.of(), null, null, false)));
+            .map(found -> found.orElse(Isolation.NONE));
     }
 
-    /** The isolation of a row's columns; empty when the host reported no tiers yet (before V085's first hello). */
+    /** The isolation of a row's columns; empty before the host's first hello to a server of this release. */
     private static Optional<Isolation> isolation(ResultSet rs, int row) throws SQLException {
-        Array tiers = rs.getArray("isolation_tiers");
-        if (tiers == null) {
+        IsolationLevel level = IsolationLevel.ofName(rs.getString("isolation_level"));
+        if (level == null) {
             return Optional.empty();
         }
-        Set<IsolationTier> stored = EnumSet.noneOf(IsolationTier.class);
-        for (Object tier : (Object[]) tiers.getArray()) {
-            stored.add(IsolationTier.valueOf((String) tier));
-        }
-        return Optional.of(new Isolation(stored, IsolationLevel.ofName(rs.getString("isolation_level")),
+        return Optional.of(new Isolation(level, rs.getBoolean("isolation_gvisor"),
                 Hardening.ofName(rs.getString("isolation_hardened")), rs.getBoolean("isolation_stated")));
     }
 
@@ -481,14 +474,13 @@ class RunnerHostStore {
         boolean found = jdbc.sql("UPDATE " + target.table() + """
                    SET runner_version = ?, hostname = ?, os = ?, arch = ?, max_concurrent_runs_ceiling = ?,
                        max_concurrent_runs = least(coalesce(desired_max_concurrent_runs, ?), ?), draining = false,
-                       runtimes = CAST(? AS varchar(16)[]), isolation_tiers = CAST(? AS varchar(16)[]),
-                       isolation_level = ?, isolation_hardened = ?, isolation_stated = ?, last_seen_at = ?
+                       runtimes = CAST(? AS varchar(16)[]), isolation_level = ?, isolation_gvisor = ?,
+                       isolation_hardened = ?, isolation_stated = ?, last_seen_at = ?
                  WHERE id = ?""")
             .params(facts.runnerVersion(), facts.hostname(), facts.os(), facts.arch(),
                     facts.maxConcurrentRunsCeiling(), facts.maxConcurrentRunsCeiling(),
                     facts.maxConcurrentRunsCeiling(), names(facts.runtimes()),
-                    isolation.tiers().stream().map(Enum::name).sorted().toArray(String[]::new),
-                    isolation.level() != null ? isolation.level().name() : null,
+                    isolation.level() != null ? isolation.level().name() : null, isolation.gvisor(),
                     isolation.hardened() != null ? isolation.hardened().name() : null, isolation.stated(), ts(now),
                     target.id())
             .update() == 1;

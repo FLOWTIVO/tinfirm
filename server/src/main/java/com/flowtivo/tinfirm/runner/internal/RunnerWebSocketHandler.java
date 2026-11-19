@@ -38,7 +38,9 @@ import com.flowtivo.tinfirm.shared.security.SystemContext;
  * <li>The first frame must be a valid {@code hello}, else the connection is closed with 1008; so is a hello that
  * lists {@code sandbox.pool} or {@code sandbox.elastic} while the licence in force does not hold
  * {@code ELASTIC_RUNNERS}, after an {@code error} {@code EDITION_REQUIRED} (ADR-0100, ADR-0114).
- * {@code sandbox.bridge} is accepted in every edition. Its {@code protocolVersion} must be 1 or 2, else the
+ * {@code sandbox.bridge} is accepted in every edition. So is a hello of protocol 2 whose {@code isolationTiers}
+ * carry {@code microvm}, after an {@code error} {@code UPGRADE_REQUIRED} that names the server's version (ADR-0113,
+ * decision 2). Its {@code protocolVersion} must be 1 or 2, else the
  * connection is closed with 1002 after an {@code error} {@code UNSUPPORTED_PROTOCOL}; the connection speaks that
  * version from then on (CONVENTIONS §14.10). The hello
  * records the host, its ceiling and version, and a personal host's credentials ({@link RunnerHostSessions}; a company
@@ -214,6 +216,19 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                 + ". Or apply a Pro or Enterprise licence key";
     }
 
+    /**
+     * The {@code error} message for a hello of protocol 2 that carries {@code microvm} (ADR-0113, decision 2): a Kata
+     * host or a host with a VM per run of an older release, which must take the server's release. It names the
+     * version to install, or says "this server's version" where the build does not name one.
+     */
+    static String microvmRefusal(@Nullable String serverVersion) {
+        String version = serverVersion != null ? "version " + serverVersion : "this server's version";
+        return "This runner host reports the isolation tier microvm, which this Tinfirm server (" + version
+                + ") no longer takes: a host now reports its level of isolation, container for Kata Containers and "
+                + "machine or vm-jail for a VM per run. Upgrade tinfirm-runner-host on this host to " + version
+                + ", the server's, and start it again. Hosts with Docker keep working until they are upgraded.";
+    }
+
     private void hello(WebSocketSession session, WebSocketSession out, ConnectedHost authenticated,
             RunnerMessages.Hello hello, List<String> unknownCredentialKinds) {
         if (!RunnerMessages.supported(hello.protocolVersion())) {
@@ -226,6 +241,14 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
         // From here on the connection speaks the host's version: its frames decode, and run.assign is built, for it.
         ConnectedHost host = authenticated.speaking(hello.protocolVersion());
         session.getAttributes().put(HOST, host);
+        if (hello.carriesMicrovm()) {
+            // A host to upgrade with the server (ADR-0113, decision 2): it stops, and does not reconnect, at 1008.
+            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.UPGRADE_REQUIRED,
+                    microvmRefusal(serverVersion)));
+            RunnerConnectionRegistry.close(out, CloseStatus.POLICY_VIOLATION.withReason(
+                    "Upgrade tinfirm-runner-host to " + (serverVersion != null ? serverVersion : "the server's version")));
+            return;
+        }
         String problem = RunnerHostSessions.helloProblem(hello);
         if (problem != null) {
             registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.BAD_MESSAGE, problem));

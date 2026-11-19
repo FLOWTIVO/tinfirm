@@ -1073,6 +1073,22 @@ fn doctor_says_what_an_escape_reaches() {
         report.contains("the host's token and every run's git token"),
         "{report}"
     );
+    // Docker's runtime: Kata reports `container` (its VMM is root on this machine), gVisor
+    // `gvisor`; what an escape reaches is a container host's.
+    for (runtime, reports) in [
+        ("kata", "reports container, hardened no"),
+        ("runsc", "reports gvisor, hardened no"),
+    ] {
+        let report = doctor(&[("TINFIRM_RUNNER_SANDBOX_RUNTIME", runtime)]);
+        assert!(
+            report.contains(&format!("[info] isolation: {reports}")),
+            "{report}"
+        );
+        assert!(
+            report.contains("the host's token and every run's git token"),
+            "{report}"
+        );
+    }
     let report = doctor(&[
         ("TINFIRM_RUNNER_EXECUTOR", "vm"),
         ("TINFIRM_RUNNER_VM_DRIVER", "digitalocean"),
@@ -1087,8 +1103,18 @@ fn doctor_says_what_an_escape_reaches() {
         ("TINFIRM_RUNNER_VM_DRIVER", "/usr/local/bin/my-driver"),
     ];
     let report = doctor(&own);
+    // A driver of one's own without a statement: `container`, a warning, and how to state
+    // the level.
     assert!(
-        report.contains("[warn] isolation: reports none"),
+        report.contains("[warn] isolation: reports container, hardened no"),
+        "{report}"
+    );
+    assert!(
+        report.contains("a VM host shown as a container host"),
+        "{report}"
+    );
+    assert!(
+        report.contains("--isolation-level machine|vm-jail"),
         "{report}"
     );
     assert!(report.contains("as on a container host"), "{report}");
@@ -1101,8 +1127,26 @@ fn doctor_says_what_an_escape_reaches() {
         report.contains("[info] isolation: reports vm-jail, hardened no, stated by the operator"),
         "{report}"
     );
+    let report = doctor(&[
+        own[0],
+        own[1],
+        ("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine"),
+        ("TINFIRM_RUNNER_ISOLATION_HARDENED", "none"),
+    ]);
+    assert!(
+        report.contains("[info] isolation: reports machine, hardened none, stated by the operator"),
+        "{report}"
+    );
     let report = doctor(&[("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine")]);
     assert!(report.contains("[FAIL] isolation"), "{report}");
+    let report = doctor(&[
+        ("TINFIRM_RUNNER_SANDBOX_RUNTIME", "runsc"),
+        ("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine"),
+    ]);
+    assert!(
+        report.contains("[FAIL] isolation: --isolation-level is for a VM driver of your own: with the Docker executor this host reports `gvisor` itself"),
+        "{report}"
+    );
 }
 
 #[test]

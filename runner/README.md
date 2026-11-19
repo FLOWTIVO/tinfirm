@@ -380,7 +380,7 @@ Testcontainers, `docker compose` and image builds ([ADR-0025](../docs/adr/0025-k
 
 | Option | Variable | Effect |
 |---|---|---|
-| `run --sandbox-runtime <name>` | `TINFIRM_RUNNER_SANDBOX_RUNTIME` | The Docker runtime of every sandbox, for example `kata`. Default: Docker's default (runc). `run` refuses a runtime that Docker does not know. The tier follows the name: `kata…` is `microvm`, `runsc…` is `gvisor`, anything else is `container` |
+| `run --sandbox-runtime <name>` | `TINFIRM_RUNNER_SANDBOX_RUNTIME` | The Docker runtime of every sandbox, for example `kata`. Default: Docker's default (runc). `run` refuses a runtime that Docker does not know. The host reports `gvisor` for a `runsc…` name and `container` for any other, a `kata…` one included ([Isolation level](#isolation-level)) |
 | `run --sandbox-docker` | `TINFIRM_RUNNER_SANDBOX_DOCKER` (`1`, `true`) | The agent gets its own dockerd in the sandbox (below) |
 | `run --egress-proxy`, `--egress-allow HOST[:PORT]`, `--egress-allow-private` | `TINFIRM_RUNNER_EGRESS_PROXY`, `TINFIRM_RUNNER_EGRESS_ALLOW` (one entry per line), `TINFIRM_RUNNER_EGRESS_ALLOW_PRIVATE` | The sandboxes reach the network only through the host's egress proxy, to the agent's model, the mirrors of `--sandbox-env` and the allowed hosts ([below](#egress-proxy)) |
 | `run --model-proxy-local-gateway ORIGIN`, `--egress-allow-private` | `TINFIRM_RUNNER_MODEL_PROXY_LOCAL_GATEWAY`, `TINFIRM_RUNNER_EGRESS_ALLOW_PRIVATE` | The [model proxy](#model-proxy), which keeps a gateway's key on this host, is always on and has no option of its own. These two only widen where the gateway may be: the one gateway on this machine, or a private address. `--model-proxy` (`TINFIRM_RUNNER_MODEL_PROXY`) is accepted by 0.2.0 and 0.3.0 and does nothing |
@@ -465,16 +465,18 @@ mirror settings, and builds the images. By hand, on a machine with `/dev/kvm`:
 4. `docker run --rm --runtime kata alpine uname -r` prints a kernel other than this
    machine's, and `doctor` lists `kata` under "docker runtimes".
 5. Start `run --sandbox-runtime kata --sandbox-docker --sandbox-env …`. Its log line
-   `runner host starting` shows `sandbox_runtime`, `isolation_tier`, `sandbox_docker` and
-   the names of the extra variables.
+   `runner host starting` shows `sandbox_runtime`, `sandbox_family` (`kata`), `sandbox_docker`
+   and the names of the extra variables; the next line, the level of isolation, is `container`
+   ([Isolation level](#isolation-level)).
 
 ## Isolation level
 
-A host with protocol 2 reports its level of isolation: the strongest wall between an agent's code
-and the credentials ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md)). It lists the
-feature `host.isolation` in its `hello` and sends `hello.isolation`: the level, and whether the
-machine that runs its VMs is hardened beyond the jail (`yes`, `no`, or `none` when the host runs no
-machine of its own for its VMs).
+A host reports its level of isolation: the strongest wall between an agent's code and the
+credentials ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md)). With protocol 2 it
+sends it as the one value of `hello.isolationTiers`, with `hello.hardened`, whether the machine that
+runs its VMs is hardened beyond the jail (`yes`, `no`, or `none` when the host runs no machine of its
+own for its VMs; left out for `no`), and `hello.isolationStated: true` when the level rests on your
+statement.
 
 | Level | The wall | Where the credentials are | What an escape from a sandbox reaches |
 |---|---|---|---|
@@ -482,22 +484,32 @@ machine of its own for its VMs).
 | `vm-jail` | A jail around each VM | On the same machine, out of a VMM's user's reach | Through the VMM, one jailed user that reads no credential; through a flaw of the kernel under the VMs, the machine with every credential |
 | `container` | The container and the kernel | On the same machine, behind the kernel alone | This machine, which holds the host's token and every run's git token, and the other runs on it |
 
+`gvisor` is a `container` host whose runtime is `runsc…`; the server places it as `container`.
+
 The host derives its level from what it can see, and only takes your word where it cannot:
 
-| This host | Reports | Hardened |
+| This host | `isolationTiers` | `hardened` |
 |---|---|---|
-| Docker, whatever `--sandbox-runtime` (runc, `runsc…`, `kata…`; the tier stays `container`, `gvisor` or `microvm`) | `container` | `no` |
+| Docker with runc, or with a `kata…` `--sandbox-runtime` | `container` | left out (`no`) |
+| Docker with a `runsc…` `--sandbox-runtime` | `gvisor` | left out (`no`) |
 | `--executor vm --vm-driver digitalocean` | `machine` | `none` |
-| `--executor vm --vm-driver node`, every node over its local socket ([Sandbox nodes](#sandbox-nodes)) | `vm-jail` | `no` |
-| `--executor vm --vm-driver node`, every node over TLS at an address that is not this host's own | `machine` | `no` |
-| `--executor vm` with a driver of your own | What `--isolation-level` states, marked as stated (`"stated": true`), or no level | `--isolation-hardened` |
-| Protocol 1 | No level | |
+| `--executor vm --vm-driver node`, every node over its local socket ([Sandbox nodes](#sandbox-nodes)) | `vm-jail` | left out (`no`) |
+| `--executor vm --vm-driver node`, every node over TLS at an address that is not this host's own | `machine` | left out (`no`) |
+| `--executor vm` with a driver of your own and `--isolation-level` | What `--isolation-level` states, with `"isolationStated": true` | What `--isolation-hardened` states |
+| `--executor vm` with a driver of your own and no `--isolation-level` | `container` | left out (`no`) |
+| Protocol 1 | `container` | not sent |
 
+- **Kata Containers.** A Kata host reports `container`: its sandboxes are VMs, but the VMM runs as
+  root on the machine that holds the credentials, so an escape through it reaches them. It still
+  runs every sandbox as a Kata VM through Docker, and still takes `--sandbox-docker`
+  ([Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox)); only
+  what it reports is `container`.
 - **A driver of your own.** The host cannot see where your driver runs the VMs. State the level
   with `--isolation-level machine` (the VMs run on other machines than this host, which hold no
   credential) or `vm-jail` (each VM's VMM runs in a jail of its own on this machine), and
-  `--isolation-hardened yes|no|none`. Without them the host reports no level and says so at its
-  start; the server then places its runs as on a container host.
+  `--isolation-hardened yes|no|none`. Without them the host reports `container`, and says so at
+  its start and in `doctor`, with how to state the level: it is a VM host shown as a container
+  host until you state its level.
 - **A statement never overrides what the host can see:** `run` refuses `--isolation-level` with
   the Docker executor, with `--vm-driver digitalocean` and with `--vm-driver node`.
 - **The node driver's hardening** is `no` for now: the node agent's checks of a hardened machine,
@@ -506,9 +518,16 @@ The host derives its level from what it can see, and only takes your word where 
 - **Where it shows.** `run` logs the level at its start, with what an escape from a sandbox reaches
   on such a host. `doctor` says the same for the settings in its environment
   (`TINFIRM_RUNNER_EXECUTOR`, `TINFIRM_RUNNER_VM_DRIVER`, `TINFIRM_RUNNER_ISOLATION_*`; it does not
-  see `run`'s flags). The server stores the level and shows it on the host's page as reported; it
-  checks neither value. Placing an agent's runs by level is planned on the server
+  see `run`'s flags). The server stores the level and shows it on the host's page as reported,
+  places runs by it, and checks neither value
   ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 4).
+- **Hosts and server take this release together.** `microvm` is no value any more: a server of
+  this release refuses a hello that carries it, and a server of an earlier release refuses a host
+  of this release that reports `machine` or `vm-jail`. A host that reports `container` or
+  `gvisor` works with either; a host with a VM per run, and a Kata host of an earlier release
+  (which sent `microvm`), is upgraded with the server
+  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 2, which amends
+  [ADR-0109](../docs/adr/0109-runner-version-is-the-release-version.md) for this one change).
 
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
@@ -639,7 +658,8 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   line names (`tinfirm.user-data=disk:/dev/vdb`: a sandbox node's VM gets it on a small read-only
   disk, ADR-0112), or else from DigitalOcean's metadata service; one VM image serves both.
 - **Always on:** the sandbox bridge, and the [egress proxy](#egress-proxy), which is the VM's only way
-  to the network (`--egress-allow` works as with Docker). The tier is `microvm`.
+  to the network (`--egress-allow` works as with Docker). The level it reports depends on the
+  driver ([Isolation level](#isolation-level)).
 - **No images on this host**: the VM's image holds the runner images, built when the image is
   built (below), and `run` rebuilds none.
 - **`--sandbox-docker` needs no Kata here**: the VM is the boundary, and the agent is root in it, as
@@ -956,7 +976,7 @@ The host speaks one runner protocol version per connection and names it in
 | Version | Schema | What it is |
 |---|---|---|
 | 1 | [`protocol/runner-v1.schema.json`](../protocol/runner-v1.schema.json) | The frames and tools before the restart: `run.ask`, `run.repository_request`, `run.task_create` and their acks; the tools `ask_human`, `finish_run`, `request_repository`, `create_task`, `upload_attachment`, `list_repositories`. For a server from before protocol v2: the current server accepts a v1 host but sends it no runs. |
-| 2 | [`protocol/runner-v2.schema.json`](../protocol/runner-v2.schema.json) | The protocol of the current server ([docs/PLATFORM.md §11.1](../docs/PLATFORM.md#111-the-runner)): one generic `run.request` / `run.request.ack` pair for every platform request (kinds `ASK`, `ACCESS`, `ARTIFACT`, `NETWORK`, `TOOL`), the server-executed tools of `run.assign.tools`, the writable [`/output`](#output-protocol-v2) folder and `run.finished.artifacts`, `run.finished.resumed` and `resumeOutcome`, the cache writes apart from the input in the usage (`cacheWriteTokens`), `run.assign.workItem` and `job` in place of `task` (the current server fills both with the conversation), `microvm` among the isolation tiers, and `welcome.protocolVersion`. The tools are renamed: `ask`, `finish`, `request_access`, `save_artifact`, `list_repositories`; `create_task` is gone. The default. |
+| 2 | [`protocol/runner-v2.schema.json`](../protocol/runner-v2.schema.json) | The protocol of the current server ([docs/PLATFORM.md §11.1](../docs/PLATFORM.md#111-the-runner)): one generic `run.request` / `run.request.ack` pair for every platform request (kinds `ASK`, `ACCESS`, `ARTIFACT`, `NETWORK`, `TOOL`), the server-executed tools of `run.assign.tools`, the writable [`/output`](#output-protocol-v2) folder and `run.finished.artifacts`, `run.finished.resumed` and `resumeOutcome`, the cache writes apart from the input in the usage (`cacheWriteTokens`), `run.assign.workItem` and `job` in place of `task` (the current server fills both with the conversation), the level of isolation in `hello.isolationTiers` (`machine`, `vm-jail`, `container` or `gvisor`) with `hello.hardened` and `hello.isolationStated`, and `welcome.protocolVersion`. The tools are renamed: `ask`, `finish`, `request_access`, `save_artifact`, `list_repositories`; `create_task` is gone. The default. |
 
 - **Choosing.** `config.json` holds `protocolVersion` (2 when the field is missing, as in a
   file written before this version); `run --protocol-version 1` (or
@@ -976,10 +996,10 @@ The host speaks one runner protocol version per connection and names it in
 - **Frames of the other version** (a `run.ask.ack` for a v2 host, a `run.request.ack` for a
   v1 host) are answered with `error` `UNKNOWN_TYPE`, as the schemas demand. The host reads a
   `run.assign` of either shape (`task` or `workItem`), whatever version it speaks.
-- **Isolation tiers.** With version 2 `hello.isolationTiers` names the tier of the sandbox
-  runtime: `microvm` for a `kata…` runtime, `gvisor` for `runsc…`, else `container`. With
-  version 1 the host reports `container` as before: `microvm` is an additive change of the
-  v1 schema that a server from before protocol v2 refuses.
+- **Isolation tiers.** With version 2 `hello.isolationTiers` holds the host's one level of
+  isolation ([Isolation level](#isolation-level)): `machine`, `vm-jail`, `container`, or
+  `gvisor` for a `runsc…` runtime. With version 1 the host reports `container` as before, and
+  no `hardened` or `isolationStated`. A host of this release never sends `microvm`.
 - **Optional features.** A v2 host lists in `hello.features` what it implements beyond v2, and
   the server sends a feature's frames only to a host that lists it. This host lists `run.steer`
   ([Steering](#steering-protocol-v2)), `session.bundle`
@@ -1005,7 +1025,7 @@ Three numbers, each moved by something else
 | The features | `hello.features` | A new optional capability within protocol 2, whatever release ships it | Sends a feature's frames only to a host that lists it |
 
 **This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
-It uses the features `run.steer`, `run.skills`, `session.bundle`, `host.isolation`,
+It uses the features `run.steer`, `run.skills`, `session.bundle`,
 `sandbox.bridge`, `sandbox.pool` and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
 [ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). A host that lists none of them
 still takes turns; it only misses what they add.
@@ -1016,7 +1036,13 @@ features: the server sends a run paid by a budget to any host of protocol 2, and
 refuses a model request without the host's token.
 
 So **any runner host release that speaks a protocol the server supports works with it**: upgrade
-hosts and server in either order. A build from `main` or the `rolling` prerelease reports the
+hosts and server in either order, with one exception. **The level of isolation** changed the
+values of `hello.isolationTiers` in this release ([Isolation level](#isolation-level)): a server
+of this release refuses `microvm`, which a host of an earlier release with a VM per run or Kata
+sends, and a server of an earlier release refuses `machine` and `vm-jail`, which a host of this
+release with a VM per run sends. Such hosts and the server take this release together
+([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 2, which amends
+ADR-0109 for this one change); a host that reports `container` or `gvisor` works with either. A build from `main` or the `rolling` prerelease reports the
 development version (`0.1.0-SNAPSHOT`) in `hello`; its `--version` adds what it was published
 as, such as `0.1.0-SNAPSHOT (rolling-abc1234)` (`TINFIRM_RUNNER_BUILD` at build time).
 

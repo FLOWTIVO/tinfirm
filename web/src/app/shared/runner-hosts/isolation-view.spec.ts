@@ -9,11 +9,11 @@ import {
 } from './isolation-view';
 
 function isolation(overrides: Partial<RunnerHostIsolation> = {}): RunnerHostIsolation {
-  return { tiers: ['MICROVM'], level: 'MACHINE', hardened: 'NONE', stated: false, ...overrides };
+  return { level: 'MACHINE', gvisor: false, hardened: 'NONE', stated: false, ...overrides };
 }
 
 describe('a runner host’s isolation (ADR-0113)', () => {
-  it('shows nothing before the host’s first report', () => {
+  it('shows nothing before the host’s first hello to a server of this release', () => {
     expect(isolationLines(null)).toBeNull();
     expect(isolationLines(undefined)).toBeNull();
   });
@@ -23,7 +23,6 @@ describe('a runner host’s isolation (ADR-0113)', () => {
     expect(lines.reports).toBe('Reports machine');
     expect(lines.hardening).toContain('provider’s hypervisor is the boundary');
     expect(lines.reaches).toContain('credentials are on another machine');
-    expect(lines.tiers).toBe('Tier microvm');
   });
 
   it.each<[RunnerHostIsolation['level'], string, string]>([
@@ -34,6 +33,15 @@ describe('a runner host’s isolation (ADR-0113)', () => {
     const lines = isolationLines(isolation({ level, hardened: 'NO' }))!;
     expect(lines.reports).toBe(reports);
     expect(lines.reaches).toContain(reaches);
+  });
+
+  it('names gVisor on a container host', () => {
+    const lines = isolationLines(isolation({ level: 'CONTAINER', gvisor: true, hardened: 'NO' }))!;
+    expect(lines.reports).toBe('Reports container with gVisor');
+    expect(lines.reaches).toContain('behind gVisor and the kernel');
+    expect(
+      isolationLines(isolation({ level: 'CONTAINER', gvisor: true, stated: true }))!.reports,
+    ).toBe('Reports container with gVisor, stated by the operator');
   });
 
   it('marks a level the operator stated', () => {
@@ -48,14 +56,6 @@ describe('a runner host’s isolation (ADR-0113)', () => {
     ['NONE', 'No machine of its own'],
   ])('shows the hardening %s', (hardened, words) => {
     expect(isolationLines(isolation({ hardened }))!.hardening).toMatch(new RegExp(`^${words}`));
-  });
-
-  it('shows a host without a level with its tier, placed as a container host', () => {
-    const lines = isolationLines({ tiers: ['MICROVM'], stated: false })!;
-    expect(lines.reports).toBe('Reports no level: its runs are placed as on a container host.');
-    expect(lines.tiers).toBe('Tier microvm');
-    expect(lines.hardening).toBeNull();
-    expect(lines.reaches).toBeNull();
   });
 });
 

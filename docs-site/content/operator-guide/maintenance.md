@@ -162,7 +162,7 @@ Keep the old host name pointing at Tinfirm, redirecting to the new one, for as l
 
 ## Upgrade runner hosts
 
-Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
+Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. For the release that reports levels of isolation, upgrade every host with a VM per run or Kata Containers right after the server: the new server refuses a host of an older release of those kinds, which stops with the error `UPGRADE_REQUIRED` and the server's version, and turns that only those hosts may run wait until then. Hosts with Docker keep working and can follow at any time. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
 
 ## The Compose stack
 

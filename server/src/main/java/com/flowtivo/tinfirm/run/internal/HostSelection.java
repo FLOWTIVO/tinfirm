@@ -16,8 +16,8 @@ import com.flowtivo.tinfirm.runner.RunnerHostInfo;
  * has confirmed its capacity on that connection, speaks runner protocol v2, does not drain and has a free slot under
  * its dispatch limit. Of those, for a session that moves with its bundle, a host of its level that restores it wins;
  * then the conversation's previous host, so that the turn resumes its session there; then the stronger host by its
- * level and hardening ({@link Isolation#rank}, ADR-0113: the dispatcher hands it the hosts of one level, and the
- * session's host); else the one with the most free slots, then the first by name, so that runs spread over the hosts.
+ * level and hardening ({@link Isolation#rank}, ADR-0113: the dispatcher hands it the hosts that take one level, the
+ * payer's stronger personal hosts among them, and the session's host); else the one with the most free slots, then the first by name, so that runs spread over the hosts.
  * When none takes it, the queue reason says why, about the one eligible host when there is only one.
  */
 final class HostSelection {
@@ -141,7 +141,7 @@ final class HostSelection {
         // A free host of the level that restores a moving session first; then the session's (or previous) host; then
         // the stronger by level and hardening, the one with more room, the name.
         Comparator<Host> restoring = Comparator.comparing(host -> !(restorersOf != null && host.restores()
-                && Isolation.placedAt(host.info()) == restorersOf));
+                && Isolation.takes(host.info(), restorersOf)));
         Comparator<Host> previous = Comparator.comparing(host -> !host.info().id().equals(previousHost));
         return new Chosen(free.stream()
             .min(restoring.thenComparing(previous)

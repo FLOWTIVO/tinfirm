@@ -3,6 +3,7 @@ package com.flowtivo.tinfirm.runner;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -82,6 +83,14 @@ public final class RunnerMessages {
      * (ADR-0100, ADR-0114). The connection is closed with 1008, and the host does not reconnect.
      */
     public static final String EDITION_REQUIRED = "EDITION_REQUIRED";
+
+    /**
+     * A {@code hello} of protocol 2 whose {@code isolationTiers} carry {@code microvm}, before {@code welcome}: a Kata
+     * host or a host with a VM per run of a release before ADR-0113's levels, which must be upgraded to the server's
+     * release (ADR-0113, decision 2). The connection is closed with 1008, and the host does not reconnect: a released
+     * host logs the {@code error}'s code and message, whatever the code, and stops at a close of 1008.
+     */
+    public static final String UPGRADE_REQUIRED = "UPGRADE_REQUIRED";
 
     /**
      * The {@code error} code, and the {@code run.request.ack} code, of a frame refused because its host, its company or
@@ -177,13 +186,6 @@ public final class RunnerMessages {
      */
     public static final String FEATURE_SANDBOX_ELASTIC = "sandbox.elastic";
 
-    /**
-     * The optional feature of protocol 2 ({@code hello.features}) whose host reports its level of isolation and its
-     * hardening in {@code hello.isolation} (ADR-0113, decisions 1 to 3). It adds no frame. {@code hello.isolation} is
-     * required with it and not allowed without it; a host without it reports no level.
-     */
-    public static final String FEATURE_HOST_ISOLATION = "host.isolation";
-
     /** The largest session bundle, compressed ({@code run.assign.sessionBundle.sizeBytes} maximum): 32 MiB. */
     public static final int MAX_SESSION_BUNDLE_BYTES = 32 * 1024 * 1024;
 
@@ -266,41 +268,38 @@ public final class RunnerMessages {
      * The first frame of a runner host after connecting. {@code maxConcurrentRuns} and each credential's
      * {@code poolSize} are the host's ceilings (archived v1 CONVENTIONS §14.8): 1 to 16 for a credential and a host
      * with Docker, up to 1000 for a host that creates a sandbox per run. {@code pool} comes with the feature
-     * {@link #FEATURE_SANDBOX_POOL}, {@code isolation} with {@link #FEATURE_HOST_ISOLATION} (ADR-0113): the schema
-     * says both, and {@code RunnerHostSessions.helloProblem} refuses a hello where the object and the feature, or the
-     * level and {@code isolationTiers}, disagree.
+     * {@link #FEATURE_SANDBOX_POOL}, as the schema says.
+     * <p>
+     * In protocol 2, {@code isolationTiers} carries the host's level of isolation and {@code hardened} and
+     * {@code isolationStated} what goes with it (ADR-0113, decisions 1 to 3); the server stores and shows them as
+     * reported and checks none. {@code microvm} is accepted here only so that the server can refuse it by name
+     * ({@link #UPGRADE_REQUIRED}); {@code machine} and {@code vm-jail} are no tiers of protocol 1
+     * ({@code RunnerMessageCodec}). An explicit {@code null} of either optional field, which the schema refuses, is
+     * read as absent.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Hello(@NotNull Integer protocolVersion,
             @NotBlank @Size(max = 100) String runnerVersion, @Nullable @Size(max = 255) String hostname,
             @Nullable @Size(max = 64) String os, @Nullable @Size(max = 64) String arch,
             @NotEmpty List<@NotNull @Pattern(regexp = "docker") String> executors,
-            @NotEmpty List<@NotNull @Pattern(regexp = "container|gvisor|microvm") String> isolationTiers,
+            @NotEmpty List<@NotNull @Pattern(regexp = "machine|vm-jail|container|gvisor|microvm") String> isolationTiers,
             @NotNull @Min(1) @Max(MAX_HOST_CAPACITY) Integer maxConcurrentRuns,
             @NotNull @Size(max = 100) List<@Valid @NotNull HelloCredential> credentials,
             @NotNull List<@Valid @NotNull HelloRuntime> runtimes,
             @Nullable List<@Valid @NotNull ActiveRun> activeRuns,
             @Nullable @Valid PublicSuffixListVersion publicSuffixList,
             @Nullable @Size(max = 50) List<@NotNull @Pattern(regexp = "^[a-z][a-z0-9._-]{0,63}$") String> features,
-            @Nullable @Valid HelloPool pool, @Nullable @Valid HelloIsolation isolation) implements Inbound {
+            @Nullable @Valid HelloPool pool, @Nullable Hardening hardened, @Nullable Boolean isolationStated)
+            implements Inbound {
 
-        /** A hello of a host before {@code hello.isolation}. */
+        /** A hello of a host before {@code hello.hardened} and {@code hello.isolationStated}. */
         public Hello(Integer protocolVersion, String runnerVersion, @Nullable String hostname, @Nullable String os,
                 @Nullable String arch, List<String> executors, List<String> isolationTiers, Integer maxConcurrentRuns,
                 List<HelloCredential> credentials, List<HelloRuntime> runtimes, @Nullable List<ActiveRun> activeRuns,
                 @Nullable PublicSuffixListVersion publicSuffixList, @Nullable List<String> features,
                 @Nullable HelloPool pool) {
             this(protocolVersion, runnerVersion, hostname, os, arch, executors, isolationTiers, maxConcurrentRuns,
-                    credentials, runtimes, activeRuns, publicSuffixList, features, pool, null);
-        }
-
-        /** A hello of a host before {@code hello.pool}. */
-        public Hello(Integer protocolVersion, String runnerVersion, @Nullable String hostname, @Nullable String os,
-                @Nullable String arch, List<String> executors, List<String> isolationTiers, Integer maxConcurrentRuns,
-                List<HelloCredential> credentials, List<HelloRuntime> runtimes, @Nullable List<ActiveRun> activeRuns,
-                @Nullable PublicSuffixListVersion publicSuffixList, @Nullable List<String> features) {
-            this(protocolVersion, runnerVersion, hostname, os, arch, executors, isolationTiers, maxConcurrentRuns,
-                    credentials, runtimes, activeRuns, publicSuffixList, features, null, null);
+                    credentials, runtimes, activeRuns, publicSuffixList, features, pool, null, null);
         }
 
         /** The optional features the host lists; empty when it lists none. */
@@ -308,7 +307,7 @@ public final class RunnerMessages {
             return features != null ? Set.copyOf(features) : Set.of();
         }
 
-        /** The tiers of {@code isolationTiers}, which the schema and the constraints allow only by name. */
+        /** The tiers of {@code isolationTiers}, which the constraints allow only by name. */
         public Set<IsolationTier> tiers() {
             Set<IsolationTier> tiers = EnumSet.noneOf(IsolationTier.class);
             isolationTiers.forEach(tier -> tiers.add(IsolationTier.ofWire(tier)));
@@ -316,13 +315,34 @@ public final class RunnerMessages {
         }
 
         /**
-         * The isolation the host reports (ADR-0113): {@code isolation} while a host of protocol 2 lists
-         * {@link #FEATURE_HOST_ISOLATION}, else null, the level of a host that reports none. The level is a feature of
-         * protocol 2 (decision 2): a hello of protocol 1 reports none, whatever it carries.
+         * The host's tier: the weakest of {@code isolationTiers}. A host sends one value; one that sends several is
+         * placed by the weakest wall it reports (ADR-0113).
          */
-        public @Nullable HelloIsolation reportedIsolation() {
+        public IsolationTier tier() {
+            return tiers().stream().max(Comparator.naturalOrder()).orElseThrow();
+        }
+
+        /** Whether this is a hello of protocol 2 that carries {@code microvm}, which the server refuses. */
+        public boolean carriesMicrovm() {
             return protocolVersion != null && protocolVersion == PROTOCOL_V2
-                    && featureSet().contains(FEATURE_HOST_ISOLATION) ? isolation : null;
+                    && tiers().contains(IsolationTier.MICROVM);
+        }
+
+        /**
+         * The hardening the host reports: {@code hardened} in protocol 2, absent {@link Hardening#NO}; always
+         * {@code NO} in protocol 1, which has no such field.
+         */
+        public Hardening hardening() {
+            return v2() && hardened != null ? hardened : Hardening.NO;
+        }
+
+        /** Whether the operator stated the level: {@code isolationStated} in protocol 2, absent false. */
+        public boolean stated() {
+            return v2() && Boolean.TRUE.equals(isolationStated);
+        }
+
+        private boolean v2() {
+            return protocolVersion != null && protocolVersion == PROTOCOL_V2;
         }
 
         /** The operator's ceiling of ready sandboxes of a host with {@link #FEATURE_SANDBOX_POOL}; else null. */
@@ -333,22 +353,6 @@ public final class RunnerMessages {
 
     /** {@code hello.pool} (ADR-0099): the operator's {@code --pool-max-ready}; 0 turns ready sandboxes off. */
     public record HelloPool(@NotNull @Min(0) @Max(MAX_HOST_CAPACITY) Integer maxReady) {
-    }
-
-    /**
-     * {@code hello.isolation} (ADR-0113, the feature {@link #FEATURE_HOST_ISOLATION}): the host's level of isolation
-     * and whether the machine that runs its VMs is hardened, as it reports them. Reported, never checked (decision 3).
-     *
-     * @param stated true when the level rests on the operator's statement in the host's configuration and not on what
-     *               the host can see; absent is false
-     */
-    public record HelloIsolation(@NotNull IsolationLevel level, @NotNull Hardening hardened,
-            @Nullable Boolean stated) {
-
-        /** Whether the operator stated the level ({@code stated}, absent: false). */
-        public boolean statedByOperator() {
-            return Boolean.TRUE.equals(stated);
-        }
     }
 
     /**

@@ -130,9 +130,11 @@ public enum AuditAction {
     RUNNER_HOST_REMOVED("runner_host.removed"),
     RUNNER_HOST_UPDATED("runner_host.updated"),
     /**
-     * What a runner host reports about its isolation changed at its {@code hello} (ADR-0113): {@code oldLevel},
-     * {@code newLevel}, {@code oldHardened}, {@code newHardened}, {@code oldStated}, {@code newStated} (a level and a
-     * hardening in their protocol names, null for none). By SYSTEM, in the chain of each company the host is in.
+     * What a runner host reports about its isolation changed at its {@code hello} (ADR-0113): its level, gVisor, its
+     * hardening or the operator's statement. {@code oldLevel}, {@code newLevel}, {@code oldGvisor}, {@code newGvisor},
+     * {@code oldHardened}, {@code newHardened}, {@code oldStated}, {@code newStated} (a level and a hardening in their
+     * protocol names; the old ones null before the host's first hello to a server of this release). By SYSTEM, in the
+     * chain of each company the host is in.
      */
     RUNNER_HOST_ISOLATION_CHANGED("runner_host.isolation_changed"),
     /**

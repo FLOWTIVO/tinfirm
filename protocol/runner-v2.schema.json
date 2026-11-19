@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://tinfirm.dev/protocol/runner-v2.schema.json",
   "title": "Tinfirm runner protocol v2",
-  "description": "Messages on the WebSocket between a runner host and the server (GET /api/runner/v1/connect, header `Authorization: Bearer <runner host token>`). Every frame is one UTF-8 JSON text message that matches `Message`. Unknown fields must be ignored; unknown message types must be answered with an `error` and otherwise ignored. Protocol v2 (ADR-0039; CONVENTIONS §14.10) is v1 (runner-v1.schema.json) with one generic request pair, `run.request` and `run.request.ack`, in place of `run.ask`, `run.repository_request`, `run.task_create` and their acks; the server-executed tools of a run in `run.assign.tools`; `run.assign.workItem` and `job` in place of `task` (both name the run's conversation since the redesign of 2026-10-12); the writable `/output` folder of the sandbox, whose files the host saves as artifacts and lists in `run.finished.artifacts`; `microvm` among the isolation tiers; and `welcome.protocolVersion`. The host chooses the version with `hello.protocolVersion`; the server accepts both and answers with the version it speaks. Epochs, leases, events, capacity and everything else are as in v1. Every host of protocol 2 has the always-on model proxy (a gateway's run gets the proxy's address and never its one-run token in the sandbox) and sends its own runner host token in `X-Tinfirm-Runner-Token` with every request to the server's model relay; no feature names these, since no host of protocol 2 lacks them, and the server relies on both (ADR-0109). Compatibility is this version and `hello.features`, never `hello.runnerVersion`. Optional features, which a host lists in `hello.features`, add frames to v2 without a new version: `run.steer` and `run.steer.ack` (feature `run.steer`), `run.assign.skills` (feature `run.skills`), `run.assign.sessionBundle` with `run.finished.sessionBundle` (feature `session.bundle`), `hello.pool`, `host.config.pool`, `host.config.applied.pool` with `host.pool.status` (feature `sandbox.pool`, ADR-0099), and `hello.isolation` (feature `host.isolation`, ADR-0113); the features `sandbox.bridge` and `sandbox.elastic` add no frame. The server's licence decides which features a hello may list (ADR-0114): `sandbox.bridge` in every edition, `sandbox.pool` and `sandbox.elastic` only with elastic runners (ADR-0100).",
+  "description": "Messages on the WebSocket between a runner host and the server (GET /api/runner/v1/connect, header `Authorization: Bearer <runner host token>`). Every frame is one UTF-8 JSON text message that matches `Message`. Unknown fields must be ignored; unknown message types must be answered with an `error` and otherwise ignored. Protocol v2 (ADR-0039; CONVENTIONS §14.10) is v1 (runner-v1.schema.json) with one generic request pair, `run.request` and `run.request.ack`, in place of `run.ask`, `run.repository_request`, `run.task_create` and their acks; the server-executed tools of a run in `run.assign.tools`; `run.assign.workItem` and `job` in place of `task` (both name the run's conversation since the redesign of 2026-10-12); the writable `/output` folder of the sandbox, whose files the host saves as artifacts and lists in `run.finished.artifacts`; the host's level of isolation in `hello.isolationTiers` (`machine`, `vm-jail`, `container`, `gvisor`) with `hello.hardened` and `hello.isolationStated` beside it (ADR-0113); and `welcome.protocolVersion`. The host chooses the version with `hello.protocolVersion`; the server accepts both and answers with the version it speaks. Epochs, leases, events, capacity and everything else are as in v1. Every host of protocol 2 has the always-on model proxy (a gateway's run gets the proxy's address and never its one-run token in the sandbox) and sends its own runner host token in `X-Tinfirm-Runner-Token` with every request to the server's model relay; no feature names these, since no host of protocol 2 lacks them, and the server relies on both (ADR-0109). Compatibility is this version and `hello.features`, never `hello.runnerVersion`, with one exception made once: `hello.isolationTiers` changed its values in place from tiers to levels (ADR-0113, decision 2, which amends ADR-0109 for this change), so the server refuses `microvm` with an `error` `UPGRADE_REQUIRED`, and a server and its hosts with a VM per run or Kata take the same release. Optional features, which a host lists in `hello.features`, add frames to v2 without a new version: `run.steer` and `run.steer.ack` (feature `run.steer`), `run.assign.skills` (feature `run.skills`), `run.assign.sessionBundle` with `run.finished.sessionBundle` (feature `session.bundle`), and `hello.pool`, `host.config.pool`, `host.config.applied.pool` with `host.pool.status` (feature `sandbox.pool`, ADR-0099); the features `sandbox.bridge` and `sandbox.elastic` add no frame. The server's licence decides which features a hello may list (ADR-0114): `sandbox.bridge` in every edition, `sandbox.pool` and `sandbox.elastic` only with elastic runners (ADR-0100).",
   "$ref": "#/$defs/Message",
   "$defs": {
     "Message": {
@@ -188,13 +188,14 @@
           "type": "array",
           "items": {
             "enum": [
+              "machine",
+              "vm-jail",
               "container",
-              "gvisor",
-              "microvm"
+              "gvisor"
             ]
           },
           "minItems": 1,
-          "description": "The isolation of the host's sandboxes (ADR-0006): `container` (runc), `gvisor` (runsc) or `microvm` (Kata Containers, ADR-0025), as the host's sandbox runtime gives it. The tier names a technology; the level of isolation, which says what an escape reaches, is `hello.isolation`'s (feature `host.isolation`, ADR-0113)."
+          "description": "The host's level of isolation (ADR-0113, decision 1), named for the strongest wall between an agent's code and the credentials; a host has one executor and sends one value. `machine`: the credentials are on another machine than the VM (a VM per run at a provider; a control host with sandbox nodes). `vm-jail`: a jail around each VM, the credentials on the same machine out of a VMM's user's reach. `container`: the container and the kernel, the credentials on the same machine behind the kernel alone; a Docker host reports it whatever its runtime, a Kata host included. `gvisor` is reserved for a host with a `runsc` runtime, and is placed as `container`. `microvm` is no value any more: the server refuses a hello that carries it and names the release to install, so a server and its hosts with a VM per run or Kata take this release together (ADR-0113, decision 2, which amends ADR-0109 for this one change). The server stores and shows the level as reported, places runs by it and checks it nowhere."
         },
         "maxConcurrentRuns": {
           "$ref": "#/$defs/HostCapacity",
@@ -302,7 +303,7 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9._-]{0,63}$"
           },
-          "description": "The optional features of protocol 2 the host implements; absent or empty for none. A new optional capability is a new feature name, whatever release ships it; a breaking change of the wire is a new protocol version (ADR-0109). The server sends a feature's frames only to a host that lists it, and ignores names it does not know. `run.steer`: the host takes `run.steer` and answers each with `run.steer.ack`. `run.skills`: the host takes `run.assign.skills` (ADR-0064). `session.bundle`: the host takes `run.assign.sessionBundle` and reports `run.finished.sessionBundle` (ADR-0097). `sandbox.pool`: the host keeps ready sandboxes, sends `hello.pool`, takes `host.config.pool`, reports `host.config.applied.pool` and sends `host.pool.status` (ADR-0098, ADR-0099). `host.isolation`: the host reports its level of isolation and its hardening in `hello.isolation` (ADR-0113); it adds no frame, and `hello.isolation` is required with it and not allowed without it. `sandbox.bridge`: the host runs its agents over the sandbox bridge (ADR-0095), with `run --sandbox-bridge` or a VM per run (ADR-0096); it adds no frame, and every edition accepts it (ADR-0114). `sandbox.elastic`: the host's VM driver is one of the binary's paid ones, a provider's (ADR-0114); it adds no frame. A server whose licence does not hold elastic runners (ADR-0100) refuses a hello that lists `sandbox.pool` or `sandbox.elastic` with an `error` `EDITION_REQUIRED` and close code 1008."
+          "description": "The optional features of protocol 2 the host implements; absent or empty for none. A new optional capability is a new feature name, whatever release ships it; a breaking change of the wire is a new protocol version (ADR-0109). The server sends a feature's frames only to a host that lists it, and ignores names it does not know. `run.steer`: the host takes `run.steer` and answers each with `run.steer.ack`. `run.skills`: the host takes `run.assign.skills` (ADR-0064). `session.bundle`: the host takes `run.assign.sessionBundle` and reports `run.finished.sessionBundle` (ADR-0097). `sandbox.pool`: the host keeps ready sandboxes, sends `hello.pool`, takes `host.config.pool`, reports `host.config.applied.pool` and sends `host.pool.status` (ADR-0098, ADR-0099). `sandbox.bridge`: the host runs its agents over the sandbox bridge (ADR-0095), with `run --sandbox-bridge` or a VM per run (ADR-0096); it adds no frame, and every edition accepts it (ADR-0114). `sandbox.elastic`: the host's VM driver is one of the binary's paid ones, a provider's (ADR-0114); it adds no frame. A server whose licence does not hold elastic runners (ADR-0100) refuses a hello that lists `sandbox.pool` or `sandbox.elastic` with an `error` `EDITION_REQUIRED` and close code 1008."
         },
         "pool": {
           "type": "object",
@@ -319,99 +320,22 @@
           },
           "description": "v2, the optional feature `sandbox.pool` (ADR-0099): the host keeps ready sandboxes, which wait for runs created and probed (ADR-0098), and takes Tinfirm's count of them in `host.config.pool`. Present exactly when `features` lists `sandbox.pool`."
         },
-        "isolation": {
-          "type": "object",
-          "required": [
-            "level",
-            "hardened"
+        "hardened": {
+          "enum": [
+            "yes",
+            "no",
+            "none"
           ],
-          "properties": {
-            "level": {
-              "enum": [
-                "machine",
-                "vm-jail",
-                "container"
-              ],
-              "description": "The strongest wall between an agent's code and the credentials (ADR-0113, decision 1). `machine`: the credentials are on another machine than the VM (a VM per run at a provider; a control host with sandbox nodes). `vm-jail`: a jail around each VM, the credentials on the same machine out of a VMM's user's reach. `container`: the container and the kernel, the credentials on the same machine behind the kernel alone; a host with gVisor is `container` too. `machine` and `vm-jail` come only with `isolationTiers` that are all `microvm`."
-            },
-            "hardened": {
-              "enum": [
-                "yes",
-                "no",
-                "none"
-              ],
-              "description": "Whether the machine that runs the host's VMs is hardened beyond the jail (ADR-0113, decision 5): `yes`, `no`, or `none` where the host runs no machine of its own for its VMs (a VM per run at a provider, whose hypervisor is the boundary). Any value goes with any level."
-            },
-            "stated": {
-              "type": "boolean",
-              "description": "True when the level rests on the operator's statement in the host's configuration and not on what the host can see (ADR-0113, decision 3); absent means false."
-            }
-          },
-          "description": "v2, the optional feature `host.isolation` (ADR-0113, decisions 1 to 3): the host's level of isolation and its hardening, as it reports them. Present exactly when `features` lists `host.isolation`. The server stores and shows them as reported and checks neither: it refuses only a hello where the object and the feature disagree, or where `level` is `machine` or `vm-jail` and `isolationTiers` are not all `microvm` (`error` `BAD_MESSAGE`, close code 1008). A host without the feature reports no level, and is placed as `container` when the server places runs by level (ADR-0113, decision 4)."
-        }
-      },
-      "allOf": [
-        {
-          "if": {
-            "required": [
-              "features"
-            ],
-            "properties": {
-              "features": {
-                "contains": {
-                  "const": "host.isolation"
-                }
-              }
-            }
-          },
-          "then": {
-            "required": [
-              "isolation"
-            ]
-          },
-          "else": {
-            "not": {
-              "required": [
-                "isolation"
-              ]
-            }
-          }
+          "description": "v2, optional: whether the machine that runs the host's VMs is hardened beyond the jail (ADR-0113, decision 5): `yes`, `no`, or `none` where the host runs no machine of its own for its VMs (a VM per run at a provider, whose hypervisor is the boundary). Absent: `no`. It orders hosts of one level and refuses none."
         },
-        {
-          "if": {
-            "required": [
-              "isolation"
-            ],
-            "properties": {
-              "isolation": {
-                "required": [
-                  "level"
-                ],
-                "properties": {
-                  "level": {
-                    "enum": [
-                      "machine",
-                      "vm-jail"
-                    ]
-                  }
-                }
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "isolationTiers": {
-                "items": {
-                  "const": "microvm"
-                }
-              }
-            }
-          }
+        "isolationStated": {
+          "type": "boolean",
+          "description": "v2, optional: true when the level rests on the operator's statement in the host's configuration and not on what the host can see (ADR-0113, decision 3); absent means false."
         }
-      ]
+      }
     },
     "Welcome": {
-      "description": "Server -> runner host, answer to hello. It carries the protocol version the server speaks. The server sends host.config right after it, and assigns runs to the host only after the host's first host.config.applied on this connection. Close codes: 4401 bad or revoked token (right after the upgrade), 4409 replaced by a newer connection of the same host, 1008 first frame not hello, invalid hello, or a hello that lists a feature the server's licence does not hold (after an `error` `EDITION_REQUIRED`, ADR-0100), 1002 unsupported protocolVersion, 1009 frame larger than 1 MiB, 1011 peer silent for 3 heartbeat intervals. The server sends WebSocket pings every heartbeat interval.",
+      "description": "Server -> runner host, answer to hello. It carries the protocol version the server speaks. The server sends host.config right after it, and assigns runs to the host only after the host's first host.config.applied on this connection. Close codes: 4401 bad or revoked token (right after the upgrade), 4409 replaced by a newer connection of the same host, 1008 first frame not hello, invalid hello, a hello that lists a feature the server's licence does not hold (after an `error` `EDITION_REQUIRED`, ADR-0100), or a hello whose `isolationTiers` carry `microvm` (after an `error` `UPGRADE_REQUIRED` whose message names the server's version to install, ADR-0113), 1002 unsupported protocolVersion, 1009 frame larger than 1 MiB, 1011 peer silent for 3 heartbeat intervals. The server sends WebSocket pings every heartbeat interval.",
       "type": "object",
       "required": [
         "type",
@@ -2335,6 +2259,7 @@
             "UNKNOWN_CREDENTIAL_KIND",
             "PERSONAL_HOST_CREDENTIAL_ONLY",
             "EDITION_REQUIRED",
+            "UPGRADE_REQUIRED",
             "TOO_MANY_REQUESTS",
             "PAYLOAD_TOO_LARGE",
             "RUN_EVENTS_FULL",

@@ -30,8 +30,8 @@
 //!   are left out of the JSON);
 //! - the usage of USAGE events and `run.finished` reports cache writes apart from the input
 //!   in v2 (`cacheWriteTokens`); v1 counts them as input ([`UsagePayload::into_v1`]);
-//! - `hello.isolationTiers` has `microvm` in v2 (and, as an additive change, in the v1
-//!   schema: a server from before v2 refuses it, so a v1 host reports `container`).
+//! - `hello.isolationTiers` holds the host's level of isolation in v2 ([`IsolationTier`]),
+//!   with `hello.hardened` and `hello.isolationStated`; a v1 host reports `container`.
 
 use std::fmt;
 
@@ -458,15 +458,38 @@ pub enum Executor {
     Docker,
 }
 
-/// `hello.isolationTiers[]` (ADR-0006). `microvm` came with protocol v2: a v1 server from
-/// before it refuses a hello that carries it, so a v1 host reports `container`.
+/// `hello.isolationTiers[]`: in v2 the host's one level of isolation (ADR-0113, decision 1),
+/// named for the strongest wall between an agent's code and the credentials. A v1 host reports
+/// `container`.
+///
+/// `microvm` is no value any more: a server of this release refuses a hello that carries it,
+/// and a server of an earlier release refuses `machine` and `vm-jail`, so hosts with a VM per
+/// run and the server take this release together (ADR-0113, decision 2, which amends ADR-0109
+/// for this one change).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum IsolationTier {
+    /// The credentials are on another machine than the VM (a VM per run at a provider; a
+    /// control host with sandbox nodes).
+    Machine,
+    /// A jail around each VM; the credentials on the same machine, out of a VMM's user's reach.
+    VmJail,
+    /// The container and the kernel; the credentials on the same machine behind the kernel. A
+    /// Docker host reports it whatever its runtime, a Kata host included.
     Container,
+    /// Reserved for a host with a `runsc…` runtime; placed as `container`.
     Gvisor,
-    /// Kata Containers: every sandbox is a microVM with its own kernel (ADR-0025).
-    Microvm,
+}
+
+impl IsolationTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationTier::Machine => "machine",
+            IsolationTier::VmJail => "vm-jail",
+            IsolationTier::Container => "container",
+            IsolationTier::Gvisor => "gvisor",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -674,50 +697,18 @@ pub struct Hello {
     /// v2, the feature [`feature::SANDBOX_POOL`]: the operator's ceiling of ready sandboxes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<HelloPool>,
-    /// v2, the feature [`feature::HOST_ISOLATION`] (ADR-0113): the host's level of isolation
-    /// and its hardening. Present exactly when `features` lists it.
+    /// v2, optional (ADR-0113, decision 5): whether the machine that runs the host's VMs is
+    /// hardened beyond the jail. Left out: `no`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub isolation: Option<HostIsolation>,
-}
-
-/// `hello.isolation` (ADR-0113, decisions 1 to 3): what the host reports of its isolation.
-/// The server stores and shows it as reported, and checks neither value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostIsolation {
-    pub level: IsolationLevel,
-    pub hardened: Hardened,
-    /// The level rests on the operator's statement, not on what the host can see. Left out
-    /// when false.
+    pub hardened: Option<Hardened>,
+    /// v2, optional (ADR-0113, decision 3): the level rests on the operator's statement, not on
+    /// what the host can see. Left out when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stated: bool,
+    pub isolation_stated: bool,
 }
 
-/// The strongest wall between an agent's code and the credentials (ADR-0113, decision 1).
-/// `Machine` and `VmJail` come only with `isolationTiers` that are all `microvm`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum IsolationLevel {
-    /// The credentials are on another machine than the VM.
-    Machine,
-    /// A jail around each VM; the credentials on the same machine, out of a VMM's user's reach.
-    VmJail,
-    /// The container and the kernel; the credentials on the same machine behind the kernel.
-    Container,
-}
-
-impl IsolationLevel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            IsolationLevel::Machine => "machine",
-            IsolationLevel::VmJail => "vm-jail",
-            IsolationLevel::Container => "container",
-        }
-    }
-}
-
-/// Whether the machine that runs the host's VMs is hardened beyond the jail (ADR-0113,
-/// decision 5).
+/// `hello.hardened`: whether the machine that runs the host's VMs is hardened beyond the jail
+/// (ADR-0113, decision 5). It orders hosts of one level and refuses none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Hardened {
@@ -757,9 +748,6 @@ pub mod feature {
     /// [`super::RunFinished::session_bundle`] (ADR-0097): it restores the conversation's
     /// session folders from the server's bundle, and uploads them again when the run ends.
     pub const SESSION_BUNDLE: &str = "session.bundle";
-    /// The host reports its level of isolation and its hardening in
-    /// [`super::Hello::isolation`] (ADR-0113). It adds no frame.
-    pub const HOST_ISOLATION: &str = "host.isolation";
     /// The host keeps ready sandboxes (ADR-0098) and takes Tinfirm's count of them (ADR-0099):
     /// [`super::Hello::pool`], [`super::HostConfig::pool`], [`super::HostConfigApplied::pool`]
     /// and [`super::HostPoolStatus`].

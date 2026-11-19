@@ -73,9 +73,11 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  * name no model ({@code MODEL_REQUIRED}) or one the key does not allow ({@code MODEL_NOT_ALLOWED}) fail the run;</li>
  * <li>the hosts that may carry the run's credentials ({@link Hosts#eligible}, I13): none while the company has hosts
  * for the runtime ({@code NO_HOST_FOR_CREDENTIALS}), none at all ({@code NO_RUNNER_HOST});</li>
- * <li>the level of isolation ({@link IsolationPlacement}, ADR-0113 decision 4): of those hosts, the ones of the level
- * chosen for the agent ({@code NO_HOST_OF_LEVEL} when none reports it), else of the strongest level they report; the
- * session's host first, and with an automatic agent the weaker host that holds the conversation's session too. A
+ * <li>the level of isolation ({@link IsolationPlacement}, ADR-0113 decision 4): of those hosts, the ones that take the
+ * level chosen for the agent ({@code NO_HOST_OF_LEVEL} when none does), else the strongest level the company's hosts
+ * among them report (the payer's personal hosts' where none is the company's): the company hosts of the level and the
+ * payer's personal hosts of it or a stronger one; the session's host first, and with an automatic agent the weaker
+ * host that holds the conversation's session too. A
  * reason of the next steps names the level where it left a weaker host out;</li>
  * <li>a subscription's label still reported by its host; then, with the eligible hosts locked in the order of their
  * ids so that concurrent dispatchers count one at a time, on every replica, a subscription's pool on its host
@@ -528,7 +530,7 @@ class RunDispatcher {
     /**
      * The conversation's session for the level's step: the host of its latest run that reported a session, when that
      * host still counts for this run, and whether a bundle of the session is kept (asked only when the session's host
-     * is of another level than the run may go to, where a kept bundle moves the turn).
+     * does not take the level the run may go to, where a kept bundle moves the turn).
      */
     private IsolationPlacement.@Nullable Session session(RunStore.RunRow run, RunStore.@Nullable RunRow sessionRun,
             List<RunnerHostInfo> eligible, @Nullable IsolationLevel chosen) {
@@ -542,8 +544,8 @@ class RunDispatcher {
         if (held == null) {
             return null;
         }
-        IsolationLevel target = chosen != null ? chosen : Isolation.strongest(eligible).orElseThrow();
-        SessionBundles kept = Isolation.placedAt(held) != target ? bundles.getIfAvailable() : null;
+        IsolationLevel target = chosen != null ? chosen : Isolation.automatic(eligible).orElseThrow();
+        SessionBundles kept = !Isolation.takes(held, target) ? bundles.getIfAvailable() : null;
         boolean carried = kept != null && kept.carries(run.conversationId(), run.agentId(), run.runtime().name(),
                 sessionRun.sessionId());
         return new IsolationPlacement.Session(held, carried);

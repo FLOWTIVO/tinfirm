@@ -4,13 +4,13 @@ Every command and option of `tinfirm-runner-host`, every `TINFIRM_RUNNER_*` envi
 
 ## Compatibility
 
-A runner host and the server agree on the **runner protocol**, never on a version number. Any runner host release that speaks a protocol the server supports works with it, so hosts and server can be upgraded in either order.
+A runner host and the server agree on the **runner protocol**, never on a version number. Any runner host release that speaks a protocol the server supports works with it, so hosts and server can be upgraded in either order. One release is the exception: from the release that reports levels of isolation, the server refuses a host of an older release with a VM per run or Kata Containers, which reports the tier `microvm`. Such a host stops with the error `UPGRADE_REQUIRED`, which names the server's version: upgrade it to that version right after the server ([Upgrade runner hosts](../operator-guide/maintenance.md#upgrade-runner-hosts)).
 
 | Number | Where you see it | What it means |
 |---|---|---|
 | The release version | `tinfirm-runner-host --version`, the host's card (such as `v1.0.0`), the release's file names and the image tag `v1.0.0` | Which release the host runs, for support. Tinfirm decides nothing from it |
 | The protocol version | The `protocol_version` of the host's `runner host starting` log line | Version 2 takes turns. A host on version 1 connects but takes none |
-| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), the sandbox bridge (`sandbox.bridge`), its level of isolation (`host.isolation`, with `hello.isolation`: the host derives it from its executor and its VM driver, or from `run --isolation-level` with a VM driver of your own, and the server stores and shows it), and with elastic runners (Pro and Enterprise) ready sandboxes (`sandbox.pool`) and a provider's VM driver (`sandbox.elastic`). A host without one still takes turns |
+| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), the sandbox bridge (`sandbox.bridge`), and with elastic runners (Pro and Enterprise) ready sandboxes (`sandbox.pool`) and a provider's VM driver (`sandbox.elastic`). A host without one still takes turns. Not a feature: the host's level of isolation, which it sends in every hello, derived from its executor and its VM driver, or from `run --isolation-level` with a VM driver of your own; the server stores and shows it |
 
 The server accepts protocol versions 1 and 2. Every host of protocol 2 keeps a run's model token out of the sandbox (its model proxy is always on) and sends its own token with the run's model requests, so turns paid by a budget go to any host of protocol 2. A build from the `rolling` prerelease shows what it was built from after its version, such as `0.1.0-SNAPSHOT (rolling-abc1234)`.
 
@@ -182,7 +182,7 @@ Each run is a container `tinfirm-run-<run id>`:
 | Processes | 1,024 |
 | User | 1000:1000, every capability dropped, `no-new-privileges`; with `--sandbox-docker`, root with the settings Docker in a microVM needs |
 | Mounts | `/workspace`, `/home/agent`, `/attachments` (read-only), `/output`, the agent's skills (read-only) |
-| Isolation tier | `microvm` for a runtime named `kata…`, `gvisor` for `runsc…`, else `container` |
+| Isolation level reported | `gvisor` for a runtime named `runsc…`, placed as `container`; else `container`, a runtime named `kata…` included |
 
 ### Sandbox settings
 

@@ -23,9 +23,10 @@ import org.jspecify.annotations.Nullable;
  * @param runnerVersion            the version of its latest {@code hello}; null before it connected. Shown and logged
  *                                 only: what a host can do is its protocol and its features (ADR-0109)
  * @param lastSeenAt               when the host was last connected, or null if it never was
- * @param isolationLevel           the level of isolation its latest {@code hello} reported (ADR-0113, feature
- *                                 {@code host.isolation}); null for a host that reports none, which is placed as
- *                                 {@link IsolationLevel#CONTAINER} (decision 2). Reported, never checked (decision 3)
+ * @param isolationLevel           the level of isolation its latest {@code hello} reported in
+ *                                 {@code isolationTiers} (ADR-0113); null before its first hello to a server of this
+ *                                 release, and such a host is placed as {@link IsolationLevel#CONTAINER} (decision 2).
+ *                                 Reported, never checked (decision 3)
  * @param hardened                 the hardening it reported with the level; null exactly when the level is
  * @param stated                   whether the level rests on its operator's statement rather than on what the host can
  *                                 see; false without a level

@@ -28,8 +28,8 @@ import { isolationLines } from './isolation-view';
 
 /**
  * One runner host as a sheet (package 2): online or offline and since when, draining, its version
- * and machine, what it reports about its isolation (ADR-0113: its level, its hardening, what an
- * escape reaches there, its tier), its slots (in use, effective, the machine's ceiling, the desired value Tinfirm sets
+ * and machine, what it reports about its isolation (ADR-0113: its level, gVisor, its hardening,
+ * what an escape reaches there; nothing before its first hello to a server of this release), its slots (in use, effective, the machine's ceiling, the desired value Tinfirm sets
  * and whether the host confirmed it), for a company host that keeps ready sandboxes its pool
  * (ADR-0099: the count now and next, the week, the host's last report), and for a personal host
  * the subscriptions it reported. Its page saves a capacity, edits the pool's schedule and confirms
@@ -111,18 +111,11 @@ import { isolationLines } from './isolation-view';
       >
         <h4 class="text-sm font-semibold" [id]="'host-isolation-' + h.id">Isolation</h4>
         <p class="text-sm" data-testid="isolation-reports">{{ iso.reports }}</p>
-        @if (iso.hardening; as hardening) {
-          <p class="text-muted-foreground text-xs text-pretty" data-testid="isolation-hardening">
-            {{ hardening }}
-          </p>
-        }
-        @if (iso.reaches; as reaches) {
-          <p class="text-muted-foreground text-xs text-pretty" data-testid="isolation-reaches">
-            {{ reaches }}
-          </p>
-        }
-        <p class="text-muted-foreground font-mono text-xs" data-testid="isolation-tiers">
-          {{ iso.tiers }}
+        <p class="text-muted-foreground text-xs text-pretty" data-testid="isolation-hardening">
+          {{ iso.hardening }}
+        </p>
+        <p class="text-muted-foreground text-xs text-pretty" data-testid="isolation-reaches">
+          {{ iso.reaches }}
         </p>
       </section>
     }

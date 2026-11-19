@@ -98,32 +98,28 @@ pub const DOCKER_ENV: &str = "TINFIRM_SANDBOX_DOCKER";
 /// has started as root: [`USER`].
 pub const AGENT_USER_ENV: &str = "TINFIRM_SANDBOX_AGENT_USER";
 
-/// Isolation tier of the sandboxes (ADR-0006), given by the Docker runtime (ADR-0025).
+/// What runs the sandboxes (ADR-0006, ADR-0025): the technology, for the logs and the rules
+/// of these settings. The level of isolation that the host reports is crate::isolation's: a
+/// Kata host reports `container`, since its VMM is root on the machine with the credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
+pub enum RuntimeFamily {
     /// runc or another runtime that shares the host kernel.
-    Container,
+    Runc,
     /// gVisor (`runsc…`).
     Gvisor,
     /// Kata Containers (`kata…`): every sandbox is a microVM with its own kernel.
-    Microvm,
+    Kata,
+    /// A VM per run (the VM executor, crate::vm): no Docker runtime on this host.
+    Vm,
 }
 
-impl Tier {
+impl RuntimeFamily {
     pub fn as_str(self) -> &'static str {
         match self {
-            Tier::Container => "container",
-            Tier::Gvisor => "gvisor",
-            Tier::Microvm => "microvm",
-        }
-    }
-
-    /// The tier as `hello.isolationTiers` names it.
-    pub fn isolation_tier(self) -> tinfirm_protocol::IsolationTier {
-        match self {
-            Tier::Container => tinfirm_protocol::IsolationTier::Container,
-            Tier::Gvisor => tinfirm_protocol::IsolationTier::Gvisor,
-            Tier::Microvm => tinfirm_protocol::IsolationTier::Microvm,
+            RuntimeFamily::Runc => "runc",
+            RuntimeFamily::Gvisor => "gvisor",
+            RuntimeFamily::Kata => "kata",
+            RuntimeFamily::Vm => "vm",
         }
     }
 }
@@ -211,15 +207,15 @@ impl SandboxSettings {
                 .is_some_and(|r| r.starts_with("kata"))
     }
 
-    /// The isolation tier that the runtime gives.
-    pub fn tier(&self) -> Tier {
+    /// What runs the sandboxes, by the runtime's name.
+    pub fn family(&self) -> RuntimeFamily {
         if self.per_run_vm {
-            return Tier::Microvm;
+            return RuntimeFamily::Vm;
         }
         match self.runtime.as_deref() {
-            Some(r) if r.starts_with("kata") => Tier::Microvm,
-            Some(r) if r.starts_with("runsc") => Tier::Gvisor,
-            _ => Tier::Container,
+            Some(r) if r.starts_with("kata") => RuntimeFamily::Kata,
+            Some(r) if r.starts_with("runsc") => RuntimeFamily::Gvisor,
+            _ => RuntimeFamily::Runc,
         }
     }
 
@@ -1357,10 +1353,10 @@ mod tests {
     }
 
     #[test]
-    fn a_vm_per_run_is_a_microvm_that_may_run_docker_and_names_no_runtime() {
+    fn a_vm_per_run_is_a_vm_that_may_run_docker_and_names_no_runtime() {
         let settings = SandboxSettings::for_vms(None, true, Vec::new()).unwrap();
         assert!(settings.is_vm() && settings.docker && settings.per_run_vm);
-        assert_eq!(settings.tier(), Tier::Microvm);
+        assert_eq!(settings.family(), RuntimeFamily::Vm);
         assert_eq!(settings.runtime, None);
         let plain = SandboxSettings::for_vms(Some(" ".into()), false, Vec::new()).unwrap();
         assert!(!plain.docker && plain.is_vm());
@@ -1392,22 +1388,20 @@ mod tests {
         }
         for runtime in ["kata", "kata-clh", "kata-qemu"] {
             let settings = SandboxSettings::new(Some(runtime.into()), true, Vec::new()).unwrap();
+            // A Kata host still runs every sandbox as a VM and takes --sandbox-docker; it
+            // reports `container` (crate::isolation).
             assert!(settings.is_vm() && settings.docker);
-            assert_eq!(settings.tier(), Tier::Microvm);
-            assert_eq!(
-                settings.tier().isolation_tier(),
-                tinfirm_protocol::IsolationTier::Microvm
-            );
+            assert_eq!(settings.family(), RuntimeFamily::Kata);
         }
         // Without Docker in the sandbox any runtime goes.
         let runc = SandboxSettings::new(Some(" runc ".into()), false, Vec::new()).unwrap();
         assert_eq!(runc.runtime.as_deref(), Some("runc"));
-        assert_eq!(runc.tier(), Tier::Container);
+        assert_eq!(runc.family(), RuntimeFamily::Runc);
         let gvisor = SandboxSettings::new(Some("runsc".into()), false, Vec::new()).unwrap();
-        assert_eq!(gvisor.tier(), Tier::Gvisor);
+        assert_eq!(gvisor.family(), RuntimeFamily::Gvisor);
         let default = SandboxSettings::new(Some("  ".into()), false, Vec::new()).unwrap();
         assert_eq!(default, SandboxSettings::default());
-        assert_eq!(default.tier().as_str(), "container");
+        assert_eq!(default.family().as_str(), "runc");
     }
 
     #[test]

@@ -17,6 +17,7 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.stereotype.Component;
 
 import com.flowtivo.tinfirm.runner.CredentialKind;
+import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 
 import tools.jackson.core.JacksonException;
@@ -159,6 +160,12 @@ class RunnerMessageCodec {
                 throw new BadFrame(RunnerMessages.BAD_MESSAGE, "Invalid " + name
                         + " message: maxConcurrentRuns must be at most " + RunnerMessages.MAX_CAPACITY
                         + " in runner protocol 1", null);
+            // Protocol 1's tiers are container, gvisor and microvm (runner-v1 Hello); the levels are protocol 2's.
+            case RunnerMessages.Hello hello when hello.protocolVersion() == RunnerMessages.PROTOCOL_V1
+                    && hello.tiers().stream().anyMatch(tier -> tier == IsolationTier.MACHINE
+                            || tier == IsolationTier.VM_JAIL) ->
+                throw new BadFrame(RunnerMessages.BAD_MESSAGE, "Invalid " + name
+                        + " message: isolationTiers machine and vm-jail are not in runner protocol 1", null);
             case RunnerMessages.HostConfigApplied applied when version == RunnerMessages.PROTOCOL_V1
                     && applied.maxConcurrentRunsCeiling() > RunnerMessages.MAX_CAPACITY ->
                 throw new BadFrame(RunnerMessages.BAD_MESSAGE, "Invalid " + name

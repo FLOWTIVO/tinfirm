@@ -21,6 +21,7 @@ import com.flowtivo.tinfirm.audit.AuditLog;
 import com.flowtivo.tinfirm.audit.AuditRecord;
 import com.flowtivo.tinfirm.principal.PrincipalInfo;
 import com.flowtivo.tinfirm.principal.Principals;
+import com.flowtivo.tinfirm.runner.Hardening;
 import com.flowtivo.tinfirm.runner.HostCredentialInfo;
 import com.flowtivo.tinfirm.runner.HostScope;
 import com.flowtivo.tinfirm.runner.Isolation;
@@ -465,14 +466,13 @@ class RunnerHostService {
         }).toList();
     }
 
-    /** A host's reported isolation for its page: the tiers in their order, the level and hardening by name. */
+    /** A host's reported isolation for its page: the level and the hardening by name, gVisor, the statement. */
     private static RunnerViews.@Nullable IsolationView isolationView(RunnerHostStore.@Nullable Isolation isolation) {
-        if (isolation == null) {
+        if (isolation == null || isolation.level() == null) {
             return null;
         }
-        return new RunnerViews.IsolationView(isolation.tiers().stream().sorted().map(Enum::name).toList(),
-                isolation.level() != null ? isolation.level().name() : null,
-                isolation.hardened() != null ? isolation.hardened().name() : null, isolation.stated());
+        return new RunnerViews.IsolationView(isolation.level().name(), isolation.gvisor(),
+                isolation.hardened() != null ? isolation.hardened().name() : Hardening.NO.name(), isolation.stated());
     }
 
     /**

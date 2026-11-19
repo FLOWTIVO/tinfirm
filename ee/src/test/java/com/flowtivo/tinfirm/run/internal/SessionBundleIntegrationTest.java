@@ -189,7 +189,7 @@ class SessionBundleIntegrationTest extends RunTestBench {
 
             try (FakeRunner machine = FakeRunner.connect(port, strong.token())) {
                 Map<String, Object> hello = FakeRunner.helloWithIsolation("machine", "none");
-                hello.put("features", List.of("session.bundle", "host.isolation"));
+                hello.put("features", List.of("session.bundle"));
                 machine.send(hello);
                 machine.expect("welcome");
                 awaitConfigured(strong.id());

@@ -45,10 +45,9 @@ The page updates every 10 seconds. Each host's card shows:
 | **… of … slots in use** | The turns running now, of the slots it has |
 | **Up to … on this machine** | Its ceiling: the most turns at a time the machine's owner allows |
 | **Isolation**: **Reports machine**, **vm-jail** or **container** | The level of isolation the host reports, with what an escape from a sandbox reaches on a host of that kind. See [Isolation levels](#isolation-levels) |
+| **with gVisor** | A container host whose sandboxes run under gVisor. Its turns are placed as on any container host |
 | **stated by the operator** | The level rests on what the host's operator configured, not on what the host can see |
 | **Hardened**, **Not hardened**, **No machine of its own** | Whether the machine that runs the host's VMs is hardened. **No machine of its own**: a VM per run at a provider, whose hypervisor is the boundary |
-| **Tier** and a name | The technology of its sandboxes: `container`, `gvisor` or `microvm` |
-| **Reports no level** | The host does not report a level. Its turns will be placed as on a container host |
 
 The version is the runner host's release, shown for support: any release that speaks runner protocol 2 takes turns ([Runner host reference](../reference/runner-host.md#compatibility)). When hosts are registered but none takes turns, because none is online and not draining, the page warns **No company host takes turns now**.
 
@@ -64,9 +63,9 @@ A host reports how well its sandboxes keep an agent's code away from the credent
 
 On every level, a flaw in the runner host's code that reads what a sandbox sends reaches the runner host's credentials. A change of a host's level or hardening is recorded in the audit log.
 
-A host that reports no level shows **Reports no level** with its tier: a runner host before the release that reports levels, or one with a VM driver of the operator's own that states none.
+A Kata Containers host reports **container**, as a host with Docker does. A host with a VM driver of the operator's own reports **container** unless its operator states another level. A host that has not connected since the server's upgrade shows no isolation, and its turns are placed as on a container host.
 
-**Where turns run.** An agent's turns go to the strongest level among the hosts that may run them, and a host that reports no level counts as **container**. Within a level, a hardened host comes first. When every host of that level is busy or offline, the turn waits for one: it never goes to a weaker host by itself. A conversation whose session is on a weaker host stays there while that host can take its turns, and says so. Whoever edits an agent can choose a level for it among those the company's hosts report; its turns then run on hosts of that level only.
+**Where turns run.** The company's hosts set the level: an agent's turns go to the strongest level among the company's hosts that may run them. A member's own host takes their turns too when it reports that level or a stronger one, and comes first while it is free; a member's own host that reports a weaker level takes none of them. No turn waits for a member's own host: while it is busy or offline, the company's hosts take the turn. Only a turn that no company host may run, such as one paid by a member's own subscription, goes by the level of the member's own hosts. Among the free hosts, a stronger one comes first, then a hardened one. When every company host of the level is busy or offline, the turn waits for one: it never goes to a weaker host by itself. A conversation whose session is on a weaker host stays there while that host can take its turns, and says so. Whoever edits an agent can choose a level for it among those the company's hosts report; its turns then run on the company's hosts of that level, and on a member's own host that reports it or a stronger one.
 
 ## Runs at a time
 

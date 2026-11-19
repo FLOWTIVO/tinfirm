@@ -152,13 +152,13 @@ It mounts the workspace at `/workspace`, the agent's home at `/home/agent` (kept
 
 ### Isolation
 
-By default a sandbox is a container under Docker's default runtime, runc, which shares the machine's kernel. `--sandbox-runtime <name>` picks another runtime that Docker knows; the host reports the tier by the runtime's name:
+By default a sandbox is a container under Docker's default runtime, runc, which shares the machine's kernel. `--sandbox-runtime <name>` picks another runtime that Docker knows. Every host with Docker reports the level of isolation `container`, since its credentials are on the machine that runs the sandboxes; the runtime changes what an escape must get through first:
 
-| Tier | Runtime | What it is |
+| Runtime | What it is | The host reports |
 |---|---|---|
-| `container` | runc, Docker's default | A container on the machine's kernel |
-| `gvisor` | a runtime whose name starts with `runsc` | gVisor's user-space kernel |
-| `microvm` | a runtime whose name starts with `kata` | A Kata Containers microVM with its own kernel; needs Linux with KVM |
+| runc, Docker's default | A container on the machine's kernel | `container` |
+| a runtime whose name starts with `runsc` | gVisor's user-space kernel | `gvisor`, shown as **container with gVisor** and placed as `container` |
+| a runtime whose name starts with `kata` | A Kata Containers microVM with its own kernel; needs Linux with KVM | `container` |
 
 **Docker in the sandbox.** With `--sandbox-docker`, the agent gets its own Docker daemon in its sandbox, for Testcontainers, `docker compose` and image builds. That needs a container that is root with every capability, so `run` refuses it unless the runtime's name starts with `kata`: root then reaches the microVM, not the machine. The agent's Docker keeps its data on a sparse disk of 40 GB by default, and the sandbox's limits cover it and its containers.
 
@@ -260,7 +260,7 @@ A **drain** lets the active runs finish instead of cancelling them:
 
 A drain can last as long as the longest turn. SIGTERM or `Ctrl-C` during a drain cancels what is still running. Closing the terminal of a foreground `run` drains it too.
 
-To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts.
+To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts. A host with a VM per run or Kata Containers of a release before the levels of isolation stops when the upgraded server refuses it (`UPGRADE_REQUIRED`): upgrade it right after the server.
 
 ## Disk maintenance
 

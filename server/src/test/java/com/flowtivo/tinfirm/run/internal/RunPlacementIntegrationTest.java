@@ -20,8 +20,10 @@ import io.micrometer.core.instrument.MeterRegistry;
 import tools.jackson.databind.JsonNode;
 
 /**
- * ADR-0113, decision 4: a run goes to the hosts of the strongest level among those that count, or of the level chosen
- * for its agent, and never to a weaker host by itself; a host without a level is placed as {@code container}; an
+ * ADR-0113, decision 4: a run goes to the hosts of the strongest level among the company's hosts that count, or of the
+ * level chosen for its agent, and never to a weaker host by itself; the payer's personal host takes it too at that level
+ * or a stronger one, and no run waits for it; a gVisor host, and a host without a level, are placed as
+ * {@code container}; an
  * automatic agent's conversation stays on the weaker host of its session, and a chosen level moves it with a fresh
  * session; the run records the level and the note, and the metric counts it.
  */
@@ -31,7 +33,7 @@ class RunPlacementIntegrationTest extends RunTestBench {
     @Autowired
     MeterRegistry meters;
 
-    /** A company host that reports a level ({@code host.isolation}), with these slots, configured. */
+    /** A company host that reports a level ({@code hello.isolationTiers}), with these slots, configured. */
     FakeRunner leveledHost(Bench bench, String level, String hardened, int slots) {
         RunnerHostRef host = registerRunnerHost(bench.owner(), bench.companyId(), unique(level), "COMPANY");
         FakeRunner runner = FakeRunner.connect(port, host.token());
@@ -209,7 +211,7 @@ class RunPlacementIntegrationTest extends RunTestBench {
             assertThat(offline.get("isolationLevel").asString()).isEqualTo("MACHINE");
             container.expectNone("run.assign", Duration.ofMillis(300));
 
-            // The host comes back without the feature: it reports no level, and the queued run is placed again.
+            // The host comes back with container: the queued run is placed again.
             try (FakeRunner downgraded = FakeRunner.connect(port, vm.token())) {
                 downgraded.send(FakeRunner.helloV2(List.of(), List.of()));
                 downgraded.expect("welcome");
@@ -242,6 +244,86 @@ class RunPlacementIntegrationTest extends RunTestBench {
                 .isEqualTo("run_queue_reason_ck");
             sql.accepted("UPDATE run SET isolation_level = 'MACHINE', placement_note = 'FRESH_SESSION_CHOSEN_LEVEL' "
                     + "WHERE id = ?", turn.runId());
+        }
+    }
+
+    /** A gVisor host is a container host: its level is {@code container}, beside a host with runc. */
+    @Test
+    void aGvisorHostIsPlacedAsContainer() {
+        Bench bench = bench(true);
+        chooseLevel(bench, "CONTAINER");
+        try (FakeRunner gvisor = leveledHost(bench, "gvisor", null, 2)) {
+            Turn turn = start(bench);
+            expectAssign(gvisor, turn.runId());
+            assertThat(getRun(bench, turn.runId()).get("isolationLevel").asString()).isEqualTo("CONTAINER");
+            gvisor.assertFramesValid();
+        }
+    }
+
+    /** The member's own host at this level, said hello once and left connected; its id in the result. */
+    private FakeRunner personalHost(Bench bench, RunnerHostRef host, String level) {
+        FakeRunner runner = FakeRunner.connect(port, host.token());
+        runner.send(FakeRunner.helloWithIsolation(level, "no"));
+        runner.expect("welcome");
+        awaitConfigured(host.id());
+        return runner;
+    }
+
+    /**
+     * The owner's rule of 2026-11-19: the company's hosts set the level. A member's vm-jail laptop does not hold their
+     * runs of an automatic agent back from the company's container hosts while it is offline, and takes them, as the
+     * stronger host, when it is free.
+     */
+    @Test
+    void aStrongerPersonalHostTakesTheMembersRunsWhenFreeAndNoRunWaitsForIt() {
+        Bench bench = bench(true);
+        RunnerHostRef laptop = registerRunnerHost(bench.person(), bench.companyId(), unique("laptop"));
+        try (FakeRunner container = companyHost(bench, RUNNER_VERSION, 4)) {
+            // The laptop reported vm-jail once, and is offline now.
+            try (FakeRunner once = personalHost(bench, laptop, "vm-jail")) {
+                once.assertFramesValid();
+            }
+            await().atMost(WAIT).until(() -> !connections.isConnected(laptop.id()));
+            Turn offline = start(bench);
+            expectAssign(container, offline.runId());
+            JsonNode run = getRun(bench, offline.runId());
+            assertThat(run.get("isolationLevel").asString()).isEqualTo("CONTAINER");
+            assertThat(run.has("placementNote")).isFalse();
+
+            // The laptop is back and free: a new conversation goes to it, the stronger host.
+            try (FakeRunner back = personalHost(bench, laptop, "vm-jail")) {
+                Turn free = start(bench);
+                expectAssign(back, free.runId());
+                JsonNode placed = getRun(bench, free.runId());
+                assertThat(placed.get("isolationLevel").asString()).isEqualTo("VM_JAIL");
+                assertThat(placed.get("runnerHostKind").asString()).isEqualTo("PERSONAL");
+                container.expectNone("run.assign", Duration.ofMillis(300));
+                back.assertFramesValid();
+            }
+            container.assertFramesValid();
+        }
+    }
+
+    /**
+     * The owner's rule of 2026-11-19: a personal host weaker than the company's level never takes the member's runs,
+     * even while the company's host of the level is full.
+     */
+    @Test
+    void aWeakerPersonalHostNeverTakesTheMembersRuns() {
+        Bench bench = bench(true);
+        RunnerHostRef laptop = registerRunnerHost(bench.person(), bench.companyId(), unique("laptop"));
+        try (FakeRunner machine = leveledHost(bench, "machine", "none", 1);
+                FakeRunner docker = personalHost(bench, laptop, "container")) {
+            Turn first = start(bench);
+            expectAssign(machine, first.runId());
+            Turn second = start(bench);
+            JsonNode reason = awaitQueueReason(bench, second.runId(), "RUNNER_HOST_FULL");
+            assertThat(reason.get("isolationLevel").asString()).isEqualTo("MACHINE");
+            docker.expectNone("run.assign", Duration.ofMillis(500));
+            finish(machine, bench, first.runId(), "session-1");
+            expectAssign(machine, second.runId());
+            docker.expectNone("run.assign", Duration.ofMillis(300));
+            docker.assertFramesValid();
         }
     }
 }
