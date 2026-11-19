@@ -494,8 +494,14 @@ fn run_takes_protocol_version_1_or_2() {
 /// Like [`run`], with extra environment variables.
 fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BIN);
-    cmd.args(args)
-        .env("TINFIRM_RUNNER_CONFIG_DIR", dir.join("config"))
+    cmd.args(args);
+    host_env(&mut cmd, dir, env).output().unwrap()
+}
+
+/// The environment of [`run_with_env`]: private directories, none of the options a developer's
+/// shell may set, and `env`.
+fn host_env<'a>(cmd: &'a mut Command, dir: &Path, env: &[(&str, &str)]) -> &'a mut Command {
+    cmd.env("TINFIRM_RUNNER_CONFIG_DIR", dir.join("config"))
         .env("TINFIRM_RUNNER_DATA_DIR", dir.join("data"))
         .env("TINFIRM_RUNNER_LOG", "warn")
         .env_remove("TINFIRM_RUNNER_SANDBOX_RUNTIME")
@@ -511,9 +517,10 @@ fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("TINFIRM_RUNNER_ISOLATION_LEVEL")
         .env_remove("TINFIRM_RUNNER_ISOLATION_HARDENED")
         .env_remove("TINFIRM_NODE_DRIVER_CONFIG")
+        .env_remove("TINFIRM_RUNNER_SANDBOX_BRIDGE")
+        .env_remove("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER")
         .envs(env.iter().copied())
-        .stdin(Stdio::null());
-    cmd.output().unwrap()
+        .stdin(Stdio::null())
 }
 
 #[test]
@@ -1239,6 +1246,170 @@ fn the_node_driver_reports_what_its_nodes_configuration_reaches() {
     let report = doctor(&mixed);
     assert!(
         report.contains("[FAIL] isolation: --vm-driver node:"),
+        "{report}"
+    );
+}
+
+/// Where [`run_without_landlock`] hands the runner host's arguments to
+/// [`launch_without_landlock`].
+const WITHOUT_LANDLOCK: &str = "TINFIRM_TEST_WITHOUT_LANDLOCK";
+
+/// Like [`run_with_env`], on a system where the reader cannot be confined: this test binary
+/// starts itself again, and [`launch_without_landlock`] runs the host there with Landlock refused
+/// as a kernel without it refuses it. The host and its readers inherit that.
+fn run_without_landlock(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "launch_without_landlock",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(WITHOUT_LANDLOCK, serde_json::to_string(args).unwrap());
+    host_env(&mut cmd, dir, env).output().unwrap()
+}
+
+/// Not a test of its own: does nothing unless [`run_without_landlock`] started it. Then it
+/// installs a seccomp filter on its thread that answers `landlock_create_ruleset` with `ENOSYS`,
+/// as a kernel without Landlock does, and replaces itself with the runner host.
+#[test]
+fn launch_without_landlock() {
+    use std::collections::BTreeMap;
+    use std::os::unix::process::CommandExt;
+
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+
+    let Ok(args) = std::env::var(WITHOUT_LANDLOCK) else {
+        return;
+    };
+    let args: Vec<String> = serde_json::from_str(&args).unwrap();
+    let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
+    let filter: BpfProgram = SeccompFilter::new(
+        BTreeMap::from([(libc::SYS_landlock_create_ruleset, Vec::new())]),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    seccompiler::apply_filter(&filter).unwrap();
+    let error = Command::new(BIN)
+        .args(args)
+        .env_remove(WITHOUT_LANDLOCK)
+        .exec();
+    panic!("cannot start the runner host: {error}");
+}
+
+#[test]
+fn every_host_with_the_bridge_refuses_a_reader_it_cannot_confine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let out = run(
+        dir,
+        &["login", "--server", "http://127.0.0.1:9/"],
+        Some(&format!("{HOST_TOKEN}\n")),
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    // No Docker: a host that gets past the reader stops there.
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let vm = [
+        "run",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "digitalocean",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    for (args, env) in [
+        (&["run", "--sandbox-bridge"][..], &[no_docker][..]),
+        (
+            &["run"][..],
+            &[no_docker, ("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1")][..],
+        ),
+        (&vm[..], &[][..]),
+    ] {
+        let out = run_without_landlock(dir, args, env);
+        assert!(!out.status.success(), "{args:?} {env:?}");
+        let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            message.contains("cannot confine the reader")
+                && message.contains("no Landlock 2")
+                && message.contains("refuses to start here")
+                && message.contains("--allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up the reader's confinement")
+                && message.contains("the host's token and stored credentials"),
+            "{args:?} {env:?}: {message}"
+        );
+        // Refused before Docker is asked for anything.
+        assert!(!message.contains("DOCKER_HOST"), "{message}");
+    }
+    // With the flag, a Docker host starts with a warning that says what it gave up, and stops
+    // at Docker here.
+    for (args, env) in [
+        (
+            &["run", "--sandbox-bridge", "--allow-unconfined-reader"][..],
+            &[no_docker][..],
+        ),
+        (
+            &["run", "--sandbox-bridge"][..],
+            &[no_docker, ("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER", "1")][..],
+        ),
+    ] {
+        let out = run_without_landlock(dir, args, env);
+        assert!(!out.status.success(), "{args:?} {env:?}");
+        let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            message.contains("cannot confine the reader")
+                && message.contains("--allow-unconfined-reader accepts this")
+                && message.contains("can end `run` and its runs with a signal"),
+            "{args:?} {env:?}: {message}"
+        );
+        assert!(!message.contains("refuses to start"), "{message}");
+        assert!(message.contains("DOCKER_HOST"), "{message}");
+    }
+    // A Docker host without the bridge uses no reader, and checks none.
+    let out = run_without_landlock(dir, &["run"], &[no_docker]);
+    assert!(!out.status.success());
+    let message = text(&out);
+    assert!(!message.contains("reader"), "{message}");
+    assert!(message.contains("DOCKER_HOST"), "{message}");
+}
+
+#[test]
+fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let doctor = |env: &[(&str, &str)]| {
+        text(&run_without_landlock(dir, &["doctor"], env))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for env in [
+        &[("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1")][..],
+        &[("TINFIRM_RUNNER_EXECUTOR", "vm")][..],
+    ] {
+        let report = doctor(env);
+        assert!(
+            report.contains("[FAIL] reader: cannot be confined here")
+                && report.contains("refuses to start without --allow-unconfined-reader, which gives up the reader's confinement"),
+            "{env:?}: {report}"
+        );
+        let mut allowed = env.to_vec();
+        allowed.push(("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER", "1"));
+        let report = doctor(&allowed);
+        assert!(
+            report.contains("[warn] reader: cannot be confined here")
+                && report.contains("--allow-unconfined-reader accepts this"),
+            "{allowed:?}: {report}"
+        );
+    }
+    let report = doctor(&[]);
+    assert!(
+        report.contains("[info] reader: cannot be confined here")
+            && report.contains("only used with --sandbox-bridge or --executor vm"),
         "{report}"
     );
 }

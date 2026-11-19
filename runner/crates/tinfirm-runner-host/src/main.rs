@@ -300,10 +300,11 @@ struct SandboxArgs {
     )]
     sandbox_bridge: bool,
     /// Run sandboxes over the bridge although this system cannot confine the reader of what
-    /// they send back (Landlock 2 and seccomp: Linux 5.19 or later). The reader then runs as a
-    /// process of its own without credentials, but a flaw in its reading of a hostile archive
-    /// or git bundle reaches this host's files, its token among them. Needed for --executor vm
-    /// on such a system; a Docker host with --sandbox-bridge only warns.
+    /// they send back (Landlock 2 and seccomp: Linux 5.19 or later). Without it, a host with
+    /// --sandbox-bridge or --executor vm refuses to start on such a system. With it, the reader
+    /// still runs as a process of its own without a token, but a flaw in its reading of a
+    /// sandbox's archive or git bundle reaches every file of this host's user, the host's token
+    /// and stored credentials among them, and can end `run` with a signal.
     #[arg(
         long,
         env = "TINFIRM_RUNNER_ALLOW_UNCONFINED_READER",
@@ -2086,6 +2087,13 @@ async fn run(
     }
     secure_fs::ensure_private_dir(&paths.data_dir)?;
     secure_fs::ensure_private_dir(&paths.config_dir)?;
+    // The reader of what the sandboxes send back, before any image is built: a host that
+    // cannot confine it is refused at once.
+    let reader = if sandbox_args.sandbox_bridge || vm_options.is_some() {
+        Some(check_reader(paths, sandbox_args.allow_unconfined_reader).await?)
+    } else {
+        None
+    };
     // One `run` per config: two would replace each other's connection (4409) forever.
     let Some(mut lock) = run_lock(paths, true)? else {
         bail!(
@@ -2102,7 +2110,6 @@ async fn run(
             paths.run_lock_file().display()
         )
     })?;
-    let vm_host = vm_options.is_some();
     let started = match vm_options {
         Some((options, pool)) => {
             vm_executor(
@@ -2136,7 +2143,7 @@ async fn run(
     };
     let (mut opts, endpoint) = started;
     if let Some(bridge) = opts.bridge.as_mut() {
-        bridge.reader = check_reader(paths, vm_host, sandbox_args.allow_unconfined_reader).await?;
+        bridge.reader = reader.context("a host with the bridge has a reader")?;
     }
     opts.egress = egress;
     // The model proxy is always on: a setup where its listeners could never serve a sandbox is
@@ -2169,13 +2176,10 @@ async fn run(
 
 /// The reader of what the sandboxes send back (ADR-0112, open question 1): this binary,
 /// confined. A probe confines itself as a reader does and tries to open this host's
-/// directories, its own memory and a socket. Where it cannot be confined, a VM host is refused
-/// unless `allow` (`--allow-unconfined-reader`), and a Docker host warns.
-async fn check_reader(
-    paths: &Paths,
-    vm_host: bool,
-    allow: bool,
-) -> Result<tinfirm_runner_host::reader::Reader> {
+/// directories, its own memory and a socket. Where it cannot be confined, every host that uses
+/// the bridge (`--sandbox-bridge`, `--executor vm`) is refused unless `allow`
+/// (`--allow-unconfined-reader`).
+async fn check_reader(paths: &Paths, allow: bool) -> Result<tinfirm_runner_host::reader::Reader> {
     let reader = tinfirm_runner_host::reader::Reader::from_current_exe()?;
     let probe = probe_reader(paths, &reader).await?;
     if probe.confined() {
@@ -2185,18 +2189,21 @@ async fn check_reader(
         );
         return Ok(reader);
     }
-    let message = format!(
-        "this system cannot confine the reader of what sandboxes send back ({}): it still runs as a process of its own without credentials, but a flaw in its reading of a sandbox's archive or git bundle reaches this host's files, its token among them",
+    let cannot = format!(
+        "this system cannot confine the reader of what sandboxes send back ({})",
         probe.describe()
     );
-    if vm_host && !allow {
+    if !allow {
         bail!(
-            "{message}. --executor vm takes hostile input: run it on Linux 5.19 or later with Landlock enabled, or accept this with --allow-unconfined-reader"
+            "{cannot}. A host that runs its sandboxes over the bridge (--sandbox-bridge, --executor vm) refuses to start here: run it on Linux 5.19 or later with Landlock enabled at boot. --allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up the reader's confinement: {UNCONFINED_READER_COST}"
         );
     }
-    tracing::warn!("{message}");
+    tracing::warn!("{cannot}. --allow-unconfined-reader accepts this: {UNCONFINED_READER_COST}");
     Ok(reader.allowing_unconfined(true))
 }
+
+/// What `--allow-unconfined-reader` gives up, for the refusal, the warning and `doctor`.
+const UNCONFINED_READER_COST: &str = "the reader still runs as a process of its own without a token, but a flaw in its reading of a sandbox's archive or git bundle reaches every file of this host's user, the host's token and stored credentials among them, and can end `run` and its runs with a signal; where seccomp is missing too, it reaches the network as well";
 
 /// A reader's probe, with this host's directories and its memory to be refused.
 async fn probe_reader(
@@ -2250,19 +2257,21 @@ async fn doctor_reader(checks: &mut Checks, paths: &Paths) {
             ),
         ),
         Ok(probe) => {
-            let detail = format!(
-                "cannot be confined here: {}. A flaw in reading a sandbox's archive or git bundle would reach this host's files",
-                probe.describe()
-            );
-            if vm_host && !allow {
+            let detail = format!("cannot be confined here: {}", probe.describe());
+            if bridged && !allow {
                 checks.fail(
                     "reader",
                     format!(
-                        "{detail}; `run --executor vm` refuses to start without --allow-unconfined-reader"
+                        "{detail}. `run` with --sandbox-bridge or --executor vm refuses to start without --allow-unconfined-reader, which gives up the reader's confinement: {UNCONFINED_READER_COST}"
                     ),
                 );
             } else if bridged {
-                checks.warn("reader", detail);
+                checks.warn(
+                    "reader",
+                    format!(
+                        "{detail}. --allow-unconfined-reader accepts this: {UNCONFINED_READER_COST}"
+                    ),
+                );
             } else {
                 checks.info(
                     "reader",

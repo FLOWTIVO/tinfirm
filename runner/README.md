@@ -704,17 +704,21 @@ not run by hand; `reader.rs`, `confine.rs`).
   reader; and what `run` still parses itself: the bridge's frames and control messages, the
   tunnels, and the HTTP requests to the git, model and egress proxies and the platform tools, which
   then add the credentials. Those are bounded and tested with a hostile peer, not split yet.
-- **Where it cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS), the
-  reader still runs as a process of its own without a token, but nothing keeps it from `run`'s
-  files. `run` says so at its start. With `--executor vm`, which exists for hostile input, `run`
-  refuses to start unless `--allow-unconfined-reader` (`TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`)
-  accepts it; a Docker host with `--sandbox-bridge` (container sandboxes, for input the company
-  trusts) starts with a warning.
+- **Where it cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS), every
+  host that uses the bridge refuses to start: `--executor vm` and a Docker host with
+  `--sandbox-bridge` alike, before any image is built. `--allow-unconfined-reader`
+  (`TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`) starts it anyway, with a warning, and gives up the
+  reader's confinement: the reader still runs as a process of its own without a token, but a flaw
+  in its reading of a sandbox's archive or git bundle reaches every file of the host's user (the
+  host's token and stored credentials among them), and can end `run` and its runs with a signal;
+  where seccomp is missing too, it reaches the network as well. A Docker host without the bridge
+  uses no reader and checks none.
 - **`doctor`** runs a reader, which confines itself and tries to open the config and data
   directories, its parent's memory and a socket, and says `reader: confined: Landlock ABI 7 (files,
-  TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable`, or why not (a
-  failure where `run --executor vm` would refuse, a warning where the bridge is on). `host memory`
-  says whether `run` can make itself not dumpable.
+  TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable`, or why not: a
+  failure where `run` would refuse (`TINFIRM_RUNNER_SANDBOX_BRIDGE` or `TINFIRM_RUNNER_EXECUTOR=vm`
+  set, without `TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), a warning where the flag accepts it, and
+  a note where the bridge is off. `host memory` says whether `run` can make itself not dumpable.
 
 ## A VM per run
 

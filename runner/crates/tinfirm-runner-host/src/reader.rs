@@ -34,8 +34,8 @@
 //!
 //! Where the reader cannot be confined (no Landlock 2, macOS), it still runs as a process of its
 //! own without a token, but nothing keeps it from the host's files: [`Reader::probe`] tells, and
-//! `run` refuses such a host with `--executor vm` unless `--allow-unconfined-reader` says
-//! otherwise, and warns on a Docker host with `--sandbox-bridge` (runner/README.md).
+//! `run` refuses such a host with `--sandbox-bridge` or `--executor vm` unless
+//! `--allow-unconfined-reader` says otherwise (runner/README.md).
 
 use std::io::{self, BufRead, Read, Write};
 use std::net::SocketAddr;
@@ -79,8 +79,8 @@ const IMPORTED_REF: &str = "refs/tinfirm/sandbox";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Job {
-    /// The host takes an unconfined reader on this system (`--allow-unconfined-reader`, a
-    /// Docker host, the tests). Otherwise a reader that cannot confine itself refuses.
+    /// The host takes an unconfined reader on this system (`--allow-unconfined-reader`, the
+    /// tests). Otherwise a reader that cannot confine itself refuses.
     allow_unconfined: bool,
     work: Work,
 }
@@ -251,8 +251,8 @@ impl Reader {
         ))
     }
 
-    /// Whether a reader that cannot confine itself here works anyway (`--allow-unconfined-reader`
-    /// on a VM host, a Docker host, the tests), as a process of its own without a token.
+    /// Whether a reader that cannot confine itself here works anyway (`--allow-unconfined-reader`,
+    /// the tests), as a process of its own without a token.
     pub fn allowing_unconfined(mut self, allow: bool) -> Reader {
         self.allow_unconfined = allow;
         self
