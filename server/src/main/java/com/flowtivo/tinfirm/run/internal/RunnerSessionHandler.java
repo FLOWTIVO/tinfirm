@@ -18,6 +18,7 @@ import com.flowtivo.tinfirm.run.RunEvents;
 import com.flowtivo.tinfirm.run.RunStatus;
 import com.flowtivo.tinfirm.run.TurnEnded;
 import com.flowtivo.tinfirm.runner.ConnectedHost;
+import com.flowtivo.tinfirm.runner.RunnerConnections;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RunnerProperties;
 import com.flowtivo.tinfirm.runner.RunnerSessionListener;
@@ -117,11 +118,15 @@ class RunnerSessionHandler implements RunnerSessionListener {
 
     private final RunnerFloodControl flood;
 
+    private final RunnerConnections connections;
+
     RunnerSessionHandler(RunStore runs, RunLocks locks, RunEventStore events, RunCommandStore commands,
             RunCompletion completion, RunResumption resumption, RunRequestRouter requests, RunDispatcher dispatcher,
             RunEventHub hub, RunMetrics metrics, ApplicationEventPublisher publisher, SystemTransactions transactions,
             RunnerProperties runnerProperties, RunProperties properties, TimeSource time,
-            PublicSuffixPush publicSuffixes, RunPorts ports, SessionBundleCleanup bundles, RunnerFloodControl flood) {
+            PublicSuffixPush publicSuffixes, RunPorts ports, SessionBundleCleanup bundles, RunnerFloodControl flood,
+            RunnerConnections connections) {
+        this.connections = connections;
         this.flood = flood;
         this.ports = ports;
         this.bundles = bundles;
@@ -220,8 +225,9 @@ class RunnerSessionHandler implements RunnerSessionListener {
      * <li>any other run the host reports is resumed when it was lost by lease expiry and the rule of
      * {@link RunResumption} allows it, and cancelled otherwise.</li>
      * </ul>
-     * Pending cancel commands of the kept and resumed runs are sent again. A v2 host that holds no Public Suffix List,
-     * or another version than the server's, gets the server's first ({@code psl.update}, {@link PublicSuffixPush}).
+     * Pending revocations of git tokens (ADR-0116) and cancel commands of the kept and resumed runs are sent again, the
+     * revocations first. A v2 host that holds no Public Suffix List, or another version than the server's, gets the
+     * server's first ({@code psl.update}, {@link PublicSuffixPush}).
      */
     @Override
     public List<RunnerMessages.Outbound> hostConnected(ConnectedHost host, List<RunnerMessages.ActiveRun> activeRuns,
@@ -287,9 +293,32 @@ class RunnerSessionHandler implements RunnerSessionListener {
                     replies.add(new RunnerMessages.RunCancel(other.runId(), other.epoch()));
                 }
             }
+            // A revocation goes before a cancel: a cancelled run pushes its work (ADR-0116).
+            replies.addAll(pendingRevocations(host, kept, now));
             replies.addAll(pendingCancels(kept, now));
             return replies;
         });
+    }
+
+    /**
+     * {@code run.git.revoke} for the pending revocations of the runs' current assignments (ADR-0116), to a host that
+     * lists the feature; each counts as sent again. A host without it gets none, and its runs keep their tokens.
+     */
+    private List<RunnerMessages.Outbound> pendingRevocations(ConnectedHost host, List<UUID> runIds, Instant now) {
+        if (!connections.supports(host.runnerHostId(), RunnerMessages.FEATURE_RUN_GIT_REVOKE)) {
+            return List.of();
+        }
+        List<RunnerMessages.Outbound> revocations = new ArrayList<>();
+        for (RunCommandStore.GitRevocation revocation : commands.pendingRevocations(runIds)) {
+            RunStore.RunRow run = runs.find(revocation.runId()).orElse(null);
+            if (run == null || run.epoch() != revocation.epoch()) {
+                continue;
+            }
+            revocations.add(new RunnerMessages.RunGitRevoke(run.id(), run.epoch(), revocation.componentIds(),
+                    revocation.reason(), revocation.message()));
+            commands.markRevocationSent(revocation.id(), now);
+        }
+        return revocations;
     }
 
     /** {@code run.cancel} for the runs with a pending cancel command, which count as sent again. */

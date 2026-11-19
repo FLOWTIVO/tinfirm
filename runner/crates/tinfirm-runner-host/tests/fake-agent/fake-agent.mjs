@@ -42,6 +42,9 @@
 //   refusal            the model refuses (stopReason: refusal)
 //   fetch              prints `origin`, waits for a new commit on main (git fetch through the
 //                      git proxy), reads its file, tries to push, and leaves an uncommitted file
+//   refetch            fetches `main` (through the git proxy), commits `refetch.txt`, reports and
+//                      waits like `gate` until the file `release` appears, then fetches again
+//                      and reports that fetch and what `release` holds
 //   multi              lists the repositories, prints each `origin` and whether it has
 //                      alternates, then applies the `[commit:<dir>]` and `[wip:<dir>]` markers
 //   forge-remote-ref   commits the credential in the first repository, points the forged
@@ -758,6 +761,29 @@ async function prompt(msg) {
       }
       fs.writeFileSync(path.join(cwd, "fetch.txt"), "written after the fetch\n");
       chunk(sessionId, `\n${report.join("\n")}`);
+      return done({ stopReason: "end_turn" });
+    }
+    case "refetch": {
+      const report = [];
+      const fetchOnce = (label) => {
+        try {
+          git(cwd, "fetch", "origin", "main");
+          report.push(`${label}: ok`);
+        } catch (e) {
+          report.push(`${label} failed: ${(e.stderr || e.message || "").toString().trim()}`);
+        }
+      };
+      fetchOnce("first fetch");
+      fs.writeFileSync(path.join(cwd, "refetch.txt"), "work before the revocation\n");
+      git(cwd, "add", "refetch.txt");
+      git(cwd, "commit", "-q", "-m", "Refetch work");
+      chunk(sessionId, `\n${report.join("\n")}\nwaiting for release`);
+      const release = path.join(root, "release");
+      while (!fs.existsSync(release)) {
+        if (await waitCancel(100)) return done({ stopReason: "cancelled" });
+      }
+      fetchOnce("second fetch");
+      chunk(sessionId, `\n${report[1]}\nrelease said: ${fs.readFileSync(release, "utf8").trim()}`);
       return done({ stopReason: "end_turn" });
     }
     case "multi": {

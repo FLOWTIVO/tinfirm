@@ -634,6 +634,27 @@ impl Conn {
         .await;
     }
 
+    /// Waits until a run's agent has said `needle` (its AGENT_MESSAGE events, joined).
+    pub async fn until_agent_says(&mut self, run_id: Uuid, needle: &str) {
+        let id = run_id.to_string();
+        let mut said = String::new();
+        loop {
+            let frame = self
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("connection closed before the agent said {needle:?}"));
+            if frame["type"] == "run.finished" && frame["runId"] == id {
+                panic!("the run finished before the agent said {needle:?}: {said}\n{frame:#}");
+            }
+            if frame["runId"] == id && frame["eventType"] == "AGENT_MESSAGE" {
+                said.push_str(frame["payload"]["text"].as_str().unwrap_or_default());
+                if said.contains(needle) {
+                    return;
+                }
+            }
+        }
+    }
+
     async fn receive(&mut self) -> Option<Value> {
         if self.closed {
             return None;
@@ -1644,6 +1665,18 @@ pub fn request_ack(
         ack["message"] = json!(message);
     }
     ack
+}
+
+/// A `run.git.revoke` frame (ADR-0116).
+pub fn git_revoke(run_id: Uuid, epoch: i64, component_ids: &[Uuid], message: &str) -> Value {
+    json!({
+        "type": "run.git.revoke",
+        "runId": run_id,
+        "epoch": epoch,
+        "componentIds": component_ids,
+        "reason": "GRANT_REMOVED",
+        "message": message
+    })
 }
 
 /// The server's answer to a `run.repository_request` frame.

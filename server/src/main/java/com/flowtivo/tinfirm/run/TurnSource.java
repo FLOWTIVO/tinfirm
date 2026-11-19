@@ -57,6 +57,21 @@ public interface TurnSource {
     }
 
     /**
+     * The third phase of an assignment (ADR-0116, decision 2), in its transaction, before the run's row is locked:
+     * whether every binding the content's git tokens came from is still {@code BOUND} and its system not paused. A
+     * binding that failed its check, or a system paused, between the reveal and this transaction would otherwise send
+     * a token that no revocation finds, since the run's {@code run_repository} rows are written only here. Locks the
+     * workspace's systems {@code FOR SHARE} in the order of their ids, then the conversation's row (CONVENTIONS §10):
+     * a pause, which locks its system first, and a binding's change, which locks the conversation first, either commit
+     * before this reads, or find the rows once it has committed. Answers why the assignment may not be sent, in words,
+     * or empty when it may.
+     */
+    default java.util.Optional<String> workspaceRevoked(UUID companyId, UUID conversationId,
+            List<Workspace> workspaces) {
+        return java.util.Optional.empty();
+    }
+
+    /**
      * The content of the turn's {@code run.assign}, once the run is assigned to its host with a new epoch. Runs outside
      * any transaction, as actor SYSTEM, on a thread of its own (it may open its own short transactions in the run's
      * company): the workspace's git tokens come from {@code ConversationBindings.use} and {@code Accounts.reveal} with

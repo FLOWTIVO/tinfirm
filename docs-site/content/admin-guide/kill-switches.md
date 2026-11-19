@@ -68,6 +68,10 @@ While it is paused:
 - every trigger that watches it, or acts with an account on it, pauses (**An admin paused its system**), and its write-backs wait;
 - a webhook system answers deliveries `200` with `{"paused": true}`: nothing is stored, and they never fire later.
 
+The turns running now lose their git access to the system's repositories at once, whether or not you cancel them: the agent's next fetch fails, and Tinfirm does not push those repositories when the turn ends. A turn that had commits to push there ends failed, and its run page shows **Git access revoked** on the repository. Resuming the system does not give a running turn its access back; the conversation's next turn has it. A runner host of an older release cannot drop a token: its turns keep their access until they end, and their conversation says so.
+
+Pausing an agent or a trigger, and stopping every run, do not revoke git access: those turns finish, or are cancelled, as above.
+
 ### Resume a system
 
 Choose **Resume** beside it. Its accounts work again and waiting turns go on. When its pause paused triggers, the dialog lists them, with **Resume its triggers too** ticked. Each trigger resumes from now on: nothing that happened during the pause fires it. A trigger you leave out stays paused until its author or an admin resumes it.

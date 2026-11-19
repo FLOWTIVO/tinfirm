@@ -186,6 +186,28 @@ public final class RunnerMessages {
      */
     public static final String FEATURE_SANDBOX_ELASTIC = "sandbox.elastic";
 
+    /**
+     * The optional feature of protocol 2 ({@code hello.features}) whose host takes {@link RunGitRevoke} and
+     * {@link WelcomeDone} (ADR-0116): it
+     * drops the named repositories' git tokens from its git proxy, its own git and its take-back record. The server
+     * sends the frame only to such a host; a run on another keeps its tokens until it ends.
+     */
+    public static final String FEATURE_RUN_GIT_REVOKE = "run.git.revoke";
+
+    /**
+     * The optional feature of protocol 2 ({@code hello.features}) whose host reads {@code workspaces[].git.expiresAt}
+     * and {@code mirrorKey} and renews a token that expires with a {@code run.request} of kind {@code GIT_TOKEN}
+     * (ADR-0116). A run whose git token a GitHub App mints goes only to a host that lists it and
+     * {@link #FEATURE_RUN_GIT_REVOKE}.
+     */
+    public static final String FEATURE_RUN_GIT_REFRESH = "run.git.refresh";
+
+    /** The most repositories one {@link RunGitRevoke} names ({@code $defs/RunGitRevoke.componentIds}). */
+    public static final int MAX_GIT_REVOKE_COMPONENTS = 20;
+
+    /** The longest {@code run.git.revoke.message}, in characters. */
+    public static final int MAX_GIT_REVOKE_MESSAGE = 1000;
+
     /** The largest session bundle, compressed ({@code run.assign.sessionBundle.sizeBytes} maximum): 32 MiB. */
     public static final int MAX_SESSION_BUNDLE_BYTES = 32 * 1024 * 1024;
 
@@ -225,6 +247,8 @@ public final class RunnerMessages {
             @JsonSubTypes.Type(value = RunHeartbeat.class, name = "run.heartbeat"),
             @JsonSubTypes.Type(value = RunFinished.class, name = "run.finished"),
             @JsonSubTypes.Type(value = RunCancel.class, name = "run.cancel"),
+            @JsonSubTypes.Type(value = RunGitRevoke.class, name = "run.git.revoke"),
+            @JsonSubTypes.Type(value = WelcomeDone.class, name = "welcome.done"),
             @JsonSubTypes.Type(value = RunRepositoryRequest.class, name = "run.repository_request"),
             @JsonSubTypes.Type(value = RunRepositoryRequestAck.class, name = "run.repository_request.ack"),
             @JsonSubTypes.Type(value = RunTaskCreate.class, name = "run.task_create"),
@@ -854,6 +878,37 @@ public final class RunnerMessages {
     }
 
     public record RunCancel(UUID runId, long epoch) implements Outbound {
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116): the last frame of the server's answer to a host's
+     * {@code hello}, once per connection, after everything it sends again for the runs the hello listed. Every pending
+     * revocation of those runs went on this connection before it; a host that took a run back pushes the run's work
+     * only after it.
+     */
+    public record WelcomeDone() implements Outbound {
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116): the host drops the git tokens of the repositories
+     * named ({@code workspaces[].componentId}) for the run's assignment of {@code epoch}. No ack: the server sends it
+     * after the change's commit and again at every {@code hello} that lists the run, until the run ends.
+     *
+     * @param reason  a code: the binding's reason, {@code SYSTEM_PAUSED}, {@code CREDENTIAL_REPLACED} or
+     *                {@code REFRESH_REFUSED}
+     * @param message the text for the run's log and the agent, at most {@value #MAX_GIT_REVOKE_MESSAGE} characters
+     */
+    public record RunGitRevoke(UUID runId, long epoch, List<UUID> componentIds, String reason, String message)
+            implements Outbound {
+
+        public RunGitRevoke {
+            componentIds = List.copyOf(componentIds);
+            if (componentIds.isEmpty() || componentIds.size() > MAX_GIT_REVOKE_COMPONENTS || message.isEmpty()
+                    || message.length() > MAX_GIT_REVOKE_MESSAGE) {
+                throw new IllegalArgumentException("A run.git.revoke names 1 to " + MAX_GIT_REVOKE_COMPONENTS
+                        + " repositories, with a message of 1 to " + MAX_GIT_REVOKE_MESSAGE + " characters");
+            }
+        }
     }
 
     // ---- steering (the protocol 2 feature run.steer) ---------------------------------------------------------------

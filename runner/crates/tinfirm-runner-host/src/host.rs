@@ -13,8 +13,8 @@ use tinfirm_protocol::{
     AssignedCredential, CredentialKind, CredentialState, CredentialStatus, ErrorMessage,
     Executor as ExecutorKind, Hello, IsolationTier, MAX_WORKSPACES, Message, ModelAccess,
     PslUpdate, PublicSuffixListVersion, RequestKind, RunAccepted, RunAsk, RunAskAck, RunAssign,
-    RunCancel, RunRef, RunRejected, RunRepositoryRequest, RunRequest, RunRequestAck, RunSteer,
-    RunTaskCreate, RunTaskCreateAck, Runtime, RuntimeInfo, WorkspaceSpec, feature,
+    RunCancel, RunGitRevoke, RunRef, RunRejected, RunRepositoryRequest, RunRequest, RunRequestAck,
+    RunSteer, RunTaskCreate, RunTaskCreateAck, Runtime, RuntimeInfo, WorkspaceSpec, feature,
     is_valid_workspace_dir, reject_code,
 };
 use tokio::sync::{Notify, oneshot, watch};
@@ -30,6 +30,7 @@ use crate::credentials::CredentialStore;
 use crate::docker;
 use crate::egress_proxy::{EgressProxy, EgressSettings, Rule};
 use crate::git_proxy::{self, GitProxy};
+use crate::git_tokens::RunGitTokens;
 use crate::homes::SessionHomes;
 use crate::images;
 use crate::maintenance;
@@ -99,6 +100,10 @@ pub struct HostOptions {
     /// How long a `run.request` of kind TOOL waits for its ack: the server's tool timeout
     /// (60 s by default) plus 5 s.
     pub tool_request_timeout: Duration,
+    /// How long a run taken back after a restart waits for the server's `welcome.done` before
+    /// it pushes with what its record holds (ADR-0116, decision 10): 2 minutes, the server's
+    /// reconnect grace; tests shorten it.
+    pub welcome_done_wait: Duration,
     /// Deletion and gc of mirrors, deletion of session homes and of cached skills
     /// (`TINFIRM_RUNNER_MIRROR_MAX_IDLE_DAYS`, `TINFIRM_RUNNER_MIRROR_MAX_BYTES`,
     /// `TINFIRM_RUNNER_HOME_MAX_IDLE_DAYS`, `TINFIRM_RUNNER_SKILL_CACHE_MAX_IDLE_DAYS`).
@@ -153,6 +158,7 @@ impl HostOptions {
             model_proxy: ModelProxySettings::default(),
             repository_request_timeout: REPOSITORY_REQUEST_TIMEOUT,
             tool_request_timeout: TOOL_REQUEST_TIMEOUT,
+            welcome_done_wait: WELCOME_DONE_WAIT,
             maintenance: maintenance::Settings::from_env(),
             bridge: None,
             ready_vms: crate::ready_vms::ReadyVmOptions::default(),
@@ -280,6 +286,9 @@ const STALE_COPY_WAIT: Duration = Duration::from_secs(20);
 /// How long `hello` waits for Docker to report the runtime images.
 const HELLO_IMAGE_CHECK: Duration = Duration::from_secs(5);
 
+/// [`HostOptions::welcome_done_wait`] by default.
+pub const WELCOME_DONE_WAIT: Duration = Duration::from_secs(120);
+
 /// How often a draining host checks whether its last run has ended.
 const DRAIN_POLL: Duration = Duration::from_millis(200);
 
@@ -307,6 +316,8 @@ struct RunEntry {
     stop: watch::Sender<Option<StopRequest>>,
     /// The execution's `run.steer`s, for its agent session.
     steering: Arc<Steering>,
+    /// The execution's git tokens, which a `run.git.revoke` drops (ADR-0116).
+    git_tokens: Arc<RunGitTokens>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -373,6 +384,10 @@ pub struct Shared {
     platform_requests: Mutex<HashMap<Uuid, PendingRequest>>,
     /// Between `welcome` and the end of that connection.
     connected: AtomicBool,
+    /// Set by the current connection's `welcome.done` (ADR-0116): the server has sent every
+    /// pending revocation of the runs the hello listed. Cleared at each `welcome` and at a
+    /// disconnect.
+    welcome_done: watch::Sender<bool>,
     heartbeat_secs: AtomicU64,
     lease_ttl_secs: AtomicU64,
     runner_host_id: Mutex<Option<Uuid>>,
@@ -432,6 +447,7 @@ impl Shared {
             platform_requests: Mutex::new(HashMap::new()),
             public_suffix: Arc::new(PublicSuffixStore::load(&opts.paths)),
             connected: AtomicBool::new(false),
+            welcome_done: watch::Sender::new(false),
             opts,
             config,
             outbox,
@@ -708,6 +724,8 @@ impl Shared {
             tracing::info!(%run_id, epoch, "taking back a run of the process before this one");
             let (stop_tx, stop_rx) = watch::channel(None);
             let steering = Steering::new(run_id, epoch, self.outbox.clone());
+            // No token that the server revoked comes back (ADR-0116).
+            let git_tokens = RunGitTokens::restored(&record.assign, &record.revoked);
             lock(&self.runs).insert(
                 run_id,
                 RunEntry {
@@ -716,6 +734,7 @@ impl Shared {
                     credential_label: record.assign.credential_label.clone(),
                     stop: stop_tx,
                     steering: steering.clone(),
+                    git_tokens: git_tokens.clone(),
                     handle: None,
                 },
             );
@@ -723,7 +742,9 @@ impl Shared {
             let shared = self.clone();
             let handle = tokio::spawn(async move {
                 let finished =
-                    run::take_back(&shared, record, sandbox, registration, stop_rx).await;
+                    run::take_back(&shared, record, &git_tokens, sandbox, registration, stop_rx)
+                        .await;
+                git_tokens.close_log();
                 steering.close("the run ended");
                 match finished {
                     Some(finished) => {
@@ -838,6 +859,7 @@ impl Shared {
     }
 
     pub fn on_welcome(&self, welcome: &tinfirm_protocol::Welcome) {
+        self.welcome_done.send_replace(false);
         self.connected.store(true, Ordering::SeqCst);
         // A new connection: forget the host.config version, and drop answers that the old
         // connection did not write. The server sends host.config after welcome.
@@ -877,9 +899,16 @@ impl Shared {
         self.connected.load(Ordering::SeqCst)
     }
 
+    /// Whether the current connection's `welcome.done` has come, as it changes: `true` once
+    /// the server has sent every pending revocation of the runs the hello listed.
+    pub fn welcome_done(&self) -> watch::Receiver<bool> {
+        self.welcome_done.subscribe()
+    }
+
     /// The connection ended.
     pub fn on_disconnect(&self) {
         self.connected.store(false, Ordering::SeqCst);
+        self.welcome_done.send_replace(false);
         lock(&self.capacity).new_connection();
         self.outbox.on_disconnect();
     }
@@ -1160,6 +1189,7 @@ impl Shared {
             Message::RunAssign(assign) => self.handle_assign(assign),
             Message::RunCancel(cancel) => self.handle_cancel(cancel),
             Message::RunSteer(steer) => self.handle_steer(steer),
+            Message::RunGitRevoke(revoke) => self.handle_git_revoke(revoke),
             Message::RunRepositoryRequestAck(ack) => self.handle_platform_ack(
                 ack.run_id,
                 ack.request_id,
@@ -1178,6 +1208,11 @@ impl Shared {
             Message::PslUpdate(update) => self.handle_psl_update(update),
             Message::Error(error) => self.handle_error(error),
             Message::Welcome(_) => {}
+            Message::WelcomeDone(_) => {
+                // After the frames it promises: a revocation it names was applied already.
+                tracing::info!("the server's answer to the hello is complete (welcome.done)");
+                self.welcome_done.send_replace(true);
+            }
             other => self.outbox.push_control(Message::Error(ErrorMessage {
                 code: "BAD_MESSAGE".into(),
                 message: format!("unexpected message type `{}`", other.message_type()),
@@ -1396,6 +1431,7 @@ impl Shared {
         }
         let (stop_tx, stop_rx) = watch::channel(None);
         let steering = Steering::new(assign.run_id, assign.epoch, self.outbox.clone());
+        let git_tokens = RunGitTokens::new(&assign);
         // Take the slot. The draining flag, the task, the host's slots and the pool are
         // checked under the lock of the runs, so two assignments cannot both take the last
         // slot, and no run starts after a drain found none active.
@@ -1458,6 +1494,7 @@ impl Shared {
                             credential_label: label.map(str::to_string),
                             stop: stop_tx,
                             steering: steering.clone(),
+                            git_tokens: git_tokens.clone(),
                             handle: None,
                         },
                     )
@@ -1480,8 +1517,17 @@ impl Shared {
                 let _ = tokio::time::timeout(STALE_COPY_WAIT, stale_copy).await;
             }
             if admitted {
-                let finished =
-                    run::execute(&shared, &assign, &credential, stop_rx, &steering).await;
+                let finished = run::execute(
+                    &shared,
+                    &assign,
+                    &credential,
+                    &git_tokens,
+                    stop_rx,
+                    &steering,
+                )
+                .await;
+                // Before run.finished: a revocation that comes later is no event of the run.
+                git_tokens.close_log();
                 // Before run.finished: the steers the agent did not take wait for the next turn.
                 steering.close("the run ended");
                 match finished {
@@ -1719,6 +1765,26 @@ impl Shared {
         }
     }
 
+    /// `run.git.revoke` (ADR-0116): the execution's holder drops the named repositories'
+    /// tokens. There is no ack: a frame for another epoch, for a run this host does not hold or
+    /// no longer holds, or for repositories revoked already, is ignored, as the server sends the
+    /// frame again at every hello until the run ends.
+    fn handle_git_revoke(&self, revoke: RunGitRevoke) {
+        let tokens = lock(&self.runs)
+            .get(&revoke.run_id)
+            .filter(|e| e.epoch == revoke.epoch)
+            .map(|e| e.git_tokens.clone());
+        match tokens {
+            Some(tokens) => {
+                tracing::info!(run_id = %revoke.run_id, epoch = revoke.epoch, reason = %revoke.reason, "the server revokes git tokens of a run");
+                tokens.revoke(&revoke.component_ids, &revoke.reason, &revoke.message);
+            }
+            None => {
+                tracing::debug!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke for an execution this host does not run; ignored");
+            }
+        }
+    }
+
     /// `run.steer`: for the execution's agent session, which answers it; an execution this host
     /// does not run refuses it at once.
     fn handle_steer(&self, steer: RunSteer) {
@@ -1873,6 +1939,7 @@ impl Shared {
                 credential_label: Some(credential_label.to_string()),
                 stop,
                 steering: Steering::new(run_id, epoch, self.outbox.clone()),
+                git_tokens: RunGitTokens::new_empty(run_id, epoch),
                 handle: None,
             },
         );
@@ -2182,7 +2249,7 @@ pub(crate) fn validate_model_access(access: &ModelAccess, runtime: Runtime) -> R
 /// (`hello.features`): `run.steer`, `run.skills` when the skills reach the sandbox (Docker
 /// mounts them, a VM gets them over the bridge; the local test executor has no mounts,
 /// ADR-0064), `session.bundle` (ADR-0097), which the server uses for company hosts only,
-/// `sandbox.bridge` with the sandbox bridge (ADR-0095), and `sandbox.elastic` when the VM
+/// `run.git.revoke` (ADR-0116), `sandbox.bridge` with the sandbox bridge (ADR-0095), and `sandbox.elastic` when the VM
 /// driver is one of this binary's paid ones (ADR-0114). A v1 host lists none.
 pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     if !v2 {
@@ -2193,6 +2260,8 @@ pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
         features.push(feature::RUN_SKILLS.to_string());
     }
     features.push(feature::SESSION_BUNDLE.to_string());
+    // Every executor: the holder of a run's git tokens is the host's (ADR-0116).
+    features.push(feature::RUN_GIT_REVOKE.to_string());
     if bridged {
         features.push(feature::SANDBOX_BRIDGE.to_string());
     }
@@ -3084,12 +3153,17 @@ mod tests {
         );
         assert_eq!(
             features(true, &docker, false),
-            ["run.steer", "run.skills", "session.bundle"]
+            [
+                "run.steer",
+                "run.skills",
+                "session.bundle",
+                "run.git.revoke"
+            ]
         );
         // The local test executor has no mounts.
         assert_eq!(
             features(true, &local, false),
-            ["run.steer", "session.bundle"]
+            ["run.steer", "session.bundle", "run.git.revoke"]
         );
         assert!(features(false, &docker, false).is_empty());
         assert!(features(false, &local, false).is_empty());
@@ -3100,6 +3174,7 @@ mod tests {
                 "run.steer",
                 "run.skills",
                 "session.bundle",
+                "run.git.revoke",
                 "sandbox.bridge"
             ]
         );
@@ -3118,6 +3193,7 @@ mod tests {
                 "run.steer",
                 "run.skills",
                 "session.bundle",
+                "run.git.revoke",
                 "sandbox.bridge",
                 "sandbox.elastic"
             ]
@@ -3128,6 +3204,7 @@ mod tests {
                 "run.steer",
                 "run.skills",
                 "session.bundle",
+                "run.git.revoke",
                 "sandbox.bridge"
             ]
         );

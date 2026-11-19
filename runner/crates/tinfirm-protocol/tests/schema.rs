@@ -1811,6 +1811,14 @@ fn constructed_messages_v2() -> Vec<Message> {
         )));
     }
     out.push(Message::RunSteer(steer));
+    out.push(Message::WelcomeDone(WelcomeDone {}));
+    out.push(Message::RunGitRevoke(RunGitRevoke {
+        run_id: run_id(),
+        epoch: 1,
+        component_ids: vec![component_id(), Uuid::new_v4()],
+        reason: "SYSTEM_PAUSED".into(),
+        message: "Tinfirm revoked this run's access: the system was paused.".into(),
+    }));
     for (i, event) in all_payloads(true).into_iter().enumerate() {
         out.push(Message::RunEvent(RunEvent {
             run_id: run_id(),
@@ -2527,6 +2535,84 @@ fn steer_bounds_and_versions() {
         frame["features"] = bad.clone();
         assert!(!v2.is_valid(&frame), "features {bad}");
     }
+}
+
+#[test]
+fn git_revoke_bounds_and_versions() {
+    let v1 = validator();
+    let v2 = validator_v2();
+    let revoke = sample_v2("run.git.revoke.json");
+    assert_valid(&v2, &revoke, "run.git.revoke");
+    // A v2 feature (ADR-0116): v1 knows no such frame.
+    assert!(!v1.is_valid(&revoke), "run.git.revoke is not a v1 frame");
+    assert!(Message::from_value_version(revoke.clone(), PROTOCOL_VERSION).is_err());
+    let Message::RunGitRevoke(parsed) =
+        Message::from_value_version(revoke.clone(), PROTOCOL_VERSION_V2).unwrap()
+    else {
+        panic!("not run.git.revoke");
+    };
+    assert_eq!(parsed.component_ids, vec![component_id()]);
+    assert_eq!(parsed.reason, "GRANT_REMOVED");
+    for field in ["runId", "epoch", "componentIds", "reason", "message"] {
+        let mut frame = revoke.clone();
+        frame.as_object_mut().unwrap().remove(field);
+        assert!(!v2.is_valid(&frame), "run.git.revoke without {field}");
+        assert!(
+            Message::from_value(frame).is_err(),
+            "run.git.revoke without {field}"
+        );
+    }
+    // Always named, never "every repository"; at most one per workspace.
+    let mut none = revoke.clone();
+    none["componentIds"] = json!([]);
+    assert!(!v2.is_valid(&none), "no repository");
+    let mut many = revoke.clone();
+    many["componentIds"] = json!(
+        (0..=GIT_REVOKE_MAX_COMPONENTS)
+            .map(|_| Uuid::new_v4().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(!v2.is_valid(&many), "too many repositories");
+    many["componentIds"] = json!(
+        (0..GIT_REVOKE_MAX_COMPONENTS)
+            .map(|_| Uuid::new_v4().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_valid(&v2, &many, "repositories at the limit");
+    // A reason is a code; one the host does not know is no error.
+    let mut later = revoke.clone();
+    later["reason"] = json!("SOME_LATER_REASON");
+    assert_valid(&v2, &later, "an unknown reason code");
+    assert!(Message::from_value(later).is_ok());
+    let mut lower = revoke.clone();
+    lower["reason"] = json!("grant_removed");
+    assert!(!v2.is_valid(&lower), "a reason is upper case");
+    // The message: 1 to 1000 characters.
+    let mut empty = revoke.clone();
+    empty["message"] = json!("");
+    assert!(!v2.is_valid(&empty), "empty message");
+    let mut long = revoke.clone();
+    long["message"] = json!("x".repeat(GIT_REVOKE_MESSAGE_MAX_CHARS));
+    assert_valid(&v2, &long, "message at the limit");
+    long["message"] = json!("x".repeat(GIT_REVOKE_MESSAGE_MAX_CHARS + 1));
+    assert!(!v2.is_valid(&long), "message above the limit");
+    // welcome.done: the type alone, v2 only.
+    let done = sample_v2("welcome.done.json");
+    assert_valid(&v2, &done, "welcome.done");
+    assert!(!v1.is_valid(&done), "welcome.done is not a v1 frame");
+    assert!(Message::from_value_version(done.clone(), PROTOCOL_VERSION).is_err());
+    assert_eq!(
+        Message::from_value_version(done.clone(), PROTOCOL_VERSION_V2).unwrap(),
+        Message::WelcomeDone(WelcomeDone {})
+    );
+    assert_eq!(
+        serde_json::to_value(Message::WelcomeDone(WelcomeDone {})).unwrap(),
+        json!({"type": "welcome.done"})
+    );
+    // The feature's name is a valid feature.
+    let mut hello = sample_v2("hello.json");
+    hello["features"] = json!([feature::RUN_STEER, feature::RUN_GIT_REVOKE]);
+    assert_valid(&v2, &hello, "hello with run.git.revoke");
 }
 
 #[test]

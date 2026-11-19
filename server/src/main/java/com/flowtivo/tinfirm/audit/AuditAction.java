@@ -162,6 +162,15 @@ public enum AuditAction {
      */
     RUN_RESUMED("run.resumed"),
     /**
+     * A run's git tokens of some repositories were revoked on its host (ADR-0116, decision 2), one event per run and
+     * cause: {@code conversationId}, {@code bindingId} (a binding that failed its check or followed another
+     * credential) or {@code systemId} (a paused system), {@code componentIds}, {@code reason}, {@code epoch},
+     * {@code sent} (whether {@code run.git.revoke} went to the host at once) and {@code delivery} ({@code SENT},
+     * {@code ON_RECONNECT}, or {@code UNSUPPORTED}: the host does not list {@code run.git.revoke}, and the run keeps
+     * its tokens until it ends). The actor is the change's. Never a token.
+     */
+    RUN_GIT_REVOKED("run.git_revoked"),
+    /**
      * A conversation's tool call ran on its system (the package 3 contract, §8), by the agent: {@code conversationId},
      * {@code runId}, {@code systemId}, {@code tool}, {@code effect}, {@code mode}, {@code accountId},
      * {@code holderPrincipalId}, {@code grantId}, {@code decisionId} for an approved call, {@code bindingId} for a

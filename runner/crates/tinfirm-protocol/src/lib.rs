@@ -100,7 +100,7 @@ pub const MESSAGE_TYPES: [&str; 19] = [
 /// Every `type` value defined by the v2 schema, in schema order: v1 without the three
 /// bespoke request pairs, plus `run.request` and `run.request.ack`, and the frames of the
 /// optional features ([`feature`]).
-pub const MESSAGE_TYPES_V2: [&str; 19] = [
+pub const MESSAGE_TYPES_V2: [&str; 21] = [
     "hello",
     "welcome",
     "run.assign",
@@ -110,6 +110,8 @@ pub const MESSAGE_TYPES_V2: [&str; 19] = [
     "run.heartbeat",
     "run.finished",
     "run.cancel",
+    "run.git.revoke",
+    "welcome.done",
     "run.request",
     "run.request.ack",
     "run.steer",
@@ -123,7 +125,7 @@ pub const MESSAGE_TYPES_V2: [&str; 19] = [
 ];
 
 /// Every `type` value of any version: what [`Message::parse`] accepts.
-const KNOWN_MESSAGE_TYPES: [&str; 25] = [
+const KNOWN_MESSAGE_TYPES: [&str; 27] = [
     "hello",
     "welcome",
     "run.assign",
@@ -133,6 +135,8 @@ const KNOWN_MESSAGE_TYPES: [&str; 25] = [
     "run.heartbeat",
     "run.finished",
     "run.cancel",
+    "run.git.revoke",
+    "welcome.done",
     "run.repository_request",
     "run.repository_request.ack",
     "run.task_create",
@@ -521,6 +525,13 @@ pub enum Message {
     RunFinished(RunFinished),
     #[serde(rename = "run.cancel")]
     RunCancel(RunCancel),
+    /// v2 feature [`feature::RUN_GIT_REVOKE`], server -> host: drop git tokens of a run.
+    #[serde(rename = "run.git.revoke")]
+    RunGitRevoke(RunGitRevoke),
+    /// v2 feature [`feature::RUN_GIT_REVOKE`], server -> host: the server's answer to the hello
+    /// is complete, every pending revocation of the runs it listed included.
+    #[serde(rename = "welcome.done")]
+    WelcomeDone(WelcomeDone),
     #[serde(rename = "run.repository_request")]
     RunRepositoryRequest(RunRepositoryRequest),
     #[serde(rename = "run.repository_request.ack")]
@@ -645,6 +656,8 @@ impl Message {
             Message::RunHeartbeat(_) => "run.heartbeat",
             Message::RunFinished(_) => "run.finished",
             Message::RunCancel(_) => "run.cancel",
+            Message::RunGitRevoke(_) => "run.git.revoke",
+            Message::WelcomeDone(_) => "welcome.done",
             Message::RunRepositoryRequest(_) => "run.repository_request",
             Message::RunRepositoryRequestAck(_) => "run.repository_request.ack",
             Message::RunTaskCreate(_) => "run.task_create",
@@ -762,6 +775,9 @@ pub mod feature {
     /// ([`EDITION_REQUIRED`](super::EDITION_REQUIRED)). An operator's own driver does not
     /// list it.
     pub const SANDBOX_ELASTIC: &str = "sandbox.elastic";
+    /// The host takes [`super::RunGitRevoke`] (ADR-0116): it drops the named repositories' git
+    /// tokens from its git proxy, its own git and its take-back record.
+    pub const RUN_GIT_REVOKE: &str = "run.git.revoke";
 }
 
 /// `error.code` before `welcome`: the server's licence does not hold a feature the hello
@@ -1755,6 +1771,39 @@ pub struct RunCancel {
     pub run_id: Uuid,
     pub epoch: i64,
 }
+
+/// Most repositories one [`RunGitRevoke`] names.
+pub const GIT_REVOKE_MAX_COMPONENTS: usize = 20;
+/// Longest `run.git.revoke.message`, in characters.
+pub const GIT_REVOKE_MESSAGE_MAX_CHARS: usize = 1000;
+
+/// Server -> runner host (v2 feature [`feature::RUN_GIT_REVOKE`], ADR-0116): the run may no
+/// longer use the git tokens of the repositories named. Durable on the server, sent again at
+/// every `hello` that lists the run until the run ends; there is no ack. The host applies it
+/// to the run's current epoch only, once per repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunGitRevoke {
+    pub run_id: Uuid,
+    pub epoch: i64,
+    /// `run.assign.workspaces[].componentId` of each repository whose token goes: 1 to
+    /// [`GIT_REVOKE_MAX_COMPONENTS`], never "every repository". An id that is not one of the
+    /// run's is ignored.
+    pub component_ids: Vec<Uuid>,
+    /// Why, as a code (the binding's reason, `SYSTEM_PAUSED`, `CREDENTIAL_REPLACED`,
+    /// `REFRESH_REFUSED`, …). Logged; the host decides nothing from it.
+    pub reason: String,
+    /// The server's text for the run's log and the agent (1 to
+    /// [`GIT_REVOKE_MESSAGE_MAX_CHARS`] characters).
+    pub message: String,
+}
+
+/// Server -> runner host (v2 feature [`feature::RUN_GIT_REVOKE`], ADR-0116), once per
+/// connection: the last frame of the server's answer to the hello, after every pending
+/// [`RunGitRevoke`] and [`RunCancel`] of the runs the hello listed. A host that took a run back
+/// pushes the run's work only after it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelcomeDone {}
 
 /// Longest `run.steer.text`, in characters.
 pub const STEER_TEXT_MAX_CHARS: usize = 110_000;

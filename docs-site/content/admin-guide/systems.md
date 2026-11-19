@@ -171,7 +171,7 @@ Its **⋯** menu:
 
 - **Store a new token…** or **Sign in again…** keeps its name, its id and what it is lent to, so the triggers and conversations that act with it go on. To rotate a token, create the new one at the system, store it here, then revoke the old one at the system.
 - **Rename…** keeps its grants, lendings and triggers.
-- **Disable** stops every use of it, by groups and service accounts, at its next check, until you **Enable** it. Conversations that act with it wait for an admin and go on once you enable it. Triggers that act with it pause, and stay paused until their author or an admin resumes them.
+- **Disable** stops every use of it, by groups and service accounts, at its next check, until you **Enable** it. Conversations that act with it wait for an admin and go on once you enable it. Triggers that act with it pause, and stay paused until their author or an admin resumes them. A turn running now with it loses its git access at once: its next fetch fails, and Tinfirm does not push its repositories on that system when it ends (see [Revoked git access](#revoked-git-access)).
 - **Remove…** removes its grants, then its lendings to service accounts (their triggers that act with it pause until their authors name another account), then the credential and its token. A sign-in is revoked at the system where the system allows that. Conversations that act with it stop at their next use of it.
 
 **Credentials** also counts the members who connect their own account on the system, for example *3 members connect their own account on GitHub (1 needs signing in again).* Their accounts are theirs: you see whether they hold one and its state on [Members](members.md), never the login or the token.
@@ -251,6 +251,27 @@ Tinfirm reads Jira, GitHub and GitLab for the triggers that watch them. Each rea
 - **Triggers**, **How it is read**, lists each read, such as *With the credential CI bot* or *With Alex Rivera's own account*, with its state (**Read**, **Idle: no active trigger**, **Waiting**), **Last read**, the requests left of the system's rate limit, and its last error.
 
 When less than a tenth of the system's rate limit is left, Tinfirm reads it half as often. When the system refuses the account, the account turns **Sign in again** or **Store a new token**, and the read waits until it works again. When the system answers that one project or repository is forbidden or not found, only the triggers that watch it wait; the others are read. On a rate limit, Tinfirm backs off until the limit resets, at most an hour. When the system cannot be reached, it backs off up to 30 minutes, and after an hour of failures its triggers wait. Changes are not lost while a read waits: they are read later. A system takes at most 100 live triggers.
+
+## Revoked git access
+
+When the account a running turn cloned a repository with can no longer be used, Tinfirm tells the turn's runner host to drop that repository's git token at once. This happens when:
+
+- a credential is disabled, removed, or needs a new token or sign-in;
+- a grant or a lending is withdrawn, or the person leaves the grant's group;
+- a member's own account is disconnected or needs signing in again;
+- an account's holder is suspended or leaves;
+- the system is paused or removed;
+- a trigger's service account borrows another credential on the system.
+
+The agent's next fetch from that repository fails, and Tinfirm does not push it when the turn ends. A turn with unpushed commits there ends failed; its run page shows **Git access revoked** on the repository with the reason, and the commits stay only on the runner host, if its operator keeps failed workspaces. The turn's other repositories go on as usual. The audit log records each revocation as `run.git_revoked`.
+
+What a revocation does not stop:
+
+- a fetch or push already under way;
+- what the agent's sandbox has already cloned or read;
+- the token itself at the code host. Tinfirm cannot rotate a member's personal access token: when it may have been copied, rotate it at GitHub or GitLab.
+
+A runner host of an older release cannot drop a token. Its turns keep their access until they end, the conversation says so, and the run page shows that the host was not told. Ask your operator to upgrade the runner hosts.
 
 ## The three switches
 

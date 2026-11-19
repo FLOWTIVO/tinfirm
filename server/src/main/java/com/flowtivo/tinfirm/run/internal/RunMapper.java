@@ -5,6 +5,7 @@ import org.mapstruct.Mapper;
 import com.flowtivo.tinfirm.shared.api.model.QueueReason;
 import com.flowtivo.tinfirm.shared.api.model.Run;
 import com.flowtivo.tinfirm.shared.api.model.RunCounts;
+import com.flowtivo.tinfirm.shared.api.model.RunGitRevocation;
 import com.flowtivo.tinfirm.shared.api.model.RunRelayUsage;
 import com.flowtivo.tinfirm.shared.api.model.RunRepository;
 import com.flowtivo.tinfirm.shared.api.model.RunResult;
@@ -17,6 +18,8 @@ interface RunMapper {
     Run toDto(RunViews.RunDetails run);
 
     RunRepository toDto(RunViews.RepositoryDetails repository);
+
+    RunGitRevocation toDto(RunViews.GitRevocationDetails revocation);
 
     QueueReason toDto(RunViews.QueueReasonDetails reason);
 

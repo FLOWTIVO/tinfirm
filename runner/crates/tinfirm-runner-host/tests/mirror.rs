@@ -315,7 +315,7 @@ async fn a_workspace_is_a_copy_with_no_link_to_the_mirror() {
             ("Host".into(), "host@tinfirm.invalid".into()),
         );
         let lease = mirrors
-            .update(&url, host_git.authorization())
+            .update(&url, host_git.authorization().unwrap().as_ref())
             .await
             .unwrap();
         let requests = server.seen().len();

@@ -623,6 +623,17 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     host's runs when the machine itself restarts (Docker stops the containers), are lost.
   - The records hold the run's credentials (the repositories' tokens, a model access key) and the
     listener's private key while the sandbox lives, as the config directory holds the host token.
+    A record's git tokens are those the run holds now: when Tinfirm revokes a repository's token
+    ([Revoked git tokens](#revoked-git-tokens-protocol-v2)), the host writes the record again,
+    whole and 0600, without the token and with the repository in its `revoked` list (the
+    server's reason and message). A host that takes the run back then neither uses that token
+    nor pushes the repository.
+  - A host of protocol 2 that took a run back pushes its work only once the server has sent
+    `welcome.done` on the current connection: the last frame of its answer to the `hello`, after
+    every revocation (and cancel) it keeps for the runs the `hello` listed, which the host has
+    applied by then. So a revocation that Tinfirm sent while the host was away comes first.
+    Without `welcome.done` within 2 minutes (no connection, or a server that sends none) the run
+    pushes with what the record holds, and a warning in its log says which of the two it was.
   - `run` must start with the same data directory and, for Docker, the same sandbox network, within
     the 15 minutes; `run --sandbox-bridge` must stay on.
 
@@ -1065,8 +1076,9 @@ The host speaks one runner protocol version per connection and names it in
 - **Optional features.** A v2 host lists in `hello.features` what it implements beyond v2, and
   the server sends a feature's frames only to a host that lists it. This host lists `run.steer`
   ([Steering](#steering-protocol-v2)), `session.bundle`
-  ([Session bundles](#session-bundles-protocol-v2)) and, with Docker, `run.skills`
-  ([Skills](#skills-protocol-v2)); a v1 host lists nothing.
+  ([Session bundles](#session-bundles-protocol-v2)), `run.git.revoke`
+  ([Revoked git tokens](#revoked-git-tokens-protocol-v2)) and, with Docker or a VM per run,
+  `run.skills` ([Skills](#skills-protocol-v2)); a v1 host lists nothing.
 - **Per-kind waits.** A `run.request` of kind `ASK`, `ACCESS`, `NETWORK` or `ARTIFACT` waits 30 s for
   its ack (as the v1 pairs do); a `TOOL` request waits 65 s, the server's tool timeout
   (60 s by default) plus 5 s. A request that still waits when the connection is lost is sent
@@ -1087,7 +1099,7 @@ Three numbers, each moved by something else
 | The features | `hello.features` | A new optional capability within protocol 2, whatever release ships it | Sends a feature's frames only to a host that lists it |
 
 **This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
-It uses the features `run.steer`, `run.skills`, `session.bundle`,
+It uses the features `run.steer`, `run.skills`, `session.bundle`, `run.git.revoke`,
 `sandbox.bridge`, `sandbox.pool` and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
 [ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). A host that lists none of them
 still takes turns; it only misses what they add.
@@ -1894,6 +1906,44 @@ process, with one route and one route secret per repository.
 - If the proxy cannot start, the run goes on with a warning, without fetch and without the
   platform tools; a run whose model access is a gateway fails instead, because its model
   proxy has no address to listen on.
+- A route reads its repository's token from the run's holder at each request, never a copy
+  taken when the run started. Once Tinfirm has revoked the token
+  ([below](#revoked-git-tokens-protocol-v2)), each new request gets 403 with Tinfirm's message
+  as plain text, which git shows the agent (`fatal: unable to access …: The requested URL
+  returned error: 403`, after the message). A request already forwarded finishes.
+
+### Revoked git tokens (protocol v2)
+
+Under protocol v2 the host lists the feature `run.git.revoke` in `hello.features`
+([ADR-0116](../docs/adr/0116-short-lived-and-revocable-git-tokens.md)). Tinfirm sends
+`run.git.revoke` when the run may no longer use a repository's git token: the conversation's
+account was disconnected or needs a new sign-in, a credential was disabled, a grant or a lending
+was withdrawn, a holder was suspended, the system was paused or removed, and so on. The frame names
+the repositories (`componentIds`), a reason code and a message; it has no ack, and Tinfirm sends
+it again at every `hello` that lists the run, until the run ends, followed by `welcome.done`,
+which says that every such frame of the runs the `hello` listed has been sent.
+
+One holder per run keeps each repository's token; the host's git, the git proxy's routes and the
+take-back record read it there when they use it. For a frame of the run's current epoch, for each
+repository it names:
+
+| What | After the revocation |
+|---|---|
+| The holder | Drops the token, and keeps the reason and the message |
+| The git proxy | Answers each new fetch with 403 and the message ([Git in the sandbox](#git-in-the-sandbox)). A fetch already under way finishes |
+| A clone not yet made | `cannot clone <repository>: <message>`, `GIT_ERROR` |
+| The mirror fetch before the push | Not attempted: the credential scan compares with the refs at clone time |
+| The push | Not attempted. A repository with commits ahead fails the run with `GIT_ERROR` and `git failed in <repository>: not pushed: <message>`, its git result `pushed: false` with the commits counted; its commits stay only in a kept failed workspace. A repository without commits fails nothing |
+| The take-back record | Written again without the token ([Sandbox bridge](#sandbox-bridge)) |
+| The redaction | The token stays on the run's list until the run ends: what was revealed stays redacted, and the agent printing it is still `CREDENTIAL_LEAK` |
+| The run's events | A `LOG` event at `warn` with the message |
+
+The other repositories go on as before, and so does the agent: it works on without git for the
+repositories revoked. A frame for another epoch, for a run the host does not hold, for a
+repository it does not have or one revoked already, changes nothing, and is not answered. A
+cancelled run whose token was revoked ends `CANCELLED` as before, with the repository not pushed
+and the reason in the log. A host of protocol 1 knows no such frame (`error` `UNKNOWN_TYPE`), and
+Tinfirm sends it only to a host that lists the feature: such a run keeps its token until it ends.
 
 ### Platform tools
 

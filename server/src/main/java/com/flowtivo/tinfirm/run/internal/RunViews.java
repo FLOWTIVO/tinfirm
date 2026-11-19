@@ -34,7 +34,11 @@ final class RunViews {
 
     record RepositoryDetails(@Nullable UUID repositoryId, @Nullable UUID systemId, String repositoryName, String dir,
             boolean readOnly, @Nullable String readOnlyCause, @Nullable Boolean pushed, @Nullable String headSha,
-            @Nullable Integer commits) {
+            @Nullable Integer commits, @Nullable GitRevocationDetails gitRevoked) {
+    }
+
+    /** ADR-0116: the revocation of a repository's git token in the run's current assignment. */
+    record GitRevocationDetails(String reason, String message, Instant revokedAt, boolean hostTold) {
     }
 
     record ResultDetails(String outcome, String summary, List<String> nextSteps, List<String> openQuestions) {

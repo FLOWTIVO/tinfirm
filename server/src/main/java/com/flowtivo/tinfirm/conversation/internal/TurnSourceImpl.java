@@ -232,6 +232,42 @@ class TurnSourceImpl implements TurnSource {
     }
 
     /**
+     * ADR-0116, decision 2: in the third phase's transaction, the workspace's systems locked {@code FOR SHARE} in the
+     * order of their ids, then the conversation's row; a binding a git token came from that is no longer
+     * {@code BOUND}, or a paused or removed system, means the assignment is not sent.
+     */
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public java.util.Optional<String> workspaceRevoked(UUID companyId, UUID conversationId,
+            List<Workspace> workspaces) {
+        java.util.SortedSet<UUID> systemIds = new java.util.TreeSet<>();
+        workspaces.forEach(repository -> systemIds.add(repository.systemId()));
+        Map<UUID, SystemInfo> locked = new java.util.HashMap<>();
+        for (UUID systemId : systemIds) {
+            systems.lockShared(companyId, systemId).ifPresent(system -> locked.put(systemId, system));
+        }
+        store.lock(companyId, conversationId);
+        for (Workspace repository : workspaces) {
+            SystemInfo system = locked.get(repository.systemId());
+            if (system == null) {
+                return java.util.Optional.of(repository.name() + ": its system was removed.");
+            }
+            if (system.paused()) {
+                return java.util.Optional.of(repository.name() + ": " + system.name() + " was paused.");
+            }
+            if (repository.bindingId() == null) {
+                continue;
+            }
+            BindingInfo binding = bindings.find(companyId, repository.bindingId()).orElse(null);
+            if (binding == null || !binding.bound()) {
+                return java.util.Optional.of(repository.name() + ": "
+                        + (binding != null ? texts.text(binding) : system.name() + " is not connected."));
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
+    /**
      * The workspace with every system's binding resolved: a repository approved since the last turn binds now, asked for
      * by the turn's run.
      */

@@ -10,8 +10,9 @@ export function gitResult(repo: RunRepository, active: boolean): string {
   if (repo.pushed === true) return commits !== null ? `Pushed ${commitCount(commits)}` : 'Pushed';
   if (repo.pushed === false) {
     if (!commits) return 'No changes';
-    return repo.readOnly
-      ? `${commitCount(commits)}, not pushed (read-only)`
+    if (repo.readOnly) return `${commitCount(commits)}, not pushed (read-only)`;
+    return repo.gitRevoked
+      ? `${commitCount(commits)}, not pushed (access revoked)`
       : `${commitCount(commits)}, not pushed`;
   }
   return active ? 'Working' : 'No result';
@@ -25,9 +26,22 @@ export const READ_ONLY_CAUSES: Record<NonNullable<RunRepository['readOnlyCause']
 };
 
 /**
+ * What a revocation of a repository's git token meant for the run (ADR-0116): the host dropped it,
+ * or, on a host that cannot, the run kept it until it ended.
+ */
+export function revokedNote(repo: RunRepository): string | null {
+  const revoked = repo.gitRevoked;
+  if (!revoked) return null;
+  return revoked.hostTold
+    ? revoked.message
+    : `${revoked.message} The runner host was not told: it was not connected, or it cannot drop a token, and the run kept it until it ended.`;
+}
+
+/**
  * The workspace of a run (its conversation's repositories, each with its read-only flag and why)
- * with the git result of each once the run has finished: directory, push, commits and head. The
- * change requests are the conversation's outputs.
+ * with the git result of each once the run has finished: directory, push, commits and head; and
+ * where Tinfirm revoked the run's git access while it ran, why (ADR-0116). The change requests are
+ * the conversation's outputs.
  */
 @Component({
   selector: 'app-run-repositories',
@@ -61,11 +75,23 @@ export const READ_ONLY_CAUSES: Record<NonNullable<RunRepository['readOnlyCause']
               >Read-only</span
             >
           }
+          @if (repo.gitRevoked) {
+            <span
+              class="text-destructive border-destructive/40 rounded-full border px-2 font-semibold"
+              data-testid="git-revoked"
+              >Git access revoked</span
+            >
+          }
           <span class="text-muted-foreground tabular-nums">{{ result(repo) }}</span>
           @if (repo.headSha) {
             <code class="text-muted-foreground font-mono" [title]="repo.headSha"
               ><span class="sr-only">at </span>{{ sha(repo.headSha) }}</code
             >
+          }
+          @if (revoked(repo); as note) {
+            <p class="text-muted-foreground basis-full" data-testid="git-revoked-note">
+              {{ note }}
+            </p>
           }
         </li>
       }
@@ -82,6 +108,10 @@ export class RunRepositories {
   protected readOnlyWhy(repo: RunRepository): string {
     const cause = repo.readOnlyCause ? READ_ONLY_CAUSES[repo.readOnlyCause] : null;
     return `${cause ?? 'The agent could only read this repository'}: Tinfirm does not push it`;
+  }
+
+  protected revoked(repo: RunRepository): string | null {
+    return revokedNote(repo);
   }
 
   protected result(repo: RunRepository): string {

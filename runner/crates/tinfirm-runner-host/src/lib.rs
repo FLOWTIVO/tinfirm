@@ -20,6 +20,7 @@ pub mod docker;
 pub mod egress_proxy;
 pub mod git;
 pub mod git_proxy;
+pub mod git_tokens;
 pub mod homes;
 pub mod host;
 pub mod images;

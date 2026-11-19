@@ -34,7 +34,10 @@ class RunPresenter {
 
     private final RunMapper mapper;
 
-    RunPresenter(Principals principals, RunRepositoryStore repositories, RunMapper mapper) {
+    private final RunCommandStore commands;
+
+    RunPresenter(Principals principals, RunRepositoryStore repositories, RunMapper mapper, RunCommandStore commands) {
+        this.commands = commands;
         this.principals = principals;
         this.repositories = repositories;
         this.mapper = mapper;
@@ -55,11 +58,12 @@ class RunPresenter {
             people.add(run.payerPrincipalId());
         });
         Map<UUID, String> names = principals.displayNames(runs.getFirst().companyId(), people);
-        Map<UUID, List<RunRepositoryStore.RepositoryRow>> workspaces = repositories.ofRuns(runs.stream()
-            .map(RunStore.RunRow::id)
-            .toList());
+        List<UUID> runIds = runs.stream().map(RunStore.RunRow::id).toList();
+        Map<UUID, List<RunRepositoryStore.RepositoryRow>> workspaces = repositories.ofRuns(runIds);
+        Map<UUID, List<RunCommandStore.GitRevocation>> revocations = commands.revocationsOfRuns(runIds);
         return runs.stream()
-            .map(run -> mapper.toDto(details(run, names, workspaces.getOrDefault(run.id(), List.of()))))
+            .map(run -> mapper.toDto(details(run, names, workspaces.getOrDefault(run.id(), List.of()),
+                    revocations.getOrDefault(run.id(), List.of()))))
             .toList();
     }
 
@@ -69,7 +73,7 @@ class RunPresenter {
     }
 
     private static RunViews.RunDetails details(RunStore.RunRow run, Map<UUID, String> names,
-            List<RunRepositoryStore.RepositoryRow> workspace) {
+            List<RunRepositoryStore.RepositoryRow> workspace, List<RunCommandStore.GitRevocation> revocations) {
         RunViews.UsageDetails usage = run.inputTokens() != null || run.outputTokens() != null
                 ? new RunViews.UsageDetails(orZero(run.inputTokens()), orZero(run.outputTokens()),
                         run.cachedInputTokens(), run.cacheWriteTokens(), run.costUsd())
@@ -85,7 +89,8 @@ class RunPresenter {
                     .map(repository -> new RunViews.RepositoryDetails(repository.repositoryId(),
                             repository.systemId(), repository.name(), repository.dir(), repository.readOnly(),
                             repository.readOnlyCause() != null ? repository.readOnlyCause().name() : null,
-                            repository.pushed(), repository.headSha(), repository.commits()))
+                            repository.pushed(), repository.headSha(), repository.commits(),
+                            gitRevoked(repository, revocations)))
                     .toList(),
                 usage,
                 run.relay() != null ? new RunViews.RelayDetails(run.relay().requests(), run.relay().requestBytes(),
@@ -96,6 +101,24 @@ class RunPresenter {
                 run.textsPurgedAt(), run.eventsPurgedAt(),
                 run.isolationLevel() != null ? run.isolationLevel().name() : null,
                 run.placementNote() != null ? run.placementNote().name() : null);
+    }
+
+    /**
+     * The first revocation of the repository's git token in the assignment that wrote its row (ADR-0116); null when
+     * there was none.
+     */
+    static RunViews.@Nullable GitRevocationDetails gitRevoked(RunRepositoryStore.RepositoryRow repository,
+            List<RunCommandStore.GitRevocation> revocations) {
+        if (repository.componentId() == null || repository.epoch() == null) {
+            return null;
+        }
+        return revocations.stream()
+            .filter(revocation -> revocation.epoch() == repository.epoch()
+                    && revocation.componentIds().contains(repository.componentId()))
+            .findFirst()
+            .map(revocation -> new RunViews.GitRevocationDetails(revocation.reason(), revocation.message(),
+                    revocation.createdAt(), revocation.lastSentAt() != null))
+            .orElse(null);
     }
 
     /** The run's result, whose summary is the run's summary; null without {@code finish}. */

@@ -12,6 +12,12 @@
 //!   `Accept`, `Content-Encoding`, `User-Agent`); the client's `Authorization` never does.
 //! - `git-receive-pack` (push) is refused with 403 and a plain-text reason. Any other path
 //!   is 404, and so is an unknown secret.
+//! - The route reads its repository's `Authorization` at each request
+//!   ([`RouteCredentials`]; for a run, its holder of git tokens, [`crate::git_tokens`]). Once
+//!   the server has revoked the run's token for the repository (ADR-0116), every new request
+//!   gets 403 with the server's message as plain text, which git in the sandbox shows. A
+//!   request that was forwarded before the revocation finishes: it carried the token already,
+//!   and cutting its response would only break the sandbox's clone.
 //! - Redirects are not followed, and an upstream 401 is not passed on (it would make git in
 //!   the sandbox ask for credentials).
 //!
@@ -354,13 +360,28 @@ impl Upstream {
     }
 }
 
+/// Where a route gets the `Authorization` header it adds upstream, read at each request.
+pub trait RouteCredentials: Send + Sync {
+    /// The header's value now: `Ok(None)` for a public repository, `Err(message)` when the
+    /// sandbox may no longer reach the repository (the run's token was revoked): the request
+    /// is refused with 403 and `message`.
+    fn authorization(&self) -> Result<Option<Secret>, String>;
+}
+
+/// A value fixed for the route's life.
+impl RouteCredentials for Option<Secret> {
+    fn authorization(&self) -> Result<Option<Secret>, String> {
+        Ok(self.clone())
+    }
+}
+
 /// One run's route: its secret and the repository behind it.
 struct Route {
     secret: Secret,
     run_id: Uuid,
     upstream: Upstream,
-    /// Value of the `Authorization` header sent upstream.
-    authorization: Option<Secret>,
+    /// Where the `Authorization` header sent upstream comes from.
+    credentials: Arc<dyn RouteCredentials>,
     branch: String,
     /// Its requests in flight ([`ListenerLimits::max_requests_per_route`]).
     in_flight: Arc<Semaphore>,
@@ -532,16 +553,17 @@ impl GitProxy {
         self.inner.shutdown.cancel();
     }
 
-    /// Registers a run: its sandbox may fetch `repo_url` through the proxy, with
-    /// `authorization` added upstream, until the returned guard is dropped.
+    /// Registers a run: its sandbox may fetch `repo_url` through the proxy, with the
+    /// `Authorization` of `credentials` (read at each request) added upstream, until the
+    /// returned guard is dropped.
     pub fn register(
         &self,
         run_id: Uuid,
         repo_url: &str,
-        authorization: Option<Secret>,
+        credentials: impl RouteCredentials + 'static,
         branch: &str,
     ) -> Result<RouteGuard> {
-        self.register_at(run_id, repo_url, authorization, branch, None)
+        self.register_at(run_id, repo_url, credentials, branch, None)
     }
 
     /// [`GitProxy::register`], with a URL that names `sandbox_host` in place of the endpoint's
@@ -551,7 +573,7 @@ impl GitProxy {
         &self,
         run_id: Uuid,
         repo_url: &str,
-        authorization: Option<Secret>,
+        credentials: impl RouteCredentials + 'static,
         branch: &str,
         sandbox_host: Option<&str>,
     ) -> Result<RouteGuard> {
@@ -571,7 +593,7 @@ impl GitProxy {
                 secret: secret.clone(),
                 run_id,
                 upstream,
-                authorization,
+                credentials: Arc::new(credentials),
                 branch: branch.to_string(),
                 in_flight: Arc::new(Semaphore::new(self.inner.limits.max_requests_per_route)),
             }),
@@ -717,7 +739,8 @@ impl GitRequest {
 }
 
 enum Decision {
-    Forward(Arc<Route>, GitRequest),
+    /// With the `Authorization` header to add, as the route's credentials have it now.
+    Forward(Arc<Route>, GitRequest, Option<Secret>),
     Refuse(StatusCode, String),
 }
 
@@ -768,7 +791,13 @@ fn decide(inner: &Inner, method: &Method, uri: &Uri) -> Decision {
         }
         _ => return not_found(),
     };
-    Decision::Forward(route, request)
+    match route.credentials.authorization() {
+        Ok(authorization) => Decision::Forward(route, request, authorization),
+        Err(message) => {
+            tracing::info!(run_id = %route.run_id, request = request.as_str(), "git proxy refused a fetch: the run's git token for the repository was revoked");
+            Decision::Refuse(StatusCode::FORBIDDEN, message)
+        }
+    }
 }
 
 /// The MCP endpoint that `path` (`/<secret>/mcp`) names, if any.
@@ -792,13 +821,13 @@ async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Response<ProxyBody
     }
     match decide(&inner, req.method(), req.uri()) {
         Decision::Refuse(status, reason) => text(status, &reason),
-        Decision::Forward(route, request) => {
+        Decision::Forward(route, request, authorization) => {
             let Ok(permit) = route.in_flight.clone().try_acquire_owned() else {
                 tracing::warn!(run_id = %route.run_id, "git proxy: too many requests at once");
                 return too_many_requests();
             };
             // The permit is held until the response's body ends.
-            forward(&inner, &route, request, req)
+            forward(&inner, &route, request, authorization.as_ref(), req)
                 .await
                 .map(|body| Held::new(body, permit).boxed_unsync())
         }
@@ -922,6 +951,7 @@ async fn forward(
     inner: &Inner,
     route: &Route,
     request: GitRequest,
+    authorization: Option<&Secret>,
     req: Request<Incoming>,
 ) -> Response<ProxyBody> {
     let (parts, body) = req.into_parts();
@@ -971,7 +1001,7 @@ async fn forward(
             headers.append(name.clone(), value.clone());
         }
     }
-    if let Some(authorization) = &route.authorization {
+    if let Some(authorization) = authorization {
         match HeaderValue::from_str(authorization.expose()) {
             Ok(mut value) => {
                 value.set_sensitive(true);
@@ -1581,6 +1611,76 @@ mod tests {
         );
         assert_eq!(got.headers[header::AUTHORIZATION], HOST_AUTHORIZATION);
         assert_eq!(got.headers["git-protocol"], "version=2");
+    }
+
+    /// Credentials that the test revokes while the route lives.
+    struct Revocable(Arc<Mutex<Option<String>>>);
+
+    impl RouteCredentials for Revocable {
+        fn authorization(&self) -> Result<Option<Secret>, String> {
+            match &*lock(&self.0) {
+                Some(message) => Err(message.clone()),
+                None => Ok(Some(Secret::new(HOST_AUTHORIZATION))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revoked_route_refuses_each_new_request_with_the_servers_message() {
+        let upstream = FakeUpstream::start(reply_ok()).await;
+        let proxy = proxy().await;
+        let revoked = Arc::new(Mutex::new(None));
+        let route = proxy
+            .register(
+                Uuid::new_v4(),
+                &format!("{}/acme/widgets.git", upstream.url),
+                Revocable(revoked.clone()),
+                "agent/TEST-1",
+            )
+            .unwrap();
+        let info_refs = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
+        let upload_pack = format!("{}/git-upload-pack", prefix(&route));
+        let (status, _, _) = request(&proxy, Method::GET, &info_refs, &[], b"").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(upstream.seen().len(), 1);
+
+        *lock(&revoked) = Some("Tinfirm revoked this run's access to acme/widgets.".into());
+        for (method, path) in [(Method::GET, &info_refs), (Method::POST, &upload_pack)] {
+            let (status, headers, body) = request(&proxy, method, path, &[], b"0000").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(
+                headers[header::CONTENT_TYPE],
+                "text/plain; charset=utf-8",
+                "git shows a plain-text body"
+            );
+            assert_eq!(body, "Tinfirm revoked this run's access to acme/widgets.\n");
+        }
+        // Nothing more reached the repository; the route itself stays, and unknown paths and
+        // pushes are answered as before.
+        assert_eq!(upstream.seen().len(), 1);
+        assert_eq!(proxy.route_count(), 1);
+        let (status, _, _) = request(
+            &proxy,
+            Method::GET,
+            &format!("{}/objects/info/packs", prefix(&route)),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, body) = request(
+            &proxy,
+            Method::POST,
+            &format!("{}/git-receive-pack", prefix(&route)),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body.contains("pushing from the sandbox is not allowed"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

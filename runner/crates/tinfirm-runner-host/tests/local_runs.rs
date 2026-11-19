@@ -3080,7 +3080,7 @@ async fn a_host_without_mounts_lists_no_skills_and_rejects_a_run_with_skills() {
         let hello = conn.handshake(5).await;
         // The local test executor has no mounts: it does not list `run.skills` (ADR-0064). Over
         // the bridge it says so, for the server's licence (ADR-0100).
-        let mut features = vec!["run.steer", "session.bundle"];
+        let mut features = vec!["run.steer", "session.bundle", "run.git.revoke"];
         if bridged_tests() {
             features.push("sandbox.bridge");
         }
@@ -3876,6 +3876,309 @@ async fn a_run_that_leaked_a_credential_stores_no_session_bundle() {
         assert_eq!(t.finished()["sessionBundle"], "REFUSED");
         assert!(session_bundle_upload(&server).is_none());
         t.assert_no_secrets();
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+// ----- revoked git tokens (ADR-0116) -----------------------------------------------------
+
+/// The server's message of the revocation tests.
+const REVOKED: &str =
+    "Tinfirm revoked this run's access to acme/origin: the credential 'CI bot' was disabled.";
+
+/// The frames the host sent of type `error`.
+fn host_errors(conn: &Conn) -> Vec<serde_json::Value> {
+    conn.frames
+        .iter()
+        .filter(|f| f["type"] == "error")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_token_stops_the_sandboxs_next_fetch_and_the_push() {
+    use common::git_http::{GitHttpServer, test_git_authorization};
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(test_git_authorization())).await;
+        let repo_url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        assert!(
+            hello["features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("run.git.revoke")),
+            "{hello}"
+        );
+        let spec = AssignSpec::v2("refetch", Some(&repo_url));
+        let component = spec.workspaces[0].component_id;
+        conn.send(spec.to_json());
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+
+        // A frame of another epoch, and one of a run this host does not hold, change nothing.
+        conn.send(git_revoke(spec.run_id, 2, &[component], "another epoch"));
+        conn.send(git_revoke(Uuid::new_v4(), 1, &[component], "another run"));
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[component, Uuid::new_v4()],
+            REVOKED,
+        ));
+        // The server sends it again at a hello; the host applies it once.
+        conn.send(git_revoke(spec.run_id, 1, &[component], REVOKED));
+        let id = spec.run_id.to_string();
+        conn.take_where("the revocation's warning", |f| {
+            f["runId"] == id && f["eventType"] == "LOG" && f["payload"]["message"] == REVOKED
+        })
+        .await;
+        let requests = git_server.seen().len();
+        release(&host.paths, spec.run_id);
+        conn.until_finished(spec.run_id).await;
+
+        let t = run_frames(&conn, spec.run_id);
+        t.assert_contiguous_seq();
+        t.assert_no_secrets();
+        let finished = t.finished();
+        let text = t.agent_text();
+        assert_eq!(finished["outcome"], "FAILED", "{finished:#}\n{text}");
+        assert_eq!(finished["failureClass"], "GIT_ERROR");
+        assert_eq!(
+            finished["failureMessage"],
+            format!("git failed in `Repo` (/workspace/repo): not pushed: {REVOKED}")
+        );
+        assert_eq!(finished["git"][0]["pushed"], false);
+        assert!(
+            finished["git"][0]["commits"].as_u64().unwrap() >= 1,
+            "{finished:#}"
+        );
+        // The first fetch went through; the second got the proxy's 403 with the message.
+        assert!(text.contains("first fetch: ok"), "{text}");
+        assert!(text.contains("second fetch failed:"), "{text}");
+        assert!(text.contains(REVOKED), "git shows the message: {text}");
+        // Nothing more reached the repository: no fetch of the sandbox, no mirror fetch and no
+        // push of the host's.
+        assert_eq!(
+            git_server.seen().len(),
+            requests,
+            "{:#?}",
+            git_server.seen()
+        );
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        // One warning, the server's message; the ignored frames left no trace.
+        let warnings: Vec<_> = t
+            .events_of("LOG")
+            .into_iter()
+            .filter(|e| e["payload"]["message"] == REVOKED)
+            .collect();
+        assert_eq!(warnings.len(), 1, "{}", t.text());
+        assert_eq!(warnings[0]["payload"]["level"], "warn");
+        assert!(!t.text().contains("another epoch") && !t.text().contains("another run"));
+        assert!(host_errors(&conn).is_empty(), "{:#?}", host_errors(&conn));
+        // A frame for the run once it has ended is ignored too.
+        conn.send(git_revoke(spec.run_id, 1, &[component], REVOKED));
+        let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+            while conn.next().await.is_some() {}
+        })
+        .await;
+        assert!(host_errors(&conn).is_empty(), "{:#?}", host_errors(&conn));
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_revoked_before_the_push_leaves_that_repository_alone_unpushed() {
+    with_timeout(120, async {
+        let shop = TestRepo::new();
+        let docs = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let mut spec = AssignSpec::with_workspaces(
+            "rebase",
+            vec![
+                WorkspaceEntry::new("shop", "Shop", &shop.url),
+                WorkspaceEntry::new("docs", "Docs", &docs.url),
+            ],
+        );
+        spec.protocol_version = 2;
+        spec.prompt_extra = " [commit:shop] [commit:docs] [wait]".into();
+        conn.send(spec.to_json());
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[spec.workspaces[0].component_id],
+            REVOKED,
+        ));
+        let id = spec.run_id.to_string();
+        conn.take_where("the revocation's warning", |f| {
+            f["runId"] == id && f["eventType"] == "LOG" && f["payload"]["message"] == REVOKED
+        })
+        .await;
+        release(&host.paths, spec.run_id);
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "GIT_ERROR");
+        assert_eq!(
+            finished["failureMessage"],
+            format!("git failed in `Shop` (/workspace/shop): not pushed: {REVOKED}")
+        );
+        let results = finished["git"].as_array().unwrap();
+        assert_eq!(results[0]["pushed"], false);
+        assert!(results[0]["commits"].as_u64().unwrap() >= 1);
+        // The other repository goes on as before.
+        assert_eq!(results[1]["pushed"], true, "{}", t.text());
+        assert!(shop.branch_head("agent/TEST-1").is_none());
+        assert_eq!(
+            docs.file_at("agent/TEST-1", "docs.txt").as_deref(),
+            Some("change in docs\n")
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_token_stays_redacted_from_the_runs_events() {
+    use common::git_http::{GitHttpServer, test_git_authorization};
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(test_git_authorization())).await;
+        let repo_url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::v2("refetch", Some(&repo_url));
+        conn.send(spec.to_json());
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[spec.workspaces[0].component_id],
+            REVOKED,
+        ));
+        let id = spec.run_id.to_string();
+        conn.take_where("the revocation's warning", |f| {
+            f["runId"] == id && f["eventType"] == "LOG" && f["payload"]["message"] == REVOKED
+        })
+        .await;
+        // The agent prints the token it no longer has (as a copy taken before the revocation
+        // would be): what was revealed stays redacted, and printing it is still a leak.
+        let workspace = host.paths.workspace(spec.run_id);
+        let sandbox = std::path::PathBuf::from(
+            tinfirm_runner_host::sandbox_files::Layout::local(&workspace).workspace,
+        );
+        let root = if sandbox.exists() { sandbox } else { workspace };
+        std::fs::write(root.join("release"), TEST_GIT_TOKEN).unwrap();
+        conn.until_finished(spec.run_id).await;
+        let t = run_frames(&conn, spec.run_id);
+        t.assert_no_secrets();
+        let text = t.agent_text();
+        assert!(text.contains("release said: [REDACTED]"), "{text}");
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{finished:#}");
+        assert_eq!(finished["failureClass"], "CREDENTIAL_LEAK");
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_of_protocol_1_knows_no_revocation_and_pushes_as_before() {
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::local()).await;
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        assert!(hello.get("features").is_none(), "{hello}");
+        let mut spec = AssignSpec::new("rebase", Some(&repo.url));
+        spec.prompt_extra = " [commit:repo] [wait]".into();
+        conn.send(spec.to_json());
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[spec.workspaces[0].component_id],
+            REVOKED,
+        ));
+        // A frame protocol 1 does not have: answered with an error, and otherwise ignored.
+        let error = conn.take("error").await;
+        assert_eq!(error["code"], "UNKNOWN_TYPE", "{error}");
+        release(&host.paths, spec.run_id);
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{}", t.text());
+        assert_eq!(finished["git"][0]["pushed"], true);
+        assert!(!t.text().contains(REVOKED));
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "repo.txt").as_deref(),
+            Some("change in repo\n")
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_right_after_the_assignment_leaves_the_repository_unpushed() {
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::v2("happy", Some(&repo.url));
+        conn.send(spec.to_json());
+        // The host handles frames in order: this one comes before the clone or while it runs.
+        // Either the clone is not attempted, or the push is not: the outcome is the same.
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[spec.workspaces[0].component_id],
+            REVOKED,
+        ));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "GIT_ERROR");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message == format!("cannot clone `Repo` (/workspace/repo): {REVOKED}")
+                || message
+                    == format!("git failed in `Repo` (/workspace/repo): not pushed: {REVOKED}"),
+            "{message}"
+        );
+        assert!(
+            t.events_of("LOG")
+                .iter()
+                .any(|e| e["payload"]["message"] == REVOKED && e["payload"]["level"] == "warn"),
+            "{}",
+            t.text()
+        );
+        assert!(repo.branch_head("agent/TEST-1").is_none());
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

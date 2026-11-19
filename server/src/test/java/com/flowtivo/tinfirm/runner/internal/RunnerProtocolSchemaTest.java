@@ -42,7 +42,7 @@ class RunnerProtocolSchemaTest {
     /** The runner host's samples of protocol v2: the frames it sends and expects. */
     private static final Path V2_SAMPLES = Path.of("../runner/crates/tinfirm-protocol/tests/samples/v2");
 
-    private static final Set<String> SERVER_TYPES = Set.of("welcome", "run.assign", "run.cancel",
+    private static final Set<String> SERVER_TYPES = Set.of("welcome", "run.assign", "run.cancel", "run.git.revoke", "welcome.done",
             "run.repository_request.ack", "run.task_create.ack", "run.ask.ack", "run.request.ack", "run.steer",
             "host.config", "psl.update");
 
@@ -660,11 +660,28 @@ class RunnerProtocolSchemaTest {
                         "The call of `jira_comment` on Jira was interrupted (TOOL_INTERRUPTED): …",
                         JSON.readTree("{\"code\":\"TOOL_INTERRUPTED\",\"cause\":\"TIMEOUT\"}"), true), null),
                 RunnerMessages.ProtocolError.of(RunnerMessages.UNKNOWN_TYPE, "run.ask is not a message of v2"),
-                new RunnerMessages.HostConfig(1, 2, List.of()));
+                new RunnerMessages.HostConfig(1, 2, List.of()),
+                // ADR-0116: the end of a hello's answer, then the revocation of a repository's git token.
+                new RunnerMessages.WelcomeDone(),
+                new RunnerMessages.RunGitRevoke(runId, 1, List.of(UUID.randomUUID()), "RECONNECT_COMPANY",
+                        "Tinfirm revoked this run's access to acme/shop: the shared credential CI bot was disabled."));
         for (RunnerMessages.Outbound frame : frames) {
             String json = codec.encode(frame);
             assertThat(ProtocolSchema.violations(2, json)).as(json).isEmpty();
         }
+        assertThat(codec.encode(new RunnerMessages.WelcomeDone())).isEqualTo("{\"type\":\"welcome.done\"}");
+        JsonNode revoke = JSON.readTree(codec.encode(frames.getLast()));
+        assertThat(revoke.get("type").asString()).isEqualTo("run.git.revoke");
+        assertThat(revoke.get("componentIds")).hasSize(1);
+        // Never "every repository": a frame names one to 20, with a message of 1 to 1000 characters.
+        assertThatThrownBy(() -> new RunnerMessages.RunGitRevoke(runId, 1, List.of(), "X", "m"))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new RunnerMessages.RunGitRevoke(runId, 1, List.of(UUID.randomUUID()), "X",
+                "m".repeat(1001))).isInstanceOf(IllegalArgumentException.class);
+        // The schema refuses what the record refuses.
+        assertThat(ProtocolSchema.violations(2, """
+                {"type":"run.git.revoke","runId":"%s","epoch":1,"componentIds":[],"reason":"X","message":"m"}"""
+            .formatted(runId))).isNotEmpty();
         JsonNode assign = JSON.readTree(codec.encode(withTools));
         assertThat(assign.has("task")).isFalse();
         assertThat(assign.get("workItem").get("key").asString()).isEqualTo("SHOP-1");

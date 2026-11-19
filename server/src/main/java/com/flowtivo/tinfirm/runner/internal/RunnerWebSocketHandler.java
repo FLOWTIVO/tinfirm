@@ -300,6 +300,12 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
         List<RunnerMessages.ActiveRun> activeRuns = hello.activeRuns() != null ? hello.activeRuns() : List.of();
         String publicSuffixSha256 = hello.publicSuffixList() != null ? hello.publicSuffixList().sha256() : null;
         send(out, connected(host, placements, activeRuns, publicSuffixSha256));
+        if (hello.protocolVersion() == RunnerMessages.PROTOCOL_V2
+                && hello.featureSet().contains(RunnerMessages.FEATURE_RUN_GIT_REVOKE)) {
+            // ADR-0116: the end of what the hello's answer sends again, the pending revocations included. A host that
+            // took a run back pushes its work only after it.
+            registry.sendTo(out, new RunnerMessages.WelcomeDone());
+        }
     }
 
     /**

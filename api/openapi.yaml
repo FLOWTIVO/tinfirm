@@ -11240,6 +11240,33 @@ components:
         pushed: { type: boolean, nullable: true, description: True when the run pushed the branch; null until it ended or without a result }
         headSha: { type: string, nullable: true }
         commits: { type: integer, format: int32, nullable: true }
+        gitRevoked:
+          allOf: [{ $ref: '#/components/schemas/RunGitRevocation' }]
+          nullable: true
+          description: "Tinfirm revoked the run's git token of this repository while the run was under way (ADR-0116); null when it did not"
+    RunGitRevocation:
+      type: object
+      description: >-
+        Why and when Tinfirm revoked a run's git token of one repository (ADR-0116): the conversation's account there
+        failed its check, its system was paused, a trigger's binding followed another credential, or a renewal was
+        refused. A host that took the revocation refuses the agent's next fetch and does not push the repository; the
+        run's failure says so when it had commits to push.
+      required: [reason, message, revokedAt, hostTold]
+      properties:
+        reason:
+          type: string
+          description: >-
+            A code: the binding's reason (`RECONNECT_YOURS`, `RECONNECT_COMPANY`, `SUSPENDED`, `NOT_ENTITLED`,
+            `GRANT_REMOVED`, `LEFT_GROUP`, `IDENTITY_CHANGED`, `HOLDER_LEFT`, `SYSTEM_REMOVED`, …), or `SYSTEM_PAUSED`,
+            `CREDENTIAL_REPLACED` or `REFRESH_REFUSED`
+          example: RECONNECT_COMPANY
+        message: { type: string, description: "The text the run's host got, for its log and the agent" }
+        revokedAt: { type: string, format: date-time }
+        hostTold:
+          type: boolean
+          description: >-
+            Whether the run's host was told. False while it was not connected, and for good when it does not take
+            revocations (an older runner host): the run then kept the token until it ended.
     RunCounts:
       type: object
       description: The work of a finished run as its transcript shows it

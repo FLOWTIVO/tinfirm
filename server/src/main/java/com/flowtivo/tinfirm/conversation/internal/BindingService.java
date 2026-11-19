@@ -315,6 +315,8 @@ class BindingService implements ConversationBindings {
         messages.system(binding.companyId(), binding.conversationId(), texts.followed(binding, replaced) + ".", null);
         events.publishEvent(new ConversationEvents.BindingBound(binding.companyId(), binding.conversationId(),
                 binding.id(), binding.systemId()));
+        events.publishEvent(new ConversationEvents.BindingFollowed(binding.companyId(), binding.conversationId(),
+                binding.id(), binding.systemId(), before.accountId(), credential.id()));
         hooks.forEach(hook -> hook.bound(binding));
         refresh(binding);
         return store.lock(binding.companyId(), binding.id()).orElseThrow();

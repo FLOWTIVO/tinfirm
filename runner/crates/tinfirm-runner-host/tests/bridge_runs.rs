@@ -477,6 +477,16 @@ async fn the_agents_work_stays_in_the_sandbox_until_the_host_takes_it() {
 /// Where the restart test's host A keeps its directories, and its server.
 const RESTART_DIR: &str = "TINFIRM_TEST_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_RESTART_URL";
+/// Set: host A speaks protocol 2.
+const RESTART_V2: &str = "TINFIRM_TEST_RESTART_V2";
+
+/// The setup of both hosts of a restart test.
+fn restart_setup(v2: bool) -> HostSetup {
+    HostSetup {
+        protocol_version: if v2 { 2 } else { 1 },
+        ..HostSetup::bridged()
+    }
+}
 
 /// Host A of [`a_host_that_restarted_takes_its_run_back_and_saves_the_work`], in a process of its
 /// own that the test kills as a crash would (SIGKILL): run only by that test.
@@ -491,7 +501,8 @@ fn restart_test_host_a() {
         .build()
         .unwrap()
         .block_on(async {
-            let _host = start_host_at(std::path::Path::new(&dir), &url, HostSetup::bridged()).await;
+            let v2 = std::env::var_os(RESTART_V2).is_some();
+            let _host = start_host_at(std::path::Path::new(&dir), &url, restart_setup(v2)).await;
             std::future::pending::<()>().await;
         });
 }
@@ -503,22 +514,53 @@ async fn a_host_killed_mid_run(
     server: &mut FakeServer,
     repo: &TestRepo,
 ) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf, u64) {
+    a_host_killed_mid_run_after(server, repo, false, None).await
+}
+
+/// [`a_host_killed_mid_run`], with host A of protocol 2 when `v2`, which gets a `run.git.revoke`
+/// with the message `revoke` (ADR-0116) while its run's agent works, and applies it, before it
+/// is killed.
+async fn a_host_killed_mid_run_after(
+    server: &mut FakeServer,
+    repo: &TestRepo,
+    v2: bool,
+    revoke: Option<&str>,
+) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf, u64) {
     let dir = tempfile::tempdir().unwrap();
-    let mut host_a = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .args(["restart_test_host_a", "--exact", "--ignored", "--nocapture"])
         .env(RESTART_DIR, dir.path())
         .env(RESTART_URL, &server.url)
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+        .stdout(std::process::Stdio::null());
+    if v2 {
+        command.env(RESTART_V2, "1");
+    }
+    let mut host_a = command.spawn().unwrap();
     let mut conn = server.accept().await;
     conn.handshake(1).await;
-    let spec = AssignSpec::new("slow", Some(&repo.url));
+    let mut spec = AssignSpec::new("slow", Some(&repo.url));
+    if v2 {
+        spec.protocol_version = 2;
+    }
     conn.send(spec.to_json());
     // The agent has written its work and goes on: the run's record is there.
     conn.wait_running(spec.run_id).await;
     let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
     assert!(record.exists(), "no record of the run");
+    if let Some(message) = revoke {
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[spec.workspaces[0].component_id],
+            message,
+        ));
+        let id = spec.run_id.to_string();
+        conn.take_where("the revocation's warning", |f| {
+            f["runId"] == id && f["eventType"] == "LOG" && f["payload"]["message"] == message
+        })
+        .await;
+    }
     let before = conn.until_seq(spec.run_id, 3).await;
     host_a.kill().unwrap();
     host_a.wait().unwrap();
@@ -604,6 +646,198 @@ async fn a_run_taken_back_that_the_server_cancels_still_saves_its_work() {
             Some("work in progress\n")
         );
         assert!(!record.exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// The server's message of the revocation tests (ADR-0116).
+const REVOKED: &str =
+    "Tinfirm revoked this run's access to acme/origin: the account was disconnected.";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_revoked_before_a_restart_does_not_come_back_with_the_run() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_after(&mut server, &repo, true, Some(REVOKED)).await;
+        // Host A wrote its record again: no token, the repository named as revoked.
+        let kept = std::fs::read_to_string(&record).unwrap();
+        assert!(!kept.contains(TEST_GIT_TOKEN), "{kept}");
+        let kept: serde_json::Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(kept["version"], 1);
+        assert!(
+            kept["assign"]["workspaces"][0].get("git").is_none(),
+            "{kept:#}"
+        );
+        assert_eq!(
+            kept["revoked"],
+            json!([{
+                "componentId": spec.workspaces[0].component_id,
+                "reason": "GRANT_REMOVED",
+                "message": REVOKED
+            }])
+        );
+
+        // Host B takes the run back from that record; the server does not even send the
+        // revocation again.
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        assert_eq!(finished["git"][0]["pushed"], false, "{}", t.text());
+        assert!(
+            t.text().contains(&format!("not pushed: {REVOKED}")),
+            "{}",
+            t.text()
+        );
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        assert!(!record.exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_sent_again_at_the_hello_comes_before_the_push_of_a_run_taken_back() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        // Host A never got the revocation: it was disconnected when the server sent it.
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        assert!(
+            std::fs::read_to_string(&record)
+                .unwrap()
+                .contains(TEST_GIT_TOKEN)
+        );
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        assert_eq!(hello["activeRuns"][0]["runId"], spec.run_id.to_string());
+        // As the server does at every hello that lists the run: the pending revocation, then
+        // `welcome.done`, which the push waits for.
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[spec.workspaces[0].component_id],
+            REVOKED,
+        ));
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["git"][0]["pushed"], false, "{}", t.text());
+        assert!(
+            t.text().contains(&format!("not pushed: {REVOKED}")),
+            "{}",
+            t.text()
+        );
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// Host B of a restart test, whose wait for `welcome.done` is `wait`.
+fn restart_setup_waiting(wait: Duration) -> HostSetup {
+    HostSetup {
+        options: Some(Box::new(move |opts| opts.welcome_done_wait = wait)),
+        ..restart_setup(true)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_taken_back_pushes_only_once_the_server_says_welcome_done() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        let host = start_host_at(
+            dir.path(),
+            &server.url,
+            restart_setup_waiting(Duration::from_secs(120)),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        // The sandbox came back and its agent stopped: the run is ready to push, and waits.
+        let id = spec.run_id.to_string();
+        conn.take_where("the agent stopped", |f| {
+            f["runId"] == id
+                && f["eventType"] == "LOG"
+                && f["payload"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("was stopped") || m.contains("had stopped"))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            repo.branch_head("agent/TEST-1").is_none(),
+            "pushed before welcome.done"
+        );
+        assert!(
+            !conn.frames.iter().any(|f| f["type"] == "run.finished"),
+            "finished before welcome.done"
+        );
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert!(!t.text().contains("welcome.done"), "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_taken_back_without_welcome_done_pushes_after_the_cap_and_says_so() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        let host = start_host_at(
+            dir.path(),
+            &server.url,
+            restart_setup_waiting(Duration::from_secs(2)),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        // A server that never sends welcome.done.
+        conn.handshake(1).await;
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        let warning = t
+            .events_of("LOG")
+            .into_iter()
+            .find(|e| {
+                e["payload"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("no welcome.done"))
+            })
+            .unwrap_or_else(|| panic!("no warning: {}", t.text()))
+            .clone();
+        assert_eq!(warning["payload"]["level"], "warn");
+        assert!(
+            warning["payload"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("pushed without knowing whether a git token of the run was revoked")
+        );
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

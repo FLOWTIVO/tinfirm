@@ -31,17 +31,21 @@
 //! fetch from the sandbox's bundle with every object checked, and the checkout. From then on
 //! the clone holds objects a sandbox made, so every command on it runs in a reader too
 //! ([`Git::read_through`]), but the push, which needs the run's git token ([`Git::push`]).
+//!
+//! A `Git` holds no token of its own: it reads its repository's from the run's holder
+//! ([`crate::git_tokens`]) when a command needs it, so a token the server revoked is never
+//! used again (ADR-0116).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
 use tinfirm_protocol::{Secret, WorkspaceSpec};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::git_tokens::{RepoTokens, Revocation, RunGitTokens};
 use crate::redact::Redactor;
 
 /// Output of a finished git command.
@@ -249,14 +253,9 @@ async fn collect(mut cmd: Command, input: Option<String>, group: bool) -> Result
 
 /// The `Authorization` header value (`Basic …`) for a repository's credentials.
 pub fn authorization_for(spec: &WorkspaceSpec) -> Option<Secret> {
-    spec.git.as_ref().map(|g| {
-        let basic = base64::engine::general_purpose::STANDARD.encode(format!(
-            "{}:{}",
-            g.username,
-            g.token.expose()
-        ));
-        Secret::new(format!("Basic {basic}"))
-    })
+    spec.git
+        .as_ref()
+        .map(|g| crate::git_tokens::basic_authorization(&g.username, &g.token))
 }
 
 /// A branch or tag of a mirror and the object it points at.
@@ -288,8 +287,8 @@ pub fn branch_tip<'a>(refs: &'a [MirrorRef], branch: &str) -> Option<&'a str> {
 pub struct Git {
     dir: PathBuf,
     repo_url: String,
-    /// Value of the `Authorization` header (`Basic …`).
-    authorization: Option<Secret>,
+    /// The repository's token, read from the run's holder at each use.
+    tokens: RepoTokens,
     author_name: String,
     author_email: String,
     config_snapshot: Option<Vec<u8>>,
@@ -301,12 +300,14 @@ pub struct Git {
 }
 
 impl Git {
-    /// `identity` is the (name, email) for commits the host makes (the WIP commit).
+    /// `identity` is the (name, email) for commits the host makes (the WIP commit). The token
+    /// is `spec`'s, in a holder of its own; a run's repository reads its run's holder instead
+    /// ([`Git::with_tokens`]).
     pub fn new(dir: impl Into<PathBuf>, spec: &WorkspaceSpec, identity: (String, String)) -> Git {
         Git {
             dir: dir.into(),
             repo_url: spec.repo_url.clone(),
-            authorization: authorization_for(spec),
+            tokens: RunGitTokens::standalone(spec),
             author_name: identity.0,
             author_email: identity.1,
             config_snapshot: None,
@@ -331,6 +332,17 @@ impl Git {
         }
     }
 
+    /// Reads the token from `tokens`, the run's holder, from now on.
+    pub fn with_tokens(mut self, tokens: RepoTokens) -> Git {
+        self.tokens = tokens;
+        self
+    }
+
+    /// The holder this repository reads its token from.
+    pub fn tokens(&self) -> &RepoTokens {
+        &self.tokens
+    }
+
     /// `.git/config` as the clone wrote it.
     pub fn config_snapshot(&self) -> Option<&[u8]> {
         self.config_snapshot.as_deref()
@@ -344,9 +356,15 @@ impl Git {
         &self.repo_url
     }
 
-    /// The `Authorization` header value, for the redactor, the mirror and the git proxy.
-    pub fn authorization(&self) -> Option<&Secret> {
-        self.authorization.as_ref()
+    /// The `Authorization` header value now, for the mirror: `Ok(None)` for a public
+    /// repository, `Err` once the run's token for it was revoked.
+    pub fn authorization(&self) -> Result<Option<Secret>, Revocation> {
+        self.tokens.authorization()
+    }
+
+    /// Why the run's token for this repository is gone, if it is.
+    pub fn revocation(&self) -> Option<Revocation> {
+        self.tokens.revocation()
     }
 
     /// The mirror's refs at clone time.
@@ -380,11 +398,13 @@ impl Git {
             }
             _ => {
                 let authorization = if auth {
-                    self.authorization.as_ref()
+                    self.tokens
+                        .authorization()
+                        .map_err(|revocation| anyhow!("not pushed: {revocation}"))?
                 } else {
                     None
                 };
-                let mut cmd = command(&self.dir, authorization);
+                let mut cmd = command(&self.dir, authorization.as_ref());
                 cmd.args(args);
                 collect(cmd, input, false).await
             }

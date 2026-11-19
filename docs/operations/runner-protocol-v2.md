@@ -14,7 +14,7 @@ and [`protocol/runner-v2.schema.json`](../../protocol/runner-v2.schema.json), an
 | Tools the agent sees | `ask_human`, `finish_run`, `request_repository`, `create_task`, `upload_attachment`, `list_repositories` | The platform tools `ask`, `finish`, `request_access`, `request_network_access` (only on a host with the egress proxy), `save_artifact` and `list_repositories`, as far as `run.assign.platformTools` names them; plus the server-executed tools of `run.assign.tools`: the systems' tools (`jira_get`, `jira_search`, …) and, while the agent's memory is on, `remember`, `forget` and `recall` |
 | Documents | `upload_attachment` only | `/output` in the sandbox, saved as outputs of the conversation when the run ends (`run.finished.artifacts`), and `save_artifact` for files elsewhere and for links. The host refuses a file above `run --upload-max-bytes` (default 25 MiB, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE`) before it reads it; set the two alike |
 | `run.assign` | `task {id, key, title}` | `workItem {id, key, title}` and `job {id}`, which carry the conversation (PLATFORM.md §11.1); `tools[]`; `platformTools[]`, the platform tools the agent may use (`finish` and `list_repositories` always); `allowedHosts[]`, the network hosts approved for the conversation or the agent; `skills[]` (feature `run.skills`, below); and `agent.effort` unless it is the runtime's default |
-| `hello.features` | none | The optional features the host implements: `run.steer` and `run.skills` (below) |
+| `hello.features` | none | The optional features the host implements: `run.steer`, `run.skills`, `run.git.revoke` and others (below) |
 | `hello.isolationTiers` | `container`, `gvisor` (and `microvm`, which no v1 host sends); all placed as `container` | The host's level of isolation: `machine`, `vm-jail`, `container`, or `gvisor` (placed as `container`); `microvm` is refused. Beside it `hardened` and `isolationStated` (below) |
 | `welcome` | no version | `protocolVersion`: the version the server speaks |
 | Usage (USAGE events, `run.finished.usage`) | cache writes counted in `inputTokens` | `cacheWriteTokens` apart from `inputTokens` |
@@ -158,6 +158,39 @@ ships it.
   upgrade the hosts, and rebuild the pi image for pi's steering
   (`tinfirm-runner-host images build --runtime pi`). OpenCode has no steering; its messages wait
   for the next turn.
+- **Revoking a run's git token** ([ADR-0116](../adr/0116-short-lived-and-revocable-git-tokens.md)).
+  A host that lists the feature `run.git.revoke` gets `run.git.revoke {runId, epoch,
+  componentIds, reason, message}` when the account that cloned one of its run's repositories can
+  no longer be used: the conversation's binding there waits or is gone (an account disconnected
+  or to sign in again, a credential disabled, a grant or a lending withdrawn, a person who left
+  the grant's group, a holder suspended or gone, a system removed), the system is paused (with
+  or without "stop running turns"), or a trigger's binding follows its service account to
+  another credential. The host drops those repositories' tokens: its git proxy answers the
+  agent's next fetch with 403 and the message, and it does not push them at the run's end, so a
+  repository with commits ahead fails the run `GIT_ERROR`. The other repositories go on.
+  - The server keeps the revocation as a durable command (`run_command` of type `REVOKE_GIT`),
+    sends the frame right after the change's commit, and again at every `hello` that lists the
+    run, before any `run.cancel`, until the run ends. There is no ack. A host sends nothing back
+    for a `run.git.revoke` of an unknown run or another epoch, no `error` frame: it ignores it.
+    A host of protocol 1 never gets one, and would answer it `error` `UNKNOWN_TYPE`.
+  - `welcome.done` (no other field) ends the server's answer to a `hello` that lists
+    `run.git.revoke`: once per connection, after every frame it sends again for the runs the
+    `hello` listed (the pending revocations, then the cancels), also when there is nothing to send
+    again. Every pending revocation of those runs went before it. A host that took a run back
+    after a restart pushes the run's work only after `welcome.done`, so that it never pushes with
+    a token the server revoked while it was away; without one within 2 minutes it pushes with what
+    its take-back record holds and logs a warning, as it does without a connection.
+  - Each revocation is audited `run.git_revoked` (the run, the binding or the paused system,
+    the repositories, the reason, and whether the host was told), and the run's page shows it on
+    the repository.
+  - A host that does not list the feature gets nothing: its run keeps its tokens until it ends,
+    as before, the audit says `sent: false`, and the conversation says so. Upgrade the hosts to
+    revoke at once; nothing needs configuring.
+  - A paused agent or trigger, and the company's stop, revoke nothing: those runs finish, or are
+    cancelled, by their own rules.
+  - A revocation stops only what has not started: a fetch or a push already under way finishes,
+    what the sandbox holds stays there, and the token itself stays valid at the code host. Rotate
+    a member's personal access token at the code host when it may have been copied.
 - **Skills** ([ADR-0064](../adr/0064-skills-library.md)). A v2 host that lists `run.skills` gets
   the agent's skills in `run.assign.skills` and downloads each from the server before the
   sandbox starts ([runner/README.md](../../runner/README.md#skills-protocol-v2)). A run whose

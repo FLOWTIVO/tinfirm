@@ -13,9 +13,17 @@
 //! bundle is stored, and the run is reported failed with `INFRA`. The next turn goes on from
 //! the session. A record that cannot be taken back (another executor now, or no bridge) is
 //! reported in the log and removed.
+//!
+//! The record's git tokens are those of the run's holder ([`crate::git_tokens`]): the record is
+//! written again whenever the holder changes ([`RecordHandle::sync_git`]). A repository whose
+//! token the server revoked (ADR-0116) has no `git` in the record's assignment and is named in
+//! `revoked` with the server's reason and message, so a host that restarts neither uses the
+//! token nor pushes the repository. The format stays version 1: a record without `revoked`
+//! revoked nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -26,6 +34,7 @@ use tinfirm_protocol::RunAssign;
 use uuid::Uuid;
 
 use crate::git::MirrorRef;
+use crate::git_tokens::{RevokedRepository, RunGitTokens};
 use crate::paths::Paths;
 
 /// The format of the records. A record of another one is not taken back.
@@ -58,6 +67,10 @@ pub struct RunRecord {
     pub session_id: Option<String>,
     /// Every event of the run has a lower number.
     pub seq_floor: u64,
+    /// The repositories whose token the server revoked (ADR-0116): their `git` in `assign` is
+    /// null, and a host that takes the run back pushes none of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<RevokedRepository>,
 }
 
 impl RunRecord {
@@ -260,6 +273,8 @@ fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
 pub struct RecordHandle {
     records: Records,
     record: Mutex<RunRecord>,
+    /// Set by [`RecordHandle::remove`]: a change that comes later writes nothing.
+    removed: AtomicBool,
 }
 
 impl std::fmt::Debug for RecordHandle {
@@ -280,12 +295,14 @@ impl RecordHandle {
         RecordHandle {
             records: records.clone(),
             record: Mutex::new(record),
+            removed: AtomicBool::new(false),
         }
     }
 
     fn update(&self, change: impl FnOnce(&mut RunRecord) -> bool) {
         let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
         if change(&mut record)
+            && !self.removed.load(Ordering::SeqCst)
             && let Err(e) = self.records.save(&record)
         {
             tracing::warn!(run_id = %record.run_id(), error = %format!("{e:#}"), "cannot update the run's record");
@@ -314,15 +331,33 @@ impl RecordHandle {
         });
     }
 
+    /// The run's git tokens as `tokens` holds them now: the record is written again, whole,
+    /// when a token was revoked (or, later, renewed) since it was last written.
+    pub fn sync_git(&self, tokens: &RunGitTokens) {
+        self.update(|record| {
+            let mut assign = record.assign.clone();
+            let revoked = tokens.write_to(&mut assign);
+            if assign == record.assign && revoked == record.revoked {
+                return false;
+            }
+            record.assign = assign;
+            record.revoked = revoked;
+            true
+        });
+    }
+
     /// The sandbox has stopped: nothing is left to take back.
     pub fn remove(&self) {
         let record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        self.removed.store(true, Ordering::SeqCst);
         self.records.remove(record.run_id());
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn record() -> RunRecord {
@@ -359,6 +394,7 @@ mod tests {
             home_exclude: vec![".cache".into()],
             session_id: None,
             seq_floor: SEQ_BLOCK,
+            revoked: Vec::new(),
         }
     }
 
@@ -390,6 +426,58 @@ mod tests {
 
         handle.remove();
         assert!(records.load_all().is_empty());
+    }
+
+    #[test]
+    fn a_revoked_token_leaves_the_record_and_a_removed_record_stays_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let mut first = record();
+        let component_id = Uuid::new_v4();
+        first.assign.workspaces = vec![
+            serde_json::from_value(serde_json::json!({
+                "componentId": component_id,
+                "dir": "repo",
+                "name": "Repo",
+                "repoUrl": "https://git.example.invalid/acme/repo.git",
+                "defaultBranch": "main",
+                "branch": "agent/T-1",
+                "git": {"username": "x-access-token", "token": "revoked-token-0123456789"},
+            }))
+            .unwrap(),
+        ];
+        let tokens = RunGitTokens::new(&first.assign);
+        let run_id = first.run_id();
+        let path = dir.path().join(format!("data/runs/{run_id}.json"));
+        let handle = Arc::new(RecordHandle::create(&records, first).unwrap());
+        tokens.keep_record(handle.clone());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("revoked-token-0123456789"));
+        assert!(!text.contains("\"revoked\""), "nothing revoked yet: {text}");
+
+        tokens.revoke(&[component_id], "SUSPENDED", "the holder was suspended");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("revoked-token-0123456789"), "{text}");
+        assert_eq!(crate::secure_fs::mode_of(&path), Some(0o600));
+        let loaded = records.load_all();
+        assert_eq!(loaded[0].version, RECORD_VERSION);
+        assert!(loaded[0].assign.workspaces[0].git.is_none());
+        assert_eq!(
+            loaded[0].revoked,
+            vec![RevokedRepository {
+                component_id,
+                reason: "SUSPENDED".into(),
+                message: "the holder was suspended".into(),
+            }]
+        );
+        let restored = RunGitTokens::restored(&loaded[0].assign, &loaded[0].revoked);
+        assert!(restored.authorization(component_id).is_err());
+
+        handle.remove();
+        handle.numbered(10 * SEQ_BLOCK);
+        tokens.revoke(&[Uuid::new_v4()], "SUSPENDED", "nothing");
+        assert!(!path.exists(), "a removed record is not written again");
     }
 
     #[test]

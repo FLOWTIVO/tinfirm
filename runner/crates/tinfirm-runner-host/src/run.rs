@@ -37,6 +37,7 @@ use crate::docker;
 use crate::egress_proxy::{EgressGuard, Rule};
 use crate::git::{self, Git, branch_tip, ref_shas};
 use crate::git_proxy::{GitProxy, McpGuard, RouteGuard};
+use crate::git_tokens::RunGitTokens;
 use crate::host::{Shared, StopRequest};
 use crate::limits::{self, AgentError, DEFAULT_COOLDOWN_MINUTES};
 use crate::mapper::{EventMapper, Signal};
@@ -139,6 +140,12 @@ pub struct EventSink {
     shared: Arc<Shared>,
     run_id: Uuid,
     epoch: i64,
+    /// Shared with the run's other sinks ([`EventSink::side`]): one numbering per run.
+    numbering: Arc<std::sync::Mutex<Numbering>>,
+}
+
+/// The numbers of a run's events.
+struct Numbering {
     seq: u64,
     /// The run's record while its sandbox lives (ADR-0101): it reserves the event numbers.
     record: Option<Arc<RecordHandle>>,
@@ -156,26 +163,42 @@ impl EventSink {
             shared,
             run_id,
             epoch,
-            seq,
-            record: None,
+            numbering: Arc::new(std::sync::Mutex::new(Numbering { seq, record: None })),
         }
+    }
+
+    /// A second sink of the same run, which numbers its events in the same sequence: for what
+    /// happens to the run outside its task, such as a revocation of its git tokens.
+    pub fn side(&self) -> EventSink {
+        EventSink {
+            shared: self.shared.clone(),
+            run_id: self.run_id,
+            epoch: self.epoch,
+            numbering: self.numbering.clone(),
+        }
+    }
+
+    fn numbering(&self) -> std::sync::MutexGuard<'_, Numbering> {
+        self.numbering.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps the run's record up to date from now on.
     pub fn keep_record(&mut self, record: Arc<RecordHandle>) {
-        self.record = Some(record);
+        self.numbering().record = Some(record);
     }
 
     /// The sandbox is gone: its record too.
     pub fn drop_record(&mut self) {
-        if let Some(record) = self.record.take() {
+        let record = self.numbering().record.take();
+        if let Some(record) = record {
             record.remove();
         }
     }
 
     /// The agent's session is open.
     pub fn session_opened(&self, session_id: &str) {
-        if let Some(record) = &self.record {
+        let record = self.numbering().record.clone();
+        if let Some(record) = record {
             record.session_opened(session_id);
         }
     }
@@ -213,17 +236,21 @@ impl EventSink {
         } else {
             payload
         };
-        self.seq += 1;
-        if let Some(record) = &self.record {
-            record.numbered(self.seq);
+        // Numbered and queued under one lock, so that the run's sinks queue in order.
+        let mut numbering = self.numbering();
+        numbering.seq += 1;
+        let seq = numbering.seq;
+        if let Some(record) = &numbering.record {
+            record.numbered(seq);
         }
         self.shared.outbox.push_event(RunEvent {
             run_id: self.run_id,
             epoch: self.epoch,
-            seq: self.seq,
+            seq,
             at: Utc::now(),
             event: payload,
         });
+        drop(numbering);
         hit
     }
 
@@ -257,7 +284,7 @@ impl EventSink {
     }
 
     pub fn last_seq(&self) -> u64 {
-        self.seq
+        self.numbering().seq
     }
 
     fn redact(&self, text: &str) -> String {
@@ -342,18 +369,22 @@ fn repo_label(ws: &WorkspaceSpec) -> String {
     format!("`{}` ({WORKSPACE_ROOT}/{})", ws.name, ws.dir)
 }
 
-/// Executes a run. Returns `None` when the run was aborted (stale epoch) and must not
-/// report anything.
+/// Executes a run. Its repositories read their git tokens from `tokens`, the run's holder
+/// (ADR-0116). Returns `None` when the run was aborted (stale epoch) and must not report
+/// anything.
 pub async fn execute(
     shared: &Arc<Shared>,
     assign: &RunAssign,
     credential: &RunCredential,
+    tokens: &Arc<RunGitTokens>,
     mut stop_rx: watch::Receiver<Option<StopRequest>>,
     steering: &Arc<Steering>,
 ) -> Option<RunFinished> {
     let started = Instant::now();
     let paths = shared.opts.paths.clone();
     let mut sink = EventSink::new(shared.clone(), assign.run_id, assign.epoch);
+    // A revocation of the run's git tokens is a warning in the run's events.
+    tokens.attach_log(sink.side());
     let mut failure = Failure::default();
     let mut cancelled = false;
     sink.status(Phase::Preparing, None);
@@ -412,7 +443,7 @@ pub async fn execute(
     if !assign.workspaces.is_empty() {
         sink.status(Phase::Cloning, None);
         let cloned = tokio::select! {
-            result = clone_all(shared, &mut sink, assign, &workspace_dir, &mut repos) => Some(result),
+            result = clone_all(shared, &mut sink, assign, tokens, &workspace_dir, &mut repos) => Some(result),
             _ = wait_for_stop(&mut stop_rx) => None,
         };
         if let Some(Err(message)) = &cloned {
@@ -760,9 +791,12 @@ pub async fn execute(
                 }
                 // While the sandbox lives, a host that restarts takes the run back (ADR-0101).
                 if let Some((kind, bridge_id, session_key)) = sandbox.take_back_record() {
+                    // The tokens as the run's holder has them now, none that was revoked.
+                    let mut kept = assign.clone();
+                    let revoked = tokens.write_to(&mut kept);
                     let record = RunRecord {
                         version: crate::takeback::RECORD_VERSION,
-                        assign: assign.clone(),
+                        assign: kept,
                         sandbox: kind,
                         bridge_id,
                         session_key,
@@ -781,9 +815,15 @@ pub async fn execute(
                         home_exclude: home_exclude.clone(),
                         session_id: None,
                         seq_floor: sink.last_seq() + crate::takeback::SEQ_BLOCK,
+                        revoked,
                     };
                     match RecordHandle::create(&shared.records, record) {
-                        Ok(record) => sink.keep_record(Arc::new(record)),
+                        Ok(record) => {
+                            let record = Arc::new(record);
+                            sink.keep_record(record.clone());
+                            // A revocation from now on writes the record again.
+                            tokens.keep_record(record);
+                        }
                         Err(e) => sink.log(
                             LogLevel::Warn,
                             format!(
@@ -841,6 +881,7 @@ pub async fn execute(
                     .await;
                 }
                 sandbox.stop(Duration::from_secs(5)).await;
+                tokens.drop_record();
                 sink.drop_record();
                 phase = Some(agent);
             }
@@ -1025,6 +1066,7 @@ const RECLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn take_back(
     shared: &Arc<Shared>,
     record: RunRecord,
+    tokens: &Arc<RunGitTokens>,
     sandbox: crate::sandbox::TakenBack,
     registration: tinfirm_bridge::host::Registration,
     mut stop_rx: watch::Receiver<Option<StopRequest>>,
@@ -1037,10 +1079,11 @@ pub async fn take_back(
         assign.epoch,
         record.seq_floor,
     );
-    sink.keep_record(Arc::new(RecordHandle::kept(
-        &shared.records,
-        record.clone(),
-    )));
+    let kept = Arc::new(RecordHandle::kept(&shared.records, record.clone()));
+    sink.keep_record(kept.clone());
+    tokens.attach_log(sink.side());
+    // A revocation that the server sends again at the hello writes the record again.
+    tokens.keep_record(kept);
     let mut secrets = Vec::new();
     if let Some(tinfirm_protocol::AssignedCredential::Model(access)) = assign.credential() {
         secrets.push(access.api_key.expose().to_string());
@@ -1098,7 +1141,8 @@ pub async fn take_back(
                     git_identity(assign, Some(ws)),
                     kept.base_refs(),
                     kept.config_snapshot(),
-                ),
+                )
+                .with_tokens(tokens.repo(ws.component_id)),
                 cloned_head: kept.cloned_head.clone(),
                 cloned_commits: kept.cloned_commits,
                 collected: None,
@@ -1166,6 +1210,7 @@ pub async fn take_back(
         }
         None => sandbox.discard(Duration::from_secs(5)).await,
     }
+    tokens.drop_record();
     sink.drop_record();
 
     let cancelled = match *stop_rx.borrow() {
@@ -1186,6 +1231,16 @@ pub async fn take_back(
     let mut leak = false;
     let results = if came_back && !repos.is_empty() {
         sink.status(Phase::Finalizing, None);
+        // The push waits for the server: a revocation that came while this host was away
+        // comes again after its hello (ADR-0116, decision 10). A host of protocol 1 knows no
+        // revocation, and pushes as before.
+        if shared.speaks_v2()
+            && repos
+                .iter()
+                .any(|repo| matches!(repo.git.authorization(), Ok(Some(_))))
+        {
+            wait_for_the_server(shared, &mut sink, &mut stop_rx).await;
+        }
         let finalized = finalize_git(shared, &mut sink, &repos, assign.run_id, false).await;
         if finalized.outgoing_leak {
             leak = true;
@@ -1260,6 +1315,47 @@ pub async fn take_back(
         finished.outcome == Outcome::Failed || failed_git,
     );
     Some(finished)
+}
+
+/// Before a run taken back pushes with its git tokens (ADR-0116, decision 10): waits for the
+/// current connection's `welcome.done`, which the server sends after every pending
+/// `run.git.revoke` of the runs the hello listed; the host has applied those by then, since it
+/// handles the server's frames in order. Without it within [`HostOptions::welcome_done_wait`]
+/// (no connection, or a server that sends none) the run pushes with what its record holds, and
+/// the log says which of the two it was. An abort stops the wait.
+///
+/// [`HostOptions::welcome_done_wait`]: crate::host::HostOptions::welcome_done_wait
+async fn wait_for_the_server(
+    shared: &Arc<Shared>,
+    sink: &mut EventSink,
+    stop_rx: &mut watch::Receiver<Option<StopRequest>>,
+) {
+    let mut done = shared.welcome_done();
+    let deadline = tokio::time::sleep(shared.opts.welcome_done_wait);
+    tokio::pin!(deadline);
+    loop {
+        if *stop_rx.borrow() == Some(StopRequest::Abort) || *done.borrow_and_update() {
+            return;
+        }
+        tokio::select! {
+            Ok(()) = done.changed() => {}
+            Ok(()) = stop_rx.changed() => {}
+            _ = &mut deadline => {
+                let why = if shared.is_connected() {
+                    "the server did not say that it had sent every revocation of the run's git tokens (no welcome.done)"
+                } else {
+                    "the runner host is not connected to the server"
+                };
+                sink.log(
+                    LogLevel::Warn,
+                    format!(
+                        "{why}: the run's work is pushed without knowing whether a git token of the run was revoked meanwhile"
+                    ),
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// Restores the conversation's session bundle into the home, unless the home holds it already.
@@ -1513,6 +1609,7 @@ async fn clone_all<'a>(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     assign: &'a RunAssign,
+    tokens: &Arc<RunGitTokens>,
     workspace_dir: &Path,
     repos: &mut Vec<Repo<'a>>,
 ) -> Result<(), String> {
@@ -1521,13 +1618,21 @@ async fn clone_all<'a>(
             workspace_dir.join(&ws.dir),
             ws,
             git_identity(assign, Some(ws)),
-        );
+        )
+        .with_tokens(tokens.repo(ws.component_id));
+        // A token the server revoked before the clone (ADR-0116): no fetch is attempted.
+        let authorization = match git.authorization() {
+            Ok(authorization) => authorization,
+            Err(revocation) => {
+                return Err(sink.redact(&format!("cannot clone {}: {revocation}", repo_label(ws))));
+            }
+        };
         let cloned = async {
             // The mirror is fetched with this repository's credentials first, so a token
             // that no longer works fails the run instead of serving stale content.
             let mirror = shared
                 .mirrors
-                .update(&ws.repo_url, git.authorization())
+                .update(&ws.repo_url, authorization.as_ref())
                 .await
                 .map_err(|e| e.context("cannot update the host's mirror"))?;
             git.clone_from_mirror(&mirror.path, &mirror.refs, ws).await
@@ -1868,10 +1973,11 @@ async fn route_git_proxy(
             ),
         );
     };
+    // The route reads the token from the run's holder at each request (ADR-0116).
     let route = match proxy.register_at(
         assign.run_id,
         &ws.repo_url,
-        repo.git.authorization().cloned(),
+        repo.git.tokens().clone(),
         &ws.branch,
         sandbox_host,
     ) {
@@ -3123,6 +3229,15 @@ async fn finalize_git(
             );
             continue;
         }
+        // The server revoked the run's token for this repository (ADR-0116): its commits
+        // stay on this host.
+        if let Some(revocation) = repo.git.revocation() {
+            let reason = sink.redact(&revocation.message);
+            finalized
+                .errors
+                .push(format!("{}: not pushed: {reason}", repo.label()));
+            continue;
+        }
         match repo.git.push(&repo.ws.branch).await {
             Ok(out) if out.status.success() => {
                 finalized.results[i].pushed = true;
@@ -3175,10 +3290,12 @@ async fn prepare_repository(
     }
     // What the host knows the repository has: the mirror's refs at clone time and, fetched
     // again now, its current refs. Never the workspace's own refs, which the agent controls.
-    let current = if scan {
+    // A revoked token (ADR-0116) fetches nothing: the scan compares with the clone's refs.
+    let authorization = git.authorization().ok();
+    let current = if let (true, Some(authorization)) = (scan, authorization) {
         match shared
             .mirrors
-            .refresh(git.repo_url(), git.authorization())
+            .refresh(git.repo_url(), authorization.as_ref())
             .await
         {
             Ok(refs) => refs,
