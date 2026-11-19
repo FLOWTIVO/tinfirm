@@ -1216,6 +1216,23 @@ pub async fn take_back(
     tokens.drop_record();
     sink.drop_record();
 
+    // The push waits for the server: a revocation that came while this host was away comes
+    // again in its answer to the hello (ADR-0116, decision 10). A host of protocol 1 knows no
+    // revocation, and pushes as before. Then every token of the run that expires is renewed,
+    // an expired one included: after `welcome.done`, or right after the `welcome` of an older
+    // server, which never sent `expiresAt`, so that its runs have nothing to renew
+    // (`git_refresh::renew` asks for no repository then). The stop is looked at after this,
+    // so that an abort meanwhile pushes and reports nothing.
+    if came_back
+        && shared.speaks_v2()
+        && repos.iter().any(|repo| tokens.holds(repo.ws.component_id))
+    {
+        wait_for_the_server(shared, &mut sink, &mut stop_rx).await;
+        if *stop_rx.borrow() != Some(StopRequest::Abort) {
+            crate::git_refresh::renew(shared, tokens, None).await;
+        }
+    }
+
     let cancelled = match *stop_rx.borrow() {
         Some(StopRequest::Abort) => {
             let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
@@ -1234,14 +1251,6 @@ pub async fn take_back(
     let mut leak = false;
     let results = if came_back && !repos.is_empty() {
         sink.status(Phase::Finalizing, None);
-        // The push waits for the server: a revocation that came while this host was away
-        // comes again after its hello (ADR-0116, decision 10). A host of protocol 1 knows no
-        // revocation, and pushes as before.
-        if shared.speaks_v2() && repos.iter().any(|repo| tokens.holds(repo.ws.component_id)) {
-            wait_for_the_server(shared, &mut sink, &mut stop_rx).await;
-            // Then every token that expires is renewed first, an expired one included.
-            crate::git_refresh::renew(shared, tokens, None).await;
-        }
         let finalized = finalize_git(shared, &mut sink, &repos, tokens, assign.run_id, false).await;
         if finalized.outgoing_leak {
             leak = true;
@@ -1319,11 +1328,14 @@ pub async fn take_back(
 }
 
 /// Before a run taken back pushes with its git tokens (ADR-0116, decision 10): waits for the
-/// current connection's `welcome.done`, which the server sends after every pending
-/// `run.git.revoke` of the runs the hello listed; the host has applied those by then, since it
-/// handles the server's frames in order. Without it within [`HostOptions::welcome_done_wait`]
-/// (no connection, or a server that sends none) the run pushes with what its record holds, and
-/// the log says which of the two it was. An abort stops the wait.
+/// server's answer to the hello. A server that lists `run.git.revoke` in `welcome.features`
+/// sends `welcome.done` after every pending `run.git.revoke` of the runs the hello listed, and
+/// the host has applied those by then, since it handles the server's frames in order; the run
+/// waits for it. An older server (no such feature in `welcome`) keeps no revocation and sends
+/// no `welcome.done`: the run pushes once it is welcomed, as before. Without either within
+/// [`HostOptions::welcome_done_wait`] (no connection, or a server that lists the feature and
+/// sends no `welcome.done`) the run pushes with what its record holds, and the log says which
+/// of the two it was. An abort stops the wait; the caller looks at the stop again.
 ///
 /// [`HostOptions::welcome_done_wait`]: crate::host::HostOptions::welcome_done_wait
 async fn wait_for_the_server(
@@ -1331,15 +1343,15 @@ async fn wait_for_the_server(
     sink: &mut EventSink,
     stop_rx: &mut watch::Receiver<Option<StopRequest>>,
 ) {
-    let mut done = shared.welcome_done();
+    let mut answer = shared.hello_answer();
     let deadline = tokio::time::sleep(shared.opts.welcome_done_wait);
     tokio::pin!(deadline);
     loop {
-        if *stop_rx.borrow() == Some(StopRequest::Abort) || *done.borrow_and_update() {
+        if *stop_rx.borrow() == Some(StopRequest::Abort) || answer.borrow_and_update().complete() {
             return;
         }
         tokio::select! {
-            Ok(()) = done.changed() => {}
+            Ok(()) = answer.changed() => {}
             Ok(()) = stop_rx.changed() => {}
             _ = &mut deadline => {
                 let why = if shared.is_connected() {

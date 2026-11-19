@@ -1026,6 +1026,7 @@ mod tests {
             server_version: None,
             heartbeat_interval_seconds: heartbeat,
             lease_ttl_seconds: lease,
+            features: Vec::new(),
         };
         host.on_welcome(&welcome(10, 30));
         assert_eq!(host.heartbeat_interval(), Duration::from_secs(10));

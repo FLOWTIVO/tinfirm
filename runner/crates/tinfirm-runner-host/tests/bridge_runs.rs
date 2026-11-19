@@ -537,6 +537,18 @@ async fn a_host_killed_mid_run_with(
     revoke: Option<&str>,
     change: impl FnOnce(&mut AssignSpec<'static>),
 ) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf, u64) {
+    a_host_killed_when(server, repo, v2, revoke, change, None).await
+}
+
+/// [`a_host_killed_mid_run_with`], killed only once the agent has said `ready`, when given.
+async fn a_host_killed_when(
+    server: &mut FakeServer,
+    repo: &TestRepo,
+    v2: bool,
+    revoke: Option<&str>,
+    change: impl FnOnce(&mut AssignSpec<'static>),
+    ready: Option<&str>,
+) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf, u64) {
     let dir = tempfile::tempdir().unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
@@ -557,7 +569,11 @@ async fn a_host_killed_mid_run_with(
     change(&mut spec);
     conn.send(spec.to_json());
     // The agent has written its work and goes on: the run's record is there.
-    conn.wait_running(spec.run_id).await;
+    match ready {
+        // Its first message may hold `ready` already.
+        Some(ready) => conn.until_agent_says(spec.run_id, ready).await,
+        None => conn.wait_running(spec.run_id).await,
+    }
     let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
     assert!(record.exists(), "no record of the run");
     if let Some(message) = revoke {
@@ -573,7 +589,18 @@ async fn a_host_killed_mid_run_with(
         })
         .await;
     }
-    let before = conn.until_seq(spec.run_id, 3).await;
+    let before = if ready.is_some() {
+        // An agent that waits says nothing more: the events so far.
+        let id = spec.run_id.to_string();
+        conn.frames
+            .iter()
+            .filter(|f| f["runId"] == id)
+            .filter_map(|f| f["seq"].as_u64())
+            .max()
+            .unwrap_or(0)
+    } else {
+        conn.until_seq(spec.run_id, 3).await
+    };
     host_a.kill().unwrap();
     host_a.wait().unwrap();
     (dir, spec, record, before)
@@ -664,6 +691,9 @@ async fn a_run_taken_back_that_the_server_cancels_still_saves_its_work() {
     .await;
 }
 
+/// `welcome.features` of a server of ADR-0116 and later.
+const SERVER_FEATURES: &[&str] = &["run.steer", "run.git.revoke", "run.git.refresh"];
+
 /// The server's message of the revocation tests (ADR-0116).
 const REVOKED: &str =
     "Tinfirm revoked this run's access to acme/origin: the account was disconnected.";
@@ -732,7 +762,7 @@ async fn a_revocation_sent_again_at_the_hello_comes_before_the_push_of_a_run_tak
         );
         let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
         let mut conn = server.accept().await;
-        let hello = conn.handshake(1).await;
+        let hello = conn.handshake_listing(1, SERVER_FEATURES).await;
         assert_eq!(hello["activeRuns"][0]["runId"], spec.run_id.to_string());
         // As the server does at every hello that lists the run: the pending revocation, then
         // `welcome.done`, which the push waits for.
@@ -780,7 +810,7 @@ async fn a_run_taken_back_pushes_only_once_the_server_says_welcome_done() {
         )
         .await;
         let mut conn = server.accept().await;
-        conn.handshake(1).await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
         // The sandbox came back and its agent stopped: the run is ready to push, and waits.
         let id = spec.run_id.to_string();
         conn.take_where("the agent stopped", |f| {
@@ -829,7 +859,7 @@ async fn a_run_taken_back_without_welcome_done_pushes_after_the_cap_and_says_so(
         .await;
         let mut conn = server.accept().await;
         // A server that never sends welcome.done.
-        conn.handshake(1).await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
         let t = conn.until_finished(spec.run_id).await;
         let finished = t.finished();
         assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
@@ -891,7 +921,7 @@ async fn a_run_taken_back_after_its_token_expired_renews_it_before_the_push() {
 
         let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
         let mut conn = server.accept().await;
-        conn.handshake(1).await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
         conn.send(json!({"type": "welcome.done"}));
         // After welcome.done the host renews every token of the run that expires.
         let id = spec.run_id.to_string();
@@ -929,6 +959,146 @@ async fn a_run_taken_back_after_its_token_expired_renews_it_before_the_push() {
         assert_eq!(
             repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
             Some("work in progress\n")
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_taken_back_by_an_older_servers_host_pushes_without_waiting() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        let host = start_host_at(
+            dir.path(),
+            &server.url,
+            restart_setup_waiting(Duration::from_secs(120)),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        // A server of before ADR-0116: no `welcome.features`, and never a `welcome.done`.
+        conn.handshake(1).await;
+        let started = std::time::Instant::now();
+        let t = conn.until_finished(spec.run_id).await;
+        assert!(started.elapsed() < Duration::from_secs(60), "it waited");
+        let finished = t.finished();
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert!(!t.text().contains("welcome.done"), "{}", t.text());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abort_while_a_run_taken_back_waits_for_welcome_done_pushes_and_reports_nothing() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        let host = start_host_at(
+            dir.path(),
+            &server.url,
+            restart_setup_waiting(Duration::from_secs(120)),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
+        let id = spec.run_id.to_string();
+        conn.take_where("the agent stopped", |f| {
+            f["runId"] == id
+                && f["eventType"] == "LOG"
+                && f["payload"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("was stopped") || m.contains("had stopped"))
+        })
+        .await;
+        // The run waits for welcome.done; the server calls its execution stale meanwhile.
+        conn.send(json!({
+            "type": "error",
+            "code": "STALE_EPOCH",
+            "message": "epoch 1 is stale",
+            "runId": spec.run_id,
+            "epoch": 1
+        }));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        conn.send(json!({"type": "welcome.done"}));
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            while conn.next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            !conn
+                .frames
+                .iter()
+                .any(|f| f["type"] == "run.finished" && f["runId"] == id),
+            "an aborted run reports nothing"
+        );
+        assert!(
+            repo.branch_head("agent/TEST-1").is_none(),
+            "an aborted run pushes nothing"
+        );
+        assert!(!host.paths.workspace(spec.run_id).exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_taken_back_with_a_revocation_and_a_cancel_in_the_hellos_answer_pushes_the_others() {
+    with_timeout(180, async {
+        let shop = TestRepo::new();
+        let docs = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (shop_url, docs_url) = (shop.url.clone(), docs.url.clone());
+        let (dir, spec, _, _) = a_host_killed_when(
+            &mut server,
+            &shop,
+            true,
+            None,
+            move |spec| {
+                spec.scenario = "rebase";
+                spec.prompt_extra = " [commit:shop] [commit:docs] [wait]".into();
+                spec.workspaces = vec![
+                    WorkspaceEntry::new("shop", "Shop", &shop_url),
+                    WorkspaceEntry::new("docs", "Docs", &docs_url),
+                ];
+            },
+            Some("waiting for release"),
+        )
+        .await;
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
+        // One hello's answer: the pending revocation, then the cancel, then welcome.done.
+        conn.send(git_revoke(
+            spec.run_id,
+            1,
+            &[spec.workspaces[0].component_id],
+            REVOKED,
+        ));
+        conn.send(json!({"type": "run.cancel", "runId": spec.run_id, "epoch": 1}));
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "CANCELLED", "{}", t.text());
+        let results = finished["git"].as_array().unwrap();
+        assert_eq!(results[0]["pushed"], false, "{}", t.text());
+        assert_eq!(results[1]["pushed"], true, "{}", t.text());
+        assert!(shop.branch_head("agent/TEST-1").is_none());
+        assert_eq!(
+            docs.file_at("agent/TEST-1", "docs.txt").as_deref(),
+            Some("change in docs\n")
+        );
+        assert!(
+            t.text().contains(&format!("not pushed: {REVOKED}")),
+            "{}",
+            t.text()
         );
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();

@@ -102,6 +102,17 @@ them refuses a host started with `--vm-driver digitalocean` or `--pool-max-ready
 (`EDITION_REQUIRED`, and the host stops), and hands out no session bundle. The sandbox bridge and
 a VM per run with a driver of your own are in every edition, as is a host with Docker, as below.
 
+The same release also carries the node agent of a sandbox node
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)):
+`tinfirm-node-agent-<version>-x86_64-unknown-linux-musl.tar.gz` and
+`tinfirm-node-agent-<version>-aarch64-unknown-linux-musl.tar.gz`, static. It runs on the sandbox
+nodes of a control host whose VMs run on your own machines, not on a runner host; install it from
+the same release as the runner host, which checks the agent's release when it connects. Download
+and verify it as above, with `tinfirm-node-agent` in place of `tinfirm-runner-host` and a Linux
+target; its archive holds the binary, its licence and the licences of its crates. It cannot run
+VMs yet: its service units and their setup are planned
+([docs-site, runner hosts](../docs-site/content/operator-guide/runner-hosts.md)).
+
 Then continue with the [Quickstart](#quickstart). To upgrade, install the
 new binary the same way and drain ([Drain and upgrades](#drain-and-upgrades)). A Compose host
 that follows `rolling` with auto-deploy does this by itself: it installs the new binary when
@@ -628,12 +639,16 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     whole and 0600, without the token and with the repository in its `revoked` list (the
     server's reason and message). A host that takes the run back then neither uses that token
     nor pushes the repository.
-  - A host of protocol 2 that took a run back pushes its work only once the server has sent
-    `welcome.done` on the current connection: the last frame of its answer to the `hello`, after
-    every revocation (and cancel) it keeps for the runs the `hello` listed, which the host has
-    applied by then. So a revocation that Tinfirm sent while the host was away comes first.
-    Without `welcome.done` within 2 minutes (no connection, or a server that sends none) the run
-    pushes with what the record holds, and a warning in its log says which of the two it was.
+  - A host of protocol 2 that took a run back pushes its work only once the server has answered
+    its `hello` whole. A server that lists `run.git.revoke` in `welcome.features` sends
+    `welcome.done` last, after every revocation (and cancel) it keeps for the runs the `hello`
+    listed, which the host has applied by then; the run waits for it, so a revocation that
+    Tinfirm sent while the host was away comes first. A server that lists no such feature (one
+    from before ADR-0116) keeps no revocation, and the run pushes as soon as it is welcomed.
+    Without either within 2 minutes (no connection, or a server that lists the feature and sends
+    no `welcome.done`) the run pushes with what the record holds, and a warning in its log says
+    which of the two it was. A stop that comes during the wait is applied after it: a cancel
+    still pushes, an abort (a stale epoch) pushes and reports nothing.
     Then it renews every token of the run that expires
     ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)), an expired one included,
     before the push. The record keeps a token's latest value and its expiry.
@@ -1960,7 +1975,9 @@ hour away) and `git.mirrorKey`; any other token has neither and lives until the 
 - **When the host renews.** With a `run.request` of kind `GIT_TOKEN` naming every repository that
   is due: while the run works, when a token has 10 minutes or less left (the host looks every
   15 s); before the push at the run's end, when it has 20 minutes or less left; and for a run
-  taken back after a restart, after `welcome.done`, every token that expires. It asks at most
+  taken back after a restart, every token that expires, once the server has answered the
+  `hello` whole (after `welcome.done`; a server without `run.git.revoke` in `welcome.features`
+  never sent `expiresAt`, so such a run has none to renew). It asks at most
   once a minute per repository, and only while connected.
 - **The answer.** DONE: each renewed token goes into the run's holder (so the git proxy's routes,
   the host's git and the take-back record use it from then on) and onto the run's redaction list,

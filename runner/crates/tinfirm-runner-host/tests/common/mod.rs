@@ -274,6 +274,8 @@ pub struct Conn {
     pub max_frame: usize,
     /// Every text frame received on this connection, in order.
     pub frames: Vec<Value>,
+    /// `welcome.features` of the next handshake ([`Conn::handshake_listing`]).
+    pub welcome_features: Option<Value>,
     /// Frames received but passed over by [`Conn::take`]; [`Conn::next`] returns them first.
     backlog: VecDeque<Value>,
     pub closed: bool,
@@ -382,6 +384,7 @@ impl FakeServer {
                     pongs,
                     max_frame: 0,
                     frames: Vec::new(),
+                    welcome_features: None,
                     backlog: VecDeque::new(),
                     closed: false,
                     close_frame,
@@ -752,6 +755,15 @@ impl Conn {
         hello
     }
 
+    /// [`Conn::handshake`] of a server that lists `features` in `welcome.features` (a server
+    /// of ADR-0116 and later lists `run.git.revoke` and `run.git.refresh`).
+    pub async fn handshake_listing(&mut self, heartbeat_seconds: u64, features: &[&str]) -> Value {
+        self.welcome_features = Some(json!(features));
+        let hello = self.handshake(heartbeat_seconds).await;
+        self.welcome_features = None;
+        hello
+    }
+
     /// Answers `hello` with `welcome`, then sends `config` (if any) and waits for its
     /// `host.config.applied`. Returns the hello and the applied frame.
     pub async fn handshake_with(
@@ -760,7 +772,7 @@ impl Conn {
         config: Option<Value>,
     ) -> (Value, Option<Value>) {
         let hello = self.expect("hello").await;
-        self.send(json!({
+        let mut welcome = json!({
             "type": "welcome",
             "protocolVersion": hello["protocolVersion"],
             "runnerHostId": self.runner_host_id,
@@ -769,7 +781,11 @@ impl Conn {
             "heartbeatIntervalSeconds": heartbeat_seconds,
             "leaseTtlSeconds": 30,
             "someFutureField": {"ignored": true}
-        }));
+        });
+        if let Some(features) = &self.welcome_features {
+            welcome["features"] = features.clone();
+        }
+        self.send(welcome);
         let applied = match config {
             Some(config) => {
                 self.send(config);

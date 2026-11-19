@@ -53,7 +53,9 @@ pub fn applies(shared: &Shared) -> bool {
 
 /// Asks the server for the new tokens of the repositories of `tokens` that are due: those whose
 /// token expires within `within` (`None`: every token that expires), and applies the answer.
-/// Without a connection it asks nothing.
+/// Without a connection it asks nothing, and for a run without a token that expires it asks
+/// for no repository: an older server, which lists no `run.git.refresh` in `welcome.features`,
+/// never sent `expiresAt`.
 pub async fn renew(shared: &Arc<Shared>, tokens: &Arc<RunGitTokens>, within: Option<Duration>) {
     if !applies(shared) || !shared.is_connected() {
         return;

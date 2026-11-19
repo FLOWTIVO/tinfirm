@@ -300,6 +300,7 @@ fn constructed_messages() -> Vec<Message> {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         }),
         Message::RunAssign(RunAssign {
             run_id: run_id(),
@@ -1647,6 +1648,7 @@ fn constructed_messages_v2() -> Vec<Message> {
             server_version: Some("0.2.0".into()),
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         }),
         Message::RunAssign(RunAssign {
             run_id: run_id(),
@@ -2690,6 +2692,26 @@ fn git_revoke_bounds_and_versions() {
     assert_valid(&v2, &long, "message at the limit");
     long["message"] = json!("x".repeat(GIT_REVOKE_MESSAGE_MAX_CHARS + 1));
     assert!(!v2.is_valid(&long), "message above the limit");
+    // welcome.features: the server's own features, optional; an older server sends none.
+    let welcome = sample_v2("welcome-features.json");
+    assert_valid(&v2, &welcome, "welcome with features");
+    let Message::Welcome(parsed) = Message::from_value(welcome.clone()).unwrap() else {
+        panic!("not welcome");
+    };
+    assert!(parsed.lists(feature::RUN_GIT_REVOKE) && parsed.lists(feature::RUN_GIT_REFRESH));
+    let Message::Welcome(older) = Message::from_value(sample_v2("welcome.json")).unwrap() else {
+        panic!("not welcome");
+    };
+    assert!(older.features.is_empty() && !older.lists(feature::RUN_GIT_REVOKE));
+    assert!(
+        serde_json::to_value(Message::Welcome(older))
+            .unwrap()
+            .get("features")
+            .is_none()
+    );
+    let mut bad = welcome.clone();
+    bad["features"] = json!(["Run.Git.Revoke"]);
+    assert!(!v2.is_valid(&bad));
     // welcome.done: the type alone, v2 only.
     let done = sample_v2("welcome.done.json");
     assert_valid(&v2, &done, "welcome.done");

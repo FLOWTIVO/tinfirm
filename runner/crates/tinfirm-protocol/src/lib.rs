@@ -840,6 +840,18 @@ pub struct Welcome {
     pub server_version: Option<String>,
     pub heartbeat_interval_seconds: u64,
     pub lease_ttl_seconds: u64,
+    /// v2, optional (ADR-0116): the optional features this server implements, in the form of
+    /// [`Hello::features`]. Absent (empty): an older server, which implements neither
+    /// [`feature::RUN_GIT_REVOKE`] nor [`feature::RUN_GIT_REFRESH`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
+impl Welcome {
+    /// Whether the server implements the optional feature `name`.
+    pub fn lists(&self, name: &str) -> bool {
+        self.features.iter().any(|f| f == name)
+    }
 }
 
 /// Server -> runner host: start a run. Exactly one of `credential_label` and `model_access` is

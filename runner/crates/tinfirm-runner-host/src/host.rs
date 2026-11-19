@@ -296,6 +296,29 @@ const DRAIN_POLL: Duration = Duration::from_millis(200);
 const DRAINING_REASON: &str =
     "the runner host is draining: it finishes its active runs and then restarts";
 
+/// Where the current connection's answer to the hello is (ADR-0116, decision 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloAnswer {
+    /// No connection, or no `welcome` yet.
+    NotConnected,
+    /// `welcome` came; `revokes`: the server lists `run.git.revoke` in `welcome.features`, so
+    /// it sends `welcome.done` after every pending revocation of the runs the hello listed.
+    Welcomed { revokes: bool },
+    /// `welcome.done` came.
+    Done,
+}
+
+impl HelloAnswer {
+    /// Whether a run taken back may push now: the server sent every revocation it keeps for the
+    /// run (`welcome.done`), or it is an older one, which keeps none.
+    pub fn complete(self) -> bool {
+        matches!(
+            self,
+            HelloAnswer::Done | HelloAnswer::Welcomed { revokes: false }
+        )
+    }
+}
+
 /// Why a run is asked to stop from outside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopRequest {
@@ -384,10 +407,9 @@ pub struct Shared {
     platform_requests: Mutex<HashMap<Uuid, PendingRequest>>,
     /// Between `welcome` and the end of that connection.
     connected: AtomicBool,
-    /// Set by the current connection's `welcome.done` (ADR-0116): the server has sent every
-    /// pending revocation of the runs the hello listed. Cleared at each `welcome` and at a
-    /// disconnect.
-    welcome_done: watch::Sender<bool>,
+    /// Where the current connection's answer to the hello is (ADR-0116): set at each
+    /// `welcome` and by `welcome.done`, cleared at a disconnect.
+    welcome_done: watch::Sender<HelloAnswer>,
     heartbeat_secs: AtomicU64,
     lease_ttl_secs: AtomicU64,
     runner_host_id: Mutex<Option<Uuid>>,
@@ -447,7 +469,7 @@ impl Shared {
             platform_requests: Mutex::new(HashMap::new()),
             public_suffix: Arc::new(PublicSuffixStore::load(&opts.paths)),
             connected: AtomicBool::new(false),
-            welcome_done: watch::Sender::new(false),
+            welcome_done: watch::Sender::new(HelloAnswer::NotConnected),
             opts,
             config,
             outbox,
@@ -859,7 +881,9 @@ impl Shared {
     }
 
     pub fn on_welcome(&self, welcome: &tinfirm_protocol::Welcome) {
-        self.welcome_done.send_replace(false);
+        self.welcome_done.send_replace(HelloAnswer::Welcomed {
+            revokes: welcome.lists(feature::RUN_GIT_REVOKE),
+        });
         self.connected.store(true, Ordering::SeqCst);
         // A new connection: forget the host.config version, and drop answers that the old
         // connection did not write. The server sends host.config after welcome.
@@ -899,16 +923,15 @@ impl Shared {
         self.connected.load(Ordering::SeqCst)
     }
 
-    /// Whether the current connection's `welcome.done` has come, as it changes: `true` once
-    /// the server has sent every pending revocation of the runs the hello listed.
-    pub fn welcome_done(&self) -> watch::Receiver<bool> {
+    /// Where the current connection's answer to the hello is, as it changes.
+    pub fn hello_answer(&self) -> watch::Receiver<HelloAnswer> {
         self.welcome_done.subscribe()
     }
 
     /// The connection ended.
     pub fn on_disconnect(&self) {
         self.connected.store(false, Ordering::SeqCst);
-        self.welcome_done.send_replace(false);
+        self.welcome_done.send_replace(HelloAnswer::NotConnected);
         lock(&self.capacity).new_connection();
         self.outbox.on_disconnect();
     }
@@ -1211,7 +1234,7 @@ impl Shared {
             Message::WelcomeDone(_) => {
                 // After the frames it promises: a revocation it names was applied already.
                 tracing::info!("the server's answer to the hello is complete (welcome.done)");
-                self.welcome_done.send_replace(true);
+                self.welcome_done.send_replace(HelloAnswer::Done);
             }
             other => self.outbox.push_control(Message::Error(ErrorMessage {
                 code: "BAD_MESSAGE".into(),
@@ -2730,6 +2753,7 @@ mod tests {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         });
         host
     }
@@ -2872,6 +2896,7 @@ mod tests {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         });
         let again = host.outbox.take_next().expect("the request is sent again");
         let Message::RunRequest(again) = again else {
@@ -2914,6 +2939,7 @@ mod tests {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         };
         let started = std::time::Instant::now();
         let ask = tokio::spawn(requester.send_request(v2_request(run_id, ask_payload())));
