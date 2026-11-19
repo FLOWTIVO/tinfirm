@@ -19,7 +19,8 @@ It is a binary of its own, licensed under MIT like the rest of `runner/` outside
 | The runner host's `node` driver (`--vm-driver node`), which relays the driver protocol to this listener | Built, in the runner host (`runner/crates/tinfirm-runner-host/src/node.rs`), tested against this agent with its fake backend over TLS and the local socket; no VM has run through it, since this agent's execution is planned |
 | `vm-boot` reading the user data from the user-data disk | Built, in the runner host (`vm_boot.rs`), tested on files standing in for the device; not run in a real guest |
 | Metrics for the operator | Planned. The agent logs to stderr (the service manager's journal) |
-| The service units, the Ansible role, the release's signed binary | Planned |
+| The release's signed binary | Built: `tinfirm-node-agent-<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, static, on each release and on `rolling`, built beside the runner host's (`deploy/release/runner-musl.Dockerfile`) and listed in the release's `SHA256SUMS`, which is signed with the release key. No release has been made with it yet |
+| The service units, the Ansible role | Planned |
 
 ## The two processes
 
@@ -178,7 +179,7 @@ Refusals (a connection from another address, a failed or late handshake, a dropp
 
 A request has exactly `jsonrpc` (`"2.0"`), `method`, `params` and `id` (a number, or a string of at most 64 bytes), each once. Any other field is refused. `params` must be a JSON object: absent, an array, a string or `null` is refused with `-32602`. A request without `id` is a notification: the listener takes none and answers none.
 
-**Versioning.** The first request on a connection is `hello`. Every other method before it gets `-32001`. `wire` is this wire's version, 1: another is refused. `build` is each side's build id; the release sets it (`TINFIRM_BUILD_ID` at compile time, planned), else it is the crate's version. The `node` driver sends the runner host's build id, which carries a digest of its runner images after `+` (`1.0.0+images.1a2b3c4d5e6f`): the check compares releases, what comes before `+` (`release_of`), on both sides. A driver of another release is served with a warning, or refused with `peerBuild: refuse`. The answer carries the agent's build, so the driver applies its own rule (its `peerBuild`, warning by default).
+**Versioning.** The first request on a connection is `hello`. Every other method before it gets `-32001`. `wire` is this wire's version, 1: another is refused. `build` is each side's build id. The release sets the agent's at compile time (`TINFIRM_BUILD_ID`, from `deploy/release/assets.sh build-id`): the workspace's version for a release (`1.0.0`), and the workspace's version with the asset's after `+` for `rolling` (`1.0.1-SNAPSHOT+rolling-abc1234`). A build without it takes the crate's version. The `node` driver sends the runner host's build id, which carries a digest of its runner images after `+` (`1.0.0+images.1a2b3c4d5e6f`): the check compares releases, what comes before `+` (`release_of`), on both sides. A driver of another release is served with a warning, or refused with `peerBuild: refuse`. The answer carries the agent's build, so the driver applies its own rule (its `peerBuild`, warning by default).
 
 **The methods.** The driver protocol's (`ee/runner/tinfirm-runner-host/src/vm.rs`), with the same names, parameters and results, so that the runner host's `node` driver is a thin relay.
 

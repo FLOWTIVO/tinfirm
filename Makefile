@@ -95,7 +95,7 @@ smoke-image: build-image ## Build $(IMAGE):$(TAG), start it against PostgreSQL a
 deploy-host: ## Deploy to one host over SSH: make deploy-host HOST=user@host [URL=https://…] [PORT=8080]
 	deploy/compose/deploy-host.sh "$(HOST)" "$(URL)" "$(or $(PORT),8080)"
 
-release-assets: ## Static Linux runner host binaries (x86_64, aarch64) and the Compose tarball of HEAD, in dist/release-assets
+release-assets: ## Static Linux runner host and node agent binaries (x86_64, aarch64) and the Compose tarball of HEAD, in dist/release-assets
 	rm -rf $(ASSETS_DIR)
 	deploy/release/assets.sh runner-linux x86_64-unknown-linux-musl "$(VERSION)" $(ASSETS_DIR)
 	deploy/release/assets.sh runner-linux aarch64-unknown-linux-musl "$(VERSION)" $(ASSETS_DIR)

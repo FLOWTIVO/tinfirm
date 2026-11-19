@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 
-# Static Linux builds of tinfirm-runner-host (musl), for the release assets
-# tinfirm-runner-host-<version>-<target>.tar.gz, and the runner host's image. The stage
-# `binary` is the FILE alone: deploy/release/assets.sh exports it and packages it:
+# Static Linux builds of tinfirm-runner-host and tinfirm-node-agent (musl), for the release
+# assets tinfirm-runner-host-<version>-<target>.tar.gz and
+# tinfirm-node-agent-<version>-<target>.tar.gz, and the runner host's image. The stage
+# `binary` is the two FILES alone: deploy/release/assets.sh exports them and packages each:
 #
 #   docker build -f deploy/release/runner-musl.Dockerfile --target binary \
 #     --build-arg TARGET=aarch64-unknown-linux-musl --output type=local,dest=out .
@@ -10,7 +11,9 @@
 # The last stage, the default, is the image ghcr.io/flowtivo/tinfirm-runner-host (ADR-0101,
 # decision 8): the binary on Debian slim with git, for the Helm chart's runner pod, which runs
 # its sandboxes as VMs and needs no Docker. It holds no agent runtime, so it may be published;
-# TARGET follows the platform of the build (--platform) when it is not given.
+# TARGET follows the platform of the build (--platform) when it is not given. It does not
+# hold the node agent, and does not build it: the agent runs on a sandbox node as two
+# systemd services, never in the runner pod (ADR-0112, decision 4).
 #
 # Both targets cross-compile on the build platform (no emulation) with cargo-zigbuild: zig
 # is the C compiler for ring and the linker against Rust's bundled musl. The result is one
@@ -31,6 +34,12 @@
 # passes the asset's version (`rolling-<sha7>` for rolling, the version for a release).
 # `--version` shows it next to the workspace's version; hello.runnerVersion stays the
 # workspace's version alone (ADR-0109).
+#
+# TINFIRM_BUILD_ID, empty by default, is the node agent's build id (its `--version` and the
+# `build` of its wire's `hello`, ADR-0112): assets.sh passes `assets.sh build-id`, the
+# workspace's version, then `+` and the asset's version when that differs (a rolling build).
+# Empty, the agent takes the crate's version. Both sides of the wire compare what comes
+# before `+`, which is the workspace's version either way, as in the runner host's build id.
 ARG CACHE_SCOPE=pr
 
 # ---- 1. Toolchain: Rust, the two musl targets, zig, cargo-zigbuild ----------------------
@@ -96,9 +105,53 @@ RUN --mount=type=cache,id=tinfirm-cargo-registry-${CACHE_SCOPE},target=/usr/loca
       *) echo "expected a static $machine executable" >&2; exit 1 ;; \
     esac
 
-# ---- 3. The binary alone, for --output type=local ---------------------------------------
+# ---- 2b. Build the node agent ------------------------------------------------------------
+# A cargo run of its own, with `-p tinfirm-node-agent` alone, so that the agent is built with
+# the features of its own dependencies, not those the runner host's would unify into it
+# (ADR-0112, decision 4: a small binary of its own). The same toolchain, workspace, lock and
+# cache mounts as `build`, and the same check that the result is static. Only `binary` needs
+# this stage; the image does not build it.
+FROM toolchain AS node-agent
+ARG TARGET
+ARG CACHE_SCOPE
+ARG TARGETARCH
+ARG TINFIRM_BUILD_ID=
+WORKDIR /src
+COPY protocol/ protocol/
+COPY runner/ runner/
+COPY ee/runner/ ee/runner/
+WORKDIR /src/runner
+# An empty TINFIRM_BUILD_ID is unset, not passed: the agent reads the variable at compile
+# time, and an empty one would be its build id.
+RUN --mount=type=cache,id=tinfirm-cargo-registry-${CACHE_SCOPE},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=tinfirm-runner-musl-target-${CACHE_SCOPE},target=/src/runner/target,sharing=locked \
+    set -eu; \
+    if [ -z "${TARGET:-}" ]; then \
+      case "$TARGETARCH" in \
+        amd64) TARGET=x86_64-unknown-linux-musl ;; \
+        arm64) TARGET=aarch64-unknown-linux-musl ;; \
+        *) echo "no TARGET, and no musl target for the platform '$TARGETARCH'" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    case "$TARGET" in \
+      x86_64-unknown-linux-musl) machine=x86-64 ;; \
+      aarch64-unknown-linux-musl) machine=aarch64 ;; \
+      *) echo "TARGET must be x86_64-unknown-linux-musl or aarch64-unknown-linux-musl, not '$TARGET'" >&2; exit 1 ;; \
+    esac; \
+    if [ -z "${TINFIRM_BUILD_ID:-}" ]; then unset TINFIRM_BUILD_ID; fi; \
+    cargo zigbuild --release --locked --target "$TARGET" -p tinfirm-node-agent; \
+    install -D -m 755 "target/$TARGET/release/tinfirm-node-agent" /out/tinfirm-node-agent; \
+    info="$(file -b /out/tinfirm-node-agent)"; \
+    echo "tinfirm-node-agent for $TARGET: $info"; \
+    case "$info" in \
+      *"$machine"*"statically linked"* | *"$machine"*"static-pie linked"*) ;; \
+      *) echo "expected a static $machine executable" >&2; exit 1 ;; \
+    esac
+
+# ---- 3. The binaries alone, for --output type=local -------------------------------------
 FROM scratch AS binary
 COPY --from=build /out/tinfirm-runner-host /tinfirm-runner-host
+COPY --from=node-agent /out/tinfirm-node-agent /tinfirm-node-agent
 
 # ---- 4. The image: the binary, git and the CA certificates -------------------------------
 # git for the clones and mirrors, ca-certificates for the server's and the providers' TLS

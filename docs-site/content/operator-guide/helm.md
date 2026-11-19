@@ -363,7 +363,7 @@ The pod is then a control host: it holds the credentials and runs no agent code.
 
 Prepare:
 
-- the sandbox nodes, each with the node agent, its templates and the VM image of the same release as the chart;
+- the sandbox nodes, each with the node agent, its templates and the VM image of the same release as the chart. The node agent is the archive `tinfirm-node-agent-<version>-<target>.tar.gz` of that release, checked against its signed `SHA256SUMS` as the runner host's ([Install and run runner hosts](runner-hosts.md#install));
 - the pod's client certificate and key: `tinfirm-node-agent identity --cert client.crt --key client.key` writes them (DER) and prints the certificate's SHA-256, which each node's listener names as `tls.clientSha256`;
 - each node's certificate's SHA-256: `tinfirm-node-agent fingerprint --cert node.crt`;
 - the network: the pod reaches each node at its agent's TLS port (`tls.listen`) and at the ports where the node publishes the VMs' bridges (its `network.firstPort` to `firstPort + maxVms - 1`), and each node's `network.controlHost` is the address it sees the pod's connections come from. A node lets in the published ports from that one address alone, so the cluster's pods must leave through one address, such as a NAT gateway or an egress IP.

@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Builds, packages and publishes the GitHub Release assets of one Tinfirm revision: the
-# runner host binaries and deploy/compose (docs/operations/auto-deploy.md). The reusable
+# runner host binaries, the node agent's (ADR-0112) and deploy/compose
+# (docs/operations/auto-deploy.md). The reusable
 # workflow .github/workflows/runner-artifacts.yml runs it for the rolling prerelease
 # (every push to main) and for versioned releases; `make release-assets` runs the Linux
 # part locally.
 #
 #   assets.sh version <release-tag>                        rolling-<sha7> for `rolling`, x.y.z for vx.y.z
 #   assets.sh subject [<commit>]                           one-line subject (a merge: the PR title)
-#   assets.sh runner-linux <target> <version> <outdir>     static musl build in Docker, packaged
-#   assets.sh package <target> <version> <binary> <outdir> package a binary built on this host
+#   assets.sh build-id <version>                           the node agent's TINFIRM_BUILD_ID
+#   assets.sh runner-linux <target> <version> <outdir>     static musl builds in Docker of the
+#                                                          runner host and the node agent, packaged
+#   assets.sh package <target> <version> <binary> <outdir> package a binary built on this host:
+#                                                          tinfirm-runner-host or tinfirm-node-agent
+#                                                          by its file name (.exe on Windows)
 #   assets.sh compose <version> <outdir>                   deploy/compose of HEAD, never a .env
 #   assets.sh sums <dir>                                   REVISION (HEAD) and SHA256SUMS
 #   assets.sh sign-sums <dir> <public key>                 SHA256SUMS.sig and SHA256SUMS.sigstore.json
@@ -23,6 +28,10 @@
 # Assets, with the same names in `rolling` and in versioned releases:
 #   tinfirm-runner-host-<version>-<target>.tar.gz   .zip for Windows; one directory: the binary,
 #                                                    LICENSE, ee/LICENSE and THIRD-PARTY-LICENSES.txt
+#   tinfirm-node-agent-<version>-<target>.tar.gz    the two Linux musl targets only (it runs on a
+#                                                    sandbox node with KVM); one directory: the
+#                                                    binary, LICENSE and THIRD-PARTY-LICENSES.txt
+#                                                    (MIT alone: it compiles in nothing of ee/)
 #   tinfirm-compose-<version>.tar.gz                one directory with deploy/compose and LICENSE
 #   REVISION                                         the full commit SHA, one line
 #   SHA256SUMS                                       `sha256sum` format, over every other asset
@@ -100,23 +109,45 @@ cmd_subject() {
   printf '%s\n' "$subject" | tr -d '\000-\011\013-\037\177'
 }
 
+# The program is the binary's file name: tinfirm-runner-host or tinfirm-node-agent, with
+# .exe on Windows. Any other name is refused, so that an archive is never named after a stray
+# file.
 cmd_package() {
   local target="${1:?target}" version="${2:?version}" binary="${3:?binary}" outdir="${4:?outdir}"
-  local name="tinfirm-runner-host-${version}-${target}" out stage exe=tinfirm-runner-host
+  local program name out stage exe
   [ -f "$binary" ] || die "no binary at $binary"
+  program="$(basename "$binary")"
+  program="${program%.exe}"
+  case "$program" in
+    tinfirm-runner-host) ;;
+    tinfirm-node-agent)
+      case "$target" in
+        x86_64-unknown-linux-musl | aarch64-unknown-linux-musl) ;;
+        *) die "the node agent is released for the Linux musl targets only, not '$target'" ;;
+      esac ;;
+    *) die "package takes tinfirm-runner-host or tinfirm-node-agent, not '$(basename "$binary")'" ;;
+  esac
+  name="${program}-${version}-${target}"
+  exe="$program"
   out="$(abs_dir "$outdir")"
   stage="$(mktemp -d)"
   mkdir "$stage/$name"
-  case "$target" in *-windows-*) exe=tinfirm-runner-host.exe ;; esac
+  case "$target" in *-windows-*) exe="$program.exe" ;; esac
   cp "$binary" "$stage/$name/$exe"
   chmod 755 "$stage/$name/$exe"
   # The licence and the notices of the crates the binary is built with (ADR-0082), the same
-  # for every target: runner/THIRD-PARTY-LICENSES.txt, which CI keeps as Cargo.lock gives it.
+  # for every target and both programs: runner/THIRD-PARTY-LICENSES.txt, which CI keeps as
+  # Cargo.lock gives it. cargo-about reads the whole workspace, so it lists the node agent's
+  # crates too.
   cp "$ROOT/LICENSE" "$ROOT/runner/THIRD-PARTY-LICENSES.txt" "$stage/$name/"
-  # The binary holds the paid code of ee/runner (ADR-0100, ADR-0114), under ee/LICENSE.
-  mkdir "$stage/$name/ee"
-  cp "$ROOT/ee/LICENSE" "$stage/$name/ee/LICENSE"
-  chmod 644 "$stage/$name/LICENSE" "$stage/$name/THIRD-PARTY-LICENSES.txt" "$stage/$name/ee/LICENSE"
+  chmod 644 "$stage/$name/LICENSE" "$stage/$name/THIRD-PARTY-LICENSES.txt"
+  # The runner host holds the paid code of ee/runner (ADR-0100, ADR-0114), under ee/LICENSE.
+  # The node agent links no other crate of the workspace and nothing of ee/: MIT alone.
+  if [ "$program" = tinfirm-runner-host ]; then
+    mkdir "$stage/$name/ee"
+    cp "$ROOT/ee/LICENSE" "$stage/$name/ee/LICENSE"
+    chmod 644 "$stage/$name/ee/LICENSE"
+  fi
   case "$target" in
     *-windows-*)
       rm -f "$out/$name.zip"
@@ -133,23 +164,59 @@ cmd_package() {
   rm -rf "$stage"
 }
 
+# The node agent's build id (TINFIRM_BUILD_ID at compile time, ADR-0112): the workspace's
+# version in runner/Cargo.toml, which in a release is the release's version (set-version.sh,
+# cargo:runner), then `+` and the asset's version as build metadata when that is not the
+# same: 1.0.0 for v1.0.0, 1.0.1-SNAPSHOT+rolling-abc1234 for rolling. The runner host's build
+# id is the workspace's version, `+images.` and a digest. Both sides of the node wire compare
+# what comes before the first `+` (release_of), so a node agent and a runner host of one
+# release see one release, and of two releases two.
+cmd_build_id() {
+  local version="${1:?usage: assets.sh build-id <version>}" workspace
+  # The first `version = "..."` of [workspace.package], as set-version.sh reads it.
+  workspace="$(awk '
+    /^\[/ { in_pkg = ($0 ~ /^\[workspace\.package\][[:space:]]*$/); next }
+    in_pkg && /^version[[:space:]]*=[[:space:]]*"[^"]*"/ {
+      sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+    }' "$ROOT/runner/Cargo.toml")"
+  [ -n "$workspace" ] || die "no version in [workspace.package] of runner/Cargo.toml"
+  if [ "$version" = "$workspace" ]; then
+    echo "$workspace"
+    return
+  fi
+  # A release's asset version is its version, which set-version.sh wrote into the workspace:
+  # one that differs is a checkout the release did not version, whose binaries would report
+  # another release than their assets' names.
+  case "$version" in
+    [0-9]*) die "the asset version $version is a release's, but runner/Cargo.toml says $workspace" ;;
+  esac
+  # Build metadata: identifiers of [0-9A-Za-z-], separated by dots (semantic versioning).
+  [[ $version =~ ^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$ ]] ||
+    die "'$version' cannot be the build metadata of a build id: [0-9A-Za-z-] only, dot-separated"
+  echo "${workspace}+${version}"
+}
+
 cmd_runner_linux() {
-  local target="${1:?target}" version="${2:?version}" outdir="${3:?outdir}" work
+  local target="${1:?target}" version="${2:?version}" outdir="${3:?outdir}" work build_id
   case "$target" in
     x86_64-unknown-linux-musl | aarch64-unknown-linux-musl) ;;
     *) die "runner-linux builds x86_64-unknown-linux-musl or aarch64-unknown-linux-musl, not '$target'" ;;
   esac
+  build_id="$(cmd_build_id "$version")"
   work="$(mktemp -d)"
   # The daemon's own builder (as in ci.yml), so the cache mounts persist between builds.
   # CACHE_SCOPE: the suffix of the Dockerfile's cache ids, `main` from runner-artifacts.yml
   # for main and the release branches, else `pr` (runner-musl.Dockerfile).
   # TINFIRM_RUNNER_BUILD: the asset's version, which `--version` shows next to the
   # workspace's (`0.1.0-SNAPSHOT (rolling-abc1234)`; ADR-0109).
+  # TINFIRM_BUILD_ID: the node agent's build id (cmd_build_id).
   docker build --progress=plain -f "$ROOT/deploy/release/runner-musl.Dockerfile" --target binary \
     --build-arg "TARGET=$target" --build-arg "CACHE_SCOPE=${CACHE_SCOPE:-pr}" \
     --build-arg "TINFIRM_RUNNER_BUILD=$version" \
+    --build-arg "TINFIRM_BUILD_ID=$build_id" \
     --output "type=local,dest=$work" "$ROOT" >&2
   cmd_package "$target" "$version" "$work/tinfirm-runner-host" "$outdir"
+  cmd_package "$target" "$version" "$work/tinfirm-node-agent" "$outdir"
   rm -rf "$work"
 }
 
@@ -349,7 +416,7 @@ release, has no version and no support; use a versioned release for anything you
 - Commit: [\`$short\`]($server/$GH_REPO/commit/$rev) $subject
 - Server image: \`ghcr.io/flowtivo/tinfirm-server:sha-$rev\`
 ${run_url:+- Build: $run_url
-}- Assets: the runner host binaries, \`deploy/compose\` as \`tinfirm-compose-rolling-$short.tar.gz\`,
+}- Assets: the runner host binaries, the node agent's (Linux), \`deploy/compose\` as \`tinfirm-compose-rolling-$short.tar.gz\`,
   \`REVISION\` (the commit), \`SHA256SUMS\` and, when the run signed it, its signature
   \`SHA256SUMS.sig\` by the rolling key (\`deploy/compose/auto-deploy/cosign-rolling.pub\`, not
   the release key). Verify the signature, then the downloads with
@@ -393,6 +460,7 @@ cmd="${1:-}"
 [ $# -gt 0 ] && shift
 case "$cmd" in
   version) cmd_version "$@" ;;
+  build-id) cmd_build_id "$@" ;;
   subject) cmd_subject "$@" ;;
   runner-linux) cmd_runner_linux "$@" ;;
   package) cmd_package "$@" ;;

@@ -6,8 +6,8 @@ name: CI
 # Under `workflow_call` the event name is the CALLER's (`workflow_dispatch`), so no gate
 # job may branch on it. The two that do, `publish` and `rolling`, must NOT run under the
 # release gate: after a push to main they publish that commit, the server image
-# (sha-<sha> and `main`) and the rolling prerelease with the runner host binaries and the
-# Compose files, which hosts that follow rolling deploy from
+# (sha-<sha> and `main`) and the rolling prerelease with the runner host binaries, the node
+# agent's and the Compose files, which hosts that follow rolling deploy from
 # (docs/operations/auto-deploy.md).
 #
 # Runners: every job runs on the runner label in the repository variable CI_RUNNER
@@ -566,10 +566,14 @@ jobs:
   # commit for hosts that deploy main (docs/operations/auto-deploy.md):
   #   publish  the server image ghcr.io/flowtivo/tinfirm-server:sha-<sha>, and `main`, and
   #            the chart oci://ghcr.io/flowtivo/charts/tinfirm:0.0.0-sha-<sha> (ADR-0080);
-  #   rolling  the rolling prerelease with the runner host binaries and the Compose files
-  #            (runner-artifacts.yml), after the image: hosts that see the new prerelease
-  #            pull sha-<sha> right away.
-  # Releases keep their own images and assets (release.yml).
+  #   rolling  the rolling prerelease with the runner host binaries, the node agent's and
+  #            the Compose files (runner-artifacts.yml), after the image: hosts that see the
+  #            new prerelease pull sha-<sha> right away.
+  # Releases keep their own images and assets (release.yml). No pull-request job builds the
+  # release's static binaries (runner-musl.Dockerfile, `binary`): `runner` checks and tests
+  # the whole workspace, the node agent included, on glibc, and hadolint lints the
+  # Dockerfile. `rolling` is the first build the release's way, at every push to main, so a
+  # release is never the first; a failed `rolling` shows it on main before any release.
   #
   # Both are skipped under the release gate (workflow_call), where the event is the caller's
   # `workflow_dispatch`. release.yml still grants their permissions, because GitHub

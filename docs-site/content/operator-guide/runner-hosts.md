@@ -31,8 +31,12 @@ Each Tinfirm release carries the binary for these platforms on its [GitHub Relea
 | `tinfirm-runner-host-<version>-aarch64-unknown-linux-musl.tar.gz` | Linux arm64, static |
 | `tinfirm-runner-host-<version>-aarch64-apple-darwin.tar.gz` | macOS on Apple silicon |
 | `tinfirm-runner-host-<version>-x86_64-pc-windows-msvc.zip` | Windows: planned |
+| `tinfirm-node-agent-<version>-x86_64-unknown-linux-musl.tar.gz` | The node agent of a sandbox node, Linux x86_64, static |
+| `tinfirm-node-agent-<version>-aarch64-unknown-linux-musl.tar.gz` | The node agent of a sandbox node, Linux arm64, static |
 
-`<version>` is `x.y.z` for a release `vx.y.z`, such as `1.0.0`, and `rolling-<short sha>` for `rolling`. Only the runner host is published, as these archives and as the image `ghcr.io/flowtivo/tinfirm-runner-host` (`:v1.0.0` for v1.0.0); the runner images, which contain Claude Code, are built on your machine and never pushed to a registry.
+`<version>` is `x.y.z` for a release `vx.y.z`, such as `1.0.0`, and `rolling-<short sha>` for `rolling`. Only the runner host and the node agent are published: the runner host as these archives and as the image `ghcr.io/flowtivo/tinfirm-runner-host` (`:v1.0.0` for v1.0.0), the node agent as its archives alone. The runner images, which contain Claude Code, are built on your machine and never pushed to a registry.
+
+The node agent runs on the sandbox nodes of a control host whose VMs run on your own machines ([With sandbox nodes](helm.md#with-sandbox-nodes)), not on a runner host. Install it from the same release as the runner host, which checks the agent's release when it connects. Download and check its archive as the runner host's below, with `tinfirm-node-agent` in place of `tinfirm-runner-host` and a Linux target; its archive holds the binary, its licence and the licences of the crates it is built with. The node agent cannot run VMs yet: its service units and their setup are planned.
 
 On Kubernetes, the Helm chart can run a company host for you, as a pod whose sandboxes are VMs, with no machine of its own and no registration in the app: [The runner pod](helm.md#the-runner-pod).
 
