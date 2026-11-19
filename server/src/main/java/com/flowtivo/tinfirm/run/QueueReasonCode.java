@@ -23,6 +23,9 @@ package com.flowtivo.tinfirm.run;
  * Package 4 adds {@code TRIGGER_PAUSED}, the conversation's step: a paused trigger's conversations take no turn until
  * it is resumed (the package 4 contract, §5.11 and §11). The skills library (ADR-0064) adds {@code NO_HOST_FOR_SKILLS},
  * a host's step: the agent has skills and no connected host that could take the run lists {@code run.skills}.
+ * ADR-0116 adds {@code NO_HOST_FOR_APP_TOKENS}, a host's step after it: a repository's binding is on a GitHub App's
+ * installation, and no connected host that could take the run lists {@code run.git.refresh} and
+ * {@code run.git.revoke}.
  * Automatic retries (ADR-0073) add {@code RETRY_SCHEDULED}, before every check: an automatic retry of a turn that
  * failed for a reason that may pass waits until {@code retryAt}, its number of how many in {@code used} and
  * {@code limit}; the dispatcher does not look at it before.
@@ -31,6 +34,6 @@ public enum QueueReasonCode {
     COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE,
     MODEL_ACCESS_UNAVAILABLE,
     NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL,
-    PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, RETRY_SCHEDULED,
+    PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, NO_HOST_FOR_APP_TOKENS, RETRY_SCHEDULED,
     OTHER
 }

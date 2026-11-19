@@ -47,7 +47,8 @@ describe('gitResult', () => {
 describe('revokedNote', () => {
   const revoked = {
     reason: 'RECONNECT_COMPANY',
-    message: "Tinfirm revoked this run's access to shop-web: the shared credential CI bot was disabled.",
+    message:
+      "Tinfirm revoked this run's access to shop-web: the shared credential CI bot was disabled.",
     revokedAt: '2026-11-19T10:00:00Z',
     hostTold: true,
   };

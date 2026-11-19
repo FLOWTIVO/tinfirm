@@ -160,6 +160,16 @@ public enum ProblemCode {
     DUPLICATE_GRANT,
     /** 409: the system has a credential of this name, ignoring case (ADR-0072). */
     DUPLICATE_CREDENTIAL_NAME,
+    /** 400: GitHub refused the App's id and key, or does not know the installation for the App (ADR-0116). */
+    GITHUB_APP_REFUSED,
+    /** 409: credentials of kind {@code APP} remain on the system, whose App cannot go before them (ADR-0116). */
+    GITHUB_APP_IN_USE,
+    /** 409: the {@code GITHUB} system has no GitHub App, which an installation's credential needs (ADR-0116). */
+    GITHUB_APP_REQUIRED,
+    /** 409: a credential of the system is that installation of its GitHub App already (ADR-0116). */
+    DUPLICATE_INSTALLATION,
+    /** 502: Tinfirm could not ask GitHub for the App's installations (ADR-0116). */
+    GITHUB_UNREACHABLE,
     /**
      * 409: the conversation can never run as its person's settings stand: no gateway, an inactive payer, a subscription
      * gone ({@code details.reason}, package 2's refusal; the package 3 contract, §5.7).

@@ -37,6 +37,7 @@ import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 import com.flowtivo.tinfirm.system.CallResult;
 import com.flowtivo.tinfirm.system.ChatSystems;
+import com.flowtivo.tinfirm.system.GitHubApps;
 import com.flowtivo.tinfirm.system.OAuthTokens;
 import com.flowtivo.tinfirm.system.SystemCalls;
 import com.flowtivo.tinfirm.system.SystemInfo;
@@ -75,7 +76,7 @@ class AccountServiceTest {
             mock(AccountSecrets.class), mock(Grants.class), principals, systems, calls, mock(CompanyAccessGuard.class),
             refusals, mock(AuditLog.class), mock(ApplicationEventPublisher.class), mock(AccountMapper.class),
             mock(AccountRevocations.class), mock(SignInVerifiers.class), mock(PlatformTransactionManager.class),
-            new TimeSource(Clock.systemUTC()), mock(ChatSystems.class));
+            new TimeSource(Clock.systemUTC()), mock(ChatSystems.class), mock(GitHubApps.class));
 
     private final SystemInfo atA = new SystemInfo(SYSTEM, COMPANY, "Wiki", "wiki", SystemKind.MCP,
             "https://a.test/mcp", null, null, true);

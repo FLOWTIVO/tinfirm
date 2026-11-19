@@ -22,6 +22,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.flowtivo.tinfirm.account.AccountInfo;
+import com.flowtivo.tinfirm.account.Accounts;
 import com.flowtivo.tinfirm.account.GrantInfo;
 import com.flowtivo.tinfirm.agent.AgentInfo;
 import com.flowtivo.tinfirm.agent.EffectiveSettings;
@@ -105,6 +107,8 @@ class TurnSourceImpl implements TurnSource {
 
     private final ConversationHolds holds;
 
+    private final Accounts accounts;
+
     TurnSourceImpl(ConversationStore store, WorkspaceService workspace, ConversationBindings bindings,
             BindingTexts texts, Principals principals, Systems systems, RunReads runs,
             SystemTransactions transactions, ObjectProvider<TurnTools> tools,
@@ -112,7 +116,8 @@ class TurnSourceImpl implements TurnSource {
             ObjectProvider<PromptSection.Files> files, ObjectProvider<PromptSection.Outputs> outputs,
             DecisionStore decisions, TriggerPorts triggers,
             ObjectProvider<com.flowtivo.tinfirm.conversation.PlacePrompts> places, MemoryPrompt memory,
-            ConversationHolds holds) {
+            ConversationHolds holds, Accounts accounts) {
+        this.accounts = accounts;
         this.holds = holds;
         this.memory = memory;
         this.triggers = triggers;
@@ -159,6 +164,7 @@ class TurnSourceImpl implements TurnSource {
         List<ConversationWorkspace.Repository> repositories = resolved(conversation, settings, turn.runId());
         Set<UUID> holders = new HashSet<>();
         Set<String> cards = new LinkedHashSet<>();
+        boolean appTokens = false;
         for (ConversationWorkspace.Repository repository : repositories) {
             BindingInfo binding = repository.binding();
             if (binding == null || binding.waiting()) {
@@ -170,12 +176,16 @@ class TurnSourceImpl implements TurnSource {
                 if (holder != null) {
                     holders.add(holder);
                 }
+                // ADR-0116, decision 8: a run that holds an App installation's tokens needs a host that renews them.
+                appTokens |= binding.accountId() != null && accounts.find(conversation.companyId(), binding.accountId())
+                    .filter(account -> account.kind() == AccountInfo.Kind.APP)
+                    .isPresent();
             }
         }
         if (!cards.isEmpty()) {
             return new TurnPlan.AccountRequired(String.join(" ", cards));
         }
-        return new TurnPlan.Ready(holders);
+        return new TurnPlan.Ready(holders, appTokens);
     }
 
     /**
@@ -328,12 +338,19 @@ class TurnSourceImpl implements TurnSource {
             .filter(BindingInfo::bound)
             .toList());
         List<Workspace> workspaces = new ArrayList<>();
+        // ADR-0116: an App installation's binding mints once for all its repositories of the run, one token per access.
+        Map<UUID, ConversationBindings.BindingUse> minted = new HashMap<>();
         for (ConversationWorkspace.Repository repository : prepared.repositories()) {
             BindingInfo binding = repository.binding();
             if (binding == null || !binding.bound()) {
                 return notReady(companyId, binding, repository);
             }
-            ConversationBindings.BindingUse use = bindings.use(companyId, binding.id(), "run:" + turn.runId());
+            ConversationBindings.BindingUse use = minted.containsKey(binding.id()) ? minted.get(binding.id())
+                    : bindings.use(companyId, binding.id(), "run:" + turn.runId(), scope(binding,
+                            prepared.repositories()));
+            if (use instanceof ConversationBindings.BindingUse.AppTokens) {
+                minted.put(binding.id(), use);
+            }
             if (use instanceof ConversationBindings.BindingUse.Held held) {
                 // D5: a kill switch went on since the plan; the dispatcher's next pass says which.
                 return held.hold() == ConversationBindings.Hold.TRIGGER_PAUSED
@@ -346,6 +363,23 @@ class TurnSourceImpl implements TurnSource {
                         repository.systemId()));
                 return new TurnContent.Later("Tinfirm could not get a token for " + system + " right now; the turn "
                         + "is tried again shortly.");
+            }
+            if (use instanceof ConversationBindings.BindingUse.NotCovered notCovered) {
+                // ADR-0116, decision 7: an admin installs the App there, and the person retries.
+                return new TurnContent.NotReady(new TurnPlan.Cancel(notCovered.message() + "."));
+            }
+            if (use instanceof ConversationBindings.BindingUse.AppTokens app) {
+                requireCarried(placement, turn.payerPrincipalId(), List.of(app.binding()));
+                Accounts.RunGitToken.Minted token = Objects.requireNonNull(app.tokens().get(repository.repositoryId()));
+                boolean readOnly = repository.readOnly() || app.access() == GrantInfo.Access.READ;
+                ReadOnlyCause cause = repository.readOnlyCause() != null ? repository.readOnlyCause()
+                        : readOnly ? ReadOnlyCause.GRANT : null;
+                workspaces.add(new Workspace(repository.repositoryId(), repository.systemId(), binding.id(),
+                        repository.name(), repository.url(), repository.defaultBranch(), readOnly, cause,
+                        new RunnerMessages.GitCredentials(gitUsername(SystemKind.GITHUB), token.token(),
+                                token.expiresAt().toString(), mirrorKey(companyId, app.account().id())),
+                        authorName, authorEmail));
+                continue;
             }
             if (!(use instanceof ConversationBindings.BindingUse.Token token)) {
                 return notReady(companyId, use.binding(), repository);
@@ -380,6 +414,33 @@ class TurnSourceImpl implements TurnSource {
                 turnTools.size() > TurnContent.Content.MAX_TOOLS
                         ? turnTools.subList(0, TurnContent.Content.MAX_TOOLS) : turnTools,
                 null, grantedHosts, turnAttachments);
+    }
+
+    /** The repositories of the run that the binding's account clones, for an App installation's tokens. */
+    private static ConversationBindings.GitScope scope(BindingInfo binding,
+            List<ConversationWorkspace.Repository> repositories) {
+        return new ConversationBindings.GitScope(repositories.stream()
+            .filter(repository -> repository.binding() != null && repository.binding().id().equals(binding.id()))
+            .map(repository -> new ConversationBindings.GitRepository(repository.repositoryId(), repository.url(),
+                    repository.readOnly()))
+            .toList());
+    }
+
+    /**
+     * ADR-0116, decision 8: the stable key of the credential an App's token was minted for, which names the runner
+     * host's mirror in place of the token: lowercase hex of SHA-256 over {@code tinfirm-git-mirror:v1:}, the company's
+     * id, {@code :} and the credential's id. The same for every run and token of the credential, never derived from a
+     * token.
+     */
+    static String mirrorKey(UUID companyId, UUID accountId) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(("tinfirm-git-mirror:v1:"
+                    + companyId + ":" + accountId).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest);
+        }
+        catch (java.security.NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("The JDK has no SHA-256", ex);
+        }
     }
 
     private TurnContent notReady(UUID companyId, @Nullable BindingInfo binding,

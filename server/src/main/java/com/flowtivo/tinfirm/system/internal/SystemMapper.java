@@ -60,6 +60,7 @@ interface SystemMapper {
     @Mapping(target = "webhook", ignore = true)
     @Mapping(target = "pollIntervalSeconds", ignore = true)
     @Mapping(target = "lastTest", ignore = true)
+    @Mapping(target = "githubApp", ignore = true)
     ExternalSystem toDto(SystemDetails system);
 
     SystemApp toDto(AppDetails app);

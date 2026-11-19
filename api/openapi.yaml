@@ -1781,6 +1781,130 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /api/companies/{companyId}/systems/{systemId}/github-app:
+    parameters:
+      - $ref: '#/components/parameters/CompanyId'
+      - $ref: '#/components/parameters/SystemId'
+    get:
+      tags: [Systems]
+      operationId: getSystemGitHubApp
+      summary: The GitHub App of a GITHUB system (OWNER, ADMIN)
+      description: |
+        ADR-0116: the company's own GitHub App on the system, without its private key, and how many of the company's
+        connected runner hosts cannot renew its tokens yet (`hostsWithoutAppTokens`). Problems: 404 when the system has
+        no App.
+      responses:
+        '200':
+          description: The App
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubApp' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Systems]
+      operationId: setSystemGitHubApp
+      summary: Set the GitHub App of a GITHUB system, or replace its private key (OWNER, ADMIN)
+      description: |
+        ADR-0116, decision 6. The App's id and its private key (PEM, PKCS#1 or PKCS#8, RSA). Tinfirm signs a JWT with
+        the key (RS256) and asks GitHub for the App (`GET {baseUrl}/app`); a refusal, or an App of another id, is 400
+        GITHUB_APP_REFUSED and nothing is stored. The key is kept in a managed company secret
+        (`SYSTEM_GITHUB_APP_KEY`), write-only: an admin rotates it by setting it again. Works on github.com
+        (`https://api.github.com`) and on GitHub Enterprise Server (`https://{host}/api/v3`; untested against a real
+        one). The system's OAuth app for members' sign-in is a different thing and stays as it is. Audited as
+        `system.github_app_set`, never with the key. Problems: 400 VALIDATION_FAILED; 400 SYSTEM_KIND_INVALID (not a
+        company `GITHUB` system); 400 GITHUB_APP_REFUSED; 409 SYSTEM_PAUSED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GitHubAppRequest' }
+      responses:
+        '200':
+          description: Set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubApp' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Systems]
+      operationId: removeSystemGitHubApp
+      summary: Remove the GitHub App of a GITHUB system (OWNER, ADMIN)
+      description: |
+        Removes the App and deletes its private key from the vault. Audited as `system.github_app_removed`. Problems:
+        404 when the system has no App; 409 GITHUB_APP_IN_USE while a credential of kind `APP` remains on the system
+        (`details.credentials`: their names): remove them first.
+      responses:
+        '204': { description: Removed }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/companies/{companyId}/systems/{systemId}/github-app/installations:
+    parameters:
+      - $ref: '#/components/parameters/CompanyId'
+      - $ref: '#/components/parameters/SystemId'
+    get:
+      tags: [Systems]
+      operationId: listSystemGitHubAppInstallations
+      summary: The installations of the system's GitHub App (OWNER, ADMIN)
+      description: |
+        As GitHub answers `GET {baseUrl}/app/installations` with the App's JWT, at most 1000: each with the account it
+        is installed on, its repository selection, and the credential of the system that is that installation, if
+        any. Problems: 404 when the system has no App; 502 GITHUB_UNREACHABLE when GitHub could not be asked.
+      responses:
+        '200':
+          description: The installations
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GitHubAppInstallationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+
+  /api/companies/{companyId}/systems/{systemId}/credentials/app:
+    parameters:
+      - $ref: '#/components/parameters/CompanyId'
+      - $ref: '#/components/parameters/SystemId'
+    post:
+      tags: [Credentials]
+      operationId: addSystemCredentialApp
+      summary: Add an installation of the system's GitHub App as a credential (OWNER, ADMIN)
+      description: |
+        ADR-0116, decision 7: a credential of kind `APP`, one installation of the system's GitHub App, chosen from
+        `listSystemGitHubAppInstallations`. Tinfirm asks GitHub for the installation; its login becomes the
+        credential's `login`. It is lent to groups and service accounts, disabled and removed like every credential.
+        Tinfirm mints the installation's tokens itself: for its own calls with the installation's permissions less
+        `workflows`, kept in the credential's managed secret (`SYSTEM_CREDENTIAL`) until they expire; for each run a
+        token of its own, limited to the run's repositories and to `contents` and `pull_requests`, never kept.
+        Audited as `account.connected` with the credential's name. Problems as for `addSystemCredential`; 400
+        SYSTEM_KIND_INVALID (not a `GITHUB` system); 409 GITHUB_APP_REQUIRED (the system has no App); 400
+        GITHUB_APP_REFUSED (GitHub does not know the installation for the App); 409 DUPLICATE_INSTALLATION (a
+        credential of the system is that installation already).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SystemCredentialAppCreateRequest' }
+      responses:
+        '201':
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemCredential' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /api/companies/{companyId}/systems/{systemId}/test:
     parameters:
       - $ref: '#/components/parameters/CompanyId'
@@ -7166,6 +7290,8 @@ components:
           type: string
           description: |
             Stable machine-readable error code (CONVENTIONS §6), e.g. `LAST_OWNER` or `DUPLICATE_EMAIL`, or
+            GitHub Apps (ADR-0116): `GITHUB_APP_REFUSED` (400), `GITHUB_APP_IN_USE`, `GITHUB_APP_REQUIRED` and
+            `DUPLICATE_INSTALLATION` (409), `GITHUB_UNREACHABLE` (502). Or
             `DUPLICATE_GROUP_NAME` (409, ADR-0049). Package 6's audit and retention: `AUDIT_EXPORT_TOO_LARGE` (400),
             `RETENTION_INVALID` (400), `ERASURE_NOT_ALLOWED` (409), `ON_HOLD` (409, with `holdIds`),
             `CONTENT_PURGED` (410). Package R: `IDEMPOTENCY_KEY_REUSED` (422, an `Idempotency-Key` sent before
@@ -8000,6 +8126,7 @@ components:
             (`TINFIRM_CONNECTION_INTERNAL_HOSTS`, ADR-0066), a service on the deployment's own network; false for a
             personal MCP server, which is never reached there, and for a kind without a base URL. An `MCP` server
             that receives data and is not on an internal host is shown as a third-party server
+        githubApp: { type: boolean, description: "A company GITHUB system: whether it holds a GitHub App (ADR-0116), for whoever manages it; absent otherwise" }
         pollIntervalSeconds:
           type: integer
           format: int32
@@ -8671,7 +8798,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         systemId: { type: string, format: uuid }
-        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT, LINK] }
+        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT, APP, LINK] }
         status:
           type: string
           enum: [OK, RECONNECT, ERROR]
@@ -8767,7 +8894,7 @@ components:
         id: { type: string, format: uuid }
         systemId: { type: string, format: uuid }
         name: { type: string }
-        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT], description: 'CLIENT: an OAuth client''s own credentials (an Atlassian service account''s)' }
+        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT, APP], description: 'CLIENT: an OAuth client''s own credentials (an Atlassian service account''s); APP: an installation of the system''s GitHub App (ADR-0116)' }
         status:
           type: string
           enum: [OK, RECONNECT, ERROR]
@@ -8869,6 +8996,57 @@ components:
       properties:
         clientId: { type: string, minLength: 1, maxLength: 500 }
         clientSecret: { type: string, minLength: 1, maxLength: 2000, format: password, description: Write-only }
+    GitHubAppRequest:
+      type: object
+      required: [appId, privateKey]
+      properties:
+        appId: { type: integer, format: int64, minimum: 1, description: "The App's id, from its settings page at GitHub" }
+        privateKey: { type: string, minLength: 1, maxLength: 10000, format: password, description: "The App's private key, PEM (`-----BEGIN RSA PRIVATE KEY-----`, as GitHub downloads it, or PKCS#8). Write-only" }
+    GitHubApp:
+      type: object
+      description: A GITHUB system's GitHub App (ADR-0116), without its private key
+      required: [systemId, appId, setAt, hostsConnected, hostsWithoutAppTokens, permissions]
+      properties:
+        systemId: { type: string, format: uuid }
+        appId: { type: integer, format: int64 }
+        slug: { type: string, nullable: true, description: "The App's slug, as GitHub answered when it was set" }
+        name: { type: string, nullable: true }
+        setAt: { type: string, format: date-time }
+        setByName: { type: string, nullable: true }
+        hostsConnected: { type: integer, format: int32, description: "The company's runner hosts connected now" }
+        hostsWithoutAppTokens: { type: integer, format: int32, description: "Of those, the hosts that list neither or only one of run.git.refresh and run.git.revoke: a run on an App credential never goes to them" }
+        permissions:
+          type: array
+          description: "The repository permissions to give the App at GitHub, and the ones never to give: Contents and Pull requests (read and write), Metadata (read), Issues (read and write) for the system's tools; never Workflows"
+          items:
+            type: object
+            required: [name, access]
+            properties:
+              name: { type: string, example: Contents }
+              access: { type: string, enum: [READ, WRITE, NEVER] }
+    GitHubAppInstallation:
+      type: object
+      required: [id, accountLogin, accountType, repositorySelection]
+      properties:
+        id: { type: integer, format: int64 }
+        accountLogin: { type: string }
+        accountType: { type: string, description: "`Organization` or `User`, as GitHub names it" }
+        repositorySelection: { type: string, description: "`all` or `selected`, as GitHub names it" }
+        credentialId: { type: string, format: uuid, nullable: true, description: "The system's credential that is this installation" }
+        credentialName: { type: string, nullable: true }
+    GitHubAppInstallationList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/GitHubAppInstallation' }
+    SystemCredentialAppCreateRequest:
+      type: object
+      required: [name, installationId]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100, description: 'Unique on the system, ignoring case' }
+        installationId: { type: integer, format: int64, minimum: 1 }
     SystemCredentialClientCreateRequest:
       type: object
       required: [name, clientId, clientSecret]
@@ -8919,7 +9097,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
-        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT], description: 'CLIENT: an OAuth client''s own credentials (an Atlassian service account''s)' }
+        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT, APP], description: 'CLIENT: an OAuth client''s own credentials (an Atlassian service account''s); APP: an installation of the system''s GitHub App (ADR-0116)' }
         status: { type: string, enum: [OK, RECONNECT, ERROR] }
         enabled: { type: boolean }
         login: { type: string, nullable: true }
@@ -11164,10 +11342,13 @@ components:
         RUNNER_HOST_REJECTED: the host rejected the run, which waits until `retryAt`. TRIGGER_PAUSED (package 4): the
         conversation's trigger is paused, and its turns wait until it is resumed. NO_HOST_FOR_SKILLS (ADR-0064): the
         agent has skills, and no connected runner host that may run the conversation delivers skills (`run.skills`).
+        NO_HOST_FOR_APP_TOKENS (ADR-0116): a repository of the workspace acts through an installation of a GitHub App,
+        and no connected runner host that may run the conversation renews such tokens (`run.git.refresh` with
+        `run.git.revoke`).
         RETRY_SCHEDULED (ADR-0073), before every check: an automatic retry of a turn that failed for a reason that may
         pass waits until `retryAt`, the `used`th of at most `limit` in a row (`AgentSettings.autoRetry`).
         OTHER: anything else, in `message`.
-      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, RETRY_SCHEDULED, OTHER]
+      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, NO_HOST_FOR_APP_TOKENS, RETRY_SCHEDULED, OTHER]
     QueueReason:
       type: object
       description: |
@@ -12239,7 +12420,7 @@ components:
         credentialKind:
           type: string
           nullable: true
-          enum: [TOKEN, OAUTH, CLIENT]
+          enum: [TOKEN, OAUTH, CLIENT, APP]
           description: "That credential's kind: an admin stores a new token, or signs it in again"
         credentialEnabled:
           type: boolean
@@ -13329,7 +13510,7 @@ components:
         systemId: { type: string, format: uuid }
         systemName: { type: string }
         credentialName: { type: string }
-        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT], description: 'A token is stored again; a sign-in signed in again; client credentials stored again' }
+        kind: { type: string, enum: [TOKEN, OAUTH, CLIENT, APP], description: 'A token is stored again; a sign-in signed in again; client credentials stored again; an App installation''s credential is added again' }
     DepartureAgent:
       type: object
       required: [id, name]

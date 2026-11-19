@@ -150,6 +150,9 @@ class SystemService {
 
     private final TransactionTemplate transactions;
 
+    /** The system's GitHub App (ADR-0116), looked up when used. */
+    private final ObjectProvider<GitHubAppService> gitHubApps;
+
     private final TimeSource time;
 
     private final ChatSystemsImpl chatSystems;
@@ -172,7 +175,9 @@ class SystemService {
             ApplicationEventPublisher events, SystemMapper mapper, PlatformTransactionManager transactionManager,
             TimeSource time, ChatSystemsImpl chatSystems, ChatEndpoints chatEndpoints, TinfirmProperties tinfirm,
             ObjectProvider<ChatSystemTests> chatTests, WebhookSystemsImpl webhookSystems,
-            ObjectProvider<WebhookLimits> webhookLimits, OutboundProperties outbound) {
+            ObjectProvider<WebhookLimits> webhookLimits, OutboundProperties outbound,
+            ObjectProvider<GitHubAppService> gitHubApps) {
+        this.gitHubApps = gitHubApps;
         this.outbound = outbound;
         this.webhookSystems = webhookSystems;
         this.webhookLimits = webhookLimits;
@@ -590,6 +595,7 @@ class SystemService {
         UUID companyId = system.companyId();
         accounts.systemDeleting(companyId, system.id());
         deleteClientSecret(system, system.oauthClientSecretId());
+        gitHubApps.getObject().systemDeleting(companyId, system.id());
         if (system.kind().chat()) {
             chatSystems.deleteSecrets(companyId, system.id());
         }
@@ -1459,6 +1465,8 @@ class SystemService {
                 system.accountsRequired(), system.kind().receivesData(),
                 !system.personal() && outbound.internalHost(system.baseUrl())))
             .webhook(webhook)
+            .githubApp(manages && system.kind() == SystemKind.GITHUB && !system.personal()
+                    ? gitHubApps.getObject().has(system.companyId(), system.id()) : null)
             .pollIntervalSeconds(system.kind().tracker()
                     ? (int) SystemPollsImpl.interval(system.settings()).toSeconds() : null)
             .lastTest(lastTest(system, manages, testers));

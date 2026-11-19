@@ -195,6 +195,15 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
     }
 
     /**
+     * A repository's binding is on a GitHub App's installation, and none of the connected hosts that could take the
+     * run lists {@code run.git.refresh} and {@code run.git.revoke} (ADR-0116): the run waits for a host that renews its
+     * tokens.
+     */
+    static QueueReason noHostForAppTokens(String message) {
+        return of(QueueReasonCode.NO_HOST_FOR_APP_TOKENS).withMessage(message);
+    }
+
+    /**
      * An automatic retry of a failed turn (ADR-0073) waits until {@code at}: the {@code attempt}th of at most
      * {@code attempts} in a row, in {@code used} and {@code limit}.
      */
@@ -265,6 +274,9 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
                     + "until it is resumed.";
             case NO_HOST_FOR_SKILLS -> message != null ? message : "The agent has skills, and no connected runner "
                     + "host that may run this conversation delivers skills yet.";
+            case NO_HOST_FOR_APP_TOKENS -> message != null ? message : "A repository of this conversation acts "
+                    + "through a GitHub App's installation, and no connected runner host that may run it renews its "
+                    + "tokens yet.";
             // The time is retryAt, for the reader's own clock and locale, as BUDGET_SPENT's.
             case RETRY_SCHEDULED -> "The previous turn failed for a reason that may pass; Tinfirm retries it by itself"
                     + (used != null && limit != null ? " (automatic retry " + used + " of " + limit + ")" : "") + ".";

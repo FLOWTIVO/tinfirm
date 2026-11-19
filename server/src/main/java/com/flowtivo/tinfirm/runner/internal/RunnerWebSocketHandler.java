@@ -275,7 +275,8 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
         registry.sendTo(out, new RunnerMessages.Welcome(host.protocolVersion(), host.machineId(),
                 placements.isEmpty() ? NO_COMPANY : placements.getFirst().company(), serverVersion,
                 Math.max(1, properties.heartbeatInterval().toSeconds()),
-                Math.max(1, properties.leaseTtl().toSeconds())));
+                Math.max(1, properties.leaseTtl().toSeconds()),
+                host.protocolVersion() == RunnerMessages.PROTOCOL_V2 ? RunnerMessages.SERVER_FEATURES : null));
         registry.sendTo(out, config);
         if (outcome.get().credentialsRefused()) {
             // M5: only a personal host holds credentials; a company host runs budget-paid runs only.

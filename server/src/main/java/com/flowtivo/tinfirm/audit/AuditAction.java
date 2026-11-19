@@ -433,6 +433,13 @@ public enum AuditAction {
      * ({@code clientSecret}), {@code scopes}, and {@code registered} when Tinfirm registered itself; never the secret.
      */
     SYSTEM_APP_CHANGED("system.app_changed"),
+    /**
+     * A {@code GITHUB} system's GitHub App was set, or its key replaced (ADR-0116): {@code appId}, {@code slug},
+     * {@code keyReplaced}, {@code previousAppId}; never the key.
+     */
+    SYSTEM_GITHUB_APP_SET("system.github_app_set"),
+    /** A {@code GITHUB} system's GitHub App was removed with its key (ADR-0116): {@code appId}. */
+    SYSTEM_GITHUB_APP_REMOVED("system.github_app_removed"),
     /** An MCP server's catalogue was read again: the tools {@code added}, {@code removed} and {@code unconfirmed}. */
     SYSTEM_TOOLS_REFRESHED("system.tools_refreshed"),
     /** An MCP tool's effect was confirmed: {@code tool}, {@code effect}. */

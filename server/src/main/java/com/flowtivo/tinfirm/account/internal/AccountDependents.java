@@ -148,6 +148,17 @@ class AccountDependents implements SystemAccounts, PrincipalDependents, GroupDep
 
     @Override
     @Transactional(readOnly = true)
+    public List<AppCredential> appCredentials(UUID companyId, UUID systemId) {
+        return store.credentialsOn(companyId, systemId).stream()
+            .filter(account -> account.kind() == AccountInfo.Kind.APP && account.externalId() != null
+                    && account.externalId().startsWith("installation:"))
+            .map(account -> new AppCredential(account.id(), java.util.Objects.requireNonNull(account.name()),
+                    Long.parseLong(account.externalId().substring("installation:".length()))))
+            .toList();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
     public Optional<UUID> onlyUsableCredential(UUID companyId, UUID systemId) {
         List<AccountStore.AccountRow> usable = store.credentialsOn(companyId, systemId).stream()
             .filter(account -> account.enabled() && account.status() == AccountInfo.Status.OK)

@@ -235,4 +235,11 @@ public class TestTurns implements TurnSource, TurnEnded, RunRequests {
                 : RunnerMessages.RunRequestAck.rejected(run.runId(), requestId, "UNKNOWN_TOOL",
                         "This run has no server-executed tools.");
     }
+
+    @Override
+    public GitTokenAnswer gitTokens(ActiveRun run, List<GitTokenRepository> repositories) {
+        RunRequests real = real(RunRequests.class);
+        return !scripted(run.conversationId()) && real != null ? real.gitTokens(run, repositories)
+                : RunRequests.super.gitTokens(run, repositories);
+    }
 }

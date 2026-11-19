@@ -49,6 +49,11 @@ export type ProblemCode =
   | 'GRANT_NOT_SERVICE'
   | 'DUPLICATE_GRANT'
   | 'DUPLICATE_CREDENTIAL_NAME'
+  | 'GITHUB_APP_REFUSED'
+  | 'GITHUB_APP_IN_USE'
+  | 'GITHUB_APP_REQUIRED'
+  | 'DUPLICATE_INSTALLATION'
+  | 'GITHUB_UNREACHABLE'
   // Model access and runner hosts (package 2, §15.4)
   | 'GATEWAY_NOT_CONFIGURED'
   | 'GATEWAY_UNREACHABLE'
@@ -227,6 +232,13 @@ const CODE_MESSAGES: Record<ProblemCode, string> = {
   DUPLICATE_GRANT: 'This credential is already lent to this group.',
   DUPLICATE_CREDENTIAL_NAME:
     'The system has a credential of this name already. Names are unique on a system, ignoring case.',
+  GITHUB_APP_REFUSED:
+    'GitHub refused the App’s id and private key, or does not know the installation.',
+  GITHUB_APP_IN_USE:
+    'Installations of the App are still credentials of this system. Remove them first.',
+  GITHUB_APP_REQUIRED: 'This system has no GitHub App yet. Set it up first.',
+  DUPLICATE_INSTALLATION: 'A credential of this system is that installation already.',
+  GITHUB_UNREACHABLE: 'Tinfirm could not reach GitHub. Try again in a moment.',
   GATEWAY_NOT_CONFIGURED:
     'The company’s model gateway is not set up yet. An admin sets it up under Model access.',
   GATEWAY_UNREACHABLE: 'Tinfirm could not reach the model gateway.',

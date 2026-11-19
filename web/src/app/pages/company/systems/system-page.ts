@@ -76,6 +76,7 @@ import { ChatChannels } from './chat/chat-channels';
 import { ChatSystem } from './chat/chat-system';
 import { holdsCredentials } from './credential-labels';
 import { SystemApp } from './system-app';
+import { SystemGitHubApp } from './system-github-app';
 import { SystemCredentials } from './system-credentials';
 import { SystemDialog } from './system-dialog';
 import {
@@ -287,6 +288,7 @@ export function removalEffects(
     ChatChannels,
     ChatSystem,
     SystemApp,
+    SystemGitHubApp,
     SystemCredentials,
     SystemDialog,
     SystemRepositories,
@@ -881,6 +883,13 @@ export function removalEffects(
               [companyId]="companyId()!"
               [system]="s"
               (credentials)="credentials.set($event)"
+            />
+          }
+          @if (s.kind === 'GITHUB' && !s.personal) {
+            <app-system-github-app
+              [companyId]="companyId()!"
+              [system]="s"
+              [canManage]="canManage()"
             />
           }
           @if (kind().app) {

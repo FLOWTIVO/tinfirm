@@ -110,6 +110,8 @@ class BindingTexts {
         return switch (credential.kind()) {
             case OAUTH -> "an admin must sign the shared credential " + credential.name() + " in again";
             case CLIENT -> "an admin must store new client credentials for the shared credential " + credential.name();
+            case APP -> "an admin must check the GitHub App's installation " + credential.name()
+                    + " on the system's page";
             default -> "an admin must store a new token for the shared credential " + credential.name();
         };
     }

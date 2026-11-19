@@ -403,11 +403,31 @@ public final class RunnerMessages {
     /**
      * The answer to {@code hello}. {@code protocolVersion} is the host's version, which the server speaks on this
      * connection: required under v2, ignored by a v1 host.
+     *
+     * @param features v2: the optional features of protocol 2 this server implements ({@link #SERVER_FEATURES});
+     *                 null for a v1 host. A host that took a run back waits for {@link WelcomeDone} only when it lists
+     *                 {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116)
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Welcome(int protocolVersion, UUID runnerHostId, UUID companyId, @Nullable String serverVersion,
-            long heartbeatIntervalSeconds, long leaseTtlSeconds) implements Outbound {
+            long heartbeatIntervalSeconds, long leaseTtlSeconds, @Nullable List<String> features) implements Outbound {
+
+        public Welcome {
+            features = features != null ? List.copyOf(features) : null;
+        }
+
+        /** A welcome without features (a v1 host's). */
+        public Welcome(int protocolVersion, UUID runnerHostId, UUID companyId, @Nullable String serverVersion,
+                long heartbeatIntervalSeconds, long leaseTtlSeconds) {
+            this(protocolVersion, runnerHostId, companyId, serverVersion, heartbeatIntervalSeconds, leaseTtlSeconds,
+                    null);
+        }
     }
+
+    /** Every optional feature of protocol 2 this server implements, as {@code welcome.features} names them. */
+    public static final List<String> SERVER_FEATURES = List.of(FEATURE_RUN_STEER, FEATURE_RUN_SKILLS,
+            FEATURE_SESSION_BUNDLE, FEATURE_SANDBOX_POOL, FEATURE_SANDBOX_BRIDGE, FEATURE_SANDBOX_ELASTIC,
+            FEATURE_RUN_GIT_REVOKE, FEATURE_RUN_GIT_REFRESH);
 
     // ---- run.assign --------------------------------------------------------------------------------------------
 
@@ -756,12 +776,37 @@ public final class RunnerMessages {
     public record RequestableRepository(UUID componentId, String name, String repoUrl, boolean pendingRequest) {
     }
 
-    /** HTTPS credentials for clone and push, used only by the runner host, never inside the sandbox. */
-    public record GitCredentials(String username, String token) {
+    /**
+     * HTTPS credentials for clone and push, used only by the runner host, never inside the sandbox.
+     *
+     * @param expiresAt v2, the feature {@link #FEATURE_RUN_GIT_REFRESH} (ADR-0116): when a token a GitHub App minted
+     *                  for the run expires, RFC 3339; null for a token that lives until the run ends
+     * @param mirrorKey with {@code expiresAt}: the stable key of the credential that minted it, which names the host's
+     *                  mirror in place of the token; null otherwise
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record GitCredentials(String username, String token, @Nullable String expiresAt,
+            @Nullable String mirrorKey) {
+
+        public GitCredentials {
+            if ((expiresAt == null) != (mirrorKey == null)) {
+                throw new IllegalArgumentException("expiresAt and mirrorKey come together");
+            }
+        }
+
+        /** A token that lives until the run ends. */
+        public GitCredentials(String username, String token) {
+            this(username, token, null, null);
+        }
+
+        /** The same token without its expiry and mirror key, for a host without {@link #FEATURE_RUN_GIT_REFRESH}. */
+        public GitCredentials withoutRefresh() {
+            return new GitCredentials(username, token);
+        }
 
         @Override
         public String toString() {
-            return "GitCredentials[username=" + username + ", token=***]";
+            return "GitCredentials[username=" + username + ", token=***, expiresAt=" + expiresAt + "]";
         }
     }
 
@@ -1045,7 +1090,12 @@ public final class RunnerMessages {
         /** A server-executed tool of {@code run.assign.tools}. */
         TOOL,
         /** {@code request_network_access}: an ACCESS decision of a network host. */
-        NETWORK
+        NETWORK,
+        /**
+         * The host's own request for new git tokens of repositories whose token a GitHub App minted (ADR-0116, the
+         * feature {@link #FEATURE_RUN_GIT_REFRESH}).
+         */
+        GIT_TOKEN
     }
 
     /**
@@ -1105,7 +1155,44 @@ public final class RunnerMessages {
     }
 
     /** The payload of a {@link RunRequestAck}. */
-    public sealed interface AckPayload permits DecisionPayload, ArtifactPayload, ToolResult {
+    public sealed interface AckPayload permits DecisionPayload, ArtifactPayload, ToolResult, GitTokens {
+    }
+
+    /** {@code run.request.ack} code: a repository's token is refused for good (ADR-0116, decision 9). */
+    public static final String GIT_REVOKED = "GIT_REVOKED";
+
+    /** {@code run.request.ack} code: a kill switch holds the run's systems; ask again later. */
+    public static final String GIT_HELD = "GIT_HELD";
+
+    /** {@code run.request.ack} code: GitHub could not mint now; ask again later. */
+    public static final String GIT_UNAVAILABLE = "GIT_UNAVAILABLE";
+
+    /**
+     * DONE of a GIT_TOKEN request (ADR-0116, decision 9): every repository the request named is in exactly one of
+     * {@code git} and {@code refused}.
+     *
+     * @param refused null for none
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record GitTokens(List<GitToken> git, @Nullable List<GitRefused> refused) implements AckPayload {
+
+        public GitTokens {
+            git = List.copyOf(git);
+            refused = refused != null && !refused.isEmpty() ? List.copyOf(refused) : null;
+        }
+    }
+
+    /** A renewed git token of one repository of the run, valid until {@code expiresAt} (RFC 3339). Never log it. */
+    public record GitToken(UUID componentId, String username, String token, String expiresAt) {
+
+        @Override
+        public String toString() {
+            return "GitToken[componentId=" + componentId + ", token=***, expiresAt=" + expiresAt + "]";
+        }
+    }
+
+    /** A repository of a GIT_TOKEN request the server did not renew, with the code and the server's message. */
+    public record GitRefused(UUID componentId, String code, String message) {
     }
 
     /** PENDING: the decision the request stored. */

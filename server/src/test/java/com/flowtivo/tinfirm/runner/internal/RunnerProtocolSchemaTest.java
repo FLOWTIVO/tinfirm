@@ -645,6 +645,9 @@ class RunnerProtocolSchemaTest {
                 "resume", null, List.of(), List.of());
         List<RunnerMessages.Outbound> frames = List.of(
                 new RunnerMessages.Welcome(2, UUID.randomUUID(), UUID.randomUUID(), "0.1.0", 10, 30),
+                // ADR-0116: a server of this release names the features it implements.
+                new RunnerMessages.Welcome(2, UUID.randomUUID(), UUID.randomUUID(), "0.1.0", 10, 30,
+                        RunnerMessages.SERVER_FEATURES),
                 withTools, withoutTools, new RunnerMessages.RunCancel(runId, 1),
                 RunnerMessages.RunRequestAck.pending(runId, UUID.randomUUID(), UUID.randomUUID(), "posted"),
                 RunnerMessages.RunRequestAck.pending(runId, UUID.randomUUID(), UUID.randomUUID(), null),
@@ -670,6 +673,10 @@ class RunnerProtocolSchemaTest {
             assertThat(ProtocolSchema.violations(2, json)).as(json).isEmpty();
         }
         assertThat(codec.encode(new RunnerMessages.WelcomeDone())).isEqualTo("{\"type\":\"welcome.done\"}");
+        JsonNode welcome = JSON.readTree(codec.encode(frames.get(1)));
+        assertThat(welcome.get("features")).extracting(JsonNode::asString)
+            .contains("run.git.revoke", "run.git.refresh", "run.steer");
+        assertThat(JSON.readTree(codec.encode(frames.getFirst())).has("features")).isFalse();
         JsonNode revoke = JSON.readTree(codec.encode(frames.getLast()));
         assertThat(revoke.get("type").asString()).isEqualTo("run.git.revoke");
         assertThat(revoke.get("componentIds")).hasSize(1);
@@ -695,13 +702,13 @@ class RunnerProtocolSchemaTest {
         JsonNode noHosts = JSON.readTree(codec.encode(withoutTools)).get("allowedHosts");
         assertThat(noHosts.isArray()).isTrue();
         assertThat(noHosts).isEmpty();
-        JsonNode toolAck = JSON.readTree(codec.encode(frames.get(7)));
+        JsonNode toolAck = JSON.readTree(codec.encode(frames.get(8)));
         assertThat(toolAck.get("payload").get("isError").asBoolean()).isFalse();
         assertThat(toolAck.get("payload").get("content").get(0).get("type").asString()).isEqualTo("text");
         assertThat(toolAck.get("payload").get("structuredContent").get("count").asInt()).isEqualTo(1);
         // A v2 frame is no v1 frame: the welcome's version and the assignment's shape differ.
         assertThat(ProtocolSchema.violations(1, codec.encode(withTools))).isNotEmpty();
-        assertThat(ProtocolSchema.violations(1, codec.encode(frames.get(4)))).isNotEmpty();
+        assertThat(ProtocolSchema.violations(1, codec.encode(frames.get(5)))).isNotEmpty();
         // A v1 host is sent protocolVersion 1, which its schema allows (and the host ignores).
         assertThat(ProtocolSchema.violations(1, codec.encode(new RunnerMessages.Welcome(1, UUID.randomUUID(),
                 UUID.randomUUID(), null, 10, 30)))).isEmpty();

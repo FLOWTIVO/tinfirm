@@ -133,10 +133,12 @@ function fixFor(
     case 'HOST_OFFLINE':
     case 'CREDENTIAL_POOL_FULL':
       return ownHosts;
-    // NO_HOST_FOR_SKILLS waits for a host whose runner delivers skills (ADR-0064).
+    // NO_HOST_FOR_SKILLS waits for a host whose runner delivers skills (ADR-0064), and
+    // NO_HOST_FOR_APP_TOKENS for one that renews a GitHub App's tokens (ADR-0116).
     case 'NO_HOST_FOR_CREDENTIALS':
     case 'NO_RUNNER_HOST':
     case 'NO_HOST_FOR_SKILLS':
+    case 'NO_HOST_FOR_APP_TOKENS':
       return companyHosts ?? ownHosts;
     // ADR-0113: a host that reports the level chosen for the agent, or another level for the agent.
     case 'NO_HOST_OF_LEVEL':

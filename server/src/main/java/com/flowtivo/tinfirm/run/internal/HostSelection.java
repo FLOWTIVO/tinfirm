@@ -34,8 +34,15 @@ final class HostSelection {
      * @param skills     whether its connection lists {@code run.skills} (ADR-0064)
      * @param restores   whether it restores session bundles: a company host whose connection lists
      *                   {@code session.bundle} (ADR-0097)
+     * @param appTokens  whether its connection lists {@code run.git.refresh} and {@code run.git.revoke} (ADR-0116)
      */
-    record Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills, boolean restores) {
+    record Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills, boolean restores,
+            boolean appTokens) {
+
+        /** A host that renews no App installation's token. */
+        Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills, boolean restores) {
+            this(info, configured, protocol, used, skills, restores, false);
+        }
 
         /** A host that restores no session bundle. */
         Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills) {
@@ -98,6 +105,16 @@ final class HostSelection {
      */
     static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills,
             @Nullable IsolationLevel restorersOf) {
+        return select(eligible, previousHost, needsSkills, restorersOf, false);
+    }
+
+    /**
+     * As {@link #select(List, UUID, boolean, IsolationLevel)}, for a run whose git tokens a GitHub App mints
+     * ({@code needsAppTokens}, ADR-0116, decision 8): only a host that renews them takes it, else it waits
+     * {@code NO_HOST_FOR_APP_TOKENS}.
+     */
+    static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills,
+            @Nullable IsolationLevel restorersOf, boolean needsAppTokens) {
         if (eligible.isEmpty()) {
             throw new IllegalArgumentException("No eligible host to select from");
         }
@@ -125,6 +142,19 @@ final class HostSelection {
                                 + "may run this conversation delivers skills yet."));
             }
             current = delivering;
+        }
+        if (needsAppTokens) {
+            List<Host> renewing = current.stream().filter(Host::appTokens).toList();
+            if (renewing.isEmpty()) {
+                return new Waits(QueueReason.noHostForAppTokens(current.size() == 1
+                        ? "A repository of this conversation acts through a GitHub App's installation, and runner host "
+                                + current.getFirst().info().name() + " cannot renew its tokens yet: it needs a runner "
+                                + "host version with run.git.refresh."
+                        : "A repository of this conversation acts through a GitHub App's installation, and none of "
+                                + "the " + current.size() + " connected runner hosts that may run it renews its tokens "
+                                + "yet."));
+            }
+            current = renewing;
         }
         List<Host> open = current.stream().filter(host -> !host.info().draining()).toList();
         if (open.isEmpty()) {

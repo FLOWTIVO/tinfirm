@@ -9,6 +9,9 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.flowtivo.tinfirm.shared.api.SystemsApi;
 import com.flowtivo.tinfirm.shared.api.model.ExternalSystem;
+import com.flowtivo.tinfirm.shared.api.model.GitHubApp;
+import com.flowtivo.tinfirm.shared.api.model.GitHubAppInstallationList;
+import com.flowtivo.tinfirm.shared.api.model.GitHubAppRequest;
 import com.flowtivo.tinfirm.shared.api.model.ExternalSystemPage;
 import com.flowtivo.tinfirm.shared.api.model.SystemAppRequest;
 import com.flowtivo.tinfirm.shared.api.model.SystemCreateRequest;
@@ -30,7 +33,10 @@ class SystemsController implements SystemsApi {
 
     private final CatalogueService catalogue;
 
-    SystemsController(SystemService systems, CatalogueService catalogue) {
+    private final GitHubAppService gitHubApps;
+
+    SystemsController(SystemService systems, CatalogueService catalogue, GitHubAppService gitHubApps) {
+        this.gitHubApps = gitHubApps;
         this.systems = systems;
         this.catalogue = catalogue;
     }
@@ -70,6 +76,28 @@ class SystemsController implements SystemsApi {
     public ResponseEntity<Void> removeSystemApp(UUID companyId, UUID systemId) {
         systems.removeApp(companyId, systemId);
         return ResponseEntity.noContent().build();
+    }
+
+    @Override
+    public ResponseEntity<GitHubApp> getSystemGitHubApp(UUID companyId, UUID systemId) {
+        return ResponseEntity.ok(gitHubApps.get(companyId, systemId));
+    }
+
+    @Override
+    public ResponseEntity<GitHubApp> setSystemGitHubApp(UUID companyId, UUID systemId, GitHubAppRequest request) {
+        return ResponseEntity.ok(gitHubApps.set(companyId, systemId, request));
+    }
+
+    @Override
+    public ResponseEntity<Void> removeSystemGitHubApp(UUID companyId, UUID systemId) {
+        gitHubApps.remove(companyId, systemId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @Override
+    public ResponseEntity<GitHubAppInstallationList> listSystemGitHubAppInstallations(UUID companyId,
+            UUID systemId) {
+        return ResponseEntity.ok(gitHubApps.installations(companyId, systemId));
     }
 
     @Override

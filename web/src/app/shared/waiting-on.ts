@@ -48,6 +48,7 @@ const RUNNER_REASONS: Record<string, string> = {
   CREDENTIAL_POOL_FULL: 'Subscription busy',
   RUNNER_HOST_FULL: 'Host busy',
   NO_HOST_FOR_SKILLS: 'No host for its skills',
+  NO_HOST_FOR_APP_TOKENS: 'No host for its GitHub App',
   RETRY_SCHEDULED: 'Retrying soon',
 };
 

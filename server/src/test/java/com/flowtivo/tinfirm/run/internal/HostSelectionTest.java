@@ -107,6 +107,27 @@ class HostSelectionTest {
                     waits -> assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.NO_HOST_FOR_SKILLS));
     }
 
+    /** A run on a GitHub App's installation goes only to a host that renews its tokens (ADR-0116, decision 8). */
+    @org.junit.jupiter.api.Test
+    void aRunOnAnAppInstallationGoesOnlyToAHostThatRenewsTokens() {
+        RunnerHostInfo alpha = host(A, "alpha", true, 2, false, 4, 0).info();
+        RunnerHostInfo beta = host(B, "beta", true, 2, false, 4, 3).info();
+        HostSelection.Host plain = new HostSelection.Host(alpha, true, 2, 0, false, false, false);
+        HostSelection.Host renewing = new HostSelection.Host(beta, true, 2, 3, false, false, true);
+
+        assertThat(HostSelection.select(List.of(plain, renewing), null, false, null, true))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("beta"));
+        assertThat(HostSelection.select(List.of(plain, renewing), null, false, null, false))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("alpha"));
+        assertThat(HostSelection.select(List.of(plain), A, false, null, true))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.NO_HOST_FOR_APP_TOKENS);
+                assertThat(waits.reason().text()).contains("alpha", "run.git.refresh");
+            });
+    }
+
     private static HostSelection.Host leveled(String name, com.flowtivo.tinfirm.runner.@Nullable IsolationLevel level,
             com.flowtivo.tinfirm.runner.@Nullable Hardening hardened, int used, boolean restores) {
         RunnerHostInfo info = new RunnerHostInfo(UUID.randomUUID(), UUID.randomUUID(), name, HostScope.COMPANY, null,

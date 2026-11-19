@@ -492,13 +492,15 @@ class RunDispatcher {
                     host.personalHostId() != null ? usedOfMachines.getOrDefault(host.personalHostId(), 0)
                             : used.getOrDefault(host.id(), 0),
                     connections.supports(host.id(), RunnerMessages.FEATURE_RUN_SKILLS),
-                    host.company() && connections.supports(host.id(), RunnerMessages.FEATURE_SESSION_BUNDLE)))
+                    host.company() && connections.supports(host.id(), RunnerMessages.FEATURE_SESSION_BUNDLE),
+                    connections.supports(host.id(), RunnerMessages.FEATURE_RUN_GIT_REFRESH)
+                            && connections.supports(host.id(), RunnerMessages.FEATURE_RUN_GIT_REVOKE)))
             .toList();
         UUID previousHost = placement.preferred() != null ? placement.preferred()
                 : runs.previousHost(run.conversationId(), run.id()).orElse(null);
         HostSelection.Host chosen;
         switch (HostSelection.select(candidates, previousHost, !effective.skills().isEmpty(),
-                placement.preferRestorers() ? placement.level() : null)) {
+                placement.preferRestorers() ? placement.level() : null, ready.appTokens())) {
             case HostSelection.Waits waits -> {
                 return waiting(run, placement.weakerLeftOut() || placement.chosen()
                         ? waits.reason().withIsolationLevel(placement.level(), placement.chosen()) : waits.reason(),

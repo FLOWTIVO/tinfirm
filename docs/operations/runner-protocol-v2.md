@@ -191,6 +191,25 @@ ships it.
   - A revocation stops only what has not started: a fetch or a push already under way finishes,
     what the sandbox holds stays there, and the token itself stays valid at the code host. Rotate
     a member's personal access token at the code host when it may have been copied.
+- **Renewing a GitHub App's tokens** ([ADR-0116](../adr/0116-short-lived-and-revocable-git-tokens.md)).
+  A host that lists the feature `run.git.refresh` (and `run.git.revoke` with it) gets, for a
+  repository whose credential is an installation of a GitHub system's App, `workspaces[].git`
+  with `expiresAt` (an hour from the mint) and `mirrorKey` (the key it names the repository's
+  mirror by, in place of the token). It renews with `run.request` kind `GIT_TOKEN`,
+  `payload {componentIds}`: when ten minutes or less are left, before the push at the run's end
+  when twenty or less are left, and after it took a run back, once connected. The server checks
+  the conversation's binding again for each, and answers `DONE` with `{git: [{componentId,
+  username, token, expiresAt}], refused?: [{componentId, code, message}]}`, or `REJECTED` with
+  `GIT_REVOKED` (refused for good: applied as a `run.git.revoke`, and recorded as one),
+  `GIT_HELD` (a kill switch holds; ask again later) or `GIT_UNAVAILABLE` (GitHub not answering)
+  when no repository got a token and all share the code. At most one `GIT_TOKEN` request of a run
+  waits for its answer; the host waits 30 seconds. A run on such a credential goes only to a host
+  that lists both features; until one is connected it waits with `NO_HOST_FOR_APP_TOKENS`. A host
+  without the feature never gets `expiresAt` or `mirrorKey`.
+- **`welcome.features`.** From this release the server's `welcome` names every optional feature
+  it implements. A host that took a run back after a restart waits for `welcome.done` before it
+  pushes the run's work only when `welcome.features` lists `run.git.revoke`; with an older server
+  it pushes as before, without waiting.
 - **Skills** ([ADR-0064](../adr/0064-skills-library.md)). A v2 host that lists `run.skills` gets
   the agent's skills in `run.assign.skills` and downloads each from the server before the
   sandbox starts ([runner/README.md](../../runner/README.md#skills-protocol-v2)). A run whose

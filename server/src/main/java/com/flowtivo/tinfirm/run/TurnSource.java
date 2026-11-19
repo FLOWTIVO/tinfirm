@@ -114,11 +114,19 @@ public interface TurnSource {
          * @param workspaceAccountHolders the principals whose accounts the workspace's git tokens are (each
          *                                repository's binding's holder), for the host scope rule (open point 7; M4);
          *                                empty without a workspace
+         * @param appTokens               a repository's binding is on a credential of kind {@code APP} (ADR-0116):
+         *                                the run goes only to a host that lists {@code run.git.refresh} and
+         *                                {@code run.git.revoke}, else waits {@code NO_HOST_FOR_APP_TOKENS}
          */
-        record Ready(Set<UUID> workspaceAccountHolders) implements TurnPlan {
+        record Ready(Set<UUID> workspaceAccountHolders, boolean appTokens) implements TurnPlan {
 
             public Ready {
                 workspaceAccountHolders = Set.copyOf(workspaceAccountHolders);
+            }
+
+            /** A turn without a binding on a GitHub App's installation. */
+            public Ready(Set<UUID> workspaceAccountHolders) {
+                this(workspaceAccountHolders, false);
             }
         }
 

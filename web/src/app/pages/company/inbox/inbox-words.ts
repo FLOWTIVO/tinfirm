@@ -208,6 +208,7 @@ export const WAITING_TEXTS: Record<QueueReasonCode, string> = {
   ASSIGNED: 'Sent to a runner host, waiting for it to start.',
   TRIGGER_PAUSED: 'Its trigger is paused; its turns wait until it is resumed.',
   NO_HOST_FOR_SKILLS: 'No connected runner host can give its agent its skills yet.',
+  NO_HOST_FOR_APP_TOKENS: 'No connected runner host can renew the tokens of its GitHub App yet.',
   RETRY_SCHEDULED: 'Its turn failed for a reason that may pass; it is retried by itself soon.',
   OTHER: 'It waits for a runner host.',
 };
@@ -372,6 +373,16 @@ export function inboxRowView(item: InboxItem, reader: InboxReader): InboxRowView
           body: `${waiting} Store new client credentials for it on ${system}’s page.`,
           tone: 'human',
           link: { label: 'Store new client credentials', ...atIt },
+          action: null,
+        };
+      }
+      if (c.kind === 'APP') {
+        return {
+          kind: 'GitHub App installation',
+          title: `${credential} cannot mint tokens`,
+          body: `${waiting} GitHub refused the App’s installation: check the App and its installation on ${system}’s page.`,
+          tone: 'human',
+          link: { label: `Open ${system}`, ...atIt },
           action: null,
         };
       }

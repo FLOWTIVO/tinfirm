@@ -190,6 +190,10 @@ class RunnerSessionHandler implements RunnerSessionListener {
                 // A call on a system may take a minute: never in a transaction, never holding up the frames.
                 return requests.call(host, request);
             }
+            if (RunnerMessages.RequestKind.GIT_TOKEN.name().equals(request.kind())) {
+                // A mint at GitHub (ADR-0116): never in a transaction, never holding up the frames.
+                return requests.gitToken(host, request);
+            }
         }
         if (message instanceof RunnerMessages.RunEvent event) {
             return event(host, event);

@@ -108,6 +108,37 @@ For agents that only read, narrow the scopes at the provider and on the app: `re
 
 A Jira Cloud sign-in must include the system's site: Atlassian asks which sites to allow. Jira and GitHub offer Tinfirm no way to revoke a grant. When you remove a credential there, or a member disconnects their account, revoke the grant at the provider too. On GitLab, Tinfirm revokes it for you.
 
+## Set up the GitHub App
+
+A GitHub system can hold one GitHub App: your company's own, registered at GitHub by you. Each installation of the App becomes a credential, and every agent run that acts through it gets a token of its own: only for the run's repositories, only to read and write code and pull requests, and valid for one hour. Tinfirm renews it while the run works and checks, each time, that the conversation may still use the credential. A stolen copy of such a token is worth an hour of the run's repositories, never your other repositories, and never your workflows.
+
+Before you start, ask your operator to upgrade the runner hosts: a run on an App's installation runs only on a host that can renew its tokens. Until one is connected, it waits with *No host for its GitHub App*. The App's section counts the hosts that cannot yet.
+
+1. At GitHub, in your organisation's **Settings**, **Developer settings**, **GitHub Apps**, choose **New GitHub App**. Give it a name, any homepage URL, and turn **Webhook** off.
+2. Under **Repository permissions** give it:
+
+    | Permission | Access |
+    |---|---|
+    | Contents | Read and write |
+    | Pull requests | Read and write |
+    | Metadata | Read-only |
+    | Issues | Read and write, when agents use the system's issue tools |
+    | Workflows | **No access** |
+
+    Never give it Workflows: Tinfirm never asks for it, so an agent cannot change your CI.
+3. Create the App, note its **App ID**, and under **Private keys** choose **Generate a private key**. GitHub downloads a `.pem` file.
+4. **Install App** on your organisation, with all repositories or the ones agents work in.
+5. In Tinfirm, on the GitHub system's page, under **GitHub App**, choose **Set up the App**, enter the App ID, paste the whole `.pem` file, and choose **Check and save**. Tinfirm asks GitHub for the App with the key. The key goes to the vault; nobody sees it again.
+6. Under **Credentials**, choose **Add credential**, then **GitHub App installation**, and pick the installation. Lend the new credential to groups or service accounts like any other.
+
+To rotate the key, generate a new one at GitHub, choose **Replace the key** and paste it, then delete the old key at GitHub. To remove the App, remove its installations' credentials first.
+
+A repository on another GitHub account, or one the installation does not include, cannot be worked on through it: the turn ends with a message that names the repository. Install the App there, and retry.
+
+GitHub Enterprise Server works the same way, with the system's address `https://<your host>/api/v3`. That setup has not yet been tested against a real GitHub Enterprise Server.
+
+Members who connect their own GitHub accounts keep doing so: their tokens are not shortened, but a running turn still loses its access when their account can no longer be used ([Revoked git access](#revoked-git-access)).
+
 ## Test a system
 
 **Test** reaches the system and says as whom. It uses, in this order:
@@ -135,7 +166,7 @@ A credential is the company's token or sign-in on a system. A system can hold an
 
 1. On the system's **Overview**, under **Credentials**, choose **Add credential**. The dialog is **Add a credential to** the system's name, such as **Add a credential to GitHub**.
 2. **Name**: what it is for, as the system's page and the trigger editor name it. 1 to 100 characters, unique on the system, ignoring case.
-3. **How**: **Paste a token**, or **Sign in to GitHub** (or the system's name) where its Sign-in app is set up. Git takes tokens only. Jira Cloud also takes **Service account (OAuth 2.0)** ([below](#add-a-jira-cloud-service-account)).
+3. **How**: **Paste a token**, or **Sign in to GitHub** (or the system's name) where its Sign-in app is set up. Git takes tokens only. Jira Cloud also takes **Service account (OAuth 2.0)** ([below](#add-a-jira-cloud-service-account)). GitHub, once its GitHub App is set up, also takes **GitHub App installation** ([below](#set-up-the-github-app)).
 4. With a token, paste it under **Token** and choose **Check and add**. Tinfirm checks it with the system and keeps it in the vault: nobody sees it again. With a sign-in, choose the sign-in button, sign in at the system as the user the credential should be, and come back. The page says: *The credential is connected. Lend it to a group or a service account.*
 
 A new credential is lent to nobody. Lend it next ([Lend a credential](#lend-a-credential)).

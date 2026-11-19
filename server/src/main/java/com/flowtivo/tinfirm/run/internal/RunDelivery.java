@@ -209,9 +209,9 @@ class RunDelivery {
             }
             return;
         }
-        TurnSource.TurnContent.Content turn;
+        TurnSource.TurnContent.Content revealed;
         switch (content) {
-            case TurnSource.TurnContent.Content found -> turn = found;
+            case TurnSource.TurnContent.Content found -> revealed = found;
             case TurnSource.TurnContent.NotReady notReady -> {
                 notReady(assignment, notReady.outcome());
                 return;
@@ -237,6 +237,10 @@ class RunDelivery {
                 return;
             }
         }
+        // ADR-0116, decision 8: expiresAt and mirrorKey go only to a host that renews tokens; placement sends a run on
+        // an App's installation to none other.
+        TurnSource.TurnContent.Content turn = connections.supports(assignment.host().id(),
+                RunnerMessages.FEATURE_RUN_GIT_REFRESH) ? revealed : withoutRefresh(revealed);
         List<String> dirs = dirs(turn.workspaces());
         // The conversation's session bundle (ADR-0097), for a company host that takes bundles.
         String resumeSessionId = assignment.previous() != null ? assignment.previous().sessionId() : null;
@@ -265,6 +269,24 @@ class RunDelivery {
             log.info("Run {} could not be sent to runner host {}; the accept timeout will requeue it", run.id(),
                     assignment.host().id());
         }
+    }
+
+    /** The content with each repository's token without its expiry and mirror key. */
+    static TurnSource.TurnContent.Content withoutRefresh(TurnSource.TurnContent.Content turn) {
+        if (turn.workspaces().stream().noneMatch(workspace -> workspace.git() != null
+                && workspace.git().expiresAt() != null)) {
+            return turn;
+        }
+        List<TurnSource.Workspace> workspaces = turn.workspaces().stream()
+            .map(workspace -> workspace.git() == null || workspace.git().expiresAt() == null ? workspace
+                    : new TurnSource.Workspace(workspace.repositoryId(), workspace.systemId(), workspace.bindingId(),
+                            workspace.name(), workspace.url(), workspace.defaultBranch(), workspace.readOnly(),
+                            workspace.readOnlyCause(), workspace.git().withoutRefresh(), workspace.authorName(),
+                            workspace.authorEmail()))
+            .toList();
+        return new TurnSource.TurnContent.Content(turn.title(), turn.prompt(), turn.resumePrompt(), workspaces,
+                turn.requestableRepositories(), turn.tools(), turn.platformTools(), turn.grantedHosts(),
+                turn.attachments());
     }
 
     /** {@code run.assign} of protocol v2, without a session bundle. */
