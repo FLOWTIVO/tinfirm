@@ -253,8 +253,8 @@ class GitRevocationService implements RunGitRevocations {
     /**
      * {@code run.git.revoke} for the pending revocations of the runs' current assignments, for a {@code hello} that
      * keeps or resumes them, or a heartbeat that resumes one, in its transaction: to a host that takes them, each
-     * counted as sent (the frames are the answer); a host that does not gets none, and the revocations it was never
-     * sent are {@code UNSUPPORTED}.
+     * counted as sent once the answer was written ({@link #written}); a host that does not gets none, and the
+     * revocations it was never sent are {@code UNSUPPORTED}.
      */
     List<RunnerMessages.Outbound> pending(ConnectedHost host, Collection<UUID> runIds, Instant now) {
         boolean takes = takesRevocations(host.runnerHostId());
@@ -268,11 +268,22 @@ class GitRevocationService implements RunGitRevocations {
                 commands.markRevocationUnsupported(revocation.id());
                 continue;
             }
+            // Counted as sent once the answer was written ({@link #written}).
             frames.add(new RunnerMessages.RunGitRevoke(run.id(), run.epoch(), revocation.componentIds(),
                     revocation.reason(), revocation.message()));
-            commands.markRevocationSent(revocation.id(), now);
         }
         return frames;
+    }
+
+    /**
+     * The {@code run.git.revoke} frames of an answer that were written to the host's connection: their revocations
+     * are {@code SENT} from now, in a transaction of their own. Those of an answer that was not written stay
+     * {@code ON_RECONNECT}, which the run's view shows as pending, and go again at the host's next {@code hello}.
+     */
+    void written(List<RunnerMessages.RunGitRevoke> frames) {
+        Instant now = time.now();
+        separate.executeWithoutResult(status -> frames.forEach(frame -> commands.markRevocationWritten(frame.runId(),
+                frame.epoch(), frame.componentIds(), now)));
     }
 
     /**
@@ -289,8 +300,16 @@ class GitRevocationService implements RunGitRevocations {
      */
     List<RunnerMessages.Outbound> beforeCancels(ConnectedHost host, List<RunnerMessages.Outbound> answer,
             Set<UUID> locked) {
-        if (answer.stream().noneMatch(RunnerMessages.RunCancel.class::isInstance)
-                || !takesRevocations(host.runnerHostId())) {
+        if (answer.stream().noneMatch(RunnerMessages.RunCancel.class::isInstance)) {
+            return answer;
+        }
+        if (!takesRevocations(host.runnerHostId())) {
+            // The host that reports these runs will never be told: their revocations say so, not "pending".
+            for (RunnerMessages.Outbound frame : answer) {
+                if (frame instanceof RunnerMessages.RunCancel cancel) {
+                    commands.markRevocationsUnsupported(cancel.runId(), cancel.epoch());
+                }
+            }
             return answer;
         }
         Instant now = time.now();
@@ -327,7 +346,6 @@ class GitRevocationService implements RunGitRevocations {
             if (!sent.containsAll(revocation.componentIds())) {
                 frames.add(new RunnerMessages.RunGitRevoke(runId, epoch, revocation.componentIds(),
                         revocation.reason(), revocation.message()));
-                commands.markRevocationSent(revocation.id(), now);
                 sent.addAll(revocation.componentIds());
             }
         }
@@ -363,7 +381,7 @@ class GitRevocationService implements RunGitRevocations {
             List<String> names = componentIds.stream().map(id -> cloned.get(id).name()).toList();
             String message = message(names, first.why());
             commands.insertRevocation(run.companyId(), runId, epoch, componentIds, first.reason(), message,
-                    currentUser(), now, now, Delivery.SENT.name());
+                    currentUser(), now, now, Delivery.ON_RECONNECT.name());
             auditLog.record(AuditRecord.company(run.companyId(), AuditAction.RUN_GIT_REVOKED, CurrentActor.actor())
                 .target(RunCompletion.TARGET, runId)
                 .detail("conversationId", run.conversationId().toString())

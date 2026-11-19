@@ -12,7 +12,11 @@ import java.util.Map;
 import java.util.UUID;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 
+import com.flowtivo.tinfirm.runner.ConnectedHost;
+import com.flowtivo.tinfirm.runner.RunnerMessages;
+import com.flowtivo.tinfirm.shared.security.SystemContext;
 import com.flowtivo.tinfirm.support.ApiResponse;
 import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.TenantSql;
@@ -554,6 +558,86 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
             assertThat(answerOrder(third)).containsExactly(REVOKE, "run.cancel", DONE);
         }
         assertThat(revocations(bench, runId)).hasSize(1);
+    }
+
+    @Autowired
+    com.flowtivo.tinfirm.runner.RunnerSessionListener listener;
+
+    private String deliveryOf(Bench bench, String runId) {
+        return bench.member().get(bench.path("/runs/" + runId)).json().get("repositories").get(0).get("gitRevoked")
+            .get("delivery").asString();
+    }
+
+    @Test
+    void aRevocationInAHellosAnswerCountsAsSentOnlyOnceTheAnswerWasWritten() {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        Lent credential = lent(bench, git[0], "WRITE");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        RunnerHostRef ref = hostRef(bench);
+        JsonNode assign;
+        try (FakeRunner runner = host(ref, List.of(REVOKE), List.of())) {
+            assign = running(bench, runner, agentId);
+        }
+        String runId = assign.get("runId").asString();
+        long epoch = assign.get("epoch").asLong();
+        await().atMost(WAIT).until(() -> !connections.isConnected(ref.id()));
+        assertThat(bench.owner().patch(bench.path("/systems/" + git[0] + "/credentials/"
+                + credential.credentialId()), Map.of("enabled", false)).status()).isEqualTo(200);
+        await().atMost(WAIT).until(() -> !revocations(bench, runId).isEmpty());
+        assertThat(deliveryOf(bench, runId)).isEqualTo("PENDING");
+        List<Map<String, Object>> reported = List.of(Map.of("runId", runId, "epoch", epoch, "lastSeq", 0));
+        try (FakeRunner again = host(ref, List.of(REVOKE), reported)) {
+            again.expect(REVOKE);
+            again.expect(DONE);
+            // Written to the connection: told.
+            await().atMost(WAIT).until(() -> "SENT".equals(deliveryOf(bench, runId)));
+
+            // The same reconciliation whose answer is not written (a connection that closed): still pending.
+            sql(bench, "UPDATE run_command SET delivery = 'ON_RECONNECT', last_sent_at = NULL WHERE run_id = ?",
+                    UUID.fromString(runId));
+            ConnectedHost host = new ConnectedHost(ref.id(), bench.id(), 2);
+            List<RunnerMessages.Outbound> answer = SystemContext.callInCompany(bench.id(),
+                    () -> listener.hostConnected(host, List.of(new RunnerMessages.ActiveRun(UUID.fromString(runId),
+                            epoch, 0L)), null));
+            List<RunnerMessages.RunGitRevoke> frames = answer.stream()
+                .filter(RunnerMessages.RunGitRevoke.class::isInstance)
+                .map(RunnerMessages.RunGitRevoke.class::cast)
+                .toList();
+            assertThat(frames).singleElement().satisfies(frame -> assertThat(frame.runId().toString())
+                .isEqualTo(runId));
+            assertThat(deliveryOf(bench, runId)).isEqualTo("PENDING");
+            // Once written, it counts as sent.
+            SystemContext.runInCompany(bench.id(), () -> listener.revocationsWritten(host, frames));
+            assertThat(deliveryOf(bench, runId)).isEqualTo("SENT");
+        }
+    }
+
+    @Test
+    void aRunThatAHostWithoutTheFeatureReportsAndThatIsCancelledShowsItsRevocationUnsupported() {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        Lent credential = lent(bench, git[0], "WRITE");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        RunnerHostRef ref = hostRef(bench);
+        JsonNode assign;
+        try (FakeRunner runner = host(ref, List.of(REVOKE), List.of())) {
+            assign = running(bench, runner, agentId);
+        }
+        String runId = assign.get("runId").asString();
+        long epoch = assign.get("epoch").asLong();
+        await().atMost(WAIT).until(() -> !connections.isConnected(ref.id()));
+        assertThat(bench.owner().patch(bench.path("/systems/" + git[0] + "/credentials/"
+                + credential.credentialId()), Map.of("enabled", false)).status()).isEqualTo(200);
+        await().atMost(WAIT).until(() -> !revocations(bench, runId).isEmpty());
+        lostLongAgo(bench, ref, runId);
+        assertThat(deliveryOf(bench, runId)).isEqualTo("PENDING");
+        // The host comes back an older release, with the run: it is cancelled and can never be told.
+        try (FakeRunner older = host(ref, List.of(), List.of(Map.of("runId", runId, "epoch", epoch, "lastSeq", 0)))) {
+            older.expect("run.cancel");
+            older.expectNone(REVOKE, Duration.ofMillis(500));
+        }
+        assertThat(deliveryOf(bench, runId)).isEqualTo("UNSUPPORTED");
     }
 
     // ---- A lost run whose host is connected, resumed by a heartbeat ---------------------------------------------------

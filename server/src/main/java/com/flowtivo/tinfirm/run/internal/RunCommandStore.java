@@ -166,6 +166,30 @@ class RunCommandStore {
             .update();
     }
 
+    /**
+     * The frame of a revocation was written to the host's connection in an answer: the revocation of the run's
+     * assignment of {@code epoch} that names exactly these repositories (no two of one assignment name the same one).
+     */
+    void markRevocationWritten(UUID runId, long epoch, List<UUID> componentIds, Instant now) {
+        jdbc.sql("""
+                UPDATE run_command SET last_sent_at = ?, delivery = 'SENT'
+                 WHERE run_id = ? AND type = 'REVOKE_GIT' AND epoch = ? AND component_ids = CAST(? AS uuid[])""")
+            .params(RunStore.ts(now), runId, epoch, uuidArray(componentIds))
+            .update();
+    }
+
+    /**
+     * The host that reports the run's assignment of {@code epoch} cannot take a revocation: those it was never sent
+     * cannot reach it.
+     */
+    void markRevocationsUnsupported(UUID runId, long epoch) {
+        jdbc.sql("""
+                UPDATE run_command SET delivery = 'UNSUPPORTED'
+                 WHERE run_id = ? AND type = 'REVOKE_GIT' AND epoch = ? AND delivery <> 'SENT'""")
+            .params(runId, epoch)
+            .update();
+    }
+
     /** The run's host reconnected without {@code run.git.revoke}: a revocation it was never sent cannot reach it. */
     void markRevocationUnsupported(UUID commandId) {
         jdbc.sql("UPDATE run_command SET delivery = 'UNSUPPORTED' WHERE id = ? AND delivery <> 'SENT'")

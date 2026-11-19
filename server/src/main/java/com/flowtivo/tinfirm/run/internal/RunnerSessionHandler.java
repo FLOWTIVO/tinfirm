@@ -216,6 +216,12 @@ class RunnerSessionHandler implements RunnerSessionListener {
         });
     }
 
+    /** ADR-0116: the revocations of an answer that were written to the host's connection count as sent. */
+    @Override
+    public void revocationsWritten(ConnectedHost host, List<RunnerMessages.RunGitRevoke> written) {
+        revocations.written(written);
+    }
+
     private static final String NOT_V2 = "The run is not active: this server runs conversations on hosts of runner "
             + "protocol 2.";
 

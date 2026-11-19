@@ -300,7 +300,17 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
             .ifPresent(latest -> registry.sendTo(out, latest));
         List<RunnerMessages.ActiveRun> activeRuns = hello.activeRuns() != null ? hello.activeRuns() : List.of();
         String publicSuffixSha256 = hello.publicSuffixList() != null ? hello.publicSuffixList().sha256() : null;
-        send(out, connected(host, placements, activeRuns, publicSuffixSha256));
+        List<Answered> answer = connected(host, placements, activeRuns, publicSuffixSha256);
+        Map<UUID, List<RunnerMessages.RunGitRevoke>> written = new HashMap<>();
+        Map<UUID, ConnectedHost> places = new HashMap<>();
+        for (Answered frame : answer) {
+            if (registry.sendTo(out, frame.frame()) && frame.placed() != null
+                    && frame.frame() instanceof RunnerMessages.RunGitRevoke revoke) {
+                written.computeIfAbsent(frame.placed().company(), id -> new ArrayList<>()).add(revoke);
+                places.put(frame.placed().company(), frame.placed());
+            }
+        }
+        written.forEach((company, revocations) -> revocationsWritten(places.get(company), revocations));
         if (hello.protocolVersion() == RunnerMessages.PROTOCOL_V2
                 && hello.featureSet().contains(RunnerMessages.FEATURE_RUN_GIT_REVOKE)) {
             // ADR-0116: the end of what the hello's answer sends again, the pending revocations included. A host that
@@ -313,14 +323,14 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
      * Reconciles the host in each of its companies, with the active runs it reports that belong to that company. A
      * reported run of no company of the host's (one it left, or a run the server does not know) is cancelled.
      */
-    private List<RunnerMessages.Outbound> connected(ConnectedHost host, List<ConnectedHost> placements,
+    private List<Answered> connected(ConnectedHost host, List<ConnectedHost> placements,
             List<RunnerMessages.ActiveRun> activeRuns, @Nullable String publicSuffixSha256) {
         Map<UUID, List<RunnerMessages.ActiveRun>> byCompany = new HashMap<>();
-        List<RunnerMessages.Outbound> frames = new ArrayList<>();
+        List<Answered> frames = new ArrayList<>();
         for (RunnerMessages.ActiveRun active : activeRuns) {
             UUID company = sessions.placeForRun(host, active.runId()).map(ConnectedHost::company).orElse(null);
             if (company == null) {
-                frames.add(new RunnerMessages.RunCancel(active.runId(), active.epoch()));
+                frames.add(new Answered(null, new RunnerMessages.RunCancel(active.runId(), active.epoch())));
             }
             else {
                 byCompany.computeIfAbsent(company, id -> new ArrayList<>()).add(active);
@@ -338,10 +348,37 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                     }
                     pslSent = true;
                 }
-                frames.add(frame);
+                frames.add(new Answered(placed, frame));
             }
         }
         return frames;
+    }
+
+    /** A frame of the hello's answer, with the company presence whose reconciliation answered it. */
+    private record Answered(@Nullable ConnectedHost placed, RunnerMessages.Outbound frame) {
+    }
+
+    /** The frames of a run message's answer, written; then the company hears which revocations were written. */
+    private void send(WebSocketSession out, ConnectedHost placed, List<RunnerMessages.Outbound> frames) {
+        List<RunnerMessages.RunGitRevoke> written = new ArrayList<>();
+        for (RunnerMessages.Outbound frame : frames) {
+            if (registry.sendTo(out, frame) && frame instanceof RunnerMessages.RunGitRevoke revoke) {
+                written.add(revoke);
+            }
+        }
+        if (!written.isEmpty()) {
+            revocationsWritten(placed, written);
+        }
+    }
+
+    /** ADR-0116: the revocations written count as sent; a failure to record it leaves them pending, never lost. */
+    private void revocationsWritten(ConnectedHost placed, List<RunnerMessages.RunGitRevoke> written) {
+        try {
+            SystemContext.runInCompany(placed.company(), () -> listener().revocationsWritten(placed, written));
+        }
+        catch (RuntimeException ex) {
+            log.warn("Recording the revocations written to runner host {} failed", placed.runnerHostId(), ex);
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -381,7 +418,8 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                 byCompany.forEach((company, entries) -> {
                     ConnectedHost placed = known.in(company).orElseThrow();
                     RunnerMessages.RunHeartbeat theirs = new RunnerMessages.RunHeartbeat(entries);
-                    send(out, SystemContext.callInCompany(company, () -> listener().runMessage(placed, theirs)));
+                    send(out, placed, SystemContext.callInCompany(company,
+                            () -> listener().runMessage(placed, theirs)));
                 });
                 sessions.touch(host);
             }
@@ -392,7 +430,8 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                     return;
                 }
                 adopt(session, host, placed);
-                send(out, SystemContext.callInCompany(placed.company(), () -> listener().runMessage(placed, runMessage)));
+                send(out, placed, SystemContext.callInCompany(placed.company(),
+                        () -> listener().runMessage(placed, runMessage)));
             }
             case RunnerMessages.ProtocolError error -> log.warn("Runner host {} reported error {}: {}",
                     host.machineId(), abbreviate(error.code()), abbreviate(error.message()));
@@ -464,12 +503,6 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     private RunnerSessionListener listener() {
         return listeners.getObject();
-    }
-
-    private void send(WebSocketSession out, List<RunnerMessages.Outbound> frames) {
-        for (RunnerMessages.Outbound frame : frames) {
-            registry.sendTo(out, frame);
-        }
     }
 
     @Override

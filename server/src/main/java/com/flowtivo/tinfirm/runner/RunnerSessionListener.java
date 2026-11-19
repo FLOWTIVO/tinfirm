@@ -36,6 +36,14 @@ public interface RunnerSessionListener {
     List<RunnerMessages.Outbound> runMessage(ConnectedHost host, RunnerMessages.RunMessage message);
 
     /**
+     * The {@code run.git.revoke} frames of an answer ({@link #hostConnected}, {@link #runMessage}) that were written to
+     * the host's connection, after the write (ADR-0116): their revocations count as sent from now. A frame whose write
+     * failed is not among them. Called in the company's tenant context, outside any transaction.
+     */
+    default void revocationsWritten(ConnectedHost host, List<RunnerMessages.RunGitRevoke> written) {
+    }
+
+    /**
      * After {@code host.config.applied} was stored: the host's confirmed capacity or draining state changed, and on
      * the first one of a connection the host starts taking runs. Dispatches without waiting for the next tick.
      */
