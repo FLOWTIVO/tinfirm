@@ -1,0 +1,58 @@
+# The listener: an unprivileged user that takes the control host's TLS connection and asks
+# the helper. It holds no capability and no device, and sees nothing of the machine but its
+# own two directories, its configuration and the helper's socket.
+[Unit]
+Description=Tinfirm node agent: the listener (unprivileged), which takes the control host's connection
+Requires=tinfirm-node-agent-helper.service
+After=tinfirm-node-agent-helper.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=tinfirm-node-listener
+Group=tinfirm-node-listener
+ExecStart=/usr/local/bin/tinfirm-node-agent listener --config /etc/tinfirm/node-agent/listener.json
+# The helper's socket is there a moment after the helper starts: the listener starts again.
+Restart=on-failure
+RestartSec=1
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Its network: the TLS port, and the helper's local socket. The node's role adds, in a
+# drop-in, the one address that may connect:
+#     [Service]
+#     IPAddressAllow=<the control host's address>
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tinfirm-node-agent/spool /var/lib/tinfirm-node-agent/listener
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

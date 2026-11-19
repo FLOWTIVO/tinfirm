@@ -1,0 +1,19 @@
+# The kernel modules a sandbox node needs, loaded once at boot, so that the helper may load
+# none (its unit has ProtectKernelModules=yes, and a hardened node sets
+# kernel.modules_disabled=1 after this unit).
+[Unit]
+Description=Tinfirm node agent: the kernel modules of a sandbox node
+Before=tinfirm-node-agent-helper.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# KVM for the processor that is there: one of the two fails, by design.
+ExecStart=-/usr/sbin/modprobe kvm_intel
+ExecStart=-/usr/sbin/modprobe kvm_amd
+# The snapshot over the shared image; the veth and the tap device of a VM; the two firewall
+# tables of a VM with their connection tracking and their DNAT.
+ExecStart=/usr/sbin/modprobe -a dm_snapshot loop tun veth nf_tables nft_ct nft_chain_nat nft_nat nf_nat
+
+[Install]
+WantedBy=multi-user.target
