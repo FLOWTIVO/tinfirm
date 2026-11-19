@@ -4,8 +4,10 @@ import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
@@ -18,7 +20,6 @@ import com.flowtivo.tinfirm.run.RunEvents;
 import com.flowtivo.tinfirm.run.RunStatus;
 import com.flowtivo.tinfirm.run.TurnEnded;
 import com.flowtivo.tinfirm.runner.ConnectedHost;
-import com.flowtivo.tinfirm.runner.RunnerConnections;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RunnerProperties;
 import com.flowtivo.tinfirm.runner.RunnerSessionListener;
@@ -118,15 +119,15 @@ class RunnerSessionHandler implements RunnerSessionListener {
 
     private final RunnerFloodControl flood;
 
-    private final RunnerConnections connections;
+    private final GitRevocationService revocations;
 
     RunnerSessionHandler(RunStore runs, RunLocks locks, RunEventStore events, RunCommandStore commands,
             RunCompletion completion, RunResumption resumption, RunRequestRouter requests, RunDispatcher dispatcher,
             RunEventHub hub, RunMetrics metrics, ApplicationEventPublisher publisher, SystemTransactions transactions,
             RunnerProperties runnerProperties, RunProperties properties, TimeSource time,
             PublicSuffixPush publicSuffixes, RunPorts ports, SessionBundleCleanup bundles, RunnerFloodControl flood,
-            RunnerConnections connections) {
-        this.connections = connections;
+            GitRevocationService revocations) {
+        this.revocations = revocations;
         this.flood = flood;
         this.ports = ports;
         this.bundles = bundles;
@@ -230,8 +231,10 @@ class RunnerSessionHandler implements RunnerSessionListener {
      * {@link RunResumption} allows it, and cancelled otherwise.</li>
      * </ul>
      * Pending revocations of git tokens (ADR-0116) and cancel commands of the kept and resumed runs are sent again, the
-     * revocations first. A v2 host that holds no Public Suffix List, or another version than the server's, gets the
-     * server's first ({@code psl.update}, {@link PublicSuffixPush}).
+     * revocations first; and every {@code run.cancel} of the answer follows the revocations its host must hear first
+     * ({@link GitRevocationService#beforeCancels}), since a cancelled run pushes its work. A v2 host that holds no
+     * Public Suffix List, or another version than the server's, gets the server's first ({@code psl.update},
+     * {@link PublicSuffixPush}).
      */
     @Override
     public List<RunnerMessages.Outbound> hostConnected(ConnectedHost host, List<RunnerMessages.ActiveRun> activeRuns,
@@ -249,6 +252,8 @@ class RunnerSessionHandler implements RunnerSessionListener {
             List<RunStore.RunRow> handled = new ArrayList<>(occupying);
             reported.keySet().forEach(runId -> runs.find(runId).ifPresent(handled::add));
             locks.lockConversations(handled);
+            Set<UUID> locked = new HashSet<>();
+            handled.forEach(run -> locked.add(run.id()));
             for (RunStore.RunRow listed : occupying) {
                 RunStore.RunRow run = runs.lock(listed.id()).orElse(null);
                 if (run == null || !run.status().active()) {
@@ -298,31 +303,10 @@ class RunnerSessionHandler implements RunnerSessionListener {
                 }
             }
             // A revocation goes before a cancel: a cancelled run pushes its work (ADR-0116).
-            replies.addAll(pendingRevocations(host, kept, now));
+            replies.addAll(revocations.pending(host, kept, now));
             replies.addAll(pendingCancels(kept, now));
-            return replies;
+            return revocations.beforeCancels(host, replies, locked);
         });
-    }
-
-    /**
-     * {@code run.git.revoke} for the pending revocations of the runs' current assignments (ADR-0116), to a host that
-     * lists the feature; each counts as sent again. A host without it gets none, and its runs keep their tokens.
-     */
-    private List<RunnerMessages.Outbound> pendingRevocations(ConnectedHost host, List<UUID> runIds, Instant now) {
-        if (!connections.supports(host.runnerHostId(), RunnerMessages.FEATURE_RUN_GIT_REVOKE)) {
-            return List.of();
-        }
-        List<RunnerMessages.Outbound> revocations = new ArrayList<>();
-        for (RunCommandStore.GitRevocation revocation : commands.pendingRevocations(runIds)) {
-            RunStore.RunRow run = runs.find(revocation.runId()).orElse(null);
-            if (run == null || run.epoch() != revocation.epoch()) {
-                continue;
-            }
-            revocations.add(new RunnerMessages.RunGitRevoke(run.id(), run.epoch(), revocation.componentIds(),
-                    revocation.reason(), revocation.message()));
-            commands.markRevocationSent(revocation.id(), now);
-        }
-        return revocations;
     }
 
     /** {@code run.cancel} for the runs with a pending cancel command, which count as sent again. */
@@ -345,6 +329,11 @@ class RunnerSessionHandler implements RunnerSessionListener {
     // ---- run.accepted / run.rejected ------------------------------------------------------------------------------
 
     private List<RunnerMessages.Outbound> accepted(ConnectedHost host, RunnerMessages.RunAccepted accepted) {
+        // The run is locked, its conversation first: a cancel's revocations may be recorded (ADR-0116).
+        return revocations.beforeCancels(host, accept(host, accepted), Set.of(accepted.runId()));
+    }
+
+    private List<RunnerMessages.Outbound> accept(ConnectedHost host, RunnerMessages.RunAccepted accepted) {
         RunStore.RunRow run = locks.lock(accepted.runId()).orElse(null);
         List<RunnerMessages.Outbound> problem = check(host, run, accepted.runId(), accepted.epoch(), true);
         if (problem != null) {
@@ -358,7 +347,9 @@ class RunnerSessionHandler implements RunnerSessionListener {
                 markRunning(run, time.now());
                 log.info("Run {} of conversation {} accepted by runner host {}", run.id(), run.conversationKey(),
                         host.runnerHostId());
-                return List.of();
+                // A revocation sent while the assignment was on its way may have reached the host before it, which
+                // dropped it (ADR-0116): it goes again now that the host runs the run.
+                return revocations.pending(host, List.of(run.id()), time.now());
             }
             case RUNNING -> {
                 runs.renewLease(run.id(), run.epoch(), host.runnerHostId(), lease(time.now()));
@@ -567,6 +558,7 @@ class RunnerSessionHandler implements RunnerSessionListener {
             .map(entry -> runs.find(entry.runId()).orElse(null))
             .filter(found -> found != null && !found.status().active())
             .toList());
+        Set<UUID> locked = new HashSet<>();
         for (RunnerMessages.HeartbeatRun entry : heartbeat.runs()) {
             RunStore.RunRow run = runs.find(entry.runId()).orElse(null);
             List<RunnerMessages.Outbound> problem = check(host, run, entry.runId(), entry.epoch(), true);
@@ -580,19 +572,23 @@ class RunnerSessionHandler implements RunnerSessionListener {
             else if (!run.status().active()) {
                 // Ended on the server. A run lost by lease expiry that the host still runs is resumed; the host must
                 // stop any other.
-                RunStore.RunRow locked = locks.lock(run.id()).orElse(run);
-                if (locked.status() == RunStatus.RUNNING) {
-                    runs.renewLease(locked.id(), locked.epoch(), host.runnerHostId(), lease);
+                RunStore.RunRow held = locks.lock(run.id()).orElse(run);
+                locked.add(held.id());
+                if (held.status() == RunStatus.RUNNING) {
+                    runs.renewLease(held.id(), held.epoch(), host.runnerHostId(), lease);
                 }
-                else if (resumption.resume(host, locked, entry.epoch(), now, "run.heartbeat")) {
-                    replies.addAll(pendingCancels(List.of(locked.id()), now));
+                else if (resumption.resume(host, held, entry.epoch(), now, "run.heartbeat")) {
+                    // Its revocations, which its resumption opened again, before its cancel (ADR-0116).
+                    replies.addAll(revocations.pending(host, List.of(held.id()), now));
+                    replies.addAll(pendingCancels(List.of(held.id()), now));
                 }
                 else {
                     replies.add(new RunnerMessages.RunCancel(run.id(), run.epoch()));
                 }
             }
         }
-        return replies;
+        // A cancel follows the revocations of the run's assignment that its host must hear first (ADR-0116).
+        return revocations.beforeCancels(host, replies, locked);
     }
 
     // ---- run.steer.ack --------------------------------------------------------------------------------------------

@@ -36,11 +36,13 @@ class RunCommandStore {
     /**
      * A {@code REVOKE_GIT} command.
      *
-     * @param lastSentAt when its frame last went to the run's host; null while it never did (a host without
-     *                   {@code run.git.revoke}, or one not connected since)
+     * @param lastSentAt when its frame was last written to the run's host's connection; null while it never was (a
+     *                   host without {@code run.git.revoke}, one not connected since, or a send that failed)
+     * @param delivery   {@code SENT} once its frame was written to the host's connection; {@code ON_RECONNECT} while
+     *                   it was not; {@code UNSUPPORTED} while the run's host does not list {@code run.git.revoke}
      */
     record GitRevocation(UUID id, UUID runId, long epoch, List<UUID> componentIds, String reason, String message,
-            Instant createdAt, @Nullable Instant lastSentAt, boolean pending) {
+            Instant createdAt, @Nullable Instant lastSentAt, boolean pending, String delivery) {
 
         GitRevocation {
             componentIds = List.copyOf(componentIds);
@@ -87,19 +89,33 @@ class RunCommandStore {
      * again ({@link #reopen}).
      *
      * @param completedAt null for a pending command; the lost run's end otherwise
+     * @param delivery    {@code ON_RECONNECT}, {@code UNSUPPORTED}, or {@code SENT} for a frame in the answer to a
+     *                    {@code hello} (then {@code last_sent_at} is now)
      */
     UUID insertRevocation(UUID companyId, UUID runId, long epoch, List<UUID> componentIds, String reason,
-            String message, @Nullable UUID createdBy, Instant now, @Nullable Instant completedAt) {
+            String message, @Nullable UUID createdBy, Instant now, @Nullable Instant completedAt, String delivery) {
         UUID id = Ids.newId();
         jdbc.sql("""
                 INSERT INTO run_command (id, company_id, run_id, type, status, created_by, created_at, completed_at,
-                                         epoch, component_ids, reason, message)
-                VALUES (?, ?, ?, 'REVOKE_GIT', ?, ?, ?, ?, ?, CAST(? AS uuid[]), ?, ?)""")
+                                         last_sent_at, epoch, component_ids, reason, message, delivery)
+                VALUES (?, ?, ?, 'REVOKE_GIT', ?, ?, ?, ?, ?, ?, CAST(? AS uuid[]), ?, ?, ?)""")
             .params(id, companyId, runId, completedAt == null ? "PENDING" : "DONE", createdBy, RunStore.ts(now),
-                    completedAt != null ? RunStore.ts(completedAt) : null, epoch, uuidArray(componentIds), reason,
-                    message)
+                    completedAt != null ? RunStore.ts(completedAt) : null,
+                    SENT.equals(delivery) ? RunStore.ts(now) : null, epoch, uuidArray(componentIds), reason, message,
+                    delivery)
             .update();
         return id;
+    }
+
+    /** Every revocation of the run's assignment of {@code epoch}, pending or done, oldest first. */
+    List<GitRevocation> revocationsOf(UUID runId, long epoch) {
+        return jdbc.sql("SELECT " + REVOCATION_COLUMNS + """
+                 FROM run_command
+                WHERE type = 'REVOKE_GIT' AND run_id = ? AND epoch = ?
+                ORDER BY created_at, id""")
+            .params(runId, epoch)
+            .query(RunCommandStore::revocation)
+            .list();
     }
 
     /** The repositories a revocation of the run's assignment of {@code epoch} named, pending or done. */
@@ -143,22 +159,33 @@ class RunCommandStore {
             .collect(Collectors.groupingBy(GitRevocation::runId, HashMap::new, Collectors.toList()));
     }
 
-    /** The revocation's frame went to the run's host. */
+    /** The revocation's frame was written to the run's host's connection. */
     void markRevocationSent(UUID commandId, Instant now) {
-        jdbc.sql("UPDATE run_command SET last_sent_at = ? WHERE id = ?")
+        jdbc.sql("UPDATE run_command SET last_sent_at = ?, delivery = 'SENT' WHERE id = ?")
             .params(RunStore.ts(now), commandId)
             .update();
     }
 
+    /** The run's host reconnected without {@code run.git.revoke}: a revocation it was never sent cannot reach it. */
+    void markRevocationUnsupported(UUID commandId) {
+        jdbc.sql("UPDATE run_command SET delivery = 'UNSUPPORTED' WHERE id = ? AND delivery <> 'SENT'")
+            .param(commandId)
+            .update();
+    }
+
+    /** {@code run_command.delivery} of a revocation whose frame was written to the host's connection. */
+    static final String SENT = "SENT";
+
     private static final String REVOCATION_COLUMNS = """
-            id, run_id, epoch, component_ids, reason, message, created_at, last_sent_at, status""";
+            id, run_id, epoch, component_ids, reason, message, created_at, last_sent_at, status, delivery""";
 
     private static GitRevocation revocation(ResultSet rs, int row) throws SQLException {
         Timestamp sent = rs.getTimestamp("last_sent_at");
         return new GitRevocation(rs.getObject("id", UUID.class), rs.getObject("run_id", UUID.class),
                 rs.getLong("epoch"), uuids(rs.getArray("component_ids")), rs.getString("reason"),
                 rs.getString("message"), rs.getTimestamp("created_at").toInstant(),
-                sent != null ? sent.toInstant() : null, "PENDING".equals(rs.getString("status")));
+                sent != null ? sent.toInstant() : null, "PENDING".equals(rs.getString("status")),
+                rs.getString("delivery"));
     }
 
     private static List<UUID> uuids(@Nullable Array array) throws SQLException {

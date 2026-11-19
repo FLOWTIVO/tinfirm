@@ -50,14 +50,17 @@ describe('revokedNote', () => {
     message:
       "Tinfirm revoked this run's access to shop-web: the shared credential CI bot was disabled.",
     revokedAt: '2026-11-19T10:00:00Z',
-    hostTold: true,
+    delivery: 'SENT' as const,
   };
 
   it('says why the git access went, and whether the host could drop it', () => {
     expect(revokedNote(WEB)).toBeNull();
     expect(revokedNote({ ...WEB, gitRevoked: revoked })).toBe(revoked.message);
-    expect(revokedNote({ ...WEB, gitRevoked: { ...revoked, hostTold: false } })).toContain(
-      'the run kept it until it ended',
+    expect(revokedNote({ ...WEB, gitRevoked: { ...revoked, delivery: 'PENDING' } })).toContain(
+      'It is told when it reconnects, before it pushes',
+    );
+    expect(revokedNote({ ...WEB, gitRevoked: { ...revoked, delivery: 'UNSUPPORTED' } })).toContain(
+      'cannot drop a token (an older version), so the run keeps its git access until it ends',
     );
     expect(gitResult({ ...WEB, commits: 2, gitRevoked: revoked }, false)).toBe(
       '2 commits, not pushed (access revoked)',

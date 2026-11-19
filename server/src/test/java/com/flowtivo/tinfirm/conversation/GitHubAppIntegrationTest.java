@@ -151,6 +151,59 @@ class GitHubAppIntegrationTest extends ConversationTestBench {
         assertThat(bench.owner().get(path).status()).isEqualTo(404);
     }
 
+    @Test
+    void anotherAppIsRefusedWhileAnInstallationsCredentialRemainsAndTheSameAppsKeyIsReplaced() {
+        Bench bench = bench(false);
+        GitHubAppStub app = GitHubAppStub.create(515151);
+        UUID[] git = gitHub(bench, app, "https://localhost/acme/shop");
+        String path = bench.path("/systems/" + git[0] + "/github-app");
+        UUID credential = appCredential(bench, app, git[0], 21, "WRITE");
+
+        // The same App's key again: its rotation.
+        ApiResponse rotated = bench.owner().put(path, Map.of("appId", app.appId(), "privateKey", app.privateKeyPem()));
+        assertThat(rotated.status()).as("%s", rotated).isEqualTo(200);
+
+        // Another App on the same GitHub: its credential stands for an installation of the first.
+        app.answersAs(616161);
+        ApiResponse other = bench.owner().put(path, Map.of("appId", 616161, "privateKey", app.privateKeyPem()));
+        assertThat(other.status()).as("%s", other).isEqualTo(409);
+        assertThat(other.problemCode()).isEqualTo("GITHUB_APP_IN_USE");
+        assertThat(bench.owner().get(path).json().get("appId").asLong()).isEqualTo(app.appId());
+
+        // Once the credential is gone, another App may be set.
+        assertThat(bench.owner().delete(bench.path("/systems/" + git[0] + "/credentials/" + credential)).status())
+            .isEqualTo(204);
+        ApiResponse set = bench.owner().put(path, Map.of("appId", 616161, "privateKey", app.privateKeyPem()));
+        assertThat(set.status()).as("%s", set).isEqualTo(200);
+        assertThat(set.json().get("appId").asLong()).isEqualTo(616161);
+    }
+
+    @Test
+    void anInstallationVerifiedForAnAppReplacedMeanwhileIsNotStored() throws Exception {
+        Bench bench = bench(false);
+        GitHubAppStub app = GitHubAppStub.create(717171);
+        UUID[] git = gitHub(bench, app, "https://localhost/acme/shop");
+        String path = bench.path("/systems/" + git[0] + "/github-app");
+        assertThat(bench.owner().put(path, Map.of("appId", app.appId(), "privateKey", app.privateKeyPem())).status())
+            .isEqualTo(200);
+        app.installationSlowly(31, "acme", INSTALLED, 2000);
+        java.util.concurrent.CompletableFuture<ApiResponse> adding = java.util.concurrent.CompletableFuture
+            .supplyAsync(() -> bench.owner().post(bench.path("/systems/" + git[0] + "/credentials/app"),
+                    Map.of("name", unique("Acme App"), "installationId", 31)));
+        // While GitHub answers for the first App, an admin sets another one on the system.
+        await().atMost(WAIT).until(() -> app.installationAsked(31) > 0);
+        app.answersAs(818181);
+        ApiResponse replaced = bench.owner().put(path, Map.of("appId", 818181, "privateKey", app.privateKeyPem()));
+        assertThat(replaced.status()).as("%s", replaced).isEqualTo(200);
+
+        ApiResponse added = adding.get(30, java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(added.status()).as("%s", added).isEqualTo(409);
+        assertThat(added.problemCode()).isEqualTo("GITHUB_APP_CHANGED");
+        // Nothing was stored: no credential of kind APP on the system.
+        assertThat(bench.owner().get(bench.path("/systems/" + git[0] + "/credentials")).json().toString())
+            .doesNotContain("\"APP\"");
+    }
+
     // ---- A run's own tokens -----------------------------------------------------------------------------------------
 
     @Test

@@ -2,7 +2,9 @@ package com.flowtivo.tinfirm.run.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.UUID;
 
 import org.junit.jupiter.api.Test;
 
@@ -25,5 +27,23 @@ class GitRevocationMessageTest {
     void staysWithinTheProtocolsLength() {
         String message = GitRevocationService.message(List.of("x".repeat(900), "y".repeat(900)), "why");
         assertThat(message).hasSize(RunnerMessages.MAX_GIT_REVOKE_MESSAGE).endsWith("…");
+    }
+
+    @Test
+    void cutsOnACodePointWhenAnEmojiEndsAtTheCut() {
+        String prefix = "Tinfirm revoked this run's access to ";
+        // The emoji's two UTF-16 units are the 999th and 1000th characters: a cut at 999 would split them.
+        String name = "x".repeat(RunnerMessages.MAX_GIT_REVOKE_MESSAGE - 2 - prefix.length()) + "\uD83D\uDE00"
+                + "y".repeat(50);
+        String message = GitRevocationService.message(List.of(name), "why");
+        assertThat(message).endsWith("x…").hasSizeLessThanOrEqualTo(RunnerMessages.MAX_GIT_REVOKE_MESSAGE);
+        assertThat(new String(message.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8)).isEqualTo(message);
+        // The frame takes it, and so does the codec.
+        assertThat(new RunnerMessages.RunGitRevoke(UUID.randomUUID(), 1, List.of(UUID.randomUUID()), "SUSPENDED",
+                message).message()).isEqualTo(message);
+
+        // One unit earlier, the emoji is whole before the cut and stays.
+        String whole = GitRevocationService.message(List.of(name.substring(1)), "why");
+        assertThat(whole).hasSize(RunnerMessages.MAX_GIT_REVOKE_MESSAGE).endsWith("\uD83D\uDE00…");
     }
 }

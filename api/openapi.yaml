@@ -1813,8 +1813,11 @@ paths:
         (`SYSTEM_GITHUB_APP_KEY`), write-only: an admin rotates it by setting it again. Works on github.com
         (`https://api.github.com`) and on GitHub Enterprise Server (`https://{host}/api/v3`; untested against a real
         one). The system's OAuth app for members' sign-in is a different thing and stays as it is. Audited as
-        `system.github_app_set`, never with the key. Problems: 400 VALIDATION_FAILED; 400 SYSTEM_KIND_INVALID (not a
-        company `GITHUB` system); 400 GITHUB_APP_REFUSED; 409 SYSTEM_PAUSED.
+        `system.github_app_set`, never with the key. Another `appId` than the system's App is refused while a credential
+        of kind `APP` remains on the system (409 GITHUB_APP_IN_USE, with `details.credentials`): such a credential is an
+        installation of the App it was added for. The same `appId` with a new key is the key's rotation, always
+        allowed. Problems: 400 VALIDATION_FAILED; 400 SYSTEM_KIND_INVALID (not a company `GITHUB` system); 400
+        GITHUB_APP_REFUSED; 409 GITHUB_APP_IN_USE; 409 SYSTEM_PAUSED.
       requestBody:
         required: true
         content:
@@ -1886,8 +1889,10 @@ paths:
         token of its own, limited to the run's repositories and to `contents` and `pull_requests`, never kept.
         Audited as `account.connected` with the credential's name. Problems as for `addSystemCredential`; 400
         SYSTEM_KIND_INVALID (not a `GITHUB` system); 409 GITHUB_APP_REQUIRED (the system has no App); 400
-        GITHUB_APP_REFUSED (GitHub does not know the installation for the App); 409 DUPLICATE_INSTALLATION (a
-        credential of the system is that installation already).
+        GITHUB_APP_REFUSED (GitHub does not know the installation for the App); 409 GITHUB_APP_CHANGED (the system's
+        App was replaced while Tinfirm asked GitHub: an installation verified for one App is never stored as
+        another's; choose it again from the App's installations); 409 DUPLICATE_INSTALLATION (a credential of the
+        system is that installation already).
       requestBody:
         required: true
         content:
@@ -7290,8 +7295,8 @@ components:
           type: string
           description: |
             Stable machine-readable error code (CONVENTIONS §6), e.g. `LAST_OWNER` or `DUPLICATE_EMAIL`, or
-            GitHub Apps (ADR-0116): `GITHUB_APP_REFUSED` (400), `GITHUB_APP_IN_USE`, `GITHUB_APP_REQUIRED` and
-            `DUPLICATE_INSTALLATION` (409), `GITHUB_UNREACHABLE` (502). Or
+            GitHub Apps (ADR-0116): `GITHUB_APP_REFUSED` (400), `GITHUB_APP_IN_USE`, `GITHUB_APP_REQUIRED`,
+            `GITHUB_APP_CHANGED` and `DUPLICATE_INSTALLATION` (409), `GITHUB_UNREACHABLE` (502). Or
             `DUPLICATE_GROUP_NAME` (409, ADR-0049). Package 6's audit and retention: `AUDIT_EXPORT_TOO_LARGE` (400),
             `RETENTION_INVALID` (400), `ERASURE_NOT_ALLOWED` (409), `ON_HOLD` (409, with `holdIds`),
             `CONTENT_PURGED` (410). Package R: `IDEMPOTENCY_KEY_REUSED` (422, an `Idempotency-Key` sent before
@@ -11432,7 +11437,7 @@ components:
         failed its check, its system was paused, a trigger's binding followed another credential, or a renewal was
         refused. A host that took the revocation refuses the agent's next fetch and does not push the repository; the
         run's failure says so when it had commits to push.
-      required: [reason, message, revokedAt, hostTold]
+      required: [reason, message, revokedAt, delivery]
       properties:
         reason:
           type: string
@@ -11443,11 +11448,15 @@ components:
           example: RECONNECT_COMPANY
         message: { type: string, description: "The text the run's host got, for its log and the agent" }
         revokedAt: { type: string, format: date-time }
-        hostTold:
-          type: boolean
+        delivery:
+          type: string
+          enum: [SENT, PENDING, UNSUPPORTED]
           description: >-
-            Whether the run's host was told. False while it was not connected, and for good when it does not take
-            revocations (an older runner host): the run then kept the token until it ended.
+            Whether the run's host heard of it. `SENT`: the revocation was written to the host's connection. `PENDING`:
+            the host was not connected, or the send failed; the revocation goes when the host reconnects, before it
+            can push the run's work. `UNSUPPORTED`: the host cannot drop a token (an older runner host), so the run
+            keeps its git access until it ends.
+          example: SENT
     RunCounts:
       type: object
       description: The work of a finished run as its transcript shows it

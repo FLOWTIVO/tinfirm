@@ -63,12 +63,47 @@ public interface TurnSource {
      * a token that no revocation finds, since the run's {@code run_repository} rows are written only here. Locks the
      * workspace's systems {@code FOR SHARE} in the order of their ids, then the conversation's row (CONVENTIONS §10):
      * a pause, which locks its system first, and a binding's change, which locks the conversation first, either commit
-     * before this reads, or find the rows once it has committed. Answers why the assignment may not be sent, in words,
-     * or empty when it may.
+     * before this reads, or find the rows once it has committed. A binding whose version is no longer the one its
+     * token was revealed at ({@link Workspace#bindingVersion}) fails too: it followed another credential, or waited
+     * and was bound again, since the reveal. Answers why the assignment may not be sent, in words, or empty when it
+     * may.
      */
     default java.util.Optional<String> workspaceRevoked(UUID companyId, UUID conversationId,
             List<Workspace> workspaces) {
         return java.util.Optional.empty();
+    }
+
+    /**
+     * The repositories of a run's assignment whose git token the server would not let its host use now (ADR-0116,
+     * decision 1): its system removed or paused, its binding no longer {@code BOUND}, or at another version than the
+     * token was revealed at. For a run that a host reports and the server no longer tracks (it ended, or was lost
+     * longer ago than the resume window), before the host is told to cancel it, since a cancelled run pushes its work.
+     * In the caller's transaction; reads only, and locks nothing.
+     */
+    default List<GitAccessGone> gitAccessGone(UUID companyId, List<ClonedRepository> repositories) {
+        return List.of();
+    }
+
+    /**
+     * A repository a run's assignment cloned with a binding's token, as its {@code run_repository} row says.
+     *
+     * @param systemId       null once the system was removed
+     * @param bindingVersion the binding's version the token was revealed at; null for a row from before V087
+     */
+    record ClonedRepository(UUID componentId, @Nullable UUID systemId, UUID bindingId, @Nullable Long bindingVersion) {
+    }
+
+    /**
+     * Why a run may no longer use a repository's git token.
+     *
+     * @param reason    a code, as {@code run.git.revoke.reason}: the binding's reason, {@code SYSTEM_PAUSED},
+     *                  {@code SYSTEM_REMOVED} or {@code BINDING_CHANGED}
+     * @param why       the cause in words, which ends the revocation's message
+     * @param bindingId the binding, for the audit; null when the system is the cause
+     * @param systemId  the system, for the audit, when it is the cause
+     */
+    record GitAccessGone(UUID componentId, String reason, String why, @Nullable UUID bindingId,
+            @Nullable UUID systemId) {
     }
 
     /**
@@ -269,17 +304,28 @@ public interface TurnSource {
      * @param readOnly      cloned, never pushed, no change request (I9)
      * @param readOnlyCause why, when read-only: the agent's access, the binding's read-only grant, or an approval that
      *                      gave {@code READ}
-     * @param git           the token of the binding's account, for clone and push; null for a public repository
-     * @param authorName    the commits' author: {@code {Person} via Tinfirm agent {agent}}
+     * @param git            the token of the binding's account, for clone and push; null for a public repository
+     * @param authorName     the commits' author: {@code {Person} via Tinfirm agent {agent}}
+     * @param bindingVersion the binding's version as the gate checked it when it revealed {@code git} (ADR-0116); the
+     *                       third phase sends the token only while the binding is still at it. Null without a token
      */
     record Workspace(UUID repositoryId, UUID systemId, @Nullable UUID bindingId, String name, String url,
             String defaultBranch, boolean readOnly, @Nullable ReadOnlyCause readOnlyCause,
-            RunnerMessages.@Nullable GitCredentials git, String authorName, String authorEmail) {
+            RunnerMessages.@Nullable GitCredentials git, String authorName, String authorEmail,
+            @Nullable Long bindingVersion) {
 
         public Workspace {
             if (readOnly != (readOnlyCause != null)) {
                 throw new IllegalArgumentException("A read-only repository says why, and only one");
             }
+        }
+
+        /** A repository without the version of its binding. */
+        public Workspace(UUID repositoryId, UUID systemId, @Nullable UUID bindingId, String name, String url,
+                String defaultBranch, boolean readOnly, @Nullable ReadOnlyCause readOnlyCause,
+                RunnerMessages.@Nullable GitCredentials git, String authorName, String authorEmail) {
+            this(repositoryId, systemId, bindingId, name, url, defaultBranch, readOnly, readOnlyCause, git, authorName,
+                    authorEmail, null);
         }
     }
 

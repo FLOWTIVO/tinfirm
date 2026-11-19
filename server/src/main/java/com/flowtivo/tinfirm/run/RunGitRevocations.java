@@ -34,6 +34,13 @@ public interface RunGitRevocations {
     String REFRESH_REFUSED = "REFRESH_REFUSED";
 
     /**
+     * The reason of a revocation that a host's {@code hello} finds for a run the server no longer tracks: the binding
+     * holds, but no longer at the version the run's token was revealed at (it followed another credential, or waited
+     * and was bound again).
+     */
+    String BINDING_CHANGED = "BINDING_CHANGED";
+
+    /**
      * The runs whose repositories the binding's account cloned.
      *
      * @param reason a code: the binding's reason, or {@link #CREDENTIAL_REPLACED}

@@ -1842,7 +1842,7 @@
       }
     },
     "RunGitRevoke": {
-      "description": "Server -> runner host, only to a host whose hello lists the feature `run.git.revoke` (ADR-0116): the server no longer lets this run use the git tokens of the repositories named, because the conversation's binding to their system failed its check, the system was paused, a trigger's binding follows another credential, or a renewal was refused for good. The server sends it after the change's commit, and again at every `hello` that lists the run, until the run ends; there is no ack. For a run of its current epoch the host drops each named repository's token from its holder, its git proxy's route and its own git, writes its take-back record again without it, answers the git proxy's next request for the repository with 403 and the message as plain text, attempts neither a clone, a mirror fetch nor the push of that repository afterwards (a repository with commits ahead fails the run `GIT_ERROR` with `<repository>: not pushed: <message>`, its `git` result `pushed: false`), keeps the token on the run's redaction list, and reports a LOG event at `warn` with the message. A frame for a repository already revoked changes nothing, and the host sends nothing for one of another epoch or an unknown run (unlike a `run.cancel`, which it answers `error` `UNKNOWN_RUN`): it ignores it. The repositories it does not name go on as before. A request already under way with the token finishes.",
+      "description": "Server -> runner host, only to a host whose hello lists the feature `run.git.revoke` (ADR-0116): the server no longer lets this run use the git tokens of the repositories named, because the conversation's binding to their system failed its check, the system was paused, a trigger's binding follows another credential, or a renewal was refused for good. The server sends it after the change's commit (to the host of a lost run too, when it is connected), again at every `hello` that lists the run until the run ends, again when the host accepts the run or resumes it with a heartbeat, and before any `run.cancel` of a run that a `hello`, a heartbeat or a `run.accepted` reports, for that report's epoch, also once the run ended: then for every revocation recorded for that assignment, and, but for a heartbeat of an earlier epoch, for each repository whose binding or system the server would not let the run use now (a cancelled run pushes its work); there is no ack. For a run of its current epoch the host drops each named repository's token from its holder, its git proxy's route and its own git, writes its take-back record again without it, answers the git proxy's next request for the repository with 403 and the message as plain text, attempts neither a clone, a mirror fetch nor the push of that repository afterwards (a repository with commits ahead fails the run `GIT_ERROR` with `<repository>: not pushed: <message>`, its `git` result `pushed: false`), keeps the token on the run's redaction list, and reports a LOG event at `warn` with the message. A frame for a repository already revoked changes nothing, and the host sends nothing for one of another epoch or an unknown run (unlike a `run.cancel`, which it answers `error` `UNKNOWN_RUN`): it ignores it. The repositories it does not name go on as before. A request already under way with the token finishes.",
       "type": "object",
       "required": [
         "type",
@@ -1875,7 +1875,7 @@
         "reason": {
           "type": "string",
           "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
-          "description": "Why, as a code: the binding's reason, or SYSTEM_PAUSED, CREDENTIAL_REPLACED or REFRESH_REFUSED. The host logs it and decides nothing from it; a code it does not know is no error.",
+          "description": "Why, as a code: the binding's reason, or SYSTEM_PAUSED, CREDENTIAL_REPLACED, REFRESH_REFUSED or BINDING_CHANGED (found at a host's report of a run the server no longer tracks: the binding holds, but changed since the run cloned the repository). The host logs it and decides nothing from it; a code it does not know is no error.",
           "examples": [
             "RECONNECT_YOURS",
             "RECONNECT_COMPANY",
@@ -1888,7 +1888,8 @@
             "SYSTEM_REMOVED",
             "SYSTEM_PAUSED",
             "CREDENTIAL_REPLACED",
-            "REFRESH_REFUSED"
+            "REFRESH_REFUSED",
+            "BINDING_CHANGED"
           ]
         },
         "message": {
@@ -1900,7 +1901,7 @@
       }
     },
     "WelcomeDone": {
-      "description": "Server -> runner host, only to a host whose hello lists the feature `run.git.revoke` (ADR-0116), once per connection: the last frame of the server's answer to the hello, after everything it sends again for the runs the hello listed (the pending `run.git.revoke`, then `run.cancel`, and any other). It promises that every pending revocation of the runs the hello listed has been sent on this connection before it. Sent also when the hello lists no run and nothing is sent again. A host that took a run back pushes the run's work only after it, when `welcome.features` lists `run.git.revoke`; one that gets no `welcome.done` within 2 minutes pushes with what its take-back record holds and logs a warning, as it does without a connection. A host of protocol 1 never gets it, and answers an unknown type with `error` `UNKNOWN_TYPE`.",
+      "description": "Server -> runner host, only to a host whose hello lists the feature `run.git.revoke` (ADR-0116), once per connection: the last frame of the server's answer to the hello, after everything it sends again for the runs the hello listed (the pending `run.git.revoke`, then `run.cancel`, and any other). It promises that the revocations of the runs the hello listed that the server held when it reconciled the hello (committed before the reconciliation read them, under the runs' locks) went on this connection before it, those of runs it cancels included. A revocation that commits after that read is sent after its commit, as any other, and may arrive after `welcome.done`: the host applies it when it arrives, and a push already under way finishes. Sent also when the hello lists no run and nothing is sent again. A host that took a run back pushes the run's work only after it, when `welcome.features` lists `run.git.revoke`; one that gets no `welcome.done` within 2 minutes pushes with what its take-back record holds and logs a warning, as it does without a connection. A host of protocol 1 never gets it, and answers an unknown type with `error` `UNKNOWN_TYPE`.",
       "type": "object",
       "required": [
         "type"

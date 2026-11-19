@@ -44,6 +44,15 @@ class GitHubAppStore {
             .optional();
     }
 
+    /** The row, locked {@code FOR SHARE}: no {@code PUT} or {@code DELETE} of the App passes until the commit. */
+    Optional<AppRow> lockShared(UUID companyId, UUID systemId) {
+        return jdbc.sql("SELECT " + COLUMNS + " FROM system_github_app WHERE company_id = ? AND system_id = ?"
+                + " FOR SHARE")
+            .params(companyId, systemId)
+            .query(GitHubAppStore::row)
+            .optional();
+    }
+
     Optional<AppRow> withSecret(UUID companyId, UUID secretId) {
         return jdbc.sql("SELECT " + COLUMNS
                 + " FROM system_github_app WHERE company_id = ? AND private_key_secret_id = ?")

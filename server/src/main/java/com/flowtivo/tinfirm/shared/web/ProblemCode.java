@@ -166,6 +166,11 @@ public enum ProblemCode {
     GITHUB_APP_IN_USE,
     /** 409: the {@code GITHUB} system has no GitHub App, which an installation's credential needs (ADR-0116). */
     GITHUB_APP_REQUIRED,
+    /**
+     * 409: the system's GitHub App was replaced while Tinfirm asked GitHub for an installation, which is not stored as
+     * the new App's (ADR-0116).
+     */
+    GITHUB_APP_CHANGED,
     /** 409: a credential of the system is that installation of its GitHub App already (ADR-0116). */
     DUPLICATE_INSTALLATION,
     /** 502: Tinfirm could not ask GitHub for the App's installations (ADR-0116). */

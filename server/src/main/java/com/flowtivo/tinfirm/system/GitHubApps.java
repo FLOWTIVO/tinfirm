@@ -23,8 +23,21 @@ public interface GitHubApps {
     /** The system's App, in the caller's transaction; empty without one. */
     Optional<App> app(UUID companyId, UUID systemId);
 
+    /**
+     * The system's App, locked {@code FOR SHARE} until the caller's transaction ends, so that no other App or removal
+     * commits before it (ADR-0116); empty without one.
+     */
+    Optional<App> lockApp(UUID companyId, UUID systemId);
+
     /** An installation of the system's App, as GitHub answers it; fails {@code NOT_FOUND} without an App. */
     CallResult<Installation> installation(SystemInfo system, long installationId);
+
+    /**
+     * An installation of the App {@code expected}, as GitHub answers it, asked with that App's key only: fails
+     * {@code OTHER} when the system's App is another one now ({@link App#sameApp}), and {@code NOT_FOUND} without
+     * an App. So that what is verified is what the caller stores under the App it read.
+     */
+    CallResult<Installation> installation(SystemInfo system, App expected, long installationId);
 
     /**
      * Mints an installation access token at GitHub ({@code POST /app/installations/{id}/access_tokens}).
@@ -38,8 +51,18 @@ public interface GitHubApps {
     CallResult<InstallationToken> mint(SystemInfo system, long installationId, @Nullable List<String> repositories,
             Map<String, String> permissions, String purpose);
 
-    /** A system's App, without its key. */
-    record App(UUID systemId, long appId, @Nullable String slug, @Nullable String name, Instant setAt) {
+    /**
+     * A system's App, without its key.
+     *
+     * @param keyId the vault secret that holds its key: replacing the key of the same App keeps it, removing the App
+     *              and setting one again makes another
+     */
+    record App(UUID systemId, long appId, @Nullable String slug, @Nullable String name, Instant setAt, UUID keyId) {
+
+        /** Whether the other is this App with this key's secret: the same id, never removed and set again since. */
+        public boolean sameApp(App other) {
+            return systemId.equals(other.systemId) && appId == other.appId && keyId.equals(other.keyId);
+        }
     }
 
     /**

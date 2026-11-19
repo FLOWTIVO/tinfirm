@@ -117,8 +117,17 @@ class RunPresenter {
                     && revocation.componentIds().contains(repository.componentId()))
             .findFirst()
             .map(revocation -> new RunViews.GitRevocationDetails(revocation.reason(), revocation.message(),
-                    revocation.createdAt(), revocation.lastSentAt() != null))
+                    revocation.createdAt(), delivery(revocation)))
             .orElse(null);
+    }
+
+    /** The API's {@code RunGitRevocation.delivery}: what was written to the host's connection, not what was meant. */
+    static String delivery(RunCommandStore.GitRevocation revocation) {
+        return switch (revocation.delivery()) {
+            case RunCommandStore.SENT -> "SENT";
+            case "UNSUPPORTED" -> "UNSUPPORTED";
+            default -> "PENDING";
+        };
     }
 
     /** The run's result, whose summary is the run's summary; null without {@code finish}. */

@@ -129,8 +129,18 @@ Inside:
 Problems: `400 GITHUB_APP_REFUSED` (GitHub refused the id and key, or does not know the
 installation), `400 SYSTEM_KIND_INVALID` (not a company GitHub system; a token or sign-in on an
 installation's credential), `409 GITHUB_APP_REQUIRED`, `409 DUPLICATE_INSTALLATION`,
-`409 GITHUB_APP_IN_USE` (remove the installations' credentials first), `409 SYSTEM_PAUSED`,
-`502 GITHUB_UNREACHABLE`.
+`409 GITHUB_APP_IN_USE` (remove the installations' credentials first), `409 GITHUB_APP_CHANGED`,
+`409 SYSTEM_PAUSED`, `502 GITHUB_UNREACHABLE`.
+
+- **Another App on the system.** A `PUT` with another `appId` than the system's App is
+  `409 GITHUB_APP_IN_USE` while a credential of kind `APP` remains: each is an installation of the
+  App it was added for, and another App's key would mint for it, or fail. The same `appId` with a
+  new key is the key's rotation, always allowed. Remove the installations' credentials, then set
+  the other App, then add its installations.
+- **Adding an installation while the App changes.** Tinfirm asks GitHub for the installation with
+  the key of the App it read first, and stores the credential only while the system's App is still
+  that one (the same id, and the same key secret: not removed and set again). Otherwise it answers
+  `409 GITHUB_APP_CHANGED` and stores nothing; choose the installation again.
 
 ## 4. Credentials
 

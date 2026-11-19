@@ -26,15 +26,21 @@ export const READ_ONLY_CAUSES: Record<NonNullable<RunRepository['readOnlyCause']
 };
 
 /**
- * What a revocation of a repository's git token meant for the run (ADR-0116): the host dropped it,
- * or, on a host that cannot, the run kept it until it ended.
+ * What a revocation of a repository's git token meant for the run (ADR-0116): the host was told;
+ * it was not connected, and is told when it reconnects, before it pushes; or it cannot drop a
+ * token, and the run keeps it until it ends.
  */
 export function revokedNote(repo: RunRepository): string | null {
   const revoked = repo.gitRevoked;
   if (!revoked) return null;
-  return revoked.hostTold
-    ? revoked.message
-    : `${revoked.message} The runner host was not told: it was not connected, or it cannot drop a token, and the run kept it until it ended.`;
+  switch (revoked.delivery) {
+    case 'SENT':
+      return revoked.message;
+    case 'UNSUPPORTED':
+      return `${revoked.message} The runner host cannot drop a token (an older version), so the run keeps its git access until it ends.`;
+    default:
+      return `${revoked.message} The runner host has not been told yet: it was not connected. It is told when it reconnects, before it pushes this run's work.`;
+  }
 }
 
 /**

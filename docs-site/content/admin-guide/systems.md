@@ -131,7 +131,9 @@ Before you start, ask your operator to upgrade the runner hosts: a run on an App
 5. In Tinfirm, on the GitHub system's page, under **GitHub App**, choose **Set up the App**, enter the App ID, paste the whole `.pem` file, and choose **Check and save**. Tinfirm asks GitHub for the App with the key. The key goes to the vault; nobody sees it again.
 6. Under **Credentials**, choose **Add credential**, then **GitHub App installation**, and pick the installation. Lend the new credential to groups or service accounts like any other.
 
-To rotate the key, generate a new one at GitHub, choose **Replace the key** and paste it, then delete the old key at GitHub. To remove the App, remove its installations' credentials first.
+To rotate the key, generate a new one at GitHub, choose **Replace the key** and paste it, then delete the old key at GitHub. To remove the App, or to set another App in its place, remove its installations' credentials first: each one stands for an installation of the App it was added for, so Tinfirm refuses another App ID while one remains. If the App is replaced while you add an installation, Tinfirm does not add it: pick the installation again from the new App's list.
+
+A revoked run loses the App's token on its runner host at once, but the token itself stays valid at GitHub until its hour ends: Tinfirm keeps no run's token, and does not ask GitHub to revoke it.
 
 A repository on another GitHub account, or one the installation does not include, cannot be worked on through it: the turn ends with a message that names the repository. Install the App there, and retry.
 
@@ -300,9 +302,11 @@ What a revocation does not stop:
 
 - a fetch or push already under way;
 - what the agent's sandbox has already cloned or read;
-- the token itself at the code host. Tinfirm cannot rotate a member's personal access token: when it may have been copied, rotate it at GitHub or GitLab.
+- the token itself at the code host. Tinfirm cannot rotate a member's personal access token: when it may have been copied, rotate it at GitHub or GitLab. A GitHub App's token stays valid at GitHub until its hour ends.
 
-A runner host of an older release cannot drop a token. Its turns keep their access until they end, the conversation says so, and the run page shows that the host was not told. Ask your operator to upgrade the runner hosts.
+When the runner host is not connected, it is told when it reconnects, before it can push the turn's work, and the run page says so until then. This holds also for a turn that ended, or was lost, while the host was away: a host that comes back with such a turn is told before it is told to cancel it.
+
+A runner host of an older release cannot drop a token. Its turns keep their access until they end, the conversation says so, and the run page says that the host cannot drop a token. Ask your operator to upgrade the runner hosts.
 
 ## The three switches
 

@@ -32,6 +32,7 @@ import com.flowtivo.tinfirm.conversation.ConversationBindings;
 import com.flowtivo.tinfirm.conversation.ConversationInfo;
 import com.flowtivo.tinfirm.model.Hosts;
 import com.flowtivo.tinfirm.principal.Principals;
+import com.flowtivo.tinfirm.run.RunGitRevocations;
 import com.flowtivo.tinfirm.run.RunInfo;
 import com.flowtivo.tinfirm.run.RunPlacementStale;
 import com.flowtivo.tinfirm.run.RunReads;
@@ -273,8 +274,58 @@ class TurnSourceImpl implements TurnSource {
                 return java.util.Optional.of(repository.name() + ": "
                         + (binding != null ? texts.text(binding) : system.name() + " is not connected."));
             }
+            if (repository.bindingVersion() != null && repository.bindingVersion() != binding.version()) {
+                // The token is the one the gate revealed: the binding followed another credential, or waited and was
+                // bound again, since (ADR-0116). The next pass reveals the binding's token as it is now.
+                return java.util.Optional.of(repository.name() + ": the conversation's account on " + system.name()
+                        + " changed while the turn was prepared; it is prepared again.");
+            }
         }
         return java.util.Optional.empty();
+    }
+
+    /**
+     * ADR-0116, decision 1: what the server would refuse a run's host now, for a run it no longer tracks. Reads the
+     * systems and the bindings without a lock: the caller's hello holds the run, and a change that commits after this
+     * read concerns a cancelled run that its host reports again at its next hello.
+     */
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public List<GitAccessGone> gitAccessGone(UUID companyId, List<ClonedRepository> repositories) {
+        Set<UUID> systemIds = new HashSet<>();
+        repositories.stream().map(ClonedRepository::systemId).filter(Objects::nonNull).forEach(systemIds::add);
+        Map<UUID, SystemInfo> found = systems.findAll(companyId, systemIds);
+        List<GitAccessGone> gone = new ArrayList<>();
+        for (ClonedRepository repository : repositories) {
+            SystemInfo system = repository.systemId() != null ? found.get(repository.systemId()) : null;
+            if (system == null) {
+                gone.add(new GitAccessGone(repository.componentId(), BindingInfo.Reason.SYSTEM_REMOVED.name(),
+                        "the repository's system was removed", null, repository.systemId()));
+                continue;
+            }
+            if (system.paused()) {
+                gone.add(new GitAccessGone(repository.componentId(), RunGitRevocations.SYSTEM_PAUSED,
+                        system.name() + " was paused by an admin", null, system.id()));
+                continue;
+            }
+            BindingInfo binding = bindings.find(companyId, repository.bindingId()).orElse(null);
+            if (binding == null) {
+                gone.add(new GitAccessGone(repository.componentId(), BindingInfo.Reason.ACCOUNT_REMOVED.name(),
+                        "the conversation's account on " + system.name() + " is gone", repository.bindingId(),
+                        null));
+            }
+            else if (!binding.bound()) {
+                BindingInfo.Reason reason = binding.reason() != null ? binding.reason() : BindingInfo.Reason.NONE;
+                gone.add(new GitAccessGone(repository.componentId(), reason.name(), texts.revoked(binding),
+                        binding.id(), null));
+            }
+            else if (repository.bindingVersion() != null && repository.bindingVersion() != binding.version()) {
+                gone.add(new GitAccessGone(repository.componentId(), RunGitRevocations.BINDING_CHANGED,
+                        "the conversation's account on " + system.name() + " changed after the run cloned it",
+                        binding.id(), null));
+            }
+        }
+        return gone;
     }
 
     /**
@@ -378,7 +429,7 @@ class TurnSourceImpl implements TurnSource {
                         repository.name(), repository.url(), repository.defaultBranch(), readOnly, cause,
                         new RunnerMessages.GitCredentials(gitUsername(SystemKind.GITHUB), token.token(),
                                 token.expiresAt().toString(), mirrorKey(companyId, app.account().id())),
-                        authorName, authorEmail));
+                        authorName, authorEmail, app.binding().version()));
                 continue;
             }
             if (!(use instanceof ConversationBindings.BindingUse.Token token)) {
@@ -394,7 +445,7 @@ class TurnSourceImpl implements TurnSource {
                     repository.name(), repository.url(), repository.defaultBranch(), readOnly, cause,
                     new RunnerMessages.GitCredentials(gitUsername(system != null ? system.kind() : SystemKind.GIT),
                             token.credential().credential().token()),
-                    authorName, authorEmail));
+                    authorName, authorEmail, token.binding().version()));
         }
 
         PromptRenderer.Context promptContext = prepared.context();

@@ -416,22 +416,28 @@ class AccountService {
      * for it ({@code 400 GITHUB_APP_REFUSED}), which no credential of the system is yet
      * ({@code 409 DUPLICATE_INSTALLATION}). Its login is the installation account's; its identity
      * {@code installation:{id}}. GitHub is asked between the transaction that authorises the caller and the one that
-     * stores the credential; no token is minted now.
+     * stores the credential, with the key of the App the first one read; the second stores it only while the system's
+     * App is still that one ({@link GitHubApps.App#sameApp}), else {@code 409 GITHUB_APP_CHANGED}: an installation
+     * verified for one App is never stored as another's. No token is minted now.
      */
     AccountStore.AccountRow storeApp(Supplier<Holder> authorise, long installationId) {
         if (installationId <= 0) {
             throw ApiException.invalid("installationId must be the installation's id, a positive number",
                     "installationId");
         }
-        Holder holder = inTransaction(() -> {
+        record Authorised(Holder holder, GitHubApps.App app) {
+        }
+        Authorised authorised = inTransaction(() -> {
             Holder found = authorise.get();
             requireConnectable(found, false);
-            requireAppInstallation(found, installationId);
-            return found;
+            return new Authorised(found, requireAppInstallation(found, installationId));
         });
-        CallResult<GitHubApps.Installation> installation = gitHubApps.installation(holder.system(), installationId);
+        Holder holder = authorised.holder();
+        CallResult<GitHubApps.Installation> installation = gitHubApps.installation(holder.system(), authorised.app(),
+                installationId);
         if (installation.failure() != null) {
             requireStillThere(holder, installation.failure());
+            inTransaction(() -> requireSameApp(holder, authorised.app()));
             CallResult.Kind kind = installation.failure().kind();
             if (kind == CallResult.Kind.UNAVAILABLE || kind == CallResult.Kind.RATE_LIMITED) {
                 throw new ApiException(org.springframework.http.HttpStatus.BAD_GATEWAY, ProblemCode.GITHUB_UNREACHABLE,
@@ -447,13 +453,35 @@ class AccountService {
             Holder current = again(holder);
             requireConnectable(current, false);
             requireAppInstallation(current, installationId);
+            requireSameApp(current, authorised.app());
             return save(current, AccountInfo.Kind.APP, new AppInstallationSecret(installationId, null, null).json(),
                     identity, null, null);
         });
     }
 
-    /** An installation: a new credential of a company GITHUB system with an App, no other credential of it. */
-    private void requireAppInstallation(Holder holder, long installationId) {
+    /**
+     * The system's App is still the one the installation was verified with, locked {@code FOR SHARE} until the commit
+     * so that no {@code PUT} or {@code DELETE} of the App passes it; else {@code 409 GITHUB_APP_CHANGED}.
+     */
+    private GitHubApps.App requireSameApp(Holder holder, GitHubApps.App verified) {
+        GitHubApps.App now = gitHubApps.lockApp(holder.companyId(), holder.system().id()).orElse(null);
+        if (now == null) {
+            throw ApiException.conflict(ProblemCode.GITHUB_APP_REQUIRED, holder.system().name() + " has no GitHub "
+                    + "App any more: it was removed while Tinfirm asked GitHub for the installation");
+        }
+        if (!verified.sameApp(now)) {
+            throw ApiException.conflict(ProblemCode.GITHUB_APP_CHANGED, holder.system().name() + "'s GitHub App was "
+                    + "replaced while Tinfirm asked GitHub for the installation: choose the installation again from "
+                    + "the App's list");
+        }
+        return now;
+    }
+
+    /**
+     * An installation: a new credential of a company GITHUB system with an App, no other credential of it. Answers the
+     * App.
+     */
+    private GitHubApps.App requireAppInstallation(Holder holder, long installationId) {
         if (!holder.credential() || holder.credentialId() != null) {
             throw ApiException.badRequest(ProblemCode.SYSTEM_KIND_INVALID, "An installation of a GitHub App is a new "
                     + "credential of the system's, never a member's own account");
@@ -462,7 +490,8 @@ class AccountService {
             throw ApiException.badRequest(ProblemCode.SYSTEM_KIND_INVALID, "A " + holder.system().kind().label()
                     + " system has no GitHub App: only a company GitHub system does");
         }
-        if (gitHubApps.app(holder.companyId(), holder.system().id()).isEmpty()) {
+        GitHubApps.App app = gitHubApps.app(holder.companyId(), holder.system().id()).orElse(null);
+        if (app == null) {
             throw ApiException.conflict(ProblemCode.GITHUB_APP_REQUIRED, holder.system().name() + " has no GitHub "
                     + "App: set it on the system's page first");
         }
@@ -470,6 +499,7 @@ class AccountService {
                 AppInstallationSecret.externalId(installationId)).isPresent()) {
             throw duplicateInstallation(installationId);
         }
+        return app;
     }
 
     static ApiException duplicateInstallation(long installationId) {

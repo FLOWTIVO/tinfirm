@@ -282,7 +282,7 @@ class RunDelivery {
                     : new TurnSource.Workspace(workspace.repositoryId(), workspace.systemId(), workspace.bindingId(),
                             workspace.name(), workspace.url(), workspace.defaultBranch(), workspace.readOnly(),
                             workspace.readOnlyCause(), workspace.git().withoutRefresh(), workspace.authorName(),
-                            workspace.authorEmail()))
+                            workspace.authorEmail(), workspace.bindingVersion()))
             .toList();
         return new TurnSource.TurnContent.Content(turn.title(), turn.prompt(), turn.resumePrompt(), workspaces,
                 turn.requestableRepositories(), turn.tools(), turn.platformTools(), turn.grantedHosts(),

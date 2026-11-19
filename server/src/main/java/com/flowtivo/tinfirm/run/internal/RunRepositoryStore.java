@@ -26,7 +26,7 @@ class RunRepositoryStore {
 
     private static final String COLUMNS = """
             run_id, position, repository_id, system_id, binding_id, name, dir, read_only, read_only_cause, pushed,
-            head_sha, commits, component_id, epoch""";
+            head_sha, commits, component_id, epoch, binding_version""";
 
     private final JdbcClient jdbc;
 
@@ -41,11 +41,13 @@ class RunRepositoryStore {
      *                    result
      * @param componentId the id {@code run.assign} named it by; null for a row from before V087 whose repository is gone
      * @param epoch       the assignment that wrote the row; null for a row from before V087
+     * @param bindingVersion the binding's version its git token was revealed at; null without a token, or before V087
      */
     record RepositoryRow(UUID runId, int position, @Nullable UUID repositoryId, @Nullable UUID systemId,
             @Nullable UUID bindingId, String name, String dir, boolean readOnly,
             TurnSource.@Nullable ReadOnlyCause readOnlyCause, @Nullable Boolean pushed, @Nullable String headSha,
-            @Nullable Integer commits, @Nullable UUID componentId, @Nullable Long epoch) {
+            @Nullable Integer commits, @Nullable UUID componentId, @Nullable Long epoch,
+            @Nullable Long bindingVersion) {
     }
 
     /**
@@ -55,12 +57,12 @@ class RunRepositoryStore {
     void insert(UUID companyId, UUID runId, long epoch, int position, TurnSource.Workspace workspace, String dir) {
         jdbc.sql("""
                 INSERT INTO run_repository (run_id, company_id, position, repository_id, system_id, binding_id, name,
-                                            dir, read_only, read_only_cause, component_id, epoch)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
+                                            dir, read_only, read_only_cause, component_id, epoch, binding_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
             .params(runId, companyId, position, workspace.repositoryId(), workspace.systemId(), workspace.bindingId(),
                     workspace.name(), dir, workspace.readOnly(),
                     workspace.readOnlyCause() != null ? workspace.readOnlyCause().name() : null,
-                    workspace.repositoryId(), epoch)
+                    workspace.repositoryId(), epoch, workspace.git() != null ? workspace.bindingVersion() : null)
             .update();
     }
 
@@ -115,6 +117,14 @@ class RunRepositoryStore {
     /** The workspace of an earlier assignment of the run goes: each assignment sends its own. */
     void deleteOfRun(UUID runId) {
         jdbc.sql("DELETE FROM run_repository WHERE run_id = ?").param(runId).update();
+    }
+
+    /** The repositories the run's assignment of {@code epoch} cloned, if its rows are still that assignment's. */
+    List<RepositoryRow> ofAssignment(UUID runId, long epoch) {
+        return jdbc.sql("SELECT " + COLUMNS + " FROM run_repository WHERE run_id = ? AND epoch = ? ORDER BY position")
+            .params(runId, epoch)
+            .query(RunRepositoryStore::row)
+            .list();
     }
 
     List<RepositoryRow> ofRun(UUID runId) {
@@ -174,6 +184,7 @@ class RunRepositoryStore {
                 rs.getObject("binding_id", UUID.class), rs.getString("name"), rs.getString("dir"),
                 rs.getBoolean("read_only"), cause != null ? TurnSource.ReadOnlyCause.valueOf(cause) : null,
                 rs.getObject("pushed", Boolean.class), rs.getString("head_sha"), rs.getObject("commits", Integer.class),
-                rs.getObject("component_id", UUID.class), rs.getObject("epoch", Long.class));
+                rs.getObject("component_id", UUID.class), rs.getObject("epoch", Long.class),
+                rs.getObject("binding_version", Long.class));
     }
 }

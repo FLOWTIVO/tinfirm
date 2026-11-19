@@ -150,6 +150,12 @@ public class TestTurns implements TurnSource, TurnEnded, RunRequests {
     }
 
     @Override
+    public List<GitAccessGone> gitAccessGone(UUID companyId, List<ClonedRepository> repositories) {
+        TurnSource real = real(TurnSource.class);
+        return real != null ? real.gitAccessGone(companyId, repositories) : List.of();
+    }
+
+    @Override
     public java.util.Optional<String> pausedWorkspaceSystem(TurnRef turn) {
         TurnSource real = real(TurnSource.class);
         return !scripted(turn.conversationId()) && real != null ? real.pausedWorkspaceSystem(turn)

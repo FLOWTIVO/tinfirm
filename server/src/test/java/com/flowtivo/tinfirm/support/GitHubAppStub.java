@@ -98,6 +98,31 @@ public final class GitHubAppStub {
             .willReturn(GitHubStub.json(200, body)));
     }
 
+    /** As {@link #installation}, answered only after {@code delayMillis}: a race with the call's caller. */
+    public void installationSlowly(long installationId, String login, Map<String, String> permissions,
+            int delayMillis) {
+        Map<String, Object> body = installationBody(installationId, login, permissions);
+        GitHubStub.server().stubFor(get(urlEqualTo(path + "/app/installations/" + installationId))
+            .willReturn(GitHubStub.json(200, body).withFixedDelay(delayMillis)));
+    }
+
+    /** How often the installation was asked for. */
+    public int installationAsked(long installationId) {
+        return GitHubStub.server().findAll(com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor(
+                urlEqualTo(path + "/app/installations/" + installationId))).size();
+    }
+
+    /**
+     * {@code GET /app} at this App's API base answers another App's id from now on: an admin who sets that App on the
+     * same system (the key is not checked by the fake).
+     */
+    public void answersAs(long otherAppId) {
+        GitHubStub.server().stubFor(get(urlEqualTo(path + "/app"))
+            .withHeader("Authorization", matching("Bearer .+"))
+            .willReturn(GitHubStub.json(200, Map.of("id", otherAppId, "slug", "tinfirm-other", "name",
+                    "Tinfirm other"))));
+    }
+
     /** The App's installations, as one page. */
     public void installations(List<Map<String, Object>> installations) {
         GitHubStub.server().stubFor(get(urlPathEqualTo(path + "/app/installations"))

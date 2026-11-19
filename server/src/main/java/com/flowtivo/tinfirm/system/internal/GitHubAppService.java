@@ -162,6 +162,16 @@ class GitHubAppService implements GitHubApps {
             SystemAccess.Caller caller = access.caller(companyId);
             SystemStore.SystemRow current = appSystem(caller, systemId);
             Optional<GitHubAppStore.AppRow> before = store.lock(companyId, systemId);
+            if (before.isPresent() && before.get().appId() != appId) {
+                // An installation's credential stands for an installation of the App an admin verified: another App's
+                // key would mint for it, or fail. Its key alone may be replaced (a rotation).
+                List<SystemAccounts.AppCredential> left = accounts.getObject().appCredentials(companyId, systemId);
+                if (!left.isEmpty()) {
+                    throw inUse(left, "of the App " + before.get().appId() + ": remove " + (left.size() == 1 ? "it"
+                            : "them") + " before you set another App, or set the App " + before.get().appId()
+                            + "'s key again.");
+                }
+            }
             UUID secretId = before.map(GitHubAppStore.AppRow::privateKeySecretId).orElse(null);
             if (secretId == null || !secrets.replace(companyId, secretId, pem)) {
                 secretId = secrets.create(companyId, KEY_SECRET_NAME, "The private key of the GitHub App of the "
@@ -190,11 +200,7 @@ class GitHubAppService implements GitHubApps {
         GitHubAppStore.AppRow app = store.lock(companyId, system.id()).orElseThrow(GitHubAppService::noApp);
         List<SystemAccounts.AppCredential> left = accounts.getObject().appCredentials(companyId, systemId);
         if (!left.isEmpty()) {
-            throw ApiException.conflict(ProblemCode.GITHUB_APP_IN_USE, left.size() + (left.size() == 1
-                    ? " credential is" : " credentials are") + " an installation of the App: remove "
-                    + (left.size() == 1 ? "it" : "them") + " first.",
-                    Map.of("details", Map.of("credentials", left.stream().map(SystemAccounts.AppCredential::name)
-                        .toList())));
+            throw inUse(left, "of the App: remove " + (left.size() == 1 ? "it" : "them") + " first.");
         }
         deleteApp(app);
         auditLog.record(AuditRecord.company(companyId, AuditAction.SYSTEM_GITHUB_APP_REMOVED, CurrentActor.actor())
@@ -307,12 +313,31 @@ class GitHubAppService implements GitHubApps {
     @Transactional(readOnly = true)
     public Optional<App> app(UUID companyId, UUID systemId) {
         return store.find(companyId, systemId)
-            .map(row -> new App(row.systemId(), row.appId(), row.slug(), row.name(), row.setAt()));
+            .map(GitHubAppService::app);
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public Optional<App> lockApp(UUID companyId, UUID systemId) {
+        return store.lockShared(companyId, systemId).map(GitHubAppService::app);
+    }
+
+    private static App app(GitHubAppStore.AppRow row) {
+        return new App(row.systemId(), row.appId(), row.slug(), row.name(), row.setAt(), row.privateKeySecretId());
     }
 
     @Override
     public CallResult<Installation> installation(SystemInfo system, long installationId) {
         Signed signed = signed(system, "github-app:installation");
+        if (signed.failure() != null) {
+            return CallResult.failed(signed.failure());
+        }
+        return signed.client().installation(signed.jwt(), installationId);
+    }
+
+    @Override
+    public CallResult<Installation> installation(SystemInfo system, App expected, long installationId) {
+        Signed signed = signed(system, "github-app:installation", expected);
         if (signed.failure() != null) {
             return CallResult.failed(signed.failure());
         }
@@ -343,8 +368,13 @@ class GitHubAppService implements GitHubApps {
     }
 
     private Signed signed(SystemInfo system, String purpose) {
+        return signed(system, purpose, null);
+    }
+
+    /** As {@link #signed(SystemInfo, String)}, with the App {@code expected} only, when it is given. */
+    private Signed signed(SystemInfo system, String purpose, @Nullable App expected) {
         NoTransaction.require("A call of a GitHub App");
-        record Found(SystemStore.SystemRow system, PrivateKey key, long appId) {
+        record Found(SystemStore.@Nullable SystemRow system, @Nullable PrivateKey key, long appId) {
         }
         Found found = transactions.execute(status -> {
             SystemStore.SystemRow row = systems.find(system.companyId(), system.id()).orElse(null);
@@ -352,11 +382,18 @@ class GitHubAppService implements GitHubApps {
                 return null;
             }
             GitHubAppStore.AppRow app = store.find(system.companyId(), system.id()).orElse(null);
+            if (app != null && expected != null && !expected.sameApp(app(app))) {
+                return new Found(null, null, app.appId());
+            }
             return app != null ? new Found(row, key(app, purpose), app.appId()) : null;
         });
         if (found == null) {
             return new Signed(null, null, CallResult.Failure.of(CallResult.Kind.NOT_FOUND, system.name()
                     + " has no GitHub App"));
+        }
+        if (found.system() == null || found.key() == null) {
+            return new Signed(null, null, CallResult.Failure.of(CallResult.Kind.OTHER, system.name()
+                    + "'s GitHub App was replaced meanwhile"));
         }
         GitHubAppClient client = new GitHubAppClient(clients.http(found.system()),
                 Objects.requireNonNull(found.system().baseUrl()));
@@ -372,6 +409,14 @@ class GitHubAppService implements GitHubApps {
                         + app.appId() + " is not usable: " + bad.reason());
             };
         }
+    }
+
+    /** {@code 409 GITHUB_APP_IN_USE}, with the credentials that are installations of the App. */
+    private static ApiException inUse(List<SystemAccounts.AppCredential> left, String rest) {
+        return ApiException.conflict(ProblemCode.GITHUB_APP_IN_USE, left.size() + (left.size() == 1
+                ? " credential is" : " credentials are") + " an installation " + rest,
+                Map.of("details", Map.of("credentials", left.stream().map(SystemAccounts.AppCredential::name)
+                    .toList())));
     }
 
     private static ApiException noApp() {
