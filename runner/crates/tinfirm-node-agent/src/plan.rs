@@ -108,8 +108,27 @@ pub struct HelperConfig {
 }
 
 impl HelperConfig {
+    /// Reads the helper's configuration. The helper is root and runs what this file names, so
+    /// the file must be root's or the helper's own user's, and neither its group nor others
+    /// may write it ([`check_config_file`]). The check and the read are of the one opened
+    /// file, so no other file can take its place between them.
     pub fn load(path: &Path) -> Result<HelperConfig> {
-        let text = read_bounded(path, 1024 * 1024)?;
+        use std::os::unix::fs::MetadataExt;
+        let file =
+            std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let own = crate::local::own_uid()?;
+        if let Err(problem) = check_config_file(
+            meta.file_type().is_file(),
+            meta.uid(),
+            meta.mode() & 0o7777,
+            own,
+        ) {
+            bail!("the helper's configuration {} {problem}", path.display());
+        }
+        let text = read_bounded_file(file, path, 1024 * 1024)?;
         let config: HelperConfig = serde_json::from_slice(&text)
             .with_context(|| format!("{} is not a valid helper configuration", path.display()))?;
         config.validate()?;
@@ -241,11 +260,37 @@ fn plain_path(name: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What the root helper asks of its configuration file: a regular file of root or of the
+/// helper's own user (`own`; the same as root where the helper is installed), which neither
+/// its group nor others can write. A file that the listener's user could write would hand
+/// that user the helper's root, since the file names the programs the helper runs.
+pub fn check_config_file(is_file: bool, uid: u32, mode: u32, own: u32) -> Result<(), String> {
+    if !is_file {
+        return Err("is not a regular file".into());
+    }
+    if uid != 0 && uid != own {
+        return Err(format!(
+            "belongs to uid {uid}: it must be root's or the helper's own user's"
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "has mode {mode:04o}: neither its group nor others may write it"
+        ));
+    }
+    Ok(())
+}
+
 /// Reads a file of at most `limit` bytes.
 pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    use std::io::Read;
     let file =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    read_bounded_file(file, path, limit)
+}
+
+/// Reads an opened file of at most `limit` bytes; `path` is for the message.
+fn read_bounded_file(file: std::fs::File, path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
     let mut bytes = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut bytes)
@@ -680,5 +725,39 @@ pub(crate) mod tests {
         let mut c = config();
         c.network.node_address = "0.0.0.0".parse().unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn the_configuration_file_must_be_roots_or_the_helpers_own_and_theirs_alone_to_write() {
+        // Root's file, or the helper's own user's, that others can at most read.
+        assert!(check_config_file(true, 0, 0o644, 0).is_ok());
+        assert!(check_config_file(true, 0, 0o600, 4242).is_ok());
+        assert!(check_config_file(true, 4242, 0o640, 4242).is_ok());
+        // Another user's, the listener's for one.
+        assert!(check_config_file(true, 991, 0o644, 0).is_err());
+        // One that its group or others can write.
+        assert!(check_config_file(true, 0, 0o664, 0).is_err());
+        assert!(check_config_file(true, 0, 0o646, 0).is_err());
+        // A directory, a device, a FIFO.
+        assert!(check_config_file(false, 0, 0o644, 0).is_err());
+    }
+
+    #[test]
+    fn a_configuration_file_that_others_can_write_is_refused_before_it_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper.json");
+        std::fs::write(&path, config_json().to_string()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(HelperConfig::load(&path).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let error = format!("{:#}", HelperConfig::load(&path).unwrap_err());
+        assert!(
+            error.contains("neither its group nor others may write it"),
+            "{error}"
+        );
+        // A directory in its place.
+        let error = format!("{:#}", HelperConfig::load(dir.path()).unwrap_err());
+        assert!(error.contains("is not a regular file"), "{error}");
     }
 }

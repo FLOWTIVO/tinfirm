@@ -42,7 +42,7 @@ The paths are the defaults the role is to use (planned). Each is set in a config
 
 | Path | Owner:group | Mode | What |
 |---|---|---|---|
-| `/etc/tinfirm/node-agent/helper.json` | root:root | 0644 | The helper's configuration |
+| `/etc/tinfirm/node-agent/helper.json` | root:root | 0644 | The helper's configuration. The helper refuses, at its start, a configuration that is not a regular file of root (or of the helper's own user, where a test runs it as another), or that its group or others can write: the file names the programs that the helper runs as root |
 | `/etc/tinfirm/node-agent/listener.json` | root:tinfirm-node-listener | 0640 | The listener's configuration |
 | `/etc/tinfirm/node-agent/node.crt` | root:root | 0644 | The node's certificate (DER), which the driver pins |
 | `/etc/tinfirm/node-agent/node.key` | tinfirm-node-listener | 0600 | Its key (PKCS #8 DER). The listener refuses a key that another user owns or that group or others can read |
@@ -168,7 +168,7 @@ Every line of both wires is read as one JSON value in which no object, at any le
 
 | Transport | Bound | What happens beyond it |
 |---|---|---|
-| TLS, before the handshake | 8 handshakes pending at once (`HANDSHAKE_SLOTS`), each within 3 s (`HANDSHAKE_TIMEOUT`) | A new connection drops the oldest pending handshake. Connections that say nothing therefore cannot keep the control host out: its handshake takes milliseconds, and it gets a place at once |
+| TLS, before the handshake | 8 handshakes pending at once (`HANDSHAKE_SLOTS`), each within 3 s (`HANDSHAKE_TIMEOUT`) | A new connection drops the oldest pending handshake. Connections that say nothing therefore cannot keep the control host out: its handshake takes milliseconds, and it gets a place at once. A peer that opens more than 8 connections within those milliseconds, again and again, can still drop the control host's handshake each time: while it does, the runner host neither makes nor deletes a VM on this node, and nothing else is reached. The agent does not filter by source address; the node's firewall must admit only the control host to this port (the role's rule for it is planned) |
 | TLS, after a handshake with the pinned certificate | 16 served connections (`MAX_CONNECTIONS`) | A 17th authenticated connection is closed after its handshake. Nothing displaces a served connection |
 | The local socket | 16 connections of the runner host's uid | A 17th is closed at once; a peer of another uid is closed before it is read |
 
@@ -344,6 +344,7 @@ The execution needs KVM, Firecracker and root, and must be checked against the o
 | An unknown template is refused by `make`, `check`, `verify` and `create` | `helper.rs`, `tests/agent.rs` |
 | The user data file: a link (to a file, dangling, to a directory), a directory, a FIFO, two names, too large, empty, missing, another owner | `spool.rs`, on real files; the owner by `chown` where the test is root, and by the check on made-up facts always, as for the socket and device kinds |
 | The spool: a link to a good spool, a spool of another owner, a group-writable parent, and every case of the check on made-up facts | `spool.rs` |
+| The helper's configuration file: another user's, one that its group or others can write, and what is not a regular file, on made-up facts and on a real file | `plan.rs` |
 | A peer that is not the listener's uid gets nothing from the helper | `helper.rs` (the helper expects another uid than the test's, where the test is root); `tests/agent.rs` runs a real process as uid 65534 with `setpriv` against a helper that expects 4242 and one that expects 65534, where the test runs as root and has `setpriv` and `python3`, and skips otherwise |
 | The helper serves at most 32 connections, and refuses one that sends no request within 5 s | `helper.rs` |
 | A failed make whose cleanup fails keeps its slot until a delete succeeds; a leftover that cannot be removed keeps its slot; a jail of unknown form blocks every slot and `check` names it, escaped | `helper.rs` |
