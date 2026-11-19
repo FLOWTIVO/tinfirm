@@ -123,6 +123,7 @@ Both files are JSON. An unknown field anywhere is refused. Paths are absolute.
   "address": "10.0.0.20",
   "tls": {
     "listen": "10.0.0.20:7700",
+    "controlHost": "10.0.0.5",
     "certificate": "/etc/tinfirm/node-agent/node.crt",
     "key": "/etc/tinfirm/node-agent/node.key",
     "clientSha256": "64 hex digits: the SHA-256 of the control host's certificate"
@@ -140,6 +141,7 @@ Both files are JSON. An unknown field anywhere is refused. Paths are absolute.
 |---|---|
 | `address` | The node's address as the control host dials it, which `describe` answers: an IP address or a host name |
 | `tls`, `socket` | At least one. A separated node has `tls`; `socket` is for the single machine (planned, above) |
+| `tls.controlHost` | The control host's address, as the node sees its connections: the only source the listener takes a TLS connection from. The same address as the helper's `network.controlHost` |
 | `tls.clientSha256` | The one client certificate the listener accepts |
 | `socket.peerUid` | The runner host's user, the one peer; not 0 |
 | `peerBuild` | `warn` (default) or `refuse`: what `hello` does with a driver of another build |
@@ -168,11 +170,11 @@ Every line of both wires is read as one JSON value in which no object, at any le
 
 | Transport | Bound | What happens beyond it |
 |---|---|---|
-| TLS, before the handshake | 8 handshakes pending at once (`HANDSHAKE_SLOTS`), each within 3 s (`HANDSHAKE_TIMEOUT`) | A new connection drops the oldest pending handshake. Connections that say nothing therefore cannot keep the control host out: its handshake takes milliseconds, and it gets a place at once. A peer that opens more than 8 connections within those milliseconds, again and again, can still drop the control host's handshake each time: while it does, the runner host neither makes nor deletes a VM on this node, and nothing else is reached. The agent does not filter by source address; the node's firewall must admit only the control host to this port (the role's rule for it is planned) |
+| TLS, before the handshake | 8 handshakes pending at once (`HANDSHAKE_SLOTS`), each within 3 s (`HANDSHAKE_TIMEOUT`) | A connection from another address than the control host's (`tls.controlHost`) is closed at once and takes no place. A new connection from that address drops the oldest pending handshake. Connections that say nothing therefore cannot keep the control host out: its handshake takes milliseconds, and it gets a place at once. What is left: a peer that sends from the control host's own address (the control host itself, or a machine that can take its address in the node's network) and opens more than 8 connections within those milliseconds, again and again, can still drop the control host's handshake each time. While it does, the runner host neither makes nor deletes a VM on this node, and nothing else is reached. The node's firewall admits only the control host to this port as well (the role's rule for it is planned) |
 | TLS, after a handshake with the pinned certificate | 16 served connections (`MAX_CONNECTIONS`) | A 17th authenticated connection is closed after its handshake. Nothing displaces a served connection |
 | The local socket | 16 connections of the runner host's uid | A 17th is closed at once; a peer of another uid is closed before it is read |
 
-Refusals (a failed or late handshake, a dropped pending handshake, a full transport, a local peer of another uid) are counted by kind and logged as one summary at most every 60 s (`REFUSAL_SUMMARY_EVERY`), with kinds and counts only: a peer refused again and again cannot flood the journal.
+Refusals (a connection from another address, a failed or late handshake, a dropped pending handshake, a full transport, a local peer of another uid) are counted by kind and logged as one summary at most every 60 s (`REFUSAL_SUMMARY_EVERY`), with kinds and counts only: a peer refused again and again cannot flood the journal.
 
 A request has exactly `jsonrpc` (`"2.0"`), `method`, `params` and `id` (a number, or a string of at most 64 bytes), each once. Any other field is refused. `params` must be a JSON object: absent, an array, a string or `null` is refused with `-32602`. A request without `id` is a notification: the listener takes none and answers none.
 
@@ -350,12 +352,13 @@ The execution needs KVM, Firecracker and root, and must be checked against the o
 | A failed make whose cleanup fails keeps its slot until a delete succeeds; a leftover that cannot be removed keeps its slot; a jail of unknown form blocks every slot and `check` names it, escaped | `helper.rs` |
 | A local peer that is not the runner host's uid gets nothing from the listener | `tests/agent.rs` (the listener expects another uid than the test's) |
 | A TLS client with another certificate, or none, gets nothing; the driver refuses a node of another certificate | `tls.rs`, `tests/agent.rs` |
+| A TLS connection from another address than the control host's is closed before its handshake, with the control host's certificate too, and more of them than there are handshake places each end within a second | `tests/agent.rs` (from 127.0.0.2), `listener.rs` |
 | Idle TCP connections, more than the handshake places and the served places together, do not keep the control host out, and do not displace a served connection | `tests/agent.rs`, and the queue's own test in `listener.rs` |
 | At most 16 served connections on each transport, the ones served staying served; at most 64 requests in flight, the next getting `-32007` | `tests/agent.rs` |
 | Refusals are logged as one summary at most every 60 s | `listener.rs` |
 | The listener refuses to start as root | `tests/agent.rs` (where the test is root) |
 | At its start the listener empties its spool, drops a stale record and deletes an unrecorded VM; a `list` deletes an unrecorded VM again; a bad record is moved aside and a half-written one removed | `tests/agent.rs`, `listener.rs` |
-| A failed create leaves no record and no spool file | `tests/agent.rs` |
+| A failed create leaves no record and no spool file, and deletes at once what the helper could not remove | `tests/agent.rs` |
 | `hello`, `verify`, `create`, `describe`, `list`, `delete` end to end over TLS and over the local socket, the listener and the helper in one process on the fake backend | `tests/agent.rs` |
 | A VMM that dies is pushed as `vmFailed`, and describes as `failed` | `tests/agent.rs` |
 | No two slots share a user, an address or a port; names and jail directories never repeat, and fit the kernel's limits; a leftover's slot is read back from its jail's name; a restarted helper never hands out a name in use | `plan.rs`, `helper.rs` |

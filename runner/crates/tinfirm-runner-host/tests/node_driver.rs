@@ -109,7 +109,8 @@ async fn agent(max_vms: u32, client: &[u8]) -> Agent {
         "state": root.join("listener-state"),
         "address": "192.0.2.10",
         "tls": {
-            "listen": "127.0.0.1:0", "certificate": "/unused", "key": "/unused",
+            "listen": "127.0.0.1:0", "controlHost": "127.0.0.1",
+            "certificate": "/unused", "key": "/unused",
             "clientSha256": tls::to_hex(&tls::sha256(client)),
         },
         "socket": { "path": socket, "peerUid": own },

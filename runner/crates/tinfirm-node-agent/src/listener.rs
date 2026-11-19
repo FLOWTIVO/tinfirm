@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -58,6 +58,9 @@ pub enum BuildPolicy {
 pub struct TlsSettings {
     /// Where the listener takes the control host's TLS connections.
     pub listen: SocketAddr,
+    /// The control host's address: the only one a connection is taken from. A connection
+    /// from any other address is closed before it takes a place for its handshake.
+    pub control_host: IpAddr,
     /// The node's certificate (DER), which the driver pins.
     pub certificate: PathBuf,
     /// Its key (PKCS #8 DER), the listener's own with mode 0600.
@@ -133,6 +136,9 @@ impl ListenerConfig {
         }
         if let Some(tls) = &self.tls {
             crate::tls::parse_pin(&tls.client_sha256).context("tls.clientSha256")?;
+            if tls.control_host.is_unspecified() || tls.control_host.is_multicast() {
+                bail!("tls.controlHost must be the control host's own address");
+            }
         }
         if let Some(socket) = &self.socket
             && socket.peer_uid == 0
@@ -683,7 +689,9 @@ impl Listener {
 
     // ----- the transports -------------------------------------------------------------------
 
-    /// Serves TLS connections. A connection first takes one of [`HANDSHAKE_SLOTS`] places for
+    /// Serves TLS connections, from the control host's address alone (`tls.controlHost`): a
+    /// connection from any other address is closed at once, before anything is read from it.
+    /// A connection first takes one of [`HANDSHAKE_SLOTS`] places for
     /// its handshake, which it must finish within [`HANDSHAKE_TIMEOUT`]; when they are all
     /// taken, the oldest pending handshake is dropped for the new one, so idle connections
     /// cannot keep the control host out. Only a client that presented the pinned certificate
@@ -696,6 +704,7 @@ impl Listener {
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
         let served = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let pending = Arc::new(Mutex::new(Pending::default()));
+        let control_host = self.config.tls.as_ref().map(|tls| tls.control_host);
         loop {
             let (stream, addr) = match listener.accept().await {
                 Ok(accepted) => accepted,
@@ -705,6 +714,12 @@ impl Listener {
                     continue;
                 }
             };
+            // Before a handshake place: only the control host's address can fill them.
+            if !control_host.is_some_and(|control| same_address(addr.ip(), control)) {
+                self.refusals
+                    .note("a connection from another address than the control host's");
+                continue;
+            }
             let (ticket, mut evicted) = {
                 let mut pending = lock(&pending);
                 let (ticket, evicted, displaced) = pending.enter();
@@ -785,6 +800,12 @@ impl Listener {
             });
         }
     }
+}
+
+/// Whether a connection's source is the configured address. An IPv4 address that a listener
+/// on an IPv6 socket sees in its mapped form (`::ffff:a.b.c.d`) is that IPv4 address.
+pub fn same_address(peer: IpAddr, configured: IpAddr) -> bool {
+    peer.to_canonical() == configured.to_canonical()
 }
 
 /// The TLS handshakes in progress, oldest first, each with the sender that drops it.
@@ -965,6 +986,19 @@ pub async fn run(config: ListenerConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_is_the_control_host_only_at_its_own_address() {
+        let control: IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(same_address("10.0.0.5".parse().unwrap(), control));
+        // As a listener on an IPv6 socket sees an IPv4 peer.
+        assert!(same_address("::ffff:10.0.0.5".parse().unwrap(), control));
+        assert!(!same_address("10.0.0.6".parse().unwrap(), control));
+        assert!(!same_address("::1".parse().unwrap(), control));
+        let control6: IpAddr = "fd00::5".parse().unwrap();
+        assert!(same_address("fd00::5".parse().unwrap(), control6));
+        assert!(!same_address("fd00::6".parse().unwrap(), control6));
+    }
 
     #[test]
     fn refusals_are_logged_as_one_summary_at_most_every_interval() {

@@ -139,6 +139,7 @@ fn listener_config(
         "address": "192.0.2.10",
         "tls": {
             "listen": "127.0.0.1:0",
+            "controlHost": "127.0.0.1",
             "certificate": "/unused",
             "key": "/unused",
             "clientSha256": tls::to_hex(&control_pin),
@@ -466,6 +467,53 @@ async fn a_tls_client_with_another_certificate_or_none_gets_nothing() {
     assert!(!answered(&node, Some(other)).await);
     assert!(!answered(&node, None).await);
     // The listener still serves the control host afterwards.
+    let mut driver = tls_driver(&node, Some(node.control_cert.clone()))
+        .await
+        .unwrap();
+    driver.hello().await;
+}
+
+/// A TCP connection to the node's TLS port from `source`, another of this machine's loopback
+/// addresses than the control host's 127.0.0.1.
+async fn tcp_from(node: &Node, source: &str) -> tokio::net::TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+    socket.connect(node.tls_addr).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_connection_from_another_address_than_the_control_hosts_is_closed_before_its_handshake() {
+    let node = node(None).await;
+    // The control host's certificate, from another address: no handshake, no answer.
+    let config = tls::client_config(
+        tls::sha256(&node.node_cert.0),
+        Some(node.control_cert.clone()),
+    )
+    .unwrap();
+    let tcp = tcp_from(&node, "127.0.0.2").await;
+    let shaken = tokio_rustls::TlsConnector::from(config)
+        .connect(tls::server_name(), tcp)
+        .await;
+    assert!(shaken.is_err(), "a handshake from 127.0.0.2 went through");
+    // Such a connection takes no place for a handshake: the listener closes it at once, where
+    // an idle connection from the control host's address keeps its place for 3 s. More of
+    // them than there are places, and each one ends within a second.
+    let mut others = Vec::new();
+    for _ in 0..listener::HANDSHAKE_SLOTS * 4 {
+        others.push(tcp_from(&node, "127.0.0.2").await);
+    }
+    for mut other in others {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut other, &mut byte),
+        )
+        .await
+        .expect("the listener closes it at once");
+        // The end of the stream, or a reset.
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    }
+    // The control host is served, from its own address.
     let mut driver = tls_driver(&node, Some(node.control_cert.clone()))
         .await
         .unwrap();
