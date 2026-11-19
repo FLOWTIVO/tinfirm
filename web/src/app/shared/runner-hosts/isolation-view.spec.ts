@@ -55,7 +55,8 @@ describe('a runner host’s isolation (ADR-0113)', () => {
     ['NO', 'Not hardened'],
     ['NONE', 'No machine of its own'],
   ])('shows the hardening %s', (hardened, words) => {
-    expect(isolationLines(isolation({ hardened }))!.hardening).toMatch(new RegExp(`^${words}`));
+    // The line starts with these words; no pattern is built from them.
+    expect(isolationLines(isolation({ hardened }))!.hardening.slice(0, words.length)).toBe(words);
   });
 });
 
