@@ -424,7 +424,21 @@ fn pin_hex(cert: &[u8]) -> String {
 /// `tinfirm-node-agent identity` makes it: its files and this one's are the same kind, and
 /// either binary reads the other's (only the pin is checked, never the name).
 pub fn write_identity(cert: &Path, key: &Path) -> Result<String> {
-    use std::io::Write;
+    write_identity_with(cert, key, &|file, bytes| {
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+/// [`write_identity`], with `fill` writing a new file's bytes (the tests make it fail). On any
+/// failure, every file this call created is removed again, and only those: a file that was there
+/// before is never touched, so a retry starts clean.
+fn write_identity_with(
+    cert: &Path,
+    key: &Path,
+    fill: &dyn Fn(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<String> {
     use std::os::unix::fs::OpenOptionsExt;
     for path in [cert, key] {
         if path.symlink_metadata().is_ok() {
@@ -438,6 +452,8 @@ pub fn write_identity(cert: &Path, key: &Path) -> Result<String> {
         .context("cannot create a certificate")?;
     let cert_der = certified.cert.der().to_vec();
     let key_der = certified.signing_key.serialize_der();
+    // Creates `path`, which must not exist, and fills it; a file it created and could not fill
+    // is removed.
     let write = |path: &Path, bytes: &[u8], mode: u32| -> Result<()> {
         let mut file = std::fs::File::options()
             .write(true)
@@ -446,9 +462,12 @@ pub fn write_identity(cert: &Path, key: &Path) -> Result<String> {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .with_context(|| format!("cannot create {}", path.display()))?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .with_context(|| format!("cannot write {}", path.display()))
+        if let Err(e) = fill(&mut file, bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(e).with_context(|| format!("cannot write {}", path.display()));
+        }
+        Ok(())
     };
     write(key, &key_der, 0o600)?;
     if let Err(e) = write(cert, &cert_der, 0o644) {
@@ -1296,6 +1315,40 @@ mod tests {
         let cert = dir.path().join("missing-dir/new.crt");
         assert!(write_identity(&cert, &key).is_err());
         assert!(!key.exists());
+        // A write that fails after its file was made: the key's, then the certificate's. Every
+        // file the call made goes again, so a retry works; a file that was there stays.
+        let half = |file: &mut std::fs::File, bytes: &[u8]| -> std::io::Result<()> {
+            use std::io::Write;
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            Err(std::io::Error::other("the disk is full"))
+        };
+        let (cert, key) = (dir.path().join("full.crt"), dir.path().join("full.key"));
+        let error = format!("{:#}", write_identity_with(&cert, &key, &half).unwrap_err());
+        assert!(
+            error.contains("full.key") && error.contains("the disk is full"),
+            "{error}"
+        );
+        assert!(!key.exists() && !cert.exists());
+        let calls = std::cell::Cell::new(0);
+        let second_fails = |file: &mut std::fs::File, bytes: &[u8]| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                half(file, bytes)
+            } else {
+                std::io::Write::write_all(file, bytes)
+            }
+        };
+        let error = format!(
+            "{:#}",
+            write_identity_with(&cert, &key, &second_fails).unwrap_err()
+        );
+        assert!(error.contains("full.crt"), "{error}");
+        assert!(!key.exists() && !cert.exists());
+        assert!(write_identity(&cert, &key).is_ok(), "a retry starts clean");
+        // A certificate that someone made in between: refused, and left as it was.
+        let other_key = dir.path().join("other.key");
+        assert!(write_identity(&cert, &other_key).is_err());
+        assert!(cert.exists() && !other_key.exists());
         // An empty certificate has no pin.
         let empty = dir.path().join("empty.crt");
         std::fs::write(&empty, b"").unwrap();
