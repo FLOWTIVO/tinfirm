@@ -756,7 +756,7 @@ pub async fn execute(
         match started {
             Ok((mut sandbox, io)) => {
                 if let Some(files) = sandbox.files() {
-                    sandbox_reader.set(files);
+                    sandbox_reader.set(files, reader_of(shared));
                 }
                 // While the sandbox lives, a host that restarts takes the run back (ADR-0101).
                 if let Some((kind, bridge_id, session_key)) = sandbox.take_back_record() {
@@ -831,6 +831,7 @@ pub async fn execute(
                         &mut sink,
                         assign,
                         &files,
+                        &reader_of(shared),
                         &layout,
                         &mut repos,
                         &home_dir,
@@ -1142,6 +1143,7 @@ pub async fn take_back(
                     &mut sink,
                     assign,
                     &files,
+                    &reader_of(shared),
                     &layout,
                     &mut repos,
                     &home_dir,
@@ -1298,11 +1300,14 @@ async fn restore_session_bundle(
         }
     };
     let (home, runtime) = (home_dir.to_path_buf(), assign.agent.runtime);
-    let restored =
-        tokio::task::spawn_blocking(move || session_bundles::restore(&home, runtime, &bundle))
-            .await
-            .map_err(|e| anyhow::anyhow!("the restore stopped: {e}"))
-            .and_then(|restored| restored);
+    // With the bridge, a reader unpacks it (crate::reader); without, this process, as before.
+    let reader = shared.opts.bridge.as_ref().map(|b| b.reader.clone());
+    let restored = tokio::task::spawn_blocking(move || {
+        session_bundles::restore(&home, runtime, &bundle, reader.as_ref())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("the restore stopped: {e}"))
+    .and_then(|restored| restored);
     match restored {
         Ok(restored) => {
             if let Err(e) = session_bundles::record(home_dir, sha256) {
@@ -2174,14 +2179,26 @@ fn mounted_login(shared: &Shared, credential: &RunCredential) -> Option<&'static
     }
 }
 
+/// The readers of what this host's sandboxes send back (crate::reader): the bridge's.
+fn reader_of(shared: &Shared) -> crate::reader::Reader {
+    match &shared.opts.bridge {
+        Some(bridge) => bridge.reader.clone(),
+        // Only a bridged sandbox has files to read.
+        None => crate::reader::Reader::from_current_exe()
+            .unwrap_or_else(|_| crate::reader::Reader::new("tinfirm-runner-host")),
+    }
+}
+
 /// With the bridge (ADR-0095), after the agent and before the sandbox goes: each repository's
-/// commits, the session home and `/output` come back (crate::sandbox_files). A repository that
-/// does not come back fails in the finalize; a home or an `/output` that does not is logged.
+/// commits, the session home and `/output` come back (crate::sandbox_files), each read by a
+/// reader that holds no credential (crate::reader). A repository that does not come back fails
+/// in the finalize; a home or an `/output` that does not is logged.
 #[allow(clippy::too_many_arguments)]
 async fn collect_from_sandbox(
     sink: &mut EventSink,
     assign: &RunAssign,
     files: &tinfirm_bridge::host::SandboxFiles,
+    reader: &crate::reader::Reader,
     layout: &Layout,
     repos: &mut [Repo<'_>],
     home_dir: &Path,
@@ -2216,7 +2233,8 @@ async fn collect_from_sandbox(
             let (name, email) = git_identity(assign, Some(repo.ws));
             let collected = sandbox_files::collect_repository(
                 &sandbox_repo,
-                &repo.git,
+                &mut repo.git,
+                reader,
                 &message,
                 (&name, &email),
                 &candidates,
@@ -2230,7 +2248,7 @@ async fn collect_from_sandbox(
         }
         let _ = std::fs::remove_dir_all(&temp);
     }
-    match sandbox_files::collect_home(files, layout, home_exclude, home_dir, &tag).await {
+    match sandbox_files::collect_home(files, reader, layout, home_exclude, home_dir, &tag).await {
         Ok(home) if !home.left_out.is_empty() => sink.log(
             LogLevel::Debug,
             format!(
@@ -2248,7 +2266,7 @@ async fn collect_from_sandbox(
         ),
     }
     if let Some(output_dir) = output_dir {
-        match sandbox_files::collect_output(files, layout, output_dir).await {
+        match sandbox_files::collect_output(files, reader, layout, output_dir).await {
             Ok(output) if !output.left_out.is_empty() => sink.log(
                 LogLevel::Warn,
                 format!(

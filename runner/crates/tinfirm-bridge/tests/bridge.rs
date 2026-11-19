@@ -1282,3 +1282,308 @@ async fn a_host_that_restarted_without_the_session_lets_the_sandbox_go() {
     let code = tokio::time::timeout(WAIT, bridge).await.unwrap().unwrap();
     assert_eq!(code, sandbox::EXIT_HOST_GONE);
 }
+
+// ----- a hostile peer (ADR-0112, decision 8, "Path C") -------------------------------------
+//
+// The bridge runs as the agent's user in the sandbox, so the agent can speak to the host's
+// frame parser and link directly, with the run's ticket. Seeded and deterministic: a failure
+// names its seed.
+
+/// xorshift64*.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+    }
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+    fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.next() as u8).collect()
+    }
+    /// Up to `max - 1` random bytes.
+    fn noise(&mut self, max: u64) -> Vec<u8> {
+        let len = self.below(max) as usize;
+        self.bytes(len)
+    }
+}
+
+/// A TLS connection to the host's listener, as a bridge makes it (the pin is the run's own).
+async fn hostile_connect(server: &BridgeServer) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let tcp = TcpStream::connect(server.local_addr()).await.unwrap();
+    let connector =
+        tokio_rustls::TlsConnector::from(tls::client_config(tls::parse_pin(server.pin()).unwrap()));
+    connector.connect(tls::server_name(), tcp).await.unwrap()
+}
+
+fn hello(run_id: &str, ticket: &str) -> Vec<u8> {
+    let hello = tinfirm_bridge::control::Control::Hello {
+        version: tinfirm_bridge::PROTOCOL_VERSION,
+        run_id: run_id.to_string(),
+        ticket: Some(Hidden::new(ticket)),
+        session: None,
+        rx_seq: 0,
+        tx_seq: Some(0),
+        build: Some("hostile".into()),
+    };
+    tinfirm_bridge::frame::Frame::new(
+        tinfirm_bridge::frame::Kind::Control,
+        0,
+        0,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .encode()
+}
+
+/// What a hostile sandbox sends after its hello: control messages of every kind, valid,
+/// misdirected, malformed and oversized; data on streams that exist and that do not; numbers
+/// in order and out of it; and at times plain noise.
+fn hostile_frame(rng: &mut Rng, seq: &mut u64) -> Vec<u8> {
+    use tinfirm_bridge::frame::{Frame, Kind, MAX_DATA, STREAM_DYNAMIC, STREAM_STDOUT};
+    let numbered = |rng: &mut Rng, seq: &mut u64| {
+        if rng.below(20) == 0 {
+            rng.next()
+        } else {
+            *seq += 1;
+            *seq
+        }
+    };
+    let n = rng.next();
+    let control = |text: String| text.into_bytes();
+    match rng.below(14) {
+        0 => {
+            let payload = match rng.below(16) {
+                0 => control(format!(
+                    r#"{{"type":"open","stream":{},"tunnel":{}}}"#,
+                    rng.next() as u32,
+                    rng.below(40)
+                )),
+                1 => control(format!(
+                    r#"{{"type":"reset","stream":{}}}"#,
+                    rng.next() as u32
+                )),
+                2 => control(format!(r#"{{"type":"listening","id":{n},"tunnels":[]}}"#)),
+                3 => control(format!(r#"{{"type":"started","pid":{}}}"#, n as u32)),
+                4 => control(format!(
+                    r#"{{"type":"exited","code":{},"signal":{}}}"#,
+                    n as i32,
+                    rng.next() as i32
+                )),
+                5 => control(format!(
+                    r#"{{"type":"error","message":"{}"}}"#,
+                    "x".repeat(rng.below(60_000) as usize)
+                )),
+                6 => control(format!(r#"{{"type":"done","id":{}}}"#, rng.below(4))),
+                7 => control(format!(
+                    r#"{{"type":"failed","id":{},"message":"no"}}"#,
+                    rng.below(4)
+                )),
+                8 => control(format!(
+                    r#"{{"type":"exec_done","id":{},"stdout":"{}","stderr":""}}"#,
+                    rng.below(4),
+                    "y".repeat(rng.below(1000) as usize)
+                )),
+                9 => control(format!(
+                    r#"{{"type":"probed","id":{},"open":["1.1.1.1"]}}"#,
+                    rng.below(4)
+                )),
+                10 => control(format!(r#"{{"type":"reclaimed","id":{n},"running":true}}"#)),
+                11 => control(r#"{"type":"start","argv":["sh"],"env":{},"cwd":null}"#.to_string()),
+                12 => control(format!(
+                    r#"{{"type":"hello","version":1,"run_id":"other","rx_seq":{n}}}"#
+                )),
+                13 => control(format!("{}{}", "[".repeat(10_000), "]".repeat(10_000))),
+                14 => control(r#"{"type":"open","stream":"#.to_string()),
+                _ => rng.noise(500),
+            };
+            let seq = numbered(rng, seq);
+            Frame::new(Kind::Control, 0, seq, payload).encode()
+        }
+        1..=4 => {
+            let stream = match rng.below(4) {
+                0 => STREAM_STDOUT,
+                1 => 3,
+                2 => STREAM_DYNAMIC + rng.below(200) as u32,
+                _ => rng.next() as u32,
+            };
+            let len = rng.below(MAX_DATA as u64 + 1) as usize;
+            let seq = numbered(rng, seq);
+            Frame::new(Kind::Data, stream, seq, rng.bytes(len)).encode()
+        }
+        5 => {
+            let seq = numbered(rng, seq);
+            Frame::new(
+                Kind::Eof,
+                STREAM_DYNAMIC + rng.below(200) as u32,
+                seq,
+                Vec::new(),
+            )
+            .encode()
+        }
+        6 => {
+            let seq = numbered(rng, seq);
+            Frame::new(
+                Kind::Credit,
+                STREAM_DYNAMIC + rng.below(200) as u32,
+                seq,
+                Frame::credit_payload(rng.next() as u32),
+            )
+            .encode()
+        }
+        7 => Frame::ack(if rng.below(2) == 0 { rng.next() } else { *seq }).encode(),
+        8 => Frame::ping(rng.next()).encode(),
+        9 => Frame::pong(rng.next()).encode(),
+        10 => {
+            // A header that claims more than the limit, or less than a header.
+            let len: u32 = if rng.below(2) == 0 { u32::MAX } else { 3 };
+            len.to_be_bytes().to_vec()
+        }
+        _ if rng.below(10) == 0 => rng.noise(100),
+        _ => {
+            let seq = numbered(rng, seq);
+            Frame::new(Kind::Data, STREAM_STDOUT, seq, b"ok\n".to_vec()).encode()
+        }
+    }
+}
+
+/// Writes `bytes` unless the host has stopped reading for a while: a host that holds a peer
+/// back is doing its job.
+async fn send_or_give_up(
+    writer: &mut tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>,
+    bytes: &[u8],
+) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_millis(500), writer.write_all(bytes)).await,
+        Ok(Ok(()))
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_peer_after_its_hello_ends_its_own_session_and_never_the_host() {
+    let server = server().await;
+    // Each seed's session ends when the host gives its bridge up (3 s here): ten keep it short.
+    for seed in 0..10u64 {
+        let run_id = format!("run-hostile-{seed}");
+        let registration = server.register(&run_id).unwrap();
+        let tls = hostile_connect(&server).await;
+        let (mut reader, mut writer) = tokio::io::split(tls);
+        assert!(send_or_give_up(&mut writer, &hello(&run_id, registration.ticket())).await);
+        // The welcome, then whatever the host sends, read and dropped.
+        let welcome = tokio::time::timeout(WAIT, tinfirm_bridge::frame::read_frame(&mut reader))
+            .await
+            .expect("a welcome")
+            .unwrap()
+            .expect("a frame");
+        assert_eq!(welcome.kind, tinfirm_bridge::frame::Kind::Control);
+        let drain = tokio::spawn(async move {
+            let mut sink = vec![0u8; 64 * 1024];
+            while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
+        });
+        let session = registration.connected(WAIT).await.unwrap();
+        let files = session.files();
+        // The host asks the sandbox something while the flood comes: it gets an answer, an
+        // error or a timeout, never a hang.
+        let asking = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                files.exec(&["true"], &[], None, None, Duration::from_secs(2)),
+            )
+            .await
+        });
+        let mut rng = Rng::new(seed);
+        let mut seq = 0u64;
+        for _ in 0..300 {
+            let frame = hostile_frame(&mut rng, &mut seq);
+            if !send_or_give_up(&mut writer, &frame).await {
+                break;
+            }
+        }
+        let asked = asking.await.unwrap();
+        assert!(asked.is_ok(), "seed {seed}: the host's request hung");
+        drop(writer);
+        drain.abort();
+        tokio::time::timeout(WAIT, session.close(Duration::from_secs(1)))
+            .await
+            .unwrap_or_else(|_| panic!("seed {seed}: closing the session hung"));
+    }
+    // The listener and the host go on: a real bridge runs its adapter.
+    let (mut session, bridge) = connect(&server, "run-after-the-flood").await;
+    let mut io = session.start(shell("echo still here", &[])).await.unwrap();
+    assert_eq!(drain(&mut io).await.0, "still here\n");
+    assert_eq!(finish(&session, bridge).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_first_frames_are_refused_and_the_listener_goes_on() {
+    use tinfirm_bridge::frame::{Frame, Kind};
+    let server = server().await;
+    let registration = server.register("run-real").unwrap();
+    for seed in 0..64u64 {
+        let mut rng = Rng::new(1000 + seed);
+        let first: Vec<u8> = match rng.below(8) {
+            0 => {
+                let mut noise = rng.noise(200);
+                noise.push(0xff);
+                noise
+            }
+            1 => Frame::new(Kind::Data, 2, 1, b"x".to_vec()).encode(),
+            2 => Frame::new(Kind::Control, 0, 0, rng.bytes(64)).encode(),
+            3 => Frame::new(
+                Kind::Control,
+                0,
+                0,
+                r#"{"type":"hello","version":99,"run_id":"run-real","rx_seq":0}"#.to_string()
+                    .into_bytes(),
+            )
+            .encode(),
+            4 => hello(&"r".repeat(rng.below(100_000) as usize + 1), "nope"),
+            5 => hello("run-real", &"0".repeat(64)),
+            6 => hello("run-unknown", registration.ticket()),
+            _ => Frame::new(
+                Kind::Control,
+                0,
+                0,
+                format!(
+                    r#"{{"type":"hello","version":1,"run_id":"run-real","session":"{}","rx_seq":{}}}"#,
+                    "a".repeat(64),
+                    rng.next()
+                )
+                .into_bytes(),
+            )
+            .encode(),
+        };
+        let tls = hostile_connect(&server).await;
+        let (mut reader, mut writer) = tokio::io::split(tls);
+        let _ = send_or_give_up(&mut writer, &first).await;
+        // A refusal, or the end of the connection; never a session.
+        let mut buf = vec![0u8; 4096];
+        let mut answered = Vec::new();
+        loop {
+            match tokio::time::timeout(WAIT, reader.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => answered.extend_from_slice(&buf[..n]),
+                Err(_) => panic!("seed {seed}: the host kept a connection that is not a bridge"),
+            }
+        }
+        let text = String::from_utf8_lossy(&answered);
+        assert!(!text.contains("welcome"), "seed {seed}: {text}");
+    }
+    // The real run's ticket still works: nothing above used it up.
+    let bridge = spawn_bridge(config(
+        server.local_addr(),
+        "run-real",
+        registration.ticket(),
+        server.pin(),
+    ));
+    let mut session = registration.connected(WAIT).await.unwrap();
+    let mut io = session.start(shell("echo real", &[])).await.unwrap();
+    assert_eq!(drain(&mut io).await.0, "real\n");
+    assert_eq!(finish(&session, bridge).await, 0);
+}

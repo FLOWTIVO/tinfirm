@@ -216,11 +216,12 @@ pub struct FileRoot {
 /// The sandbox's files once its bridge has connected (`run --sandbox-bridge`), for the tools
 /// that read them; until then, and once the sandbox is gone, they cannot be read.
 #[derive(Clone, Default)]
-pub struct SandboxReader(Arc<std::sync::OnceLock<SandboxFiles>>);
+pub struct SandboxReader(Arc<std::sync::OnceLock<(SandboxFiles, crate::reader::Reader)>>);
 
 impl SandboxReader {
-    pub fn set(&self, files: SandboxFiles) {
-        let _ = self.0.set(files);
+    /// The sandbox's files, and the readers that parse what comes of them (crate::reader).
+    pub fn set(&self, files: SandboxFiles, reader: crate::reader::Reader) {
+        let _ = self.0.set((files, reader));
     }
 }
 
@@ -245,12 +246,20 @@ async fn read_from_sandbox(
     relative: &Path,
     max: u64,
 ) -> Result<Vec<u8>, ReadError> {
-    let Some(files) = reader.0.get() else {
+    let Some((files, parser)) = reader.0.get() else {
         return Err(ReadError::Refused("the sandbox's files cannot be reached"));
     };
-    let path = relative.to_string_lossy();
+    let path = relative.to_string_lossy().into_owned();
+    let parser = parser.clone();
+    // The archive is parsed by a reader that holds no credential (crate::reader).
     match files
-        .read_file(root, &path, max, SANDBOX_READ_TIMEOUT)
+        .receive(
+            root,
+            vec![path],
+            Vec::new(),
+            SANDBOX_READ_TIMEOUT,
+            move |input| parser.read_one(input, max, SANDBOX_READ_TIMEOUT),
+        )
         .await
     {
         Ok(ReadOne::File(content)) => Ok(content),

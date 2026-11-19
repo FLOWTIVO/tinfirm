@@ -575,15 +575,16 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     the mirrors serve them), the skills, the attachments and an empty `/output`.
   - The platform tools read the agent's files through the bridge.
   - After the agent, the host runs its git steps in the sandbox: the WIP commit, then a bundle of
-    `HEAD`. It fetches the bundle into its own clone, which the agent never reached, with every
-    object checked, and pushes from there with the usual checks. The host never runs git in a `.git`
-    that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
+    `HEAD`. A [reader](#the-reader) fetches the bundle into the host's own clone, which the agent
+    never reached, with every object checked, and the host pushes from there with the usual checks.
+    The host never runs git in a `.git` that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
     `core.packedGitWindowSize` set to 1 TiB, so git maps a whole pack at once: the fetch from a
     bundle of git 2.43 to 2.48 closes a file descriptor twice, and with git's default window of
     1 GiB the fetch of a bundle over 1 GiB could fail with `packfile … cannot be mapped: Bad file
     descriptor`.
-  - The session home and `/output` come back, as directories and regular files only (links and
-    devices are left out), at most 2 GiB and 4 GiB; then the sandbox goes.
+  - The session home and `/output` come back, unpacked by a [reader](#the-reader) as directories
+    and regular files only (links and devices are left out), at most 2 GiB and 4 GiB; then the
+    sandbox goes.
   - The images need `/attachments` and `/output` writable by the agent: the images of this version
     have them, and `run` rebuilds older ones ([Rebuilds after an upgrade](#rebuilds-after-an-upgrade)).
 - **A lost connection resumes without losing output.** The adapter's output, the tunnels'
@@ -624,6 +625,67 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     listener's private key while the sandbox lives, as the config directory holds the host token.
   - `run` must start with the same data directory and, for Docker, the same sandbox network, within
     the 15 minutes; `run --sandbox-bridge` must stay on.
+
+### The reader
+
+`run` holds every run's git token, its own token to the server and the one-run model tokens. With
+the bridge it also reads what a hostile sandbox sends back: archives and a git pack. A flaw in that
+reading used to run in `run`'s own process, with all of those in reach (path C of
+[ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)). Now each reading runs in a
+process of its own that holds no credential: `tinfirm-runner-host reader` (hidden from the help,
+not run by hand; `reader.rs`, `confine.rs`).
+
+- **What it reads.** The session home and `/output` coming back, each repository's bundle (with
+  the fetch into the host's clone, `fsck` and the checkout of the new `HEAD`), a session bundle
+  being restored (with the bridge), and the one file the platform tools read from a sandbox. One
+  process per archive or bundle, never shared between two runs.
+- **What it is given.** In its argument, only that reading's directories: the incoming session home,
+  the run's `/output`, or one bundle's scratch directory and that run's clone. The sandbox's bytes
+  on its stdin, as they come over the bridge. An empty environment but `PATH`, no descriptor but
+  stdin, stdout and stderr, and no token.
+- **What it cannot do** (Linux 5.19 or later, with Landlock enabled), applied by itself before it
+  reads a byte:
+  - Landlock: it reads and writes only its directories (it executes nothing there), reads and
+    executes the system's directories for git, and nothing else: not this host's config or data
+    directory, its token, the take-back records, another run's directories, or `/proc` (so not
+    `/proc/<pid>/mem` of `run`). Where the kernel has them, TCP (Linux 6.7) and signals and
+    abstract sockets outside the reader (Linux 6.12) are refused too;
+  - a seccomp filter: no socket of any kind, no `ptrace` or `process_vm_*`, no namespaces, no
+    mounts, no `io_uring`, no `bpf`, no new session or process group, and it cannot make itself
+    dumpable again;
+  - `no_new_privs`, and not dumpable; `run` itself is not dumpable either, so no process of its
+    user reads its memory;
+  - it runs in a process group of its own, which `run` kills when the reading is over or its time
+    is up, with everything the reader started. An unpacking may write no file larger than its
+    limit and use at most 1 GiB of memory.
+- **What `run` takes back from it.** One line of JSON of a fixed form, at most 1 MiB (and, for the
+  platform tools' file, that file's bytes). `run` treats the answer as hostile too: every field is
+  bounded and checked, and once the reader is gone, `run` walks what it wrote, without following
+  anything: only directories and regular files with one link each, within the limits, and the counts
+  the reader claimed. A link, a hard link, a device or a file over its limit fails the reading and
+  empties the directory. For a bundle, the reader must answer the `HEAD` the sandbox named; `run`
+  then puts back the clone's `.git` configuration and reads `HEAD` again.
+- **git after the import.** The clone then holds objects a sandbox made, so every git command `run`
+  runs on it afterwards (the ahead count, `HEAD`, the credential scan's listings) runs in a reader
+  too, read only. The push alone runs in `run`'s process tree, because it needs the run's git token.
+  It reads objects that `fsck` checked, from a clone whose configuration `run` restored, to the run's
+  branch alone. A flaw in git's reading of such objects in the push would still reach that run's
+  token and the files of `run`'s user: this is what is left of path C for the pack.
+- **What it does not protect against.** A flaw of the kernel (Landlock, seccomp) from inside the
+  reader; and what `run` still parses itself: the bridge's frames and control messages, the
+  tunnels, and the HTTP requests to the git, model and egress proxies and the platform tools, which
+  then add the credentials. Those are bounded and tested with a hostile peer, not split yet.
+- **Where it cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS), the
+  reader still runs as a process of its own without a token, but nothing keeps it from `run`'s
+  files. `run` says so at its start. With `--executor vm`, which exists for hostile input, `run`
+  refuses to start unless `--allow-unconfined-reader` (`TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`)
+  accepts it; a Docker host with `--sandbox-bridge` (container sandboxes, for input the company
+  trusts) starts with a warning.
+- **`doctor`** runs a reader, which confines itself and tries to open the config and data
+  directories, its parent's memory and a socket, and says `reader: confined: Landlock ABI 7 (files,
+  TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable`, or why not (a
+  failure where `run --executor vm` would refuse, a warning where the bridge is on). `host memory`
+  says whether `run` can make itself not dumpable.
 
 ## A VM per run
 
@@ -958,7 +1020,7 @@ firewall, the probe from a Droplet) and the nightly conformance test.
 | `credential add anthropic-api-key\|openai-api-key --label <l> [--pool 3]` | Stores an API key; the pool (1–16) is a ceiling |
 | `credential list`, `credential remove <label>` | Manage credentials |
 | `images build [--runtime claude\|codex\|pi\|opencode\|all\|multi] [--no-cache] [--build-arg KEY=VALUE]…` | Builds the runner images locally, with the [build arguments](#image-build-arguments) of a host without internet access, and records the arguments and runtimes in `images.json` for [the rebuilds of `run`](#rebuilds-after-an-upgrade) |
-| `doctor` | Checks the setup (directories and their modes, git, Docker, images, credentials, server); shows Docker's runtimes, the names of the recorded image build arguments, each image that `run` would rebuild, and the number of mirrors and their total size |
+| `doctor` | Checks the setup (directories and their modes, git, Docker, images, credentials, server, [the reader](#the-reader)); shows Docker's runtimes, the names of the recorded image build arguments, each image that `run` would rebuild, and the number of mirrors and their total size |
 | `mirrors list` | Lists the repository mirrors: key, size, last use, last gc, repository URL |
 | `mirrors prune [--older-than-days N] [--dry-run]` | Deletes idle mirrors and collects garbage in the others, like `run` does every 6 hours; refused while `run` is active (`--dry-run` only shows what it would do) |
 | `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |

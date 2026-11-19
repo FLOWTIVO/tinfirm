@@ -9,10 +9,14 @@
 //!     of HEAD without the commits the host has. The host fetches it into its own clone, which
 //!     the agent never touched, with every object checked, and moves its HEAD there; the
 //!     checks and the push then run as before ([`crate::run`]);
-//!   - the session home (without the same paths) and `/output`, unpacked on the host as
-//!     directories and regular files only, within limits ([`tinfirm_bridge::files`]).
+//!   - the session home (without the same paths) and `/output`, unpacked as directories and
+//!     regular files only, within limits ([`tinfirm_bridge::files`]).
 //!
-//! What the sandbox sends is the agent's: the host checks it as it checks a workspace.
+//! What the sandbox sends is the agent's: the host checks it as it checks a workspace. It never
+//! parses it itself: each archive and each bundle goes, as it comes over the bridge, to a reader
+//! process of its own that holds no credential and is confined to that one reading's
+//! directories ([`crate::reader`]; ADR-0112, open question 1). The host checks what the reader
+//! answers and what it left.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +26,7 @@ use tinfirm_bridge::files::{Limits, Unpacked};
 use tinfirm_bridge::host::{ExecOutput, SandboxFiles};
 
 use crate::git::Git;
+use crate::reader::Reader;
 use crate::sandbox::Put;
 
 /// The home's caches: they stay on neither side, the package mirrors serve them (the
@@ -287,11 +292,14 @@ impl SandboxRepo<'_> {
 }
 
 /// Brings a repository back from the sandbox into `git`, the host's own clone: the WIP commit
-/// and the bundle in the sandbox, the fetch on the host. `known` are commits that the host's
-/// clone has, which the bundle leaves out; `temp` is a directory of the host's for the bundle.
+/// and the bundle in the sandbox, the fetch from the bundle in a reader. `known` are commits
+/// that the host's clone has, which the bundle leaves out; `temp` is a directory of the host's
+/// for the bundle. `git` reads through `reader` from here on ([`Git::read_through`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_repository(
     repo: &SandboxRepo<'_>,
-    git: &Git,
+    git: &mut Git,
+    reader: &Reader,
     message: &str,
     identity: (&str, &str),
     known: &[String],
@@ -338,35 +346,56 @@ pub async fn collect_repository(
         Some(revisions),
     )
     .await?;
+    // From here on the clone takes the sandbox's objects: it is read only through readers.
+    git.read_through(reader.clone());
     let dest = temp.join(format!("bundle-{}", repo.index));
     let _ = std::fs::remove_dir_all(&dest);
-    let unpacked = repo
+    crate::secure_fs::ensure_private_dir(&dest)?;
+    let (reader, clone, scratch, bundle, expected) = (
+        reader.clone(),
+        git.dir().to_path_buf(),
+        dest.clone(),
+        name.clone(),
+        head.clone(),
+    );
+    let imported = repo
         .files
-        .get_dir(
+        .receive(
             repo.scratch,
-            vec![name.clone()],
+            vec![name],
             Vec::new(),
-            &dest,
-            BUNDLE_LIMITS,
             GET_TIMEOUT,
+            move |input| {
+                reader.import_bundle(
+                    input,
+                    &clone,
+                    &scratch,
+                    &bundle,
+                    &expected,
+                    &BUNDLE_LIMITS,
+                    GET_TIMEOUT + GIT_TIMEOUT,
+                )
+            },
         )
-        .await?;
-    if unpacked.files != 1 {
-        bail!(
-            "the sandbox's bundle did not come back (it may be larger than {} GiB)",
-            BUNDLE_LIMITS.max_file_bytes >> 30
-        );
-    }
-    let imported = git.import_bundle(&dest.join(&name), &head).await;
+        .await;
     let _ = std::fs::remove_dir_all(&dest);
+    // What the reader wrote in the clone's `.git` goes before anything else reads it, and its
+    // HEAD must be the sandbox's, by a reader of its own.
+    git.sanitize()?;
     imported?;
+    let now = git.head().await?;
+    if now != head {
+        bail!("the clone's HEAD is not the sandbox's after the import");
+    }
     Ok(Collected { wip, head })
 }
 
-/// Brings the session home back from the sandbox: what came replaces `home_dir`, so that the
-/// next turn finds the runtime's session there. `tag` names the run's temporary directory.
+/// Brings the session home back from the sandbox, unpacked by a reader into a directory of its
+/// own: what came replaces `home_dir`, so that the next turn finds the runtime's session there.
+/// `tag` names the run's temporary directory.
 pub async fn collect_home(
     files: &SandboxFiles,
+    reader: &Reader,
     layout: &Layout,
     exclude: Vec<String>,
     home_dir: &Path,
@@ -384,14 +413,15 @@ pub async fn collect_home(
     let incoming = parent.join(format!("{}{name}-in-{tag}", crate::homes::DELETE_PREFIX));
     let outgoing = parent.join(format!("{}{name}-out-{tag}", crate::homes::DELETE_PREFIX));
     let _ = std::fs::remove_dir_all(&incoming);
+    crate::secure_fs::ensure_private_dir(&incoming)?;
+    let (reader, dest) = (reader.clone(), incoming.clone());
     let unpacked = match files
-        .get_dir(
+        .receive(
             &layout.home,
             Vec::new(),
             exclude,
-            &incoming,
-            HOME_LIMITS,
             GET_TIMEOUT,
+            move |input| reader.unpack(input, &dest, &HOME_LIMITS, false, GET_TIMEOUT),
         )
         .await
     {
@@ -409,20 +439,21 @@ pub async fn collect_home(
     Ok(unpacked)
 }
 
-/// Brings `/output` back into `output_dir`, which is empty.
+/// Brings `/output` back into `output_dir`, which is empty, unpacked by a reader.
 pub async fn collect_output(
     files: &SandboxFiles,
+    reader: &Reader,
     layout: &Layout,
     output_dir: &Path,
 ) -> Result<Unpacked> {
+    let (reader, dest) = (reader.clone(), output_dir.to_path_buf());
     files
-        .get_dir(
+        .receive(
             &layout.output,
             Vec::new(),
             Vec::new(),
-            output_dir,
-            OUTPUT_LIMITS,
             GET_TIMEOUT,
+            move |input| reader.unpack(input, &dest, &OUTPUT_LIMITS, false, GET_TIMEOUT),
         )
         .await
 }

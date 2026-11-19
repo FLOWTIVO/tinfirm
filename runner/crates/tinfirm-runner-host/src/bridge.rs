@@ -27,11 +27,16 @@ pub struct BridgeOptions {
     /// own dockerd and a Kata boot come first.
     pub connect_timeout: Duration,
     pub timing: HostTiming,
+    /// The processes that read what the sandboxes send back (ADR-0112, open question 1): this
+    /// host's own executable, which `run` sets; by default `binary`, which is the same file
+    /// unless `TINFIRM_RUNNER_BRIDGE_BINARY` names another.
+    pub reader: crate::reader::Reader,
 }
 
 impl BridgeOptions {
     pub fn new(binary: PathBuf) -> BridgeOptions {
         BridgeOptions {
+            reader: crate::reader::Reader::new(binary.clone()),
             binary,
             connect_timeout: Duration::from_secs(180),
             timing: HostTiming::default(),

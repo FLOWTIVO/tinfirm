@@ -51,6 +51,12 @@ url.workspace = true
 hostname.workspace = true
 libc.workspace = true
 
+# The reader of a sandbox's input (crate::reader, crate::confine): Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+seccompiler.workspace = true
+rustix.workspace = true
+
 [dev-dependencies]
 jsonschema.workspace = true
 tempfile.workspace = true

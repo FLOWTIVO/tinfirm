@@ -4,10 +4,12 @@
 //! - [`pack`] never follows a symbolic link: it packs the link itself, and leaves out sockets,
 //!   pipes, devices and what it may not read.
 //! - In the sandbox, an archive of the host's is unpacked as it is ([`unpack_trusted`]).
-//! - On the host, an archive of the sandbox's is unpacked by [`unpack_untrusted`]: only
+//! - On the host's side, an archive of the sandbox's is unpacked by [`unpack_untrusted`]: only
 //!   directories and regular files, at relative paths without `..`, into a directory that is
-//!   new or empty, with caps on the files and the bytes. Links and the rest are left out, by
-//!   name. [`read_one`] reads the one regular file of an archive.
+//!   new or empty, with caps on the files, the other entries and the bytes. Links and the rest
+//!   are left out, by name. [`read_one`] reads the one regular file of an archive. The runner
+//!   host runs both in a reader process of its own, which holds no credential and is confined
+//!   to that reading's directory (ADR-0112, open question 1), never in its own process.
 
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Read, Write};
@@ -234,6 +236,12 @@ pub fn unpack_untrusted<R: Read>(
                 }
                 let size = entry.header().size()?;
                 if size > limits.max_file_bytes {
+                    // Counted with the other entries left out: an archive of nothing but
+                    // oversized files would otherwise grow the list without end.
+                    others += 1;
+                    if others > limits.max_files {
+                        return Err(UnpackError::TooManyEntries(limits.max_files));
+                    }
                     // The reader skips its bytes on the way to the next entry.
                     done.left_out.push(name);
                     continue;

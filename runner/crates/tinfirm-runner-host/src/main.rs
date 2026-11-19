@@ -163,6 +163,15 @@ enum Command {
         #[arg(long)]
         bridge: Option<PathBuf>,
     },
+    /// The reader of what a sandbox sends back (ADR-0112, open question 1): `run` starts one
+    /// for each archive and git bundle of a run, with no credential, confined to that run's
+    /// directories, and reads its answer on stdout; it is not run by hand.
+    #[command(hide = true)]
+    Reader {
+        /// The job, as JSON.
+        #[arg(allow_hyphen_values = true)]
+        job: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -290,6 +299,17 @@ struct SandboxArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     sandbox_bridge: bool,
+    /// Run sandboxes over the bridge although this system cannot confine the reader of what
+    /// they send back (Landlock 2 and seccomp: Linux 5.19 or later). The reader then runs as a
+    /// process of its own without credentials, but a flaw in its reading of a hostile archive
+    /// or git bundle reaches this host's files, its token among them. Needed for --executor vm
+    /// on such a system; a Docker host with --sandbox-bridge only warns.
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_ALLOW_UNCONFINED_READER",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_unconfined_reader: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -710,6 +730,10 @@ enum RuntimeChoice {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // The reader confines itself before anything else happens in it: no logging, no runtime.
+    if let Command::Reader { job } = &cli.command {
+        return tinfirm_runner_host::reader::child_main(job);
+    }
     init_tracing(&cli.log);
     if matches!(cli.command, Command::Bridge) {
         return bridge();
@@ -877,7 +901,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Drain { no_wait } => drain(&paths, no_wait).await,
         Command::Bridge => bail!("`bridge` runs in a sandbox, started by `run --sandbox-bridge`"),
-        Command::VmDriver { .. } | Command::VmBoot { .. } => {
+        Command::VmDriver { .. } | Command::VmBoot { .. } | Command::Reader { .. } => {
             unreachable!("handled before the dispatch")
         }
     }
@@ -1396,6 +1420,8 @@ async fn doctor(paths: &Paths) -> Result<()> {
     }
     // The level of isolation that `run` reports with the environment's settings (ADR-0113).
     doctor_isolation(&mut checks);
+    // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1).
+    doctor_reader(&mut checks, paths).await;
     // git.
     match git::git_version().await {
         Some(v) => checks.ok("git", v),
@@ -1976,6 +2002,13 @@ async fn run(
     sandbox_args: SandboxArgs,
     vm_args: VmArgs,
 ) -> Result<()> {
+    // No other process of this user reads this one's memory, where it holds the tokens
+    // (ADR-0112, open question 1).
+    if let Err(e) = tinfirm_runner_host::confine::protect_host_process() {
+        tracing::warn!(
+            "this host's memory can be read by any process of its user ({e}): the tokens it holds are no better protected than its files"
+        );
+    }
     // First: a forbidden combination is refused before anything else happens.
     let vm_options = vm_args.options()?;
     if vm_options.is_none() && max_concurrent_runs > MAX_CAPACITY {
@@ -2069,6 +2102,7 @@ async fn run(
             paths.run_lock_file().display()
         )
     })?;
+    let vm_host = vm_options.is_some();
     let started = match vm_options {
         Some((options, pool)) => {
             vm_executor(
@@ -2101,6 +2135,9 @@ async fn run(
         }
     };
     let (mut opts, endpoint) = started;
+    if let Some(bridge) = opts.bridge.as_mut() {
+        bridge.reader = check_reader(paths, vm_host, sandbox_args.allow_unconfined_reader).await?;
+    }
     opts.egress = egress;
     // The model proxy is always on: a setup where its listeners could never serve a sandbox is
     // refused now, rather than every run with a model gateway later.
@@ -2128,6 +2165,114 @@ async fn run(
     let result = host::serve(host, shutdown).await;
     lock.hold_until_exit();
     result
+}
+
+/// The reader of what the sandboxes send back (ADR-0112, open question 1): this binary,
+/// confined. A probe confines itself as a reader does and tries to open this host's
+/// directories, its own memory and a socket. Where it cannot be confined, a VM host is refused
+/// unless `allow` (`--allow-unconfined-reader`), and a Docker host warns.
+async fn check_reader(
+    paths: &Paths,
+    vm_host: bool,
+    allow: bool,
+) -> Result<tinfirm_runner_host::reader::Reader> {
+    let reader = tinfirm_runner_host::reader::Reader::from_current_exe()?;
+    let probe = probe_reader(paths, &reader).await?;
+    if probe.confined() {
+        tracing::info!(
+            reader = %probe.describe(),
+            "the reader of what sandboxes send back is confined: archives and git bundles are parsed in a process per reading that holds no credential"
+        );
+        return Ok(reader);
+    }
+    let message = format!(
+        "this system cannot confine the reader of what sandboxes send back ({}): it still runs as a process of its own without credentials, but a flaw in its reading of a sandbox's archive or git bundle reaches this host's files, its token among them",
+        probe.describe()
+    );
+    if vm_host && !allow {
+        bail!(
+            "{message}. --executor vm takes hostile input: run it on Linux 5.19 or later with Landlock enabled, or accept this with --allow-unconfined-reader"
+        );
+    }
+    tracing::warn!("{message}");
+    Ok(reader.allowing_unconfined(true))
+}
+
+/// A reader's probe, with this host's directories and its memory to be refused.
+async fn probe_reader(
+    paths: &Paths,
+    reader: &tinfirm_runner_host::reader::Reader,
+) -> Result<tinfirm_runner_host::reader::Probe> {
+    let deny = vec![
+        paths.config_dir.clone(),
+        paths.data_dir.clone(),
+        PathBuf::from(format!("/proc/{}/mem", std::process::id())),
+    ];
+    let reader = reader.clone();
+    tokio::task::spawn_blocking(move || {
+        reader.probe(&deny, None, std::time::Duration::from_secs(30))
+    })
+    .await
+    .context("the reader's probe did not end")?
+    .context("the reader's probe failed")
+}
+
+/// What `doctor` says of the reader (ADR-0112, open question 1) and of this process's memory.
+async fn doctor_reader(checks: &mut Checks, paths: &Paths) {
+    let flag = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+    };
+    let vm_host = std::env::var("TINFIRM_RUNNER_EXECUTOR").is_ok_and(|v| v.trim() == "vm");
+    let bridged = vm_host || flag("TINFIRM_RUNNER_SANDBOX_BRIDGE");
+    let allow = flag("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER");
+    match tinfirm_runner_host::confine::protect_host_process() {
+        Ok(()) => checks.ok(
+            "host memory",
+            "`run` makes itself not dumpable: no other process of its user reads its memory",
+        ),
+        Err(e) => checks.warn(
+            "host memory",
+            format!("any process of this host's user can read `run`'s memory: {e}"),
+        ),
+    }
+    let probe = match tinfirm_runner_host::reader::Reader::from_current_exe() {
+        Ok(reader) => probe_reader(paths, &reader).await,
+        Err(e) => Err(e),
+    };
+    match probe {
+        Ok(probe) if probe.confined() => checks.ok(
+            "reader",
+            format!(
+                "confined: {} (the sandboxes' archives and git bundles are read in a process per reading with no credential)",
+                probe.describe()
+            ),
+        ),
+        Ok(probe) => {
+            let detail = format!(
+                "cannot be confined here: {}. A flaw in reading a sandbox's archive or git bundle would reach this host's files",
+                probe.describe()
+            );
+            if vm_host && !allow {
+                checks.fail(
+                    "reader",
+                    format!(
+                        "{detail}; `run --executor vm` refuses to start without --allow-unconfined-reader"
+                    ),
+                );
+            } else if bridged {
+                checks.warn("reader", detail);
+            } else {
+                checks.info(
+                    "reader",
+                    format!("{detail} (only used with --sandbox-bridge or --executor vm)"),
+                );
+            }
+        }
+        Err(e) if bridged => checks.fail("reader", format!("{e:#}")),
+        Err(e) => checks.warn("reader", format!("{e:#}")),
+    }
 }
 
 /// The level of isolation the host reports, and what an escape from a sandbox reaches on a

@@ -11,6 +11,7 @@ pub mod attachments;
 pub mod bridge;
 pub mod capacity;
 pub mod config;
+pub mod confine;
 pub mod connection;
 pub mod credentials;
 #[path = "../../../../ee/runner/tinfirm-runner-host/src/digitalocean.rs"]
@@ -35,6 +36,7 @@ pub mod output;
 pub mod paths;
 pub mod pool;
 pub mod public_suffix;
+pub mod reader;
 #[path = "../../../../ee/runner/tinfirm-runner-host/src/ready_vms.rs"]
 pub mod ready_vms;
 pub mod redact;

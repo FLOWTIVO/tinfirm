@@ -133,23 +133,49 @@ pub struct Restored {
 
 /// Unpacks `bundle` into a directory beside `home`, then puts each of the runtime's session
 /// folders of it in place of the home's. The home is created when it is not there.
-pub fn restore(home: &Path, runtime: Runtime, bundle: &[u8]) -> Result<Restored> {
+///
+/// A bundle is what a sandbox wrote in an earlier turn (6.17): with `reader` (a host with the
+/// sandbox bridge) it is unpacked by a reader process that holds no credential
+/// ([`crate::reader`]; ADR-0112, open question 1), and in this process otherwise, as before.
+pub fn restore(
+    home: &Path,
+    runtime: Runtime,
+    bundle: &[u8],
+    reader: Option<&crate::reader::Reader>,
+) -> Result<Restored> {
     let parent = home.parent().context("a session home has a parent")?;
     std::fs::create_dir_all(home).with_context(|| format!("cannot create {}", home.display()))?;
     let scratch = parent.join(format!("{DELETE_PREFIX}bundle-{}", Uuid::new_v4().simple()));
-    let result = restore_via(home, runtime, bundle, &scratch);
+    let result = restore_via(home, runtime, bundle, &scratch, reader);
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
 
-fn restore_via(home: &Path, runtime: Runtime, bundle: &[u8], scratch: &Path) -> Result<Restored> {
+/// How long a reader may take over a session bundle.
+const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn restore_via(
+    home: &Path,
+    runtime: Runtime,
+    bundle: &[u8],
+    scratch: &Path,
+    reader: Option<&crate::reader::Reader>,
+) -> Result<Restored> {
     let limits = Limits {
         max_files: 100_000,
         max_bytes: SESSION_BUNDLE_MAX_UNPACKED_BYTES,
         max_file_bytes: SESSION_BUNDLE_MAX_UNPACKED_BYTES,
     };
-    let unpacked = files::unpack_untrusted(GzDecoder::new(bundle), scratch, &limits)
-        .map_err(|e| anyhow!("the session bundle cannot be unpacked: {e}"))?;
+    let unpacked = match reader {
+        Some(reader) => {
+            crate::secure_fs::ensure_private_dir(scratch)?;
+            reader
+                .unpack(&mut &bundle[..], scratch, &limits, true, RESTORE_TIMEOUT)
+                .map_err(|e| anyhow!("the session bundle cannot be unpacked: {e:#}"))?
+        }
+        None => files::unpack_untrusted(GzDecoder::new(bundle), scratch, &limits)
+            .map_err(|e| anyhow!("the session bundle cannot be unpacked: {e}"))?,
+    };
     let (dirs, exclude) = session_dirs(runtime);
     let mut restored = Restored {
         files: unpacked.files,
@@ -417,7 +443,7 @@ mod tests {
             "old\n",
         );
         write(&other.join(".claude/settings.json"), "{\"mine\":1}");
-        let restored = restore(&other, Runtime::ClaudeCode, &bundle).unwrap();
+        let restored = restore(&other, Runtime::ClaudeCode, &bundle, None).unwrap();
         assert_eq!(restored.dirs, [".claude/projects", ".claude/todos"]);
         assert_eq!(
             std::fs::read_to_string(other.join(".claude/projects/-workspace/s1.jsonl")).unwrap(),
@@ -503,7 +529,7 @@ mod tests {
         gz.write_all(&tar.into_inner().unwrap()).unwrap();
         let bundle = gz.finish().unwrap();
         let home = dir.path().join("agent/task");
-        let restored = restore(&home, Runtime::Codex, &bundle).unwrap();
+        let restored = restore(&home, Runtime::Codex, &bundle, None).unwrap();
         assert_eq!(restored.dirs, [".codex/sessions"]);
         assert!(home.join(".codex/sessions/s.jsonl").is_file());
         assert!(!home.join(".bashrc").exists());
@@ -526,7 +552,13 @@ mod tests {
         drop(file);
         let packed = pack(&home, Runtime::Codex);
         assert!(matches!(packed, Ok(Packed::TooLarge)), "{packed:?}");
-        let error = restore(&dir.path().join("x/task"), Runtime::Codex, b"not gzip").unwrap_err();
+        let error = restore(
+            &dir.path().join("x/task"),
+            Runtime::Codex,
+            b"not gzip",
+            None,
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("cannot be unpacked"),
             "{error:#}"

@@ -761,8 +761,11 @@ impl SandboxFiles {
     }
 
     /// Unpacks `paths` of the sandbox's directory `dir` (all of it when empty), without
-    /// `exclude`, into `dest` on the host: directories and regular files only, within `limits`
-    /// ([`files::unpack_untrusted`]).
+    /// `exclude`, into `dest`: directories and regular files only, within `limits`
+    /// ([`files::unpack_untrusted`]), in this process.
+    ///
+    /// The runner host does not use it: it hands the archive to a reader process of its own
+    /// that holds no credential ([`SandboxFiles::receive`]; ADR-0112, open question 1).
     pub async fn get_dir(
         &self,
         dir: &str,
@@ -780,7 +783,8 @@ impl SandboxFiles {
     }
 
     /// The regular file `path` (relative) of the sandbox's directory `dir`, at most `max`
-    /// bytes.
+    /// bytes, read in this process ([`files::read_one`]). The runner host reads through its
+    /// reader process instead ([`SandboxFiles::receive`]).
     pub async fn read_file(
         &self,
         dir: &str,
@@ -796,6 +800,28 @@ impl SandboxFiles {
             move |input| files::read_one(input, max).map_err(anyhow::Error::from),
         )
         .await
+    }
+
+    /// Asks the sandbox for `paths` of its directory `dir` (all of it when empty), without
+    /// `exclude`, as a tar archive, and hands the archive's bytes, as they come, to `consume`
+    /// on a blocking thread. What `consume` leaves unread is read to its end. Fails when
+    /// `consume` fails, when the archive does not arrive within `timeout`, or when the sandbox
+    /// says it could not send it.
+    ///
+    /// The bytes are the sandbox's, untouched: `consume` is what parses them.
+    pub async fn receive<T, F>(
+        &self,
+        dir: &str,
+        paths: Vec<String>,
+        exclude: Vec<String>,
+        timeout: Duration,
+        consume: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut dyn std::io::Read) -> Result<T> + Send + 'static,
+    {
+        self.get(dir, paths, exclude, timeout, consume).await
     }
 
     async fn get<T, F>(

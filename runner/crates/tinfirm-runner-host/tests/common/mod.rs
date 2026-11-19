@@ -1338,6 +1338,9 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
     if let Some(binary) = setup.bridge {
         let mut bridge = BridgeOptions::new(binary);
         bridge.connect_timeout = Duration::from_secs(30);
+        // The tests are about the runs: a kernel without Landlock reads unconfined, as a Docker
+        // host does. The reader's own tests (reader.rs) take no unconfined reader.
+        bridge.reader = bridge.reader.clone().allowing_unconfined(true);
         opts.bridge = Some(bridge);
     }
     if let Some(timeout) = setup.inactivity_timeout {

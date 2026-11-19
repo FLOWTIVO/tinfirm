@@ -357,4 +357,157 @@ mod tests {
         let frame = Frame::new(Kind::Control, 0, 1, b"sk-ant-secret".to_vec());
         assert!(!format!("{frame:?}").contains("secret"));
     }
+
+    // ----- a hostile peer (ADR-0112, decision 8, "Path C") ---------------------------------
+    //
+    // Property tests without a fuzzing dependency: a seeded generator, so that a failure names
+    // its seed and is replayed exactly.
+
+    /// xorshift64*: deterministic, and enough to spread bytes.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    const KINDS: [Kind; 7] = [
+        Kind::Control,
+        Kind::Data,
+        Kind::Eof,
+        Kind::Ack,
+        Kind::Ping,
+        Kind::Pong,
+        Kind::Credit,
+    ];
+
+    /// A frame whose fields are anything, valid or not: the encoder does not check.
+    fn any_frame(rng: &mut Rng) -> Frame {
+        let kind = KINDS[rng.below(7) as usize];
+        let stream = match rng.below(4) {
+            0 => STREAM_CONTROL,
+            1 => rng.below(20) as u32,
+            2 => STREAM_DYNAMIC + rng.below(1000) as u32,
+            _ => rng.next() as u32,
+        };
+        let seq = match rng.below(3) {
+            0 => 0,
+            1 => rng.below(10),
+            _ => rng.next(),
+        };
+        let len = match rng.below(5) {
+            0 => 0,
+            1 => 4,
+            2 => 8,
+            3 => rng.below(300) as usize,
+            _ => rng.below(MAX_DATA as u64 + 64) as usize,
+        };
+        Frame::new(kind, stream, seq, rng.bytes(len))
+    }
+
+    /// Reads every frame of `bytes` until the end or an error. Whatever a frame read here is,
+    /// it passed its checks and is exactly the bytes it came from.
+    async fn read_all(bytes: &[u8]) -> (usize, Option<FrameError>) {
+        let mut reader = bytes;
+        let mut frames = 0;
+        loop {
+            let before = reader.len();
+            match read_frame(&mut reader).await {
+                Ok(None) => return (frames, None),
+                Ok(Some(frame)) => {
+                    frame
+                        .check()
+                        .expect("a frame that was read passes its checks");
+                    let consumed = &bytes[bytes.len() - before..bytes.len() - reader.len()];
+                    assert_eq!(
+                        frame.encode(),
+                        consumed,
+                        "a frame is the bytes it came from"
+                    );
+                    frames += 1;
+                }
+                Err(e) => return (frames, Some(e)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn random_bytes_are_refused_or_read_as_frames_that_pass_their_checks() {
+        for seed in 0..3000u64 {
+            let mut rng = Rng::new(seed);
+            let len = rng.below(200) as usize;
+            let mut bytes = rng.bytes(len);
+            // Often a length that is in range, so that the header's other checks are reached.
+            if bytes.len() >= 4 && rng.below(2) == 0 {
+                let claimed = (HEADER as u64 + rng.below(64)) as u32;
+                bytes[..4].copy_from_slice(&claimed.to_be_bytes());
+            }
+            let (_, error) = read_all(&bytes).await;
+            if let Some(FrameError::Io(e)) = error {
+                panic!("seed {seed}: an I/O error from a byte slice: {e}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_with_any_fields_are_read_back_only_when_valid() {
+        for seed in 0..3000u64 {
+            let mut rng = Rng::new(seed);
+            let frame = any_frame(&mut rng);
+            let bytes = frame.encode();
+            let valid =
+                frame.check().is_ok() && HEADER + frame.payload.len() <= HEADER + MAX_CONTROL;
+            match read_all(&bytes).await {
+                (1, None) => assert!(valid, "seed {seed}: {frame:?} was read but is invalid"),
+                (0, Some(_)) => assert!(!valid, "seed {seed}: {frame:?} is valid but refused"),
+                other => panic!("seed {seed}: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_valid_stream_with_one_byte_changed_never_reads_a_broken_frame() {
+        let mut rng = Rng::new(42);
+        let mut stream = Vec::new();
+        let mut seq = 1;
+        for _ in 0..40 {
+            let frame = match rng.below(4) {
+                0 => Frame::new(Kind::Control, 0, seq, br#"{"type":"done","id":1}"#.to_vec()),
+                1 => Frame::new(Kind::Data, STREAM_STDOUT, seq, rng.bytes(100)),
+                2 => Frame::ack(rng.next()),
+                _ => Frame::new(Kind::Credit, STREAM_DYNAMIC, seq, Frame::credit_payload(7)),
+            };
+            if frame.kind.numbered() {
+                seq += 1;
+            }
+            stream.extend(frame.encode());
+        }
+        let (frames, error) = read_all(&stream).await;
+        assert_eq!(frames, 40);
+        assert!(error.is_none(), "{error:?}");
+        for round in 0..2000u64 {
+            let mut broken = stream.clone();
+            let at = rng.below(broken.len() as u64) as usize;
+            broken[at] ^= (rng.below(255) + 1) as u8;
+            // Truncated anywhere, too.
+            if round % 3 == 0 {
+                broken.truncate(rng.below(broken.len() as u64) as usize);
+            }
+            // read_all asserts on every frame it reads; that it ends is the property.
+            let _ = read_all(&broken).await;
+        }
+    }
 }
