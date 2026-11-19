@@ -16,6 +16,14 @@
 //! for it but names it as revoked, so a host that restarts does not take the token back. A
 //! revocation is for the rest of the run: nothing gives a revoked repository a token again.
 //!
+//! A token that the server minted for the run has an expiry (`git.expiresAt`, the feature
+//! `run.git.refresh`): [`crate::git_refresh`] renews it through the server before it is due, and
+//! the holder takes the new token ([`RunGitTokens::renew`]). Once a token's expiry has passed
+//! without a new one, every user gets the error [`EXPIRED`] instead of it, as after a
+//! revocation; unlike a revocation, a renewal that comes later makes it usable again. Such a
+//! token's mirror is named by `git.mirrorKey`, the credential's, not by the token
+//! ([`RunGitTokens::mirror_key`]).
+//!
 //! The redaction is not the holder's: every token a run was given stays on the run's redaction
 //! list until the run ends ([`crate::host::Shared::add_run_secrets`]), revoked ones included.
 //!
@@ -23,10 +31,12 @@
 //! description names directories and refs, never a repository's credentials.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tinfirm_protocol::{GitCredentials, LogLevel, RunAssign, Secret, WorkspaceSpec};
+use tinfirm_protocol::{GitCredentials, GitToken, LogLevel, RunAssign, Secret, WorkspaceSpec};
 use uuid::Uuid;
 
 use crate::run::EventSink;
@@ -59,6 +69,14 @@ pub struct RevokedRepository {
     pub message: String,
 }
 
+/// The reason code of a token whose expiry passed without a new one.
+pub const EXPIRED: &str = "EXPIRED";
+/// The message of such a token (ADR-0116, decision 9).
+pub const EXPIRED_MESSAGE: &str = "the git token expired and Tinfirm could not renew it";
+
+/// The holder asks the server for a repository's new token at most this often.
+pub const ASK_EVERY: Duration = Duration::from_secs(60);
+
 /// A token the run holds for one repository.
 #[derive(Clone)]
 struct Held {
@@ -66,15 +84,25 @@ struct Held {
     token: Secret,
     /// `Basic base64(username:token)`.
     authorization: Secret,
+    /// When it stops working; `None`: it lives until the run ends.
+    expires_at: Option<DateTime<Utc>>,
+    /// The credential's key, which names the mirror (with `expires_at`).
+    mirror_key: Option<String>,
 }
 
 impl Held {
-    fn new(username: &str, token: &Secret) -> Held {
+    fn of(git: &GitCredentials) -> Held {
         Held {
-            username: username.to_string(),
-            token: token.clone(),
-            authorization: basic_authorization(username, token),
+            username: git.username.clone(),
+            token: git.token.clone(),
+            authorization: basic_authorization(&git.username, &git.token),
+            expires_at: git.expires_at,
+            mirror_key: git.mirror_key.clone(),
         }
+    }
+
+    fn expired(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|at| at <= now)
     }
 }
 
@@ -89,6 +117,10 @@ enum Slot {
 struct Entry {
     component_id: Uuid,
     slot: Slot,
+    /// When the holder last asked the server for a new token ([`ASK_EVERY`]).
+    asked_at: Option<Instant>,
+    /// The expiry of the held token was logged already.
+    expiry_logged: bool,
 }
 
 /// Where the holder logs a revocation: the run's events once the run has its sink, and until
@@ -169,13 +201,15 @@ impl RunGitTokens {
                         message: r.message.clone(),
                     }),
                     None => match &ws.git {
-                        Some(git) => Slot::Held(Held::new(&git.username, &git.token)),
+                        Some(git) => Slot::Held(Held::of(git)),
                         None => Slot::Public,
                     },
                 };
                 Entry {
                     component_id: ws.component_id,
                     slot,
+                    asked_at: None,
+                    expiry_logged: false,
                 }
             })
             .collect();
@@ -212,20 +246,128 @@ impl RunGitTokens {
     }
 
     /// The `Authorization` header for `component_id` right now: `Ok(None)` for a public
-    /// repository (or one the run does not have), `Err` once its token is revoked.
+    /// repository (or one the run does not have), `Err` once its token is revoked, or while its
+    /// expiry has passed without a new one ([`EXPIRED`]).
     pub fn authorization(&self, component_id: Uuid) -> Result<Option<Secret>, Revocation> {
+        self.note_expired();
         match self.slot(component_id) {
+            Some(Slot::Held(held)) if held.expired(Utc::now()) => Err(Revocation {
+                reason: EXPIRED.to_string(),
+                message: EXPIRED_MESSAGE.to_string(),
+            }),
             Some(Slot::Held(held)) => Ok(Some(held.authorization)),
             Some(Slot::Revoked(revocation)) => Err(revocation),
             Some(Slot::Public) | None => Ok(None),
         }
     }
 
-    /// Why `component_id`'s token is gone, if it is.
+    /// Why `component_id`'s token cannot be used now, if it cannot: revoked, or expired.
     pub fn revocation(&self, component_id: Uuid) -> Option<Revocation> {
+        self.authorization(component_id).err()
+    }
+
+    /// Whether the run holds a token for `component_id`, usable or expired (not revoked).
+    pub fn holds(&self, component_id: Uuid) -> bool {
+        matches!(self.slot(component_id), Some(Slot::Held(_)))
+    }
+
+    /// The credential's key that names `component_id`'s mirror (`git.mirrorKey`), while the
+    /// run holds such a token.
+    pub fn mirror_key(&self, component_id: Uuid) -> Option<String> {
         match self.slot(component_id) {
-            Some(Slot::Revoked(revocation)) => Some(revocation),
+            Some(Slot::Held(held)) => held.mirror_key,
             _ => None,
+        }
+    }
+
+    /// Whether a token of the run expires (and so is renewed).
+    pub fn expires(&self) -> bool {
+        lock(&self.entries)
+            .iter()
+            .any(|e| matches!(&e.slot, Slot::Held(h) if h.expires_at.is_some()))
+    }
+
+    /// The repositories whose token to renew now: each held token with an expiry that is
+    /// `within` or less away (`None`: any), for which the holder did not ask during the last
+    /// [`ASK_EVERY`]. They count as asked from now.
+    pub fn due(&self, within: Option<Duration>) -> Vec<Uuid> {
+        let now = Utc::now();
+        let instant = Instant::now();
+        let mut due = Vec::new();
+        for entry in lock(&self.entries).iter_mut() {
+            let Slot::Held(Held {
+                expires_at: Some(expires_at),
+                ..
+            }) = &entry.slot
+            else {
+                continue;
+            };
+            let left = (*expires_at - now).to_std().unwrap_or(Duration::ZERO);
+            let soon = within.is_none_or(|within| left <= within);
+            let paced = entry
+                .asked_at
+                .is_some_and(|at| instant.duration_since(at) < ASK_EVERY);
+            if soon && !paced {
+                entry.asked_at = Some(instant);
+                due.push(entry.component_id);
+            }
+        }
+        due
+    }
+
+    /// Takes the server's new tokens (a GIT_TOKEN request's answer): each replaces the held
+    /// token of its repository, its mirror key kept; a repository revoked meanwhile, or one the
+    /// run does not hold a token of, keeps what it has. The take-back record is written again.
+    /// Returns the values to add to the run's redaction (each token and its header); the old
+    /// ones stay there.
+    pub fn renew(&self, renewed: &[GitToken]) -> Vec<String> {
+        let mut secrets = Vec::new();
+        {
+            let mut entries = lock(&self.entries);
+            for token in renewed {
+                let Some(entry) = entries
+                    .iter_mut()
+                    .find(|e| e.component_id == token.component_id)
+                else {
+                    continue;
+                };
+                let Slot::Held(held) = &mut entry.slot else {
+                    continue;
+                };
+                *held = Held::of(&GitCredentials {
+                    username: token.username.clone(),
+                    token: token.token.clone(),
+                    expires_at: Some(token.expires_at),
+                    mirror_key: held.mirror_key.clone(),
+                });
+                entry.expiry_logged = false;
+                secrets.push(held.token.expose().to_string());
+                secrets.push(held.authorization.expose().to_string());
+            }
+        }
+        if !secrets.is_empty() {
+            tracing::info!(run_id = %self.run_id, epoch = self.epoch, repositories = secrets.len() / 2, "renewed git tokens of the run");
+            self.sync_record();
+        }
+        secrets
+    }
+
+    /// Logs, once per token, that a token's expiry has passed without a new one.
+    fn note_expired(&self) {
+        let now = Utc::now();
+        let mut expired = false;
+        for entry in lock(&self.entries).iter_mut() {
+            if let Slot::Held(held) = &entry.slot
+                && held.expired(now)
+                && !entry.expiry_logged
+            {
+                entry.expiry_logged = true;
+                expired = true;
+            }
+        }
+        if expired {
+            tracing::warn!(run_id = %self.run_id, epoch = self.epoch, "a git token of the run expired without a new one");
+            self.log_warn(EXPIRED_MESSAGE);
         }
     }
 
@@ -295,6 +437,8 @@ impl RunGitTokens {
                     ws.git = Some(GitCredentials {
                         username: held.username.clone(),
                         token: held.token.clone(),
+                        expires_at: held.expires_at,
+                        mirror_key: held.mirror_key.clone(),
                     });
                 }
                 Slot::Revoked(revocation) => {
@@ -372,6 +516,14 @@ impl RepoTokens {
     /// Why the token is gone, if it is.
     pub fn revocation(&self) -> Option<Revocation> {
         self.tokens.revocation(self.component_id)
+    }
+
+    /// The key of this repository's mirror now ([`crate::mirror::key_for`]): the credential's
+    /// (`git.mirrorKey`) when the token has one, else that of `authorization`, the header the
+    /// fetch uses.
+    pub fn mirror_key(&self, repo_url: &str, authorization: Option<&Secret>) -> String {
+        let credential = self.tokens.mirror_key(self.component_id);
+        crate::mirror::key_for(repo_url, credential.as_deref(), authorization)
     }
 }
 
@@ -468,6 +620,110 @@ mod tests {
         let restored = RunGitTokens::restored(&view, &named);
         assert_eq!(restored.revocation(ids[0]).unwrap().message, "no more");
         assert!(restored.authorization(ids[1]).unwrap().is_some());
+    }
+
+    fn expiring(dir: &str, token: &str, expires_at: DateTime<Utc>) -> serde_json::Value {
+        let mut ws = workspace(dir, Some(token));
+        ws["git"]["expiresAt"] = serde_json::json!(expires_at.to_rfc3339());
+        ws["git"]["mirrorKey"] = serde_json::json!("3f".repeat(32));
+        ws
+    }
+
+    fn renewed(component_id: Uuid, token: &str, expires_at: DateTime<Utc>) -> GitToken {
+        GitToken {
+            component_id,
+            username: "x-access-token".into(),
+            token: Secret::new(token),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn tokens_that_expire_are_due_paced_renewed_and_unusable_once_expired() {
+        let now = Utc::now();
+        // Two repositories of one credential, as a READ and a WRITE token of it (ADR-0116,
+        // decision 8): each its own token, the same mirror key.
+        let assign = assign(serde_json::json!([
+            expiring(
+                "write",
+                "ghs_write_0123456789",
+                now + chrono::Duration::minutes(5)
+            ),
+            expiring(
+                "read",
+                "ghs_read_0123456789",
+                now + chrono::Duration::minutes(50)
+            ),
+            workspace("pat", Some("github_pat_0123456789")),
+        ]));
+        let ids: Vec<Uuid> = assign.workspaces.iter().map(|w| w.component_id).collect();
+        let tokens = RunGitTokens::new(&assign);
+        assert!(tokens.expires());
+        assert_eq!(tokens.mirror_key(ids[0]), Some("3f".repeat(32)));
+        assert_eq!(tokens.mirror_key(ids[1]), Some("3f".repeat(32)));
+        assert_eq!(tokens.mirror_key(ids[2]), None);
+        // Within 10 minutes: the first only; asked, it is not due again within the minute.
+        assert_eq!(tokens.due(Some(Duration::from_secs(600))), vec![ids[0]]);
+        assert!(tokens.due(Some(Duration::from_secs(600))).is_empty());
+        // Every token that expires (a run taken back): the second; a token without an
+        // expiry never.
+        assert_eq!(tokens.due(None), vec![ids[1]]);
+
+        let secrets = tokens.renew(&[renewed(
+            ids[0],
+            "ghs_renewed_0123456789",
+            now + chrono::Duration::minutes(60),
+        )]);
+        assert_eq!(secrets.len(), 2);
+        assert_eq!(secrets[0], "ghs_renewed_0123456789");
+        let header = basic_authorization("x-access-token", &Secret::new("ghs_renewed_0123456789"));
+        assert_eq!(secrets[1], header.expose());
+        assert_eq!(
+            tokens.authorization(ids[0]).unwrap().unwrap().expose(),
+            header.expose()
+        );
+        assert_eq!(tokens.mirror_key(ids[0]), Some("3f".repeat(32)), "kept");
+        let mut view = assign.clone();
+        tokens.write_to(&mut view);
+        let git = view.workspaces[0].git.as_ref().unwrap();
+        assert_eq!(git.token.expose(), "ghs_renewed_0123456789");
+        assert_eq!(git.expires_at, Some(now + chrono::Duration::minutes(60)));
+        assert_eq!(git.mirror_key, Some("3f".repeat(32)));
+
+        // A token whose expiry passed is not used, and a renewal makes it usable again.
+        tokens.renew(&[renewed(
+            ids[1],
+            "ghs_late_0123456789",
+            now - chrono::Duration::seconds(1),
+        )]);
+        let expired = tokens.authorization(ids[1]).unwrap_err();
+        assert_eq!(expired.reason, EXPIRED);
+        assert_eq!(expired.message, EXPIRED_MESSAGE);
+        assert!(tokens.holds(ids[1]));
+        assert!(
+            matches!(&*lock(&tokens.log), Log::Waiting(w) if w == &[EXPIRED_MESSAGE.to_string()])
+        );
+        tokens.authorization(ids[1]).unwrap_err();
+        assert!(
+            matches!(&*lock(&tokens.log), Log::Waiting(w) if w.len() == 1),
+            "logged once"
+        );
+        tokens.renew(&[renewed(
+            ids[1],
+            "ghs_again_0123456789",
+            now + chrono::Duration::minutes(60),
+        )]);
+        assert!(tokens.authorization(ids[1]).unwrap().is_some());
+
+        // A revoked repository takes no new token.
+        tokens.revoke(&[ids[0]], "SUSPENDED", "gone");
+        assert!(
+            tokens
+                .renew(&[renewed(ids[0], "ghs_after_0123456789", now)])
+                .is_empty()
+        );
+        assert_eq!(tokens.authorization(ids[0]).unwrap_err().message, "gone");
+        assert!(tokens.due(None).iter().all(|id| *id != ids[0]));
     }
 
     #[test]

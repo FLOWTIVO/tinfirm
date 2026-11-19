@@ -71,10 +71,7 @@ async fn the_sandbox_fetches_through_the_proxy_and_cannot_push() {
             repo_url: repo_url.clone(),
             default_branch: "main".into(),
             branch: "agent/TEST-1".into(),
-            git: Some(GitCredentials {
-                username: "x-access-token".into(),
-                token: Secret::new(TEST_GIT_TOKEN),
-            }),
+            git: Some(GitCredentials::new("x-access-token", Secret::new(TEST_GIT_TOKEN))),
             author_name: None,
             author_email: None,
             read_only: false,

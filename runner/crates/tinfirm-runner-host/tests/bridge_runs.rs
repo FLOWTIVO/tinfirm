@@ -526,6 +526,17 @@ async fn a_host_killed_mid_run_after(
     v2: bool,
     revoke: Option<&str>,
 ) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf, u64) {
+    a_host_killed_mid_run_with(server, repo, v2, revoke, |_| {}).await
+}
+
+/// [`a_host_killed_mid_run_after`], with the run's assignment changed by `change` first.
+async fn a_host_killed_mid_run_with(
+    server: &mut FakeServer,
+    repo: &TestRepo,
+    v2: bool,
+    revoke: Option<&str>,
+    change: impl FnOnce(&mut AssignSpec<'static>),
+) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf, u64) {
     let dir = tempfile::tempdir().unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
@@ -543,6 +554,7 @@ async fn a_host_killed_mid_run_after(
     if v2 {
         spec.protocol_version = 2;
     }
+    change(&mut spec);
     conn.send(spec.to_json());
     // The agent has written its work and goes on: the run's record is there.
     conn.wait_running(spec.run_id).await;
@@ -837,6 +849,86 @@ async fn a_run_taken_back_without_welcome_done_pushes_after_the_cap_and_says_so(
                 .as_str()
                 .unwrap()
                 .contains("pushed without knowing whether a git token of the run was revoked")
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_taken_back_after_its_token_expired_renews_it_before_the_push() {
+    use common::git_http::GitHttpServer;
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(basic_of(TEST_APP_TOKEN))).await;
+        let url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        // Host A's token expires in seconds; A asks to renew it, and gets no answer.
+        let expires_at = chrono::Utc::now() + chrono::TimeDelta::seconds(4);
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_with(&mut server, &repo, true, None, |spec| {
+                spec.workspaces = vec![WorkspaceEntry::new("repo", "Repo", &url).expiring(
+                    TEST_APP_TOKEN,
+                    expires_at,
+                    TEST_MIRROR_KEY,
+                )];
+            })
+            .await;
+        let kept: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        let git = &kept["assign"]["workspaces"][0]["git"];
+        assert_eq!(git["token"], TEST_APP_TOKEN);
+        assert_eq!(git["mirrorKey"], TEST_MIRROR_KEY);
+        assert!(git["expiresAt"].is_string(), "{kept:#}");
+        // The token expires while no host runs.
+        let wait = (expires_at - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        tokio::time::sleep(wait + Duration::from_millis(200)).await;
+        git_server.set_authorization(Some(basic_of(TEST_RENEWED_TOKEN)));
+
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        conn.send(json!({"type": "welcome.done"}));
+        // After welcome.done the host renews every token of the run that expires.
+        let id = spec.run_id.to_string();
+        let request = conn
+            .take_where("a GIT_TOKEN request", |f| {
+                f["type"] == "run.request" && f["runId"] == id && f["kind"] == "GIT_TOKEN"
+            })
+            .await;
+        let component = spec.workspaces[0].component_id;
+        assert_eq!(request["payload"]["componentIds"], json!([component]));
+        conn.send(git_tokens_ack(
+            &request,
+            &[(
+                component,
+                TEST_RENEWED_TOKEN,
+                chrono::Utc::now() + chrono::TimeDelta::minutes(60),
+            )],
+            &[],
+        ));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        let pushes: Vec<_> = git_server
+            .seen()
+            .into_iter()
+            .filter(|r| r.path.ends_with("git-receive-pack"))
+            .collect();
+        assert!(!pushes.is_empty());
+        assert!(
+            pushes
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some(basic_of(TEST_RENEWED_TOKEN).as_str()))
+        );
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
         );
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();

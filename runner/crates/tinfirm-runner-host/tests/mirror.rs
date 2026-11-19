@@ -30,10 +30,10 @@ fn spec(repo_url: &str) -> WorkspaceSpec {
         repo_url: repo_url.into(),
         default_branch: "main".into(),
         branch: "agent/TEST-1".into(),
-        git: Some(GitCredentials {
-            username: "x-access-token".into(),
-            token: Secret::new(TEST_GIT_TOKEN),
-        }),
+        git: Some(GitCredentials::new(
+            "x-access-token",
+            Secret::new(TEST_GIT_TOKEN),
+        )),
         author_name: None,
         author_email: None,
         read_only: false,

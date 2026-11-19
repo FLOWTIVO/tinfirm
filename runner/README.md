@@ -634,6 +634,9 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     applied by then. So a revocation that Tinfirm sent while the host was away comes first.
     Without `welcome.done` within 2 minutes (no connection, or a server that sends none) the run
     pushes with what the record holds, and a warning in its log says which of the two it was.
+    Then it renews every token of the run that expires
+    ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)), an expired one included,
+    before the push. The record keeps a token's latest value and its expiry.
   - `run` must start with the same data directory and, for Docker, the same sandbox network, within
     the 15 minutes; `run --sandbox-bridge` must stay on.
 
@@ -1077,9 +1080,10 @@ The host speaks one runner protocol version per connection and names it in
   the server sends a feature's frames only to a host that lists it. This host lists `run.steer`
   ([Steering](#steering-protocol-v2)), `session.bundle`
   ([Session bundles](#session-bundles-protocol-v2)), `run.git.revoke`
-  ([Revoked git tokens](#revoked-git-tokens-protocol-v2)) and, with Docker or a VM per run,
+  ([Revoked git tokens](#revoked-git-tokens-protocol-v2)), `run.git.refresh`
+  ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)) and, with Docker or a VM per run,
   `run.skills` ([Skills](#skills-protocol-v2)); a v1 host lists nothing.
-- **Per-kind waits.** A `run.request` of kind `ASK`, `ACCESS`, `NETWORK` or `ARTIFACT` waits 30 s for
+- **Per-kind waits.** A `run.request` of kind `ASK`, `ACCESS`, `NETWORK`, `ARTIFACT` or `GIT_TOKEN` waits 30 s for
   its ack (as the v1 pairs do); a `TOOL` request waits 65 s, the server's tool timeout
   (60 s by default) plus 5 s. A request that still waits when the connection is lost is sent
   again, with the same `requestId`, after the next `welcome`; exactly one ack of the
@@ -1099,7 +1103,7 @@ Three numbers, each moved by something else
 | The features | `hello.features` | A new optional capability within protocol 2, whatever release ships it | Sends a feature's frames only to a host that lists it |
 
 **This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
-It uses the features `run.steer`, `run.skills`, `session.bundle`, `run.git.revoke`,
+It uses the features `run.steer`, `run.skills`, `session.bundle`, `run.git.revoke`, `run.git.refresh`,
 `sandbox.bridge`, `sandbox.pool` and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
 [ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). A host that lists none of them
 still takes turns; it only misses what they add.
@@ -1720,7 +1724,8 @@ new session (`resumeOutcome` `NO_SESSION`).
    the old one has stopped): the connection never waits for Docker or for another run.
 2. For each repository, in order (a run can have none):
    - fetches the host's mirror of the repository URL for that repository's credentials
-     (creating it on first use), with that
+     (creating it on first use; a token minted for the run names its credential's mirror,
+     [below](#git-tokens-that-expire-protocol-v2)), with that
      repository's git token passed per command as `http.extraHeader` (through `GIT_CONFIG_*`
      environment variables, so it is neither in any `.git/config` nor in the process list).
      Any fetch failure, a 401 or 403 included, fails the run with `GIT_ERROR` before the
@@ -1944,6 +1949,35 @@ repository it does not have or one revoked already, changes nothing, and is not 
 cancelled run whose token was revoked ends `CANCELLED` as before, with the repository not pushed
 and the reason in the log. A host of protocol 1 knows no such frame (`error` `UNKNOWN_TYPE`), and
 Tinfirm sends it only to a host that lists the feature: such a run keeps its token until it ends.
+
+### Git tokens that expire (protocol v2)
+
+Under protocol v2 the host also lists `run.git.refresh`
+([ADR-0116](../docs/adr/0116-short-lived-and-revocable-git-tokens.md)). A token that Tinfirm mints
+for one run, such as a GitHub App's installation token, comes with `git.expiresAt` (at most an
+hour away) and `git.mirrorKey`; any other token has neither and lives until the run ends.
+
+- **When the host renews.** With a `run.request` of kind `GIT_TOKEN` naming every repository that
+  is due: while the run works, when a token has 10 minutes or less left (the host looks every
+  15 s); before the push at the run's end, when it has 20 minutes or less left; and for a run
+  taken back after a restart, after `welcome.done`, every token that expires. It asks at most
+  once a minute per repository, and only while connected.
+- **The answer.** DONE: each renewed token goes into the run's holder (so the git proxy's routes,
+  the host's git and the take-back record use it from then on) and onto the run's redaction list,
+  where the old one stays. A repository in `refused` with `GIT_REVOKED`, or a REJECTED
+  `GIT_REVOKED` for the whole request, is revoked with the server's message, as by
+  `run.git.revoke` ([above](#revoked-git-tokens-protocol-v2)). `GIT_HELD` (a kill switch holds the
+  run's systems), `GIT_UNAVAILABLE`, an unknown code, no answer within 30 s or no connection: the
+  token is kept, and the host asks again later.
+- **A token that expires without a new one** cannot be used: the git proxy answers 403 with "the
+  git token expired and Tinfirm could not renew it", which is also logged once as a warning, and
+  the repository is not pushed (`GIT_ERROR`, `not pushed: …`). A renewal that comes later makes
+  it usable again; nothing is revoked.
+- **The mirror.** A token with `mirrorKey` names its mirror by the credential's key, not by the
+  token, so the runs of one credential share a mirror per repository and two credentials still
+  never do. Such a mirror is a `<key>.git` like any other, and maintenance deletes it when idle.
+- `expiresAt` and `mirrorKey` come together; an assignment with one alone, or a key that is not 64
+  lowercase hex characters, is rejected with `INVALID_ASSIGNMENT`.
 
 ### Platform tools
 

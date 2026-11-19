@@ -2369,10 +2369,10 @@ mod tests {
             repo_url: format!("https://github.com/acme/{dir}.git"),
             default_branch: "main".into(),
             branch: "agent/ACME-7".into(),
-            git: Some(GitCredentials {
-                username: "x-access-token".into(),
-                token: tinfirm_protocol::Secret::new("ghp_TEST_ONLY"),
-            }),
+            git: Some(GitCredentials::new(
+                "x-access-token",
+                tinfirm_protocol::Secret::new("ghp_TEST_ONLY"),
+            )),
             author_name: None,
             author_email: None,
             read_only: false,

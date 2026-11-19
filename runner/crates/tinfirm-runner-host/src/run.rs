@@ -439,6 +439,9 @@ pub async fn execute(
     if !secrets.is_empty() {
         shared.add_run_secrets(assign.run_id, assign.epoch, secrets);
     }
+    // Tokens that expire are renewed while the run works (ADR-0116); the renewal stops when
+    // this function returns.
+    let _renewal = crate::git_refresh::spawn(shared, tokens);
     let mut repos: Vec<Repo> = Vec::new();
     if !assign.workspaces.is_empty() {
         sink.status(Phase::Cloning, None);
@@ -995,7 +998,7 @@ pub async fn execute(
     let mut results = Vec::new();
     if !repos.is_empty() {
         sink.status(Phase::Finalizing, None);
-        let finalized = finalize_git(shared, &mut sink, &repos, assign.run_id, leak).await;
+        let finalized = finalize_git(shared, &mut sink, &repos, tokens, assign.run_id, leak).await;
         if finalized.outgoing_leak {
             failure.force(
                 FailureClass::CredentialLeak,
@@ -1234,14 +1237,12 @@ pub async fn take_back(
         // The push waits for the server: a revocation that came while this host was away
         // comes again after its hello (ADR-0116, decision 10). A host of protocol 1 knows no
         // revocation, and pushes as before.
-        if shared.speaks_v2()
-            && repos
-                .iter()
-                .any(|repo| matches!(repo.git.authorization(), Ok(Some(_))))
-        {
+        if shared.speaks_v2() && repos.iter().any(|repo| tokens.holds(repo.ws.component_id)) {
             wait_for_the_server(shared, &mut sink, &mut stop_rx).await;
+            // Then every token that expires is renewed first, an expired one included.
+            crate::git_refresh::renew(shared, tokens, None).await;
         }
-        let finalized = finalize_git(shared, &mut sink, &repos, assign.run_id, false).await;
+        let finalized = finalize_git(shared, &mut sink, &repos, tokens, assign.run_id, false).await;
         if finalized.outgoing_leak {
             leak = true;
             failure.force(
@@ -1630,9 +1631,13 @@ async fn clone_all<'a>(
         let cloned = async {
             // The mirror is fetched with this repository's credentials first, so a token
             // that no longer works fails the run instead of serving stale content.
+            // A token minted for the run names its credential's mirror (ADR-0116).
+            let key = git
+                .tokens()
+                .mirror_key(&ws.repo_url, authorization.as_ref());
             let mirror = shared
                 .mirrors
-                .update(&ws.repo_url, authorization.as_ref())
+                .update_keyed(&key, &ws.repo_url, authorization.as_ref())
                 .await
                 .map_err(|e| e.context("cannot update the host's mirror"))?;
             git.clone_from_mirror(&mirror.path, &mirror.refs, ws).await
@@ -3156,10 +3161,16 @@ async fn finalize_git(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     repos: &[Repo<'_>],
+    tokens: &Arc<RunGitTokens>,
     run_id: Uuid,
     leak: bool,
 ) -> Finalized {
     let mut finalized = Finalized::default();
+    // A token that expires is renewed before the mirror fetch and the push use it, when it
+    // has 20 minutes or less left (ADR-0116, decision 10).
+    if !leak {
+        crate::git_refresh::renew(shared, tokens, Some(crate::git_refresh::BEFORE_PUSH)).await;
+    }
     // Per repository: the ahead count, when it is ready to push.
     let mut ready: Vec<Option<u64>> = Vec::with_capacity(repos.len());
     let mut leaking = Vec::new();
@@ -3293,9 +3304,12 @@ async fn prepare_repository(
     // A revoked token (ADR-0116) fetches nothing: the scan compares with the clone's refs.
     let authorization = git.authorization().ok();
     let current = if let (true, Some(authorization)) = (scan, authorization) {
+        let key = git
+            .tokens()
+            .mirror_key(git.repo_url(), authorization.as_ref());
         match shared
             .mirrors
-            .refresh(git.repo_url(), authorization.as_ref())
+            .refresh_keyed(&key, git.repo_url(), authorization.as_ref())
             .await
         {
             Ok(refs) => refs,

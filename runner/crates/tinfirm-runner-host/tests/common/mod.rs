@@ -37,6 +37,12 @@ pub const TEST_CLAUDE_TOKEN: &str = "sk-ant-oat01-TEST-ONLY-fake-claude-token-01
 pub const TEST_OPENAI_KEY: &str = "sk-TEST-ONLY-fake-openai-key-0123456789abcdef";
 pub const TEST_HOST_TOKEN: &str = "tfr_TESTONLYfakehosttoken0123456789abcdefghijk";
 pub const TEST_GIT_TOKEN: &str = "github_pat_TEST_ONLY_fake_git_token_0123456789";
+/// A GitHub App's installation token minted for a run (ADR-0116), and the one it is renewed with.
+pub const TEST_APP_TOKEN: &str = "ghs_TEST_ONLY_fake_installation_token_0123";
+pub const TEST_RENEWED_TOKEN: &str = "ghs_TEST_ONLY_fake_renewed_token_456789";
+/// A credential's `git.mirrorKey`.
+pub const TEST_MIRROR_KEY: &str =
+    "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f";
 /// The key of a company model credential in `run.assign.modelAccess` (ADR-0027).
 pub const TEST_MODEL_KEY: &str = "sk-litellm-TEST-ONLY-fake-model-key-0123456789abcdef";
 /// Its gateway (never contacted: the fake agent only reports what it was given).
@@ -963,6 +969,8 @@ impl Transcript {
             TEST_OPENAI_KEY,
             TEST_HOST_TOKEN,
             TEST_GIT_TOKEN,
+            TEST_APP_TOKEN,
+            TEST_RENEWED_TOKEN,
             TEST_MODEL_KEY,
         ] {
             assert!(
@@ -1411,6 +1419,8 @@ pub struct WorkspaceEntry {
     pub token: Option<String>,
     /// `readOnly`: the host must never push it.
     pub read_only: bool,
+    /// `git.expiresAt` and `git.mirrorKey` (ADR-0116): a token minted for the run.
+    pub expiring: Option<(chrono::DateTime<chrono::Utc>, String)>,
 }
 
 impl WorkspaceEntry {
@@ -1422,7 +1432,20 @@ impl WorkspaceEntry {
             repo_url: repo_url.into(),
             token: Some(TEST_GIT_TOKEN.into()),
             read_only: false,
+            expiring: None,
         }
+    }
+
+    /// With `token`, which expires at `expires_at`, minted for the credential `mirror_key`.
+    pub fn expiring(
+        mut self,
+        token: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        mirror_key: &str,
+    ) -> WorkspaceEntry {
+        self.token = Some(token.into());
+        self.expiring = Some((expires_at, mirror_key.into()));
+        self
     }
 }
 
@@ -1531,7 +1554,14 @@ impl<'a> AssignSpec<'a> {
                     "repoUrl": w.repo_url,
                     "defaultBranch": "main",
                     "branch": format!("agent/{}", self.task_key),
-                    "git": w.token.as_ref().map(|t| json!({"username": "x-access-token", "token": t})),
+                    "git": w.token.as_ref().map(|t| {
+                        let mut git = json!({"username": "x-access-token", "token": t});
+                        if let Some((expires_at, mirror_key)) = &w.expiring {
+                            git["expiresAt"] = json!(expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                            git["mirrorKey"] = json!(mirror_key);
+                        }
+                        git
+                    }),
                     "authorName": "Tinfirm agent Tester",
                     "authorEmail": format!("agent+{}@tinfirm.invalid", self.agent_id),
                     "readOnly": w.read_only
@@ -1677,6 +1707,46 @@ pub fn git_revoke(run_id: Uuid, epoch: i64, component_ids: &[Uuid], message: &st
         "reason": "GRANT_REMOVED",
         "message": message
     })
+}
+
+/// A DONE answer to a `run.request` of kind GIT_TOKEN: `renewed` as (componentId, token,
+/// expiresAt), `refused` as (componentId, code, message).
+pub fn git_tokens_ack(
+    request: &Value,
+    renewed: &[(Uuid, &str, chrono::DateTime<chrono::Utc>)],
+    refused: &[(Uuid, &str, &str)],
+) -> Value {
+    let git: Vec<Value> = renewed
+        .iter()
+        .map(|(id, token, at)| {
+            json!({
+                "componentId": id,
+                "username": "x-access-token",
+                "token": token,
+                "expiresAt": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            })
+        })
+        .collect();
+    let refused: Vec<Value> = refused
+        .iter()
+        .map(|(id, code, message)| json!({"componentId": id, "code": code, "message": message}))
+        .collect();
+    request_ack(
+        request,
+        "DONE",
+        Some(json!({"git": git, "refused": refused})),
+        None,
+        None,
+    )
+}
+
+/// `Authorization` of `token` as the runner host sends it.
+pub fn basic_of(token: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+    )
 }
 
 /// The server's answer to a `run.repository_request` frame.

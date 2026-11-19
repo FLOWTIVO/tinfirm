@@ -2129,6 +2129,7 @@ impl PlatformRequester for HostRequester {
         let timeout: fn(&HostOptions) -> Duration = match frame.request.kind() {
             RequestKind::Tool => |opts| opts.tool_request_timeout,
             RequestKind::Ask
+            | RequestKind::GitToken
             | RequestKind::Access
             | RequestKind::Network
             | RequestKind::Artifact => |opts| opts.repository_request_timeout,
@@ -2249,7 +2250,7 @@ pub(crate) fn validate_model_access(access: &ModelAccess, runtime: Runtime) -> R
 /// (`hello.features`): `run.steer`, `run.skills` when the skills reach the sandbox (Docker
 /// mounts them, a VM gets them over the bridge; the local test executor has no mounts,
 /// ADR-0064), `session.bundle` (ADR-0097), which the server uses for company hosts only,
-/// `run.git.revoke` (ADR-0116), `sandbox.bridge` with the sandbox bridge (ADR-0095), and `sandbox.elastic` when the VM
+/// `run.git.revoke` and `run.git.refresh` (ADR-0116), `sandbox.bridge` with the sandbox bridge (ADR-0095), and `sandbox.elastic` when the VM
 /// driver is one of this binary's paid ones (ADR-0114). A v1 host lists none.
 pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     if !v2 {
@@ -2262,6 +2263,7 @@ pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     features.push(feature::SESSION_BUNDLE.to_string());
     // Every executor: the holder of a run's git tokens is the host's (ADR-0116).
     features.push(feature::RUN_GIT_REVOKE.to_string());
+    features.push(feature::RUN_GIT_REFRESH.to_string());
     if bridged {
         features.push(feature::SANDBOX_BRIDGE.to_string());
     }
@@ -2321,6 +2323,17 @@ pub fn validate_workspace(ws: &WorkspaceSpec, allow_insecure: bool) -> Result<()
     }
     if !safe_ref(&ws.default_branch) {
         return Err(format!("invalid defaultBranch `{}`", ws.default_branch));
+    }
+    // ADR-0116: a token that expires names its credential's mirror, and only together.
+    if let Some(git) = &ws.git {
+        match (&git.expires_at, &git.mirror_key) {
+            (None, None) => {}
+            (Some(_), Some(key)) if tinfirm_protocol::is_valid_mirror_key(key) => {}
+            (Some(_), Some(_)) => {
+                return Err("git.mirrorKey is not 64 lowercase hex characters".into());
+            }
+            _ => return Err("git.expiresAt and git.mirrorKey come together".into()),
+        }
     }
     Ok(())
 }
@@ -3157,13 +3170,19 @@ mod tests {
                 "run.steer",
                 "run.skills",
                 "session.bundle",
-                "run.git.revoke"
+                "run.git.revoke",
+                "run.git.refresh"
             ]
         );
         // The local test executor has no mounts.
         assert_eq!(
             features(true, &local, false),
-            ["run.steer", "session.bundle", "run.git.revoke"]
+            [
+                "run.steer",
+                "session.bundle",
+                "run.git.revoke",
+                "run.git.refresh"
+            ]
         );
         assert!(features(false, &docker, false).is_empty());
         assert!(features(false, &local, false).is_empty());
@@ -3175,6 +3194,7 @@ mod tests {
                 "run.skills",
                 "session.bundle",
                 "run.git.revoke",
+                "run.git.refresh",
                 "sandbox.bridge"
             ]
         );
@@ -3194,6 +3214,7 @@ mod tests {
                 "run.skills",
                 "session.bundle",
                 "run.git.revoke",
+                "run.git.refresh",
                 "sandbox.bridge",
                 "sandbox.elastic"
             ]
@@ -3205,6 +3226,7 @@ mod tests {
                 "run.skills",
                 "session.bundle",
                 "run.git.revoke",
+                "run.git.refresh",
                 "sandbox.bridge"
             ]
         );
@@ -3259,6 +3281,29 @@ mod tests {
             parse_finished_retention(Some("3m")),
             Duration::from_secs(180)
         );
+    }
+
+    #[test]
+    fn a_token_that_expires_names_its_credentials_mirror() {
+        let url = "https://github.com/acme/w.git";
+        let with = |expires: bool, key: Option<&str>| {
+            let mut spec = ws(url, "agent/X-1", "main");
+            let mut git = tinfirm_protocol::GitCredentials::new(
+                "x-access-token",
+                tinfirm_protocol::Secret::new("ghs_x"),
+            );
+            git.expires_at = expires.then(Utc::now);
+            git.mirror_key = key.map(str::to_string);
+            spec.git = Some(git);
+            validate_workspace(&spec, false)
+        };
+        let key = "3f".repeat(32);
+        assert!(with(false, None).is_ok());
+        assert!(with(true, Some(&key)).is_ok());
+        assert!(with(true, None).is_err());
+        assert!(with(false, Some(&key)).is_err());
+        assert!(with(true, Some(&"3F".repeat(32))).is_err());
+        assert!(with(true, Some("../x")).is_err());
     }
 
     #[test]

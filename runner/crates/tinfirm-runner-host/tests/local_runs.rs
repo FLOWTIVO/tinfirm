@@ -3080,7 +3080,7 @@ async fn a_host_without_mounts_lists_no_skills_and_rejects_a_run_with_skills() {
         let hello = conn.handshake(5).await;
         // The local test executor has no mounts: it does not list `run.skills` (ADR-0064). Over
         // the bridge it says so, for the server's licence (ADR-0100).
-        let mut features = vec!["run.steer", "session.bundle", "run.git.revoke"];
+        let mut features = vec!["run.steer", "session.bundle", "run.git.revoke", "run.git.refresh"];
         if bridged_tests() {
             features.push("sandbox.bridge");
         }
@@ -4179,6 +4179,274 @@ async fn a_revocation_right_after_the_assignment_leaves_the_repository_unpushed(
             t.text()
         );
         assert!(repo.branch_head("agent/TEST-1").is_none());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+// ----- git tokens that expire (ADR-0116, run.git.refresh) ---------------------------------
+
+/// The run's next `run.request` of kind GIT_TOKEN.
+async fn git_token_request(conn: &mut Conn, run_id: Uuid) -> serde_json::Value {
+    let id = run_id.to_string();
+    conn.take_where("a GIT_TOKEN request", |f| {
+        f["type"] == "run.request" && f["runId"] == id && f["kind"] == "GIT_TOKEN"
+    })
+    .await
+}
+
+/// Until the host redacts `value`: it took a renewed token.
+async fn until_redacted(host: &TestHost, value: &str) {
+    for _ in 0..200 {
+        if host.host.redactor().contains(value) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the host never took the renewed token");
+}
+
+/// A run of `scenario` with one repository whose token expires in `expires_in`.
+fn expiring_run<'a>(scenario: &'a str, url: &str, expires_in: TimeDelta) -> AssignSpec<'a> {
+    let mut spec = AssignSpec::v2(scenario, None);
+    spec.workspaces = vec![WorkspaceEntry::new("repo", "Repo", url).expiring(
+        TEST_APP_TOKEN,
+        Utc::now() + expires_in,
+        TEST_MIRROR_KEY,
+    )];
+    spec
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_that_expires_mid_run_is_renewed_before_it_is_used() {
+    use common::git_http::GitHttpServer;
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(basic_of(TEST_APP_TOKEN))).await;
+        let url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        assert!(
+            hello["features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("run.git.refresh")),
+            "{hello}"
+        );
+        // Five minutes left: due at once.
+        let spec = expiring_run("refetch", &url, TimeDelta::minutes(5));
+        let component = spec.workspaces[0].component_id;
+        conn.send(spec.to_json());
+        // Asked for at once; answered once the clone and the first fetch are done.
+        let request = git_token_request(&mut conn, spec.run_id).await;
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+        assert_eq!(request["payload"]["componentIds"], json!([component]));
+        conn.send(git_tokens_ack(
+            &request,
+            &[(
+                component,
+                TEST_RENEWED_TOKEN,
+                Utc::now() + TimeDelta::minutes(60),
+            )],
+            &[],
+        ));
+        until_redacted(&host, TEST_RENEWED_TOKEN).await;
+        // From now on the repository takes the new token only.
+        git_server.set_authorization(Some(basic_of(TEST_RENEWED_TOKEN)));
+        let requests = git_server.seen().len();
+        release(&host.paths, spec.run_id);
+        conn.until_finished(spec.run_id).await;
+
+        let t = run_frames(&conn, spec.run_id);
+        t.assert_no_secrets();
+        let finished = t.finished();
+        let text = t.agent_text();
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{finished:#}\n{text}");
+        assert_eq!(finished["git"][0]["pushed"], true);
+        assert!(text.contains("second fetch: ok"), "{text}");
+        // The sandbox's fetch, the mirror fetch before the push and the push: the new token.
+        let after = &git_server.seen()[requests..];
+        assert!(after.len() >= 3, "{after:#?}");
+        assert!(
+            after
+                .iter()
+                .all(|r| r.authorization.as_deref() == Some(basic_of(TEST_RENEWED_TOKEN).as_str())),
+            "{after:#?}"
+        );
+        // One request: the new token has an hour, so the push asked for none.
+        let asked = conn
+            .frames
+            .iter()
+            .filter(|f| f["type"] == "run.request" && f["kind"] == "GIT_TOKEN")
+            .count();
+        assert_eq!(asked, 1);
+        // The mirror is the credential's, not the token's.
+        let mirrors = host.host.mirrors.list().unwrap();
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(
+            mirrors[0].key,
+            tinfirm_runner_host::mirror::credential_mirror_key(&url, TEST_MIRROR_KEY)
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_refused_for_good_is_a_revocation() {
+    use common::git_http::GitHttpServer;
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(basic_of(TEST_APP_TOKEN))).await;
+        let url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = expiring_run("refetch", &url, TimeDelta::minutes(5));
+        let component = spec.workspaces[0].component_id;
+        conn.send(spec.to_json());
+        // Asked for at once; answered once the clone and the first fetch are done.
+        let request = git_token_request(&mut conn, spec.run_id).await;
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+        // The partial answer: renewed none, this one refused for good.
+        conn.send(git_tokens_ack(
+            &request,
+            &[],
+            &[(component, "GIT_REVOKED", REVOKED)],
+        ));
+        let id = spec.run_id.to_string();
+        conn.take_where("the revocation's warning", |f| {
+            f["runId"] == id && f["eventType"] == "LOG" && f["payload"]["message"] == REVOKED
+        })
+        .await;
+        let requests = git_server.seen().len();
+        release(&host.paths, spec.run_id);
+        conn.until_finished(spec.run_id).await;
+        let t = run_frames(&conn, spec.run_id);
+        t.assert_no_secrets();
+        let finished = t.finished();
+        let text = t.agent_text();
+        assert_eq!(
+            finished["failureClass"], "GIT_ERROR",
+            "{finished:#}\n{text}"
+        );
+        assert_eq!(
+            finished["failureMessage"],
+            format!("git failed in `Repo` (/workspace/repo): not pushed: {REVOKED}")
+        );
+        assert!(
+            text.contains("second fetch failed:") && text.contains(REVOKED),
+            "{text}"
+        );
+        assert_eq!(git_server.seen().len(), requests);
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_renewal_keeps_the_token_until_it_expires() {
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let mut spec = expiring_run("rebase", &repo.url, TimeDelta::minutes(5));
+        spec.prompt_extra = " [commit:repo] [wait]".into();
+        conn.send(spec.to_json());
+        // Asked for at once; answered once the clone and the first fetch are done.
+        let request = git_token_request(&mut conn, spec.run_id).await;
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+        conn.send(request_ack(
+            &request,
+            "REJECTED",
+            None,
+            Some("GIT_HELD"),
+            Some("The agent is paused: its git token is not renewed."),
+        ));
+        release(&host.paths, spec.run_id);
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{}", t.text());
+        assert_eq!(finished["git"][0]["pushed"], true);
+        assert!(!t.text().contains("expired"), "{}", t.text());
+        // Asked once: the push, within the minute, did not ask again.
+        let asked = conn
+            .frames
+            .iter()
+            .filter(|f| f["type"] == "run.request" && f["kind"] == "GIT_TOKEN")
+            .count();
+        assert_eq!(asked, 1);
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_credentials_runs_share_a_mirror_whatever_their_tokens() {
+    use common::git_http::GitHttpServer;
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(basic_of(TEST_APP_TOKEN))).await;
+        let url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let keyed = tinfirm_runner_host::mirror::credential_mirror_key(&url, TEST_MIRROR_KEY);
+
+        // Two runs of one credential, each with a token of its own.
+        for (token, key) in [(TEST_APP_TOKEN, "TEST-1"), (TEST_RENEWED_TOKEN, "TEST-2")] {
+            git_server.set_authorization(Some(basic_of(token)));
+            let mut spec = AssignSpec::v2("happy", None);
+            spec.task_key = key;
+            spec.workspaces = vec![WorkspaceEntry::new("repo", "Repo", &url).expiring(
+                token,
+                Utc::now() + TimeDelta::minutes(60),
+                TEST_MIRROR_KEY,
+            )];
+            conn.send(spec.to_json());
+            let t = conn.until_finished(spec.run_id).await;
+            t.assert_no_secrets();
+            assert_eq!(t.finished()["git"][0]["pushed"], true, "{}", t.text());
+            let mirrors = host.host.mirrors.list().unwrap();
+            assert_eq!(
+                mirrors.iter().map(|m| m.key.as_str()).collect::<Vec<_>>(),
+                vec![keyed.as_str()],
+                "one mirror for the credential"
+            );
+        }
+        // A token without a mirror key (a member's own) has a mirror of its own, as before.
+        let mut spec = AssignSpec::v2("happy", None);
+        spec.task_key = "TEST-3";
+        let mut entry = WorkspaceEntry::new("repo", "Repo", &url);
+        entry.token = Some(TEST_RENEWED_TOKEN.into());
+        spec.workspaces = vec![entry];
+        conn.send(spec.to_json());
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["git"][0]["pushed"], true, "{}", t.text());
+        let mirrors = host.host.mirrors.list().unwrap();
+        assert_eq!(mirrors.len(), 2);
+        assert!(mirrors.iter().any(|m| m.key
+            == tinfirm_runner_host::mirror::mirror_key(
+                &url,
+                Some(&tinfirm_protocol::Secret::new(basic_of(TEST_RENEWED_TOKEN)))
+            )));
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

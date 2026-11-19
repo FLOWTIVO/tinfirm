@@ -368,10 +368,7 @@ fn constructed_messages() -> Vec<Message> {
                     repo_url: "https://github.com/o/server.git".into(),
                     default_branch: "main".into(),
                     branch: "agent/X-1".into(),
-                    git: Some(GitCredentials {
-                        username: "x-access-token".into(),
-                        token: Secret::new("t"),
-                    }),
+                    git: Some(GitCredentials::new("x-access-token", Secret::new("t"))),
                     author_name: Some("Tinfirm agent A".into()),
                     author_email: Some("a@tinfirm.invalid".into()),
                     read_only: false,
@@ -1456,7 +1453,7 @@ fn every_v2_message_and_event_type_has_a_sample() {
         .collect();
     assert_eq!(
         kinds,
-        ["ACCESS", "ARTIFACT", "ASK", "NETWORK", "TOOL"]
+        ["ACCESS", "ARTIFACT", "ASK", "GIT_TOKEN", "NETWORK", "TOOL"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -1812,6 +1809,36 @@ fn constructed_messages_v2() -> Vec<Message> {
     }
     out.push(Message::RunSteer(steer));
     out.push(Message::WelcomeDone(WelcomeDone {}));
+    out.push(request(RequestPayload::GitToken(GitTokenRequest {
+        component_ids: vec![component_id()],
+    })));
+    out.push(ack(
+        RequestStatus::Done,
+        Some(
+            serde_json::to_value(GitTokens {
+                git: vec![GitToken {
+                    component_id: component_id(),
+                    username: "x-access-token".into(),
+                    token: Secret::new("ghs_renewed"),
+                    expires_at: at,
+                }],
+                refused: vec![GitTokenRefused {
+                    component_id: Uuid::new_v4(),
+                    code: request_code::GIT_UNAVAILABLE.into(),
+                    message: "GitHub could not be reached.".into(),
+                }],
+            })
+            .unwrap(),
+        ),
+        None,
+    ));
+    for code in [
+        request_code::GIT_REVOKED,
+        request_code::GIT_HELD,
+        request_code::GIT_UNAVAILABLE,
+    ] {
+        out.push(ack(RequestStatus::Rejected, None, Some(code)));
+    }
     out.push(Message::RunGitRevoke(RunGitRevoke {
         run_id: run_id(),
         epoch: 1,
@@ -2535,6 +2562,73 @@ fn steer_bounds_and_versions() {
         frame["features"] = bad.clone();
         assert!(!v2.is_valid(&frame), "features {bad}");
     }
+}
+
+#[test]
+fn git_refresh_shapes() {
+    let v = validator_v2();
+    // run.assign: expiresAt and mirrorKey come together, read into the types and back.
+    let assign = sample_v2("run.assign-git-refresh.json");
+    assert_valid(&v, &assign, "run.assign with expiresAt and mirrorKey");
+    let Message::RunAssign(parsed) = Message::from_value(assign.clone()).unwrap() else {
+        panic!("not run.assign");
+    };
+    let git = parsed.workspaces[0].git.as_ref().unwrap();
+    assert_eq!(
+        git.expires_at,
+        Some(Utc.with_ymd_and_hms(2026, 11, 19, 15, 0, 0).unwrap())
+    );
+    assert!(is_valid_mirror_key(git.mirror_key.as_deref().unwrap()));
+    for field in ["expiresAt", "mirrorKey"] {
+        let mut alone = assign.clone();
+        alone["workspaces"][0]["git"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            !v.is_valid(&alone),
+            "one without the other ({field} removed)"
+        );
+    }
+    for bad in ["3F".repeat(32), "3f".repeat(31), "g".repeat(64)] {
+        let mut frame = assign.clone();
+        frame["workspaces"][0]["git"]["mirrorKey"] = json!(bad);
+        assert!(!v.is_valid(&frame), "mirrorKey {bad}");
+        assert!(!is_valid_mirror_key(&bad));
+    }
+    // A token without them reads as one that lives until the run ends, and writes neither.
+    let plain = sample_v2("run.assign.json");
+    let Message::RunAssign(plain) = Message::from_value(plain).unwrap() else {
+        panic!("not run.assign");
+    };
+    let git = plain.workspaces[0].git.as_ref().unwrap();
+    assert_eq!((git.expires_at, git.mirror_key.as_deref()), (None, None));
+    let out = serde_json::to_value(git).unwrap();
+    assert!(out.get("expiresAt").is_none() && out.get("mirrorKey").is_none());
+    // The request and its answers.
+    let request = sample_v2("run.request-git-token.json");
+    let Message::RunRequest(parsed) = Message::from_value(request.clone()).unwrap() else {
+        panic!("not run.request");
+    };
+    assert_eq!(parsed.request.kind(), RequestKind::GitToken);
+    let mut empty = request.clone();
+    empty["payload"]["componentIds"] = json!([]);
+    assert!(!v.is_valid(&empty), "no repository");
+    let done = sample_v2("run.request.ack-git-tokens.json");
+    let Message::RunRequestAck(ack) = Message::from_value(done).unwrap() else {
+        panic!("not run.request.ack");
+    };
+    let tokens = ack.git_tokens().unwrap();
+    assert_eq!(tokens.git.len(), 1);
+    assert_eq!(tokens.git[0].token.expose(), "ghs_TEST_ONLY_renewed_token");
+    assert!(!format!("{tokens:?}").contains("ghs_TEST_ONLY_renewed_token"));
+    assert_eq!(tokens.refused[0].code, request_code::GIT_HELD);
+    let revoked = sample_v2("run.request.ack-git-revoked.json");
+    assert_valid(&v, &revoked, "GIT_REVOKED");
+    // The feature is a valid feature name.
+    let mut hello = sample_v2("hello.json");
+    hello["features"] = json!([feature::RUN_GIT_REVOKE, feature::RUN_GIT_REFRESH]);
+    assert_valid(&v, &hello, "hello with run.git.refresh");
 }
 
 #[test]

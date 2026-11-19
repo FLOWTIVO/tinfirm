@@ -36,7 +36,12 @@ async fn a_steer_reaches_the_running_turn_before_it_ends() {
         let hello = conn.handshake(5).await;
         assert_eq!(
             hello["features"],
-            json!(["run.steer", "session.bundle", "run.git.revoke"])
+            json!([
+                "run.steer",
+                "session.bundle",
+                "run.git.revoke",
+                "run.git.refresh"
+            ])
         );
 
         let spec = AssignSpec::v2("steer", None);

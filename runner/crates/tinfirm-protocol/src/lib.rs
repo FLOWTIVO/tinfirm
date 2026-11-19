@@ -778,6 +778,10 @@ pub mod feature {
     /// The host takes [`super::RunGitRevoke`] (ADR-0116): it drops the named repositories' git
     /// tokens from its git proxy, its own git and its take-back record.
     pub const RUN_GIT_REVOKE: &str = "run.git.revoke";
+    /// The host reads `workspaces[].git.expiresAt` and `mirrorKey`, and renews a token that
+    /// expires with a [`super::RunRequest`] of kind [`super::RequestKind::GitToken`] (ADR-0116).
+    /// A host that lists it lists [`RUN_GIT_REVOKE`] too.
+    pub const RUN_GIT_REFRESH: &str = "run.git.refresh";
 }
 
 /// `error.code` before `welcome`: the server's licence does not hold a feature the hello
@@ -1226,6 +1230,36 @@ pub struct RequestableRepository {
 pub struct GitCredentials {
     pub username: String,
     pub token: Secret,
+    /// v2 feature [`feature::RUN_GIT_REFRESH`] (ADR-0116): when the token stops working, for a
+    /// token minted for this run; the host renews it ([`GitTokenRequest`]). Absent: the token
+    /// lives until the run ends. Comes with [`GitCredentials::mirror_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_instant")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// v2 feature [`feature::RUN_GIT_REFRESH`]: a stable key of the credential the token was
+    /// minted for (64 lowercase hex characters), which names the host's mirror in place of the
+    /// token's `Authorization` header. Comes with [`GitCredentials::expires_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_key: Option<String>,
+}
+
+impl GitCredentials {
+    /// A token that lives until the run ends (no `expiresAt`, no `mirrorKey`).
+    pub fn new(username: impl Into<String>, token: Secret) -> GitCredentials {
+        GitCredentials {
+            username: username.into(),
+            token,
+            expires_at: None,
+            mirror_key: None,
+        }
+    }
+}
+
+/// True when `key` matches the schema's `mirrorKey`: 64 lowercase hexadecimal characters.
+pub fn is_valid_mirror_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2070,6 +2104,13 @@ pub mod request_code {
     /// A tool result above [`super::TOOL_RESULT_MAX_BYTES`]: the agent should narrow the query.
     pub const RESULT_TOO_LARGE: &str = "RESULT_TOO_LARGE";
     pub const TOOL_FAILED: &str = "TOOL_FAILED";
+    /// GIT_TOKEN (ADR-0116): refused for good; the host applies it as a `run.git.revoke`.
+    pub const GIT_REVOKED: &str = "GIT_REVOKED";
+    /// GIT_TOKEN: a kill switch holds the run's systems; the host keeps its token until it
+    /// expires and asks again.
+    pub const GIT_HELD: &str = "GIT_HELD";
+    /// GIT_TOKEN: the code host could not be reached or refused for the moment; as GIT_HELD.
+    pub const GIT_UNAVAILABLE: &str = "GIT_UNAVAILABLE";
 }
 
 /// The kinds of a [`RunRequest`] (`run.request.kind`).
@@ -2087,6 +2128,9 @@ pub enum RequestKind {
     /// A server-executed tool call; answered DONE with a [`ToolResultPayload`], or PENDING with a
     /// decision when the call waits for a member's approval (ADR-0046).
     Tool,
+    /// The host's own (feature [`feature::RUN_GIT_REFRESH`]): new git tokens for repositories
+    /// whose token expires; answered DONE with [`GitTokens`], or REJECTED.
+    GitToken,
 }
 
 impl RequestKind {
@@ -2097,6 +2141,7 @@ impl RequestKind {
             RequestKind::Artifact => "ARTIFACT",
             RequestKind::Network => "NETWORK",
             RequestKind::Tool => "TOOL",
+            RequestKind::GitToken => "GIT_TOKEN",
         }
     }
 }
@@ -2116,6 +2161,7 @@ pub enum RequestPayload {
     Artifact(ArtifactRequest),
     Network(NetworkRequest),
     Tool(ToolRequest),
+    GitToken(GitTokenRequest),
 }
 
 impl RequestPayload {
@@ -2126,6 +2172,7 @@ impl RequestPayload {
             RequestPayload::Artifact(_) => RequestKind::Artifact,
             RequestPayload::Network(_) => RequestKind::Network,
             RequestPayload::Tool(_) => RequestKind::Tool,
+            RequestPayload::GitToken(_) => RequestKind::GitToken,
         }
     }
 }
@@ -2204,6 +2251,47 @@ pub struct ToolRequest {
     pub arguments: serde_json::Value,
 }
 
+/// GIT_TOKEN (feature [`feature::RUN_GIT_REFRESH`], ADR-0116): new git tokens for the
+/// repositories named, each one whose `git` has an `expiresAt`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTokenRequest {
+    /// 1 to [`MAX_WORKSPACES`] `run.assign.workspaces[].componentId`, without duplicates.
+    pub component_ids: Vec<Uuid>,
+}
+
+/// The payload of a DONE answer to a GIT_TOKEN request: each repository named is in exactly one
+/// of `git` and `refused`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTokens {
+    pub git: Vec<GitToken>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<GitTokenRefused>,
+}
+
+/// A renewed git token of one repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitToken {
+    pub component_id: Uuid,
+    pub username: String,
+    pub token: Secret,
+    #[serde(with = "instant")]
+    pub expires_at: DateTime<Utc>,
+}
+
+/// A repository the server did not renew, and why: [`request_code::GIT_REVOKED`],
+/// [`request_code::GIT_HELD`] or [`request_code::GIT_UNAVAILABLE`] (an unknown code reads as
+/// the last).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTokenRefused {
+    pub component_id: Uuid,
+    pub code: String,
+    pub message: String,
+}
+
 /// `run.request.ack.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2247,6 +2335,13 @@ pub struct ToolResultPayload {
 }
 
 impl RunRequestAck {
+    /// The payload of a DONE answer to a GIT_TOKEN request, if it reads as one.
+    pub fn git_tokens(&self) -> Option<GitTokens> {
+        self.payload
+            .as_ref()
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
+    }
+
     /// `payload.decisionId` of a PENDING answer.
     pub fn decision_id(&self) -> Option<Uuid> {
         self.payload
@@ -2444,10 +2539,7 @@ mod tests {
 
     #[test]
     fn secret_is_not_printed() {
-        let creds = GitCredentials {
-            username: "x-access-token".into(),
-            token: Secret::new("ghp_secret_value"),
-        };
+        let creds = GitCredentials::new("x-access-token", Secret::new("ghp_secret_value"));
         let printed = format!("{creds:?}");
         assert!(!printed.contains("ghp_secret_value"));
         assert!(printed.contains("[REDACTED]"));
