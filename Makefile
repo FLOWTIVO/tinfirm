@@ -29,7 +29,7 @@ HADOLINT_IMAGE   := hadolint/hadolint:v2.15.1
 ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
 DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile
-SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh \
+SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh runner/images/vm/local-disk.sh \
                     .github/check-pins.sh .github/actions/set-version/*.sh
 
 # `make release-assets`: the Linux release assets of HEAD (runner-artifacts.yml builds them

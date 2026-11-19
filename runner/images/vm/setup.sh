@@ -7,8 +7,9 @@
 # no provider agent.
 #
 # Takes /tmp/tinfirm-runner-host (a static Linux release binary) and
-# /tmp/tinfirm-vm-boot.service; IMAGE_BUILD_ARGS may hold `--build-arg KEY=VALUE` options for
-# `images build` (mirrors; never a credential).
+# /tmp/tinfirm-vm-boot.service; IMAGE_RUNTIMES may name the runtimes whose runner images are
+# built (all of them, and the multi-runtime image, without it); IMAGE_BUILD_ARGS may hold
+# `--build-arg KEY=VALUE` options for `images build` (mirrors; never a credential).
 set -eu
 export DEBIAN_FRONTEND=noninteractive
 
@@ -33,8 +34,10 @@ install -m 0755 -D /tmp/tinfirm-runner-host /opt/tinfirm/tinfirm-runner-host
 
 # The runner images, built here and never pulled at run time: the VM reaches no registry.
 # Each runtime's own image, and the multi-runtime image for `run --pool-runtime any` (ADR-0101).
+# IMAGE_RUNTIMES names other ones (for example `pi`), for an image that is built sooner and
+# serves only those runtimes.
 # shellcheck disable=SC2086
-for runtime in all multi; do
+for runtime in ${IMAGE_RUNTIMES:-all multi}; do
     TINFIRM_RUNNER_DATA_DIR=/var/lib/tinfirm TINFIRM_RUNNER_CONFIG_DIR=/etc/tinfirm \
         /opt/tinfirm/tinfirm-runner-host images build --runtime "${runtime}" ${IMAGE_BUILD_ARGS:-}
 done
