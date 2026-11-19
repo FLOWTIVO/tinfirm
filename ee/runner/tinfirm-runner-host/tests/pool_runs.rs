@@ -186,6 +186,102 @@ async fn a_run_of_another_runtime_starts_cold_and_the_ready_vm_makes_room() {
     .await;
 }
 
+/// The most VMs the host held at once, from the driver's calls in their order. The fake driver
+/// names its VMs `vm-1`, `vm-2` and so on as it creates them, and the host holds a VM from its
+/// `create` until it asks for its `delete`.
+fn most_vms_held(calls: &[Value]) -> usize {
+    let mut created = 0;
+    let mut held = std::collections::BTreeSet::new();
+    let mut most = 0;
+    for call in calls {
+        match call["method"].as_str() {
+            Some("create") => {
+                created += 1;
+                held.insert(format!("vm-{created}"));
+            }
+            Some("delete") => {
+                if let Some(id) = call["params"]["id"].as_str() {
+                    held.remove(id);
+                }
+            }
+            _ => {}
+        }
+        most = most.max(held.len());
+    }
+    most
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runs_of_another_runtime_never_take_the_host_above_its_pool_size() {
+    with_timeout(240, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        // The ready VMs are of Codex's image, so that two runs of Claude Code can go at once
+        // (the tests' Claude Code credential takes two runs, the OpenAI one a single run).
+        let ready = ReadyVmOptions {
+            runtime: tinfirm_protocol::Runtime::Codex,
+            ..quick()
+        };
+        let setup = HostSetup {
+            max_concurrent_runs: 3,
+            ..pool_host(vm_options(&log, &[]), ready)
+        };
+        let host = start_host(&server.url, setup).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let pool = pool_of(&host);
+        // The ready VMs fill the pool: three.
+        pool.set_scheduled(3);
+        until("three VMs ready", 60, || pool.status().ready == 3).await;
+        assert_eq!(most_vms_held(&vm_driver_calls(&log)), 3);
+
+        // Two Claude Code runs at once. Each needs a VM of its own image and starts cold,
+        // while the pool's own passes go on beside them. (The first's transcript takes the
+        // frames of both until it ends, the second's finish too if it came first.)
+        let first = AssignSpec::new("bridge-env", None);
+        let second = AssignSpec::new("bridge-env", None);
+        conn.send(first.to_json());
+        conn.send(second.to_json());
+        let t = conn.until_finished(first.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.text().contains("the run started cold"), "{}", t.text());
+        let second_id = second.run_id.to_string();
+        let finished = match t
+            .frames
+            .iter()
+            .find(|f| f["type"] == "run.finished" && f["runId"] == second_id)
+        {
+            Some(finished) => finished.clone(),
+            None => conn.take_run("run.finished", second.run_id).await,
+        };
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{finished}");
+        // After the runs the pool is back to its count.
+        until("the pool refilled", 60, || pool.status().ready == 3).await;
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+
+        let calls = vm_driver_calls(&log);
+        let images: Vec<String> = calls_of(&calls, "create")
+            .iter()
+            .map(|c| {
+                c["params"]["userData"]["image"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            images.iter().filter(|i| i.contains("claude")).count(),
+            2,
+            "{images:?}"
+        );
+        // Never more than the three VMs of the host's pool size, at any call of the driver.
+        assert_eq!(most_vms_held(&calls), 3, "{calls:#?}");
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_the_multi_runtime_image_a_run_of_any_runtime_takes_a_ready_vm() {
     use std::os::unix::fs::PermissionsExt;
