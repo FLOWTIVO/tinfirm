@@ -1251,12 +1251,15 @@ fn the_node_driver_reports_what_its_nodes_configuration_reaches() {
 }
 
 /// Where [`run_without_landlock`] hands the runner host's arguments to
-/// [`launch_without_landlock`].
+/// [`launch_without_landlock`]. Linux alone has Landlock and the seccomp filter that stands in
+/// for a kernel without it, so these helpers and their two tests are built there only.
+#[cfg(target_os = "linux")]
 const WITHOUT_LANDLOCK: &str = "TINFIRM_TEST_WITHOUT_LANDLOCK";
 
 /// Like [`run_with_env`], on a system where the reader cannot be confined: this test binary
 /// starts itself again, and [`launch_without_landlock`] runs the host there with Landlock refused
 /// as a kernel without it refuses it. The host and its readers inherit that.
+#[cfg(target_os = "linux")]
 fn run_without_landlock(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([
@@ -1272,6 +1275,7 @@ fn run_without_landlock(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Outp
 /// Not a test of its own: does nothing unless [`run_without_landlock`] started it. Then it
 /// installs a seccomp filter on its thread that answers `landlock_create_ruleset` with `ENOSYS`,
 /// as a kernel without Landlock does, and replaces itself with the runner host.
+#[cfg(target_os = "linux")]
 #[test]
 fn launch_without_landlock() {
     use std::collections::BTreeMap;
@@ -1301,6 +1305,7 @@ fn launch_without_landlock() {
     panic!("cannot start the runner host: {error}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn every_host_with_the_bridge_refuses_a_reader_it_cannot_confine() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1377,6 +1382,7 @@ fn every_host_with_the_bridge_refuses_a_reader_it_cannot_confine() {
     assert!(message.contains("DOCKER_HOST"), "{message}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
     let tmp = tempfile::tempdir().unwrap();
