@@ -586,10 +586,11 @@ runner:
     # - `digitalocean`: a Droplet per run. Pro and Enterprise: a server without elastic
     #   runners refuses the host. Set vm.digitalocean, never vm.node.nodes.
     # - `node`: sandbox nodes outside the cluster, each with the node agent (ADR-0112). Every
-    #   edition. Set vm.node, never vm.digitalocean.templates. Planned (ADR-0112): the node
-    #   agent's execution is not built, so its `verify` reports a problem and `run` refuses
-    #   the driver. The chart renders and lints this form, but the pod stops at its start,
-    #   and no VM runs through a node yet.
+    #   edition. Set vm.node, never vm.digitalocean.templates. Not ready for production
+    #   (ADR-0112): the node agent makes VMs, shown on one node, but the role that sets a
+    #   node up, the node's own firewall and its hardening are planned, and this pod has
+    #   not run against a node yet. `run` refuses the driver at its start when a node's
+    #   `verify` reports a problem.
     driver: digitalocean
     # The template every VM is created from (run --vm-template): a key of
     # vm.digitalocean.templates, or a template that one of vm.node.nodes offers.

@@ -341,7 +341,7 @@ With `runner.enabled: true` the chart also runs a runner host, as a pod: the com
 
 | `runner.vm.driver` | Where the VMs run | Edition | State |
 |---|---|---|---|
-| `node` | On sandbox nodes outside the cluster: your machines with KVM, each running the node agent, which hold no credential | Every edition, Community included | Planned: the chart renders it, but no VM runs through a node yet (below) |
+| `node` | On sandbox nodes outside the cluster: your machines with KVM, each running the node agent, which hold no credential | Every edition, Community included | Not ready for production: the node agent makes VMs, but a node's setup, firewall and hardening are planned (below) |
 | `digitalocean` (the default) | A DigitalOcean Droplet per run | Pro and Enterprise ([Licence](licence.md)). Without such a key the server refuses the host, and the pod stops. | Available |
 
 Ready VMs, which wait for runs so that a run starts in seconds, are Pro's and Enterprise's with either driver: `runner.pool.maxReady` stays `0`, its default, in Community.
@@ -355,9 +355,9 @@ kubectl -n tinfirm create secret generic tinfirm-runner --from-file=token=./runn
 
 ### With sandbox nodes
 
-!!! warning "Planned: no VM runs through a node yet"
+!!! warning "Not ready for production"
 
-    The node agent's execution (its jail, network, disks and VMM) is not built ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md) plans it). Today a node agent's check reports that as a problem, so the runner host refuses to start with the `node` driver: the chart renders and lints this form, and the pod starts and stops at once, in a restart loop. Use it to prepare the values, or use DigitalOcean's driver until the node agent can run VMs.
+    The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host's `node` driver. What a node needs around it is planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)): the role that installs the agent and its service units, the node's own firewall, its hardening, and the published VM image. The chart's pod has not run against a node, and no conversation has run through one. The runner host refuses to start with the `node` driver while a node's check reports a problem. Use this form to prepare and to test, and DigitalOcean's driver for production until then.
 
 The pod is then a control host: it holds the credentials and runs no agent code. The VMs run on sandbox nodes, machines outside the cluster that hold nothing, each with the node agent. The pod reaches each node's agent over TLS, with the node's certificate pinned by its SHA-256 and the pod's own client certificate, which each node pins in turn. A node's local socket, for a runner host on the node's own machine, is not for a pod. Such a host would report the isolation level `machine`.
 
