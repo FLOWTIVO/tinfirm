@@ -469,7 +469,7 @@ impl<B: Backend> Helper<B> {
                     format!("the node runs its {} VMs", self.config.max_vms),
                 )
             })?;
-        let user_data = spool::read(
+        let mut user_data = spool::read(
             &self.config.spool,
             id,
             self.config.listener_uid,
@@ -495,10 +495,15 @@ impl<B: Backend> Helper<B> {
         });
         if let Err(e) = state.save(&self.config.state) {
             *state = before;
+            spool::wipe(&mut user_data);
             return Err(HelperError::new(Code::Failed, format!("{e:#}")));
         }
         let plan = plan::plan(&self.config, &template, slot, serial);
-        if let Err(e) = self.backend.make(&plan, &user_data) {
+        let made = self.backend.make(&plan, &user_data);
+        // The VM has the user data, or never will: the helper keeps no copy of it.
+        spool::wipe(&mut user_data);
+        drop(user_data);
+        if let Err(e) = made {
             tracing::warn!(vm = %id, jail = %plan.names.jail(), error = %e, "cannot make the VM");
             match self.backend.delete(&plan.names) {
                 Ok(()) => {

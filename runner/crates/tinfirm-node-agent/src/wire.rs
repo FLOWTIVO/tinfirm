@@ -80,7 +80,7 @@ pub mod code {
     pub const REFUSED: i64 = -32002;
     /// Another wire version, or another build where the listener refuses one.
     pub const MISMATCH: i64 = -32003;
-    /// The Linux backend's execution is planned.
+    /// A backend that is built in parts; the Linux backend never answers so.
     pub const NOT_BUILT: i64 = -32004;
     pub const UNKNOWN_TEMPLATE: i64 = -32005;
     /// The node runs as many VMs as it may.

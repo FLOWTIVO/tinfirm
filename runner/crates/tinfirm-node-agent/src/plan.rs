@@ -80,6 +80,11 @@ pub struct Firecracker {
     pub cgroup_parent: String,
     /// Where the helper keeps each VM's snapshot file, outside every jail.
     pub work: PathBuf,
+    /// The guest writes its kernel's and its journal's messages to its serial console, which
+    /// the helper keeps in `<work>/<jail>.console`: for finding out why a guest does not come
+    /// up. Off by default: a guest's log is then nowhere on the node.
+    #[serde(default)]
+    pub guest_console: bool,
 }
 
 /// The helper's configuration file.

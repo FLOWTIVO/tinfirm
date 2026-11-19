@@ -209,9 +209,25 @@ pub fn read(
     Ok(bytes)
 }
 
+/// Overwrites bytes that held user data, before their memory is given back: a ticket should
+/// not stay readable in the helper's memory after its VM has it. The helper calls this on the
+/// bytes it read and on the disk it made from them. It is a best effort in safe Rust: the
+/// compiler is told that the zeros are read (`black_box`), which keeps the store in practice.
+pub fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wiped_bytes_are_zero() {
+        let mut bytes = b"a ticket".to_vec();
+        wipe(&mut bytes);
+        assert_eq!(bytes, [0; 8]);
+    }
 
     const LISTENER: u32 = 991;
 

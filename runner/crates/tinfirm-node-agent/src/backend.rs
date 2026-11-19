@@ -2,8 +2,8 @@
 //! helper hands a backend only what it derived itself ([`VmPlan`], [`Names`]) and the user
 //! data's bytes; a backend never sees a VM's id.
 //!
-//! Two backends: [`crate::linux::LinuxBackend`] (Firecracker under its jailer; its planning is
-//! built, its execution is planned) and [`FakeBackend`], for tests.
+//! Two backends: [`crate::linux::LinuxBackend`] (Firecracker under its jailer) and
+//! [`FakeBackend`], for tests.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,8 @@ use crate::plan::{Names, Template, VmPlan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
-    /// This backend cannot do it yet (the Linux backend's execution, planned).
+    /// This backend cannot do it. The Linux backend never answers so; the kind stays for a
+    /// backend that is built in parts.
     NotBuilt(&'static str),
     Failed(String),
 }

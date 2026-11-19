@@ -24,8 +24,8 @@ rcgen.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# Constants only (O_NOFOLLOW, O_NONBLOCK, O_NOCTTY), whose values differ by architecture; no
-# call into libc, so no unsafe code.
+# Constants (O_NOFOLLOW, O_NONBLOCK, O_NOCTTY), whose values differ by architecture, and one
+# call: prctl(PR_CAPBSET_DROP) in `src/bounding.rs`, the crate's only unsafe code.
 libc.workspace = true
 
 [dev-dependencies]
