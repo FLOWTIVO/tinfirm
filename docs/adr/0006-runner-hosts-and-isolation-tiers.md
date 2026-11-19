@@ -2,6 +2,7 @@
 
 - Status: Accepted (built: company and personal runner hosts on Docker, one sandbox per run, the tiers `container`, `gvisor` and `microvm` as the host's Docker runtime gives them, `container` the default; the egress proxy is opt-in, [ADR-0044](0044-sandbox-egress-proxy.md); not built: the Kubernetes executor, the Docker socket proxy, Apple's `container`, a tier chosen per environment)
 - Date: 2026-09-26
+- Amended by: [ADR-0113](0113-levels-of-isolation-and-placement.md), under which a host reports a level of isolation (`machine`, `vm-jail` or `container`, named for the wall between an agent's code and the credentials) in `hello.isolationTiers` in place of its tier, `microvm` removed and a Kata host `container`; an agent's runs go to the strongest level its company's hosts report, or to the level chosen for the agent, in place of a tier per environment
 
 ## Context
 

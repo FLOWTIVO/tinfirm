@@ -2,10 +2,10 @@
 
 - Status: Proposed
 - Date: 2026-11-17; split from the first draft of [ADR-0112](0112-no-credential-on-a-sandbox-machine.md) (2026-11-14) after a review
-- Decided by: not yet; the owner decides. Nothing here is built, and no build of it is scheduled: the first form below needs nothing new, and the others wait for a company that asks. What the owner decided on the way is listed under "The owner's decisions so far"
+- Decided by: not yet; the owner decides. The owner answered open question 2 on 2026-11-19: the pod per run, KubeVirt and the node agent as a DaemonSet are to be built in this scope, KubeVirt and the DaemonSet each with a decision record of its own when it is built. Nothing here is built yet; the first form below needs nothing new. What the owner decided on the way is listed under "The owner's decisions so far"
 - Sources: [ADR-0006](0006-runner-hosts-and-isolation-tiers.md) (the Kubernetes executor, not built), [ADR-0095](0095-sandbox-bridge.md), [ADR-0096](0096-a-vm-per-run.md) (the driver protocol), [ADR-0101](0101-closing-the-elastic-runners-gaps.md) (decision 8: the runner host as a pod of the chart), [ADR-0112](0112-no-credential-on-a-sandbox-machine.md) (the property and its three paths, the node agent, the jail), [ADR-0113](0113-levels-of-isolation-and-placement.md) (the levels, hardening), [ADR-0114](0114-the-secure-sandbox-is-in-the-core.md) (what is paid); the [Kubernetes runner analysis](../reviews/2026-10-15-kubernetes-runner-analysis.md) §3, §6 and its decision D1; the [threat model](../threat-model.md) 6.15, 6.21
 - Changes the analysis' decision D1: on OKD or OpenShift it chose Kata pods on KVM workers. Kata pods are not offered (decision 5)
-- Changes, when built: a VM driver for a pod per run, under `ee/runner/`; the Helm chart (the runs' namespace, the driver's service account and its rights, the default network policy, the admission policy for run pods); the operator's documentation for a cluster's admin; the threat model (new rows for a worker that runs VMs, the kubelet's credential and the ticket's Secret). A driver for KubeVirt and the node agent as a DaemonSet are later work, each with a decision of its own if it is built
+- Changes, when built: a VM driver for a pod per run, under `ee/runner/`; the Helm chart (the runs' namespace, the driver's service account and its rights, the default network policy, the admission policy for run pods); the operator's documentation for a cluster's admin; the threat model (new rows for a worker that runs VMs, the kubelet's credential and the ticket's Secret). A driver for KubeVirt and the node agent as a DaemonSet are to be built in this scope too, each with a decision record of its own when it is built
 
 ## Context
 
@@ -41,7 +41,7 @@
    - **The scheduler sees the VM:** its memory is the pod's, and a VM that outgrows its limit is stopped alone.
    - **The one-time ticket** travels in a Secret of the run's namespace, which the driver deletes as soon as the VM has read it, some two seconds after the pod starts. Until then whoever may read secrets in that namespace, and root on that worker, can read it; a used ticket opens nothing.
    - **What it costs:** two to three seconds more to a ready sandbox than a VM on a node (9 to 10.5 s against 7 to 8 s); and the device plugin is a privileged pod of its own.
-   - **No hardening mark.** A pod sees nothing of its worker's settings, and a worker whose pods use user namespaces cannot have ADR-0113's first line of hardening (no user namespaces). Such a host reports `hardened: no`, whatever else its admin set on the workers (ADR-0113, open question 3).
+   - **No hardening mark.** A pod sees nothing of its worker's settings, and a worker whose pods use user namespaces cannot have ADR-0113's first line of hardening (no user namespaces). Such a host reports `hardened: no`, whatever else its admin set on the workers (ADR-0113, decision 5, as the owner decided on 2026-11-19).
    - **The runner pod** is an ordinary pod that passes `restricted`: one unprivileged container, no capability, a read-only root file system, no device and no host path, a volume for its mirrors and session homes, and the host's token in a Secret of its own namespace, which whoever may read secrets there holds (6.21). Its network policy lets nothing in, and out only to the run pods' bridge port, DNS and the outside (the server and the code hosts); to name those hosts takes the cluster's own means. It needs no way to the model gateway: a run's model requests go from the runner pod's model proxy to the server's relay (ADR-0059; threat model 5.10), so the policy allows none. In the runs' namespace it may create and delete pods, secrets and network policies, read a pod and its log, and nothing else, and it has no right in any other namespace or on the workers.
    - **The right to create pods is a way to read secrets, so an admission policy closes it.** The runner pod may not read or list secrets, but whoever may create a pod in a namespace can mount any Secret of that namespace into it, and can name any service account there. RBAC alone is therefore no boundary. The chart installs an admission policy (a ValidatingAdmissionPolicy, or the cluster's own policy engine) for the runs' namespace: a pod there runs as the one fixed service account for runs, which has no rights; it mounts no service account token (`automountServiceAccountToken: false`, and no projected token volume); and it refers to no Secret but the one ticket Secret made for that pod, by its name. The runs' namespace holds no other Secret by design. Without such a policy in force the driver refuses to start.
 
@@ -72,10 +72,12 @@
 
 ## The owner's decisions so far
 
-Decided by the owner, 2026-11-11 to 2026-11-14.
+Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 where the date says so.
 
 - On Kubernetes a pod per run is the recommended form in a cluster, the node agent as a DaemonSet the alternative.
-- The Kubernetes forms are paid (ADR-0114; its open question 2 asks whether that includes the first form).
+- The Kubernetes forms are paid (ADR-0114). 2026-11-19: the first form, a runner pod with nodes outside the cluster, is free; the three forms in which the cluster runs the VMs are paid (ADR-0114, decision 1).
+- 2026-11-19: the pod per run is to be built in this scope, and KubeVirt and the node agent as a DaemonSet too, each with a decision record of its own when it is built. KubeVirt is tested on OKD on Azure VMs.
+- 2026-11-19: a worker whose pods use user namespaces reports `hardened: no` (decision 2; ADR-0113, decision 5).
 
 ## To verify during the build
 
@@ -89,12 +91,15 @@ Decided by the owner, 2026-11-11 to 2026-11-14.
 Not tested, and not needed for this decision. Each is named so that nobody takes it as shown.
 
 - **A cluster whose network plugin allows no second one** beside it for the tap device. The pod then uses the init container with one capability, which is tested.
-- **KubeVirt after an escape into its launcher's pod, and with hot-plugged or persistent volumes.** KubeVirt is a later driver, and its own decision covers that.
+- **KubeVirt after an escape into its launcher's pod, and with hot-plugged or persistent volumes.** KubeVirt's driver gets a decision record of its own, which covers that.
 - **OpenShift itself.** The cluster runs were on OKD and on a managed cluster.
 - **What a worker's cloud identity may do** in a given cluster. Decision 6 asks that it opens nothing; whether it does is each cluster's own setup.
 - **Why a guest started slower on the one OKD node that was tried** (13 to 16 s to a ready sandbox, against 8 to 10 s elsewhere; that range and decision 2's 9 to 10.5 s are to be reconciled from the experiment's record).
 
+## Questions the owner answered
+
+2. **When this is built:** in this scope. The pod-per-run driver is to be built, and KubeVirt and the node agent as a DaemonSet too, each with a decision record of its own when it is built; KubeVirt is tested on OKD on Azure VMs. The owner, 2026-11-19.
+
 ## Open questions
 
-1. **What the right to ask for projects gives on OKD.** Does the runner host's service account get `admin` in each project it requests, and so read its secrets? If so: a project request template with narrower rights, or one namespace for all runs with a network policy per run, which gives up the SELinux category per run.
-2. **When this is built.** No company has asked for a cluster to run the VMs itself. The pod-per-run driver is built when one does; until then this ADR records what was tried and what was decided, and stays Proposed.
+1. **What the right to ask for projects gives on OKD.** Does the runner host's service account get `admin` in each project it requests, and so read its secrets? If so: a project request template with narrower rights, or one namespace for all runs with a network policy per run, which gives up the SELinux category per run. To be verified on the cluster.

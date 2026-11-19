@@ -1,11 +1,12 @@
 # ADR-0114: The secure sandbox is in the core; elasticity stays paid
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-11-17; split from the first draft of [ADR-0112](0112-no-credential-on-a-sandbox-machine.md) (2026-11-14) after a review
-- Decided by: not yet; the owner decides. Built since the owner's word of 2026-11-18 to start, as this draft proposes it: decisions 2 and 3 (the code's cut, the pool cut in two, the hello's gate with `sandbox.elastic`), and of decision 4 that ready VMs are off unless an operator turns them on. Not built: the chart's runner pod with the `node` driver, which waits for ADR-0112's node agent to run VMs. The public pricing page is not in this repository. The owner decided the split itself on 2026-11-14 ("The owner's decisions so far"); how it is enforced and where the code is cut are not decided (open questions 1 to 3), and are built as proposed here
+- Decided by: the owner, 2026-11-19: the split as decided on 2026-11-14, and the three open questions answered as this draft proposed them ("Questions the owner answered"); ready VMs are off unless an operator turns them on
+- Built: decisions 2 and 3 (the code's cut, the pool cut in two, the hello's gate with `sandbox.elastic`), and of decision 4 that ready VMs are off by default; not the chart's runner pod with the `node` driver, which waits for ADR-0112's node agent to run VMs (planned). The public pricing page is not in this repository
 - Sources: [ADR-0077](0077-licence-editions-and-seats.md) (the editions, `ee/`, decisions 1 and 4), [ADR-0095](0095-sandbox-bridge.md) to [ADR-0099](0099-pool-settings.md), [ADR-0100](0100-elastic-runners-in-pro.md) (elastic runners are paid), [ADR-0101](0101-closing-the-elastic-runners-gaps.md) (the runner pod of the chart), [ADR-0112](0112-no-credential-on-a-sandbox-machine.md) (the control host, the node agent), [ADR-0113](0113-levels-of-isolation-and-placement.md), [ADR-0115](0115-sandbox-vms-in-a-kubernetes-cluster.md); [CONVENTIONS.md](../CONVENTIONS.md) §14.10, §15.24; the Kubernetes runner analysis, D9 and D10 (an operator can bring a driver)
-- Amends, when accepted: [ADR-0100](0100-elastic-runners-in-pro.md) (what `ELASTIC_RUNNERS` holds, what is under `ee/runner/`, the hello's gate), [ADR-0077](0077-licence-editions-and-seats.md) (decision 4's row for elastic runners), [ADR-0095](0095-sandbox-bridge.md) and [ADR-0096](0096-a-vm-per-run.md) (their code is in the core again; the provider drivers stay paid), [ADR-0098](0098-ready-vms.md) (the pool is cut in two: a VM for a run in the core, ready VMs paid)
-- Changes, when built: the runner host's code that moves from `ee/runner/` to `runner/` (decision 2) with its manifests and licences; the pool's cut; the server's gate at the hello (`RunnerWebSocketHandler`) and `Feature.ELASTIC_RUNNERS`'s description; `ModularityTest`'s list of gates; `THIRD-PARTY-LICENSES.txt` and the licences in the release archives; the Ansible role's defaults; the Helm chart's runner pod; the public pricing page; CONVENTIONS §15.24
+- Amends: [ADR-0100](0100-elastic-runners-in-pro.md) (what `ELASTIC_RUNNERS` holds, what is under `ee/runner/`, the hello's gate), [ADR-0077](0077-licence-editions-and-seats.md) (decision 4's row for elastic runners), [ADR-0095](0095-sandbox-bridge.md) and [ADR-0096](0096-a-vm-per-run.md) (their code is in the core again; the provider drivers stay paid), [ADR-0098](0098-ready-vms.md) (the pool is cut in two: a VM for a run in the core, ready VMs paid)
+- Changes: the runner host's code that moves from `ee/runner/` to `runner/` (decision 2) with its manifests and licences; the pool's cut; the server's gate at the hello (`RunnerWebSocketHandler`) and `Feature.ELASTIC_RUNNERS`'s description; `ModularityTest`'s list of gates; `THIRD-PARTY-LICENSES.txt` and the licences in the release archives; the Ansible role's defaults; the Helm chart's runner pod; the public pricing page; CONVENTIONS §15.24
 
 ## Context
 
@@ -53,9 +54,9 @@
    - `sandbox.bridge` no longer needs a licence: a Community server accepts such a hello.
    - `sandbox.pool` and the session bundles' endpoints stay gated, as ADR-0100 decided.
    - A paid driver is gated by a feature of its own, `sandbox.elastic`, which a host lists when its VM driver is one of the binary's paid ones: a provider's, or one of ADR-0115's. The server refuses such a hello without `ELASTIC_RUNNERS`, with `EDITION_REQUIRED`, as it refuses `sandbox.bridge` today.
-   - **What this gate is, and is not.** It holds for Tinfirm's own paid drivers in Tinfirm's own binary. It does not stop a driver that an operator wrote for the open driver protocol: such a host lists no paid feature, and the server cannot tell it from the `node` driver. That is ADR-0096's decision (an operator can bring a driver), and this ADR keeps it: what is paid is Tinfirm's drivers, their guards and their support, not the right to make VMs elsewhere (open question 1).
+   - **What this gate is, and is not.** It holds for Tinfirm's own paid drivers in Tinfirm's own binary. It does not stop a driver that an operator wrote for the open driver protocol: such a host lists no paid feature, and the server cannot tell it from the `node` driver. That is ADR-0096's decision (an operator can bring a driver), and this ADR keeps it: what is paid is Tinfirm's drivers, their guards and their support, not the right to make VMs elsewhere. The owner confirmed on 2026-11-19 that this gate is enough.
 
-4. **The defaults follow.** The Ansible role keeps the bridge on by default, which a Community server now accepts. The chart's runner pod works in Community with the `node` driver.
+4. **The defaults follow.** The Ansible role keeps the bridge on by default, which a Community server now accepts. Ready VMs are off unless an operator turns them on: `run --pool-max-ready` and the chart's `runner.pool.maxReady` default to 0 (the owner, 2026-11-19). The chart's runner pod works in Community with the `node` driver (planned: it waits for ADR-0112's node agent to run VMs).
 
 ## Consequences
 
@@ -78,13 +79,14 @@
 
 ## The owner's decisions so far
 
-Decided by the owner, 2026-11-11 to 2026-11-14.
+Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 where the date says so.
 
 - Editions: the secure sandbox is free, on as many nodes as a company sets up; elasticity is paid: a provider's VMs per run, ready VMs, the Kubernetes forms and session bundles (decision 1).
 - Community starts every run cold; ready VMs stay paid (decision 1).
+- 2026-11-19: ready VMs are off unless an operator turns them on (`--pool-max-ready` defaults to 0, decision 4); the three open questions answered as proposed (below).
 
-## Open questions
+## Questions the owner answered
 
-1. **The paid drivers' gate.** Is a feature that only Tinfirm's own drivers list (decision 3) enough, given that an operator's own driver passes without it? The alternatives are to close the driver protocol, or to accept that the provider drivers are paid by their licence and their support alone.
-2. **The cluster's forms and the free one.** A runner pod with nodes outside the cluster is free by decision 1's table. The first draft called "the Kubernetes forms" paid as a whole. This draft makes the three forms paid in which the cluster itself runs the VMs. The owner confirms.
-3. **The VM image's recipe for DigitalOcean.** Is the Packer template paid with the driver (proposed), or free with the image?
+1. **The paid drivers' gate:** the feature `sandbox.elastic`, which only Tinfirm's own paid drivers list, is enough; the driver protocol stays open (decision 3). The owner, 2026-11-19.
+2. **The cluster's forms and the free one:** the runner pod with nodes outside the cluster is free; the three forms in which the cluster itself runs the VMs are paid (decision 1). The owner, 2026-11-19.
+3. **The VM image's recipe for DigitalOcean:** the Packer template is paid with the driver; the image's recipe is free (decision 2). The owner, 2026-11-19.
