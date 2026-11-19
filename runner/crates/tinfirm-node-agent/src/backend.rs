@@ -73,6 +73,7 @@ struct FakeState {
     unknown: Vec<String>,
     problems: Vec<String>,
     fail_next_make: bool,
+    fail_next_delete: bool,
     fail_deletes: bool,
 }
 
@@ -123,6 +124,11 @@ impl FakeBackend {
     /// The next make fails half-way: it leaves a VM whose VMM does not run.
     pub fn fail_next_make(&self) {
         self.state().fail_next_make = true;
+    }
+
+    /// The next delete fails; the ones after it work again.
+    pub fn fail_next_delete(&self) {
+        self.state().fail_next_delete = true;
     }
 
     /// Every delete fails while this is set.
@@ -177,7 +183,7 @@ impl Backend for FakeBackend {
 
     fn delete(&self, names: &Names) -> Result<(), BackendError> {
         let mut state = self.state();
-        if state.fail_deletes {
+        if std::mem::take(&mut state.fail_next_delete) || state.fail_deletes {
             return Err(BackendError::Failed(
                 "the fake jail cannot be removed".into(),
             ));

@@ -1025,3 +1025,30 @@ async fn a_failed_create_leaves_no_record_and_no_spool_file() {
     // The half-made VM was removed with it.
     assert!(node.backend.vms().is_empty());
 }
+
+#[tokio::test]
+async fn a_failed_create_deletes_what_the_helper_could_not_remove() {
+    let node = node(None).await;
+    let mut driver = unix_driver(&node).await;
+    driver.hello().await;
+    // The make fails half-way, and the helper cannot remove what it left: the VM stays in the
+    // helper's record, where it holds its slot.
+    node.backend.fail_next_make();
+    node.backend.fail_next_delete();
+    let (code, _) = driver
+        .call(
+            "create",
+            json!({"template": TEMPLATE, "name": "n", "userData": "{\"ticket\":1}", "labels": labels(HOST, "v")}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code, wire::code::FAILED);
+    // The listener deleted it before it answered: no `list` was needed.
+    assert!(node.backend.vms().is_empty(), "{:?}", node.backend.vms());
+    let client = HelperClient::new(node.helper_socket.clone());
+    assert!(client.list().await.unwrap().vms.is_empty());
+    assert_eq!(
+        std::fs::read_dir(records_dir(&node.root)).unwrap().count(),
+        0
+    );
+}

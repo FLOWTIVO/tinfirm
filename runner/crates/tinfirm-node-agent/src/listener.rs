@@ -390,6 +390,13 @@ impl Listener {
             }
             Err(e) => {
                 tracing::warn!(name = %params.name, template = %template, code = e.code, error = %e.message, "cannot create a VM");
+                // The helper may still hold the VM: its answer was lost on the way, or it could
+                // not remove what its make left. One delete now, so that nothing runs and no
+                // slot is held until the next `list`; the record goes either way, since a VM
+                // that no record holds is deleted by each `list`.
+                if let Err(e) = self.helper.delete(&id).await {
+                    tracing::warn!(vm = %id, error = %e, "cannot delete what the failed create left: the next list deletes it");
+                }
                 self.forget(&id);
                 Err(e)
             }

@@ -401,17 +401,25 @@ impl Backend for LinuxBackend {
                 )));
             }
         };
-        Ok(entries
-            .flatten()
-            .map(|entry| {
-                let name = entry.file_name();
-                Present {
-                    jail: name.to_string_lossy().into_owned(),
-                    names: name.to_str().and_then(Names::from_jail),
-                    alive: false,
-                }
-            })
-            .collect())
+        // An entry that cannot be read fails the listing: a jail left out of it would give its
+        // slot to another VM, and would hide a jail of a form the helper does not know.
+        let mut present = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                BackendError::Failed(format!(
+                    "cannot read an entry of {}: {}",
+                    dir.display(),
+                    e.kind()
+                ))
+            })?;
+            let name = entry.file_name();
+            present.push(Present {
+                jail: name.to_string_lossy().into_owned(),
+                names: name.to_str().and_then(Names::from_jail),
+                alive: false,
+            });
+        }
+        Ok(present)
     }
 }
 
