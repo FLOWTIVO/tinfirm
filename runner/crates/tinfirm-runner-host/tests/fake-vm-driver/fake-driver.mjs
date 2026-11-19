@@ -19,6 +19,9 @@
 //                      user data's, and `describe` names it in `port`, as a sandbox node
 //                      publishes each VM's bridge (ADR-0112); the log gets a line
 //                      {method: "published", params: {id, port}}
+//   FAKE_VM_DELETE_MS  how long a `delete` takes before it answers (default 0); the VM goes,
+//                      and the log gets a line {method: "deleted", params: {id}}, when it
+//                      answers
 // Templates: `stuck` never comes up; `failing` fails at its start; any other comes up.
 
 import { spawn } from "node:child_process";
@@ -134,12 +137,14 @@ const methods = {
     const vm = vms.get(id);
     return vm ? view(vm) : { id, state: "gone", labels: {} };
   },
-  delete({ id, labels }) {
+  async delete({ id, labels }) {
     const vm = vms.get(id);
     // A real driver's guard: only a VM with each of the host's labels.
     for (const [k, v] of Object.entries(labels || {})) {
       if (vm && vm.labels[k] !== v) throw new Error(`${id} is not this host's VM`);
     }
+    const delay = Number(env.FAKE_VM_DELETE_MS || 0);
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     if (vm) {
       vm.state = "gone";
       if (vm.child) vm.child.kill("SIGKILL");
@@ -152,6 +157,7 @@ const methods = {
       }
       save();
     }
+    log("deleted", { id });
     return {};
   },
   list({ labels }) {
@@ -166,7 +172,9 @@ const methods = {
 };
 
 const lines = createInterface({ input: process.stdin });
-lines.on("line", (line) => {
+// Answered in order, but for a call that takes its time (`delete` with FAKE_VM_DELETE_MS),
+// which answers when it is done: JSON-RPC matches the answers by id.
+lines.on("line", async (line) => {
   let request;
   try {
     request = JSON.parse(line);
@@ -179,7 +187,7 @@ lines.on("line", (line) => {
   try {
     const method = methods[request.method];
     if (!method) throw new Error(`no method ${request.method}`);
-    answer = { jsonrpc: "2.0", id: request.id, result: method(params) };
+    answer = { jsonrpc: "2.0", id: request.id, result: await method(params) };
   } catch (e) {
     answer = { jsonrpc: "2.0", id: request.id, error: { code: -32000, message: String(e.message || e) } };
   }

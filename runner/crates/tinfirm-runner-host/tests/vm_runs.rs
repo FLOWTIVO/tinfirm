@@ -257,6 +257,51 @@ async fn a_vm_that_does_not_come_up_fails_the_run_and_is_deleted() {
     .await;
 }
 
+/// The run's claim and its VM's create each have a start timeout of the same length, the
+/// VM's from its create, a moment later. A VM that does not come up is deleted before its
+/// create fails; with a delete that takes 3 s, the claim's own deadline passes for certain
+/// while the delete is in flight. The claim that started the VM waits for that VM's outcome:
+/// the run fails with what happened to its VM, once the VM is deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_whose_vm_is_still_being_deleted_at_its_deadline_fails_with_its_vms_outcome() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut options = vm_options(
+            &log,
+            &[("FAKE_VM_TEMPLATE", "stuck"), ("FAKE_VM_DELETE_MS", "3000")],
+        );
+        options.start_timeout = Duration::from_secs(1);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::vm_with(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("happy", None);
+        conn.send(spec.to_json());
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED");
+        assert_eq!(finished["failureClass"], "INFRA");
+        let text = t.text();
+        assert!(
+            text.contains("the VM vm-1 did not come up within 1 s"),
+            "{text}"
+        );
+        assert!(!text.contains("no sandbox VM came up"), "{text}");
+        // Deleted, the driver's answer in, before the run finished.
+        let calls = vm_driver_calls(&log);
+        assert!(
+            calls_of(&calls, "deleted")
+                .iter()
+                .any(|c| c["params"]["id"] == "vm-1"),
+            "{calls:#?}"
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_leftover_vms_of_this_host_are_deleted_and_no_other() {
     with_timeout(120, async {

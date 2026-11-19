@@ -305,6 +305,29 @@ impl Pool {
     /// A VM of `shape` for a run: one that the keeper holds, or else the next one of its shape
     /// that comes up before `deadline`, which this claim starts unless enough are starting
     /// already. Fails when the VM that the run waits for cannot be created.
+    ///
+    /// A claim that started a VM waits for that VM's own outcome before its timer decides, so
+    /// that the run fails with what happened to its VM, and only once the VM is deleted:
+    ///
+    /// - The VM's create keeps its own deadline, `--vm-start-timeout` from its create, which
+    ///   comes later than the claim's (after the room's deletes, the bridge's and the egress
+    ///   proxy's set-up); the two are not shared. When the claim's `deadline` passes first,
+    ///   the claim waits on: its wait is then bounded by the VM's create, that is the deletes
+    ///   of the keeper's VMs that make room, the driver's `create`, the VM's own start
+    ///   timeout, the probe's timeout, and the delete of a VM that failed, each of
+    ///   which has a timeout of its own. An answer that comes meanwhile (the host stops, or a
+    ///   VM of its shape comes up) ends the wait at once.
+    /// - The VM that this claim started may still come up just after `deadline`: the first
+    ///   run that waits for its shape takes it, this claim if no earlier one waits, instead of
+    ///   the VM being created for nobody.
+    /// - The VM may also have gone to an earlier waiter of its shape, or its failure to that
+    ///   waiter: with no answer of its own when the VM's create ends, the claim fails with
+    ///   "no sandbox VM came up within N s".
+    ///
+    /// A claim that started no VM (it waits for one that another claim or the keeper started)
+    /// fails at `deadline`. Dropped (its run was cancelled), a claim leaves its VM's create
+    /// running on its own, and the VM goes to the next waiter of its shape, or to the keeper,
+    /// or is deleted.
     pub async fn claim(
         self: &Arc<Pool>,
         host: &Arc<Shared>,
@@ -341,7 +364,8 @@ impl Pool {
             }
             (rx, start)
         };
-        if start {
+        // The VM this claim started: dropped with the claim, the task goes on detached.
+        let started = start.then(|| {
             let (pool, host) = (self.clone(), host.clone());
             tokio::spawn(async move {
                 // The room first, so that the host never has more VMs than it may.
@@ -350,20 +374,31 @@ impl Pool {
                     vm.delete().await;
                 }
                 pool.create(host, shape).await;
-            });
+            })
+        });
+        let mut answer = answer;
+        if let Ok(got) = tokio::time::timeout_at(deadline, &mut answer).await {
+            return answered(got.ok(), asked);
         }
-        match tokio::time::timeout_at(deadline, answer).await {
-            Ok(Ok(Ok((vm, busy)))) => Ok(claimed(vm, busy, Served::Cold, asked)),
-            Ok(Ok(Err(message))) => Err(anyhow!(message)),
-            Ok(Err(_)) => bail!("the runner host is stopping"),
-            Err(_) => bail!(
-                "no sandbox VM came up within {} s",
-                deadline
-                    .saturating_duration_since(asked)
-                    .as_millis()
-                    .div_ceil(1000)
-            ),
+        if let Some(started) = started {
+            // Bounded by the VM's own create (see above); an answer ends the wait at once.
+            tokio::select! {
+                got = &mut answer => return answered(got.ok(), asked),
+                _ = started => {}
+            }
+            match answer.try_recv() {
+                Ok(got) => return answered(Some(got), asked),
+                Err(oneshot::error::TryRecvError::Closed) => return answered(None, asked),
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
         }
+        bail!(
+            "no sandbox VM came up within {} s",
+            deadline
+                .saturating_duration_since(asked)
+                .as_millis()
+                .div_ceil(1000)
+        )
     }
 
     /// Creates a VM of `shape` and hands it to the first run that waits for its shape, or to
@@ -586,6 +621,19 @@ impl Pool {
         let deletes = held.into_iter().map(IdleVm::delete);
         let _ =
             tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(deletes)).await;
+    }
+}
+
+/// What a claim's waiter got from the pool: a VM, a failure, or (`None`) its sender dropped
+/// unanswered, which happens only as the host stops.
+fn answered(
+    got: Option<std::result::Result<(IdleVm, Busy), String>>,
+    asked: Instant,
+) -> Result<Claimed> {
+    match got {
+        Some(Ok((vm, busy))) => Ok(claimed(vm, busy, Served::Cold, asked)),
+        Some(Err(message)) => Err(anyhow!(message)),
+        None => bail!("the runner host is stopping"),
     }
 }
 
