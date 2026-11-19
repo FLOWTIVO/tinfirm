@@ -1,0 +1,25 @@
+made node-1:vm-0f0cb4ff2a3c3975703c455cee9309f5, published at 10.0.0.6:20000 (guest 10.231.0.6, its namespace 10.231.0.2)
+from the control host (vm-mgmt, 10.0.0.4):
+  10.0.0.6:20000: tls alert
+  10.0.0.6:20001: refused
+  10.0.0.6:7700: tls TLSv1.3
+  10.231.0.6:7443: nothing
+  10.231.0.2:7443: nothing
+from a third machine (vm-sbx-third, 10.0.0.5):
+  10.0.0.6:20000: refused
+  10.0.0.6:20001: refused
+  10.0.0.6:7700: nothing
+  10.231.0.6:7443: nothing
+  10.231.0.2:7443: nothing
+from the third machine with a route to the VMs' range through the node (ip route add 10.231.0.0/16 via 10.0.0.6):
+  10.231.0.6:7443: nothing
+  10.231.0.2:7443: nothing
+from the node itself (vm-sbx-ctl, 10.0.0.6):
+  10.0.0.6:20000: refused
+  10.0.0.6:20001: refused
+  10.0.0.6:7700: nothing
+  10.231.0.6:7443: nothing
+  10.231.0.2:7443: nothing
+the agent's port from the third machine, with the control host's own certificate and key (copied there for this one try):
+  {"jsonrpc":"2.0","id":1,"result":{"protocol":1,"driver":"node","version":"1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}}
+delete: ({}, 95)

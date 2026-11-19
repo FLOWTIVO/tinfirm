@@ -1,0 +1,64 @@
+created node-1:vm-8e9d899381fe5db61d6aeb79c5568aff (two-machine-run-0) from the template sandbox-2c2g
+deleted node-1:vm-8e9d899381fe5db61d6aeb79c5568aff
+created node-1:vm-a51496f9a9c29a5436c6ae09dcd52c28 (two-machine-run-1) from the template sandbox-2c2g
+deleted node-1:vm-a51496f9a9c29a5436c6ae09dcd52c28
+created node-1:vm-9ddc933d9fa395d275c7cf915e4ef844 (two-machine-run-2) from the template sandbox-2c2g
+deleted node-1:vm-9ddc933d9fa395d275c7cf915e4ef844
+created node-1:vm-2e59260c046e4881c076fe2a98c9242f (two-machine-run-3) from the template sandbox-2c2g
+deleted node-1:vm-2e59260c046e4881c076fe2a98c9242f
+created node-1:vm-07afec924f33a91fc01103a75d3d8098 (two-machine-run-4) from the template sandbox-2c2g
+deleted node-1:vm-07afec924f33a91fc01103a75d3d8098
+created node-1:vm-978c1dc4fdc32bf854ff93a6febcef89 (two-machine-run-5) from the template sandbox-2c2g
+deleted node-1:vm-978c1dc4fdc32bf854ff93a6febcef89
+hello: 2 ms, {'protocol': 1, 'driver': 'node', 'version': '1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0'}
+verify: 7 ms, problems [], maxVms 2
+  checked: node node-1: 2 free
+  checked: node node-1: /dev/kvm
+  checked: node node-1: /dev/net/tun
+  checked: node node-1: /dev/mapper/control
+  checked: node node-1: /dev/loop-control
+  checked: node node-1: the tool /usr/sbin/ip
+  checked: node node-1: the tool /usr/sbin/nft
+  checked: node node-1: the tool /usr/sbin/sysctl
+  checked: node node-1: the tool /usr/sbin/losetup
+  checked: node node-1: the tool /usr/sbin/dmsetup
+  checked: node node-1: the tool /usr/sbin/blockdev
+  checked: node node-1: the tool /usr/bin/mknod
+  checked: node node-1: the tool /usr/bin/kill
+  checked: node node-1: the module kvm
+  checked: node node-1: the module dm_snapshot
+  checked: node node-1: the module veth
+  checked: node node-1: the module nf_tables
+  checked: node node-1: the module nft_ct
+  checked: node node-1: the module nft_chain_nat
+  checked: node node-1: the module nft_nat
+  checked: node node-1: the module nf_nat
+  checked: node node-1: net.ipv4.ip_forward=1
+  checked: node node-1: the cgroup controller cpu
+  checked: node node-1: the cgroup controller memory
+  checked: node node-1: the cgroup controller pids
+  checked: node node-1: the jailer /usr/local/bin/jailer
+  checked: node node-1: Firecracker /usr/local/bin/firecracker
+  checked: node node-1: the VM image /var/lib/tinfirm-node-agent/images/tinfirm-vm.img
+  checked: node node-1: the guest kernel /var/lib/tinfirm-node-agent/images/vmlinux
+  checked: node node-1: the jails' directory /srv/tinfirm-jails
+  checked: node node-1: the work directory /var/lib/tinfirm-node-agent/work
+  checked: node node-1: the listener's spool
+create: 2269 ms, id node-1:vm-8e9d899381fe5db61d6aeb79c5568aff; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 6455 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `refused`; list: 2 ms, 1 VM
+delete: 58 ms; then describe says gone; the port answers `refused`
+create: 128 ms, id node-1:vm-a51496f9a9c29a5436c6ae09dcd52c28; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2484 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `refused`; list: 1 ms, 1 VM
+delete: 83 ms; then describe says gone; the port answers `refused`
+create: 124 ms, id node-1:vm-9ddc933d9fa395d275c7cf915e4ef844; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2664 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `refused`; list: 2 ms, 1 VM
+delete: 89 ms; then describe says gone; the port answers `refused`
+create: 121 ms, id node-1:vm-2e59260c046e4881c076fe2a98c9242f; describe: 2 ms, running at 10.0.0.6:20000
+guest ready: 2447 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `refused`; list: 2 ms, 1 VM
+delete: 79 ms; then describe says gone; the port answers `refused`
+create: 127 ms, id node-1:vm-07afec924f33a91fc01103a75d3d8098; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2718 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `refused`; list: 2 ms, 1 VM
+delete: 60 ms; then describe says gone; the port answers `refused`
+create: 121 ms, id node-1:vm-978c1dc4fdc32bf854ff93a6febcef89; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2636 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `refused`; list: 2 ms, 1 VM
+delete: 79 ms; then describe says gone; the port answers `refused`
