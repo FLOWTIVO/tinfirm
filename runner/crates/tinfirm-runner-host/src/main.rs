@@ -1252,11 +1252,17 @@ async fn add_codex(paths: &Paths, label: &str, device_auth: bool, pool: u32) -> 
         }
     }
     let auth = codex_home.join("auth.json");
-    if !auth.exists() {
-        bail!(
+    match std::fs::symlink_metadata(&auth) {
+        Err(_) => bail!(
             "{} does not exist yet; the credential was not added",
             auth.display()
-        );
+        ),
+        // A sandbox of an earlier login may have left a link there: its mode is not changed.
+        Ok(meta) if !meta.is_file() => bail!(
+            "{} is not a regular file (a link?); remove it and add the credential again",
+            auth.display()
+        ),
+        Ok(_) => {}
     }
     std::fs::set_permissions(&auth, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let problems = credentials::check_codex_home(&codex_home);

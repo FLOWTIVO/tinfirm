@@ -177,7 +177,10 @@ the server sends it differs:
    tinfirm-runner-host credential add codex --label codex-main     # --device-auth without a browser
    ```
    If the Codex CLI is not installed, the command explains how to place an `auth.json`
-   there instead.
+   there instead. A run's sandbox can write to that directory, so the host reads `auth.json`
+   (for the redaction of its tokens, `doctor`, and the check of each run) only as a regular file
+   of at most 256 KiB, never through a link, a FIFO or a device; anything else is a problem that
+   `doctor` and the run name, and adding the login again repairs it.
 5. **Build the runner images** (a few minutes the first time):
    ```sh
    tinfirm-runner-host images build            # --runtime claude|codex|pi|opencode|all|multi, --no-cache
