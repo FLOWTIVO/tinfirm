@@ -814,3 +814,120 @@ fn the_confinement_is_reported_as_it_is() {
         assert!(probe.status.no_new_privs);
     }
 }
+
+/// A process outside every reader's process group, to be signalled: it must outlive the probe.
+fn bystander() -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    Command::new("sleep")
+        .arg("120")
+        .process_group(0)
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn a_confined_reader_can_neither_end_nor_limit_a_process_outside_its_group() {
+    if !confinable() {
+        eprintln!(
+            "SKIPPED: this kernel cannot confine a reader (no Landlock 2 or no seccomp); `doctor` says why"
+        );
+        return;
+    }
+    let mut target = bystander();
+    let (status, signals) = Reader::new(BIN).probe_signals(target.id(), WAIT).unwrap();
+    assert!(status.confined(), "{}", status.describe());
+    assert!(signals.reached.is_empty(), "{signals:?}");
+    assert!(signals.own_group, "the reader still signals its own group");
+    assert!(target.try_wait().unwrap().is_none(), "the bystander lives");
+    // As a control, an unconfined process of the same user limits it.
+    use rustix::process::{Pid, Resource, getrlimit, prlimit};
+    let pid = Pid::from_raw(target.id() as i32).unwrap();
+    assert!(prlimit(Some(pid), Resource::Core, getrlimit(Resource::Core)).is_ok());
+    target.kill().unwrap();
+    target.wait().unwrap();
+}
+
+/// Where [`reader_without_landlock`] hands the reader's job to [`launch_reader_without_landlock`].
+const WITHOUT_LANDLOCK: &str = "TINFIRM_TEST_READER_WITHOUT_LANDLOCK";
+
+/// A reader as on a kernel before Linux 6.12 at worst, with no Landlock at all: this test binary
+/// starts itself again, and [`launch_reader_without_landlock`] refuses Landlock to its thread, as
+/// a kernel without it does, and runs the reader in its place. The reader's seccomp filter is
+/// then all that confines it. Its answer is the last line of the output.
+fn reader_without_landlock(job: &str) -> serde_json::Value {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "launch_reader_without_landlock",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(WITHOUT_LANDLOCK, job)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The test harness names the test on the same line, before the answer.
+    let line = stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.find('{').map(|at| &l[at..]))
+        .unwrap_or("");
+    serde_json::from_str(line)
+        .unwrap_or_else(|e| panic!("{e}: {stdout}{}", String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Not a test of its own: does nothing unless [`reader_without_landlock`] started it.
+#[test]
+fn launch_reader_without_landlock() {
+    use std::collections::BTreeMap;
+    use std::os::unix::process::CommandExt;
+
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+
+    let Ok(job) = std::env::var(WITHOUT_LANDLOCK) else {
+        return;
+    };
+    let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
+    let filter: BpfProgram = SeccompFilter::new(
+        BTreeMap::from([(libc::SYS_landlock_create_ruleset, Vec::new())]),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    seccompiler::apply_filter(&filter).unwrap();
+    let error = Command::new(BIN)
+        .arg(tinfirm_runner_host::reader::SUBCOMMAND)
+        .arg(job)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .process_group(0)
+        .exec();
+    panic!("cannot start the reader: {error}");
+}
+
+#[test]
+fn without_landlock_the_seccomp_filter_alone_keeps_a_readers_signals_in_its_group() {
+    let mut target = bystander();
+    let job = serde_json::json!({
+        "allow_unconfined": true,
+        "work": { "kind": "probe", "deny_read": [], "connect": null, "signal": target.id() }
+    });
+    let answer = reader_without_landlock(&job.to_string());
+    let done = &answer["ok"];
+    // Landlock is gone, as before Linux 5.19; the filter is there.
+    assert_eq!(done["status"]["landlock"], false, "{answer}");
+    assert_eq!(done["status"]["seccomp"], true, "{answer}");
+    assert_eq!(
+        done["signals"]["reached"],
+        serde_json::json!([]),
+        "{answer}"
+    );
+    assert_eq!(done["signals"]["own_group"], true, "{answer}");
+    assert!(target.try_wait().unwrap().is_none(), "the bystander lives");
+    target.kill().unwrap();
+    target.wait().unwrap();
+}

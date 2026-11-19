@@ -686,7 +686,14 @@ not run by hand; `reader.rs`, `confine.rs`).
     abstract sockets outside the reader (Linux 6.12) are refused too;
   - a seccomp filter: no socket of any kind, no `ptrace` or `process_vm_*`, no namespaces, no
     mounts, no `io_uring`, no `bpf`, no new session or process group, and it cannot make itself
-    dumpable again;
+    dumpable again. It also keeps the reader's signals inside its process group on every kernel,
+    before Linux 6.12 too: a signal by pid only to its own group (0 or the group's negative id) or
+    itself, or the signal 0 (a check that a process exists) to any; no `pidfd_open` or
+    `pidfd_send_signal`, no `F_SETOWN` or `FIOSETOWN` (a `SIGIO` sent for it); and no
+    `prlimit64`, `sched_set*`, `setpriority` or `ioprio_set` on another process (Landlock's scope
+    does not cover a limit, and a CPU limit would end `run`). seccomp compares a pid with
+    constants only, so a git in the reader cannot signal its own children by their pids either:
+    its cleanup after an error is left to `run`'s kill of the group;
   - `no_new_privs`, and not dumpable; `run` itself is not dumpable either, so no process of its
     user reads its memory;
   - it runs in a process group of its own, which `run` kills when the reading is over or its time

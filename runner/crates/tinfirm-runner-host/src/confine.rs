@@ -23,8 +23,15 @@
 //!   to `clone`); mounts and `chroot`; `io_uring`, whose operations seccomp does not see;
 //!   `bpf`, `perf_event_open`, `userfaultfd`, the kernel keyring, modules, `kexec`,
 //!   `open_by_handle_at`; `setsid` and `setpgid`, so that nothing it starts leaves the process
-//!   group that the host kills when the job is over; and `PR_SET_DUMPABLE`, so it cannot make
-//!   itself traceable again.
+//!   group that the host kills when the job is over; `PR_SET_DUMPABLE`, so it cannot make
+//!   itself traceable again; and a signal to any process outside its process group, whatever
+//!   Landlock's version (`kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo` to
+//!   another target than its group or itself, `pidfd_open`, `pidfd_send_signal`, and `F_SETOWN`
+//!   or `FIOSETOWN`, which would have `SIGIO` sent), and acting on another process's limits or
+//!   priority (`prlimit64`, the `sched_set*` calls, `setpriority`, `ioprio_set`). A positive pid
+//!   of its own group cannot be told from another in a seccomp filter, so only the reader's own
+//!   pid is allowed: git's cleanup of its children after an error is refused, and the host's
+//!   kill of the group does it.
 //!
 //! Landlock 2 (Linux 5.19) is the least that counts as confined: before it, Landlock refuses
 //! every rename between two directories, which git needs to store an object. The child
@@ -421,9 +428,152 @@ mod seccomp {
 
     const PR_SET_DUMPABLE: u64 = 4;
 
-    fn filters(arch: TargetArch) -> Result<(BpfProgram, BpfProgram), seccompiler::Error> {
+    /// Refused whatever their arguments, because they act on another process of the same user
+    /// or a whole user's processes, and no reader needs them: signals through a pidfd, and the
+    /// scheduling and I/O priority of other processes (`setpriority` and `ioprio_set` take a
+    /// user's processes too).
+    const OTHERS_DENIED: &[i64] = &[
+        libc::SYS_pidfd_open,
+        libc::SYS_pidfd_send_signal,
+        libc::SYS_setpriority,
+        libc::SYS_ioprio_set,
+    ];
+
+    /// Act on the process their first argument names: allowed for 0 (the caller) and the
+    /// reader's own id, refused for any other. `prlimit64` would let a process of the user set
+    /// `run`'s limits (a CPU limit ends it), which Landlock's scope does not cover either.
+    const SELF_ONLY: &[i64] = &[
+        libc::SYS_prlimit64,
+        libc::SYS_sched_setaffinity,
+        libc::SYS_sched_setparam,
+        libc::SYS_sched_setscheduler,
+        libc::SYS_sched_setattr,
+    ];
+
+    /// `fcntl` commands that name a process to get `SIGIO` and `SIGURG`: a reader could have
+    /// `run` signalled through its own file.
+    const F_SETOWN: u64 = 8;
+    const F_SETOWN_EX: u64 = 15;
+    /// The same through `ioctl`, on a socket of `socketpair`.
+    const FIOSETOWN: u64 = 0x8901;
+    const SIOCSPGRP: u64 = 0x8902;
+
+    /// A 32-bit argument (a pid, a signal) as seccomp compares its low half.
+    fn dword(value: i32) -> u64 {
+        u64::from(value as u32)
+    }
+
+    fn arg(
+        index: u8,
+        op: SeccompCmpOp,
+        value: u64,
+    ) -> Result<SeccompCondition, seccompiler::Error> {
+        Ok(SeccompCondition::new(
+            index,
+            SeccompCmpArgLen::Dword,
+            op,
+            value,
+        )?)
+    }
+
+    /// The rules that keep a reader's signals inside its process group (ADR-0112, open question
+    /// 1), for kernels whose Landlock has no signal scope (before Linux 6.12), and for the ways
+    /// to another process that Landlock's scope does not cover. `own` is the reader's pid, and
+    /// `group` its process group's (the same: the host starts it as a group's leader).
+    ///
+    /// A signal by pid is allowed to 0 (the caller's own group), to `-group`, and to `own`; a
+    /// signal 0 (a check that a process exists) to any. Any other target is refused, `run`
+    /// and its other children among them. seccomp compares arguments with constants only, so a
+    /// positive pid of a process in the group cannot be told from one outside it: those are
+    /// refused too, in git as well. git signals its own children only to clean up after an
+    /// error, and the host kills the whole group when the reading ends; a git that re-raises a
+    /// signal to itself (`raise`, `tgkill` with its own pid) is refused that as well and goes on,
+    /// until the host's kill.
+    fn signal_rules(
+        rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
+        own: i32,
+        group: i32,
+    ) -> Result<(), seccompiler::Error> {
+        use SeccompCmpOp::Ne;
+        let not_a_check = |index: u8| arg(index, Ne, 0);
+        // kill(pid, sig)
+        rules.insert(
+            libc::SYS_kill,
+            vec![SeccompRule::new(vec![
+                arg(0, Ne, 0)?,
+                arg(0, Ne, dword(-group))?,
+                arg(0, Ne, dword(own))?,
+                not_a_check(1)?,
+            ])?],
+        );
+        // tkill(tid, sig): the reader's main thread only.
+        rules.insert(
+            libc::SYS_tkill,
+            vec![SeccompRule::new(vec![
+                arg(0, Ne, dword(own))?,
+                not_a_check(1)?,
+            ])?],
+        );
+        // tgkill(tgid, tid, sig): a thread of the reader only.
+        rules.insert(
+            libc::SYS_tgkill,
+            vec![SeccompRule::new(vec![
+                arg(0, Ne, dword(own))?,
+                not_a_check(2)?,
+            ])?],
+        );
+        // rt_sigqueueinfo(tgid, sig, info), rt_tgsigqueueinfo(tgid, tid, sig, info).
+        rules.insert(
+            libc::SYS_rt_sigqueueinfo,
+            vec![SeccompRule::new(vec![
+                arg(0, Ne, dword(own))?,
+                not_a_check(1)?,
+            ])?],
+        );
+        rules.insert(
+            libc::SYS_rt_tgsigqueueinfo,
+            vec![SeccompRule::new(vec![
+                arg(0, Ne, dword(own))?,
+                not_a_check(2)?,
+            ])?],
+        );
+        for &call in OTHERS_DENIED {
+            rules.insert(call, Vec::new());
+        }
+        for &call in SELF_ONLY {
+            rules.insert(
+                call,
+                vec![SeccompRule::new(vec![
+                    arg(0, Ne, 0)?,
+                    arg(0, Ne, dword(own))?,
+                ])?],
+            );
+        }
+        rules.insert(
+            libc::SYS_fcntl,
+            vec![
+                SeccompRule::new(vec![arg(1, SeccompCmpOp::Eq, F_SETOWN)?])?,
+                SeccompRule::new(vec![arg(1, SeccompCmpOp::Eq, F_SETOWN_EX)?])?,
+            ],
+        );
+        rules.insert(
+            libc::SYS_ioctl,
+            vec![
+                SeccompRule::new(vec![arg(1, SeccompCmpOp::Eq, FIOSETOWN)?])?,
+                SeccompRule::new(vec![arg(1, SeccompCmpOp::Eq, SIOCSPGRP)?])?,
+            ],
+        );
+        Ok(())
+    }
+
+    fn filters(
+        arch: TargetArch,
+        own: i32,
+        group: i32,
+    ) -> Result<(BpfProgram, BpfProgram), seccompiler::Error> {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
             DENIED.iter().map(|&call| (call, Vec::new())).collect();
+        signal_rules(&mut rules, own, group)?;
         let mut clone = Vec::new();
         for &flag in NAMESPACES {
             let flag = u64::from(flag as u32);
@@ -465,7 +615,9 @@ mod seccomp {
 
     pub fn apply() -> Result<(), String> {
         let arch = ARCH.ok_or("this architecture has no seccomp filter of Tinfirm's")?;
-        let (denied, clone3) = filters(arch).map_err(|e| e.to_string())?;
+        let own = rustix::process::getpid().as_raw_nonzero().get();
+        let group = rustix::process::getpgrp().as_raw_nonzero().get();
+        let (denied, clone3) = filters(arch, own, group).map_err(|e| e.to_string())?;
         seccompiler::apply_filter(&denied).map_err(|e| e.to_string())?;
         seccompiler::apply_filter(&clone3).map_err(|e| e.to_string())
     }
@@ -478,7 +630,7 @@ mod seccomp {
         fn the_filters_compile_for_this_architecture() {
             assert!(ARCH.is_some());
             if let Some(arch) = ARCH {
-                let (denied, clone3) = filters(arch).unwrap();
+                let (denied, clone3) = filters(arch, 4242, 4242).unwrap();
                 assert!(!denied.is_empty() && !clone3.is_empty());
             }
         }

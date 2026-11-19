@@ -89,10 +89,13 @@ struct Job {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Work {
     /// Confine as a reader does, then try what must be refused: open each of `deny_read`,
-    /// create a socket, connect to `connect`.
+    /// create a socket, connect to `connect`, and, with `signal`, signal and limit that
+    /// process, which is outside the reader's process group ([`Signals`]).
     Probe {
         deny_read: Vec<PathBuf>,
         connect: Option<SocketAddr>,
+        #[serde(default)]
+        signal: Option<u32>,
     },
     /// Unpack the archive on stdin (gzipped with `gzip`) into `dest`, an empty directory:
     /// directories and regular files only, within `limits` ([`files::unpack_untrusted`]).
@@ -164,6 +167,9 @@ enum Done {
         socket: bool,
         /// `connect` got through.
         connect: Option<bool>,
+        /// What the probe could do to the process `signal` named.
+        #[serde(default)]
+        signals: Option<Signals>,
     },
     Unpacked {
         files: u64,
@@ -187,6 +193,20 @@ enum OneState {
     NotRegular,
     TooLarge,
     File,
+}
+
+/// What a reader could do to a process outside its process group, of the same user
+/// ([`Reader::probe_signals`]): before Linux 6.12, Landlock has no signal scope, and only the
+/// seccomp filter keeps a reader from ending `run` ([`confine`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signals {
+    /// What got through to that process: `SIGTERM` by its pid (`kill`), to its group (`kill of
+    /// its group`), its limits (`prlimit64`), a pidfd of it (`pidfd_open`). Empty when all were
+    /// refused.
+    pub reached: Vec<String>,
+    /// The reader could still signal its own process group and itself (`SIGCONT`), as git does.
+    pub own_group: bool,
 }
 
 /// What [`Reader::probe`] found.
@@ -266,6 +286,26 @@ impl Reader {
         &self.binary
     }
 
+    /// Starts a reader that confines itself and tries to end, signal and limit `target`, a
+    /// process outside its process group, and to signal its own group: what keeps a reader
+    /// from ending `run` (ADR-0112, open question 1). With the reader's status.
+    pub fn probe_signals(&self, target: u32, timeout: Duration) -> Result<(Status, Signals)> {
+        let work = Work::Probe {
+            deny_read: Vec::new(),
+            connect: None,
+            signal: Some(target),
+        };
+        let (done, rest) = self.exchange(&work, None, 0, timeout)?;
+        match done {
+            Done::Probe {
+                status,
+                signals: Some(signals),
+                ..
+            } if rest.is_empty() => Ok((status, signals)),
+            _ => bail!("the reader's probe answered something else"),
+        }
+    }
+
     /// Starts a reader that confines itself and tries to open each of `deny_read` and to make
     /// a socket (and to connect to `connect`): what `run` and `doctor` say about the reader.
     /// It reads no input. Blocking.
@@ -278,6 +318,7 @@ impl Reader {
         let work = Work::Probe {
             deny_read: deny_read.to_vec(),
             connect,
+            signal: None,
         };
         let (done, rest) = self.exchange(&work, None, 0, timeout)?;
         let Done::Probe {
@@ -285,6 +326,7 @@ impl Reader {
             read,
             socket,
             connect: connected,
+            ..
         } = done
         else {
             bail!("the reader answered the probe with something else");
@@ -805,8 +847,16 @@ pub fn child_main(job: &str) -> ExitCode {
     #[cfg(target_os = "linux")]
     limit_resources(&job.work);
     let status = confine::confine(&plan);
-    if let Work::Probe { deny_read, connect } = &job.work {
-        return answer(Answer::Ok(probe(status, deny_read, *connect)), None);
+    if let Work::Probe {
+        deny_read,
+        connect,
+        signal,
+    } = &job.work
+    {
+        return answer(
+            Answer::Ok(probe(status, deny_read, *connect, *signal)),
+            None,
+        );
     }
     if !status.confined() && !job.allow_unconfined {
         return answer(
@@ -932,7 +982,12 @@ fn answer(answer: Answer, content: Option<Vec<u8>>) -> ExitCode {
     }
 }
 
-fn probe(status: Status, deny_read: &[PathBuf], connect: Option<SocketAddr>) -> Done {
+fn probe(
+    status: Status,
+    deny_read: &[PathBuf],
+    connect: Option<SocketAddr>,
+    signal: Option<u32>,
+) -> Done {
     let read = deny_read
         .iter()
         .map(|path| std::fs::File::open(path).is_ok())
@@ -945,6 +1000,47 @@ fn probe(status: Status, deny_read: &[PathBuf], connect: Option<SocketAddr>) -> 
         read,
         socket,
         connect,
+        signals: signal.map(probe_signals),
+    }
+}
+
+/// Tries what would end or slow `target`, which is outside this reader's process group, and
+/// whether this reader can still signal its own group.
+#[cfg(target_os = "linux")]
+fn probe_signals(target: u32) -> Signals {
+    use rustix::process::{
+        PidfdFlags, Resource, Signal, getpid, getrlimit, kill_current_process_group, kill_process,
+        kill_process_group, pidfd_open, prlimit,
+    };
+    let mut reached = Vec::new();
+    if let Some(pid) = i32::try_from(target)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        if kill_process(pid, Signal::TERM).is_ok() {
+            reached.push("kill".to_string());
+        }
+        if kill_process_group(pid, Signal::TERM).is_ok() {
+            reached.push("kill of its group".to_string());
+        }
+        // Its core size set to the reader's own: harmless where it gets through.
+        if prlimit(Some(pid), Resource::Core, getrlimit(Resource::Core)).is_ok() {
+            reached.push("prlimit64".to_string());
+        }
+        if pidfd_open(pid, PidfdFlags::empty()).is_ok() {
+            reached.push("pidfd_open".to_string());
+        }
+    }
+    let own_group = kill_current_process_group(Signal::CONT).is_ok()
+        && kill_process(getpid(), Signal::CONT).is_ok();
+    Signals { reached, own_group }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_signals(_target: u32) -> Signals {
+    Signals {
+        reached: vec!["not probed: not Linux".to_string()],
+        own_group: false,
     }
 }
 
