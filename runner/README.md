@@ -109,9 +109,11 @@ The same release also carries the node agent of a sandbox node
 nodes of a control host whose VMs run on your own machines, not on a runner host; install it from
 the same release as the runner host, which checks the agent's release when it connects. Download
 and verify it as above, with `tinfirm-node-agent` in place of `tinfirm-runner-host` and a Linux
-target; its archive holds the binary, its licence and the licences of its crates. It cannot run
-VMs yet: its service units and their setup are planned
-([docs-site, runner hosts](../docs-site/content/operator-guide/runner-hosts.md)).
+target; its archive holds the binary, its licence and the licences of its crates. It runs jailed
+Firecracker VMs, and has run them on one KVM node; its service units are in
+`crates/tinfirm-node-agent/units/`, and the role that sets up a node is planned
+([Sandbox nodes](#sandbox-nodes);
+[docs-site, runner hosts](../docs-site/content/operator-guide/runner-hosts.md)).
 
 Then continue with the [Quickstart](#quickstart). To upgrade, install the
 new binary the same way and drain ([Drain and upgrades](#drain-and-upgrades)). A Compose host
@@ -867,12 +869,16 @@ C7 of the
 nodes**, machines that hold nothing, each with the node agent (`crates/tinfirm-node-agent`). The
 driver relays `verify`, `create`, `describe`, `delete` and `list` to each node agent's listener, over
 TLS with pinned certificates both ways, or over the listener's local socket when the agent runs on
-this host's own machine (a single machine).
+this host's own machine (a single machine, planned).
 
-**Not usable yet.** The node agent's execution (its jail, network, disks and VMM) is not built: its
-`verify` reports that as a problem, so `run` refuses to start with this driver, and no VM runs through
-it today. The driver, the agent's wire and the agent's checks are built and tested against node agents
-with a fake backend; no run has gone through a node.
+**Not ready for use yet.** The node agent's execution (its jail, network, disks and VMM) is built.
+VMs were made, described, listed and deleted on one KVM node through this driver over TLS, driven by
+a script in this host's place ([the evidence](../docs/reviews/2026-11-19-node-agent-execution/README.md);
+[the agent's state](crates/tinfirm-node-agent/README.md#what-is-built-and-what-is-planned)). Still
+planned: the role that sets up a node, the node's own firewall and its hardening, the single machine
+(until its firewall is built, the node agent refuses a control host on its own machine), and the
+published VM image. No conversation has run through a node, and the Helm chart's runner pod has not
+run against one. Here, the driver is tested against node agents with their fake backend.
 
 - **Editions.** In the core, in every edition: the driver lists no paid feature
   ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)).
@@ -884,8 +890,8 @@ with a fake backend; no run has gone through a node.
   VMs (KVM) reaches the machine with every credential (`vm-jail`), or the node, which holds no
   credential, and the other runs on it (`machine`). A configuration that cannot be read, that mixes
   sockets and TLS, or that reaches this host's own address over TLS stops `run` at its start, and
-  `--isolation-level` is refused. Since no VM runs through a node yet (above), this is what such a host
-  would report.
+  `--isolation-level` is refused. No run has gone through a node yet (above): this is what such a host
+  reports at its start, and `vm-jail` waits for the single machine.
 - **Its configuration**, `/etc/tinfirm/node-driver.json` (or `TINFIRM_NODE_DRIVER_CONFIG`):
 
   ```json
@@ -909,8 +915,15 @@ with a fake backend; no run has gone through a node.
   this host's user's alone, 0600, or the driver refuses to start), or at `socket`, the listener's local
   socket, with no certificate. All the nodes are reached one way: sockets and TLS at once are refused,
   since a runner host has one isolation level. `templates` names the templates of the node agent's own
-  configuration that the node offers; `--vm-template` must be one of them. `tinfirm-node-agent
-  identity` makes a certificate and its key and prints its SHA-256.
+  configuration that the node offers; `--vm-template` must be one of them.
+- **The certificates.** `tinfirm-runner-host node identity --cert FILE --key FILE` writes a new key
+  (PKCS #8 DER, mode 0600) and its self-signed certificate (DER), and prints the certificate's SHA-256
+  in 64 hex digits: this host's client certificate, whose SHA-256 goes into the node agent's
+  `clientSha256`. Neither file may exist, and neither is followed if it is a symbolic link.
+  `tinfirm-runner-host node fingerprint --cert FILE` prints the SHA-256 of a certificate, such as the
+  node's for `nodeSha256`. `tinfirm-node-agent identity` and `fingerprint` do the same with the same
+  files: a certificate made by either binary works with the other, and the control host needs no node
+  agent's binary for its own.
 - **Placement.** A new VM goes to the node with the most free slots, by each node's `verify`, among the
   nodes that offer the template, answer and report no problem; the first in the file's order on a tie.
 - **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer with no
@@ -1058,6 +1071,7 @@ firewall, the probe from a Droplet) and the nightly conformance test.
 | `mirrors prune [--older-than-days N] [--dry-run]` | Deletes idle mirrors and collects garbage in the others, like `run` does every 6 hours; refused while `run` is active (`--dry-run` only shows what it would do) |
 | `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |
 | `drain [--no-wait]` | Asks the `run` of this config directory to [drain](#drain-and-upgrades): sends SIGHUP to the PID in `run.lock` and waits until `run` has exited (`--no-wait` returns after the signal). Exits 0, also when no `run` is active ("Nothing to drain") |
+| `node identity --cert <file> --key <file>`, `node fingerprint --cert <file>` | The TLS identity of a control host for [sandbox nodes](#sandbox-nodes): writes a new key (0600) and certificate, which must not exist, and prints its SHA-256; prints a certificate's SHA-256. The files of `tinfirm-node-agent identity` |
 
 Global options: `--config-dir`, `--data-dir` (or `TINFIRM_RUNNER_CONFIG_DIR`,
 `TINFIRM_RUNNER_DATA_DIR`) and `--log <filter>` (`TINFIRM_RUNNER_LOG`, default `info`).

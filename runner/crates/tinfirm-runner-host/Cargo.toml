@@ -31,6 +31,8 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
 ring.workspace = true
+# `node identity`: this host's certificate for sandbox nodes (crate::node).
+rcgen.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true

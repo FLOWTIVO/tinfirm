@@ -1,8 +1,8 @@
 //! The `node` driver (`vm-driver node`, ADR-0112) against real node agents: each agent's
 //! listener and helper run in this process from the node agent's library, the helper on its
 //! fake backend; the driver is this crate's binary, which the tests drive through the driver
-//! protocol as the runner host does (`vm::Driver`). No VM runs: the node agent's Linux backend
-//! is not built, and the fake backend's "VMs" are records.
+//! protocol as the runner host does (`vm::Driver`). No VM runs: the fake backend's "VMs" are
+//! records.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -47,6 +47,11 @@ impl Drop for Agent {
 /// A node agent with `max_vms` slots that takes the control host whose certificate is
 /// `client`.
 async fn agent(max_vms: u32, client: &[u8]) -> Agent {
+    agent_with(max_vms, client, tls::generate(tls::SERVER_NAME).unwrap()).await
+}
+
+/// Like [`agent`], with the node's certificate and key `node_cert` (DER).
+async fn agent_with(max_vms: u32, client: &[u8], node_cert: (Vec<u8>, Vec<u8>)) -> Agent {
     let own = local::own_uid().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -101,7 +106,6 @@ async fn agent(max_vms: u32, client: &[u8]) -> Agent {
     {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let node_cert = tls::generate(tls::SERVER_NAME).unwrap();
     let socket = root.join("listener-socket/listener.sock");
     let mut listener_config: ListenerConfig = serde_json::from_value(json!({
         "helperSocket": config.socket,
@@ -272,6 +276,81 @@ async fn the_driver_relays_the_driver_protocol_over_tls() {
         )],
     );
     the_driver_protocol(&driver, &agent, "node-a").await;
+}
+
+/// `tinfirm-runner-host node …`, as a process: the one line it prints.
+fn host_node(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tinfirm-runner-host"))
+        .arg("node")
+        .args(args)
+        .env("TINFIRM_RUNNER_CONFIG_DIR", dir.join("config"))
+        .env("TINFIRM_RUNNER_DATA_DIR", dir.join("data"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(line.lines().count(), 1, "{line}");
+    line.trim().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identity_of_either_binary_works_with_the_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+    let identity = |name: &str| {
+        let (cert, key) = (path(&format!("{name}.crt")), path(&format!("{name}.key")));
+        host_node(dir, &["identity", "--cert", &cert, "--key", &key])
+    };
+    let fingerprint = |name: &str| host_node(dir, &["fingerprint", "--cert", &path(name)]);
+    // Two pairs: first the runner host makes the control host's identity and the node agent's
+    // code the node's, then the other way round.
+    for (host, node, host_by_runner_host) in
+        [("host-a", "node-a", true), ("host-b", "node-b", false)]
+    {
+        let (host_crt, host_key) = (path(&format!("{host}.crt")), path(&format!("{host}.key")));
+        let (node_crt, node_key) = (path(&format!("{node}.crt")), path(&format!("{node}.key")));
+        let (client_pin, node_pin) = if host_by_runner_host {
+            let client_pin = identity(host);
+            let node_pin =
+                tls::write_identity(node_crt.as_ref(), node_key.as_ref(), tls::SERVER_NAME)
+                    .unwrap();
+            (client_pin, node_pin)
+        } else {
+            let client_pin =
+                tls::write_identity(host_crt.as_ref(), host_key.as_ref(), "control").unwrap();
+            (client_pin, identity(node))
+        };
+        // Each binary's rules read the other's files: the same pins, keys of their owner's alone.
+        assert_eq!(fingerprint(&format!("{host}.crt")), client_pin);
+        assert_eq!(fingerprint(&format!("{node}.crt")), node_pin);
+        assert_eq!(tls::fingerprint(host_crt.as_ref()).unwrap(), client_pin);
+        assert_eq!(tls::fingerprint(node_crt.as_ref()).unwrap(), node_pin);
+        let client_files = tls::load(host_crt.as_ref(), host_key.as_ref()).unwrap();
+        let node_files = tls::load(node_crt.as_ref(), node_key.as_ref()).unwrap();
+        // And TLS takes them: the listener with the node's, the driver with the host's.
+        let agent = agent_with(4, &client_files.0, node_files).await;
+        assert_eq!(agent.node_pin, node_pin);
+        let client = Client {
+            cert: client_files.0,
+            cert_path: host_crt.into(),
+            key_path: host_key.into(),
+        };
+        let driver = driver(
+            dir,
+            vec![tls_node(
+                node,
+                &agent.tls_addr.to_string(),
+                &node_pin,
+                &client,
+            )],
+        );
+        the_driver_protocol(&driver, &agent, node).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

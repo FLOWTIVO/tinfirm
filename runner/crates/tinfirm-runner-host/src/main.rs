@@ -139,6 +139,11 @@ enum Command {
         #[arg(long)]
         no_wait: bool,
     },
+    /// The TLS identities of sandbox nodes (ADR-0112): the certificate and key this host
+    /// presents to a node agent, and the pins that each side names. The files are those of
+    /// `tinfirm-node-agent identity` and `fingerprint`: either binary reads the other's.
+    #[command(subcommand)]
+    Node(NodeCommand),
     /// The sandbox's side of the sandbox bridge (ADR-0095). `run --sandbox-bridge` starts it in
     /// each sandbox, with its settings in the TINFIRM_BRIDGE_* variables; it is not run by hand.
     #[command(hide = true)]
@@ -682,6 +687,28 @@ enum AddCredential {
 }
 
 #[derive(Subcommand)]
+enum NodeCommand {
+    /// Write a new key (PKCS #8 DER, mode 0600) and its self-signed certificate (DER), and print
+    /// the certificate's SHA-256: the pin that the node agent's `clientSha256` names. Neither
+    /// file may exist.
+    Identity {
+        /// The certificate file to write.
+        #[arg(long)]
+        cert: PathBuf,
+        /// The key file to write.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Print the SHA-256 of a certificate (DER): its pin, as `nodeSha256` and `clientSha256`
+    /// name it.
+    Fingerprint {
+        /// The certificate file.
+        #[arg(long)]
+        cert: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum MirrorsCommand {
     /// List the mirrors: key, size, last use, last gc and repository.
     List,
@@ -901,6 +928,17 @@ async fn dispatch(cli: Cli) -> Result<()> {
             .await
         }
         Command::Drain { no_wait } => drain(&paths, no_wait).await,
+        Command::Node(NodeCommand::Identity { cert, key }) => {
+            println!(
+                "{}",
+                tinfirm_runner_host::node::write_identity(&cert, &key)?
+            );
+            Ok(())
+        }
+        Command::Node(NodeCommand::Fingerprint { cert }) => {
+            println!("{}", tinfirm_runner_host::node::fingerprint(&cert)?);
+            Ok(())
+        }
         Command::Bridge => bail!("`bridge` runs in a sandbox, started by `run --sandbox-bridge`"),
         Command::VmDriver { .. } | Command::VmBoot { .. } | Command::Reader { .. } => {
             unreachable!("handled before the dispatch")

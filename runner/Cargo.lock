@@ -2495,6 +2495,7 @@ dependencies = [
  "landlock",
  "libc",
  "percent-encoding",
+ "rcgen",
  "ring",
  "rpassword",
  "rustix",

@@ -408,6 +408,61 @@ pub fn is_own_host(host: &str) -> bool {
 
 // ----- TLS ---------------------------------------------------------------------------------
 
+/// The SHA-256 of a certificate's DER, in lower-case hex: its pin.
+fn pin_hex(cert: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, cert)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `node identity`: writes a new key (PKCS #8 DER, mode 0600) to `key` and its self-signed
+/// certificate (DER, mode 0644) to `cert`, and answers the certificate's pin. Neither file may
+/// exist, and neither is followed if it is a symbolic link; where the certificate cannot be
+/// written, the new key is removed again. The certificate names [`SERVER_NAME`], as
+/// `tinfirm-node-agent identity` makes it: its files and this one's are the same kind, and
+/// either binary reads the other's (only the pin is checked, never the name).
+pub fn write_identity(cert: &Path, key: &Path) -> Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    for path in [cert, key] {
+        if path.symlink_metadata().is_ok() {
+            bail!(
+                "{} exists: an identity is never overwritten",
+                path.display()
+            );
+        }
+    }
+    let certified = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
+        .context("cannot create a certificate")?;
+    let cert_der = certified.cert.der().to_vec();
+    let key_der = certified.signing_key.serialize_der();
+    let write = |path: &Path, bytes: &[u8], mode: u32| -> Result<()> {
+        let mut file = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("cannot write {}", path.display()))
+    };
+    write(key, &key_der, 0o600)?;
+    if let Err(e) = write(cert, &cert_der, 0o644) {
+        let _ = std::fs::remove_file(key);
+        return Err(e);
+    }
+    Ok(pin_hex(&cert_der))
+}
+
+/// `node fingerprint`: the pin of a certificate file (DER, at most 64 KiB, not empty).
+pub fn fingerprint(cert: &Path) -> Result<String> {
+    Ok(pin_hex(&read_small(cert)?))
+}
+
 fn tls_config(pin: [u8; 32], cert: Vec<u8>, key: Vec<u8>) -> Result<Arc<rustls::ClientConfig>> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -1202,6 +1257,49 @@ mod tests {
         assert!(is_own_host("127.0.0.1") && is_own_host("::1") && is_own_host("0.0.0.0"));
         assert!(!is_own_host("192.0.2.77"));
         assert!(!is_own_host("no-such-host.invalid"));
+    }
+
+    #[test]
+    fn an_identity_is_written_once_with_its_key_closed_and_its_pin_printed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("client.crt");
+        let key = dir.path().join("client.key");
+        let pin = write_identity(&cert, &key).unwrap();
+        assert_eq!(pin.len(), 64);
+        assert_eq!(parse_pin(&pin).unwrap().len(), 32);
+        assert_eq!(fingerprint(&cert).unwrap(), pin);
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&key), 0o600);
+        // This host's own rules for its client key and certificate take them, and so does TLS.
+        let (cert_der, key_der) = (read_small(&cert).unwrap(), read_key(&key).unwrap());
+        tls_config(parse_pin(&pin).unwrap(), cert_der, key_der).unwrap();
+        // Never overwritten, and a second identity differs.
+        let error = write_identity(&cert, &key).unwrap_err().to_string();
+        assert!(error.contains("exists"), "{error}");
+        assert_eq!(fingerprint(&cert).unwrap(), pin);
+        let other = write_identity(&dir.path().join("b.crt"), &dir.path().join("b.key")).unwrap();
+        assert_ne!(other, pin);
+    }
+
+    #[test]
+    fn an_identity_follows_no_link_and_leaves_no_key_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("client.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_identity(&dir.path().join("client.crt"), &link).is_err());
+        assert!(!target.exists());
+        assert!(!dir.path().join("client.crt").exists());
+        // A certificate that cannot be written: the new key goes again.
+        let key = dir.path().join("new.key");
+        let cert = dir.path().join("missing-dir/new.crt");
+        assert!(write_identity(&cert, &key).is_err());
+        assert!(!key.exists());
+        // An empty certificate has no pin.
+        let empty = dir.path().join("empty.crt");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(fingerprint(&empty).is_err());
     }
 
     #[test]

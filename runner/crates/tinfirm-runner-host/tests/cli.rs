@@ -1419,3 +1419,60 @@ fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
         "{report}"
     );
 }
+
+#[test]
+fn node_identity_writes_a_key_and_certificate_once_and_fingerprint_prints_its_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let cert = dir.join("client.crt");
+    let key = dir.join("client.key");
+    let (cert_arg, key_arg) = (cert.to_str().unwrap(), key.to_str().unwrap());
+    let out = run(
+        dir,
+        &["node", "identity", "--cert", cert_arg, "--key", key_arg],
+        None,
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let pin = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(pin.len(), 65, "{pin}");
+    assert!(
+        pin.trim()
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    assert_eq!(mode(&key), 0o600);
+    let out = run(
+        dir,
+        &["node", "fingerprint", "--cert", cert_arg],
+        None,
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), pin);
+    // A second identity on the same files is refused, and the first stays.
+    let out = run(
+        dir,
+        &["node", "identity", "--cert", cert_arg, "--key", key_arg],
+        None,
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(text(&out).contains("exists"), "{}", text(&out));
+    let out = run(
+        dir,
+        &["node", "fingerprint", "--cert", cert_arg],
+        None,
+        None,
+    );
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), pin);
+    // A certificate that is not there has no pin.
+    let missing = dir.join("missing.crt");
+    let out = run(
+        dir,
+        &["node", "fingerprint", "--cert", missing.to_str().unwrap()],
+        None,
+        None,
+    );
+    assert!(!out.status.success());
+}
