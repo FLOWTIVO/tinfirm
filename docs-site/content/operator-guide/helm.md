@@ -465,7 +465,7 @@ runner:
 
 The pod runs as user 10001 with a read-only root filesystem, no capabilities and no privilege escalation, and never calls the Kubernetes API. On an upgrade it drains first: it takes no new runs and lets the active ones finish. When `terminationGracePeriodSeconds` ends first, it stops, and the next pod takes its runs back: their work is pushed and their sessions saved, and they end as failed, so the next message of each conversation goes on from there.
 
-To rotate the token, put a new one in the Secret, then restart the server, which replaces the old token at its start and closes its connection, and then the pod. To rotate the client certificate of the `node` driver, update the Secret, set the new certificate's SHA-256 as `tls.clientSha256` on each node's listener, which accepts one certificate, and restart the pod; runs cannot start in between.
+To rotate the token, put a new one in the Secret, then restart the server, which replaces the old token at its start and closes its connection, and then the pod. To rotate the client certificate of the `node` driver, update the Secret, set the new certificate's SHA-256 as `tls.clientSha256` on each node's listener, which accepts one certificate, restart that listener, which reads its configuration at its start, and restart the pod; runs cannot start in between.
 
 ## Install the chart
 
