@@ -753,7 +753,7 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "driver": { "type": "string", "enum": ["digitalocean"] },
+            "driver": { "description": "digitalocean (Pro and Enterprise) or node (every edition)", "type": "string", "enum": ["digitalocean", "node"] },
             "template": { "type": "string", "minLength": 1 },
             "port": { "$ref": "#/definitions/port" },
             "startTimeout": { "type": "integer", "minimum": 30, "maximum": 3600 },
@@ -788,8 +788,62 @@
                   }
                 }
               }
+            },
+            "node": {
+              "description": "The node driver: sandbox nodes outside the cluster (ADR-0112), and this host's client certificate and key from a Secret",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": { "$ref": "#/definitions/secretName" },
+                "secretKeys": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "certificate": { "$ref": "#/definitions/secretKey" },
+                    "key": { "$ref": "#/definitions/secretKey" }
+                  }
+                },
+                "peerBuild": { "type": "string", "enum": ["warn", "refuse"] },
+                "publishedPorts": {
+                  "description": "The nodes' published bridge ports: firstPort to firstPort + maxVms - 1 of the node agents' helper.json",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["first", "last"],
+                  "properties": {
+                    "first": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+                    "last": { "type": "integer", "minimum": 1024, "maximum": 65535 }
+                  }
+                },
+                "nodes": {
+                  "type": "array",
+                  "maxItems": 64,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "address", "nodeSha256", "templates"],
+                    "properties": {
+                      "name": { "description": "1 to 32 of a-z, 0-9 and -", "type": "string", "pattern": "^[a-z0-9-]{1,32}$" },
+                      "address": { "description": "HOST:PORT of the node agent's TLS listener; an IPv6 address in brackets", "type": "string", "pattern": "^(\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9.-]+):[1-9][0-9]{0,4}$" },
+                      "nodeSha256": { "description": "The SHA-256 of the node's certificate, 64 hex digits", "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+                      "templates": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" } }
+                    }
+                  }
+                }
+              }
             }
-          }
+          },
+          "allOf": [
+            {
+              "description": "driver node: the DigitalOcean driver's templates are not used, so none may be set",
+              "if": { "required": ["driver"], "properties": { "driver": { "const": "node" } } },
+              "then": { "properties": { "digitalocean": { "properties": { "templates": { "maxProperties": 0 } } } } }
+            },
+            {
+              "description": "driver digitalocean: the node driver's nodes are not used, so none may be set",
+              "if": { "required": ["driver"], "properties": { "driver": { "const": "digitalocean" } } },
+              "then": { "properties": { "node": { "properties": { "nodes": { "maxItems": 0 } } } } }
+            }
+          ]
         },
         "pool": {
           "type": "object",
@@ -834,7 +888,20 @@
         "nodeSelector": { "type": "object" },
         "tolerations": { "type": "array" },
         "affinity": { "type": "object" }
-      }
+      },
+      "allOf": [
+        {
+          "description": "enabled with driver node: at least one node, each with its address and the SHA-256 of its certificate",
+          "if": {
+            "required": ["enabled", "vm"],
+            "properties": {
+              "enabled": { "const": true },
+              "vm": { "required": ["driver"], "properties": { "driver": { "const": "node" } } }
+            }
+          },
+          "then": { "properties": { "vm": { "properties": { "node": { "required": ["nodes"], "properties": { "nodes": { "minItems": 1 } } } } } } }
+        }
+      ]
     },
     "serviceAccount": {
       "type": "object",
@@ -1034,6 +1101,15 @@
                   }
                 },
                 "vms": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["to"],
+                  "properties": {
+                    "to": { "type": "array", "items": { "type": "object" } }
+                  }
+                },
+                "nodes": {
+                  "description": "driver node: the peers of the nodes' agent ports and published bridge ports. Empty = each node's own address (an IP address; a host name needs peers here)",
                   "type": "object",
                   "additionalProperties": false,
                   "required": ["to"],

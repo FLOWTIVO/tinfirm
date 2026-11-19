@@ -1,0 +1,40 @@
+# The runner pod (ADR-0101, decision 8) with the node driver (ADR-0114, decision 4; ADR-0115's
+# first form): a declared company's runner host whose sandboxes are VMs on sandbox nodes outside
+# the cluster: two nodes, IPv4 and IPv6, each with a policy rule of its own (ci/runner-values.yaml
+# covers DigitalOcean's driver).
+publicUrl: https://tinfirm.example.com
+companies:
+  - key: main
+    name: My Company
+  - key: acme
+    name: Acme
+runner:
+  enabled: true
+  company: acme
+  name: k8s-nodes
+  maxConcurrentRuns: 16
+  vm:
+    driver: node
+    template: sandbox-4c8g
+    probes:
+      - tcp:postgres.database.svc:5432
+    node:
+      existingSecret: tinfirm-node-driver
+      peerBuild: refuse
+      publishedPorts:
+        first: 20000
+        last: 20007
+      nodes:
+        - name: node-1
+          address: 10.0.0.20:7700
+          nodeSha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          templates: [sandbox-4c8g]
+        - name: node-2
+          address: "[fd00::21]:7701"
+          nodeSha256: FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210FEDCBA9876543210
+          templates: [sandbox-4c8g, sandbox-8c16g]
+  extraConfig:
+    TINFIRM_RUNNER_EGRESS_ALLOW: |-
+      registry.npmjs.org
+  persistence:
+    storageClassName: standard

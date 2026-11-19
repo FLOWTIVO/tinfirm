@@ -30,6 +30,8 @@ data:
   TINFIRM_RUNNER_POOL_LEAD_TIME_MAX: {{ $r.pool.leadTimeMax | toString | quote }}
   {{- if eq $r.vm.driver "digitalocean" }}
   TINFIRM_DO_CONFIG: {{ printf "%s/digitalocean.json" (include "tinfirm.runner.digitaloceanConfigDir" .) | quote }}
+  {{- else if eq $r.vm.driver "node" }}
+  TINFIRM_NODE_DRIVER_CONFIG: {{ printf "%s/node-driver.json" (include "tinfirm.runner.nodeConfigDir" .) | quote }}
   {{- end }}
   {{- range $name, $value := $r.extraConfig }}
   {{ $name }}: {{ $value | toString | quote }}
@@ -47,5 +49,19 @@ metadata:
 data:
   digitalocean.json: |
     {{- include "tinfirm.runner.digitaloceanConfig" . | nindent 4 }}
+{{- else if eq $r.vm.driver "node" }}
+---
+# The node driver's configuration file (TINFIRM_NODE_DRIVER_CONFIG): the sandbox nodes, their
+# addresses, the SHA-256 pins of their certificates and their templates, and the files of this
+# host's client certificate and key, mounted from runner.vm.node.existingSecret. No secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tinfirm.runner.fullname" . }}-node-driver
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+data:
+  node-driver.json: |
+    {{- include "tinfirm.runner.nodeConfig" . | nindent 4 }}
 {{- end }}
 {{- end }}

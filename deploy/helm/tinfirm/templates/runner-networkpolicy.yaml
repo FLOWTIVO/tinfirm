@@ -4,7 +4,9 @@
 # The runner pod (ADR-0101, decision 8). Ingress: nothing; the pod dials the server and the
 # VMs' bridges, and the sandboxes' traffic comes back through the bridges' tunnels. Egress (when
 # enabled): DNS, https (the server's public URL, the VM provider's API, git hosts, model
-# gateways, what the sandboxes may reach), the VMs' bridge port, plus configured extras.
+# gateways, what the sandboxes may reach), the VMs' bridge port (driver digitalocean) or the
+# nodes' agent port and published bridge ports (driver node, ADR-0115's first form), plus
+# configured extras.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -34,6 +36,40 @@ spec:
           port: {{ . }}
         {{- end }}
     {{- end }}
+    {{- if eq $.Values.runner.vm.driver "node" }}
+    {{- $node := $.Values.runner.vm.node }}
+    {{- if $r.egress.nodes.to }}
+    {{- $agentPorts := list }}
+    {{- range $node.nodes }}
+    {{- $agentPorts = append $agentPorts (include "tinfirm.runner.nodeAddress" .address | fromJson).port }}
+    {{- end }}
+    # The nodes: their agents' listeners and their published bridge ports.
+    - to:
+        {{- toYaml $r.egress.nodes.to | nindent 8 }}
+      ports:
+        {{- range uniq $agentPorts }}
+        - protocol: TCP
+          port: {{ int . }}
+        {{- end }}
+        - protocol: TCP
+          port: {{ $node.publishedPorts.first }}
+          endPort: {{ $node.publishedPorts.last }}
+    {{- else }}
+    {{- range $node.nodes }}
+    {{- $address := include "tinfirm.runner.nodeAddress" .address | fromJson }}
+    # Node {{ .name }}: its agent's listener and its published bridge ports.
+    - to:
+        - ipBlock:
+            cidr: {{ $address.cidr }}
+      ports:
+        - protocol: TCP
+          port: {{ int $address.port }}
+        - protocol: TCP
+          port: {{ $node.publishedPorts.first }}
+          endPort: {{ $node.publishedPorts.last }}
+    {{- end }}
+    {{- end }}
+    {{- else }}
     {{- with $r.egress.vms.to }}
     # The VMs' bridges.
     - to:
@@ -41,6 +77,7 @@ spec:
       ports:
         - protocol: TCP
           port: {{ $.Values.runner.vm.port }}
+    {{- end }}
     {{- end }}
     {{- with $r.egress.extra }}
     {{- toYaml . | nindent 4 }}

@@ -576,18 +576,27 @@ runner:
   # (TINFIRM_PUBLIC_URL, see publicUrl).
   serverUrl: ""
   # The most runs at once (run --max-concurrent-runs), up to 1000: each run is a VM of its
-  # own, so the provider's quota bounds it. Admins can lower it in the app, never raise it.
+  # own, so the provider's quota, or the nodes' free slots, bound it. Admins can lower it in
+  # the app, never raise it.
   maxConcurrentRuns: 4
   # The log filter (TINFIRM_RUNNER_LOG).
   log: info
   vm:
-    # The VM driver (run --vm-driver): `digitalocean`, the runner host's own, which is paid.
+    # The VM driver (run --vm-driver), one of the runner host's own (ADR-0114):
+    # - `digitalocean`: a Droplet per run. Pro and Enterprise: a server without elastic
+    #   runners refuses the host. Set vm.digitalocean, never vm.node.nodes.
+    # - `node`: sandbox nodes outside the cluster, each with the node agent (ADR-0112). Every
+    #   edition. Set vm.node, never vm.digitalocean.templates. Planned (ADR-0112): the node
+    #   agent's execution is not built, so its `verify` reports a problem and `run` refuses
+    #   the driver. The chart renders and lints this form, but the pod stops at its start,
+    #   and no VM runs through a node yet.
     driver: digitalocean
     # The template every VM is created from (run --vm-template): a key of
-    # vm.digitalocean.templates.
+    # vm.digitalocean.templates, or a template that one of vm.node.nodes offers.
     template: sandbox
     # The port where the sandbox's bridge listens in the VM (run --vm-port), which the
-    # template's firewall opens to this pod alone.
+    # template's firewall opens to this pod alone. With `node`, the template's bridgePort in
+    # the node agents' helper.json; the pod dials the node's published port instead.
     port: 7443
     # Seconds from a VM's creation to its bridge's first connection (run --vm-start-timeout).
     startTimeout: 900
@@ -597,8 +606,9 @@ runner:
     # More checks of what a VM must not reach (run --vm-probe): tcp:HOST:PORT, dns:NAME or
     # http://HOST[:PORT]/PATH, e.g. your database.
     probes: []
-    # The DigitalOcean driver (runner/README.md): its API token from a Secret, and its
-    # templates, as its configuration file (TINFIRM_DO_CONFIG) takes them.
+    # The DigitalOcean driver (runner/README.md), with driver `digitalocean`: its API token
+    # from a Secret, and its templates, as its configuration file (TINFIRM_DO_CONFIG) takes
+    # them. Neither required nor rendered with driver `node`.
     digitalocean:
       # Existing Secret with a DigitalOcean API token that may create, read and delete
       # Droplets and read firewalls and VPCs. The driver holds it; the runner host never reads it.
@@ -617,10 +627,48 @@ runner:
       #   vpc: VPC_UUID              # the sandboxes' own VPC
       #   firewall: FIREWALL_ID      # the Cloud Firewall on the tag tinfirm-sandbox
       #   bridgePort: 7443           # optional; vm.port
-  # Ready VMs (ADR-0098), Pro's and Enterprise's: the most that Tinfirm's admins may keep
+    # The node driver (runner/README.md, "Sandbox nodes"), with driver `node`: its
+    # configuration file (TINFIRM_NODE_DRIVER_CONFIG) from these values, in a ConfigMap. The
+    # pod reaches each node over TLS, both certificates pinned; a node's local socket (a
+    # single machine) is not for a pod.
+    node:
+      # Existing Secret with this host's client certificate and its key, both DER, as
+      # `tinfirm-node-agent identity --cert client.crt --key client.key` writes them; each
+      # node's listener pins the certificate's SHA-256 (tls.clientSha256):
+      #   kubectl create secret generic tinfirm-node-driver \
+      #     --from-file=client.crt=./client.crt --from-file=client.key=./client.key
+      # The driver reads the key only from a file of the pod's user that no one else may read
+      # (0600). A Secret's files belong to root, so an init container copies the key into a
+      # memory volume as the pod's user, 0600; the certificate stays in the Secret's volume.
+      existingSecret: tinfirm-node-driver
+      secretKeys:
+        certificate: client.crt
+        key: client.key
+      # A node agent of another release: `warn` in the log, or `refuse`.
+      peerBuild: warn
+      # The ports on which the nodes publish the VMs' bridges, the same on every node: the
+      # node agents' helper.json network.firstPort to firstPort + maxVms - 1. Only the pod's
+      # NetworkPolicy uses them; the driver learns each VM's port from its node. The default
+      # is the agent's documented firstPort, 20000, with its most slots, 1024.
+      publishedPorts:
+        first: 20000
+        last: 21023
+      # The nodes, 1 to 64: each one's name (1 to 32 of a-z, 0-9 and -), the address of its
+      # node agent's TLS listener (HOST:PORT, the listener.json's tls.listen as this pod
+      # reaches it), the SHA-256 of its certificate (`tinfirm-node-agent fingerprint`), and
+      # the templates of its helper.json that it offers. A node is outside the cluster, and
+      # admits the published ports from its network.controlHost alone: the pod's connections
+      # must leave the cluster from that one address (a NAT gateway, an egress IP).
+      nodes: []
+      # - name: node-1
+      #   address: 10.0.0.20:7700
+      #   nodeSha256: 64 hex digits
+      #   templates: [sandbox-4c8g]
+  # Ready VMs (ADR-0098), Pro's and Enterprise's with either driver, since each one waits,
+  # and costs, on a provider or in a node's slot: the most that Tinfirm's admins may keep
   # waiting (run --pool-max-ready). 0, the default, turns them off, and every run starts cold;
-  # above 0 the server needs a key with elastic runners. The image they start (`any`: the
-  # multi-runtime image, so that they serve every runtime).
+  # above 0 the server needs a key with elastic runners. Keep it 0 in Community. The image
+  # they start (`any`: the multi-runtime image, so that they serve every runtime).
   pool:
     maxReady: 0
     runtime: claude
@@ -950,7 +998,8 @@ networkPolicy:
   # to it: it dials the server and the VMs' bridges, whose tunnels carry the sandboxes' traffic.
   # Egress: DNS as above, https (the server's public URL, the VM provider's API, git hosts,
   # model gateways and what runner.extraConfig's TINFIRM_RUNNER_EGRESS_ALLOW allows the
-  # sandboxes), the VMs' bridge port, and runner.egress.extra (not egress.extra).
+  # sandboxes), the VMs' bridge port (driver digitalocean) or the nodes' agent and published
+  # ports (driver node), and networkPolicy.runner.egress.extra (not egress.extra).
   runner:
     egress:
       # https anywhere by default, private addresses included: the server's public URL may
@@ -964,12 +1013,19 @@ networkPolicy:
               cidr: ::/0
         ports:
           - 443
-      # The VMs, on runner.vm.port: their VPC (connect: private) or anywhere (public).
+      # Driver digitalocean: the VMs, on runner.vm.port: their VPC (connect: private) or
+      # anywhere (public).
       vms:
         to:
           - ipBlock:
               cidr: 0.0.0.0/0
           - ipBlock:
               cidr: ::/0
+      # Driver node: the nodes, on their agent's port (each address's) and on
+      # runner.vm.node.publishedPorts. Empty, the default: a rule per node, to its address
+      # alone, which must then be an IP address. With host names, name the nodes' peers here
+      # (an ipBlock of their network); every node's ports then go to all of them.
+      nodes:
+        to: []
       # More raw NetworkPolicyEgressRules, e.g. hosts the sandboxes reach on other ports.
       extra: []

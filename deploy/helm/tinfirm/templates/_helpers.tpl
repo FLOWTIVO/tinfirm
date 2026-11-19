@@ -435,6 +435,40 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- define "tinfirm.runner.digitaloceanConfigDir" -}}
 /etc/tinfirm/digitalocean
 {{- end }}
+{{- define "tinfirm.runner.nodeConfigDir" -}}
+/etc/tinfirm/node-driver
+{{- end }}
+{{- define "tinfirm.runner.nodeCertificateDir" -}}
+/etc/tinfirm/node-driver-certificate
+{{- end }}
+{{/* The key's copy, the pod's user's, 0600 (node.rs refuses any other), in a memory volume. */}}
+{{- define "tinfirm.runner.nodeKeyDir" -}}
+/etc/tinfirm/node-driver-key
+{{- end }}
+{{/* The key in the Secret's volume (root's, 0440), mounted in the init container alone. */}}
+{{- define "tinfirm.runner.nodeKeySourceDir" -}}
+/etc/tinfirm/node-driver-key-source
+{{- end }}
+
+{{/*
+A node's address, split: dict "host" "port" "ip" "cidr"; "ip" is true for an IPv4 address or an
+IPv6 address in brackets, whose "cidr" is the address alone.
+*/}}
+{{- define "tinfirm.runner.nodeAddress" -}}
+{{- $address := toString . }}
+{{- $host := regexReplaceAll ":[0-9]+$" $address "" }}
+{{- $port := regexFind "[0-9]+$" $address | atoi }}
+{{- $ip := false }}
+{{- $cidr := "" }}
+{{- if regexMatch "^\\[[0-9A-Fa-f:.]+\\]$" $host }}
+{{- $ip = true }}
+{{- $cidr = printf "%s/128" (trimPrefix "[" (trimSuffix "]" $host)) }}
+{{- else if regexMatch "^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$" $host }}
+{{- $ip = true }}
+{{- $cidr = printf "%s/32" $host }}
+{{- end }}
+{{- toJson (dict "host" $host "port" $port "ip" $ip "cidr" $cidr) }}
+{{- end }}
 
 {{/*
 Fails the render on a runner the server or the runner host would refuse: a company that
@@ -452,12 +486,60 @@ driver's configuration lacks.
 {{- fail (printf "runner.name: %q must be letters, digits, '.', '_' and '-', starting with a letter or digit, at most 100 characters" (toString $r.name)) }}
 {{- end }}
 {{- $_ := required "runner.existingSecret is required: the Secret with the runner host's token" $r.existingSecret }}
+{{- $nodes := $r.vm.node.nodes | default list }}
+{{- $doTemplates := $r.vm.digitalocean.templates | default dict }}
 {{- if eq $r.vm.driver "digitalocean" }}
+{{- if $nodes }}
+{{- fail "runner.vm.node.nodes is set, but runner.vm.driver is digitalocean: set runner.vm.driver: node to use the sandbox nodes, or remove runner.vm.node.nodes" }}
+{{- end }}
 {{- $_ := required "runner.vm.digitalocean.existingSecret is required: the Secret with the DigitalOcean API token" $r.vm.digitalocean.existingSecret }}
-{{- if not (hasKey ($r.vm.digitalocean.templates | default dict) $r.vm.template) }}
+{{- if not (hasKey $doTemplates $r.vm.template) }}
 {{- fail (printf "runner.vm.template: %q is not a key of runner.vm.digitalocean.templates" (toString $r.vm.template)) }}
 {{- end }}
+{{- else if eq $r.vm.driver "node" }}
+{{- if $doTemplates }}
+{{- fail "runner.vm.digitalocean.templates is set, but runner.vm.driver is node: remove runner.vm.digitalocean.templates, or set runner.vm.driver: digitalocean and remove runner.vm.node.nodes" }}
 {{- end }}
+{{- if not $nodes }}
+{{- fail "runner.vm.driver is node, but runner.vm.node.nodes is empty: name at least one node, with its name, address (HOST:PORT of its agent's TLS listener), nodeSha256 and templates" }}
+{{- end }}
+{{- $_ := required "runner.vm.node.existingSecret is required: the Secret with the runner host's client certificate and key for the nodes" $r.vm.node.existingSecret }}
+{{- if gt (int $r.vm.node.publishedPorts.first) (int $r.vm.node.publishedPorts.last) }}
+{{- fail (printf "runner.vm.node.publishedPorts: first (%v) is above last (%v)" $r.vm.node.publishedPorts.first $r.vm.node.publishedPorts.last) }}
+{{- end }}
+{{- $names := list }}
+{{- $offered := list }}
+{{- $np := .Values.networkPolicy }}
+{{- range $nodes }}
+{{- if has .name $names }}
+{{- fail (printf "runner.vm.node.nodes: the name %q is there twice; each node's name is its own" .name) }}
+{{- end }}
+{{- $names = append $names .name }}
+{{- $offered = concat $offered .templates }}
+{{- $address := include "tinfirm.runner.nodeAddress" .address | fromJson }}
+{{- if gt (int $address.port) 65535 }}
+{{- fail (printf "runner.vm.node.nodes: node %q: the address %q has no port from 1 to 65535" .name .address) }}
+{{- end }}
+{{- if and $np.enabled $np.egress.enabled (not $np.runner.egress.nodes.to) (not $address.ip) }}
+{{- fail (printf "runner.vm.node.nodes: node %q has the host name %q, which a NetworkPolicy cannot name: set networkPolicy.runner.egress.nodes.to to the nodes' peers (an ipBlock of their addresses), or give the node's IP address" .name $address.host) }}
+{{- end }}
+{{- end }}
+{{- if not (has $r.vm.template $offered) }}
+{{- fail (printf "runner.vm.template: %q is offered by none of runner.vm.node.nodes (their templates: %s)" (toString $r.vm.template) (uniq $offered | join ", ")) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/* The node driver's configuration file, node-driver.json: the nodes, with the mounted certificate's and key's files. */}}
+{{- define "tinfirm.runner.nodeConfig" -}}
+{{- $n := .Values.runner.vm.node }}
+{{- $certificate := printf "%s/%s" (include "tinfirm.runner.nodeCertificateDir" .) $n.secretKeys.certificate }}
+{{- $key := printf "%s/%s" (include "tinfirm.runner.nodeKeyDir" .) $n.secretKeys.key }}
+{{- $nodes := list }}
+{{- range $n.nodes }}
+{{- $nodes = append $nodes (dict "name" .name "address" .address "nodeSha256" (lower .nodeSha256) "certificate" $certificate "key" $key "templates" .templates) }}
+{{- end }}
+{{- toPrettyJson (dict "nodes" $nodes "peerBuild" $n.peerBuild) }}
 {{- end }}
 
 {{/* The DigitalOcean driver's configuration file, digitalocean.json, with the mounted token's file. */}}
