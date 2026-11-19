@@ -112,7 +112,7 @@ From the third machine, with a VM running (`third-address.out`):
 | The third machine, with a route to the VMs' range through the node | | | | nothing | nothing |
 | The node itself | refused | refused | nothing | nothing | nothing |
 
-With the control host's own certificate and key copied to the third machine for one try, the `node` driver there got no answer from the agent: the listener's unit lets in one address. The key was removed again and the machine deleted.
+With the control host's own certificate and key copied to the third machine for one try, the `node` driver there got no answer from the agent: the listener's unit lets in one address. The one line that `third-address.out` shows for this try is the driver's own answer to `hello` (`"driver":"node"`, the runner host's version), which the driver gives by itself before it dials a node. It is not an answer of the agent's. The call that needs the node got none, and the output does not show that call's error, so this file alone does not prove the refusal: the try is to be run again with the failed call recorded, and with the listener's own check of the source address (`tls.controlHost`, which came after these runs). The key was removed again and the machine deleted.
 
 ## Timings
 
