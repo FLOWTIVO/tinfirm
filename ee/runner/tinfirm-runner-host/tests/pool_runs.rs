@@ -134,6 +134,119 @@ async fn a_run_takes_a_ready_vm_and_its_replacement_starts_at_once() {
     .await;
 }
 
+const RESTART_DIR: &str = "TINFIRM_TEST_POOL_RESTART_DIR";
+const RESTART_URL: &str = "TINFIRM_TEST_POOL_RESTART_URL";
+
+/// The hosts of the ready VMs' restart test: the fake driver keeps its VMs in a file, so that
+/// they outlive the host that is killed.
+fn restart_pool_host(dir: &std::path::Path) -> HostSetup {
+    let state = dir.join("vms.json").to_string_lossy().into_owned();
+    pool_host(
+        vm_options(
+            &dir.join("driver.log"),
+            &[("FAKE_VM_STATE", state.as_str())],
+        ),
+        quick(),
+    )
+}
+
+/// Host A of the ready VMs' restart test, in a process of its own that the test kills as a
+/// crash would (SIGKILL), with one ready VM: run only by that test.
+#[test]
+#[ignore = "host A of the ready VMs' restart test, which starts it"]
+fn pool_restart_test_host_a() {
+    let (Ok(dir), Ok(url)) = (std::env::var(RESTART_DIR), std::env::var(RESTART_URL)) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let host = start_host_at(&dir.join("host"), &url, restart_pool_host(&dir)).await;
+            // Tinfirm's count, again and again: the server's welcome, which this test's server
+            // sends with no count, sets it to none.
+            loop {
+                pool_of(&host).set_scheduled(1);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+}
+
+/// The VMs of the fake driver's state file that are running.
+fn running_vms(dir: &std::path::Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(dir.join("vms.json")) else {
+        return Vec::new();
+    };
+    let state: Vec<Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+    state
+        .iter()
+        .filter(|vm| vm["state"] == "running")
+        .filter_map(|vm| vm["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_host_restart_its_ready_vms_go_and_a_run_takes_a_new_one_through_its_front() {
+    with_timeout(180, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        let mut host_a = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "pool_restart_test_host_a",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(RESTART_DIR, dir.path())
+            .env(RESTART_URL, &server.url)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        // Host A's ready VM, with its front, which holds its bridge.
+        until("host A's ready VM", 60, || {
+            running_vms(dir.path()).len() == 1 && fronts_of(host_a.id()).len() == 1
+        })
+        .await;
+        let old = running_vms(dir.path()).remove(0);
+        host_a.kill().unwrap();
+        host_a.wait().unwrap();
+        drop(conn);
+
+        // Host B holds no record of the ready VM, which no run had: it deletes it, and makes a
+        // new one, whose new front takes its bridge; the next run takes that one.
+        let host = start_host_at(
+            &dir.path().join("host"),
+            &server.url,
+            restart_pool_host(dir.path()),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let pool = pool_of(&host);
+        pool.set_scheduled(1);
+        until("host A's ready VM deleted and a new one ready", 60, || {
+            deleted(&vm_driver_calls(&log), &old) && pool.status().ready == 1
+        })
+        .await;
+        let spec = AssignSpec::new("bridge-env", None);
+        conn.send(spec.to_json());
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.text().contains("took a ready sandbox VM"), "{}", t.text());
+        assert!(!t.text().contains(&format!("({old})")), "{}", t.text());
+        assert!(host.host.started_bridge().await.is_none());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_of_another_runtime_starts_cold_and_the_ready_vm_makes_room() {
     with_timeout(120, async {
@@ -498,38 +611,8 @@ async fn echo() -> u16 {
     port
 }
 
-/// The first line of the egress proxy's answer to a `CONNECT` to `target`, with `proxy_url`'s
-/// credential, at `addr`.
-async fn connect_through(addr: &str, proxy_url: &str, target: &str) -> String {
-    use base64::Engine;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let url = url::Url::parse(proxy_url).unwrap();
-    let auth = base64::engine::general_purpose::STANDARD.encode(format!(
-        "{}:{}",
-        url.username(),
-        url.password().unwrap()
-    ));
-    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
-    socket
-        .write_all(
-            format!(
-                "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut buf = vec![0u8; 512];
-    let n = socket.read(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf[..n])
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_ready_vms_egress_listener_refuses_everything_until_its_run_binds_it() {
+async fn a_ready_vms_egress_proxy_is_reached_only_through_the_tunnel_of_the_run_that_claims_it() {
     use tinfirm_runner_host::egress_proxy::{EgressSettings, Rule};
     with_timeout(120, async {
         let port = echo().await;
@@ -551,21 +634,27 @@ async fn a_ready_vms_egress_listener_refuses_everything_until_its_run_binds_it()
         pool.set_scheduled(1);
         until("one VM ready", 30, || pool.status().ready == 1).await;
 
-        // The VM's container starts with its own listener's URL, which no run has bound yet:
-        // even a host-wide destination is refused.
+        // The VM's container starts with its egress proxy's URL: the VM's front serves it,
+        // through a tunnel on the VM's own loopback at the egress proxy's fixed port, which
+        // only the run that claims the VM opens. While the VM waits, nothing listens there,
+        // and this host binds no listener for it (its unbound listener refusing every
+        // destination is the egress proxy's own test).
         let calls = vm_driver_calls(&log);
         let env = &calls_of(&calls, "create")[0]["params"]["userData"]["env"];
         let proxy_url = env["HTTPS_PROXY"]
             .as_str()
             .expect("the proxy in the VM's settings")
             .to_string();
-        let listener_port = url::Url::parse(&proxy_url).unwrap().port().unwrap();
-        // In the test mode the listeners are on 127.0.0.2, the VM's tunnels elsewhere.
+        let url = url::Url::parse(&proxy_url).unwrap();
+        let listener_port = url.port().unwrap();
+        assert_eq!(listener_port, 18_763, "{proxy_url}");
+        let vm_side = format!("{}:{listener_port}", url.host_str().unwrap());
+        assert!(tokio::net::TcpStream::connect(&vm_side).await.is_err());
         let host_side = format!("127.0.0.2:{listener_port}");
-        let refused = connect_through(&host_side, &proxy_url, &format!("localhost:{port}")).await;
-        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert!(tokio::net::TcpStream::connect(&host_side).await.is_err());
 
-        // The run that claims the VM binds its rules to that listener.
+        // The run that claims the VM binds its rules, and reaches the destination through its
+        // tunnel.
         let mut spec = AssignSpec::new("egress", None);
         spec.prompt_extra = format!(" [target:localhost:{port}]");
         conn.send(spec.to_json());

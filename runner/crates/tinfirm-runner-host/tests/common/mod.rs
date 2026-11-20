@@ -1895,3 +1895,39 @@ pub async fn run_fetch_scenario(setup: HostSetup) -> Transcript {
     host.handle.await.unwrap().unwrap();
     t
 }
+
+/// The fronts of a host that runs as a process of the test's own: its children that run as
+/// `front`.
+pub fn fronts_of(host: u32) -> Vec<u32> {
+    let mut fronts = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().filter_map(|e| e.ok()) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let ppid = stat
+            .rfind(')')
+            .and_then(|at| stat[at + 1..].split_whitespace().nth(1))
+            .and_then(|ppid| ppid.parse::<u32>().ok());
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let front = cmdline
+            .split(|b| *b == 0)
+            .nth(1)
+            .is_some_and(|arg| arg == tinfirm_runner_host::front::SUBCOMMAND.as_bytes());
+        if ppid == Some(host) && front {
+            fronts.push(pid);
+        }
+    }
+    fronts
+}
+
+/// Ends a front as a crash would (SIGKILL).
+pub fn kill_front(pid: u32) {
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot kill the front {pid}");
+}

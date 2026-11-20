@@ -682,6 +682,9 @@ async fn a_cancelled_run_takes_its_work_back_and_deletes_its_vm() {
 const RESTART_DIR: &str = "TINFIRM_TEST_VM_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_VM_RESTART_URL";
 const RESTART_PUBLISH: &str = "TINFIRM_TEST_VM_RESTART_PUBLISH";
+/// Set: host A registers its VMs' bridges with its shared listener, and writes their records
+/// as hosts did before each VM's bridge was its front's.
+const RESTART_LEGACY: &str = "TINFIRM_TEST_VM_RESTART_LEGACY";
 
 /// The hosts of the VM restart test: the fake driver keeps its VMs in a file, so the driver
 /// of the host that restarted has them, and they outlive the host that is killed. With
@@ -704,24 +707,29 @@ fn vm_restart_test_host_a() {
         return;
     };
     let publish = std::env::var(RESTART_PUBLISH).is_ok();
+    let legacy = std::env::var(RESTART_LEGACY).is_ok();
     let dir = std::path::PathBuf::from(dir);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
-            let _host = start_host_at(&dir.join("host"), &url, restart_setup(&dir, publish)).await;
+            let mut setup = restart_setup(&dir, publish);
+            if legacy {
+                setup.options = Some(Box::new(|opts| {
+                    opts.bridge
+                        .as_mut()
+                        .expect("a VM host has the bridge")
+                        .shared_listener_for_new_runs = true;
+                }));
+            }
+            let _host = start_host_at(&dir.join("host"), &url, setup).await;
             std::future::pending::<()>().await;
         });
 }
 
-/// A run in a VM whose host is killed and started again: host B takes it back. With `publish`,
-/// the run's record keeps the VM's port and host B dials it there; without, the record has no
-/// port, as one written before the port existed, and host B dials `--vm-port`.
-async fn a_host_that_restarted_takes_back_the_run(publish: bool) {
-    let repo = TestRepo::new();
-    let mut server = FakeServer::start().await;
-    let dir = tempfile::tempdir().unwrap();
+/// Host A of the VM restart tests ([`vm_restart_test_host_a`]), on `dir`, connecting to `url`.
+fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool, legacy: bool) -> std::process::Child {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -730,13 +738,29 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool) {
             "--ignored",
             "--nocapture",
         ])
-        .env(RESTART_DIR, dir.path())
-        .env(RESTART_URL, &server.url)
+        .env(RESTART_DIR, dir)
+        .env(RESTART_URL, url)
         .stdout(std::process::Stdio::null());
     if publish {
         command.env(RESTART_PUBLISH, "1");
     }
-    let mut host_a = command.spawn().unwrap();
+    if legacy {
+        command.env(RESTART_LEGACY, "1");
+    }
+    command.spawn().unwrap()
+}
+
+/// A run in a VM whose host is killed and started again: host B takes it back. With `publish`,
+/// the run's record keeps the VM's port and host B dials it there; without, the record has no
+/// port, as one written before the port existed, and host B dials `--vm-port`. The VM's bridge
+/// is its front's, and host B gives it a new front, which it dials for; with `legacy`, host A
+/// is of the version before, whose VMs' bridges were its shared listener's, and host B takes
+/// the run back through its own shared listener.
+async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
+    let repo = TestRepo::new();
+    let mut server = FakeServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut host_a = vm_host_a(dir.path(), &server.url, publish, legacy);
     let mut conn = server.accept().await;
     conn.handshake(1).await;
     let spec = AssignSpec::new("slow", Some(&repo.url));
@@ -747,6 +771,9 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool) {
         .join(format!("host/data/runs/{}.json", spec.run_id));
     assert!(record.exists(), "no record of the run");
     conn.until_seq(spec.run_id, 3).await;
+    // One front for the VM: it holds the VM's bridge, or, on a host of the version before,
+    // only serves its listeners' HTTP.
+    assert_eq!(fronts_of(host_a.id()).len(), 1);
     host_a.kill().unwrap();
     host_a.wait().unwrap();
     let log = dir.path().join("driver.log");
@@ -760,6 +787,31 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool) {
     };
     // The record keeps the port the driver named, or none.
     let kept: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    // The record keeps the VM's bridge's own identity, and no listener: the VM's bridge listens,
+    // and its record's sandbox says where. The VM's user data has that identity's pin, and no
+    // address of this host.
+    let calls = vm_driver_calls(&log);
+    let user_data = &calls_of(&calls, "create")[0]["params"]["userData"]["env"];
+    assert!(
+        user_data.get(tinfirm_bridge::ENV_ADDR).is_none(),
+        "{user_data}"
+    );
+    assert!(
+        user_data[tinfirm_bridge::ENV_PIN].is_string(),
+        "{user_data}"
+    );
+    if legacy {
+        assert!(kept.get("bridge").is_none(), "{kept}");
+    } else {
+        let bridge = &kept["bridge"];
+        assert!(
+            bridge["cert"].is_string() && bridge["key"].is_string(),
+            "{kept}"
+        );
+        for listener in ["ip", "port", "peer"] {
+            assert!(bridge.get(listener).is_none(), "{kept}");
+        }
+    }
     let published = calls_of(&vm_driver_calls(&log), "published")
         .first()
         .map(|c| c["params"]["port"].clone());
@@ -822,18 +874,85 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool) {
     assert_eq!(calls_of(&calls, "create").len(), creates, "{calls:#?}");
     assert!(deleted(&calls, &vm_id), "{calls:#?}");
     assert!(!record.exists());
+    // Host B's shared listener serves only a record of the version before.
+    match host.host.started_bridge().await {
+        Some(listener) => {
+            assert!(
+                legacy,
+                "a shared listener without a record of the version before"
+            );
+            assert_eq!(listener.server.run_count(), 0);
+        }
+        None => assert!(!legacy, "the record of the version before was not served"),
+    }
     host.shutdown.cancel();
     host.handle.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_restarted_takes_back_the_run_in_its_vm() {
-    with_timeout(180, a_host_that_restarted_takes_back_the_run(false)).await;
+    with_timeout(180, a_host_that_restarted_takes_back_the_run(false, false)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_restarted_dials_the_port_its_record_keeps() {
-    with_timeout(180, a_host_that_restarted_takes_back_the_run(true)).await;
+    with_timeout(180, a_host_that_restarted_takes_back_the_run(true, false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener() {
+    with_timeout(180, a_host_that_restarted_takes_back_the_run(false, true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vms_front_that_ends_during_its_run_is_replaced_once_and_the_work_is_saved() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host_a = vm_host_a(dir.path(), &server.url, false, false);
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("slow", Some(&repo.url));
+        conn.send(spec.to_json());
+        conn.wait_running(spec.run_id).await;
+        conn.until_seq(spec.run_id, 3).await;
+        let fronts = fronts_of(host_a.id());
+        assert_eq!(fronts.len(), 1, "one front for the run's VM: {fronts:?}");
+        kill_front(fronts[0]);
+        // A new front dials the VM's bridge and takes its session back: the agent stops, and
+        // the work comes back.
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message.contains("front process ended during the run")
+                && message.contains("its work so far was saved"),
+            "{message}"
+        );
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        // The run's one VM, deleted after it; no other was created.
+        let calls = vm_driver_calls(&dir.path().join("driver.log"));
+        assert_eq!(calls_of(&calls, "create").len(), 1, "{calls:#?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while calls_of(&vm_driver_calls(&dir.path().join("driver.log")), "delete").is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run's VM was not deleted"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        host_a.kill().unwrap();
+        host_a.wait().unwrap();
+    })
+    .await;
 }
 
 // ----- cold starts (crate::pool) -----------------------------------------------------------

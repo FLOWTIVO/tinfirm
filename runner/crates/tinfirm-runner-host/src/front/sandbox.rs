@@ -430,6 +430,11 @@ async fn dispatch(
                     state.end();
                 }
             }
+            FrontRequest::Link { up } => {
+                if let Some(state) = lock(&router.bridge).clone() {
+                    state.link(up);
+                }
+            }
             FrontRequest::Declined { service, why } => {
                 let backend = match service {
                     Service::Model => lock(&router.model).clone(),

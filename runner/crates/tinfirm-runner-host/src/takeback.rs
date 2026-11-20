@@ -98,30 +98,56 @@ pub struct RunRecord {
 
 /// A sandbox's bridge that its front holds, as a record keeps it: the certificate and its
 /// PKCS #8 key (base64 of DER), which the record's mode protects as it does the run's tokens;
-/// the listener's address and port; and the address the bridge connects from (`0.0.0.0`: any).
+/// for a bridge that dials its front's listener, the listener's address and port and the
+/// address the bridge connects from (`0.0.0.0`: any). A VM's bridge listens, and the record's
+/// sandbox names where this host dials it ([`SandboxRecord::Vm`]): no listener here.
 /// The key is [`Hidden`], as the session key is: a `Debug` of a record never shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeRecord {
     pub cert: String,
     pub key: Hidden,
-    pub ip: std::net::IpAddr,
-    pub port: u16,
-    pub peer: std::net::IpAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<std::net::IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<std::net::IpAddr>,
 }
 
 impl BridgeRecord {
     pub fn of(keep: &crate::sandbox::BridgeKeep) -> BridgeRecord {
+        let (ip, port, peer) = match &keep.reach {
+            crate::sandbox::BridgeReach::Listen { ip, port, peer } => {
+                (Some(*ip), Some(*port), Some(*peer))
+            }
+            crate::sandbox::BridgeReach::Dial { .. } => (None, None, None),
+        };
         BridgeRecord {
             cert: B64.encode(&keep.cert),
             key: Hidden::new(B64.encode(&keep.key)),
-            ip: keep.ip,
-            port: keep.port,
-            peer: keep.peer,
+            ip,
+            port,
+            peer,
         }
     }
 
-    pub fn keep(&self) -> Result<crate::sandbox::BridgeKeep> {
+    /// What a new front takes the bridge back with: its listener, or, for a bridge that this
+    /// host dials, `dial`, the address the record's sandbox names.
+    pub fn keep(&self, dial: Option<String>) -> Result<crate::sandbox::BridgeKeep> {
+        let reach = match (self.ip, self.port, dial) {
+            (Some(ip), Some(port), _) => crate::sandbox::BridgeReach::Listen {
+                ip,
+                port,
+                peer: self
+                    .peer
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            },
+            (None, None, Some(target)) => crate::sandbox::BridgeReach::Dial { target },
+            _ => anyhow::bail!(
+                "the record's bridge names neither its listener nor where it is dialed"
+            ),
+        };
         Ok(crate::sandbox::BridgeKeep {
             cert: B64
                 .decode(&self.cert)
@@ -129,9 +155,7 @@ impl BridgeRecord {
             key: B64
                 .decode(self.key.expose())
                 .context("the record's bridge key")?,
-            ip: self.ip,
-            port: self.port,
-            peer: self.peer,
+            reach,
         })
     }
 }
@@ -755,9 +779,11 @@ mod tests {
         let keep = crate::sandbox::BridgeKeep {
             cert: b"certificate".to_vec(),
             key: key.clone(),
-            ip: "10.1.2.3".parse().unwrap(),
-            port: 41234,
-            peer: "10.1.2.4".parse().unwrap(),
+            reach: crate::sandbox::BridgeReach::Listen {
+                ip: "10.1.2.3".parse().unwrap(),
+                port: 41234,
+                peer: "10.1.2.4".parse().unwrap(),
+            },
         };
         let mut with = record();
         with.bridge = Some(BridgeRecord::of(&keep));
@@ -773,7 +799,7 @@ mod tests {
         let text = serde_json::to_string(&with).unwrap();
         assert!(text.contains(&format!("\"key\":\"{encoded}\"")), "{text}");
         let read: RunRecord = serde_json::from_str(&text).unwrap();
-        assert_eq!(read.bridge.unwrap().keep().unwrap().key, key);
+        assert_eq!(read.bridge.unwrap().keep(None).unwrap().key, key);
     }
 
     #[test]

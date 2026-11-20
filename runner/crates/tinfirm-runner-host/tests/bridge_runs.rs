@@ -1579,41 +1579,6 @@ async fn a_run_taken_back_with_a_revocation_and_a_cancel_in_the_hellos_answer_pu
 
 // ----- the sandbox's bridge in its front: its end, and the records of earlier hosts ----------
 
-/// The fronts of host A (a process of the test's own, [`host_process`]): its children that
-/// run as `front`.
-fn fronts_of(host: u32) -> Vec<u32> {
-    let mut fronts = Vec::new();
-    for entry in std::fs::read_dir("/proc").unwrap().filter_map(|e| e.ok()) {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let ppid = stat
-            .rfind(')')
-            .and_then(|at| stat[at + 1..].split_whitespace().nth(1))
-            .and_then(|ppid| ppid.parse::<u32>().ok());
-        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
-        let front = cmdline
-            .split(|b| *b == 0)
-            .nth(1)
-            .is_some_and(|arg| arg == tinfirm_runner_host::front::SUBCOMMAND.as_bytes());
-        if ppid == Some(host) && front {
-            fronts.push(pid);
-        }
-    }
-    fronts
-}
-
-fn kill_front(pid: u32) {
-    let status = std::process::Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
-        .status()
-        .unwrap();
-    assert!(status.success(), "cannot kill the front {pid}");
-}
-
 /// Host A, in a process of its own, runs the `slow` scenario until the agent has written its
 /// work, and its sandbox's front is killed (SIGKILL). Host A, its connection and the run.
 async fn a_front_killed_mid_run(

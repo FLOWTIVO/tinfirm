@@ -679,10 +679,12 @@ impl Shared {
         self.opts.executor.on_this_machine() || self.opts.sandbox_network.as_deref() == Some("host")
     }
 
-    /// The sandbox bridge's listener, started on first use where the sandboxes reach this host
-    /// (the sandbox network's gateway), on a port the system picks. The git proxy's and the
-    /// other listeners then bind loopback ([`crate::bridge::listeners_endpoint`]). `Ok(None)`
-    /// without `opts.bridge`, or when the sandboxes have no network.
+    /// The sandbox bridge's shared listener, started on first use where the sandboxes reach
+    /// this host (the sandbox network's gateway), on a port the system picks. The git proxy's
+    /// and the other listeners then bind loopback ([`crate::bridge::listeners_endpoint`]).
+    /// Only the runs of records of the previous version use it: every new sandbox's bridge,
+    /// a VM's too, is its own front's. `Ok(None)` without `opts.bridge`, or when the sandboxes
+    /// have no network.
     pub async fn bridge(&self) -> Result<Option<BridgeListener>> {
         Ok(self
             .start_bridge(Vec::new())
@@ -875,9 +877,26 @@ impl Shared {
         }
     }
 
-    /// A new front for the bridge of a run taken back whose record keeps its identity and
-    /// listener: on the kept port, or, when it is taken now, on another, which the bridge does
-    /// not find (as with the shared listener's port).
+    /// What the record of a run taken back keeps of its bridge in a front, if any: its identity,
+    /// and its listener, or, for a VM's bridge, which listens, where this host dials it: where
+    /// the record's sandbox says, at the port the driver named, or at `--vm-port` for a record
+    /// without one.
+    pub(crate) fn kept_bridge(
+        &self,
+        record: &crate::takeback::RunRecord,
+    ) -> Option<Result<crate::sandbox::BridgeKeep>> {
+        let dial = match (&record.sandbox, &self.opts.executor) {
+            (crate::takeback::SandboxRecord::Vm { address, port, .. }, Executor::Vm(vms)) => Some(
+                git_proxy::host_port(address, port.unwrap_or(vms.options.port)),
+            ),
+            _ => None,
+        };
+        record.bridge.as_ref().map(|bridge| bridge.keep(dial))
+    }
+
+    /// A new front for the bridge of a run taken back whose record keeps its identity: on the
+    /// kept port (when it is taken now, on another, which the bridge does not find, as with the
+    /// shared listener's port), or dialing the VM's bridge.
     async fn register_front_again(
         &self,
         record: &crate::takeback::RunRecord,
@@ -887,11 +906,9 @@ impl Shared {
             .bridge
             .as_ref()
             .context("this host runs no agent over the sandbox bridge now")?;
-        let keep = record
-            .bridge
-            .as_ref()
-            .context("the record keeps no bridge of a front")?
-            .keep()?;
+        let keep = self
+            .kept_bridge(record)
+            .context("the record keeps no bridge of a front")??;
         keep.register_again(
             options,
             &record.bridge_id,
@@ -1000,7 +1017,6 @@ impl Shared {
             .bridge
             .as_ref()
             .is_some_and(|bridge| !bridge.shared_listener_for_new_runs)
-            && !matches!(self.opts.executor, Executor::Vm(_))
     }
 
     /// A new sandbox's front process, which serves the HTTP of that sandbox's proxy listeners

@@ -21,8 +21,10 @@
 //! ([`ToFront::ListenGit`]) and its routes ([`ToFront::GitRoutes`]), whose requests go the same
 //! way; and the sandbox's bridge ([`ToFront::BridgeInit`]): each connection's `hello`, which
 //! `run` decides ([`ToMain::Hello`], [`ToFront::Admit`]), the adapter's start with its stdio on
-//! three sockets, its signals and stop, the reclaim, the close, the host's commands and the
-//! network probe, and the ends of the adapter and of the session; the sandbox's files, which go
+//! three sockets, its signals and stop, the end of its stdin ([`ToFront::StdinEnd`]), the
+//! reclaim, the close, the host's commands and the network probe, the ends of the adapter and
+//! of the session, and the link's connection, for a bridge that `run` dials
+//! ([`ToFront::Dialed`], [`ToMain::Link`]); the sandbox's files, which go
 //! in on a socket of their own ([`ToFront::Put`]) and come out on a pipe that is a reader's
 //! stdin in `run` ([`ToFront::Get`]); and the tunnels, each to a service of the front
 //! ([`ToFront::OpenTunnels`]).
@@ -681,6 +683,11 @@ pub enum ToMain {
     },
     /// The bridge's session has ended: its link closed, or it had no connection for too long.
     SessionEnded {},
+    /// The session's link has a connection to the sandbox's bridge (`up`), or has lost it:
+    /// where `run` dials the bridge (a VM's), it dials again only while the link is down.
+    Link {
+        up: bool,
+    },
     /// The answer to `run`'s request `id`.
     Answer {
         id: u64,
@@ -741,7 +748,8 @@ impl ToMain {
             | ToMain::Declined { .. }
             | ToMain::Admitted { .. }
             | ToMain::Exited { .. }
-            | ToMain::SessionEnded {} => Ok(()),
+            | ToMain::SessionEnded {}
+            | ToMain::Link { .. } => Ok(()),
         }
     }
 

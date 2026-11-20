@@ -287,6 +287,7 @@ impl FrontBridge {
     /// The session of a link that took its first connection.
     async fn established(self: &Arc<Self>, link: LinkHandle, inbound: link::InboundReceiver) {
         let core = SessionCore::new(link.clone(), inbound, &self.timing);
+        let connected = link.connected();
         let exit = core.exit();
         let ended = core.ended();
         *lock(&self.live) = Some(Live {
@@ -294,7 +295,7 @@ impl FrontBridge {
             control: core.control(),
         });
         *self.core.lock().await = Some(core);
-        tokio::spawn(report_ends(self.writer.clone(), exit, ended));
+        tokio::spawn(report_ends(self.writer.clone(), exit, ended, connected));
     }
 
     fn control(&self) -> Option<SessionControl> {
@@ -665,12 +666,24 @@ async fn run_ops(bridge: std::sync::Weak<FrontBridge>, mut ops: mpsc::UnboundedR
     }
 }
 
-/// Tells `run` that the adapter ended, then that the session did, in that order.
+/// Tells `run` that the adapter ended, then that the session did, in that order; and, until
+/// then, each change of the link's connection, so that a `run` that dials the bridge dials
+/// again only while it is down.
 async fn report_ends(
     writer: Arc<Writer>,
     mut exit: watch::Receiver<Option<Exit>>,
     ended: tokio_util::sync::WaitForCancellationFutureOwned,
+    mut connected: watch::Receiver<bool>,
 ) {
+    let mut said_up = None;
+    let mut link = |up: bool| {
+        if said_up != Some(up) {
+            said_up = Some(up);
+            let _ = writer.send(&ToMain::Link { up });
+        }
+    };
+    link(*connected.borrow_and_update());
+    let mut linked = true;
     let mut said = false;
     let mut say = |exit: Option<Exit>| {
         if let (false, Some(Exit::Exited { code, signal })) = (said, exit) {
@@ -687,6 +700,10 @@ async fn report_ends(
                 }
                 say(*exit.borrow_and_update());
             }
+            changed = connected.changed(), if linked => match changed {
+                Ok(()) => link(*connected.borrow_and_update()),
+                Err(_) => linked = false,
+            },
             () = &mut ended => break,
         }
     }

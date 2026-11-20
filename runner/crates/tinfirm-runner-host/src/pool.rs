@@ -12,6 +12,12 @@
 //! - **Up.** A VM is up once the provider has it running, its bridge has connected and its
 //!   probe has passed ([`IdleVm`]). It holds no run data and no secret: those reach it over the
 //!   bridge once a run claims it.
+//! - **Front.** Each VM has its own front process from its create (ADR-0112, path C, part 2),
+//!   with a TLS identity of its own, whose pin is in the VM's user data: `run` dials the VM's
+//!   bridge and passes each connection to the front, which holds the bridge's session while the
+//!   VM waits for a run and while the run lasts, and serves the VM's egress proxy through its
+//!   tunnel. A VM whose front ends before a run claims it has no session any more
+//!   ([`IdleVm::has_ended`]), and no run takes it.
 //! - **Claim.** The first run that waits for the VM's shape takes it. A claimed VM never comes
 //!   back; it is deleted after its run (ADR-0096). A VM that came up and that no run waits
 //!   for any more is deleted at once.
@@ -29,7 +35,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tinfirm_bridge::host::HostSession;
 use tinfirm_protocol::Runtime;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -73,7 +78,9 @@ impl Shape {
 /// it is deleted.
 pub struct IdleVm {
     vm: VmGuard,
-    session: HostSession,
+    session: crate::sandbox::Session,
+    /// The bridge's identity and where it is dialed, when the VM's front holds it.
+    keep: Option<crate::sandbox::BridgeKeep>,
     egress: Option<EgressGuard>,
     sandbox_host: Option<String>,
     ticket: String,
@@ -108,6 +115,17 @@ impl IdleVm {
     }
 }
 
+/// A VM's bridge, connected, and what came with it, before its build and its network are
+/// checked.
+struct Up {
+    session: crate::sandbox::Session,
+    keep: Option<crate::sandbox::BridgeKeep>,
+    egress: Option<EgressGuard>,
+    sandbox_host: Option<String>,
+    ticket: String,
+    boot_settings: Vec<(String, String)>,
+}
+
 /// How a run got its VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Served {
@@ -121,7 +139,10 @@ pub enum Served {
 pub struct Claimed {
     pub vm: VmGuard,
     /// The VM's bridge, connected; the adapter is not started yet.
-    pub session: HostSession,
+    pub session: crate::sandbox::Session,
+    /// The bridge's identity and where it is dialed, when the VM's front holds it: what a
+    /// new front, or a host that restarted, takes the session back with.
+    pub keep: Option<crate::sandbox::BridgeKeep>,
     /// The VM's egress proxy listener, which the run binds to its rules.
     pub egress: Option<EgressGuard>,
     /// The VM's own loopback in the VM executor's test mode (`VmOptions::on_this_machine`),
@@ -420,24 +441,130 @@ impl Pool {
 
     /// Creates the VM, waits until the provider has it up, dials its bridge and probes it.
     async fn boot(&self, host: &Arc<Shared>, shape: &Shape) -> Result<IdleVm> {
+        if !host.sandboxes_tunnel_to_their_front() {
+            return self.boot_shared(host, shape).await;
+        }
+        let options = &self.vms.options;
+        let bridge = host
+            .opts
+            .bridge
+            .as_ref()
+            .context("the VM executor runs its agents over the sandbox bridge")?;
+        let id = Uuid::new_v4().to_string();
+        let bridge_id = format!("vm-{id}");
+        // Where the VM's tunnels listen in the test mode, whose "VMs" share this machine's
+        // network: a loopback address of their own.
+        let sandbox_host = options
+            .on_this_machine
+            .then(|| crate::bridge::local_sandbox_loopback().to_string());
+        // The VM's front holds its bridge and serves its listeners' HTTP: its egress proxy's
+        // now, through the tunnel, and the rest once a run claims the VM.
+        let front = host.sandbox_front().await?.context("the VM has no front")?;
+        let egress = match host.egress_proxy().await? {
+            Some(proxy) => Some(
+                proxy
+                    .start_slot(
+                        sandbox_host.as_deref(),
+                        Some(front.clone()),
+                        Some(crate::bridge::tunnel_port(
+                            crate::front::wire::Service::Egress,
+                        )),
+                    )
+                    .await?,
+            ),
+            None => None,
+        };
+        let boot_settings = boot_settings(shape, egress.as_ref());
+        let identity = tinfirm_bridge::tls::Identity::generate()?;
+        let expected = crate::front::session::Expected::new_ticket()?;
+        let crate::front::session::Expected::Ticket(ticket) = &expected else {
+            unreachable!("a new ticket");
+        };
+        let ticket = ticket.expose().to_string();
+        // The VM listens: it dials nothing, and its user data names no address of this host.
+        let bootstrap = crate::bridge::bootstrap_env(&bridge_id, &ticket, &identity.pin_hex(), "");
+        let data = crate::vm::user_data(&shape.image, &boot_settings, &bootstrap, options.port);
+        let labels = Vms::labels(&host.host_label(), &id);
+        let name = format!("tinfirm-vm-{}", &id[..8]);
+        let deadline = Instant::now() + options.start_timeout;
+        let mut vm = self.vms.create(&name, &data, &labels).await?;
+        let reach = match self.vms.reach(&vm.id, deadline).await {
+            Ok(reach) => reach,
+            Err(e) => {
+                vm.delete().await;
+                return Err(e);
+            }
+        };
+        // The driver's port, if it names one (a node's published port, ADR-0112); else
+        // `--vm-port`, where the bridge listens in the VM.
+        let target = reach.dial(options.port);
+        vm.set_reach(reach);
+        tracing::debug!(vm = %vm.id, %target, "dialing the sandbox VM's bridge for its front");
+        let registration = match front
+            .bridge(
+                &identity,
+                &bridge.timing,
+                crate::front::session::Peer::Dial(target.clone()),
+                &bridge_id,
+                expected,
+            )
+            .await
+            .context("the VM's front cannot take its bridge")
+        {
+            Ok(registration) => registration,
+            Err(e) => {
+                vm.delete().await;
+                return Err(e);
+            }
+        };
+        // `--vm-start-timeout` bounds the time from the create to the bridge's connection.
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let connected = tokio::select! {
+            session = registration.connected(wait) => session,
+            gone = self.vms.ended(&vm.id) => Err(anyhow!(
+                "the VM ended before its bridge connected ({gone})"
+            )),
+        };
+        let session = match connected {
+            Ok(session) => crate::sandbox::Session::Front(session),
+            Err(e) => {
+                vm.delete().await;
+                return Err(e);
+            }
+        };
+        let (cert, key) = identity.to_der();
+        let keep = crate::sandbox::BridgeKeep {
+            cert: cert.to_vec(),
+            key: key.to_vec(),
+            reach: crate::sandbox::BridgeReach::Dial { target },
+        };
+        let up = Up {
+            session,
+            keep: Some(keep),
+            egress,
+            sandbox_host,
+            ticket,
+            boot_settings,
+        };
+        self.up(vm, up, shape).await
+    }
+
+    /// [`Pool::boot`] with this process's shared listener, as hosts did before each VM's
+    /// bridge was its front's: only for the tests of the take-back of such a run
+    /// ([`crate::bridge::BridgeOptions::shared_listener_for_new_runs`]).
+    async fn boot_shared(&self, host: &Arc<Shared>, shape: &Shape) -> Result<IdleVm> {
         let options = &self.vms.options;
         let listener = host.bridge().await?.context(
             "the sandboxes have no network, so the VMs' bridges cannot be reached from this host",
         )?;
         let id = Uuid::new_v4().to_string();
         let registration = listener.server.register(&format!("vm-{id}"))?;
-        // Where the VM's tunnels listen in the test mode, whose "VMs" share this machine's
-        // network: a loopback address of their own.
         let sandbox_host = options
             .on_this_machine
             .then(|| crate::bridge::local_sandbox_loopback().to_string());
-        // The VM's front, which serves its listeners' HTTP, comes with its first listener; the
-        // run that claims the VM gives it the rest (crate::front::sandbox).
         let egress = match host.egress_proxy().await? {
             Some(proxy) => {
                 let front = host.sandbox_front().await?;
-                // The VM's bridge is still served by this process's shared listener: its
-                // tunnels reach a listener of this host's.
                 Some(
                     proxy
                         .start_slot(sandbox_host.as_deref(), front, None)
@@ -446,16 +573,7 @@ impl Pool {
             }
             None => None,
         };
-        let mut boot_settings = shape.settings.clone();
-        if let Some(egress) = &egress {
-            boot_settings.extend(
-                egress
-                    .env()
-                    .into_iter()
-                    .filter(|(key, _)| crate::bridge::stays_in_sandbox_settings(key)),
-            );
-        }
-        boot_settings.sort();
+        let boot_settings = boot_settings(shape, egress.as_ref());
         let bootstrap = crate::bridge::bootstrap_env(
             registration.run_id(),
             registration.ticket(),
@@ -475,13 +593,10 @@ impl Pool {
                 return Err(e);
             }
         };
-        // The driver's port, if it names one (a node's published port, ADR-0112); else
-        // `--vm-port`, where the bridge listens in the VM.
         let target = reach.dial(options.port);
         vm.set_reach(reach);
         tracing::debug!(vm = %vm.id, %target, "dialing the sandbox VM's bridge");
         registration.dial(target);
-        // `--vm-start-timeout` bounds the time from the create to the bridge's connection.
         let wait = deadline.saturating_duration_since(Instant::now());
         let connected = tokio::select! {
             session = registration.connected(wait) => session,
@@ -490,28 +605,41 @@ impl Pool {
             )),
         };
         let session = match connected {
-            Ok(session) => session,
+            Ok(session) => crate::sandbox::Session::Shared(session),
             Err(e) => {
                 vm.delete().await;
                 return Err(e);
             }
         };
-        if let Err(e) = self.vms.check_image(&vm.id, session.bridge_build()) {
+        let up = Up {
+            session,
+            keep: None,
+            egress,
+            sandbox_host,
+            ticket,
+            boot_settings,
+        };
+        self.up(vm, up, shape).await
+    }
+
+    /// The VM, its bridge connected: its build checked and its network probed.
+    async fn up(&self, mut vm: VmGuard, up: Up, shape: &Shape) -> Result<IdleVm> {
+        if let Err(e) = self.vms.check_image(&vm.id, up.session.bridge_build()) {
             vm.delete().await;
             return Err(e);
         }
-        let files = crate::sandbox::Files::Shared(session.files());
-        if let Err(e) = crate::sandbox::probe(&files, &options.probe).await {
+        if let Err(e) = crate::sandbox::probe(&up.session.files(), &self.vms.options.probe).await {
             vm.delete().await;
             return Err(e);
         }
         Ok(IdleVm {
             vm,
-            session,
-            egress,
-            sandbox_host,
-            ticket,
-            boot_settings,
+            session: up.session,
+            keep: up.keep,
+            egress: up.egress,
+            sandbox_host: up.sandbox_host,
+            ticket: up.ticket,
+            boot_settings: up.boot_settings,
             shape: shape.clone(),
             up_at: Instant::now(),
         })
@@ -654,10 +782,27 @@ fn answered(
     }
 }
 
+/// The settings that a VM's container starts with: the shape's, and its egress proxy
+/// listener's that stay in the sandbox's settings. Sorted, as a shape's are.
+fn boot_settings(shape: &Shape, egress: Option<&EgressGuard>) -> Vec<(String, String)> {
+    let mut settings = shape.settings.clone();
+    if let Some(egress) = egress {
+        settings.extend(
+            egress
+                .env()
+                .into_iter()
+                .filter(|(key, _)| crate::bridge::stays_in_sandbox_settings(key)),
+        );
+    }
+    settings.sort();
+    settings
+}
+
 fn claimed(vm: IdleVm, busy: Busy, served: Served, asked: Instant) -> Claimed {
     Claimed {
         vm: vm.vm,
         session: vm.session,
+        keep: vm.keep,
         egress: vm.egress,
         sandbox_host: vm.sandbox_host,
         ticket: vm.ticket,

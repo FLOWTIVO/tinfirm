@@ -523,23 +523,33 @@ pub enum BridgePeer {
 }
 
 /// What a host keeps of a sandbox's bridge that its front holds, to take the session back
-/// with a new front: the identity that the bridge pins, the listener's address and port that
-/// it dials, and the address it connects from (unspecified: any).
+/// with a new front: the identity that the bridge pins, and how the bridge and the front meet.
 #[derive(Clone)]
 pub struct BridgeKeep {
     pub cert: Vec<u8>,
     pub key: Vec<u8>,
-    pub ip: std::net::IpAddr,
-    pub port: u16,
-    pub peer: std::net::IpAddr,
+    pub reach: BridgeReach,
+}
+
+/// How a sandbox's bridge and its front meet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeReach {
+    /// The bridge dials the listener at `ip` and `port`, from `peer` (unspecified: any): a
+    /// Docker sandbox's, the local executor's.
+    Listen {
+        ip: std::net::IpAddr,
+        port: u16,
+        peer: std::net::IpAddr,
+    },
+    /// `run` dials the bridge at `target` and passes the connection: a VM's, whose bridge
+    /// listens.
+    Dial { target: String },
 }
 
 impl std::fmt::Debug for BridgeKeep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeKeep")
-            .field("ip", &self.ip)
-            .field("port", &self.port)
-            .field("peer", &self.peer)
+            .field("reach", &self.reach)
             .finish_non_exhaustive()
     }
 }
@@ -549,8 +559,8 @@ impl BridgeKeep {
         tinfirm_bridge::tls::Identity::from_der(self.cert.clone(), self.key.clone())
     }
 
-    /// A new front for the bridge of `run_id`, on the kept port, waiting for the bridge to
-    /// come back with the session's `key`.
+    /// A new front for the bridge of `run_id`, waiting for the bridge to come back with the
+    /// session's `key`: on the kept port, or dialing the kept target.
     pub async fn register_again(
         &self,
         options: &crate::bridge::BridgeOptions,
@@ -559,35 +569,45 @@ impl BridgeKeep {
         port_wait: Duration,
     ) -> Result<Registered> {
         let front = crate::front::sandbox::SandboxFront::start(&options.front).await?;
-        // The port of a front that just ended is free a moment later.
-        let deadline = tokio::time::Instant::now() + port_wait;
-        let listener = loop {
-            match crate::bridge::bind_sandbox_listener(self.ip, Some(self.port), None).await {
-                Ok(listener) => break listener,
-                Err(_) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => return Err(e),
+        let (peer, allow) = match &self.reach {
+            BridgeReach::Listen { ip, port, peer } => {
+                // The port of a front that just ended is free a moment later.
+                let deadline = tokio::time::Instant::now() + port_wait;
+                let listener = loop {
+                    match crate::bridge::bind_sandbox_listener(*ip, Some(*port), None).await {
+                        Ok(listener) => break listener,
+                        Err(_) if tokio::time::Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
+                (crate::front::session::Peer::Listen(listener), Some(*peer))
+            }
+            BridgeReach::Dial { target } => {
+                (crate::front::session::Peer::Dial(target.clone()), None)
             }
         };
         let registration = front
             .bridge(
                 &self.identity()?,
                 &options.timing,
-                crate::front::session::Peer::Listen(listener),
+                peer,
                 run_id,
                 crate::front::session::Expected::Reclaim(key),
             )
             .await?;
-        registration.allow_peer(self.peer).await?;
+        if let Some(peer) = allow {
+            registration.allow_peer(peer).await?;
+        }
         Ok(Registered::Front(registration))
     }
 }
 
 /// A run's bridge, registered and not yet connected.
 pub enum Registered {
-    /// With this process's shared listener: a VM's (until its front holds its bridge), or a
-    /// run taken back from a record of the previous version.
+    /// With this process's shared listener: a run taken back from a record of the previous
+    /// version, whose sandbox's bridge pins that listener's identity.
     Shared(Registration),
     /// With the sandbox's front.
     Front(BridgeRegistration),
@@ -677,6 +697,14 @@ impl Session {
         match self {
             Session::Shared(session) => Files::Shared(session.files()),
             Session::Front(session) => Files::Front(session.files()),
+        }
+    }
+
+    /// The sandbox's front, when it holds the bridge.
+    pub fn sandbox_front(&self) -> Option<&std::sync::Arc<crate::front::sandbox::SandboxFront>> {
+        match self {
+            Session::Shared(_) => None,
+            Session::Front(session) => Some(session.front()),
         }
     }
 
@@ -922,8 +950,12 @@ impl Executor {
                 if let Err(e) = bridged.registration.allow_peer(peer).await {
                     return Err(stopped(&mut inner, e).await);
                 }
-                if let Some(keep) = &mut bridged.keep {
-                    keep.peer = peer;
+                if let Some(BridgeKeep {
+                    reach: BridgeReach::Listen { peer: kept, .. },
+                    ..
+                }) = &mut bridged.keep
+                {
+                    *kept = peer;
                 }
                 let start = Start {
                     argv,
@@ -940,8 +972,12 @@ impl Executor {
                 // loopback.
                 let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
                 bridged.registration.allow_peer(peer).await?;
-                if let Some(keep) = &mut bridged.keep {
-                    keep.peer = peer;
+                if let Some(BridgeKeep {
+                    reach: BridgeReach::Listen { peer: kept, .. },
+                    ..
+                }) = &mut bridged.keep
+                {
+                    *kept = peer;
                 }
                 let mut cmd = tokio::process::Command::new(&bridged.binary);
                 cmd.arg("bridge")
@@ -1069,19 +1105,23 @@ impl Executor {
             Vec::new()
         };
         let crate::pool::Claimed {
-            vm, session, busy, ..
+            vm,
+            session,
+            keep,
+            busy,
+            ..
         } = claimed;
         finish_session(
             SandboxKind::Vm {
                 vm,
                 busy: Some(busy),
             },
-            Session::Shared(session),
+            session,
             tunnels,
             puts,
             start,
             &probe,
-            None,
+            keep,
         )
         .await
     }

@@ -682,12 +682,14 @@ pub async fn execute(
             .then(|| crate::bridge::local_sandbox_loopback().to_string()),
     };
     // One front per sandbox serves its listeners' HTTP on a host with the bridge: a VM's
-    // came with its egress listener; any other's comes with the first listener it needs, which
-    // is the run's own git listener for its fetches and platform tools.
-    let mut front = claimed
-        .as_ref()
-        .and_then(|vm| vm.egress.as_ref())
-        .and_then(|egress| egress.sandbox_front().cloned());
+    // came with the VM, and holds its bridge; any other's comes with the first listener it
+    // needs, which is the run's own git listener for its fetches and platform tools.
+    let mut front = claimed.as_ref().and_then(|vm| {
+        vm.session
+            .sandbox_front()
+            .or_else(|| vm.egress.as_ref().and_then(|egress| egress.sandbox_front()))
+            .cloned()
+    });
     // The sandbox's way to fetch and to the platform tools; dropping it (at the latest when
     // this function returns) removes the run's routes from the listener.
     let mut access = sandbox_access(
@@ -1289,7 +1291,7 @@ pub async fn take_back(
         match connected {
             Some(Ok(session)) => {
                 came_back = true;
-                let keep = record.bridge.as_ref().and_then(|bridge| bridge.keep().ok());
+                let keep = shared.kept_bridge(&record).and_then(Result::ok);
                 let mut sandbox = sandbox.connected(session, keep);
                 match sandbox.reclaim(RECLAIM_TIMEOUT).await {
                     Ok(true) => sink.log(
@@ -2379,9 +2381,33 @@ async fn start_sandbox(
     let Some(options) = shared.opts.bridge.clone() else {
         return shared.opts.executor.start(spec).await;
     };
-    if claimed.is_none() && shared.sandboxes_tunnel_to_their_front() {
-        return start_in_front(shared, sink, assign, spec, access, puts, options).await;
-    }
+    let in_front = shared.sandboxes_tunnel_to_their_front();
+    let claimed = match claimed {
+        Some(claimed) if in_front => {
+            // The VM's ticket is in its user data, used up when its bridge connected; it is no
+            // credential, but it never leaves the host.
+            shared.add_run_masked(assign.run_id, assign.epoch, vec![claimed.ticket.clone()]);
+            sink.log(
+            LogLevel::Debug,
+            "the agent runs over the sandbox bridge, in the sandbox's front; its credentials are not in the sandbox's settings",
+        );
+            return shared
+                .opts
+                .executor
+                .start_claimed(
+                    spec,
+                    claimed,
+                    shared.opts.vm_reprobe_after,
+                    crate::sandbox::Tunnels::Services(front_tunnels(access)),
+                    puts,
+                )
+                .await;
+        }
+        None if in_front => {
+            return start_in_front(shared, sink, assign, spec, access, puts, options).await;
+        }
+        claimed => claimed,
+    };
     // The listeners the run uses, on this host's loopback: the sandbox reaches each through a
     // tunnel on its own loopback, at the same port.
     let mut listeners = Vec::new();
@@ -2457,6 +2483,34 @@ async fn start_sandbox(
     shared.opts.executor.start_bridged(spec, bridged).await
 }
 
+/// The tunnels of a run whose sandbox's front serves its proxies: each service the run uses,
+/// on its fixed port of the sandbox's loopback.
+fn front_tunnels(access: &SandboxAccess) -> Vec<(std::net::SocketAddr, Service)> {
+    let loopback = match access.sandbox_host.as_deref().map(str::parse) {
+        Some(Ok(ip)) => ip,
+        _ => std::net::IpAddr::V4(crate::bridge::SANDBOX_LOOPBACK),
+    };
+    let mut services = Vec::new();
+    if access.git_listener.is_some() && (access.mcp.is_some() || !access.routes.is_empty()) {
+        services.push(Service::Git);
+    }
+    if access.model_proxy.is_some() {
+        services.push(Service::Model);
+    }
+    if access.egress.is_some() {
+        services.push(Service::Egress);
+    }
+    services
+        .into_iter()
+        .map(|service| {
+            (
+                std::net::SocketAddr::new(loopback, crate::bridge::tunnel_port(service)),
+                service,
+            )
+        })
+        .collect()
+}
+
 /// Starts the run's sandbox with its bridge in the sandbox's front (ADR-0112, path C, part 2):
 /// the bridge gets a TLS identity and a listener of its own, which only its front holds; the
 /// front takes a connection only from the sandbox's address where this host can tell it, and
@@ -2483,29 +2537,7 @@ async fn start_in_front(
             .await?
             .context("the sandbox has no front")?,
     };
-    let loopback = match access.sandbox_host.as_deref().map(str::parse) {
-        Some(Ok(ip)) => ip,
-        _ => std::net::IpAddr::V4(crate::bridge::SANDBOX_LOOPBACK),
-    };
-    let mut services = Vec::new();
-    if access.git_listener.is_some() && (access.mcp.is_some() || !access.routes.is_empty()) {
-        services.push(Service::Git);
-    }
-    if access.model_proxy.is_some() {
-        services.push(Service::Model);
-    }
-    if access.egress.is_some() {
-        services.push(Service::Egress);
-    }
-    let tunnels = services
-        .into_iter()
-        .map(|service| {
-            (
-                std::net::SocketAddr::new(loopback, crate::bridge::tunnel_port(service)),
-                service,
-            )
-        })
-        .collect();
+    let tunnels = front_tunnels(access);
     if spec.extra_hosts.is_empty() {
         spec.extra_hosts = endpoint.extra_hosts.clone();
     }
@@ -2547,10 +2579,12 @@ async fn start_in_front(
     let keep = crate::sandbox::BridgeKeep {
         cert: cert.to_vec(),
         key: key.to_vec(),
-        ip: endpoint.bind.ip(),
-        port,
-        // Set once the sandbox's address is known.
-        peer: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        reach: crate::sandbox::BridgeReach::Listen {
+            ip: endpoint.bind.ip(),
+            port,
+            // Set once the sandbox's address is known.
+            peer: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        },
     };
     let bridged = crate::sandbox::Bridged {
         registration: crate::sandbox::Registered::Front(registration),

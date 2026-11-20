@@ -70,8 +70,10 @@ impl Expected {
 pub enum Peer {
     /// From this listener, which `run` bound: the sandbox's bridge connects.
     Listen(TcpListener),
-    /// From `run`, which dials the bridge ([`BridgeRegistration::dialed`]).
-    Dial,
+    /// From `run`, which dials the bridge at this address (a VM's, which listens), and dials
+    /// again whenever the link has no connection, while the front lives
+    /// ([`BridgeRegistration::dialed`]).
+    Dial(String),
 }
 
 enum Stage {
@@ -100,9 +102,15 @@ pub(crate) struct BridgeState {
     entry: Mutex<Entry>,
     exit: watch::Sender<Option<Exit>>,
     ended: CancellationToken,
+    /// Whether the session's link has a connection, as the front says.
+    link: watch::Sender<bool>,
 }
 
 impl BridgeState {
+    pub(crate) fn link(&self, up: bool) {
+        self.link.send_replace(up);
+    }
+
     /// `run`'s decision on a `hello` of the front's request `req`, recorded until its end.
     pub(crate) fn decide(&self, req: u64, hello: &WireHello) -> Result<Admission> {
         let hello = hello.hello();
@@ -264,6 +272,7 @@ impl SandboxFront {
             }),
             exit: watch::Sender::new(None),
             ended: CancellationToken::new(),
+            link: watch::Sender::new(false),
         });
         self.serve_bridge(state.clone())?;
         let (cert, key) = identity.to_der();
@@ -275,17 +284,85 @@ impl SandboxFront {
             timing: WireTiming::of(timing),
             listen: matches!(peer, Peer::Listen(_)),
         };
-        let descriptors = match peer {
-            Peer::Listen(listener) => vec![OwnedFd::from(listener.into_std()?)],
-            Peer::Dial => Vec::new(),
+        let (descriptors, target) = match peer {
+            Peer::Listen(listener) => (vec![OwnedFd::from(listener.into_std()?)], None),
+            Peer::Dial(target) => (Vec::new(), Some(target)),
         };
         self.handle().send_all(&message, descriptors).await?;
+        if let Some(target) = target {
+            tokio::spawn(dial(Arc::downgrade(self), state.clone(), target, *timing));
+        }
         Ok(BridgeRegistration {
             front: self.clone(),
             state,
             ready,
             ticket,
         })
+    }
+}
+
+/// Dials the sandbox's bridge at `target` for its front, which holds no network of its own:
+/// once at first, and again whenever the link has no connection, at most once per
+/// `dial_retry`, until the front or the session ends. A connection passed to the front is
+/// waited on, up to the handshake's time, before the next: one that the bridge has taken shows
+/// as up a moment later, and dialing again before then would leave a connection in the
+/// bridge's backlog that it would take for the next one.
+async fn dial(
+    front: std::sync::Weak<SandboxFront>,
+    state: Arc<BridgeState>,
+    target: String,
+    timing: HostTiming,
+) {
+    let mut link = state.link.subscribe();
+    loop {
+        if *link.borrow_and_update() {
+            tokio::select! {
+                () = state.ended.cancelled() => return,
+                down = link.wait_for(|up| !*up) => if down.is_err() {
+                    return;
+                },
+            }
+            continue;
+        }
+        let connected = tokio::select! {
+            () = state.ended.cancelled() => return,
+            connected = tokio::time::timeout(timing.handshake, tokio::net::TcpStream::connect(target.as_str())) => connected,
+        };
+        match connected {
+            Ok(Ok(tcp)) => {
+                let Some(front) = front.upgrade() else {
+                    return;
+                };
+                let passed = match tcp.into_std() {
+                    Ok(tcp) => front
+                        .handle()
+                        .send(&ToFront::Dialed {}, Some(OwnedFd::from(tcp)))
+                        .await
+                        .is_ok(),
+                    Err(_) => false,
+                };
+                drop(front);
+                if passed {
+                    let up = tokio::select! {
+                        () = state.ended.cancelled() => return,
+                        up = tokio::time::timeout(timing.handshake, link.wait_for(|up| *up)) => up,
+                    };
+                    if matches!(up, Ok(Ok(_))) {
+                        continue;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(run_id = %state.run_id, %target, error = %e, "the sandbox's bridge does not answer yet");
+            }
+            Err(_) => {
+                tracing::debug!(run_id = %state.run_id, %target, "dialing the sandbox's bridge timed out");
+            }
+        }
+        tokio::select! {
+            () = state.ended.cancelled() => return,
+            () = tokio::time::sleep(timing.dial_retry) => {}
+        }
     }
 }
 

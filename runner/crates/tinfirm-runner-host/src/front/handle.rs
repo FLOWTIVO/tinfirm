@@ -189,6 +189,8 @@ pub enum FrontRequest {
     },
     /// The bridge's session ended.
     SessionEnded,
+    /// The session's link has a connection to the sandbox's bridge, or has lost it.
+    Link { up: bool },
 }
 
 /// The bridge requests given up on by a timeout whose late answers `run` still takes (and
@@ -765,6 +767,7 @@ fn kind(message: &ToMain) -> &'static str {
         ToMain::Admitted { .. } => "admitted",
         ToMain::Exited { .. } => "exited",
         ToMain::SessionEnded {} => "sessionEnded",
+        ToMain::Link { .. } => "link",
         ToMain::Answer { .. } => "answer",
     }
 }
@@ -950,6 +953,12 @@ fn own_request(pending: &mut Pending, message: &ToMain) -> std::result::Result<O
             pending.session_ended = true;
             Ok(Own::Request(FrontRequest::SessionEnded))
         }
+        ToMain::Link { up } => {
+            if pending.session_ended {
+                return Err("the link of a session that ended".into());
+            }
+            Ok(Own::Request(FrontRequest::Link { up: *up }))
+        }
         ToMain::Ready { .. }
         | ToMain::Pong { .. }
         | ToMain::Checked { .. }
@@ -1028,6 +1037,7 @@ async fn read_loop(
                 | ToMain::Admitted { .. }
                 | ToMain::Exited { .. }
                 | ToMain::SessionEnded {}
+                | ToMain::Link { .. }
                 | ToMain::Answer { .. } => None,
                 ToMain::Pong { id } => pending.pongs.remove(&id),
                 ToMain::Checked { id } => pending.checks.remove(&id),

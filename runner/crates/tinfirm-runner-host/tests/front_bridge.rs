@@ -437,6 +437,96 @@ async fn a_stdin_that_ends_without_runs_word_never_ends_the_agents_input() {
     drop(front);
 }
 
+/// Forwards each connection on `listener` to `to`, and counts them; `cut` ends the ones open
+/// now, as a network that loses them does.
+async fn relay(
+    listener: TcpListener,
+    to: SocketAddr,
+) -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::sync::watch::Sender<u64>,
+) {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (cut, _) = tokio::sync::watch::channel(0u64);
+    let (counted, cuts) = (count.clone(), cut.clone());
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut cut = cuts.subscribe();
+            cut.borrow_and_update();
+            tokio::spawn(async move {
+                let Ok(mut outbound) = TcpStream::connect(to).await else {
+                    return;
+                };
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
+                    _ = cut.changed() => {}
+                }
+            });
+        }
+    });
+    (count, cut)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_dials_a_listening_bridge_for_its_front_and_again_when_the_link_is_lost() {
+    let _one = SERIAL.lock().await;
+    let identity = Identity::generate().unwrap();
+    let ticket = "d".repeat(64);
+    // The sandbox's bridge listens, as a VM's does; `run` reaches it through a relay that can
+    // lose its connections.
+    let bridge_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bridge_addr = bridge_listener.local_addr().unwrap();
+    drop(bridge_listener);
+    let bridge = tokio::spawn(sandbox::run(Config {
+        addr: String::new(),
+        listen: Some(bridge_addr),
+        run_id: "run-front-dial".to_string(),
+        ticket: Hidden::new(ticket.clone()),
+        pin: tls::parse_pin(&identity.pin_hex()).unwrap(),
+        timing: sandbox_timing(),
+        build: "test-build".into(),
+    }));
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = relay_listener.local_addr().unwrap();
+    let (dialed, cut) = relay(relay_listener, bridge_addr).await;
+    let front = SandboxFront::start(&the_front()).await.unwrap();
+    let registration = front
+        .bridge(
+            &identity,
+            &host_timing(),
+            Peer::Dial(target.to_string()),
+            "run-front-dial",
+            Expected::Ticket(Hidden::new(ticket)),
+        )
+        .await
+        .unwrap();
+    let mut session = registration.connected(WAIT).await.unwrap();
+    let mut io = session
+        .start(shell(
+            "echo up; while read line; do echo \"got $line\"; done",
+        ))
+        .await
+        .unwrap();
+    read_until(&mut io, "up").await;
+    io.stdin.write_all(b"one\n").await.unwrap();
+    read_until(&mut io, "got one").await;
+    let before = dialed.load(std::sync::atomic::Ordering::SeqCst);
+    // The link loses its connection: `run` dials again, and the session goes on.
+    cut.send_modify(|n| *n += 1);
+    io.stdin.write_all(b"two\n").await.unwrap();
+    read_until(&mut io, "got two").await;
+    assert!(dialed.load(std::sync::atomic::Ordering::SeqCst) > before);
+    // While the link is up, `run` dials no more.
+    let now = dialed.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), now);
+    io.stdin.shutdown().await.unwrap();
+    let _ = drain(&mut io).await;
+    assert_eq!(finish(&session, bridge).await, 0);
+    drop(front);
+}
+
 /// A connection that says `hello` as `hello` asks, through TLS with `pin`, and the first
 /// frame the front answers with.
 async fn hello_to(addr: SocketAddr, identity: &Identity, hello: Control) -> Option<Control> {
@@ -906,6 +996,12 @@ fn hostile_bridge_front_child() {
             req: 7,
             attached: true,
         }),
+        "link-after-end" => {
+            open(&mut send);
+            send(&ToMain::Link { up: true });
+            send(&ToMain::SessionEnded {});
+            send(&ToMain::Link { up: false });
+        }
         "exited-twice" => {
             open(&mut send);
             for _ in 0..2 {
@@ -1005,6 +1101,7 @@ async fn a_front_that_breaks_the_bridges_rules_is_ended_and_leaves_nothing_in_ru
         ("answer-unasked", "an answer to nothing asked"),
         ("admitted-unknown", "an unknown hello 7"),
         ("exited-twice", "the adapter ended twice"),
+        ("link-after-end", "the link of a session that ended"),
         ("exec-too-big", "out of bounds"),
         ("exec-not-text", "not text"),
         ("probe-unasked", "not asked"),
