@@ -158,6 +158,13 @@ pub struct HardeningConfig {
     pub max_uptime_days: u32,
 }
 
+/// The chroot base that the VMM's profile names (`units/tinfirm-vmm.apparmor`): with
+/// `vmmProfile` `required`, `firecracker.chrootBase` must be this.
+pub const PROFILE_CHROOT_BASE: &str = "/srv/tinfirm-jails";
+/// The work directory that the VMM's profile names: with `vmmProfile` `required`,
+/// `firecracker.work` must be this.
+pub const PROFILE_WORK: &str = "/var/lib/tinfirm-node-agent/work";
+
 /// The longest `hardening.maxUptimeDays`.
 pub const MAX_UPTIME_DAYS: u32 = 3650;
 
@@ -326,6 +333,16 @@ impl HelperConfig {
         {
             bail!(
                 "hardening.agentPort and hardening.sshPort must not be 0, and hardening.maxUptimeDays must be 1 to {MAX_UPTIME_DAYS}"
+            );
+        }
+        // The profile is one file with these two paths in it. Under another work directory
+        // it would refuse a VMM its console and its errors' file.
+        if self.vmm_profile == VmmProfile::Required
+            && (self.firecracker.chroot_base != Path::new(PROFILE_CHROOT_BASE)
+                || self.firecracker.work != Path::new(PROFILE_WORK))
+        {
+            bail!(
+                "vmmProfile \"required\" needs firecracker.chrootBase {PROFILE_CHROOT_BASE} and firecracker.work {PROFILE_WORK}: the VMM's profile names these paths"
             );
         }
         // The templates.
@@ -676,6 +693,27 @@ pub(crate) mod tests {
         );
         for wrong in ["notRequired", "Required", "optional", ""] {
             assert!(parse(Some(wrong.into())).is_err(), "{wrong} was taken");
+        }
+        // `required` holds only with the two paths that the profile names.
+        let validated = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut json = config_json();
+            json["vmmProfile"] = "required".into();
+            edit(&mut json);
+            serde_json::from_value::<HelperConfig>(json)
+                .unwrap()
+                .validate()
+                .map_err(|e| e.to_string())
+        };
+        validated(&|_| {}).unwrap();
+        for field in ["chrootBase", "work"] {
+            let refused = validated(&|json| {
+                json["firecracker"][field] = "/data/elsewhere".into();
+            })
+            .unwrap_err();
+            assert!(
+                refused.contains("the VMM's profile names these paths"),
+                "{refused}"
+            );
         }
         // Each VM's plan carries it.
         let mut config = config();

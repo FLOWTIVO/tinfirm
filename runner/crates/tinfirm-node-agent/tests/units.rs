@@ -59,6 +59,19 @@ fn the_helper_wants_the_hardening_and_does_not_require_it() {
 }
 
 #[test]
+fn the_profile_names_the_two_directories_that_a_required_profile_asks_of_the_configuration() {
+    use tinfirm_node_agent::plan::{PROFILE_CHROOT_BASE, PROFILE_WORK};
+    // `HelperConfig::validate` refuses `vmmProfile` `required` under other directories,
+    // because these two are written into the profile.
+    assert!(PROFILE.contains(&format!("{PROFILE_WORK}/tfvm-*.console w,")));
+    assert!(PROFILE.contains(&format!("{PROFILE_WORK}/tfvm-*.errors w,")));
+    assert!(PROFILE.contains(&format!(
+        "{}/firecracker/tfvm-*/root/",
+        PROFILE_CHROOT_BASE.trim_start_matches('/')
+    )));
+}
+
+#[test]
 fn the_profile_is_the_one_the_helper_checks_for_and_names_every_file_the_vmm_is_given() {
     let rules: Vec<&str> = PROFILE
         .lines()
