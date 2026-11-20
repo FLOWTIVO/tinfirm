@@ -114,8 +114,10 @@
 - name: Show each line of the node's hardening mark
   ansible.builtin.debug:
     msg: >-
-      {{ item.line }}: {{ 'holds' if item.holds else ('DOES NOT HOLD' if _tinfirm_sandbox_node_mark_lines[item.line] | default(false) | bool
-                                                     else 'does not hold, and its switch is off') }} ({{ item.found }})
+      {{ item.line }}: {{ 'holds' if item.holds
+        else ('DOES NOT HOLD' if _tinfirm_sandbox_node_mark_lines[item.line] | default(false) | bool
+        else ('complain mode: the profile refuses nothing yet' if item.line == 'vmm-mac' and _tinfirm_sandbox_node_mac == 'complain'
+        else 'does not hold, and its switch is off')) }} ({{ item.found }})
   loop: "{{ _tinfirm_sandbox_node_mark.lines | default([]) }}"
   loop_control:
     label: "{{ item.line }}"
@@ -144,3 +146,15 @@
       {%-   endif -%}
       {%- endfor -%}
       {{ failing }}
+
+# Complain mode: what the profile would have refused is in the kernel's log. Read it before the
+# mode becomes enforce (the role's defaults, tinfirm_sandbox_node_harden_mac).
+- name: Say where complain mode logs
+  ansible.builtin.debug:
+    msg: >-
+      The VMMs' AppArmor profile is in complain mode: it refuses nothing, and vmm-mac does not
+      hold, so the node's mark is `no`. What it would have refused, the kernel logs as lines with
+      apparmor="ALLOWED" and profile="tinfirm-vmm": `journalctl -k --grep 'apparmor="ALLOWED"'`
+      on the node, or /var/log/audit/audit.log where auditd runs. Run VMs, read those lines, and
+      set tinfirm_sandbox_node_harden_mac: enforce once there are none that a VMM needs.
+  when: _tinfirm_sandbox_node_mac == 'complain'

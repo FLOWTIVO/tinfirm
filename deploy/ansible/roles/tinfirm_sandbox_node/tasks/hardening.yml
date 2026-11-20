@@ -47,36 +47,58 @@
 
 # AppArmor's package is one of the node's packages (packages.yml, vars/main.yml): installed
 # before the node's firewall is loaded, after which the node reaches no mirror.
-# The parser checks the file before it is written; the handler loads it, and apparmor.service
-# loads it at each boot.
+# The parser checks the file before it is written, and apparmor.service loads it at each boot,
+# in the mode its flags give (_tinfirm_sandbox_node_profile_text).
 - name: Install the VMMs' AppArmor profile
   ansible.builtin.copy:
-    src: tinfirm-vmm.apparmor
+    content: "{{ _tinfirm_sandbox_node_profile_text }}"
     dest: "{{ _tinfirm_sandbox_node_profile }}"
     owner: root
     group: root
     mode: "0644"
     validate: apparmor_parser -Q -K %s
+  register: _tinfirm_sandbox_node_profile_file
   when: _tinfirm_sandbox_node_harden_on.mac | bool
-  notify: Load the VMMs' AppArmor profile
 
 - name: Read the loaded AppArmor profiles
   ansible.builtin.slurp:
     src: /sys/kernel/security/apparmor/profiles
   register: _tinfirm_sandbox_node_profiles
   failed_when: false
-  when: _tinfirm_sandbox_node_harden_on.mac | bool
 
-# As for the sysctl settings: a profile that is installed and not loaded is loaded now.
-- name: Load the VMMs' AppArmor profile where it is not loaded
+# Loaded again when its file changed, or when it is not loaded in its mode: from complain to
+# enforce and back, the file's flags change, and the load replaces the profile in the new mode.
+# A second run finds it loaded as it should be and loads nothing.
+- name: Load the VMMs' AppArmor profile in its mode
   ansible.builtin.command:
     argv: [apparmor_parser, -r, "{{ _tinfirm_sandbox_node_profile }}"]
   changed_when: true
   when:
     - _tinfirm_sandbox_node_harden_on.mac | bool
     - >-
-      'tinfirm-vmm (enforce)' not in
-      ((_tinfirm_sandbox_node_profiles.content | default('') | b64decode).splitlines() | map('trim') | list)
+      _tinfirm_sandbox_node_profile_file is changed
+      or _tinfirm_sandbox_node_profile_loaded not in
+         ((_tinfirm_sandbox_node_profiles.content | default('') | b64decode).splitlines() | map('trim') | list)
+
+# Off: a profile that an earlier run loaded is unloaded, by its name, and its file removed, so that
+# AppArmor no longer attaches it to the VMMs that start (it attaches by the program's path, whatever
+# helper.json says). A VMM that runs keeps its confinement until it ends.
+- name: Unload the VMMs' AppArmor profile
+  ansible.builtin.command:
+    argv: [apparmor_parser, -R, -K]
+    stdin: "profile tinfirm-vmm {}"
+  changed_when: true
+  when:
+    - not _tinfirm_sandbox_node_harden_on.mac | bool
+    - >-
+      (_tinfirm_sandbox_node_profiles.content | default('') | b64decode).splitlines() | map('trim')
+      | select('match', 'tinfirm-vmm [(]') | list | length > 0
+
+- name: Remove the VMMs' AppArmor profile's file
+  ansible.builtin.file:
+    path: "{{ _tinfirm_sandbox_node_profile }}"
+    state: absent
+  when: not _tinfirm_sandbox_node_harden_on.mac | bool
 
 # --- What lasts until a reboot: kexec, lockdown, module loading -------------------------------
 

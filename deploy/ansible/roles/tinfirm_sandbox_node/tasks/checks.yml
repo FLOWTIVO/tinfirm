@@ -302,6 +302,21 @@
     quiet: true
   when: _tinfirm_sandbox_node_harden_on.io_uring | bool
 
+# The profile's mode: three values, and the units' profile must carry the flags the role adds
+# `complain` to.
+- name: Check the VMMs' profile's mode
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_mac in ['off', 'complain', 'enforce']
+      - >-
+        _tinfirm_sandbox_node_profile_flags
+        in lookup('ansible.builtin.file', _tinfirm_sandbox_node_profile_src, rstrip=false)
+    fail_msg: >-
+      tinfirm_sandbox_node_harden_mac is off (or false), complain or enforce, not
+      "{{ tinfirm_sandbox_node_harden_mac }}"; and the role's tinfirm-vmm.apparmor must hold
+      {{ _tinfirm_sandbox_node_profile_flags }}, where complain mode is added.
+    quiet: true
+
 - name: Read whether AppArmor is on
   ansible.builtin.slurp:
     src: /sys/module/apparmor/parameters/enabled
@@ -320,8 +335,8 @@
       {{ 'This is a Red Hat family node: it has SELinux and no AppArmor, and the SELinux form
       for the VMMs is not built yet.' if ansible_facts['os_family'] != 'Debian'
       else 'AppArmor is not on in this kernel (/sys/module/apparmor/parameters/enabled is not Y).' }}
-      Set tinfirm_sandbox_node_harden_mac: false, and the node's hardening mark says `no` for
-      vmm-mac.
+      The profile's complain and enforce modes both need AppArmor. Set
+      tinfirm_sandbox_node_harden_mac: "off", and the node's hardening mark says `no` for vmm-mac.
     quiet: true
   when: _tinfirm_sandbox_node_harden_on.mac | bool
 

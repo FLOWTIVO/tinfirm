@@ -58,16 +58,37 @@ _tinfirm_sandbox_node_units:
 _tinfirm_sandbox_node_hardening_config: /etc/tinfirm/node-agent/hardening.json
 _tinfirm_sandbox_node_hardening_sysctl: /etc/sysctl.d/61-tinfirm-node-hardening.conf
 _tinfirm_sandbox_node_profile: /etc/apparmor.d/tinfirm-vmm
+# The profile's mode as it takes effect: off, complain or enforce. false (YAML reads an unquoted
+# off as false) is off, and so is anything with the master switch off; checks.yml refuses any
+# other value.
+_tinfirm_sandbox_node_mac: >-
+  {{ 'off' if not tinfirm_sandbox_node_harden | bool
+     or (tinfirm_sandbox_node_harden_mac is boolean and not tinfirm_sandbox_node_harden_mac)
+     else tinfirm_sandbox_node_harden_mac | string }}
+# The profile as it is installed: the units' file, with `complain` added to its flags in complain
+# mode. The mode lives in the file, so that apparmor.service loads it in that mode at each boot.
+_tinfirm_sandbox_node_profile_flags: flags=(attach_disconnected)
+# The role's copy of the profile, as a lookup finds it from the role (files/); the render tests
+# name it by its path.
+_tinfirm_sandbox_node_profile_src: tinfirm-vmm.apparmor
+_tinfirm_sandbox_node_profile_text: >-
+  {{ lookup('ansible.builtin.file', _tinfirm_sandbox_node_profile_src, rstrip=false)
+     | replace(_tinfirm_sandbox_node_profile_flags,
+               'flags=(attach_disconnected, complain)' if _tinfirm_sandbox_node_mac == 'complain'
+               else _tinfirm_sandbox_node_profile_flags) }}
+# The line AppArmor's list of loaded profiles shows for it in that mode.
+_tinfirm_sandbox_node_profile_loaded: "tinfirm-vmm ({{ _tinfirm_sandbox_node_mac }})"
 # The group whose members keep sudo once its setuid bit is cut to the group (4750).
 _tinfirm_sandbox_node_admin_group: "{{ 'sudo' if ansible_facts['os_family'] == 'Debian' else 'wheel' }}"
 # Where the setuid scan looks, as the helper's line `no-setuid` does.
 _tinfirm_sandbox_node_setuid_dirs: [/usr, /opt, /bin, /sbin]
 
-# Each line's switch as it takes effect: its own, and the master switch.
+# Each line's switch as it takes effect: its own, and the master switch. `mac`: the profile is
+# installed, in complain or enforce mode.
 _tinfirm_sandbox_node_harden_on:
   bpf: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_bpf | bool }}"
   io_uring: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_io_uring | bool }}"
-  mac: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_mac | bool }}"
+  mac: "{{ _tinfirm_sandbox_node_mac in ['complain', 'enforce'] }}"
   panic_on_oops: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_panic_on_oops | bool }}"
   modules: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_modules | bool }}"
   kexec: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_kexec | bool }}"
@@ -75,14 +96,15 @@ _tinfirm_sandbox_node_harden_on:
   setuid: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_setuid | bool }}"
   distribution: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_distribution | bool }}"
 
-# Each line of the mark, and whether the role sets it up: what the proof requires to hold. A
+# Each line of the mark, and whether the role sets it up: what the proof requires to hold
+# (vmm-mac in enforce mode alone: in complain mode it cannot hold). A
 # line of no switch of its own follows the master switch; user-namespaces always holds, since the
 # role always sets it (60-tinfirm-node-agent.conf).
 _tinfirm_sandbox_node_mark_lines:
   user-namespaces: true
   unprivileged-bpf: "{{ _tinfirm_sandbox_node_harden_on.bpf | bool }}"
   io-uring: "{{ _tinfirm_sandbox_node_harden_on.io_uring | bool }}"
-  vmm-mac: "{{ _tinfirm_sandbox_node_harden_on.mac | bool }}"
+  vmm-mac: "{{ _tinfirm_sandbox_node_mac == 'enforce' }}"
   panic-on-oops: "{{ _tinfirm_sandbox_node_harden_on.panic_on_oops | bool }}"
   modules-disabled: "{{ _tinfirm_sandbox_node_harden_on.modules | bool }}"
   kexec-disabled: "{{ _tinfirm_sandbox_node_harden_on.kexec | bool }}"

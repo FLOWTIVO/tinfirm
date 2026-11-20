@@ -2,9 +2,10 @@
     JSON has no comments, and the helper refuses an unknown field: the file is the one value
     below. Numbers are made numbers here, whatever the inventory's YAML gave. The role
     installs and loads the node's own firewall table, so the helper requires it
-    (`nodeFirewall`): a node whose table is gone takes no new VM. With the AppArmor switch on,
-    the role loads the VMMs' profile, so the helper requires it of every new VMM (`vmmProfile`);
-    the profile names the chroot base and the work directory below, which stay the defaults.
+    (`nodeFirewall`): a node whose table is gone takes no new VM. With the VMMs' profile in
+    enforce mode, the helper requires it of every new VMM (`vmmProfile`); in complain mode and
+    off it does not. The profile names the chroot base and the work directory below, which stay
+    the defaults.
     `hardening` gives the mark's lines what they need: the two ports that may listen beyond
     loopback, and the most days since the boot. -#}
 {%- set templates = {} -%}
@@ -27,7 +28,7 @@
   'maxVms': tinfirm_sandbox_node_max_vms | int,
   'vmUidBase': tinfirm_sandbox_node_vm_uid_base | int,
   'nodeFirewall': 'required',
-  'vmmProfile': 'required' if _tinfirm_sandbox_node_harden_on.mac | bool else 'not-required',
+  'vmmProfile': 'required' if _tinfirm_sandbox_node_mac == 'enforce' else 'not-required',
   'network': {
     'vmRange': tinfirm_sandbox_node_vm_range,
     'nodeAddress': tinfirm_sandbox_node_address,

@@ -73,6 +73,18 @@
         _case: mac-off
         tinfirm_sandbox_node_harden_mac: false
 
+    - name: Render the hardening with AppArmor's switch off, spelt as a string
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: mac-off-string
+        tinfirm_sandbox_node_harden_mac: "off"
+
+    - name: Render the hardening with the VMMs' profile in enforce mode
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: mac-enforce
+        tinfirm_sandbox_node_harden_mac: enforce
+
     - name: Render the hardening with panic on oops off
       ansible.builtin.include_tasks: render-hardening.yml
       vars:

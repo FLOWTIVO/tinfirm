@@ -17,6 +17,13 @@
     - {src: hardening.json.j2, dest: hardening.json}
     - {src: helper.json.j2, dest: helper.json}
 
+- name: Render the profile as the role installs it
+  ansible.builtin.copy:
+    content: "{{ _tinfirm_sandbox_node_profile_text }}"
+    dest: "{{ render_dir }}/hardening/{{ _case }}/tinfirm-vmm"
+    mode: "0644"
+  when: _tinfirm_sandbox_node_harden_on.mac | bool
+
 - name: Write what the tasks derive for the case
   ansible.builtin.copy:
     content: "{{ _derived | to_nice_json }}\n"
@@ -27,3 +34,5 @@
       mark_lines: "{{ _tinfirm_sandbox_node_mark_lines }}"
       pending: "{{ _tinfirm_sandbox_node_hardening_pending }}"
       packages: "{{ _tinfirm_sandbox_node_packages }}"
+      mac: "{{ _tinfirm_sandbox_node_mac }}"
+      profile_loaded: "{{ _tinfirm_sandbox_node_profile_loaded }}"

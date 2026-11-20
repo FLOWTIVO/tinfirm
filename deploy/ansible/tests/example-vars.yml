@@ -16,6 +16,8 @@ tinfirm_sandbox_node_templates:
     snapshotMib: 20480
     pidsMax: 64
 _tinfirm_sandbox_node_listener_uid: "991"
+# The role finds its files/ by itself; render.yml is not the role.
+_tinfirm_sandbox_node_profile_src: "{{ playbook_dir }}/../roles/tinfirm_sandbox_node/files/tinfirm-vmm.apparmor"
 # The node's kernel settings as tasks/hardening.yml reads them: Ubuntu 24.04's, where
 # kernel.perf_event_paranoid is 4 and kernel.unprivileged_bpf_disabled 2, after a first run of
 # the role for the rest. A second run must write the same file and apply nothing.

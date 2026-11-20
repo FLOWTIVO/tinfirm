@@ -176,12 +176,21 @@ tinfirm_sandbox_node_harden_bpf: true
 # kernel.io_uring_disabled = 2: no io_uring for anyone. It needs Linux 6.6 or later (Debian 12's
 # 6.1 has no such setting: the role refuses the switch there). Off: `io-uring` fails.
 tinfirm_sandbox_node_harden_io_uring: true
-# AppArmor: the package, the VMMs' profile tinfirm-vmm (unverified until it has run on a node),
-# and `"vmmProfile": "required"` in helper.json, so that a make fails for a VMM that the profile
-# does not confine. VMMs that ran before the profile was loaded stay unconfined until they are
-# deleted, and the mark is `no` until then. A Red Hat family node has SELinux and no AppArmor:
-# the role refuses the switch there. Off: `vmm-mac` fails, and makes do not ask.
-tinfirm_sandbox_node_harden_mac: true
+# AppArmor and the VMMs' profile tinfirm-vmm, in one of three modes (not true or false):
+# - `enforce`: the package, the profile loaded in enforce mode, and `"vmmProfile": "required"` in
+#   helper.json, so that a make fails for a VMM that the profile does not confine. VMMs that ran
+#   before it was loaded stay unconfined until they are deleted, and `vmm-mac` fails until then.
+# - `complain`: the profile loaded in complain mode. It refuses nothing, and the kernel logs what
+#   it would have refused (`journalctl -k`, lines with apparmor="ALLOWED"); makes do not ask, and
+#   `vmm-mac` does not hold, so the node's mark is `no`.
+# - `off` (or false): no profile. One that an earlier run loaded is unloaded and its file removed;
+#   a VMM that runs keeps its confinement until it ends. `vmm-mac` fails, and makes do not ask.
+# A Red Hat family node has SELinux and no AppArmor: the role refuses complain and enforce there.
+# The default is `complain` because the profile has not run on a real machine yet: in enforce
+# mode a rule it lacks would stop every VM from starting. It becomes `enforce` once the profile
+# has run on a node. Until then, a node set up with the defaults reports `hardened: no` for this
+# line alone.
+tinfirm_sandbox_node_harden_mac: complain
 # kernel.panic_on_oops = 1, and kernel.panic = tinfirm_sandbox_node_kernel_panic: an exploit that
 # fails takes the node down instead of trying again, and ends every run on it. Off:
 # `panic-on-oops` fails.
