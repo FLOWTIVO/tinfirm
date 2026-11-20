@@ -1,0 +1,13 @@
+== a delete by a helper that may not ask the firewall (its unit without CAP_NET_ADMIN, set after the VM was made)
+made node-1:vm-a424c4d2921d843dbabd1278a889328f
+the delete:
+  delete failed: node node-1: of the VM tfvm-000000000054-0000 this is left: the firewall table tinfirm_000000000054, perhaps (`nft list table inet tinfirm_000000000054` failed: Operation not permitted (you must be root) netlink: Error: cache initialization failed: Operation not permitted)
+  delete: ERROR after 48 ms: {'code': -32000, 'message': 'node node-1: of the VM tfvm-000000000054-0000 this is left: the firewall table tinfirm_000000000054, perhaps (`nft list table inet tinfirm_000000000054` failed: Operation not permitted (you must be root) netlink: Error: cache initialization failed: Operation not permitted)'}
+  delete: (None, 48)
+then list: list: {"vms": [{"address": "10.0.0.6", "id": "node-1:vm-a424c4d2921d843dbabd1278a889328f", "labels": {"tinfirm-host": "two-machine-run"}, "name": "cannot-ask", "port": 20000, "state": "failed"}]}
+on the node: jails tfvm-000000000054-0000 ; VM tables table inet tinfirm_000000000054 ; veths 0; VMMs 0
+== with CAP_NET_ADMIN again
+the delete: deleted node-1:vm-a424c4d2921d843dbabd1278a889328f
+delete: ({}, 23)
+then list: list: {"vms": []}
+on the node: jails 0, VM tables 0, veths 0, device-mapper 0, cgroups 0

@@ -1,0 +1,27 @@
+== 1. the VMM that the helper started through `start-jailer`, under the helper's unit
+the helper (pid 20868): CapEff: 00000000082011c3;CapBnd: 00000000082011c3;NoNewPrivs: 1;Seccomp_filters: 26;
+the VMM (pid 23550, jail tfvm-000000000050-0000): Name: firecracker;Uid: 1100000 1100000 1100000 1100000;Gid: 1100000 1100000 1100000 1100000;Groups:  ;CapInh: 0000000000000000;CapPrm: 0000000000000000;CapEff: 0000000000000000;CapBnd: 00000000082000c3;CapAmb: 0000000000000000;NoNewPrivs: 1;Seccomp: 2;Seccomp_filters: 27;
+processes in the helper's own cgroup: 1 (20868 /usr/local/bin/tinfirm-node-agent helper;)
+a process still named start-jailer: 0
+== 2. `start-jailer` run by hand on the node
+$ /usr/local/bin/tinfirm-node-agent start-jailer /usr/local/bin/jailer --id tfvm-00000000ffff-0000 --version
+    Error: cannot cut the capability bounding set (permission denied): no jailer was started
+    (exit 1)
+$ /usr/local/bin/tinfirm-node-agent start-jailer /bin/sh --id tfvm-00000000ffff-0000
+    Error: the program is not an absolute path to a file named `jailer`: no jailer was started
+    (exit 1)
+$ /usr/local/bin/tinfirm-node-agent start-jailer /usr/local/bin/jailer --version
+    Error: the arguments do not start with `--id` and a jail's name of the helper's: no jailer was started
+    (exit 1)
+$ sudo /usr/local/bin/tinfirm-node-agent start-jailer /bin/sh --id tfvm-00000000ffff-0000
+    Error: the program is not an absolute path to a file named `jailer`: no jailer was started
+    (exit 1)
+$ sudo /usr/local/bin/tinfirm-node-agent start-jailer /usr/local/bin/jailer --exec-file /bin/sh --id tfvm-00000000ffff-0000
+    Error: the arguments do not start with `--id` and a jail's name of the helper's: no jailer was started
+    (exit 1)
+$ sudo /usr/local/bin/tinfirm-node-agent start-jailer /tmp/jailer --id tfvm-00000000ffff-0000 --version
+    Error: the jailer is not a regular file of root's that only root can write: no jailer was started
+    (exit 1)
+$ /usr/local/bin/tinfirm-node-agent --help | grep -c start-jailer
+    0 (hidden)
+left: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, work files 0, spool files 0

@@ -258,3 +258,134 @@ Connections the node itself can open as root: the control host's SSH port, the m
 - **The module check on a kernel with one of the eight modules built in**: it would name the module as missing.
 - **`controlHost` in the listener's configuration** (41567f5): this change is on `7c3cf12`, before it.
 - **The single machine**, which the helper refuses on purpose.
+
+## Second round, 2026-11-19 (22:35 to 23:50 UTC)
+
+What the first round left open, on the same node and control host, from the branch at `eb6ea9c` with this round's change. The sections above are the first round's record and are not changed; where this round's result differs, it says so here. New outputs are the `r9-*` files.
+
+**The node in this round**: the agent under its units as before, and now also the node's own firewall table (`units/tinfirm-node-agent.nft`, for the control host and the management address 10.0.0.4, the node 10.0.0.6, the ports 20000 to 20001), `user.max_user_namespaces = 0`, and `tls.controlHost` 10.0.0.4 in the listener's configuration.
+
+| Claim | Result | Output |
+|---|---|---|
+| The crate's tests under umask 022 and under 002 | 70 + 16 + 2 passed, the 6 real tests skip; the same under both | below |
+| The real tests, as root on the node | 6 passed in 76.9 s; make 120 ms, guest ready 2766 ms, delete 83 ms | `r9-linux-kvm.out` |
+| No unsafe code; the VMM's bounding set is still the six | `CapBnd 00000000082000c3`, `CapEff 0`, `Groups` empty, under the helper's unit | `r9-bounding-set.out` |
+| Six cycles through the driver with the firewall, the sysctl and `tls.controlHost` | create 133 to 141 ms, ready 2.7 to 2.9 s, delete 64 to 86 ms; nothing left | `r9-two-machines.out` |
+| The ticket in the listener's memory | Not found any more | `r9-attack-node-root.out` |
+| The node's own egress, as root | Every attempt fails | `r9-attack-node-root.out` |
+| A new user namespace as a VM's user | Refused | `r9-attack-vmm-user.out` |
+| Who is served at the agent's port, and which guard refuses the others | The control host alone; each of three guards refuses the third machine on its own | `r9-control-host.out` |
+| A delete that cannot ask the firewall | Fails, names the table, the VM stays listed; succeeds once it can ask | `r9-delete-cannot-ask.out` |
+| The release's build of the two binaries at `ae1f509` | Built in 330 s; the version and the archive are as expected | `r9-release-build.out` |
+
+```
+$ cargo test -p tinfirm-node-agent     (umask 022, and again under umask 002: the same)
+test result: ok. 70 passed; 0 failed   (the library)
+test result: ok. 16 passed; 0 failed   (tests/agent.rs)
+test result: ok. 6 passed; 0 failed    (tests/linux_kvm.rs, skipping)
+test result: ok. 2 passed; 0 failed    (tests/start_jailer.rs)
+$ cargo clippy -p tinfirm-node-agent --all-targets -- -D warnings      clean
+$ cargo fmt --check -p tinfirm-node-agent                              clean
+$ grep -rn unsafe runner/crates/tinfirm-node-agent/src                 only the two sentences that say there is none
+```
+
+Under umask 002 the first round counted seven failing tests of `src/helper.rs`. That count was short: cargo stops at the first test binary that fails, and thirteen tests of `tests/agent.rs` failed for the same reason behind it. Both fixtures now set the mode of their own directory.
+
+### The bounding set without unsafe code (`r9-bounding-set.out`)
+
+The helper starts its own binary as `start-jailer`, which cuts its bounding set through rustix and becomes the jailer (the crate's README, "The bounding set"). Under the helper's unit, with a VM made from the control host:
+
+```
+the helper (pid 20868): CapEff: 00000000082011c3; CapBnd: 00000000082011c3; NoNewPrivs: 1; Seccomp_filters: 26
+the VMM (pid 23550): Name: firecracker; Uid: 1100000 (x4); Gid: 1100000 (x4); Groups: (none);
+  CapInh, CapPrm, CapEff, CapAmb: 0000000000000000; CapBnd: 00000000082000c3; NoNewPrivs: 1; Seccomp: 2; Seccomp_filters: 27
+processes in the helper's own cgroup: 1 (the helper)
+a process still named start-jailer: 0
+```
+
+Run by hand on the node:
+
+| Who, and what | Answer (status 1 each) |
+|---|---|
+| An ordinary user, root's jailer, a jail's name | cannot cut the capability bounding set (permission denied): no jailer was started |
+| An ordinary user or root, `/bin/sh` as the program | the program is not an absolute path to a file named `jailer` |
+| An ordinary user or root, arguments that do not start with `--id` and a jail's name | the arguments do not start with `--id` and a jail's name of the helper's |
+| Root, a copy of the jailer that an ordinary user owns | the jailer is not a regular file of root's that only root can write |
+
+### The ticket in the listener's memory (`r9-attack-node-root.out`)
+
+The first round found the canary in the listener's memory in two places. The listener now overwrites what it holds of a `create` (the crate's README, "A make", last paragraph). With a VM made from a canary ticket, and one `list` from the control host after the `create`, as a runner host asks about its VM next:
+
+```
+where it must not be:
+  the listener's spool, its records, the helper's record, the console file, the rest of the jail,
+  the agent's configuration, the journal of the whole machine, /run, /tmp, /var/tmp, /dev/shm: not found
+  the helper's memory: not found
+  the listener's memory: not found
+```
+
+What the agent's own code cannot overwrite is the TLS library's read buffer and the JSON parser's scratch space. Neither held the canary in this run. That is one run: a copy there lasts until the library uses the memory again, which the next request on the connection did here.
+
+### The node's firewall and its egress (`r9-attack-node-root.out`, `r9-attack-vmm-user.out`)
+
+The first round's root shell reached the control host's SSH port, the metadata service and the internet. With the node's table loaded:
+
+```
+== 3. connections the node itself can open, as root (the node's firewall table: loaded)
+  the control host's SSH (10.0.0.4:22), port 443, and the agent's own port number (7700): nothing
+  the metadata service (169.254.169.254:80): nothing
+  Azure's host agent (168.63.129.16:80): nothing
+  the internet by address (1.1.1.1:443), a resolver (8.8.8.8:53): nothing
+```
+
+The six cycles ran with it loaded. A port beside a published one is now silent from the control host, where the first round saw `refused`: the table drops what it does not admit. As a VM's user outside its jail, the control host's SSH port is refused too, and inside the jail a new user namespace is refused (`unshare: No space left on device`, the kernel's answer when `user.max_user_namespaces` is 0).
+
+Root on the node can delete the table (`nft delete table inet tinfirm_node`); nothing on the node stops that. Path B's "must fail to open a connection" holds on this node against everything but root that removes the node's own guard, where the operator's network outside the node is what the ADR relies on. No such network guard was in this test.
+
+Not tried: the node across a renewal of its DHCP lease with the table loaded (the table admits it; the lease did not come up for renewal), and a reboot with the firewall's unit enabled.
+
+### The agent's port: who is served, and by which guard (`r9-control-host.out`, `other-machine.py`)
+
+The first round's `third-address.out` shows one line for the third machine, a `hello` answer. That line is the `node` driver's own answer, made without the node; the call that needed the node was not recorded. This round records it. `other-machine.py` makes `hello`, `verify` and `list` through the driver, with the control host's certificate and key copied to the machine that runs it.
+
+A node has three guards in front of the listener's handshake: the node's firewall table, the listener unit's `IPAddressAllow`, and the listener's own `tls.controlHost` check. Each was left alone in turn, the other two set to admit the third machine:
+
+| Guards | The control host | The third machine (10.0.0.5), with the control host's key | The node itself, with the key |
+|---|---|---|---|
+| All three, as a node has them | `verify` in 5 ms, no problem | `verify` after 20.0 s: "cannot reach the node: no connection in time" | the same, after 20.0 s |
+| The listener's `tls.controlHost` alone | served | `verify` after 21 ms: "cannot reach the node: TLS: tls handshake eof" | the same, after 1 ms |
+| The unit's `IPAddressAllow` alone | | after 20.0 s: "no connection in time"; no line in the listener's journal | |
+| The firewall table alone | | after 20.0 s: "no connection in time"; the table's input counter went up | |
+
+With the listener's check alone, its journal says: `refused: 1 × a connection from another address than the control host's` (the summary is written at most once a minute, so the node's own try is counted in the next one). With all three, the first to refuse is the firewall table; the packets never reach the listener, and its journal has no line.
+
+### A delete that cannot ask (`r9-delete-cannot-ask.out`)
+
+The review bot's finding: any failure of `nft list table` was read as "the table is gone". nft ends with status 1 both for a table that does not exist and when it may not ask the kernel; only its text differs. The delete now reads the text, and every other "is it gone" check has a third answer beside there and gone (the crate's README, "A delete"). With the helper's unit set to lack `CAP_NET_ADMIN` after a VM was made:
+
+```
+delete: ERROR after 48 ms: of the VM tfvm-000000000054-0000 this is left: the firewall table tinfirm_000000000054,
+  perhaps (`nft list table inet tinfirm_000000000054` failed: Operation not permitted (you must be root) netlink: Error: ...)
+then list: the VM, state failed
+on the node: the jail and the table inet tinfirm_000000000054 are there
+== with CAP_NET_ADMIN again
+delete: ({}, 23); then list: no VM; on the node: nothing left
+```
+
+### The release's build (`r9-release-build.out`)
+
+At `ae1f509`, in a fresh clone on the node: `deploy/release/assets.sh runner-linux x86_64-unknown-linux-musl rolling-test1234 /tmp/assets` ended with status 0 after 330 s (4 vCPUs, nothing cached).
+
+| | |
+|---|---|
+| `file tinfirm-node-agent` | ELF 64-bit LSB executable, x86-64, statically linked, stripped |
+| `tinfirm-node-agent --version` | `tinfirm-node-agent 1.0.0-rc.2-SNAPSHOT+rolling-test1234`, as `assets.sh build-id rolling-test1234` prints |
+| The node agent's archive | `LICENSE`, `THIRD-PARTY-LICENSES.txt`, `tinfirm-node-agent`; no `ee/` |
+| The runner host's archive | The same three, and `ee/LICENSE` |
+| `tinfirm-runner-host --version` | `tinfirm-runner-host 1.0.0-rc.2-SNAPSHOT (rolling-test1234)` |
+
+One thing about the machine, not the script: the first try ended at once with `unknown flag: --progress`. Ubuntu's `docker.io` package has no BuildKit front end; with `docker-buildx` installed the same command ran. The script needs `docker buildx`, and does not say so.
+
+### Still not tested after this round
+
+A conversation; path B with canary credentials, and path C; `kernel.modules_disabled`, lockdown and the AppArmor profile; a guest that floods its serial port; a flush of the node's whole ruleset under running VMs; a node at its disk's or memory's end; another kernel, distribution or architecture; a kernel that really has one of the eight modules built in (the check is tested on files standing in for one); the single machine.
