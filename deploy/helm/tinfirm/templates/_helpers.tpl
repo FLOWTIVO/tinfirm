@@ -756,3 +756,17 @@ RUN_VOLUME_MIB), 64 MiB of logs plus the disk in an emptyDir (LOGS_MIB), and one
 {{- $config := dict "tokenFile" (printf "%s/%s" (include "tinfirm.runner.digitaloceanTokenDir" .) $do.secretKeys.token) "connect" $do.connect "templates" ($do.templates | default dict) }}
 {{- toPrettyJson $config }}
 {{- end }}
+
+{{/*
+The admission policy's test of one toleration `t` (CEL) against one of runner.vm.pod.tolerations:
+each field as configured, an absent one absent (operator: Equal), as spec.rs's pod carries it.
+*/}}
+{{- define "tinfirm.runs.tolerationRule" -}}
+{{- $tests := list }}
+{{- if .key }}{{ $tests = append $tests (printf "has(t.key) && t.key == '%s'" .key) }}{{ else }}{{ $tests = append $tests "!has(t.key)" }}{{ end }}
+{{- if eq (.operator | default "Equal") "Exists" }}{{ $tests = append $tests "has(t.operator) && t.operator == 'Exists'" }}{{ else }}{{ $tests = append $tests "(!has(t.operator) || t.operator == 'Equal')" }}{{ end }}
+{{- if .value }}{{ $tests = append $tests (printf "has(t.value) && t.value == '%s'" .value) }}{{ else }}{{ $tests = append $tests "!has(t.value)" }}{{ end }}
+{{- if .effect }}{{ $tests = append $tests (printf "has(t.effect) && t.effect == '%s'" .effect) }}{{ else }}{{ $tests = append $tests "!has(t.effect)" }}{{ end }}
+{{- if hasKey . "tolerationSeconds" }}{{ $tests = append $tests (printf "has(t.tolerationSeconds) && t.tolerationSeconds == %d" (int64 .tolerationSeconds)) }}{{ else }}{{ $tests = append $tests "!has(t.tolerationSeconds)" }}{{ end }}
+{{- join " && " $tests }}
+{{- end }}

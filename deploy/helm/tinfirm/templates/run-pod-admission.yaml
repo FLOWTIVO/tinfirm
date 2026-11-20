@@ -10,17 +10,21 @@ does not start.
 {{- $c := .Values.runner.vm.cluster }}
 {{- $p := .Values.runner.vm.pod }}
 {{- $image := include "tinfirm.runner.podImage" . }}
+{{- $sizes := list }}
+{{- range $p.templates }}{{ $sizes = append $sizes (printf "%dMi" (int .diskMib)) }}{{ end }}
+{{- $sizes = $sizes | uniq | sortAlpha }}
 # The admission policy for run pods (ADR-0115, decision 2). The driver may create pods in the
 # runs' namespace, and whoever may create a pod can mount any Secret of its namespace and name
 # any ServiceAccount there: RBAC alone is no boundary. Every pod of the namespace, whoever
 # creates or changes it, must be what the driver builds (spec.rs, `pod`): its name, the runs'
 # ServiceAccount, no token, a user namespace, no host namespace, no pull Secret, no ephemeral
 # container; as volumes only emptyDirs, its own ticket's Secret and, with disk.volume
-# `ephemeral`, a claim of the configured class with no source; in every container the image by
-# digest, no Secret in the environment, no privilege, every capability dropped, none added
-# but NET_ADMIN in the init container of tap mode `init`, and no host port. A rule whose field
-# is missing fails closed (failurePolicy Fail). The driver's own check creates refused pods
-# with dryRun at each check and starts no VM while one is admitted.
+# `ephemeral`, one empty claim of the configured class and of a template's disk size; in every
+# container the image by digest, no Secret in the environment, no privilege, every capability
+# dropped, none added but NET_ADMIN in the init container of tap mode `init`, and no host
+# port; placed by the default scheduler on the workers for runs, off the runner pod's node. A
+# rule whose field is missing fails closed (failurePolicy Fail). The driver's own check creates
+# refused pods with dryRun at each check and starts no VM while one is admitted.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -76,18 +80,77 @@ spec:
     - expression: "has(object.spec.volumes) && object.spec.volumes.exists_one(v, has(v.secret))"
       message: "a run pod has one Secret volume, its ticket's"
     {{- if eq $p.disk.volume "ephemeral" }}
+    - expression: "object.spec.volumes.filter(v, has(v.ephemeral)).size() == 1"
+      message: "a run pod has one claim, its disk's"
     - expression: >-
         object.spec.volumes.all(v, !has(v.ephemeral)
         || (!has(v.ephemeral.volumeClaimTemplate.spec.dataSource)
         && !has(v.ephemeral.volumeClaimTemplate.spec.dataSourceRef)
+        && !has(v.ephemeral.volumeClaimTemplate.spec.volumeName)
+        && !has(v.ephemeral.volumeClaimTemplate.spec.selector)
+        && has(v.ephemeral.volumeClaimTemplate.spec.accessModes)
+        && v.ephemeral.volumeClaimTemplate.spec.accessModes == ['ReadWriteOnce']
+        && has(v.ephemeral.volumeClaimTemplate.spec.volumeMode)
+        && v.ephemeral.volumeClaimTemplate.spec.volumeMode == 'Filesystem'
+        && 'storage' in v.ephemeral.volumeClaimTemplate.spec.resources.requests
+        && {{ $sizes | toJson }}.exists(s,
+        quantity(v.ephemeral.volumeClaimTemplate.spec.resources.requests.storage).compareTo(quantity(s)) == 0)
         {{- if $p.disk.storageClassName }}
         && has(v.ephemeral.volumeClaimTemplate.spec.storageClassName)
         && v.ephemeral.volumeClaimTemplate.spec.storageClassName == '{{ $p.disk.storageClassName }}'))
         {{- else }}
         && !has(v.ephemeral.volumeClaimTemplate.spec.storageClassName)))
         {{- end }}
-      message: "a run pod's disk is an empty claim{{ with $p.disk.storageClassName }} of the class {{ . }}{{ else }} of the cluster's default class{{ end }}: no dataSource, no dataSourceRef"
+      message: "a run pod's disk is an empty claim of its own (no dataSource, dataSourceRef, volumeName or selector), ReadWriteOnce, Filesystem, of a template's disk size ({{ $sizes | join ", " }}){{ with $p.disk.storageClassName }} and of the class {{ . }}{{ else }} and of the cluster's default class{{ end }}"
     {{- end }}
+    # Placement: where the scheduler puts the pod, on the workers for runs, never beside the
+    # runner pod. The scheduler binds through pods/binding, which this policy does not see, and
+    # spec.nodeName cannot change in an update: the rule refuses it on CREATE alone.
+    - expression: >-
+        request.operation != 'CREATE' || !has(object.spec.nodeName) || object.spec.nodeName == ''
+      message: "a run pod names no node: the scheduler places it"
+    - expression: "!has(object.spec.schedulerName) || object.spec.schedulerName == 'default-scheduler'"
+      message: "a run pod is placed by the default scheduler"
+    - expression: >-
+        has(object.spec.nodeSelector) && object.spec.nodeSelector == {{ $p.nodeSelector | toJson }}
+      message: "a run pod's nodeSelector is runner.vm.pod.nodeSelector, the workers for runs"
+    # The API server adds the two tolerations of not-ready and unreachable nodes, NoExecute, with
+    # their tolerationSeconds, before this policy sees the pod; they decide only when a pod is
+    # evicted.
+    - expression: >-
+        !has(object.spec.tolerations) || object.spec.tolerations.all(t,
+        (has(t.key) && (t.key == 'node.kubernetes.io/not-ready' || t.key == 'node.kubernetes.io/unreachable')
+        && has(t.operator) && t.operator == 'Exists' && !has(t.value)
+        && has(t.effect) && t.effect == 'NoExecute')
+        {{- range $p.tolerations }}
+        || ({{ include "tinfirm.runs.tolerationRule" . }})
+        {{- end }})
+      message: "a run pod tolerates no taint but those of runner.vm.pod.tolerations and the API server's two defaults"
+    - expression: >-
+        has(object.spec.affinity) && has(object.spec.affinity.podAntiAffinity)
+        && has(object.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution)
+        && object.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.exists(t,
+        has(t.labelSelector) && has(t.labelSelector.matchLabels)
+        && t.labelSelector.matchLabels == {{ include "tinfirm.runner.selectorLabels" . | fromYaml | toJson }}
+        && !has(t.labelSelector.matchExpressions)
+        && has(t.namespaceSelector) && has(t.namespaceSelector.matchLabels)
+        && t.namespaceSelector.matchLabels == {{ dict "kubernetes.io/metadata.name" .Release.Namespace | toJson }}
+        && !has(t.namespaceSelector.matchExpressions)
+        && !has(t.matchLabelKeys) && !has(t.mismatchLabelKeys)
+        && t.topologyKey == 'kubernetes.io/hostname')
+      message: "a run pod keeps off the runner pod's node: the required anti-affinity against its labels in namespace {{ .Release.Namespace }}, by kubernetes.io/hostname"
+    - expression: "has(object.spec.affinity) && !has(object.spec.affinity.podAffinity)"
+      message: "a run pod has no pod affinity, which would draw it toward other pods"
+    # The runner pod's node is known to the driver alone: the policy lets a node affinity only
+    # exclude nodes by name, never draw the pod toward one.
+    - expression: >-
+        has(object.spec.affinity) && (!has(object.spec.affinity.nodeAffinity)
+        || (!has(object.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution)
+        && (!has(object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution)
+        || object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.all(term,
+        !has(term.matchExpressions) && has(term.matchFields)
+        && term.matchFields.all(f, f.key == 'metadata.name' && f.operator == 'NotIn')))))
+      message: "a run pod's node affinity only excludes nodes by name (metadata.name NotIn)"
     - expression: >-
         variables.containers.all(c,
         (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)))

@@ -470,7 +470,18 @@ pub fn admission_battery(
         format!("{repository}@sha256:{flipped}")
     };
     let ticket = id.ticket_name();
-    type Change = Box<dyn Fn(&mut Value)>;
+    let node = runner_node.to_string();
+    let ephemeral = config.disk.volume == DiskVolume::Ephemeral;
+    let disk_mib = config.template(template)?.disk_mib;
+    // A size that no template has.
+    let other_size = config
+        .templates
+        .values()
+        .map(|t| t.disk_mib)
+        .max()
+        .unwrap_or(0)
+        + 1024;
+    let claim = |change: Change| claim_case(ephemeral, disk_mib, change);
     let cases: Vec<(&'static str, bool, Change)> = vec![
         (
             "another ServiceAccount",
@@ -578,6 +589,93 @@ pub fn admission_battery(
             false,
             Box::new(|p| volumes(p).push(sourced_volume("dataSourceRef"))),
         ),
+        // The claim of the disk, bound in every field that could reach another volume or size.
+        (
+            "a claim with a volumeName",
+            false,
+            claim(Box::new(|c| c["volumeName"] = json!("another-volume"))),
+        ),
+        (
+            "a claim with a selector",
+            false,
+            claim(Box::new(|c| {
+                c["selector"] = json!({"matchLabels": {"volume": "another"}});
+            })),
+        ),
+        (
+            "a claim of another size",
+            false,
+            claim(Box::new(move |c| {
+                c["resources"]["requests"]["storage"] = json!(format!("{other_size}Mi"));
+            })),
+        ),
+        (
+            "a claim of another access mode",
+            false,
+            claim(Box::new(|c| c["accessModes"] = json!(["ReadWriteMany"]))),
+        ),
+        (
+            "a block claim",
+            false,
+            claim(Box::new(|c| c["volumeMode"] = json!("Block"))),
+        ),
+        // Placement: the pod goes only where the scheduler puts it, on the workers for runs,
+        // never beside the runner pod.
+        (
+            "a node's name",
+            false,
+            Box::new({
+                let node = node.clone();
+                move |p| p["spec"]["nodeName"] = json!(node)
+            }),
+        ),
+        (
+            "another nodeSelector",
+            false,
+            Box::new({
+                let node = node.clone();
+                move |p| p["spec"]["nodeSelector"] = json!({"kubernetes.io/hostname": node})
+            }),
+        ),
+        (
+            "one more toleration",
+            false,
+            Box::new(|p| {
+                p["spec"]["tolerations"]
+                    .as_array_mut()
+                    .expect("tolerations")
+                    .push(json!({"operator": "Exists"}));
+            }),
+        ),
+        (
+            "another scheduler",
+            false,
+            Box::new(|p| p["spec"]["schedulerName"] = json!("another-scheduler")),
+        ),
+        (
+            "no anti-affinity against the runner pod",
+            false,
+            Box::new(|p| {
+                let affinity = p["spec"]["affinity"].as_object_mut().expect("affinity");
+                affinity.remove("podAntiAffinity");
+            }),
+        ),
+        (
+            "a node affinity toward a node",
+            false,
+            Box::new(|p| {
+                p["spec"]["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+                    ["nodeSelectorTerms"][0]["matchFields"][0]["operator"] = json!("In");
+            }),
+        ),
+        (
+            "a pod affinity",
+            false,
+            Box::new(|p| {
+                let affinity = &mut p["spec"]["affinity"];
+                affinity["podAffinity"] = affinity["podAntiAffinity"].clone();
+            }),
+        ),
     ];
     let refused = cases
         .into_iter()
@@ -592,6 +690,32 @@ pub fn admission_battery(
         })
         .collect();
     Ok(AdmissionBattery { accepted, refused })
+}
+
+type Change = Box<dyn Fn(&mut Value)>;
+
+/// A change to the disk's claim: the pod's own claim with an ephemeral disk; else an ephemeral
+/// volume added, with the correct claim of `disk_mib` so changed.
+fn claim_case(ephemeral: bool, disk_mib: u32, change: Change) -> Change {
+    Box::new(move |p| {
+        if ephemeral {
+            let disk = volumes(p)
+                .iter_mut()
+                .find(|v| v["name"] == "disk")
+                .expect("the disk's volume");
+            change(&mut disk["ephemeral"]["volumeClaimTemplate"]["spec"]);
+        } else {
+            let mut spec = json!({
+                "accessModes": ["ReadWriteOnce"],
+                "volumeMode": "Filesystem",
+                "resources": {"requests": {"storage": format!("{disk_mib}Mi")}},
+            });
+            change(&mut spec);
+            volumes(p).push(
+                json!({"name": "claim", "ephemeral": {"volumeClaimTemplate": {"spec": spec}}}),
+            );
+        }
+    })
 }
 
 /// An ephemeral volume whose claim is made from another claim of the namespace, by `field`.
@@ -1037,7 +1161,7 @@ mod tests {
 
     #[test]
     fn each_refused_pod_differs_from_the_correct_one_in_its_one_point() {
-        let expected: BTreeMap<&str, Vec<&str>> = BTreeMap::from([
+        let common: BTreeMap<&str, Vec<&str>> = BTreeMap::from([
             ("another ServiceAccount", vec![".spec.serviceAccountName"]),
             (
                 "a ServiceAccount token mounted automatically",
@@ -1083,8 +1207,51 @@ mod tests {
                 "an ephemeral volume with a dataSourceRef",
                 vec![".spec.volumes"],
             ),
+            ("a node's name", vec![".spec.nodeName"]),
+            (
+                "another nodeSelector",
+                vec![
+                    ".spec.nodeSelector.tinfirm.flowtivo.com/kvm",
+                    ".spec.nodeSelector.kubernetes.io/hostname",
+                ],
+            ),
+            ("one more toleration", vec![".spec.tolerations"]),
+            ("another scheduler", vec![".spec.schedulerName"]),
+            (
+                "no anti-affinity against the runner pod",
+                vec![".spec.affinity.podAntiAffinity"],
+            ),
+            (
+                "a node affinity toward a node",
+                vec![
+                    ".spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchFields[0].operator",
+                ],
+            ),
+            ("a pod affinity", vec![".spec.affinity.podAffinity"]),
         ]);
+        // The claim's cases change the pod's own claim with an ephemeral disk, and add a
+        // volume with an emptyDir disk.
+        let claims = [
+            ("a claim with a volumeName", "volumeName"),
+            ("a claim with a selector", "selector"),
+            ("a claim of another size", "resources.requests.storage"),
+            ("a claim of another access mode", "accessModes[0]"),
+            ("a block claim", "volumeMode"),
+        ];
         for config in [config(&good()), init_ephemeral()] {
+            let ephemeral = config.disk.volume == DiskVolume::Ephemeral;
+            let mut expected: BTreeMap<&str, Vec<String>> = common
+                .iter()
+                .map(|(name, paths)| (*name, paths.iter().map(|p| p.to_string()).collect()))
+                .collect();
+            for (name, field) in claims {
+                let path = if ephemeral {
+                    format!(".spec.volumes[2].ephemeral.volumeClaimTemplate.spec.{field}")
+                } else {
+                    ".spec.volumes".to_string()
+                };
+                expected.insert(name, vec![path]);
+            }
             let battery =
                 admission_battery(&config, "sandbox-4c8g", &id(), &labels(), NODE).unwrap();
             assert_eq!(
@@ -1100,6 +1267,10 @@ mod tests {
                 differences("", &battery.accepted, &refused.pod, &mut seen);
                 let paths: Vec<&str> = seen.iter().map(|d| d.split(':').next().unwrap()).collect();
                 assert_eq!(paths, expected[refused.name], "{}: {seen:?}", refused.name);
+                if !ephemeral && claims.iter().any(|(name, _)| *name == refused.name) {
+                    let added = &refused.pod["spec"]["volumes"][3];
+                    assert_eq!(added["name"], "claim", "{}", refused.name);
+                }
                 assert_eq!(
                     refused.refused_by_validation,
                     refused.name == "the host's network"

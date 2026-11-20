@@ -902,6 +902,8 @@ mod tests {
         /// Reads of the network policies are forbidden.
         fail_policy_reads: bool,
         next_uid: u64,
+        /// The driver's configuration, which the fake admission policy follows.
+        config: PodConfig,
     }
 
     fn quota() -> Value {
@@ -936,11 +938,12 @@ mod tests {
             fail_pod_delete: false,
             fail_policy_reads: false,
             next_uid: 1,
+            config,
         }
     }
 
     /// Whether a sound admission policy takes `pod` (the chart's rules, in outline).
-    fn sound(pod: &Value) -> bool {
+    fn sound(config: &PodConfig, pod: &Value) -> bool {
         let spec = &pod["spec"];
         let name = pod["metadata"]["name"].as_str().unwrap_or_default();
         let ticket = name.replacen("tinfirm-vm-", "tinfirm-ticket-", 1);
@@ -969,18 +972,73 @@ mod tests {
                         .all(|e| e["valueFrom"].get("secretKeyRef").is_none())
                     && c["securityContext"]["privileged"] != json!(true)
                     && c["securityContext"]["capabilities"].get("add").is_none()
-                    && c["image"]
-                        == json!(format!(
-                            "registry.example.com:5000/tinfirm/vm-pod@{}",
-                            super::super::config::tests::DIGEST
-                        ))
+                    && c["image"] == json!(config.image)
             });
-        spec["serviceAccountName"] == "tinfirm-run"
+        // Every ephemeral claim: no way to another volume, and a template's size.
+        let sizes: Vec<Value> = config
+            .templates
+            .values()
+            .map(|t| json!(format!("{}Mi", t.disk_mib)))
+            .collect();
+        let claims_ok = volumes
+            .iter()
+            .filter_map(|v| v["ephemeral"]["volumeClaimTemplate"].get("spec"))
+            .all(|c| {
+                c.get("volumeName").is_none()
+                    && c.get("selector").is_none()
+                    && sizes.contains(&c["resources"]["requests"]["storage"])
+                    && c["accessModes"] == json!(["ReadWriteOnce"])
+                    && (c.get("volumeMode").is_none() || c["volumeMode"] == "Filesystem")
+            });
+        // Placement: only where the scheduler puts it, on the workers for runs, never beside
+        // the runner pod.
+        let affinity = &spec["affinity"];
+        let tolerations = json!(config.tolerations);
+        let tolerations_ok = spec["tolerations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|t| {
+                tolerations
+                    .as_array()
+                    .is_some_and(|known| known.contains(t))
+            });
+        let anti_ok = affinity["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|term| {
+                term["labelSelector"]["matchLabels"] == json!(config.runner.labels)
+                    && term["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"]
+                        == json!(config.runner.namespace)
+            });
+        let node_affinity_ok = affinity["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+            ["nodeSelectorTerms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|term| {
+                term.get("matchExpressions").is_none()
+                    && term["matchFields"].as_array().into_iter().flatten().all(|f| {
+                        f["key"] == "metadata.name" && f["operator"] == "NotIn"
+                    })
+            });
+        let placement_ok = spec.get("nodeName").is_none()
+            && (spec.get("schedulerName").is_none()
+                || spec["schedulerName"] == "default-scheduler")
+            && spec["nodeSelector"] == json!(config.node_selector)
+            && tolerations_ok
+            && anti_ok
+            && affinity.get("podAffinity").is_none()
+            && node_affinity_ok;
+        spec["serviceAccountName"] == json!(config.run_service_account)
             && spec["automountServiceAccountToken"] == false
             && spec["hostUsers"] == false
             && spec.get("hostNetwork").is_none()
             && volumes_ok
+            && claims_ok
             && containers_ok
+            && placement_ok
     }
 
     /// The kubelet, as far as the driver sees it: a pod waits for its Secret, then runs, then
@@ -1030,9 +1088,9 @@ mod tests {
                 }
                 if dry {
                     let accept = match cluster.admission {
-                        Admission::Sound => sound(&seen.body),
+                        Admission::Sound => sound(&cluster.config, &seen.body),
                         Admission::LetsHostPathIn => {
-                            sound(&seen.body)
+                            sound(&cluster.config, &seen.body)
                                 || seen.body["spec"]["volumes"]
                                     .as_array()
                                     .is_some_and(|v| v.iter().any(|v| v.get("hostPath").is_some()))
@@ -1249,7 +1307,8 @@ mod tests {
         }
     }
 
-    async fn start_with(cluster: Cluster, config_value: Value, node: Option<&str>) -> Test {
+    async fn start_with(mut cluster: Cluster, config_value: Value, node: Option<&str>) -> Test {
+        cluster.config = config(&config_value);
         let cluster = Arc::new(Mutex::new(cluster));
         let state = cluster.clone();
         let handler: Handler =

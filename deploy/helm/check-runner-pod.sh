@@ -55,6 +55,54 @@ count() { grep -c -E '^kind: ValidatingAdmissionPolicy(Binding)?$' || true; }
 [ "$(render -f "$chart/ci/runner-pod-init-values.yaml" "${vap[@]}" | count)" = 0 ] \
   || fail "Admission policies with runner.vm.cluster.admission: external"
 
+# The pod policy's rules of placement and of the disk's claim, in every configuration of the
+# two ci/ files: the battery's pods for them (spec.rs, admission_battery) are refused each by
+# its rule only in a cluster, which the kind test shows; here each rule is there, with the
+# configured values in it.
+has_rule() { # <what> <fixed string of the rendered policy>
+  grep -q -F -e "$2" <<< "$policy" || fail "$name: the pod policy lacks its rule on $1 ($2)"
+}
+for name in multus ephemeral init init-emptydir; do
+  case "$name" in
+    multus) args=(-f "$values") ;;
+    ephemeral) args=(-f "$values" --set runner.vm.pod.disk.volume=ephemeral) ;;
+    init) args=(-f "$chart/ci/runner-pod-init-values.yaml" --set runner.vm.cluster.admission=validatingAdmissionPolicy) ;;
+    init-emptydir) args=(-f "$chart/ci/runner-pod-init-values.yaml" --set runner.vm.cluster.admission=validatingAdmissionPolicy
+      --set runner.vm.pod.disk.volume=emptyDir --set runner.vm.pod.disk.storageClassName=) ;;
+  esac
+  policy="$(render "${args[@]}" "${vap[@]}" --show-only templates/run-pod-admission.yaml)"
+  has_rule "a node's name" "request.operation != 'CREATE' || !has(object.spec.nodeName)"
+  has_rule "the scheduler" "object.spec.schedulerName == 'default-scheduler'"
+  has_rule "the nodeSelector" 'object.spec.nodeSelector == {"tinfirm.flowtivo.com/kvm":"true"}'
+  has_rule "the default tolerations" "t.key == 'node.kubernetes.io/not-ready' || t.key == 'node.kubernetes.io/unreachable'"
+  has_rule "the configured toleration" "|| (has(t.key) && t.key == 'tinfirm.flowtivo.com/kvm'"
+  has_rule "the anti-affinity" 't.labelSelector.matchLabels == {"app.kubernetes.io/component":"runner","app.kubernetes.io/instance":"tinfirm","app.kubernetes.io/name":"tinfirm"}'
+  has_rule "the anti-affinity's namespace" 't.namespaceSelector.matchLabels == {"kubernetes.io/metadata.name":"tinfirm"}'
+  has_rule "the anti-affinity's topology" "t.topologyKey == 'kubernetes.io/hostname'"
+  has_rule "a pod affinity" "!has(object.spec.affinity.podAffinity)"
+  has_rule "the node affinity" "f.key == 'metadata.name' && f.operator == 'NotIn'"
+  case "$name" in
+    ephemeral | init)
+      has_rule "one claim" 'object.spec.volumes.filter(v, has(v.ephemeral)).size() == 1'
+      for field in dataSource dataSourceRef volumeName selector; do
+        has_rule "the claim's $field" "!has(v.ephemeral.volumeClaimTemplate.spec.$field)"
+      done
+      has_rule "the claim's access modes" "v.ephemeral.volumeClaimTemplate.spec.accessModes == ['ReadWriteOnce']"
+      has_rule "the claim's volume mode" "v.ephemeral.volumeClaimTemplate.spec.volumeMode == 'Filesystem'"
+      if [ "$name" = init ]; then sizes='["8192Mi"]'; else sizes='["32768Mi","65536Mi"]'; fi
+      has_rule "the claim's size" "&& $sizes.exists(s,"
+      ;;
+    *)
+      grep -q -F 'has(v.ephemeral)' <<< "$policy" && fail "$name: an emptyDir disk, but the pod policy admits a claim"
+      ;;
+  esac
+done
+
+# The driver's Role: network policies listed, never read one by one, created or changed.
+out="$(render -f "$values" --show-only templates/runner-driver-rbac.yaml)"
+grep -A1 -x '    resources: \[networkpolicies\]' <<< "$out" | grep -q -x '    verbs: \[list\]' \
+  || fail "The driver's Role must allow network policies [list] and nothing else"
+
 # The runner pod: its own ServiceAccount, no automatic token, and of the runs' namespace
 # nothing but the projected token.
 out="$(render -f "$values" --show-only templates/runner-deployment.yaml)"
