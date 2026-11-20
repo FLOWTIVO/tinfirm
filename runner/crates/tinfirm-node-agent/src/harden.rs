@@ -322,18 +322,23 @@ pub fn perform(root: &Path, steps: &[Step]) -> (Vec<String>, bool) {
     (lines, ok)
 }
 
-/// What was written must read back as set. `again` is the plan made after the writes of
-/// `planned`: for each step that wrote, the same step must now have nothing to do. One line
-/// for each that would write again, and for each whose setting cannot be read back.
+/// After the writes, every setting must read as the configuration asks. `again` is the plan
+/// made after the writes of `planned`: each step must now have nothing to do. One line for
+/// each that would write, and for each whose setting cannot be read, whatever the step did
+/// the first time. A step that was refused before and is refused still has said why already.
 pub fn not_taken(planned: &[Step], again: &[Step]) -> Vec<String> {
     planned
         .iter()
         .zip(again)
-        .filter(|(first, _)| matches!(first, Step::Write { .. }))
-        .filter_map(|(_, second)| match second {
-            Step::Leave(_) => None,
-            Step::Write { says, .. } => Some(format!("did not take: {says}")),
-            Step::Refuse(why) => Some(format!("written, but it cannot be read back: {why}")),
+        .filter_map(|(first, second)| match (first, second) {
+            (_, Step::Leave(_)) => None,
+            (Step::Refuse(_), Step::Refuse(_)) => None,
+            (Step::Write { .. }, Step::Write { says, .. }) => Some(format!("did not take: {says}")),
+            (_, Step::Write { says, .. }) => Some(format!("changed while harden ran: {says}")),
+            (Step::Write { .. }, Step::Refuse(why)) => {
+                Some(format!("written, but it cannot be read back: {why}"))
+            }
+            (_, Step::Refuse(why)) => Some(format!("cannot be read any more: {why}")),
         })
         .collect()
 }
@@ -641,13 +646,40 @@ mod tests {
                 "written, but it cannot be read back: kernel.modules_disabled not set: not a number",
             ]
         );
-        // A step that wrote nothing is not judged here: its own line said what it found.
-        let refused = [
+        // A step that wrote nothing is judged too: what it found set must still be set.
+        let changed = [
             Step::Leave("a".into()),
-            Step::Refuse("lockdown not set".into()),
+            Step::Refuse("lockdown not set: not readable".into()),
             Step::Leave("c".into()),
         ];
-        assert_eq!(not_taken(&planned, &refused), Vec::<String>::new());
+        assert_eq!(
+            not_taken(&planned, &changed),
+            ["cannot be read any more: lockdown not set: not readable"]
+        );
+        let unset = [
+            Step::Leave("a".into()),
+            write("lockdown is none: set to integrity"),
+            Step::Leave("c".into()),
+        ];
+        assert_eq!(
+            not_taken(&planned, &unset),
+            ["changed while harden ran: lockdown is none: set to integrity"]
+        );
+        // Refused before and refused still: its own line said why, once.
+        let refused_before = [
+            write("kexec"),
+            Step::Refuse("the kernel has no lockdown".into()),
+            Step::Leave("modules".into()),
+        ];
+        let refused_still = [
+            Step::Leave("a".into()),
+            Step::Refuse("the kernel has no lockdown".into()),
+            Step::Leave("c".into()),
+        ];
+        assert_eq!(
+            not_taken(&refused_before, &refused_still),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
