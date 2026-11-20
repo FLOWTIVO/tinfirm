@@ -124,6 +124,9 @@ struct Pending {
     last_req: u64,
     /// `run`'s requests about the sandbox's bridge that wait for their answer, by id.
     answers: HashMap<u64, oneshot::Sender<wire::Reply>>,
+    /// The bridge requests that `run` gave up waiting for, oldest first, at most
+    /// [`MAX_ABANDONED`]: a late answer to one of them is dropped once.
+    abandoned: std::collections::VecDeque<u64>,
     /// The bridge's connections whose `hello` `run` has not yet seen attached: `true` once
     /// `run` admitted it.
     hellos: HashMap<u64, bool>,
@@ -187,6 +190,11 @@ pub enum FrontRequest {
     /// The bridge's session ended.
     SessionEnded,
 }
+
+/// The bridge requests given up on by a timeout whose late answers `run` still takes (and
+/// drops). Past this, the oldest is forgotten, and its answer, should it still come, ends the
+/// front: a front that leaves this many requests unanswered beyond their time is stuck.
+pub const MAX_ABANDONED: usize = 64;
 
 /// The front's requests that wait for their consumer.
 const REQUEST_QUEUE: usize = 64;
@@ -553,20 +561,33 @@ impl FrontHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock(&self.pending).answers.insert(id, tx);
+        let mut timed_out = false;
         let answered = match self.send_all(&make(id), descriptors).await {
             Ok(()) => {
                 tokio::select! {
                     answered = tokio::time::timeout(timeout, rx) => match answered {
                         Ok(Ok(reply)) => Ok(reply),
                         Ok(Err(_)) => Err(anyhow::anyhow!("{}", self.ended().map_or_else(|| "the front ended".to_string(), |e| e.to_string()))),
-                        Err(_) => Err(anyhow::anyhow!("the sandbox's front did not answer within {} s", timeout.as_secs())),
+                        Err(_) => {
+                            timed_out = true;
+                            Err(anyhow::anyhow!("the sandbox's front did not answer within {} s", timeout.as_secs()))
+                        }
                     },
                     ended = self.wait_ended() => Err(anyhow::anyhow!("{ended}")),
                 }
             }
             Err(e) => Err(e),
         };
-        lock(&self.pending).answers.remove(&id);
+        let mut pending = lock(&self.pending);
+        // A request given up on by its timeout may still get its answer, once: its sandbox is
+        // slow, not the front wrong. One whose answer came meanwhile has none to wait for.
+        if pending.answers.remove(&id).is_some() && timed_out {
+            if pending.abandoned.len() >= MAX_ABANDONED {
+                pending.abandoned.pop_front();
+            }
+            pending.abandoned.push_back(id);
+        }
+        drop(pending);
         answered
     }
 
@@ -580,6 +601,11 @@ impl FrontHandle {
     pub fn bridge_waiting(&self) -> (usize, usize) {
         let pending = lock(&self.pending);
         (pending.answers.len(), pending.hellos.len())
+    }
+
+    /// The bridge requests given up on whose late answer `run` would still drop once.
+    pub fn abandoned(&self) -> usize {
+        lock(&self.pending).abandoned.len()
     }
 
     /// One round trip.
@@ -973,8 +999,19 @@ async fn read_loop(
                     let _ = tx.send(reply.clone());
                     continue;
                 }
-                None if *id < next_id.load(Ordering::Relaxed) => continue,
-                None => break Some(format!("an answer to nothing asked ({id})")),
+                None => {
+                    // A late answer to a request `run` gave up on: dropped, and its id
+                    // forgotten. Any other answer is to nothing that waits for one: a request
+                    // never asked, one answered already, or a message of another kind.
+                    if let Some(at) = pending.abandoned.iter().position(|a| a == id) {
+                        pending.abandoned.remove(at);
+                        continue;
+                    }
+                    if *id >= next_id.load(Ordering::Relaxed) {
+                        break Some(format!("an answer to nothing asked ({id})"));
+                    }
+                    break Some(format!("an answer to a request that waits for none ({id})"));
+                }
             }
         }
         let answered = {
@@ -1048,6 +1085,7 @@ async fn read_loop(
     pending.open.clear();
     pending.requests.clear();
     pending.answers.clear();
+    pending.abandoned.clear();
     pending.hellos.clear();
     drop(pending);
     let _ = ended.send(Some(how));

@@ -863,6 +863,31 @@ fn hostile_bridge_front_child() {
             };
             send(&ToMain::Answer { id, reply });
         }
+        "answer-twice" | "late-once" | "late-twice" => {
+            let ToFront::Probe { id, .. } = next(&|m| matches!(m, ToFront::Probe { .. })) else {
+                unreachable!()
+            };
+            if mode != "answer-twice" {
+                // Later than `run` waits.
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+            let times = if mode == "late-once" { 1 } else { 2 };
+            for _ in 0..times {
+                send(&ToMain::Answer {
+                    id,
+                    reply: wire::Reply::Probed { open: Vec::new() },
+                });
+            }
+        }
+        "answer-ping-id" => {
+            let ToFront::Ping { id } = next(&|m| matches!(m, ToFront::Ping { .. })) else {
+                unreachable!()
+            };
+            send(&ToMain::Answer {
+                id,
+                reply: wire::Reply::Done,
+            });
+        }
         other => panic!("no mode {other}"),
     }
     // Stays until `run` ends it.
@@ -1074,4 +1099,81 @@ async fn hostile_first_frames_are_refused_and_the_front_goes_on() {
     let mut io = session.start(shell("echo real")).await.unwrap();
     assert_eq!(drain(&mut io).await.0, "real\n");
     assert_eq!(finish(&session, bridge).await, 0);
+}
+
+/// An answer is taken only for a request that waits for it, or, once, for one that `run` gave
+/// up on by its timeout: a slow front is not ended for its late answer, and a front that
+/// answers twice, answers a late request twice, or answers a ping with a bridge answer is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_answer_is_taken_once_and_any_other_answer_to_nothing_ends_the_front() {
+    let _one = SERIAL.lock().await;
+    let ticket = "t".repeat(64);
+    for (mode, why) in [
+        ("late-once", None),
+        ("answer-twice", Some("waits for none")),
+        ("late-twice", Some("waits for none")),
+        ("answer-ping-id", Some("waits for none")),
+    ] {
+        let front = SandboxFront::start(&hostile_bridge_front(mode, &ticket))
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _registration = front
+            .bridge(
+                &Identity::generate().unwrap(),
+                &host_timing(),
+                Peer::Listen(listener),
+                HOSTILE_RUN,
+                Expected::Ticket(Hidden::new(ticket.clone())),
+            )
+            .await
+            .unwrap();
+        let probe = |id| ToFront::Probe {
+            id,
+            checks: Vec::new(),
+            timeout_ms: 1000,
+        };
+        match mode {
+            "answer-ping-id" => {
+                assert!(front.handle().ping().await.is_err(), "{mode}");
+            }
+            "answer-twice" => {
+                let answered = front
+                    .handle()
+                    .ask(probe, Vec::new(), Duration::from_secs(5))
+                    .await;
+                assert!(answered.is_ok(), "{mode}: {answered:?}");
+            }
+            _ => {
+                let answered = front
+                    .handle()
+                    .ask(probe, Vec::new(), Duration::from_millis(300))
+                    .await;
+                assert!(answered.is_err(), "{mode}: the answer was not late");
+                assert_eq!(front.handle().abandoned(), 1, "{mode}");
+            }
+        }
+        match why {
+            None => {
+                // The late answer comes, is dropped, and its id is forgotten; the front lives.
+                eventually("the late answer is taken", || {
+                    front.handle().abandoned() == 0
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(front.handle().ended().is_none(), "{mode}");
+            }
+            Some(why) => {
+                let how = tokio::time::timeout(WAIT, front.handle().end_watch().wait())
+                    .await
+                    .unwrap_or_else(|_| panic!("{mode}: the front was not ended"));
+                match how {
+                    Ended::Broken(reason) => assert!(reason.contains(why), "{mode}: {reason}"),
+                    other => panic!("{mode}: {other}"),
+                }
+                assert_eq!(front.handle().bridge_waiting(), (0, 0), "{mode}");
+                assert_eq!(front.handle().abandoned(), 0, "{mode}");
+            }
+        }
+    }
 }
