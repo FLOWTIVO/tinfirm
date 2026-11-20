@@ -9,8 +9,8 @@
 # Not done by this role, and not specified yet: the hardening of ADR-0113 decision 5 (kernel
 # lockdown, kernel.modules_disabled, an AppArmor profile for the VMMs); the single machine
 # (ADR-0112 decision 5), which the node agent refuses today; and `verify` trying the node's own
-# egress. Sandbox nodes are not ready for production: no conversation with a real runtime has
-# run through one.
+# egress. Sandbox nodes are not ready for production: a node's hardening and the published VM
+# image are not built.
 
 # --- The node agent's binary -----------------------------------------------------------------
 

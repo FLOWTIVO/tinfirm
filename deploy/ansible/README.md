@@ -9,8 +9,8 @@ Three playbooks:
 | `sandbox-node.yml` | `tinfirm_sandbox_node` | A sandbox node: the node agent, Firecracker, the guest kernel, the VM image and the node's own firewall. It holds no credential |
 
 The last two are not ready for production. The roles ran on machines once (2026-11-20, Ubuntu
-24.04), with runs of a stand-in agent through a node; no conversation with a real runtime has
-run through a node ([below](#sandbox-nodes-and-their-control-host)).
+24.04), with ten conversations with real runtimes through the node; a node's hardening and the
+published VM image are not built ([below](#sandbox-nodes-and-their-control-host)).
 
 ## Runner hosts with Kata Containers
 
@@ -209,10 +209,9 @@ on large workspaces).
 
 ## Sandbox nodes and their control host
 
-> **Not ready for production.** No conversation with a real runtime has run through a sandbox
-> node. The two plays ran on machines once, on 2026-11-20, with runs of the runner host tests'
-> stand-in agent: [Test on two machines](#test-on-two-machines) says what ran and what it found.
-> Use them to prepare and to test.
+> **Not ready for production.** The two plays ran on machines once, on 2026-11-20, on one
+> distribution: [Test on two machines](#test-on-two-machines) says what ran and what it found. A
+> node's hardening and the published VM image are not built. Use them to prepare and to test.
 
 [ADR-0112](../../docs/adr/0112-no-credential-on-a-sandbox-machine.md) splits a runner host with
 VMs in two. The **control host** keeps every credential (the host's token, the runs' git and
@@ -580,8 +579,10 @@ done
 
 Ran once, on 2026-11-20, at commit `bfa9bfd`, on Ubuntu 24.04 machines: a control host
 (2 vCPUs), a node (4 vCPUs, KVM) and a third machine as the management address, in one subnet.
-The runs were those of the runner host tests' stand-in agent, in an image added to the VM image:
-no model and no real runtime. Three defects of the plays were found and are fixed here:
+The first runs were those of the runner host tests' stand-in agent, in an image added to the VM
+image, with no model. Ten conversations with real runtimes (Claude Code and PI) and a model
+followed on the same machines, among them two at once, a cancel, a control host killed during a
+run and a grant withdrawn during a run. Three defects of the plays were found and are fixed here:
 
 - After the node's firewall was loaded, the next task failed with "Timeout (12s) waiting for
   privilege escalation prompt". The firewall drops the node's DNS queries, the cloud image's own
