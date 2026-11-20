@@ -541,6 +541,52 @@ async fn a_host_whose_own_vms_fill_its_nodes_starts_and_one_with_too_few_slots_d
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_the_node_driver_only_own_vms_on_nodes_of_the_template_count_as_room() {
+    use tinfirm_runner_host::vm::{Builtin, Vms};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("driver.log");
+    // Two nodes as the node driver's file names them: `n1` offers the template, `n2` another.
+    let config = dir.path().join("node-driver.json");
+    std::fs::write(
+        &config,
+        json!({"nodes": [
+            {"name": "n1", "socket": "/run/tinfirm-node-agent/n1.sock", "templates": ["sandbox-test"]},
+            {"name": "n2", "socket": "/run/tinfirm-node-agent/n2.sock", "templates": ["other"]},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    // This host's VMs, with the node driver's ids (`<node>:<id>`): one on `n1`, two on `n2`.
+    let own = json!([
+        {"id": "n1:a", "labels": {"tinfirm-host": "host-a"}},
+        {"id": "n2:b", "labels": {"tinfirm-host": "host-a"}},
+        {"id": "n2:c", "labels": {"tinfirm-host": "host-a"}},
+    ])
+    .to_string();
+    let check = |max: u32| {
+        let mut options = vm_options(
+            &log,
+            &[("FAKE_VM_SLOTS", "3"), ("FAKE_VM_LEFTOVERS", own.as_str())],
+        );
+        // The fake driver stands in for the node driver, whose file the host reads.
+        options.driver.builtin = Some(Builtin::Node {
+            config: config.clone(),
+        });
+        let vms = Vms::new(options);
+        async move { vms.check(max, Some("host-a")).await }
+    };
+    // The VMs on `n2` hold no room of the template: one own VM counts, and a ceiling of 3 on
+    // no free slot is refused.
+    let error = format!("{:#}", check(3).await.unwrap_err());
+    assert!(
+        error.contains("room for 0 more VM(s), and this host holds 1 VM(s) of its own"),
+        "{error}"
+    );
+    let (_, _, held) = check(1).await.unwrap();
+    assert_eq!(held, 1);
+}
+
 /// The canonical zip of a skill: `SKILL.md` and a script, deflated.
 fn skill_zip(name: &str) -> Vec<u8> {
     use std::io::Write;

@@ -761,8 +761,27 @@ impl Vms {
         Ok((hello, verified, held))
     }
 
-    /// How many VMs that are not gone carry this host's label.
+    /// How many VMs that are not gone carry this host's label, where the driver's `maxVms`
+    /// counts room. With `--vm-driver node` that is on the nodes that offer the template: the
+    /// driver's `verify` sums the free slots of those alone, and a VM's id names its node
+    /// (`<node>:<id>`), so a VM on a node of other templates is not counted. A node that does
+    /// not answer is in neither: `verify` does not count it, and `list` does not list its VMs.
+    /// A node that reports a problem refuses the start before this counts.
     async fn own_vms(&self, host: &str) -> Result<u32> {
+        let nodes = match &self.options.driver.builtin {
+            Some(Builtin::Node { config }) => {
+                let config = crate::node::NodeConfig::load(config)?;
+                Some(
+                    config
+                        .nodes
+                        .into_iter()
+                        .filter(|node| node.templates.contains(&self.options.template))
+                        .map(|node| node.name)
+                        .collect::<HashSet<String>>(),
+                )
+            }
+            _ => None,
+        };
         let labels = BTreeMap::from([(HOST_LABEL.to_string(), host.to_string())]);
         let count = self
             .driver
@@ -772,6 +791,13 @@ impl Vms {
             // A driver that lists more than asked: only this host's count.
             .filter(|vm| vm.labels.get(HOST_LABEL).map(String::as_str) == Some(host))
             .filter(|vm| vm.state != VmState::Gone)
+            .filter(|vm| {
+                nodes.as_ref().is_none_or(|nodes| {
+                    vm.id
+                        .split_once(':')
+                        .is_some_and(|(node, _)| nodes.contains(node))
+                })
+            })
             .count();
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }

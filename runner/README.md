@@ -804,7 +804,10 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   again with them in place. Only when the room is short does `run` list them (`list`), and the
   refusal says both numbers: "--max-concurrent-runs is 4, but the VM driver `node` has room for 1
   more VM(s), and this host holds 2 VM(s) of its own". A host that has never been welcomed has no
-  VMs of its own. A driver that names no `maxVms` is not checked.
+  VMs of its own. A driver that names no `maxVms` is not checked. With `--vm-driver node` the
+  count is where the room is: only this host's VMs on the nodes that offer `--vm-template` count,
+  since only those nodes' free slots are in `maxVms` (a VM's id names its node). A node that does
+  not answer is in neither number; a node that reports a problem refuses the start before.
 - **Leftovers.** After each connection to the server, this host lists its VMs and deletes those it does
   not hold: after a crash of this host, or a delete that failed. Each VM has the labels `tinfirm-host`
   (this host's id) and `tinfirm-vm` (the VM's own id); the run that takes it is in this host's log.
