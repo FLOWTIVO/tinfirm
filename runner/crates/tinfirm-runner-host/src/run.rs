@@ -827,6 +827,8 @@ pub async fn execute(
                             seq_floor,
                             revoked,
                             collected: false,
+                            // The holder sets it ([`RunGitTokens::make_record`]).
+                            redaction: None,
                         });
                     match made {
                         Ok(record) => sink.keep_record(record),
@@ -1121,6 +1123,21 @@ pub async fn take_back(
     }
     if !secrets.is_empty() {
         shared.add_run_secrets(assign.run_id, assign.epoch, secrets);
+    }
+    // Every token the run has held, those the record no longer holds included (a revoked one,
+    // a GitHub App's earlier ones), by the salted hashes the record keeps: the events, the
+    // host's log lines of the run, and the scans before the push, of the session bundle and
+    // of `/output` find them as they find the live ones.
+    let hashes = tokens.hashes();
+    if !hashes.is_empty() {
+        match crate::secret_hashes::HashedMatcher::new(&hashes) {
+            Ok(matcher) => {
+                shared.add_run_hashed(assign.run_id, assign.epoch, Arc::new(matcher));
+            }
+            Err(e) => {
+                tracing::warn!(run_id = %assign.run_id, error = %format!("{e:#}"), "the record's hashes of the run's earlier git tokens cannot be read; only its live tokens are redacted")
+            }
+        }
     }
     sink.log(
         LogLevel::Warn,

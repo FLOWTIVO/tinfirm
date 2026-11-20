@@ -1062,6 +1062,143 @@ async fn a_run_taken_back_whose_record_cannot_be_marked_keeps_its_sandbox_for_th
     .await;
 }
 
+/// A run whose record, when its host is killed, no longer holds two of the tokens it had: the
+/// server revoked `shop`'s (`TEST_GIT_TOKEN`), and `docs`'s App token (`TEST_APP_TOKEN`) was
+/// renewed. Before the kill the agent's work in `docs` gains a file with `leaked`, one of the
+/// two. Host B takes the run back: the scan before the push finds it by the record's hashes.
+async fn a_token_the_record_no_longer_holds_is_caught_after_a_restart(leaked: &str) {
+    let (shop, docs) = (TestRepo::new(), TestRepo::new());
+    let mut server = FakeServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut host_a = host_process(dir.path(), &server.url, true);
+    let mut conn = server.accept().await;
+    conn.handshake(1).await;
+    let mut spec = AssignSpec::with_workspaces(
+        "rebase",
+        vec![
+            WorkspaceEntry::new("shop", "Shop", &shop.url),
+            WorkspaceEntry::new("docs", "Docs", &docs.url).expiring(
+                TEST_APP_TOKEN,
+                chrono::Utc::now() + chrono::TimeDelta::minutes(5),
+                TEST_MIRROR_KEY,
+            ),
+        ],
+    );
+    spec.protocol_version = 2;
+    spec.prompt_extra = " [commit:shop] [commit:docs] [wait]".into();
+    let (shop_id, docs_id) = (
+        spec.workspaces[0].component_id,
+        spec.workspaces[1].component_id,
+    );
+    conn.send(spec.to_json());
+    let id = spec.run_id.to_string();
+    // The App token is due: host A renews it.
+    let request = conn
+        .take_where("a GIT_TOKEN request", |f| {
+            f["type"] == "run.request" && f["runId"] == id && f["kind"] == "GIT_TOKEN"
+        })
+        .await;
+    conn.send(git_tokens_ack(
+        &request,
+        &[(
+            docs_id,
+            TEST_RENEWED_TOKEN,
+            chrono::Utc::now() + chrono::TimeDelta::minutes(60),
+        )],
+        &[],
+    ));
+    conn.until_agent_says(spec.run_id, "waiting for release")
+        .await;
+    conn.send(git_revoke(spec.run_id, 1, &[shop_id], REVOKED));
+    conn.take_where("the revocation's warning", |f| {
+        f["runId"] == id && f["eventType"] == "LOG" && f["payload"]["message"] == REVOKED
+    })
+    .await;
+    // The record holds neither token, and the renewed one.
+    let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
+    let started = std::time::Instant::now();
+    loop {
+        let text = std::fs::read_to_string(&record).unwrap_or_default();
+        if text.contains(TEST_RENEWED_TOKEN)
+            && !text.contains(TEST_APP_TOKEN)
+            && !text.contains(TEST_GIT_TOKEN)
+        {
+            assert!(text.contains("\"redaction\""), "{text}");
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "{text}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    host_a.kill().unwrap();
+    host_a.wait().unwrap();
+    // The agent's work in `docs` holds the token, uncommitted: the sandbox commits it.
+    let paths =
+        tinfirm_runner_host::paths::Paths::new(dir.path().join("config"), dir.path().join("data"));
+    let workspace = paths.workspace(spec.run_id);
+    let sandbox =
+        PathBuf::from(tinfirm_runner_host::sandbox_files::Layout::local(&workspace).workspace);
+    std::fs::write(
+        sandbox.join("docs").join("notes.txt"),
+        format!("the token: {leaked}\n"),
+    )
+    .unwrap();
+
+    let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+    let mut conn = server.accept().await;
+    conn.handshake_listing(1, SERVER_FEATURES).await;
+    conn.send(json!({"type": "welcome.done"}));
+    // The renewal of every token that expires, after welcome.done.
+    let request = conn
+        .take_where("a GIT_TOKEN request", |f| {
+            f["type"] == "run.request" && f["runId"] == id && f["kind"] == "GIT_TOKEN"
+        })
+        .await;
+    conn.send(git_tokens_ack(
+        &request,
+        &[(
+            docs_id,
+            TEST_RENEWED_TOKEN,
+            chrono::Utc::now() + chrono::TimeDelta::minutes(60),
+        )],
+        &[],
+    ));
+    let t = conn.until_finished(spec.run_id).await;
+    t.assert_no_secrets();
+    let finished = t.finished();
+    assert_eq!(finished["failureClass"], "CREDENTIAL_LEAK", "{}", t.text());
+    assert!(
+        finished["failureMessage"]
+            .as_str()
+            .unwrap()
+            .contains("a commit contains a credential value"),
+        "{finished:#}"
+    );
+    let results = finished["git"].as_array().unwrap();
+    assert!(results.iter().all(|r| r["pushed"] == false), "{finished:#}");
+    assert!(docs.branch_head("agent/TEST-1").is_none());
+    assert!(shop.branch_head("agent/TEST-1").is_none());
+    host.shutdown.cancel();
+    host.handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_token_in_a_commit_of_another_repository_is_caught_after_a_restart() {
+    with_timeout(
+        180,
+        a_token_the_record_no_longer_holds_is_caught_after_a_restart(TEST_GIT_TOKEN),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apps_earlier_token_in_a_commit_is_caught_after_a_restart() {
+    with_timeout(
+        180,
+        a_token_the_record_no_longer_holds_is_caught_after_a_restart(TEST_APP_TOKEN),
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_applied_before_a_restart_is_confirmed_again_after_it() {
     with_timeout(180, async {

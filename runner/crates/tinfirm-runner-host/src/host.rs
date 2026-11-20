@@ -373,6 +373,9 @@ pub struct Shared {
     run_secrets: Mutex<HashMap<(Uuid, i64), Vec<String>>>,
     /// Git proxy secrets of active runs: redacted, but no credentials.
     run_masked: Mutex<HashMap<(Uuid, i64), Vec<String>>>,
+    /// The git tokens of runs taken back that their records keep as salted hashes alone
+    /// (crate::secret_hashes): redacted and scanned for as credentials.
+    run_hashed: Mutex<HashMap<(Uuid, i64), Arc<crate::secret_hashes::HashedMatcher>>>,
     /// The fetch-only git proxy and platform MCP listener, started by the first run.
     git_proxy: tokio::sync::Mutex<Option<GitProxy>>,
     /// The sandbox bridge's listener (ADR-0095), started by the first run with `opts.bridge`.
@@ -480,6 +483,7 @@ impl Shared {
             redactor: RwLock::new(Arc::new(Redactor::default())),
             run_secrets: Mutex::new(HashMap::new()),
             run_masked: Mutex::new(HashMap::new()),
+            run_hashed: Mutex::new(HashMap::new()),
             git_proxy: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
             egress_proxy: tokio::sync::Mutex::new(None),
@@ -518,7 +522,8 @@ impl Shared {
             secrets.extend(values.iter().cloned());
         }
         let masked: Vec<String> = lock(&self.run_masked).values().flatten().cloned().collect();
-        let redactor = Arc::new(Redactor::with_masked(secrets, masked));
+        let hashed = lock(&self.run_hashed).values().cloned().collect();
+        let redactor = Arc::new(Redactor::with_masked(secrets, masked).with_hashed(hashed));
         *self.redactor.write().unwrap_or_else(|e| e.into_inner()) = redactor;
     }
 
@@ -540,9 +545,23 @@ impl Shared {
         self.refresh_redactor();
     }
 
+    /// The tokens a run taken back held before its restart, known by their salted hashes alone
+    /// (crate::secret_hashes): from now on until the run ends they are redacted and scanned for
+    /// as its other credentials are.
+    pub fn add_run_hashed(
+        &self,
+        run_id: Uuid,
+        epoch: i64,
+        hashed: Arc<crate::secret_hashes::HashedMatcher>,
+    ) {
+        lock(&self.run_hashed).insert((run_id, epoch), hashed);
+        self.refresh_redactor();
+    }
+
     fn remove_run_secrets(&self, run_id: Uuid, epoch: i64) {
         lock(&self.run_secrets).remove(&(run_id, epoch));
         lock(&self.run_masked).remove(&(run_id, epoch));
+        lock(&self.run_hashed).remove(&(run_id, epoch));
         self.refresh_redactor();
     }
 
@@ -775,7 +794,8 @@ impl Shared {
         let (stop_tx, stop_rx) = watch::channel(None);
         let steering = Steering::new(run_id, epoch, self.outbox.clone());
         // No token that the server revoked comes back (ADR-0116).
-        let git_tokens = RunGitTokens::restored(&record.assign, &record.revoked);
+        let git_tokens =
+            RunGitTokens::restored(&record.assign, &record.revoked, record.redaction.as_ref());
         // The record on disk is the holder's before the run can get a revocation: one that
         // comes from now on writes it again before the host confirms it.
         let kept = Arc::new(crate::takeback::RecordHandle::kept(

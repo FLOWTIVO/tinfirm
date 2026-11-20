@@ -79,6 +79,12 @@ pub struct RunRecord {
     /// finds no sandbox, and reports the run's work as lost.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub collected: bool,
+    /// The salted hashes of every git token the run has held (crate::secret_hashes): a host
+    /// that takes the run back redacts and scans for its revoked and replaced tokens with
+    /// them, which the record no longer holds. An older host ignores the field; a record
+    /// without it reads as before, and its run's earlier tokens are not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redaction: Option<crate::secret_hashes::SecretHashes>,
 }
 
 impl RunRecord {
@@ -433,11 +439,14 @@ impl RecordHandle {
         self.update(|record| {
             let mut assign = record.assign.clone();
             let revoked = tokens.write_to(&mut assign);
-            if assign == record.assign && revoked == record.revoked {
+            let redaction = Some(tokens.hashes());
+            if assign == record.assign && revoked == record.revoked && redaction == record.redaction
+            {
                 return false;
             }
             record.assign = assign;
             record.revoked = revoked;
+            record.redaction = redaction;
             true
         })
     }
@@ -508,6 +517,7 @@ mod tests {
             seq_floor: SEQ_BLOCK,
             revoked: Vec::new(),
             collected: false,
+            redaction: None,
         }
     }
 
@@ -584,8 +594,21 @@ mod tests {
                 message: "the holder was suspended".into(),
             }]
         );
-        let restored = RunGitTokens::restored(&loaded[0].assign, &loaded[0].revoked);
+        let restored = RunGitTokens::restored(&loaded[0].assign, &loaded[0].revoked, None);
         assert!(restored.authorization(component_id).is_err());
+        // The revoked token is gone from the record, but its salted hashes are there: a host
+        // that takes the run back still finds it, in plain text and in a `Basic` header.
+        let hashes = loaded[0]
+            .redaction
+            .as_ref()
+            .expect("the record keeps hashes");
+        let matcher = crate::secret_hashes::HashedMatcher::new(hashes).unwrap();
+        assert!(matcher.contains(b"pushed revoked-token-0123456789 by mistake"));
+        let header = crate::git_tokens::basic_authorization(
+            "x-access-token",
+            &tinfirm_protocol::Secret::new("revoked-token-0123456789"),
+        );
+        assert!(matcher.contains(header.expose().as_bytes()));
 
         handle.remove();
         handle.numbered(10 * SEQ_BLOCK);
@@ -643,6 +666,37 @@ mod tests {
         // Nothing changes now, but the record on disk is behind: it is written.
         assert!(handle.update(|_| false));
         assert_eq!(records.load_all()[0].session_id.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn a_record_without_hashes_reads_as_before_and_one_with_them_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        // A record of the previous version: no `redaction`.
+        let first = record();
+        records.save(&first).unwrap();
+        let text = std::fs::read_to_string(
+            dir.path()
+                .join(format!("data/runs/{}.json", first.run_id())),
+        )
+        .unwrap();
+        assert!(!text.contains("redaction"), "{text}");
+        let loaded = records.load_all();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].redaction.is_none());
+        // With hashes: written and read back as they are, beside the fields of before.
+        let mut second = record();
+        let mut hashes = crate::secret_hashes::SecretHashes::new();
+        hashes.add("ghs_TESTONLYanearliertoken0123456789abc");
+        second.redaction = Some(hashes.clone());
+        records.save(&second).unwrap();
+        let loaded = records.load_all();
+        let kept = loaded
+            .iter()
+            .find(|r| r.run_id() == second.run_id())
+            .unwrap();
+        assert_eq!(kept.redaction.as_ref(), Some(&hashes));
     }
 
     #[test]

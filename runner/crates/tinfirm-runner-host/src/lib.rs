@@ -48,6 +48,7 @@ pub mod runtime_env;
 pub mod sandbox;
 pub mod sandbox_files;
 pub mod secret_eq;
+pub mod secret_hashes;
 pub mod secure_fs;
 #[path = "../../../../ee/runner/tinfirm-runner-host/src/session_bundles.rs"]
 pub mod session_bundles;

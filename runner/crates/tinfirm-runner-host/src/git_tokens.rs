@@ -40,6 +40,7 @@ use tinfirm_protocol::{GitCredentials, GitToken, LogLevel, RunAssign, Secret, Wo
 use uuid::Uuid;
 
 use crate::run::EventSink;
+use crate::secret_hashes::SecretHashes;
 use crate::takeback::{RecordHandle, Records, RunRecord};
 
 /// Why a repository's token is gone: the server's reason code and its message for the run's
@@ -151,6 +152,9 @@ pub struct RunGitTokens {
     /// The take-back record while the run's sandbox lives (ADR-0101).
     record: Mutex<Option<Arc<RecordHandle>>>,
     log: Mutex<Log>,
+    /// The salted hashes of every token the run has held, revoked and replaced ones included,
+    /// which its take-back record keeps (crate::secret_hashes).
+    hashes: Mutex<SecretHashes>,
 }
 
 impl std::fmt::Debug for RunGitTokens {
@@ -179,23 +183,35 @@ pub fn basic_authorization(username: &str, token: &Secret) -> Secret {
 impl RunGitTokens {
     /// The tokens of `assign`'s repositories, as the server sent them.
     pub fn new(assign: &RunAssign) -> Arc<RunGitTokens> {
-        RunGitTokens::of(assign.run_id, assign.epoch, &assign.workspaces, &[])
+        RunGitTokens::of(assign.run_id, assign.epoch, &assign.workspaces, &[], None)
     }
 
     /// The tokens of a run that this host takes back (ADR-0101): those of the record's
-    /// assignment, and none for the repositories it names as revoked.
-    pub fn restored(assign: &RunAssign, revoked: &[RevokedRepository]) -> Arc<RunGitTokens> {
-        RunGitTokens::of(assign.run_id, assign.epoch, &assign.workspaces, revoked)
+    /// assignment, and none for the repositories it names as revoked. `hashes` are those the
+    /// record keeps of every token the run has held; a record without them starts new ones.
+    pub fn restored(
+        assign: &RunAssign,
+        revoked: &[RevokedRepository],
+        hashes: Option<&SecretHashes>,
+    ) -> Arc<RunGitTokens> {
+        RunGitTokens::of(
+            assign.run_id,
+            assign.epoch,
+            &assign.workspaces,
+            revoked,
+            hashes.cloned(),
+        )
     }
 
     /// A holder of no repository (tests).
     pub fn new_empty(run_id: Uuid, epoch: i64) -> Arc<RunGitTokens> {
-        RunGitTokens::of(run_id, epoch, &[], &[])
+        RunGitTokens::of(run_id, epoch, &[], &[], None)
     }
 
     /// A holder of one repository's token alone, outside any run (tests and tools).
     pub fn standalone(spec: &WorkspaceSpec) -> RepoTokens {
-        RunGitTokens::of(Uuid::nil(), 0, std::slice::from_ref(spec), &[]).repo(spec.component_id)
+        RunGitTokens::of(Uuid::nil(), 0, std::slice::from_ref(spec), &[], None)
+            .repo(spec.component_id)
     }
 
     fn of(
@@ -203,7 +219,14 @@ impl RunGitTokens {
         epoch: i64,
         workspaces: &[WorkspaceSpec],
         revoked: &[RevokedRepository],
+        hashes: Option<SecretHashes>,
     ) -> Arc<RunGitTokens> {
+        let mut hashes = hashes.unwrap_or_default();
+        // The token alone: its `Basic` header holds the token's base64, which the token's own
+        // forms match, so the header's forms would only give more away.
+        for git in workspaces.iter().filter_map(|ws| ws.git.as_ref()) {
+            hashes.add(git.token.expose());
+        }
         let entries = workspaces
             .iter()
             .map(|ws| {
@@ -231,6 +254,7 @@ impl RunGitTokens {
             entries: Mutex::new(entries),
             record: Mutex::new(None),
             log: Mutex::new(Log::Waiting(Vec::new())),
+            hashes: Mutex::new(hashes),
         })
     }
 
@@ -357,6 +381,14 @@ impl RunGitTokens {
                 secrets.push(held.authorization.expose().to_string());
             }
         }
+        {
+            // The new tokens (each the first of its pair) join the hashes of every token the
+            // run has held; the old ones stay there.
+            let mut hashes = lock(&self.hashes);
+            for token in secrets.iter().step_by(2) {
+                hashes.add(token);
+            }
+        }
         if !secrets.is_empty() {
             tracing::info!(run_id = %self.run_id, epoch = self.epoch, repositories = secrets.len() / 2, "renewed git tokens of the run");
             self.sync_record();
@@ -446,7 +478,9 @@ impl RunGitTokens {
         let mut slot = lock(&self.record);
         let mut kept = assign.clone();
         let revoked = self.write_to(&mut kept);
-        let record = Arc::new(RecordHandle::create(records, build(kept, revoked))?);
+        let mut record = build(kept, revoked);
+        record.redaction = Some(self.hashes());
+        let record = Arc::new(RecordHandle::create(records, record)?);
         *slot = Some(record.clone());
         Ok(record)
     }
@@ -458,6 +492,11 @@ impl RunGitTokens {
     pub fn keep_record(&self, record: Arc<RecordHandle>) {
         *lock(&self.record) = Some(record);
         self.sync_record();
+    }
+
+    /// The salted hashes of every token the run has held, as the take-back record keeps them.
+    pub fn hashes(&self) -> SecretHashes {
+        lock(&self.hashes).clone()
     }
 
     /// The record is gone with the sandbox.
@@ -672,7 +711,7 @@ mod tests {
         assert!(!serde_json::to_string(&view).unwrap().contains("token-of-a"));
 
         // A host that restarts with that record does not take the token back.
-        let restored = RunGitTokens::restored(&view, &named);
+        let restored = RunGitTokens::restored(&view, &named, None);
         assert_eq!(restored.revocation(ids[0]).unwrap().message, "no more");
         assert!(restored.authorization(ids[1]).unwrap().is_some());
     }
@@ -819,6 +858,7 @@ mod tests {
                         seq_floor: 1000,
                         revoked,
                         collected: false,
+                        redaction: None,
                     }
                 })
                 .unwrap();

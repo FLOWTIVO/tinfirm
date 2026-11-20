@@ -644,6 +644,33 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     whole and 0600, without the token and with the repository in its `revoked` list (the
     server's reason and message). A host that takes the run back then neither uses that token
     nor pushes the repository.
+  - **Redaction after a restart.** A token that the record no longer holds (a revoked one, a
+    GitHub App's token that a renewal replaced) must still be redacted and found by the scans
+    once the host restarts. So the record also keeps, in `redaction`, salted hashes of every
+    token the run has held, live ones included: one path for all of them, written whenever a
+    token enters the run. For each form in which the redactor matches a token (the raw value,
+    its URL encoding, its base64 at each of the three byte alignments in both alphabets: 5 to
+    8 forms of a GitHub token), it keeps the form's length, the top 12 bits of a rolling hash
+    of the form (a polynomial hash modulo 2^64 whose base the record's salt gives) and
+    SHA-256 over the record's salt (32 random bytes, one per record) and the form. A run taken
+    back slides a window of each length over what it scans, and hashes a window with the salt
+    only where the 12 bits match. Its events, the host's own log lines of the run, the scan of
+    the outgoing commits before the push (`CREDENTIAL_LEAK`), the session bundle's scan and
+    the `/output` scan find those tokens as they find the live ones. A token's `Basic` header
+    holds its base64, which these forms match, so the headers are not kept. A record without
+    `redaction` (an earlier version's) is read as before, and the previous version reads one
+    with it, ignoring the field.
+  - **What the hashes give away.** Someone who reads the record learns, of a token that is no
+    longer in it, its length and at most 12 bits per stored form from the rolling hashes: at
+    most 60 to 96 bits for 5 to 8 forms, if all of them could be used together, which no method
+    known to us does for forms in different encodings. The salted SHA-256 lets them test one
+    guess at a time, for this record only. A GitHub token has 30 random characters (about 178
+    bits; its last 6 are a checksum), so at least about 82 bits stay unknown even in that worst
+    case, beyond any search; a token with less entropy (GitLab's `glpat-` tokens have 20
+    characters, about 119 bits) keeps less in that worst case. The live tokens are in the
+    record in plain text, as before. The cost: a scan of 200 MiB of pack-like bytes for ten
+    tokens took 1.1 to 1.2 s by value and 1.6 to 1.8 s by their hashes alone (release build,
+    4 CPUs), so a run taken back scans its commits about 2.5 times as long as before.
   - A host that took a run back uses none of the run's git tokens and pushes nothing before this
     process has been welcomed by the server. A server that lists `run.git.revoke` in
     `welcome.features` sends `welcome.done` last, after every revocation (and cancel) it keeps for
