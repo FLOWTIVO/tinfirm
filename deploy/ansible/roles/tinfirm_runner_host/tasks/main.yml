@@ -37,9 +37,11 @@
     - tinfirm_runner_host_images_build | bool
     - not (_tinfirm_runner_host_vm | bool)
 
-- name: Run the runner host as a systemd service
-  ansible.builtin.import_tasks: service.yml
-
+# Before the service: a control host is not started, and one that runs is stopped, while its
+# user reaches a Docker socket.
 - name: Check that the control host's user reaches no Docker
   ansible.builtin.import_tasks: proof.yml
   when: _tinfirm_runner_host_vm | bool
+
+- name: Run the runner host as a systemd service
+  ansible.builtin.import_tasks: service.yml

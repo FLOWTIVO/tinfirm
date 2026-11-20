@@ -1,7 +1,9 @@
 ---
-# The end of a control host's play: its user reaches no Docker (ADR-0112 decision 3). Asked as
-# that user: it is in no docker group, and no Docker or containerd socket answers it, the
-# rootless one included.
+# Before a control host's service is started: its user reaches no Docker (ADR-0112 decision 3).
+# Asked as that user: it is in no docker group, and no Docker or containerd socket answers it,
+# the rootless one included, which the checks at the play's start do not see. When one answers,
+# the host is not started, and a host that already runs is stopped (SIGTERM: its runs are
+# cancelled and their work is pushed), since it holds every run's credentials.
 - name: Read the runner host user's groups
   ansible.builtin.command:
     argv: [id, -nG, "{{ tinfirm_runner_host_user }}"]
@@ -35,6 +37,20 @@
   register: _tinfirm_runner_host_sockets
   changed_when: false
 
+- name: Look for a runner host that runs
+  ansible.builtin.stat:
+    path: /etc/systemd/system/tinfirm-runner-host.service
+    get_checksum: false
+  register: _tinfirm_runner_host_proof_unit
+
+- name: Stop a runner host whose user reaches Docker
+  ansible.builtin.systemd_service:
+    name: tinfirm-runner-host
+    state: stopped
+  when:
+    - _tinfirm_runner_host_proof_unit.stat.exists
+    - "'docker' in (_tinfirm_runner_host_groups.stdout | split) or (_tinfirm_runner_host_sockets.stdout | trim | length > 0)"
+
 - name: Fail when the runner host's user reaches Docker
   ansible.builtin.assert:
     that:
@@ -44,5 +60,6 @@
       {{ tinfirm_runner_host_user }} reaches Docker on this control host (groups:
       {{ _tinfirm_runner_host_groups.stdout | trim }}; {{ _tinfirm_runner_host_sockets.stdout_lines | join(', ') }}).
       A control host holds every run's credentials and must run no Docker socket (ADR-0112 decision 3).
+      The runner host was not started, and was stopped if it ran.
     success_msg: "{{ tinfirm_runner_host_user }} reaches no Docker socket."
     quiet: false

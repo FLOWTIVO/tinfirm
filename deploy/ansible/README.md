@@ -260,11 +260,12 @@ The role `tinfirm_runner_host` with `tinfirm_runner_host_executor: vm`, which th
 6. asks every node of that file through the driver, as the runner host's user: `tinfirm-runner-host vm-driver
    node` with a `verify` of `tinfirm_runner_host_vm_template`, which is what `run` asks at its
    start. A node that names a problem fails the play;
-7. installs the unit with `run --executor vm --vm-driver node --vm-template … --vm-port …`, the
+7. checks, as the runner host's user, that it is in no `docker` group and that no Docker or
+   containerd socket answers it, the rootless one included, which the first checks do not see.
+   Either fails the play before the host is started, and stops a host that already runs;
+8. installs the unit with `run --executor vm --vm-driver node --vm-template … --vm-port …`, the
    `--vm-probe`, `--egress-allow` and `--sandbox-env` settings and `--sandbox-docker`, sandboxed as
-   above, and starts it. The bridge and the egress proxy are always on with `--executor vm`;
-8. ends with the check that the runner host's user is in no `docker` group and that no Docker or
-   containerd socket answers it, the rootless one included. Either fails the play.
+   above, and starts it. The bridge and the egress proxy are always on with `--executor vm`.
 
 The control host still runs the reader of what a sandbox sends back in a confined process, which
 needs Linux 5.19 or later with Landlock enabled at boot (runner/README.md, "The reader"); `run`
