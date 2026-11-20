@@ -888,6 +888,25 @@ fn hostile_bridge_front_child() {
                 reply: wire::Reply::Done,
             });
         }
+        "tunnel-other-ip" | "tunnel-port-0" => {
+            open(&mut send);
+            let ToFront::OpenTunnels { id, .. } =
+                next(&|m| matches!(m, ToFront::OpenTunnels { .. }))
+            else {
+                unreachable!()
+            };
+            let addr = if mode == "tunnel-other-ip" {
+                "127.0.0.9:4000"
+            } else {
+                "127.0.0.1:0"
+            };
+            send(&ToMain::Answer {
+                id,
+                reply: wire::Reply::Listening {
+                    addrs: vec![addr.parse().unwrap()],
+                },
+            });
+        }
         other => panic!("no mode {other}"),
     }
     // Stays until `run` ends it.
@@ -910,6 +929,8 @@ async fn a_front_that_breaks_the_bridges_rules_is_ended_and_leaves_nothing_in_ru
         ("exec-not-text", "not text"),
         ("probe-unasked", "not asked"),
         ("wrong-kind", "answered a command with `reclaimed`"),
+        ("tunnel-other-ip", "other addresses than asked"),
+        ("tunnel-port-0", "other addresses than asked"),
     ];
     for (mode, why) in cases {
         let front = SandboxFront::start(&hostile_bridge_front(mode, &ticket))
@@ -950,6 +971,20 @@ async fn a_front_that_breaks_the_bridges_rules_is_ended_and_leaves_nothing_in_ru
                         .map(|_| ())
                 };
                 assert!(asked.is_err(), "{mode}: the answer was taken");
+                Box::new(move || session.admitted_waiting())
+            }
+            "tunnel-other-ip" | "tunnel-port-0" => {
+                let mut session = registration.connected(WAIT).await.unwrap();
+                let asked = session
+                    .open_tunnels(
+                        &[(
+                            "127.0.0.1:0".parse().unwrap(),
+                            tinfirm_runner_host::front::wire::Service::Egress,
+                        )],
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                assert!(asked.is_err(), "{mode}: the addresses were taken");
                 Box::new(move || session.admitted_waiting())
             }
             "exited-twice" => {

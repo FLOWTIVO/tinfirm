@@ -482,11 +482,16 @@ impl FrontSession {
             .context("the sandbox cannot listen for its tunnels")?;
         match reply {
             Reply::Listening { addrs } => {
+                // Exactly what was asked: the asked address, or for a port 0 the asked IP on a
+                // port that the sandbox got.
                 let fits = addrs.len() == tunnels.len()
-                    && addrs
-                        .iter()
-                        .zip(tunnels)
-                        .all(|(got, (asked, _))| asked.port() == 0 || got == asked);
+                    && addrs.iter().zip(tunnels).all(|(got, (asked, _))| {
+                        if asked.port() == 0 {
+                            got.ip() == asked.ip() && got.port() != 0
+                        } else {
+                            got == asked
+                        }
+                    });
                 if !fits {
                     let why = "the front answered the tunnels with other addresses than asked";
                     self.front.handle().break_wire(why.to_string());
