@@ -21,7 +21,7 @@
 # image's (Dockerfile); change them together.
 
 # ---- 1. Toolchain: Rust with clippy and rustfmt, Node ----------------------------------
-FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS toolchain
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS toolchain
 # The end-to-end tests start the fake ACP agent with Node, and run the pi adapter's tests.
 COPY --from=node:24-trixie-slim@sha256:54f84b4cf8432b21aaffd5d3ce8d41e12cea0d10d33c09d2f3c9879d49d6b446 /usr/local/bin/node /usr/local/bin/node
 RUN rustup component add clippy rustfmt \
