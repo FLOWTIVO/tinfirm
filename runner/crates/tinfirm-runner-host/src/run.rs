@@ -680,9 +680,25 @@ pub async fn execute(
         None => (bridged && shared.opts.executor.on_this_machine())
             .then(|| crate::bridge::local_sandbox_loopback().to_string()),
     };
+    // One front per sandbox serves its listeners' HTTP on a host with the bridge: a VM's
+    // came with its egress listener; any other's comes with the first listener it needs, which
+    // is the run's own git listener for its fetches and platform tools.
+    let mut front = claimed
+        .as_ref()
+        .and_then(|vm| vm.egress.as_ref())
+        .and_then(|egress| egress.sandbox_front().cloned());
     // The sandbox's way to fetch and to the platform tools; dropping it (at the latest when
     // this function returns) removes the run's routes from the listener.
-    let mut access = sandbox_access(shared, &mut sink, assign, &repos, roots, sandbox_host).await;
+    let mut access = sandbox_access(
+        shared,
+        &mut sink,
+        assign,
+        &repos,
+        roots,
+        sandbox_host,
+        &mut front,
+    )
+    .await;
     let mut phase = None;
     if stop_rx.borrow().is_none() && failure.0.is_none() {
         if !starting {
@@ -690,12 +706,6 @@ pub async fn execute(
         }
         // A gateway's key stays on the host (the model proxy is always on): the runtime gets the
         // run's model proxy as its base URL and a dummy key.
-        // One front per sandbox serves its listeners' HTTP on a host with the bridge: a VM's
-        // came with its egress listener; any other's comes with the first listener it needs.
-        let mut front = claimed
-            .as_ref()
-            .and_then(|vm| vm.egress.as_ref())
-            .and_then(|egress| egress.sandbox_front().cloned());
         let model_proxy = start_model_proxy(
             shared,
             &mut sink,
@@ -1825,6 +1835,9 @@ struct SandboxAccess {
     egress: Option<EgressGuard>,
     /// The run's model proxy listener, when its model access is a gateway.
     model_proxy: Option<ModelProxyGuard>,
+    /// The run's own listener of the git proxy and the platform tools, which its sandbox's
+    /// front serves on a host with the bridge; `None` where the shared listener serves them.
+    git_listener: Option<crate::git_proxy::FrontListenerGuard>,
     /// The sandbox's front, which serves the listeners' HTTP on a host with the bridge; it
     /// ends with the run's access (and its listeners' guards).
     front: Option<Arc<crate::front::sandbox::SandboxFront>>,
@@ -2042,6 +2055,7 @@ async fn sandbox_access(
     repos: &[Repo<'_>],
     file_roots: Vec<FileRoot>,
     sandbox_host: Option<String>,
+    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
 ) -> SandboxAccess {
     let mut access = SandboxAccess {
         sandbox_host,
@@ -2069,6 +2083,26 @@ async fn sandbox_access(
         }
     };
     access.extra_hosts = proxy.endpoint().extra_hosts.clone();
+    // On a host with the bridge the run gets a listener of its own, which its sandbox's front
+    // serves: the front reads the sandbox's requests, and this process attaches the tokens.
+    let proxy = match run_listener(shared, &proxy, front).await {
+        Ok(Some((own, guard))) => {
+            access.git_listener = Some(guard);
+            own
+        }
+        Ok(None) => proxy,
+        Err(e) => {
+            let error = sink.redact(&format!("{e:#}"));
+            tracing::warn!(run_id = %assign.run_id, %error, "the sandbox's front cannot serve its git proxy");
+            sink.log(
+                LogLevel::Warn,
+                format!(
+                    "the Tinfirm platform tools and git fetch are not available in this run: {error}"
+                ),
+            );
+            return access;
+        }
+    };
     for repo in repos {
         let host = access.sandbox_host.as_deref();
         if let Some(route) = route_git_proxy(shared, sink, &proxy, repo, assign, host).await {
@@ -2116,7 +2150,41 @@ async fn sandbox_access(
             );
         }
     }
+    if let Err(e) = proxy.publish().await {
+        let error = sink.redact(&format!("{e:#}"));
+        tracing::warn!(run_id = %assign.run_id, %error, "the sandbox's front did not get its routes");
+        sink.log(
+            LogLevel::Warn,
+            format!(
+                "the Tinfirm platform tools and git fetch are not available in this run: {error}"
+            ),
+        );
+    }
     access
+}
+
+/// The run's own listener of the git proxy and the platform tools in its sandbox's front, on a
+/// host with the bridge (the front starts here if the sandbox has none yet); `Ok(None)`
+/// elsewhere, where the shared listener serves the run.
+async fn run_listener(
+    shared: &Arc<Shared>,
+    shared_proxy: &GitProxy,
+    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
+) -> anyhow::Result<Option<(GitProxy, crate::git_proxy::FrontListenerGuard)>> {
+    if front.is_none() {
+        *front = shared.sandbox_front().await?;
+    }
+    let Some(front) = front.as_ref() else {
+        return Ok(None);
+    };
+    let (proxy, guard) = GitProxy::start_in_front(
+        shared_proxy.endpoint().clone(),
+        shared.opts.allow_insecure_repo_urls,
+        crate::git_proxy::ListenerLimits::default(),
+        front,
+    )
+    .await?;
+    Ok(Some((proxy, guard)))
 }
 
 /// Registers one repository with the git proxy and points its `origin` at it, so the agent
@@ -2212,10 +2280,15 @@ async fn start_sandbox(
     // The listeners the run uses, on this host's loopback: the sandbox reaches each through a
     // tunnel on its own loopback, at the same port.
     let mut listeners = Vec::new();
-    if (access.mcp.is_some() || !access.routes.is_empty())
-        && let Some(proxy) = shared.git_proxy().await?
-    {
-        listeners.push(proxy.local_addr());
+    if access.mcp.is_some() || !access.routes.is_empty() {
+        match &access.git_listener {
+            Some(own) => listeners.push(own.local_addr()),
+            None => {
+                if let Some(proxy) = shared.git_proxy().await? {
+                    listeners.push(proxy.local_addr());
+                }
+            }
+        }
     }
     listeners.extend(access.model_proxy.as_ref().map(|m| m.local_addr()));
     listeners.extend(access.egress.as_ref().map(|e| e.local_addr()));

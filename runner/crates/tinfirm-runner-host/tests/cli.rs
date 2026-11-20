@@ -1594,7 +1594,7 @@ fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
     // Without the bridge, `run` starts no front: a note.
     assert!(
         report.contains("[info] front: cannot be confined here")
-            && report.contains("`run` starts one per sandbox for its egress and model proxies"),
+            && report.contains("`run` starts one per sandbox for its git proxy"),
         "{report}"
     );
     assert!(

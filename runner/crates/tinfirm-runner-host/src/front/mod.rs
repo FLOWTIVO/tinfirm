@@ -8,8 +8,10 @@
 //! (`--sandbox-bridge` or a VM per run), with the sandbox's first proxy listener
 //! ([`sandbox::SandboxFront`]): the front parses the HTTP of the sandbox's egress proxy and
 //! copies its tunnels, while `run` decides and makes each connection ([`crate::egress_proxy`]);
-//! and it reads the sandbox's model requests, which `run` checks again and sends on with the
-//! key ([`crate::model_proxy`]). The git proxy, the platform tools and the bridge follow.
+//! it reads the sandbox's model requests, which `run` checks again and sends on with the
+//! key ([`crate::model_proxy`]); and it reads the fetches and tool calls of the run's own
+//! listener of the git proxy and the platform tools, which `run` checks again and answers with
+//! the run's tokens and tools ([`crate::git_proxy`]). The bridge follows.
 //! `front --probe JOB` confines itself as a front does
 //! ([`crate::confine::Profile::Front`]) and then tries what a front must be refused, and answers
 //! one line of JSON on stdout ([`Probe`]). `doctor` runs it ([`probe`]). `front` alone serves
@@ -44,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::confine::{self, Plan, Status};
 
 pub mod handle;
+pub mod head;
 pub mod sandbox;
 mod serve;
 pub mod wire;

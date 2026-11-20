@@ -52,8 +52,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
@@ -2096,13 +2096,27 @@ fn plain(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     response
 }
 
+/// A request body of at most [`MAX_BODY`] bytes: `None` when it is longer, or broke.
+async fn read_bounded(mut body: crate::front::head::ProxyBody) -> Option<Bytes> {
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.ok()?.into_data() {
+            if out.len() + data.len() > MAX_BODY {
+                return None;
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Some(Bytes::from(out))
+}
+
 /// Serves one HTTP request to a run's MCP endpoint.
 /// `body_timeout` bounds the read of the request body from the end of its headers (M5 of
 /// the security review of 2026-10-27: a sandbox that sends a body slowly holds no request
 /// slot of its run for long).
 pub async fn handle_http(
     tools: Arc<RunTools>,
-    req: Request<Incoming>,
+    req: Request<crate::front::head::ProxyBody>,
     body_timeout: std::time::Duration,
 ) -> Response<Full<Bytes>> {
     // Agents do not send Origin; browsers always do. No page may talk to this endpoint.
@@ -2119,14 +2133,9 @@ pub async fn handle_http(
             .insert(header::ALLOW, HeaderValue::from_static("POST"));
         return response;
     }
-    let body = match tokio::time::timeout(
-        body_timeout,
-        Limited::new(req.into_body(), MAX_BODY).collect(),
-    )
-    .await
-    {
-        Ok(Ok(body)) => body.to_bytes(),
-        Ok(Err(_)) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large"),
+    let body = match tokio::time::timeout(body_timeout, read_bounded(req.into_body())).await {
+        Ok(Some(body)) => body,
+        Ok(None) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large"),
         Err(_) => {
             return plain(
                 StatusCode::REQUEST_TIMEOUT,

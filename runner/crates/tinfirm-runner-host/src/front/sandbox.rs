@@ -14,8 +14,9 @@
 //! - **egress:** a destination that the front asks for is decided and connected by the egress
 //!   proxy's broker, and the connection's descriptor goes to the front, which holds it until it
 //!   says it ended; its place among the run's 256 is held until then;
-//! - **model:** a request's head is checked again and sent on with the key by the model proxy's
-//!   run half (crate::model_proxy). Its body comes on a socket pair of its own, which `run`
+//! - **model, git and platform tools:** a request's head is checked again and sent on with the
+//!   key or the run's git token, or answered by the run's tools, by the run half of the model
+//!   proxy or of the git proxy (crate::model_proxy, crate::git_proxy). Its body comes on a socket pair of its own, which `run`
 //!   makes for each request: the front writes the request's body on it, `run` writes the
 //!   answer's body back, and the kernel holds either side back when the other does not read.
 //!   The control channel carries only the heads and the ends. A request ends with `run`'s
@@ -36,9 +37,11 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::handle::{FrontCommand, FrontHandle, FrontRequest};
+use super::head::{Backend, BoxError, ProxyBody, RequestHead};
+use super::wire::{FrontLimits, GitRouteSpec, McpRouteSpec};
 use super::wire::{Service, ToFront};
 use crate::egress_proxy::{Connector, Refusal};
-use crate::model_proxy::{BoxError, ModelApi, ModelBackend, ProxyBody, RequestHead};
+use crate::model_proxy::ModelApi;
 
 /// How much of a body one read takes.
 const CHUNK: usize = 64 * 1024;
@@ -55,10 +58,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 struct Router {
     egress: Mutex<Option<Arc<dyn Connector>>>,
-    model: Mutex<Option<Arc<dyn ModelBackend>>>,
+    model: Mutex<Option<Arc<dyn Backend>>>,
+    /// The run's git proxy and platform tools.
+    git: Mutex<Option<Arc<dyn Backend>>>,
     /// The connections given to the front, each with its place, until it says they ended.
     held: Mutex<HashMap<u64, Box<dyn Send + Sync>>>,
-    /// The model requests being answered, by id.
+    /// The requests being answered (of the model proxy, the git proxy and the platform
+    /// tools), by id.
     requests: Mutex<HashMap<u64, Answering>>,
     /// The tasks that answer requests, alive now.
     tasks: Arc<AtomicUsize>,
@@ -66,8 +72,9 @@ struct Router {
     served: Mutex<std::collections::HashSet<Service>>,
 }
 
-/// A model request that `run` answers.
+/// A request that `run` answers.
 struct Answering {
+    service: Service,
     /// Resolved when the front says the request body is whole.
     body_end: Option<oneshot::Sender<()>>,
     /// Cancelled when the front gives the request up, or the listener closes.
@@ -135,6 +142,7 @@ impl SandboxFront {
                 match service {
                     Service::Egress => "egress",
                     Service::Model => "model",
+                    Service::Git => "git proxy",
                 }
             );
         }
@@ -165,7 +173,7 @@ impl SandboxFront {
         secret: String,
         api: ModelApi,
         base_path: String,
-        backend: Arc<dyn ModelBackend>,
+        backend: Arc<dyn Backend>,
     ) -> Result<()> {
         self.first(Service::Model)?;
         *lock(&self.router.model) = Some(backend);
@@ -182,6 +190,37 @@ impl SandboxFront {
             .await
     }
 
+    /// The front serves a run's git proxy and platform tools on `listener`, within `limits`,
+    /// for the routes that [`SandboxFront::git_routes`] gives it; `backend` answers each request
+    /// it lets through.
+    pub(crate) async fn listen_git(
+        &self,
+        listener: TcpListener,
+        limits: FrontLimits,
+        backend: Arc<dyn Backend>,
+    ) -> Result<()> {
+        self.first(Service::Git)?;
+        *lock(&self.router.git) = Some(backend);
+        let listener = OwnedFd::from(listener.into_std()?);
+        self.handle
+            .send(&ToFront::ListenGit { limits }, Some(listener))
+            .await
+    }
+
+    /// The run's routes as they are now, for the front's git listener; returns once the front
+    /// has them (a round trip after them, which the front answers in order), so that a request
+    /// that follows finds them.
+    pub(crate) async fn git_routes(
+        &self,
+        routes: Vec<GitRouteSpec>,
+        mcp: Vec<McpRouteSpec>,
+    ) -> Result<()> {
+        self.handle
+            .send(&ToFront::GitRoutes { routes, mcp }, None)
+            .await?;
+        self.handle.ping().await
+    }
+
     /// The listener of `service` closes: `run` answers none of its requests from now on, ends
     /// those it answers, and tells the front to stop serving it.
     pub(crate) fn unlisten(self: &Arc<Self>, service: Service) {
@@ -190,10 +229,15 @@ impl SandboxFront {
                 lock(&self.router.egress).take();
                 lock(&self.router.held).clear();
             }
-            Service::Model => {
-                lock(&self.router.model).take();
+            Service::Model | Service::Git => {
+                match service {
+                    Service::Model => lock(&self.router.model).take(),
+                    _ => lock(&self.router.git).take(),
+                };
                 for answering in lock(&self.router.requests).values() {
-                    answering.stop.cancel();
+                    if answering.service == service {
+                        answering.stop.cancel();
+                    }
                 }
             }
         }
@@ -276,12 +320,17 @@ async fn dispatch(
                 lock(&router.held).remove(&req);
             }
             FrontRequest::Request { req, head } => {
-                let backend = lock(&router.model).clone();
+                let service = head.target.service();
+                let backend = match service {
+                    Service::Model => lock(&router.model).clone(),
+                    _ => lock(&router.git).clone(),
+                };
                 let (body_end, body_end_rx) = oneshot::channel();
                 let stop = CancellationToken::new();
                 lock(&router.requests).insert(
                     req,
                     Answering {
+                        service,
                         body_end: Some(body_end),
                         stop: stop.clone(),
                     },
@@ -307,14 +356,16 @@ async fn dispatch(
                     answering.stop.cancel();
                 }
             }
-            FrontRequest::Declined { service, why } => match service {
-                Service::Model => {
-                    if let Some(backend) = lock(&router.model).clone() {
-                        backend.declined(why);
-                    }
+            FrontRequest::Declined { service, why } => {
+                let backend = match service {
+                    Service::Model => lock(&router.model).clone(),
+                    Service::Git => lock(&router.git).clone(),
+                    Service::Egress => None,
+                };
+                if let Some(backend) = backend {
+                    backend.declined(why);
                 }
-                Service::Egress => {}
-            },
+            }
         }
     }
     // The front ended: its requests end with it, upstream requests included, and the places
@@ -345,7 +396,7 @@ impl Drop for Task {
 /// socket, and the end. Whatever happens, the request ends with `end`, unless the front is gone.
 async fn answer(
     front: &Weak<FrontHandle>,
-    backend: Option<Arc<dyn ModelBackend>>,
+    backend: Option<Arc<dyn Backend>>,
     req: u64,
     head: RequestHead,
     body_end: oneshot::Receiver<()>,
@@ -362,7 +413,7 @@ async fn answer(
 /// Whether the answer's body went whole on the request's socket.
 async fn answer_body(
     front: &Weak<FrontHandle>,
-    backend: Option<Arc<dyn ModelBackend>>,
+    backend: Option<Arc<dyn Backend>>,
     req: u64,
     head: RequestHead,
     body_end: oneshot::Receiver<()>,

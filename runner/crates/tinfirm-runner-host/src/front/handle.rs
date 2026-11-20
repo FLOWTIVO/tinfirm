@@ -118,8 +118,8 @@ struct Pending {
     checks: HashMap<u64, oneshot::Sender<()>>,
     /// The front's own requests that are open.
     open: HashMap<u64, Open>,
-    /// How many of them are model requests.
-    model_requests: usize,
+    /// How many of them are requests, by service.
+    requests: HashMap<super::wire::Service, usize>,
     /// The last request id the front used: ids only grow.
     last_req: u64,
 }
@@ -129,9 +129,11 @@ struct Pending {
 enum Open {
     /// A `connect`: `given` once `run` gave the connection, until the front says it ended.
     Connect { given: bool },
-    /// A model `request`, until `run` ends it: whether its socket went to the front, its
-    /// answer's head did, its body ended, and the front gave it up.
+    /// A `request` (of the model proxy, the git proxy or the platform tools), until `run`
+    /// ends it: its service, whether its socket went to the front, its answer's head did, its
+    /// body ended, and the front gave it up.
     Request {
+        service: super::wire::Service,
         body: bool,
         responded: bool,
         body_ended: bool,
@@ -487,9 +489,12 @@ impl FrontHandle {
         {
             let mut pending = lock(&self.pending);
             match pending.open.get(&req) {
-                Some(Open::Request { .. }) => {
+                Some(Open::Request { service, .. }) => {
+                    let service = *service;
                     pending.open.remove(&req);
-                    pending.model_requests -= 1;
+                    if let Some(open) = pending.requests.get_mut(&service) {
+                        *open -= 1;
+                    }
                 }
                 _ => bail!("no open model request {req} of the front to end"),
             }
@@ -706,7 +711,7 @@ fn own_request(pending: &mut Pending, message: &ToMain) -> std::result::Result<O
     match message {
         ToMain::Connect { req, host, port } => {
             new(pending, *req)?;
-            let connects = pending.open.len() - pending.model_requests;
+            let connects = pending.open.len() - pending.requests.values().sum::<usize>();
             if connects >= wire::MAX_FRONT_REQUESTS {
                 return Err(format!(
                     "more than {} open requests",
@@ -732,16 +737,23 @@ fn own_request(pending: &mut Pending, message: &ToMain) -> std::result::Result<O
         },
         ToMain::Request { req, head } => {
             new(pending, *req)?;
-            if pending.model_requests >= wire::MAX_MODEL_REQUESTS {
+            let service = head.target.service();
+            let open = pending.requests.entry(service).or_insert(0);
+            if *open >= wire::MAX_SERVICE_REQUESTS {
                 return Err(format!(
-                    "more than {} open model requests",
-                    wire::MAX_MODEL_REQUESTS
+                    "more than {} open {} requests",
+                    wire::MAX_SERVICE_REQUESTS,
+                    match service {
+                        super::wire::Service::Model => "model",
+                        _ => "git",
+                    }
                 ));
             }
-            pending.model_requests += 1;
+            *open += 1;
             pending.open.insert(
                 *req,
                 Open::Request {
+                    service,
                     body: false,
                     responded: false,
                     body_ended: false,
@@ -883,7 +895,7 @@ async fn read_loop(
     pending.pongs.clear();
     pending.checks.clear();
     pending.open.clear();
-    pending.model_requests = 0;
+    pending.requests.clear();
     drop(pending);
     let _ = ended.send(Some(how));
 }

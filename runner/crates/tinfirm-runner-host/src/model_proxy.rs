@@ -91,10 +91,9 @@ use std::time::Duration;
 
 use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result, anyhow, bail};
-use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Body, Bytes, Frame, Incoming};
-use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
+use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use serde::{Deserialize, Serialize};
@@ -152,24 +151,13 @@ const FORWARDING_HEADERS: [&str; 6] = [
     "via",
 ];
 
-pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
-pub(crate) type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
-
-// ----- what the two halves say to each other ----------------------------------------------
-
-/// The headers a request may carry to the run half, and their bounds: a client's head that
-/// is larger is refused with `431` by the front half.
-pub const MAX_HEADERS: usize = 64;
-/// The longest header name of a request.
-pub const MAX_HEADER_NAME: usize = 64;
-/// The longest header value of a request.
-pub const MAX_HEADER_VALUE: usize = 8 * 1024;
-/// All of a request's header names and values together; within a front's message.
-pub const MAX_HEADER_BYTES: usize = 24 * 1024;
-/// The longest query of a request (`414` above).
-pub const MAX_QUERY: usize = 4 * 1024;
-/// The headers of an answer that go back to the front half; more are dropped.
-pub const MAX_RESPONSE_HEADERS: usize = 100;
+use crate::front::head::length_mismatch;
+pub use crate::front::head::{
+    Backend as ModelBackend, BodyLength, Declined, HeaderBytes, MAX_HEADER_BYTES, MAX_HEADER_NAME,
+    MAX_HEADER_VALUE, MAX_HEADERS, MAX_QUERY, MAX_RESPONSE_HEADERS, RequestHead, ResponseHead,
+    Target,
+};
+pub(crate) use crate::front::head::{BoxError, ProxyBody};
 
 /// The two API formats the proxy serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,165 +223,6 @@ impl ModelEndpoint {
             _ => Method::POST,
         }
     }
-}
-
-/// A header value as its bytes: HTTP allows any byte but the control bytes (UTF-8 text among
-/// them, as obs-text), so a value is not always text. On a front's wire it is a string whose
-/// characters are the bytes, U+0000 to U+00FF one for one; any other character is not a
-/// header value. Its length is the value's, in bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeaderBytes(pub Vec<u8>);
-
-impl HeaderBytes {
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl From<String> for HeaderBytes {
-    fn from(value: String) -> HeaderBytes {
-        HeaderBytes(value.into_bytes())
-    }
-}
-
-impl From<&str> for HeaderBytes {
-    fn from(value: &str) -> HeaderBytes {
-        HeaderBytes(value.as_bytes().to_vec())
-    }
-}
-
-impl Serialize for HeaderBytes {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        let text: String = self.0.iter().map(|&byte| char::from(byte)).collect();
-        serializer.serialize_str(&text)
-    }
-}
-
-impl<'de> Deserialize<'de> for HeaderBytes {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<HeaderBytes, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        text.chars()
-            .map(|c| u8::try_from(u32::from(c)).ok())
-            .collect::<Option<Vec<u8>>>()
-            .map(HeaderBytes)
-            .ok_or_else(|| serde::de::Error::custom("a header value's character above U+00FF"))
-    }
-}
-
-/// How long a request's body is, as the front half read it from the client's head.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BodyLength {
-    /// No body.
-    Empty,
-    /// `Content-Length`: exactly this many bytes.
-    Exact(u64),
-    /// Chunked: the body's end says where it ends.
-    Streamed,
-}
-
-/// A request of the sandbox, as the front half hands it on: the endpoint it maps to, never
-/// the path or the secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RequestHead {
-    pub endpoint: ModelEndpoint,
-    pub method: String,
-    pub query: Option<String>,
-    pub headers: Vec<(String, HeaderBytes)>,
-    pub length: BodyLength,
-}
-
-impl RequestHead {
-    /// The head's bounds, and that each part is one that HTTP allows (no CR, LF or NUL in a
-    /// value): checked by the run half in every case, and on a front's wire before.
-    pub fn check(&self) -> std::result::Result<(), String> {
-        if self.method.is_empty()
-            || self.method.len() > 16
-            || Method::from_bytes(self.method.as_bytes()).is_err()
-        {
-            return Err("a method that is not one".into());
-        }
-        if let Some(query) = &self.query {
-            if query.len() > MAX_QUERY {
-                return Err(format!("a query over {MAX_QUERY} bytes"));
-            }
-            if !query.bytes().all(|b| b.is_ascii_graphic()) {
-                return Err("a query with a byte that no query has".into());
-            }
-        }
-        if self.headers.len() > MAX_HEADERS {
-            return Err(format!("more than {MAX_HEADERS} headers"));
-        }
-        let mut total = 0;
-        for (name, value) in &self.headers {
-            if name.is_empty() || name.len() > MAX_HEADER_NAME || value.len() > MAX_HEADER_VALUE {
-                return Err("a header out of its bounds".into());
-            }
-            total += name.len() + value.len();
-            if HeaderName::from_bytes(name.as_bytes()).is_err()
-                || HeaderValue::from_bytes(value.as_bytes()).is_err()
-            {
-                return Err("a header that HTTP does not allow".into());
-            }
-        }
-        if total > MAX_HEADER_BYTES {
-            return Err(format!("headers over {MAX_HEADER_BYTES} bytes"));
-        }
-        Ok(())
-    }
-}
-
-/// The answer's status and headers, as the run half gives them back.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResponseHead {
-    pub status: u16,
-    pub headers: Vec<(String, HeaderBytes)>,
-}
-
-/// Why the front half answered a request itself, for the run's log and counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Declined {
-    /// Not the run's secret: `404`.
-    Secret,
-    /// A connection upgrade (WebSocket): `501`.
-    Upgrade,
-    /// A path outside the model API: `404`.
-    Path,
-    /// Another method than the endpoint's: `405`.
-    Method,
-    /// A head over the bounds, or not text: `400`, `414` or `431`.
-    Head,
-    /// A body over [`MAX_REQUEST_BODY`]: `413`.
-    TooLarge,
-}
-
-/// The run half: what makes a request towards the gateway, in this process or in `run`
-/// behind a front's wire. The answer comes back whole, its body streaming.
-pub trait ModelBackend: Send + Sync + 'static {
-    fn call(
-        &self,
-        head: RequestHead,
-        body: ProxyBody,
-    ) -> Pin<Box<dyn Future<Output = (ResponseHead, ProxyBody)> + Send>>;
-
-    /// The front half answered a request itself.
-    fn declined(&self, why: Declined);
 }
 
 /// Whether a run with this model access goes through the model proxy: a gateway (a base URL) of
@@ -1051,59 +880,9 @@ fn request_head(
     parts: &hyper::http::request::Parts,
     exact: Option<u64>,
 ) -> std::result::Result<RequestHead, Refused> {
-    let query = parts.uri.query().map(str::to_string);
-    if query.as_ref().is_some_and(|q| q.len() > MAX_QUERY) {
-        return Err(Box::new((
-            Declined::Head,
-            error(StatusCode::URI_TOO_LONG, "the request's query is too long"),
-        )));
-    }
-    let too_large = || -> Refused {
-        Box::new((
-            Declined::Head,
-            error(
-                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-                "the request's headers are too large for the Tinfirm model proxy",
-            ),
-        ))
-    };
-    if parts.headers.len() > MAX_HEADERS {
-        return Err(too_large());
-    }
-    let mut headers = Vec::with_capacity(parts.headers.len());
-    let mut total = 0;
-    for (name, value) in &parts.headers {
-        if name.as_str().len() > MAX_HEADER_NAME || value.len() > MAX_HEADER_VALUE {
-            return Err(too_large());
-        }
-        total += name.as_str().len() + value.len();
-        if total > MAX_HEADER_BYTES {
-            return Err(too_large());
-        }
-        headers.push((
-            name.as_str().to_string(),
-            HeaderBytes(value.as_bytes().to_vec()),
-        ));
-    }
-    let length = match exact {
-        Some(0) => BodyLength::Empty,
-        Some(n) => BodyLength::Exact(n),
-        None => BodyLength::Streamed,
-    };
-    let head = RequestHead {
-        endpoint,
-        method: parts.method.as_str().to_string(),
-        query,
-        headers,
-        length,
-    };
-    head.check().map_err(|_| -> Refused {
-        Box::new((
-            Declined::Head,
-            error(StatusCode::BAD_REQUEST, "bad request target"),
-        ))
-    })?;
-    Ok(head)
+    crate::front::head::head_from_parts(Target::Model(endpoint), parts, exact).map_err(
+        |(status, message)| -> Refused { Box::new((Declined::Head, error(status, message))) },
+    )
 }
 
 async fn handle(half: Arc<FrontHalf>, req: Request<Incoming>) -> Response<ProxyBody> {
@@ -1133,48 +912,16 @@ async fn handle(half: Arc<FrontHalf>, req: Request<Incoming>) -> Response<ProxyB
     response_from(head, body)
 }
 
-/// The front half's answer from the run half's head and body. A header that is not one is
-/// dropped (the run half sends none).
-pub(crate) fn response_from(head: ResponseHead, body: ProxyBody) -> Response<ProxyBody> {
-    let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    for (name, value) in head.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            response.headers_mut().append(name, value);
-        }
-    }
-    response
-}
+pub(crate) use crate::front::head::response_from;
 
 /// The run half's answer as its head and body: its first [`MAX_RESPONSE_HEADERS`] headers,
 /// byte for byte; the rest are dropped.
 fn response_head(response: Response<ProxyBody>, run_id: Uuid) -> (ResponseHead, ProxyBody) {
-    let (parts, body) = response.into_parts();
-    let mut headers = Vec::new();
-    let mut dropped = 0;
-    for (name, value) in &parts.headers {
-        if headers.len() < MAX_RESPONSE_HEADERS {
-            headers.push((
-                name.as_str().to_string(),
-                HeaderBytes(value.as_bytes().to_vec()),
-            ));
-        } else {
-            dropped += 1;
-        }
-    }
+    let (head, body, dropped) = crate::front::head::response_head(response);
     if dropped > 0 {
         tracing::debug!(%run_id, dropped, "model proxy: answer headers beyond the bound are dropped");
     }
-    (
-        ResponseHead {
-            status: parts.status.as_u16(),
-            headers,
-        },
-        body,
-    )
+    (head, body)
 }
 
 // ----- the run half: the gateway's side ----------------------------------------------------
@@ -1212,7 +959,7 @@ impl ModelBackend for Direct {
         let state = &self.0;
         state.refused.fetch_add(1, Ordering::Relaxed);
         match why {
-            Declined::Secret | Declined::Head | Declined::TooLarge => {
+            Declined::Secret | Declined::Head | Declined::TooLarge | Declined::Push => {
                 tracing::debug!(run_id = %state.run_id, ?why, "model proxy refused a request");
             }
             Declined::Upgrade => {
@@ -1222,47 +969,6 @@ impl ModelBackend for Direct {
                 tracing::info!(run_id = %state.run_id, ?why, "model proxy refused a request outside the model API");
             }
         }
-    }
-}
-
-/// The request body of a head that said how long it is: exactly that many bytes, or an error.
-struct ExactBody {
-    inner: ProxyBody,
-    left: u64,
-}
-
-/// The body did not have the length its head declared.
-#[derive(Debug, thiserror::Error)]
-#[error("the request body does not have the length its head declared")]
-struct LengthMismatch;
-
-impl Body for ExactBody {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<std::result::Result<Frame<Bytes>, BoxError>>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    let len = data.len() as u64;
-                    if len > this.left {
-                        return Poll::Ready(Some(Err(Box::new(LengthMismatch))));
-                    }
-                    this.left -= len;
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(None) if this.left > 0 => Poll::Ready(Some(Err(Box::new(LengthMismatch)))),
-            other => other,
-        }
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        hyper::body::SizeHint::with_exact(self.left)
     }
 }
 
@@ -1279,46 +985,34 @@ impl RunState {
             tracing::warn!(run_id = %self.run_id, %why, "model proxy refused a request head out of its bounds");
             return refuse(StatusCode::BAD_REQUEST, "bad request");
         }
-        if head.endpoint.api() != self.gateway.api {
-            tracing::warn!(run_id = %self.run_id, endpoint = ?head.endpoint, "model proxy refused an endpoint of the other format");
+        let Target::Model(endpoint) = head.target else {
+            tracing::warn!(run_id = %self.run_id, target = ?head.target, "model proxy refused a request for another listener");
+            return refuse(StatusCode::NOT_FOUND, NOT_THE_MODEL_API);
+        };
+        if endpoint.api() != self.gateway.api {
+            tracing::warn!(run_id = %self.run_id, ?endpoint, "model proxy refused an endpoint of the other format");
             return refuse(StatusCode::NOT_FOUND, NOT_THE_MODEL_API);
         }
-        let method = head.endpoint.method();
+        let method = endpoint.method();
         if head.method != method.as_str() {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return method_not_allowed(&method);
         }
-        let exact = match head.length {
-            BodyLength::Empty => Some(0),
-            BodyLength::Exact(n) => Some(n),
-            BodyLength::Streamed => None,
-        };
+        let exact = crate::front::head::declared(head.length);
         if exact.is_some_and(|len| len > MAX_REQUEST_BODY) {
             return refuse(StatusCode::PAYLOAD_TOO_LARGE, TOO_LARGE);
         }
         let target = match &head.query {
-            Some(query) => format!("{}{}?{query}", self.gateway.base_path, head.endpoint.path()),
-            None => format!("{}{}", self.gateway.base_path, head.endpoint.path()),
+            Some(query) => format!("{}{}?{query}", self.gateway.base_path, endpoint.path()),
+            None => format!("{}{}", self.gateway.base_path, endpoint.path()),
         };
         let Ok(target) = target.parse::<Uri>() else {
             return refuse(StatusCode::BAD_REQUEST, "bad request target");
         };
-        let mut headers = HeaderMap::new();
-        for (name, value) in &head.headers {
-            match (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_bytes(value.as_bytes()),
-            ) {
-                (Ok(name), Ok(value)) => {
-                    headers.append(name, value);
-                }
-                _ => return refuse(StatusCode::BAD_REQUEST, "bad request header"),
-            }
-        }
-        let body = match exact {
-            Some(left) => ExactBody { inner: body, left }.boxed_unsync(),
-            None => body,
+        let Some(headers) = crate::front::head::header_map(&head.headers) else {
+            return refuse(StatusCode::BAD_REQUEST, "bad request header");
         };
+        let body = crate::front::head::exact_body(body, head.length);
         self.forward(method, target, headers, body).await
     }
 
@@ -1561,18 +1255,6 @@ where
         .await
         .map_err(|_| "the model gateway did not answer in time")??;
     Ok(response)
-}
-
-/// `true` when the request body did not have the length its head declared.
-fn length_mismatch(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(e) = current {
-        if e.is::<LengthMismatch>() {
-            return true;
-        }
-        current = e.source();
-    }
-    false
 }
 
 /// `true` when the request body hit [`MAX_REQUEST_BODY`] while it was sent.

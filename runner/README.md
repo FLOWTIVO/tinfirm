@@ -816,10 +816,11 @@ not run by hand; `reader.rs`, `confine.rs`).
 - **The front process (being built).** Path C's second part moves the rest of what `run` parses
   from a sandbox (the bridge's TLS, frames and tunnels, and the HTTP of the proxies and the
   platform tools) into a confined process per sandbox, the front, which holds that sandbox's own
-  powers and no credential. So far `run` starts one for each sandbox that has a listener of the
-  [egress proxy](#egress-proxy) or the [model proxy](#model-proxy), with its first listener (a
-  VM's comes with the VM's egress listener), and the front serves the HTTP of both; it ends with
-  the sandbox. The git proxy, the platform tools and the bridge follow. A front that cannot be
+  powers and no credential. So far `run` starts one for each sandbox with its first listener (a
+  VM's comes with the VM's egress listener, any other's with its run's own listener of the
+  [git proxy](#git-in-the-sandbox) and the [platform tools](#platform-tools)), and the front
+  serves the HTTP of the sandbox's git proxy, platform tools, [model proxy](#model-proxy) and
+  [egress proxy](#egress-proxy); it ends with the sandbox. The bridge follows. A front that cannot be
   confined serves all the same, with a warning in `run`'s log. Its confinement, which it applies to itself before it builds its runtime: limits of 512 MiB of data, 1024 descriptors and
   no core file; not dumpable; Landlock with no directory at all (only `/dev/null` and
   `/dev/urandom`); and the reader's seccomp filter, with on top of it no `execve`, no new process
@@ -873,6 +874,17 @@ not run by hand; `reader.rs`, `confine.rs`).
     whether the body is whole has that request ended. When a front ends, `run` ends all its
     requests. A sandbox has one listener of each proxy in its life, and its front serves each
     once: `run` refuses a second one itself, so a front never hears of it.
+  - **The git messages.** `run` passes the front its run's own listener with its bounds (open
+    connections, the time for a request's headers, the idle time of a connection), then the
+    run's routes as they are (`gitRoutes`: each repository route's number, secret, repository
+    path and branch, and the platform tools' number and secret), again whenever they change,
+    each followed by a round trip so that a request after them finds them. For each fetch or
+    tool call the front sends `request` as for the model proxy, with the route's number in
+    place of its path and secret, and the same sockets, answers and ends follow. A route the
+    run does not have, a request its route does not take (another method, another query, a
+    push), a body over its bound or not of its declared length, a header with CR, LF or NUL,
+    and a browser's request to the tools are refused by `run` as by the shared listener; a
+    front that opens more than 64 of these requests at once is ended.
 
 ## A VM per run
 
@@ -2120,7 +2132,15 @@ process, with one route and one route secret per repository.
   `[REDACTED]`, but it is not a credential: `git fetch` prints the URL, and that is no
   `CREDENTIAL_LEAK`.
 - One listener serves all runs, and also the [platform tools](#platform-tools), so every run
-  needs it. The first run starts it, on a random port. With Docker Engine on Linux it listens on the gateway IP of the sandbox
+  needs it. The first run starts it, on a random port. With `--sandbox-bridge` or a
+  [VM per run](#a-vm-per-run) each run gets a listener of its own instead, which the sandbox's
+  [front process](#sandbox-bridge) serves: the front reads the sandbox's requests (the route
+  secret, the path and the method, the headers within the bounds below, the body's framing)
+  and hands `run` the route's number, the request's head and its body; `run` checks it again,
+  reads the route's token, makes the request and passes the answer back. The front never
+  holds a token. The rules and limits are the same either way.
+- A request's head is at most 64 headers, each name at most 64 bytes and each value at most
+  8 KiB, 24 KiB in all (`431` above), with a query of at most 4 KiB (`414`). With Docker Engine on Linux it listens on the gateway IP of the sandbox
   network (`docker0`, usually `172.17.0.1`). With Docker Desktop (and on macOS in general)
   it listens on `127.0.0.1`, which containers reach as `host.docker.internal`.
 - `TINFIRM_RUNNER_GIT_PROXY_BIND` sets the listen address (an IP, optionally with a port)
@@ -2132,14 +2152,16 @@ process, with one route and one route secret per repository.
   must be one of this machine's, and not `0.0.0.0` or `::`, or `run` refuses to start: the
   model proxy, which is always on, listens there. With `TINFIRM_RUNNER_SANDBOX_NETWORK=none`
   there is no proxy, and `run` refuses to start for the same reason.
-- If the proxy cannot start, the run goes on with a warning, without fetch and without the
-  platform tools; a run whose model access is a gateway fails instead, because its model
+- If the proxy cannot start (or, with the bridge, the sandbox's front), the run goes on with a
+  warning, without fetch and without the platform tools; a run whose model access is a gateway fails instead, because its model
   proxy has no address to listen on.
 - A route reads its repository's token from the run's holder at each request, never a copy
   taken when the run started. Once Tinfirm has revoked the token
   ([below](#revoked-git-tokens-protocol-v2)), each new request gets 403 with Tinfirm's message
   as plain text, which git shows the agent (`fatal: unable to access …: The requested URL
-  returned error: 403`, after the message). A request already forwarded finishes.
+  returned error: 403`, after the message). A request already forwarded finishes. With the
+  bridge it is `run`, not the front, that reads the token at each request, so a revocation
+  between two requests of the same sandbox refuses the second.
 
 ### Revoked git tokens (protocol v2)
 
@@ -2223,7 +2245,9 @@ Every run gets the Tinfirm platform tools over MCP (docs/archive/v1/CONVENTIONS.
 [protocol v2](#protocol-versions) the renamed set of
 [Platform tools under protocol v2](#platform-tools-under-protocol-v2)). They are served by
 the host process, not by the sandbox, at `http://<proxy host>:<port>/<mcp secret>/mcp` on
-the git proxy's listener, and passed to the agent in ACP `session/new` and `session/load` as
+the git proxy's listener (with the bridge, the run's own listener, which the sandbox's front
+serves: the front reads the HTTP and hands `run` the body, at most 1 MiB, whose JSON `run`
+reads and answers), and passed to the agent in ACP `session/new` and `session/load` as
 `mcpServers: [{"type": "http", "name": "tinfirm", "url": …, "headers": []}]`. With protocol
 v1 the six tools are the following; they serve a server from before protocol v2, since the
 current server sends runs only to v2 hosts, and their texts speak of that server's tasks:

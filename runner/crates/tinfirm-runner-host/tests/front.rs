@@ -395,6 +395,10 @@ fn hostile_front_child() {
             let _ = out.write_all(&frame(&ready()));
             hostile_model_front(&socket, mode);
         }
+        mode if mode.starts_with("git-") => {
+            let _ = out.write_all(&frame(&ready()));
+            hostile_git_front(&socket, mode);
+        }
         "deaf" => {
             // Ready, and then it never reads its channel.
             let _ = out.write_all(&frame(&ready()));
@@ -454,7 +458,7 @@ fn read_with_descriptor(
 /// requests that `run` must refuse by its own rules (`model-rules`), or that break the wire.
 fn hostile_model_front(socket: &std::os::fd::OwnedFd, mode: &str) {
     use std::io::Write;
-    use tinfirm_runner_host::model_proxy::{BodyLength, ModelEndpoint, RequestHead};
+    use tinfirm_runner_host::model_proxy::{BodyLength, ModelEndpoint, RequestHead, Target};
     let mut out = std::fs::File::from(socket.try_clone().unwrap());
     let mut send = |message: &ToMain| {
         let _ = out.write_all(&wire::encode(message, wire::MAX_TO_MAIN).unwrap());
@@ -462,7 +466,7 @@ fn hostile_model_front(socket: &std::os::fd::OwnedFd, mode: &str) {
     let _init = read_with_descriptor(socket);
     let _listener = read_with_descriptor(socket);
     let head = |endpoint, method: &str, length| RequestHead {
-        endpoint,
+        target: Target::Model(endpoint),
         method: method.into(),
         query: None,
         headers: vec![("content-type".into(), "application/json".into())],
@@ -635,6 +639,162 @@ fn hostile_model_front(socket: &std::os::fd::OwnedFd, mode: &str) {
     }
     // Stay, and keep taking `run`'s messages: `run` must end it.
     while read_with_descriptor(socket).is_some() {}
+}
+
+/// The git modes of the hostile fake front: after `ready`, `init`, the git listener and its
+/// routes, requests that `run` must refuse by its own rules (`git-rules`), or too many.
+fn hostile_git_front(socket: &std::os::fd::OwnedFd, mode: &str) {
+    use std::io::Write;
+    use tinfirm_runner_host::model_proxy::{
+        BodyLength, HeaderBytes, ModelEndpoint, RequestHead, Target,
+    };
+    let mut out = std::fs::File::from(socket.try_clone().unwrap());
+    let mut send = |message: &ToMain| {
+        let _ = out.write_all(&wire::encode(message, wire::MAX_TO_MAIN).unwrap());
+    };
+    // Up to the routes, answering `run`'s round trips.
+    let routes = loop {
+        match read_with_descriptor(socket) {
+            Some((ToFront::Ping { id }, _)) => send(&ToMain::Pong { id }),
+            Some((ToFront::GitRoutes { routes, .. }, _)) if !routes.is_empty() => {
+                break routes.iter().map(|r| r.route).collect::<Vec<u64>>();
+            }
+            Some(_) => {}
+            None => std::process::exit(1),
+        }
+    };
+    let head = |target, method: &str, query: Option<&str>, length| RequestHead {
+        target,
+        method: method.into(),
+        query: query.map(str::to_string),
+        headers: vec![("user-agent".into(), HeaderBytes::from("git/2.54.0"))],
+        length,
+    };
+    let route = routes[0];
+    let info = Some("service=git-upload-pack");
+    let answer = |req: u64, body: &[u8], send: &mut dyn FnMut(&ToMain)| {
+        let mut status = None;
+        loop {
+            match read_with_descriptor(socket)? {
+                (ToFront::Ping { id }, _) => send(&ToMain::Pong { id }),
+                (ToFront::Body { req: got }, Some(fd)) if got == req => {
+                    let mut stream = std::os::unix::net::UnixStream::from(fd);
+                    let _ = stream.write_all(body);
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    send(&ToMain::BodyEnd { req });
+                    std::mem::forget(stream);
+                }
+                (ToFront::Response { req: got, head }, _) if got == req => {
+                    status = Some(head.status)
+                }
+                (ToFront::End { req: got, .. }, _) if got == req => return status,
+                _ => {}
+            }
+        }
+    };
+    match mode {
+        "git-rules" => {
+            let cases: Vec<(RequestHead, &[u8], u16)> = vec![
+                // A route the run does not have; a route asked for as the other request; a push.
+                (
+                    head(
+                        Target::GitInfoRefs { route: 999 },
+                        "GET",
+                        info,
+                        BodyLength::Empty,
+                    ),
+                    b"",
+                    404,
+                ),
+                (
+                    head(
+                        Target::GitInfoRefs { route },
+                        "POST",
+                        info,
+                        BodyLength::Empty,
+                    ),
+                    b"",
+                    404,
+                ),
+                (
+                    head(
+                        Target::GitInfoRefs { route },
+                        "GET",
+                        Some("service=git-receive-pack"),
+                        BodyLength::Empty,
+                    ),
+                    b"",
+                    404,
+                ),
+                (
+                    head(Target::Mcp { route }, "POST", None, BodyLength::Empty),
+                    b"",
+                    404,
+                ),
+                // A model request on a front whose sandbox has no model listener.
+                (
+                    head(
+                        Target::Model(ModelEndpoint::AnthropicMessages),
+                        "POST",
+                        None,
+                        BodyLength::Empty,
+                    ),
+                    b"",
+                    503,
+                ),
+                // A body longer than its head said.
+                (
+                    head(
+                        Target::GitUploadPack { route },
+                        "POST",
+                        None,
+                        BodyLength::Exact(4),
+                    ),
+                    b"00000000",
+                    400,
+                ),
+            ];
+            let mut failed = Vec::new();
+            for (i, (head, body, want)) in cases.into_iter().enumerate() {
+                let req = i as u64 + 1;
+                send(&ToMain::Request {
+                    req,
+                    head: head.clone(),
+                });
+                let got = answer(req, body, &mut send);
+                if got != Some(want) {
+                    failed.push(format!("{head:?}: {got:?}, not {want}"));
+                }
+            }
+            if failed.is_empty() {
+                std::process::exit(0);
+            }
+            eprintln!("not refused as expected: {failed:?}");
+            std::process::exit(1);
+        }
+        "git-flood" => {
+            // The code host holds every request, spread over the routes so that `run`'s
+            // limit per route does not end them: none ends.
+            for req in 1..=65u64 {
+                let route = routes[req as usize % routes.len()];
+                send(&ToMain::Request {
+                    req,
+                    head: head(
+                        Target::GitInfoRefs { route },
+                        "GET",
+                        info,
+                        BodyLength::Empty,
+                    ),
+                });
+            }
+        }
+        other => panic!("unknown mode {other}"),
+    }
+    while let Some((message, _)) = read_with_descriptor(socket) {
+        if let ToFront::Ping { id } = message {
+            send(&ToMain::Pong { id });
+        }
+    }
 }
 
 fn alive(pid: u32) -> bool {
@@ -2032,6 +2192,73 @@ async fn a_front_serves_one_listener_of_each_service_and_run_refuses_a_second() 
     )
     .await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_front_gets_from_runs_git_proxy_only_what_its_rules_allow() {
+    use tinfirm_runner_host::git_proxy::{GitProxy, ListenerLimits};
+    let upstream = silent_gateway().await;
+    let start = |mode: &'static str| async move {
+        let front = SandboxFront::start(&hostile_front(mode, &[]))
+            .await
+            .unwrap();
+        let endpoint = Endpoint {
+            bind: "127.0.0.2:0".parse().unwrap(),
+            sandbox_host: "127.0.0.2".into(),
+            extra_hosts: Vec::new(),
+        };
+        let (proxy, listener) =
+            GitProxy::start_in_front(endpoint, true, ListenerLimits::default(), &front)
+                .await
+                .unwrap();
+        // Nine routes: room for more than 64 requests held open at 8 per route.
+        let route: Vec<_> = (0..9)
+            .map(|i| {
+                proxy
+                    .register(
+                        uuid::Uuid::new_v4(),
+                        &format!("http://{upstream}/acme/repo{i}.git"),
+                        None,
+                        "agent/TEST-1",
+                    )
+                    .unwrap()
+            })
+            .collect();
+        // A front that floods may be ended before it answers the round trip after its routes.
+        let _ = proxy.publish().await;
+        (front, proxy, listener, route)
+    };
+    let (front, _proxy, _listener, _route) = start("git-rules").await;
+    let ended = tokio::time::timeout(Duration::from_secs(60), front.handle().wait_ended())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&ended, Ended::Exited { code: Some(0), .. }),
+        "{ended:?}"
+    );
+    for _ in 0..500 {
+        if front.answering() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(front.answering(), 0, "a task of `run` stays");
+    // More requests than a front may have open: it is ended, and nothing stays.
+    let (front, _proxy, _listener, _route) = start("git-flood").await;
+    let ended = tokio::time::timeout(Duration::from_secs(20), front.handle().wait_ended())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&ended, Ended::Broken(text) if text.contains("more than 64 open git requests")),
+        "{ended:?}"
+    );
+    for _ in 0..500 {
+        if front.answering() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(front.answering(), 0, "a task of `run` stays");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

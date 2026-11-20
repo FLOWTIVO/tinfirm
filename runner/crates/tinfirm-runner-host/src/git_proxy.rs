@@ -44,6 +44,17 @@
 //!   being handled is closed (a response body the sandbox stopped reading, or an upstream
 //!   that stopped sending).
 //!
+//! The proxy is in two halves (ADR-0112, path C, part 2). The front half reads the sandbox's
+//! HTTP: the route secret, the path and the method, the head's bounds, the body's framing; it
+//! maps a request to its route's number and a [`Target`] and hands the head and the body to the
+//! run half ([`Backend`]), which checks the head again (a route of this listener's, the method
+//! and query its request takes, every header one that HTTP allows, the body's bounds), reads
+//! the route's token at that request, makes the request upstream or calls the run's tools, and
+//! gives the answer back. On a host with the bridge each run gets a listener of its own
+//! ([`GitProxy::start_in_front`]), and its sandbox's front runs the front half; it never holds
+//! a token, and the tools' JSON is still read here. Elsewhere one listener serves every run,
+//! with both halves here and the same code.
+//!
 //! The listener must be reachable from the sandboxes but not from the network. On Docker
 //! Engine (Linux) it binds the gateway IP of the sandbox network (`docker0` for the default
 //! `bridge`). With Docker Desktop (and other engines in a VM, such as on macOS) it binds
@@ -65,7 +76,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bollard::Docker;
 use bollard::models::NetworkInspect;
-use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderName, HeaderValue};
@@ -78,6 +88,11 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::front::head::{
+    Backend, BodyLength, BoxError, Declined, ProxyBody, RequestHead, ResponseHead, Target,
+};
+use crate::front::sandbox::SandboxFront;
+use crate::front::wire::{FrontLimits, GitRouteSpec, McpRouteSpec};
 use crate::mcp::{self, RunTools};
 use crate::sandbox::Executor;
 use crate::secret_eq::secret_eq;
@@ -126,9 +141,6 @@ const RESPONSE_HEADERS: [HeaderName; 5] = [
     header::EXPIRES,
     header::PRAGMA,
 ];
-
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 
 /// The bounds of the shared listener (see the module docs). Tests shorten them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +427,39 @@ struct Inner {
     limits: ListenerLimits,
     /// Open connections per peer address ([`ListenerLimits::max_connections_per_peer`]).
     peers: Mutex<HashMap<IpAddr, usize>>,
+    /// The sandbox's front that serves this listener, for a run's own listener on a host with
+    /// the bridge ([`GitProxy::start_in_front`]), and the routes it was given last.
+    front: Option<std::sync::Weak<SandboxFront>>,
+    published: tokio::sync::Mutex<Option<(Vec<GitRouteSpec>, Vec<McpRouteSpec>)>>,
+}
+
+/// A run's own listener, served by its sandbox's front ([`GitProxy::start_in_front`]).
+/// Dropping it closes the listener in the front and ends its requests here.
+pub struct FrontListenerGuard {
+    inner: Arc<Inner>,
+    front: Arc<SandboxFront>,
+}
+
+impl FrontListenerGuard {
+    /// The listener's address on this host, which a sandbox's tunnel reaches.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.addr
+    }
+}
+
+impl Drop for FrontListenerGuard {
+    fn drop(&mut self) {
+        self.inner.shutdown.cancel();
+        self.front.unlisten(crate::front::wire::Service::Git);
+    }
+}
+
+impl std::fmt::Debug for FrontListenerGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontListenerGuard")
+            .field("addr", &self.inner.addr)
+            .finish()
+    }
 }
 
 /// A registered route. Dropping it removes the route: the run is over.
@@ -525,9 +570,95 @@ impl GitProxy {
             shutdown: CancellationToken::new(),
             limits,
             peers: Mutex::new(HashMap::new()),
+            front: None,
+            published: tokio::sync::Mutex::new(None),
         });
         tokio::spawn(accept_loop(listener, inner.clone()));
         Ok(GitProxy { inner })
+    }
+
+    /// One run's own listener, on a host with the bridge: it binds where `endpoint` says, and
+    /// the sandbox's `front` serves its HTTP (ADR-0112, path C, part 2), within `limits`, while
+    /// this process keeps the run half: the tokens, the requests upstream and the run's tools.
+    /// The routes registered on it reach the front with [`GitProxy::publish`]. The listener
+    /// closes when the returned guard is dropped.
+    pub async fn start_in_front(
+        endpoint: Endpoint,
+        allow_http: bool,
+        limits: ListenerLimits,
+        front: &Arc<SandboxFront>,
+    ) -> Result<(GitProxy, FrontListenerGuard)> {
+        let listener = TcpListener::bind(endpoint.bind)
+            .await
+            .with_context(|| format!("cannot listen on {} for a run's git proxy", endpoint.bind))?;
+        let addr = listener.local_addr()?;
+        let inner = Arc::new(Inner {
+            routes: Mutex::new(HashMap::new()),
+            mcp_routes: Mutex::new(HashMap::new()),
+            next_route: AtomicU64::new(1),
+            addr,
+            endpoint,
+            allow_http,
+            tls: OnceLock::new(),
+            shutdown: CancellationToken::new(),
+            limits,
+            peers: Mutex::new(HashMap::new()),
+            front: Some(Arc::downgrade(front)),
+            published: tokio::sync::Mutex::new(None),
+        });
+        let front_limits = FrontLimits {
+            max_connections: u32::try_from(limits.max_connections).unwrap_or(u32::MAX),
+            header_read_ms: u64::try_from(limits.header_read_timeout.as_millis())
+                .unwrap_or(u64::MAX),
+            idle_ms: u64::try_from(limits.idle_timeout.as_millis()).unwrap_or(u64::MAX),
+        };
+        front
+            .listen_git(listener, front_limits, Arc::new(Direct(inner.clone())))
+            .await
+            .context("the sandbox's front cannot serve the git proxy")?;
+        Ok((
+            GitProxy {
+                inner: inner.clone(),
+            },
+            FrontListenerGuard {
+                inner,
+                front: front.clone(),
+            },
+        ))
+    }
+
+    /// Gives the sandbox's front the routes as they are now, when a front serves this
+    /// listener; nothing otherwise. A route removed since is refused by this process at once,
+    /// whether the front knows it yet or not.
+    pub async fn publish(&self) -> Result<()> {
+        let Some(front) = self.inner.front.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return Ok(());
+        };
+        let mut published = self.inner.published.lock().await;
+        let mut routes: Vec<GitRouteSpec> = lock(&self.inner.routes)
+            .iter()
+            .map(|(&route, r)| GitRouteSpec {
+                route,
+                secret: r.secret.expose().to_string(),
+                path: r.upstream.path.clone(),
+                branch: r.branch.clone(),
+            })
+            .collect();
+        routes.sort_by_key(|r| r.route);
+        let mut mcp: Vec<McpRouteSpec> = lock(&self.inner.mcp_routes)
+            .iter()
+            .map(|(&route, r)| McpRouteSpec {
+                route,
+                secret: r.secret.expose().to_string(),
+            })
+            .collect();
+        mcp.sort_by_key(|r| r.route);
+        if published.as_ref() == Some(&(routes.clone(), mcp.clone())) {
+            return Ok(());
+        }
+        front.git_routes(routes.clone(), mcp.clone()).await?;
+        *published = Some((routes, mcp));
+        Ok(())
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -667,31 +798,6 @@ pub(crate) fn host_port(host: &str, port: u16) -> String {
 }
 
 impl Inner {
-    /// The route of `secret`. Every route is compared, each with [`secret_eq`], so the time
-    /// of the answer does not tell how much of a guess was right.
-    fn route(&self, secret: &str) -> Option<Arc<Route>> {
-        let routes = lock(&self.routes);
-        let mut found = None;
-        for route in routes.values() {
-            if secret_eq(route.secret.expose().as_bytes(), secret.as_bytes()) {
-                found = Some(route.clone());
-            }
-        }
-        found
-    }
-
-    /// The MCP endpoint of `secret`, compared like [`Inner::route`].
-    fn mcp_route(&self, secret: &str) -> Option<Arc<McpRoute>> {
-        let routes = lock(&self.mcp_routes);
-        let mut found = None;
-        for route in routes.values() {
-            if secret_eq(route.secret.expose().as_bytes(), secret.as_bytes()) {
-                found = Some(route.clone());
-            }
-        }
-        found
-    }
-
     fn tls(&self) -> Arc<rustls::ClientConfig> {
         self.tls.get_or_init(tls_config).clone()
     }
@@ -738,25 +844,118 @@ impl GitRequest {
     }
 }
 
-enum Decision {
-    /// With the `Authorization` header to add, as the route's credentials have it now.
-    Forward(Arc<Route>, GitRequest, Option<Secret>),
-    Refuse(StatusCode, String),
+/// A route that the front half found by its secret: its number, its repository path and the
+/// branch the host pushes.
+pub(crate) struct Found {
+    route: u64,
+    path: String,
+    branch: String,
 }
 
-fn not_found() -> Decision {
-    Decision::Refuse(StatusCode::NOT_FOUND, "not found".into())
+/// Where the front half looks a secret up: the shared listener's routes, or a front's copy of
+/// its run's. Every route is compared, each with [`secret_eq`], so the time of the answer does
+/// not tell how much of a guess was right.
+pub(crate) trait RouteTable: Send + Sync + 'static {
+    fn git(&self, secret: &str) -> Option<Found>;
+    fn mcp(&self, secret: &str) -> Option<u64>;
 }
 
-/// Decides a request from its method and URI alone.
-fn decide(inner: &Inner, method: &Method, uri: &Uri) -> Decision {
-    let path = uri.path();
-    let Some((secret, _)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
-        return not_found();
+impl RouteTable for Inner {
+    fn git(&self, secret: &str) -> Option<Found> {
+        let routes = lock(&self.routes);
+        let mut found = None;
+        for (&id, route) in routes.iter() {
+            if secret_eq(route.secret.expose().as_bytes(), secret.as_bytes()) {
+                found = Some(Found {
+                    route: id,
+                    path: route.upstream.path.clone(),
+                    branch: route.branch.clone(),
+                });
+            }
+        }
+        found
+    }
+
+    fn mcp(&self, secret: &str) -> Option<u64> {
+        let routes = lock(&self.mcp_routes);
+        let mut found = None;
+        for (&id, route) in routes.iter() {
+            if secret_eq(route.secret.expose().as_bytes(), secret.as_bytes()) {
+                found = Some(id);
+            }
+        }
+        found
+    }
+}
+
+/// A front's copy of its run's routes ([`ToFront::GitRoutes`]), which `run` replaces whole.
+///
+/// [`ToFront::GitRoutes`]: crate::front::wire::ToFront::GitRoutes
+#[derive(Default)]
+pub struct FrontRoutes {
+    table: Mutex<(Vec<GitRouteSpec>, Vec<McpRouteSpec>)>,
+}
+
+impl FrontRoutes {
+    pub fn replace(&self, routes: Vec<GitRouteSpec>, mcp: Vec<McpRouteSpec>) {
+        *lock(&self.table) = (routes, mcp);
+    }
+}
+
+impl RouteTable for FrontRoutes {
+    fn git(&self, secret: &str) -> Option<Found> {
+        let table = lock(&self.table);
+        let mut found = None;
+        for route in &table.0 {
+            if secret_eq(route.secret.as_bytes(), secret.as_bytes()) {
+                found = Some(Found {
+                    route: route.route,
+                    path: route.path.clone(),
+                    branch: route.branch.clone(),
+                });
+            }
+        }
+        found
+    }
+
+    fn mcp(&self, secret: &str) -> Option<u64> {
+        let table = lock(&self.table);
+        let mut found = None;
+        for route in &table.1 {
+            if secret_eq(route.secret.as_bytes(), secret.as_bytes()) {
+                found = Some(route.route);
+            }
+        }
+        found
+    }
+}
+
+/// The front half's decision on a request from its method and URI alone: what it is for, or
+/// the answer to give and why.
+fn decide(
+    table: &dyn RouteTable,
+    method: &Method,
+    uri: &Uri,
+) -> Result<Target, (Declined, StatusCode, String)> {
+    let not_found = || {
+        (
+            Declined::Path,
+            StatusCode::NOT_FOUND,
+            "not found".to_string(),
+        )
     };
-    let Some(route) = inner.route(secret) else {
+    let path = uri.path();
+    let Some((secret, rest)) = path.strip_prefix('/').and_then(|p| p.split_once('/')) else {
+        return Err(not_found());
+    };
+    if rest == "mcp"
+        && let Some(route) = table.mcp(secret)
+    {
+        return Ok(Target::Mcp { route });
+    }
+    let Some(found) = table.git(secret) else {
         tracing::debug!("git proxy request without a valid route");
-        return not_found();
+        return Err((Declined::Secret, StatusCode::NOT_FOUND, "not found".into()));
     };
     // The path after the secret, with its leading slash.
     let tail = &path[1 + secret.len()..];
@@ -766,72 +965,199 @@ fn decide(inner: &Inner, method: &Method, uri: &Uri) -> Decision {
         })
     };
     if tail.ends_with("/git-receive-pack") || service("git-receive-pack") {
-        tracing::info!(run_id = %route.run_id, "git proxy refused a push from the sandbox");
-        return Decision::Refuse(
+        return Err((
+            Declined::Push,
             StatusCode::FORBIDDEN,
             format!(
                 "pushing from the sandbox is not allowed; the runner host pushes {} when the run ends",
-                route.branch
+                found.branch
             ),
-        );
+        ));
     }
-    let only_upload_pack_service = uri.query().is_some_and(|q| {
-        let mut pairs = url::form_urlencoded::parse(q.as_bytes());
-        pairs
-            .next()
-            .is_some_and(|(k, v)| k == "service" && v == "git-upload-pack")
-            && pairs.next().is_none()
-    });
-    let request = match tail.strip_prefix(route.upstream.path.as_str()) {
-        Some("/info/refs") if method == Method::GET && only_upload_pack_service => {
-            GitRequest::InfoRefs
+    match tail.strip_prefix(found.path.as_str()) {
+        Some("/info/refs")
+            if method == Method::GET && uri.query().is_some_and(only_upload_pack_service) =>
+        {
+            Ok(Target::GitInfoRefs { route: found.route })
         }
         Some("/git-upload-pack") if method == Method::POST && uri.query().is_none() => {
-            GitRequest::UploadPack
+            Ok(Target::GitUploadPack { route: found.route })
         }
-        _ => return not_found(),
+        _ => Err(not_found()),
+    }
+}
+
+/// A query of `service=git-upload-pack` alone.
+fn only_upload_pack_service(query: &str) -> bool {
+    let mut pairs = url::form_urlencoded::parse(query.as_bytes());
+    pairs
+        .next()
+        .is_some_and(|(k, v)| k == "service" && v == "git-upload-pack")
+        && pairs.next().is_none()
+}
+
+/// The front half of the git proxy and the platform tools for one listener: the routes it
+/// knows by their secrets, and the run half it hands each request to. It holds no token.
+pub(crate) struct GitHalf {
+    table: Arc<dyn RouteTable>,
+    backend: Arc<dyn Backend>,
+}
+
+async fn front_handle(half: Arc<GitHalf>, req: Request<Incoming>) -> Response<ProxyBody> {
+    let refused = |why: Declined, status: StatusCode, message: &str| {
+        half.backend.declined(why);
+        text(status, message)
     };
-    match route.credentials.authorization() {
-        Ok(authorization) => Decision::Forward(route, request, authorization),
-        Err(message) => {
-            tracing::info!(run_id = %route.run_id, request = request.as_str(), "git proxy refused a fetch: the run's git token for the repository was revoked");
-            Decision::Refuse(StatusCode::FORBIDDEN, message)
+    let target = match decide(half.table.as_ref(), req.method(), req.uri()) {
+        Ok(target) => target,
+        Err((why, status, message)) => return refused(why, status, &message),
+    };
+    let exact = req.body().size_hint().exact();
+    let bound = match target {
+        Target::Mcp { .. } => mcp::MAX_BODY as u64,
+        _ => MAX_REQUEST_BODY,
+    };
+    if exact.is_some_and(|len| len > bound) {
+        let message = match target {
+            Target::Mcp { .. } => "the request is too large",
+            _ => "the request body is too large",
+        };
+        return refused(Declined::TooLarge, StatusCode::PAYLOAD_TOO_LARGE, message);
+    }
+    let (parts, body) = req.into_parts();
+    let head = match crate::front::head::head_from_parts(target, &parts, exact) {
+        Ok(head) => head,
+        Err((status, message)) => return refused(Declined::Head, status, message),
+    };
+    let body = body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync();
+    let (head, body) = half.backend.call(head, body).await;
+    crate::front::head::response_from(head, body)
+}
+
+/// The shared listener's requests: the front half over all the runs' routes, then the run
+/// half, both here.
+async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Response<ProxyBody> {
+    let half = Arc::new(GitHalf {
+        table: inner.clone(),
+        backend: Arc::new(Direct(inner)),
+    });
+    front_handle(half, req).await
+}
+
+/// The run half in this process.
+struct Direct(Arc<Inner>);
+
+impl Backend for Direct {
+    fn call(
+        &self,
+        head: RequestHead,
+        body: ProxyBody,
+    ) -> Pin<Box<dyn std::future::Future<Output = (ResponseHead, ProxyBody)> + Send>> {
+        let inner = self.0.clone();
+        Box::pin(async move {
+            let response = inner.call(head, body).await;
+            let (head, body, _) = crate::front::head::response_head(response);
+            (head, body)
+        })
+    }
+
+    fn declined(&self, why: Declined) {
+        match why {
+            Declined::Push => tracing::info!("git proxy refused a push from the sandbox"),
+            _ => tracing::debug!(?why, "git proxy refused a request"),
         }
     }
 }
 
-/// The MCP endpoint that `path` (`/<secret>/mcp`) names, if any.
-fn mcp_target(inner: &Inner, path: &str) -> Option<Arc<McpRoute>> {
-    let (secret, rest) = path.strip_prefix('/')?.split_once('/')?;
-    if rest != "mcp" {
-        return None;
-    }
-    inner.mcp_route(secret)
-}
-
-async fn handle(inner: Arc<Inner>, req: Request<Incoming>) -> Response<ProxyBody> {
-    if let Some(route) = mcp_target(&inner, req.uri().path()) {
-        let Ok(_permit) = route.in_flight.clone().try_acquire_owned() else {
-            tracing::warn!(run_id = %route.run_id, "platform MCP endpoint: too many requests at once");
+impl Inner {
+    /// The run half's rules for a request, whoever parsed it: the head's bounds, a route of
+    /// this listener's, the request's method, the route's credentials as they are now (a
+    /// revoked token is the server's refusal), the route's requests in flight, the body's
+    /// bounds. Then the request goes upstream with the token, or to the run's tools.
+    async fn call(self: &Arc<Self>, head: RequestHead, body: ProxyBody) -> Response<ProxyBody> {
+        if let Err(why) = head.check() {
+            tracing::warn!(%why, "git proxy refused a request head out of its bounds");
+            return text(StatusCode::BAD_REQUEST, "bad request");
+        }
+        let Some(headers) = crate::front::head::header_map(&head.headers) else {
+            return text(StatusCode::BAD_REQUEST, "bad request header");
+        };
+        let (route, request) = match head.target {
+            Target::Mcp { route } => {
+                let Some(route) = lock(&self.mcp_routes).get(&route).cloned() else {
+                    tracing::warn!(
+                        "git proxy: a request for a platform tools route that is not there"
+                    );
+                    return text(StatusCode::NOT_FOUND, "not found");
+                };
+                let Ok(_permit) = route.in_flight.clone().try_acquire_owned() else {
+                    tracing::warn!(run_id = %route.run_id, "platform MCP endpoint: too many requests at once");
+                    return too_many_requests();
+                };
+                let Ok(method) = Method::from_bytes(head.method.as_bytes()) else {
+                    return text(StatusCode::BAD_REQUEST, "bad request");
+                };
+                let mut request = Request::new(crate::front::head::exact_body(body, head.length));
+                *request.method_mut() = method;
+                *request.headers_mut() = headers;
+                return mcp::handle_http(
+                    route.tools.clone(),
+                    request,
+                    self.limits.body_read_timeout,
+                )
+                .await
+                .map(|body| body.map_err(|never| match never {}).boxed_unsync());
+            }
+            Target::GitInfoRefs { route } => (route, GitRequest::InfoRefs),
+            Target::GitUploadPack { route } => (route, GitRequest::UploadPack),
+            Target::Model(_) => return text(StatusCode::NOT_FOUND, "not found"),
+        };
+        let Some(route) = lock(&self.routes).get(&route).cloned() else {
+            tracing::warn!("git proxy: a request for a repository route that is not there");
+            return text(StatusCode::NOT_FOUND, "not found");
+        };
+        let method = match request {
+            GitRequest::InfoRefs => Method::GET,
+            GitRequest::UploadPack => Method::POST,
+        };
+        let query = match request {
+            GitRequest::InfoRefs => head.query.as_deref().is_some_and(only_upload_pack_service),
+            GitRequest::UploadPack => head.query.is_none(),
+        };
+        if head.method != method.as_str() || !query {
+            tracing::warn!(run_id = %route.run_id, "git proxy refused a request that its route does not take");
+            return text(StatusCode::NOT_FOUND, "not found");
+        }
+        let authorization = match route.credentials.authorization() {
+            Ok(authorization) => authorization,
+            Err(message) => {
+                tracing::info!(run_id = %route.run_id, request = request.as_str(), "git proxy refused a fetch: the run's git token for the repository was revoked");
+                return text(StatusCode::FORBIDDEN, &message);
+            }
+        };
+        let Ok(permit) = route.in_flight.clone().try_acquire_owned() else {
+            tracing::warn!(run_id = %route.run_id, "git proxy: too many requests at once");
             return too_many_requests();
         };
-        return mcp::handle_http(route.tools.clone(), req, inner.limits.body_read_timeout)
-            .await
-            .map(|body| body.map_err(|never| match never {}).boxed_unsync());
+        // The permit is held until the response's body ends.
+        forward(
+            self,
+            &route,
+            request,
+            authorization.as_ref(),
+            headers,
+            head.length,
+            body,
+        )
+        .await
+        .map(|body| Held::new(body, permit).boxed_unsync())
     }
-    match decide(&inner, req.method(), req.uri()) {
-        Decision::Refuse(status, reason) => text(status, &reason),
-        Decision::Forward(route, request, authorization) => {
-            let Ok(permit) = route.in_flight.clone().try_acquire_owned() else {
-                tracing::warn!(run_id = %route.run_id, "git proxy: too many requests at once");
-                return too_many_requests();
-            };
-            // The permit is held until the response's body ends.
-            forward(&inner, &route, request, authorization.as_ref(), req)
-                .await
-                .map(|body| Held::new(body, permit).boxed_unsync())
-        }
-    }
+}
+
+/// A plain-text answer of the git proxy, as a head and a body.
+pub(crate) fn text_answer(status: StatusCode, message: &str) -> (ResponseHead, ProxyBody) {
+    let (head, body, _) = crate::front::head::response_head(text(status, message));
+    (head, body)
 }
 
 fn too_many_requests() -> Response<ProxyBody> {
@@ -889,13 +1215,13 @@ impl std::fmt::Display for BodyTimeout {
 impl std::error::Error for BodyTimeout {}
 
 /// A request body that fails with [`BodyTimeout`] when it has not ended by its deadline.
-struct Deadline<B> {
-    inner: B,
+struct Deadline {
+    inner: ProxyBody,
     sleep: Pin<Box<tokio::time::Sleep>>,
 }
 
-impl<B> Deadline<B> {
-    fn new(inner: B, timeout: Duration) -> Deadline<B> {
+impl Deadline {
+    fn new(inner: ProxyBody, timeout: Duration) -> Deadline {
         Deadline {
             inner,
             sleep: Box::pin(tokio::time::sleep(timeout)),
@@ -903,12 +1229,8 @@ impl<B> Deadline<B> {
     }
 }
 
-impl<B> Body for Deadline<B>
-where
-    B: Body + Unpin,
-    B::Error: Into<BoxError>,
-{
-    type Data = B::Data;
+impl Body for Deadline {
+    type Data = Bytes;
     type Error = BoxError;
 
     fn poll_frame(
@@ -917,7 +1239,7 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = &mut *self;
         if let Poll::Ready(frame) = Pin::new(&mut this.inner).poll_frame(cx) {
-            return Poll::Ready(frame.map(|f| f.map_err(Into::into)));
+            return Poll::Ready(frame);
         }
         if this.sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Some(Err(Box::new(BodyTimeout))));
@@ -952,15 +1274,11 @@ async fn forward(
     route: &Route,
     request: GitRequest,
     authorization: Option<&Secret>,
-    req: Request<Incoming>,
+    headers_in: hyper::HeaderMap,
+    length: BodyLength,
+    body: ProxyBody,
 ) -> Response<ProxyBody> {
-    let (parts, body) = req.into_parts();
-    let declared_length = parts
-        .headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if declared_length.is_some_and(|len| len > MAX_REQUEST_BODY) {
+    if crate::front::head::declared(length).is_some_and(|len| len > MAX_REQUEST_BODY) {
         return text(
             StatusCode::PAYLOAD_TOO_LARGE,
             "the request body is too large",
@@ -977,7 +1295,11 @@ async fn forward(
             Method::POST,
             format!("{}/git-upload-pack", upstream.path),
             Deadline::new(
-                Limited::new(body, MAX_REQUEST_BODY as usize),
+                Limited::new(
+                    crate::front::head::exact_body(body, length),
+                    MAX_REQUEST_BODY as usize,
+                )
+                .boxed_unsync(),
                 inner.limits.body_read_timeout,
             )
             .boxed_unsync(),
@@ -997,7 +1319,7 @@ async fn forward(
         Err(_) => return text(StatusCode::BAD_GATEWAY, "invalid repository host"),
     }
     for name in REQUEST_HEADERS {
-        for value in parts.headers.get_all(&name) {
+        for value in headers_in.get_all(&name) {
             headers.append(name.clone(), value.clone());
         }
     }
@@ -1017,6 +1339,13 @@ async fn forward(
             return text(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "the request body is too large",
+            );
+        }
+        Err(e) if crate::front::head::length_mismatch(e.as_ref()) => {
+            tracing::warn!(run_id = %route.run_id, "git proxy: a request body did not have the length its head declared");
+            return text(
+                StatusCode::BAD_REQUEST,
+                "the request body does not have the length its head declared",
             );
         }
         Err(e) if body_timed_out(e.as_ref()) => {
@@ -1147,6 +1476,9 @@ async fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
                 }
             },
         };
+        // An answer's last part goes at once, not after the client's acknowledgement of the
+        // one before (Nagle).
+        let _ = stream.set_nodelay(true);
         let Some(peer_slot) = PeerSlot::take(&inner, peer.ip()) else {
             tracing::warn!(peer = %peer.ip(), "git proxy: too many connections from one peer; closing a new one");
             drop(stream);
@@ -1162,18 +1494,41 @@ async fn accept_loop(listener: TcpListener, inner: Arc<Inner>) {
     tracing::debug!("git proxy stopped");
 }
 
-/// One connection, until it ends, the listener shuts down, or it is idle for too long.
+/// One connection of the shared listener.
 async fn serve_connection(inner: Arc<Inner>, stream: TcpStream) {
     let shutdown = inner.shutdown.clone();
     let limits = inner.limits;
+    serve_with(
+        stream,
+        limits.header_read_timeout,
+        limits.idle_timeout,
+        shutdown,
+        move |req| handle(inner.clone(), req),
+    )
+    .await;
+}
+
+/// One connection, served by `handler`, until it ends, the listener shuts down, or it is idle
+/// for `idle_timeout` while none of its requests is handled.
+async fn serve_with<F, Fut>(
+    stream: TcpStream,
+    header_read_timeout: Duration,
+    idle_timeout: Duration,
+    shutdown: CancellationToken,
+    handler: F,
+) where
+    F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Response<ProxyBody>> + Send + 'static,
+{
     let activity = Arc::new(Activity::new());
+    let handler = Arc::new(handler);
     let service = {
         let activity = activity.clone();
         hyper::service::service_fn(move |req| {
-            let inner = inner.clone();
+            let handler = handler.clone();
             let busy = Busy::new(activity.clone());
             async move {
-                let response = handle(inner, req).await;
+                let response = handler(req).await;
                 drop(busy);
                 Ok::<_, Infallible>(response)
             }
@@ -1182,7 +1537,7 @@ async fn serve_connection(inner: Arc<Inner>, stream: TcpStream) {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout)
+        .header_read_timeout(header_read_timeout)
         .max_buf_size(MAX_BUF_SIZE);
     let io = Tracked {
         inner: stream,
@@ -1190,10 +1545,10 @@ async fn serve_connection(inner: Arc<Inner>, stream: TcpStream) {
     };
     let connection = builder.serve_connection(TokioIo::new(io), service);
     let idle = async {
-        let check = (limits.idle_timeout / 4).max(Duration::from_millis(10));
+        let check = (idle_timeout / 4).max(Duration::from_millis(10));
         loop {
             tokio::time::sleep(check).await;
-            if activity.idle_for() >= limits.idle_timeout {
+            if activity.idle_for() >= idle_timeout {
                 break;
             }
         }
@@ -1208,6 +1563,57 @@ async fn serve_connection(inner: Arc<Inner>, stream: TcpStream) {
             tracing::debug!("git proxy: closed an idle connection");
         }
         _ = shutdown.cancelled() => {}
+    }
+}
+
+/// Serves a run's listener in its sandbox's front: its routes as `run` gave them (`routes`),
+/// each request it lets through to `run` (`backend`), within `limits`, until `shutdown`. Its
+/// peers are the sandbox's own tunnels, so no peer counts against another.
+pub async fn serve_in_front(
+    listener: TcpListener,
+    routes: Arc<FrontRoutes>,
+    backend: Arc<dyn Backend>,
+    limits: FrontLimits,
+    shutdown: CancellationToken,
+) {
+    let half = Arc::new(GitHalf {
+        table: routes,
+        backend,
+    });
+    let open = Arc::new(Semaphore::new(limits.max_connections.max(1) as usize));
+    let header_read_timeout = Duration::from_millis(limits.header_read_ms);
+    let idle_timeout = Duration::from_millis(limits.idle_ms);
+    loop {
+        let permit = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            permit = open.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let stream = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let _ = stream.set_nodelay(true);
+        let (half, shutdown) = (half.clone(), shutdown.clone());
+        tokio::spawn(async move {
+            let _permit = permit;
+            serve_with(
+                stream,
+                header_read_timeout,
+                idle_timeout,
+                shutdown,
+                move |req| front_handle(half.clone(), req),
+            )
+            .await;
+        });
     }
 }
 
@@ -1464,6 +1870,68 @@ mod tests {
         .unwrap()
     }
 
+    /// Where a test's front half runs: in this process (the shared listener), or in a front
+    /// of its own (a run's own listener, as on a host with the bridge).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Run,
+        Front,
+    }
+
+    /// A proxy of a test, with what keeps its front, when it has one.
+    struct Proxy {
+        proxy: GitProxy,
+        _listener: Option<FrontListenerGuard>,
+        front: Option<Arc<SandboxFront>>,
+    }
+
+    impl std::ops::Deref for Proxy {
+        type Target = GitProxy;
+        fn deref(&self) -> &GitProxy {
+            &self.proxy
+        }
+    }
+
+    async fn proxy_in(mode: Mode) -> Proxy {
+        proxy_with_in(mode, ListenerLimits::default()).await
+    }
+
+    async fn proxy_with_in(mode: Mode, limits: ListenerLimits) -> Proxy {
+        let endpoint = Endpoint {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            sandbox_host: "127.0.0.1".into(),
+            extra_hosts: Vec::new(),
+        };
+        match mode {
+            Mode::Run => Proxy {
+                proxy: GitProxy::start_with_limits(endpoint, true, limits)
+                    .await
+                    .unwrap(),
+                _listener: None,
+                front: None,
+            },
+            Mode::Front => {
+                let front = SandboxFront::start(&crate::front::test_command())
+                    .await
+                    .unwrap();
+                let (proxy, listener) = GitProxy::start_in_front(endpoint, true, limits, &front)
+                    .await
+                    .unwrap();
+                Proxy {
+                    proxy,
+                    _listener: Some(listener),
+                    front: Some(front),
+                }
+            }
+        }
+    }
+
+    /// A connection to the proxy, once its front (if any) has the routes as they are now.
+    async fn connect(proxy: &GitProxy) -> TcpStream {
+        proxy.publish().await.unwrap();
+        TcpStream::connect(proxy.local_addr()).await.unwrap()
+    }
+
     fn register(proxy: &GitProxy, upstream: &FakeUpstream, repo: &str) -> RouteGuard {
         proxy
             .register(
@@ -1498,7 +1966,7 @@ mod tests {
         headers: &[(&str, &str)],
         body: Bytes,
     ) -> (StatusCode, hyper::HeaderMap, String) {
-        let stream = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let stream = connect(proxy).await;
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
                 .await
@@ -1512,7 +1980,7 @@ mod tests {
         for (name, value) in headers {
             req.headers_mut().append(
                 HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                HeaderValue::from_str(value).unwrap(),
+                HeaderValue::from_bytes(value.as_bytes()).unwrap(),
             );
         }
         let response = sender.send_request(req).await.unwrap();
@@ -1522,10 +1990,9 @@ mod tests {
         (status, headers, String::from_utf8_lossy(&body).into_owned())
     }
 
-    #[tokio::test]
-    async fn forwards_info_refs_with_the_host_authorization_only() {
+    async fn forwards_info_refs_with_the_host_authorization_only(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let route = register(&proxy, &upstream, "/acme/widgets.git");
         let path = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
         let (status, headers, body) = request(
@@ -1574,10 +2041,9 @@ mod tests {
         assert!(got.headers.get("x-forwarded-for").is_none());
     }
 
-    #[tokio::test]
-    async fn forwards_upload_pack_posts_with_their_body() {
+    async fn forwards_upload_pack_posts_with_their_body(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let route = register(&proxy, &upstream, "/acme/widgets.git/");
         let path = format!("{}/git-upload-pack", prefix(&route));
         let (status, headers, _) = request(
@@ -1625,10 +2091,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_revoked_route_refuses_each_new_request_with_the_servers_message() {
+    async fn a_revoked_route_refuses_each_new_request_with_the_servers_message(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let revoked = Arc::new(Mutex::new(None));
         let route = proxy
             .register(
@@ -1683,10 +2148,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn refuses_pushes_with_a_reason() {
+    async fn refuses_pushes_with_a_reason(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let route = register(&proxy, &upstream, "/acme/widgets.git");
         let base = prefix(&route);
         for (method, path) in [
@@ -1711,10 +2175,9 @@ mod tests {
         assert!(upstream.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn anything_else_is_not_found() {
+    async fn anything_else_is_not_found(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let route = register(&proxy, &upstream, "/acme/widgets.git");
         let base = prefix(&route);
         let secret = route.secret().expose().to_string();
@@ -1758,10 +2221,9 @@ mod tests {
         assert!(upstream.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn wrong_or_missing_secrets_are_not_found() {
+    async fn wrong_or_missing_secrets_are_not_found(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let route = register(&proxy, &upstream, "/acme/widgets.git");
         let secret = route.secret().expose().to_string();
         assert_eq!(secret.len(), 43);
@@ -1800,11 +2262,10 @@ mod tests {
         assert!(upstream.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn each_secret_reaches_only_its_own_repository_until_the_run_ends() {
+    async fn each_secret_reaches_only_its_own_repository_until_the_run_ends(mode: Mode) {
         let first_upstream = FakeUpstream::start(reply_ok()).await;
         let second_upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let first = register(&proxy, &first_upstream, "/acme/one.git");
         let second = register(&proxy, &second_upstream, "/acme/two.git");
         assert_ne!(first.secret().expose(), second.secret().expose());
@@ -1847,12 +2308,11 @@ mod tests {
         proxy.shutdown();
     }
 
-    #[tokio::test]
-    async fn oversized_request_bodies_are_refused() {
+    async fn oversized_request_bodies_are_refused(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let route = register(&proxy, &upstream, "/acme/widgets.git");
-        let mut stream = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let mut stream = connect(&proxy).await;
         let head = format!(
             "POST {}/git-upload-pack HTTP/1.1\r\nHost: proxy\r\nContent-Length: {}\r\n\r\n",
             prefix(&route),
@@ -1866,8 +2326,7 @@ mod tests {
         assert!(upstream.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn redirects_and_credential_challenges_are_not_passed_on() {
+    async fn redirects_and_credential_challenges_are_not_passed_on(mode: Mode) {
         let redirect = FakeUpstream::start(reply_status(
             StatusCode::MOVED_PERMANENTLY,
             (
@@ -1881,7 +2340,7 @@ mod tests {
             (header::WWW_AUTHENTICATE, "Basic realm=\"GitHub\""),
         ))
         .await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let refs = "/info/refs?service=git-upload-pack";
         for upstream in [&redirect, &challenge] {
             let route = register(&proxy, upstream, "/acme/widgets.git");
@@ -1917,12 +2376,11 @@ mod tests {
         assert_eq!(body, "upstream body");
     }
 
-    #[tokio::test]
-    async fn an_unreachable_upstream_is_a_bad_gateway() {
+    async fn an_unreachable_upstream_is_a_bad_gateway(mode: Mode) {
         let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/acme/widgets.git", closed.local_addr().unwrap());
         drop(closed);
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let route = proxy
             .register(Uuid::new_v4(), &url, None, "agent/TEST-1")
             .unwrap();
@@ -2218,13 +2676,12 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(250));
     }
 
-    #[tokio::test]
-    async fn a_slow_git_body_is_cut_by_the_deadline() {
+    async fn a_slow_git_body_is_cut_by_the_deadline(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy_with(short_limits()).await;
+        let proxy = proxy_with_in(mode, short_limits()).await;
         let route = register(&proxy, &upstream, "/acme/widgets.git");
         let path = format!("{}/git-upload-pack", prefix(&route));
-        let mut stream = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let mut stream = connect(&proxy).await;
         stream
             .write_all(
                 format!("POST {path} HTTP/1.1\r\nhost: p\r\ncontent-length: 100\r\n\r\n0032want")
@@ -2236,14 +2693,13 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
     }
 
-    #[tokio::test]
-    async fn a_slow_mcp_body_is_cut_by_the_deadline() {
-        let proxy = proxy_with(short_limits()).await;
+    async fn a_slow_mcp_body_is_cut_by_the_deadline(mode: Mode) {
+        let proxy = proxy_with_in(mode, short_limits()).await;
         let guard = proxy
             .register_mcp(mcp_tools(pending("Requested.")))
             .unwrap();
         let path = mcp_path(&guard);
-        let mut stream = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let mut stream = connect(&proxy).await;
         stream
             .write_all(
                 format!("POST {path} HTTP/1.1\r\nhost: p\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{{\"jsonrpc\"")
@@ -2255,14 +2711,16 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
     }
 
-    #[tokio::test]
-    async fn a_route_serves_at_most_its_share_of_requests_at_once() {
+    async fn a_route_serves_at_most_its_share_of_requests_at_once(mode: Mode) {
         let hanging = hanging_upstream(b"").await;
-        let proxy = proxy_with(ListenerLimits {
-            limit_loopback_peers: false,
-            idle_timeout: Duration::from_secs(60),
-            ..short_limits()
-        })
+        let proxy = proxy_with_in(
+            mode,
+            ListenerLimits {
+                limit_loopback_peers: false,
+                idle_timeout: Duration::from_secs(60),
+                ..short_limits()
+            },
+        )
         .await;
         let stuck = proxy
             .register(
@@ -2275,14 +2733,23 @@ mod tests {
         let stuck_path = format!("{}/info/refs?service=git-upload-pack", prefix(&stuck));
         let mut held = Vec::new();
         for _ in 0..2 {
-            let mut stream = TcpStream::connect(proxy.local_addr()).await.unwrap();
+            let mut stream = connect(&proxy).await;
             stream
                 .write_all(format!("GET {stuck_path} HTTP/1.1\r\nhost: p\r\n\r\n").as_bytes())
                 .await
                 .unwrap();
             held.push(stream);
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Both are in flight, wherever the front half runs.
+        for _ in 0..500 {
+            let busy = lock(&proxy.inner.routes)
+                .values()
+                .all(|route| route.in_flight.available_permits() == 0);
+            if busy {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let (status, _, body) = request(&proxy, Method::GET, &stuck_path, &[], b"").await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
         // Another route, another run's, is not affected.
@@ -2298,14 +2765,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn an_idle_connection_is_closed() {
+    async fn an_idle_connection_is_closed(mode: Mode) {
         // The upstream sends the headers and three bytes of a 100-byte body, then nothing.
         let hanging = hanging_upstream(
             b"HTTP/1.1 200 OK\r\ncontent-type: application/x-git-upload-pack-advertisement\r\ncontent-length: 100\r\n\r\nabc",
         )
         .await;
-        let proxy = proxy_with(short_limits()).await;
+        let proxy = proxy_with_in(mode, short_limits()).await;
         let route = proxy
             .register(
                 Uuid::new_v4(),
@@ -2315,7 +2781,7 @@ mod tests {
             )
             .unwrap();
         let path = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
-        let mut stream = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        let mut stream = connect(&proxy).await;
         stream
             .write_all(format!("GET {path} HTTP/1.1\r\nhost: p\r\n\r\n").as_bytes())
             .await
@@ -2375,9 +2841,8 @@ mod tests {
         url::Url::parse(guard.url()).unwrap().path().to_string()
     }
 
-    #[tokio::test]
-    async fn serves_the_mcp_handshake_and_tools_of_a_run() {
-        let proxy = proxy().await;
+    async fn serves_the_mcp_handshake_and_tools_of_a_run(mode: Mode) {
+        let proxy = proxy_in(mode).await;
         let guard = proxy
             .register_mcp(mcp_tools(pending("Requested the repository `Docs`.")))
             .unwrap();
@@ -2491,8 +2956,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn rejected_and_unanswered_requests_are_tool_errors() {
+    async fn rejected_and_unanswered_requests_are_tool_errors(mode: Mode) {
         let rejected = RequestOutcome::Answered(RunRepositoryRequestAck {
             run_id: Uuid::nil(),
             request_id: Uuid::nil(),
@@ -2501,7 +2965,7 @@ mod tests {
             code: Some("ALREADY_PENDING".into()),
             message: "A request for the repository `Docs` is already pending.".into(),
         });
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         for (outcome, text) in [
             (
                 rejected,
@@ -2526,10 +2990,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn the_mcp_endpoint_refuses_everything_else() {
+    async fn the_mcp_endpoint_refuses_everything_else(mode: Mode) {
         let upstream = FakeUpstream::start(reply_ok()).await;
-        let proxy = proxy().await;
+        let proxy = proxy_in(mode).await;
         let guard = proxy.register_mcp(mcp_tools(pending("stored"))).unwrap();
         let route = register(&proxy, &upstream, "/acme/widgets.git");
         let path = mcp_path(&guard);
@@ -2610,4 +3073,712 @@ mod tests {
         let (status, _, _) = request_bytes(&proxy, Method::POST, &path, &MCP_HEADERS, ping).await;
         assert_eq!(status, StatusCode::OK);
     }
+
+    /// An upstream that takes each request whole and answers its head and `first` at once;
+    /// the rest of the answer waits for `go`. It says when each of its connections closes.
+    struct HeldUpstream {
+        url: String,
+        go: Arc<tokio::sync::Notify>,
+        events: tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    }
+
+    impl HeldUpstream {
+        /// `answer: false` holds even the head.
+        async fn start(answer: bool) -> HeldUpstream {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let go = Arc::new(tokio::sync::Notify::new());
+            let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+            let go_task = go.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let (tx, go) = (tx.clone(), go_task.clone());
+                    tokio::spawn(async move {
+                        let mut seen = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        let mut answered = false;
+                        loop {
+                            tokio::select! {
+                                read = stream.read(&mut buf) => match read {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                                },
+                                _ = go.notified(), if answered => {
+                                    let _ = stream.write_all(b"4\r\n0000\r\n0\r\n\r\n").await;
+                                    let _ = tx.send("finished");
+                                }
+                            }
+                            if !answered && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                                answered = true;
+                                let _ = tx.send("head");
+                                if answer {
+                                    let _ = stream
+                                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/x-git-upload-pack-advertisement\r\ntransfer-encoding: chunked\r\n\r\n8\r\n0008abcd\r\n")
+                                        .await;
+                                }
+                            }
+                        }
+                        let _ = tx.send("closed");
+                    });
+                }
+            });
+            HeldUpstream { url, go, events }
+        }
+
+        async fn next(&mut self) -> &'static str {
+            tokio::time::timeout(Duration::from_secs(10), self.events.recv())
+                .await
+                .expect("the upstream heard nothing")
+                .unwrap()
+        }
+    }
+
+    /// Waits until nothing of the requests stays: every route's places are back, and in a
+    /// front, no open request and no task of `run` that answers one.
+    async fn nothing_stays(proxy: &Proxy) {
+        let settled = || {
+            let routes_free = lock(&proxy.inner.routes).values().all(|route| {
+                route.in_flight.available_permits() == proxy.inner.limits.max_requests_per_route
+            }) && lock(&proxy.inner.mcp_routes).values().all(|route| {
+                route.in_flight.available_permits() == proxy.inner.limits.max_requests_per_route
+            });
+            let front_free = proxy
+                .front
+                .as_ref()
+                .is_none_or(|f| f.answering() == 0 && f.handle().open_requests() == 0);
+            routes_free && front_free
+        };
+        for _ in 0..500 {
+            if settled() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(settled(), "a place, a request or a task stays");
+        if let Some(front) = &proxy.front {
+            assert!(
+                front.handle().ended().is_none(),
+                "{:?}",
+                front.handle().ended()
+            );
+        }
+    }
+
+    async fn a_revocation_between_two_requests_refuses_the_second_and_the_first_finishes(
+        mode: Mode,
+    ) {
+        let mut upstream = HeldUpstream::start(true).await;
+        let proxy = proxy_in(mode).await;
+        let revoked = Arc::new(Mutex::new(None));
+        let route = proxy
+            .register(
+                Uuid::new_v4(),
+                &format!("{}/acme/widgets.git", upstream.url),
+                Revocable(revoked.clone()),
+                "agent/TEST-1",
+            )
+            .unwrap();
+        let info_refs = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
+        // The first request goes upstream with the token, and its answer starts.
+        let mut first = connect(&proxy).await;
+        first
+            .write_all(format!("GET {info_refs} HTTP/1.1\r\nhost: p\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(upstream.next().await, "head");
+        let mut received = String::new();
+        let mut buf = [0u8; 4096];
+        while !received.contains("0008abcd") {
+            let n = first.read(&mut buf).await.unwrap();
+            assert!(n > 0, "{received}");
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        // The server revokes the run's token: the next request is refused...
+        *lock(&revoked) = Some("Tinfirm revoked this run's access to acme/widgets.".into());
+        let (status, _, body) = request(&proxy, Method::GET, &info_refs, &[], b"").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "Tinfirm revoked this run's access to acme/widgets.\n");
+        // ...and the first one finishes, whole.
+        upstream.go.notify_one();
+        assert_eq!(upstream.next().await, "finished");
+        while !received.ends_with("0\r\n\r\n") {
+            let n = tokio::time::timeout(Duration::from_secs(5), first.read(&mut buf))
+                .await
+                .expect("the first answer did not finish")
+                .unwrap();
+            assert!(n > 0, "{received}");
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(
+            received.contains("0008abcd") && received.contains("0000"),
+            "{received}"
+        );
+    }
+
+    async fn a_client_that_leaves_costs_nothing_that_stays(mode: Mode) {
+        // Before the code host answers.
+        let mut upstream = HeldUpstream::start(false).await;
+        let proxy = proxy_in(mode).await;
+        let route = proxy
+            .register(
+                Uuid::new_v4(),
+                &format!("{}/acme/widgets.git", upstream.url),
+                None,
+                "agent/TEST-1",
+            )
+            .unwrap();
+        let info_refs = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
+        let upload_pack = format!("{}/git-upload-pack", prefix(&route));
+        let mut client = connect(&proxy).await;
+        client
+            .write_all(format!("GET {info_refs} HTTP/1.1\r\nhost: p\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(upstream.next().await, "head");
+        drop(client);
+        assert_eq!(
+            upstream.next().await,
+            "closed",
+            "the upstream request stays"
+        );
+        nothing_stays(&proxy).await;
+        // In the middle of the request body.
+        let mut client = connect(&proxy).await;
+        client
+            .write_all(
+                format!(
+                    "POST {upload_pack} HTTP/1.1\r\nhost: p\r\ncontent-length: 1000\r\n\r\n0032want"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upstream.next().await, "head");
+        drop(client);
+        assert_eq!(
+            upstream.next().await,
+            "closed",
+            "the upstream request stays"
+        );
+        nothing_stays(&proxy).await;
+        drop(route);
+        // In the middle of the answer.
+        let mut upstream = HeldUpstream::start(true).await;
+        let route = proxy
+            .register(
+                Uuid::new_v4(),
+                &format!("{}/acme/other.git", upstream.url),
+                None,
+                "agent/TEST-1",
+            )
+            .unwrap();
+        let info_refs = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
+        let mut client = connect(&proxy).await;
+        client
+            .write_all(format!("GET {info_refs} HTTP/1.1\r\nhost: p\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(upstream.next().await, "head");
+        let mut received = String::new();
+        let mut buf = [0u8; 4096];
+        while !received.contains("0008abcd") {
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "{received}");
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        drop(client);
+        assert_eq!(
+            upstream.next().await,
+            "closed",
+            "the upstream request stays"
+        );
+        nothing_stays(&proxy).await;
+        // A tool call whose client leaves in the middle of its body.
+        let guard = proxy
+            .register_mcp(mcp_tools(pending("Requested.")))
+            .unwrap();
+        let mut client = connect(&proxy).await;
+        client
+            .write_all(
+                format!("POST {} HTTP/1.1\r\nhost: p\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{{\"jsonrpc\"", mcp_path(&guard))
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(client);
+        nothing_stays(&proxy).await;
+    }
+
+    async fn hostile_request_lines_reach_no_other_repository(mode: Mode) {
+        let upstream = FakeUpstream::start(reply_ok()).await;
+        let other_upstream = FakeUpstream::start(reply_ok()).await;
+        let proxy = proxy_in(mode).await;
+        let route = register(&proxy, &upstream, "/acme/widgets.git");
+        let other = register(&proxy, &other_upstream, "/acme/secret.git");
+        let secret = route.secret().expose().to_string();
+        let other_secret = other.secret().expose().to_string();
+        for line in [
+            format!(
+                "GET /{secret}/../{other_secret}/acme/secret.git/info/refs?service=git-upload-pack HTTP/1.1"
+            ),
+            format!(
+                "GET /{secret}/acme/widgets.git/../secret.git/info/refs?service=git-upload-pack HTTP/1.1"
+            ),
+            format!("GET /{secret}/acme/secret.git/info/refs?service=git-upload-pack HTTP/1.1"),
+            format!("GET //{secret}/acme/widgets.git/info/refs?service=git-upload-pack HTTP/1.1"),
+            format!(
+                "GET /{secret}/acme/widgets.git/info/refs?service=git-upload-pack&service=git-upload-pack HTTP/1.1"
+            ),
+            format!(
+                "GET /{secret}/acme/widgets.git/info/refs?service=git-upload-pack%26x HTTP/1.1"
+            ),
+            format!(
+                "GET /{secret}/acme/widgets.git/info/refs?service=git-upload-pack HTTP/1.0\r\nhost: p\r\nx: \"\r\n"
+            ),
+            format!(
+                "GET http://evil.example/{secret}/acme/secret.git/info/refs?service=git-upload-pack HTTP/1.1"
+            ),
+        ] {
+            let mut stream = connect(&proxy).await;
+            stream
+                .write_all(format!("{line}\r\nhost: p\r\nconnection: close\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let answer = read_until_closed(&mut stream).await;
+            assert!(!answer.starts_with("HTTP/1.1 200"), "{line}: {answer}");
+        }
+        // A body framed both ways (Content-Length and chunked) is read as chunked: a request
+        // hidden after its end never reaches the code host.
+        let path = format!("{}/git-upload-pack", prefix(&route));
+        let smuggled = format!(
+            "GET {}/info/refs?service=git-upload-pack HTTP/1.1\r\nhost: p\r\n\r\n",
+            prefix(&other)
+        );
+        let mut stream = connect(&proxy).await;
+        stream
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nhost: p\r\ncontent-length: {}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n4\r\n0000\r\n0\r\n\r\n{smuggled}",
+                    13 + smuggled.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let answer = read_until_closed(&mut stream).await;
+        assert!(!answer.contains("0008"), "{answer}");
+        assert!(
+            other_upstream.seen().is_empty(),
+            "the other repository was reached"
+        );
+        for seen in upstream.seen() {
+            assert!(
+                seen.method != Method::POST || &seen.body[..] == b"0000",
+                "{seen:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_run_half_applies_every_rule_to_a_head_whatever_sent_it() {
+        use crate::front::head::HeaderBytes;
+        let upstream = FakeUpstream::start(reply_ok()).await;
+        let proxy = proxy().await;
+        let route = register(&proxy, &upstream, "/acme/widgets.git");
+        let mcp = proxy.register_mcp(mcp_tools(pending("stored"))).unwrap();
+        let route_id = *lock(&proxy.inner.routes).keys().next().unwrap();
+        let mcp_id = *lock(&proxy.inner.mcp_routes).keys().next().unwrap();
+        let backend = Direct(proxy.inner.clone());
+        let head = |target, method: &str, query: Option<&str>, length| RequestHead {
+            target,
+            method: method.into(),
+            query: query.map(str::to_string),
+            headers: vec![("content-type".into(), HeaderBytes::from("application/json"))],
+            length,
+        };
+        let info = Some("service=git-upload-pack");
+        let empty = || {
+            http_body_util::Empty::<Bytes>::new()
+                .map_err(|never| match never {})
+                .boxed_unsync()
+        };
+        let bytes = |b: &'static [u8]| {
+            Full::new(Bytes::from_static(b))
+                .map_err(|never| match never {})
+                .boxed_unsync()
+        };
+        let mut with_origin = head(
+            Target::Mcp { route: mcp_id },
+            "POST",
+            None,
+            BodyLength::Exact(2),
+        );
+        with_origin
+            .headers
+            .push(("origin".into(), HeaderBytes::from("https://evil.example")));
+        let mut with_crlf = head(
+            Target::GitInfoRefs { route: route_id },
+            "GET",
+            info,
+            BodyLength::Empty,
+        );
+        with_crlf
+            .headers
+            .push(("x-a".into(), HeaderBytes::from("a\r\nhost: elsewhere")));
+        let cases: Vec<(RequestHead, ProxyBody, StatusCode)> = vec![
+            // A route this listener does not have, and a route of the other kind.
+            (
+                head(
+                    Target::GitInfoRefs { route: 999 },
+                    "GET",
+                    info,
+                    BodyLength::Empty,
+                ),
+                empty(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                head(
+                    Target::Mcp { route: route_id },
+                    "POST",
+                    None,
+                    BodyLength::Empty,
+                ),
+                empty(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                head(
+                    Target::Model(crate::model_proxy::ModelEndpoint::AnthropicMessages),
+                    "POST",
+                    None,
+                    BodyLength::Empty,
+                ),
+                empty(),
+                StatusCode::NOT_FOUND,
+            ),
+            // Another method or query than the route's request takes: a push included.
+            (
+                head(
+                    Target::GitInfoRefs { route: route_id },
+                    "POST",
+                    info,
+                    BodyLength::Empty,
+                ),
+                empty(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                head(
+                    Target::GitInfoRefs { route: route_id },
+                    "GET",
+                    Some("service=git-receive-pack"),
+                    BodyLength::Empty,
+                ),
+                empty(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                head(
+                    Target::GitInfoRefs { route: route_id },
+                    "GET",
+                    None,
+                    BodyLength::Empty,
+                ),
+                empty(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                head(
+                    Target::GitUploadPack { route: route_id },
+                    "POST",
+                    Some("x=1"),
+                    BodyLength::Empty,
+                ),
+                empty(),
+                StatusCode::NOT_FOUND,
+            ),
+            // A body over the bound, longer than declared, shorter than declared.
+            (
+                head(
+                    Target::GitUploadPack { route: route_id },
+                    "POST",
+                    None,
+                    BodyLength::Exact(MAX_REQUEST_BODY + 1),
+                ),
+                empty(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                head(
+                    Target::GitUploadPack { route: route_id },
+                    "POST",
+                    None,
+                    BodyLength::Exact(4),
+                ),
+                bytes(b"00000000"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                head(
+                    Target::GitUploadPack { route: route_id },
+                    "POST",
+                    None,
+                    BodyLength::Exact(8),
+                ),
+                bytes(b"0000"),
+                StatusCode::BAD_REQUEST,
+            ),
+            // A header that HTTP does not allow; a browser's request to the tools.
+            (with_crlf, empty(), StatusCode::BAD_REQUEST),
+            (with_origin, bytes(b"{}"), StatusCode::FORBIDDEN),
+        ];
+        for (head, body, want) in cases {
+            let shown = format!("{head:?}");
+            let (answer, _) = backend.call(head, body).await;
+            assert_eq!(answer.status, want.as_u16(), "{shown}");
+        }
+        // Nothing of these reached the code host whole.
+        assert!(
+            upstream
+                .seen()
+                .iter()
+                .all(|seen| seen.method == Method::POST),
+            "{:?}",
+            upstream.seen()
+        );
+        assert!(upstream.seen().iter().all(|seen| seen.body.len() <= 4));
+        drop((route, mcp));
+    }
+
+    async fn header_values_pass_byte_for_byte(mode: Mode) {
+        // UTF-8 text in a value is obs-text to HTTP: allowed, and passed on as it is.
+        const AGENT: &str = "git/2.54.0 caf\u{e9}";
+        let upstream = FakeUpstream::start(reply_ok()).await;
+        let proxy = proxy_in(mode).await;
+        let route = register(&proxy, &upstream, "/acme/widgets.git");
+        let path = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
+        let (status, _, _) =
+            request(&proxy, Method::GET, &path, &[("user-agent", AGENT)], b"").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            upstream.seen()[0].headers[header::USER_AGENT].as_bytes(),
+            AGENT.as_bytes()
+        );
+    }
+
+    /// The git proxy and the platform tools, with the front half in this process and in a
+    /// front: the time a fetch request and a tool call take, and the throughput of a large
+    /// answer (a pack) and of a large request body.
+    /// `cargo test --release -p tinfirm-runner-host --lib measure_the_git_proxy -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a measurement, run by hand in release"]
+    async fn measure_the_git_proxy() {
+        // A code host that streams `x-measure: big:N` bytes, and answers anything else with
+        // a flush packet; it reads each request body whole first.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = stream.set_nodelay(true);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                        let big = req
+                            .headers()
+                            .get(header::USER_AGENT)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.strip_prefix("big:"))
+                            .and_then(|n| n.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let _ = req.into_body().collect().await;
+                        let chunk = Bytes::from(vec![b'p'; 64 * 1024]);
+                        let frames: Box<dyn Iterator<Item = Bytes> + Send> = if big > 0 {
+                            Box::new((0..big.div_ceil(64 * 1024)).map(move |_| chunk.clone()))
+                        } else {
+                            Box::new(std::iter::once(Bytes::from_static(b"0000")))
+                        };
+                        let body = http_body_util::StreamBody::new(futures::stream::iter(
+                            frames.map(|b| Ok::<_, Infallible>(Frame::data(b))),
+                        ));
+                        Ok::<_, Infallible>(Response::new(body))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        for mode in [Mode::Run, Mode::Front] {
+            let proxy = proxy_in(mode).await;
+            let route = proxy
+                .register(
+                    Uuid::new_v4(),
+                    &format!("{url}/acme/widgets.git"),
+                    None,
+                    "agent/TEST-1",
+                )
+                .unwrap();
+            let mcp = proxy
+                .register_mcp(mcp_tools(pending("Requested.")))
+                .unwrap();
+            let stream = connect(&proxy).await;
+            stream.set_nodelay(true).unwrap();
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+                    .await
+                    .unwrap();
+            tokio::spawn(connection);
+            let info_refs = format!("{}/info/refs?service=git-upload-pack", prefix(&route));
+            let upload_pack = format!("{}/git-upload-pack", prefix(&route));
+            let request = |method: Method, path: &str, agent: &str, body: Bytes| {
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::HOST, "proxy")
+                    .header(header::USER_AGENT, agent)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(body))
+                    .unwrap()
+            };
+            let median = |mut times: Vec<Duration>| {
+                times.sort();
+                (times[times.len() / 2], times[times.len() * 99 / 100])
+            };
+            // A fetch's first request, and a tool call.
+            let mut times = Vec::new();
+            for _ in 0..500 {
+                let started = std::time::Instant::now();
+                sender.ready().await.unwrap();
+                let answer = sender
+                    .send_request(request(Method::GET, &info_refs, "git/2.54.0", Bytes::new()))
+                    .await
+                    .unwrap();
+                let _ = answer.into_body().collect().await.unwrap();
+                times.push(started.elapsed());
+            }
+            let (p50, p99) = median(times);
+            println!("{mode:?}: a fetch request: median {p50:?}, p99 {p99:?}");
+            let call = Bytes::from(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+            );
+            let mut times = Vec::new();
+            for _ in 0..500 {
+                let started = std::time::Instant::now();
+                sender.ready().await.unwrap();
+                let answer = sender
+                    .send_request(request(
+                        Method::POST,
+                        &mcp_path(&mcp),
+                        "agent",
+                        call.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(answer.status(), StatusCode::OK);
+                let _ = answer.into_body().collect().await.unwrap();
+                times.push(started.elapsed());
+            }
+            let (p50, p99) = median(times);
+            println!("{mode:?}: a tool call: median {p50:?}, p99 {p99:?}");
+            // A large pack.
+            let size = 1u64 << 30;
+            let started = std::time::Instant::now();
+            sender.ready().await.unwrap();
+            let answer = sender
+                .send_request(request(
+                    Method::POST,
+                    &upload_pack,
+                    &format!("big:{size}"),
+                    Bytes::from_static(b"0000"),
+                ))
+                .await
+                .unwrap();
+            let mut body = answer.into_body();
+            let mut got = 0u64;
+            while let Some(frame) = body.frame().await {
+                got += frame
+                    .unwrap()
+                    .into_data()
+                    .map(|d| d.len() as u64)
+                    .unwrap_or(0);
+            }
+            assert_eq!(got, size);
+            let took = started.elapsed();
+            println!(
+                "{mode:?}: a 1 GiB pack in {took:?} ({:.0} MiB/s)",
+                1024.0 / took.as_secs_f64()
+            );
+            // A large request body, the largest the proxy takes.
+            let body = Bytes::from(vec![b'0'; MAX_REQUEST_BODY as usize]);
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                sender.ready().await.unwrap();
+                let answer = sender
+                    .send_request(request(
+                        Method::POST,
+                        &upload_pack,
+                        "git/2.54.0",
+                        body.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(answer.status().is_success(), "{}", answer.status());
+                let _ = answer.into_body().collect().await.unwrap();
+                times.push(started.elapsed());
+            }
+            let (p50, _) = median(times);
+            println!(
+                "{mode:?}: a 64 MiB request body: median {p50:?} ({:.0} MiB/s)",
+                64.0 / p50.as_secs_f64()
+            );
+        }
+    }
+
+    /// The tests of the proxy's traffic, with the front half in this process and in a front.
+    macro_rules! in_both {
+        ($($name:ident),* $(,)?) => {
+            mod in_run {
+                $(
+                    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                    async fn $name() {
+                        super::$name(super::Mode::Run).await
+                    }
+                )*
+            }
+            mod in_a_front {
+                $(
+                    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                    async fn $name() {
+                        super::$name(super::Mode::Front).await
+                    }
+                )*
+            }
+        };
+    }
+
+    in_both!(
+        forwards_info_refs_with_the_host_authorization_only,
+        forwards_upload_pack_posts_with_their_body,
+        a_revoked_route_refuses_each_new_request_with_the_servers_message,
+        refuses_pushes_with_a_reason,
+        anything_else_is_not_found,
+        wrong_or_missing_secrets_are_not_found,
+        each_secret_reaches_only_its_own_repository_until_the_run_ends,
+        oversized_request_bodies_are_refused,
+        redirects_and_credential_challenges_are_not_passed_on,
+        an_unreachable_upstream_is_a_bad_gateway,
+        a_slow_git_body_is_cut_by_the_deadline,
+        a_slow_mcp_body_is_cut_by_the_deadline,
+        a_route_serves_at_most_its_share_of_requests_at_once,
+        an_idle_connection_is_closed,
+        serves_the_mcp_handshake_and_tools_of_a_run,
+        rejected_and_unanswered_requests_are_tool_errors,
+        the_mcp_endpoint_refuses_everything_else,
+        a_revocation_between_two_requests_refuses_the_second_and_the_first_finishes,
+        a_client_that_leaves_costs_nothing_that_stays,
+        hostile_request_lines_reach_no_other_repository,
+        header_values_pass_byte_for_byte,
+    );
 }

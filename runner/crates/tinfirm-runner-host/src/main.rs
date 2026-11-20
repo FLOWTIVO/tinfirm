@@ -2403,7 +2403,7 @@ async fn probe_reader(
 }
 
 /// What `doctor` says of the front process of a sandbox (ADR-0112, path C, part 2), which
-/// `run` starts for each sandbox's proxy listeners with --sandbox-bridge or --executor vm: a front
+/// `run` starts for each sandbox's listeners with --sandbox-bridge or --executor vm: a front
 /// confines itself and tries to open this host's directories and memory, to make a socket,
 /// to reach this process and to start a program.
 async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool) {
@@ -2425,7 +2425,7 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool) {
         .and_then(|probe| probe),
         Err(e) => Err(anyhow::Error::from(e)),
     };
-    const USED: &str = "`run` starts one per sandbox for its egress and model proxies with --sandbox-bridge or --executor vm";
+    const USED: &str = "`run` starts one per sandbox for its git proxy, platform tools, model and egress proxies with --sandbox-bridge or --executor vm";
     // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed.
     let wire = async {
         let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
@@ -2443,7 +2443,7 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool) {
         Ok(()) => checks.ok("front wire", "ready, a round trip, a descriptor passed"),
         Err(e) if bridged => checks.fail(
             "front wire",
-            format!("{e:#} (no run with a proxy can start: each sandbox's egress and model proxies need a front)"),
+            format!("{e:#} (runs get no git fetch or platform tools, and a run with a model gateway or the egress proxy cannot start: each sandbox's proxies need a front)"),
         ),
         Err(e) => checks.info(
             "front wire",

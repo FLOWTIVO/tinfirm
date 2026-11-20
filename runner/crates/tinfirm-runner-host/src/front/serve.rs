@@ -6,9 +6,10 @@
 //! `run` closes its end, and then exits. It answers `run`'s requests in order; an egress
 //! listener that `run` passes it is served on the runtime ([`crate::egress_proxy::serve`]),
 //! and each connection it needs is asked of `run` ([`ToMain::Connect`]) and given back as a
-//! descriptor or refused; a model listener is served there too ([`crate::model_proxy::serve`]),
-//! and each request it lets through goes to `run` ([`ToMain::Request`]), its body and its
-//! answer's body on a socket `run` gives for it. Its frames go out through one writer, under a
+//! descriptor or refused; a model listener and a run's git listener are served there too
+//! ([`crate::model_proxy::serve`], [`crate::git_proxy::serve_in_front`]), and each request
+//! they let through goes to `run` ([`ToMain::Request`]), its body and its answer's body on a
+//! socket `run` gives for it. Its frames go out through one writer, under a
 //! lock, so they never interleave, and a new request takes its id under that lock, so the ids
 //! reach `run` in the order they grow. A message that is not one of the wire's, that breaks its bounds, that wants a
 //! descriptor that did not come with it, that comes before `init` or a second time, or that
@@ -30,11 +31,10 @@ use tokio::sync::oneshot;
 
 use crate::confine::Status;
 
+use super::head::{Backend, BoxError, Declined, ProxyBody, RequestHead, ResponseHead};
 use super::wire::{self, CHECK_REPLY, MAX_TO_FRONT, MAX_TO_MAIN, Service, ToFront, ToMain};
 use crate::egress_proxy::{Connector, FrontHalf, Granted, Refusal};
-use crate::model_proxy::{
-    BoxError, Declined, ModelBackend, ProxyBody, RequestHead, ResponseHead, proxy_error,
-};
+use crate::model_proxy::proxy_error;
 
 /// How much a read takes at most.
 const READ: usize = 64 * 1024;
@@ -244,20 +244,37 @@ impl Connector for WireConnector {
     }
 }
 
-/// The front's way to the model proxy's run half: each request's head goes to `run`
-/// ([`ToMain::Request`]), its body on the socket `run` gives for it ([`ToFront::Body`]), and
-/// the answer comes back the same way. At most [`wire::MAX_MODEL_REQUESTS`] are open at `run`
-/// at once, from the request to `run`'s end of it; more wait here.
+/// The front's way to the run halves of its listeners (the model proxy's, the git proxy's and
+/// the platform tools'): each request's head goes to `run` ([`ToMain::Request`]), its body on
+/// the socket `run` gives for it ([`ToFront::Body`]), and the answer comes back the same way.
+/// One for the front: `run`'s answers name the request, whichever listener it came from.
 #[derive(Clone)]
-struct ModelWire(Arc<ModelInner>);
+struct RequestWire(Arc<WireInner>);
 
-struct ModelInner {
+struct WireInner {
     writer: Arc<Writer>,
-    open: Arc<tokio::sync::Semaphore>,
     waiting: std::sync::Mutex<HashMap<u64, Waiting>>,
 }
 
-/// A model request that `run` has not ended yet.
+/// One service's side of the [`RequestWire`]: at most [`wire::MAX_SERVICE_REQUESTS`] of its
+/// requests are open at `run` at once, from the request to `run`'s end of it; more wait here.
+struct ServiceWire {
+    wire: RequestWire,
+    service: Service,
+    open: Arc<tokio::sync::Semaphore>,
+}
+
+impl ServiceWire {
+    fn new(wire: &RequestWire, service: Service) -> ServiceWire {
+        ServiceWire {
+            wire: wire.clone(),
+            service,
+            open: Arc::new(tokio::sync::Semaphore::new(wire::MAX_SERVICE_REQUESTS)),
+        }
+    }
+}
+
+/// A request that `run` has not ended yet.
 struct Waiting {
     body: Option<oneshot::Sender<OwnedFd>>,
     response: Option<oneshot::Sender<ResponseHead>>,
@@ -284,7 +301,7 @@ impl Drop for AbortNotice {
     }
 }
 
-impl ModelWire {
+impl RequestWire {
     fn waiting<T>(&self, req: u64, take: impl FnOnce(&mut Waiting) -> Option<T>) -> Option<T> {
         let mut waiting = self.0.waiting.lock().unwrap_or_else(|e| e.into_inner());
         waiting.get_mut(&req).and_then(take)
@@ -334,21 +351,27 @@ impl ModelWire {
     }
 }
 
-impl ModelBackend for ModelWire {
+impl Backend for ServiceWire {
     fn call(
         &self,
         head: RequestHead,
         body: ProxyBody,
     ) -> Pin<Box<dyn Future<Output = (ResponseHead, ProxyBody)> + Send>> {
-        let inner = self.0.clone();
+        let inner = self.wire.0.clone();
+        let open = self.open.clone();
+        let service = self.service;
         Box::pin(async move {
-            let gone = || {
-                proxy_error(
+            let gone = || match service {
+                Service::Model => proxy_error(
                     hyper::StatusCode::BAD_GATEWAY,
                     "the Tinfirm model proxy's runner host did not answer",
-                )
+                ),
+                _ => crate::git_proxy::text_answer(
+                    hyper::StatusCode::BAD_GATEWAY,
+                    "the runner host did not answer",
+                ),
             };
-            let Ok(place) = inner.open.clone().acquire_owned().await else {
+            let Ok(place) = open.acquire_owned().await else {
                 return gone();
             };
             let (body_tx, body_rx) = oneshot::channel();
@@ -425,8 +448,8 @@ impl ModelBackend for ModelWire {
     }
 
     fn declined(&self, why: Declined) {
-        let _ = self.0.writer.send(&ToMain::Declined {
-            service: Service::Model,
+        let _ = self.wire.0.writer.send(&ToMain::Declined {
+            service: self.service,
             why,
         });
     }
@@ -581,9 +604,15 @@ pub fn serve(status: Status) -> ExitCode {
     runtime.block_on(async move {
         let mut init = false;
         let mut egress: Option<Arc<WireConnector>> = None;
-        let mut model: Option<ModelWire> = None;
+        let requests = RequestWire(Arc::new(WireInner {
+            writer: writer.clone(),
+            waiting: std::sync::Mutex::new(HashMap::new()),
+        }));
+        let mut model = false;
+        let mut git: Option<Arc<crate::git_proxy::FrontRoutes>> = None;
         let egress_shutdown = tokio_util::sync::CancellationToken::new();
         let model_shutdown = tokio_util::sync::CancellationToken::new();
+        let git_shutdown = tokio_util::sync::CancellationToken::new();
         while let Some(item) = rx.recv().await {
             let (message, descriptor) = match item {
                 Ok(item) => item,
@@ -651,7 +680,7 @@ pub fn serve(status: Status) -> ExitCode {
                     }
                     continue;
                 }
-                ToFront::ListenModel { .. } if model.is_some() => {
+                ToFront::ListenModel { .. } if model => {
                     return refuse("a second model listener");
                 }
                 ToFront::ListenModel {
@@ -668,44 +697,71 @@ pub fn serve(status: Status) -> ExitCode {
                         Ok(listener) => listener,
                         Err(e) => return refuse(&format!("the model listener: {e}")),
                     };
-                    let wire = ModelWire(Arc::new(ModelInner {
-                        writer: writer.clone(),
-                        open: Arc::new(tokio::sync::Semaphore::new(wire::MAX_MODEL_REQUESTS)),
-                        waiting: std::sync::Mutex::new(HashMap::new()),
-                    }));
-                    model = Some(wire.clone());
+                    model = true;
                     let half = crate::model_proxy::FrontHalf::new(
                         secret,
                         api,
                         base_path,
-                        Arc::new(wire),
+                        Arc::new(ServiceWire::new(&requests, Service::Model)),
                         model_shutdown.clone(),
                     );
                     tokio::spawn(crate::model_proxy::serve(listener, half));
+                    continue;
+                }
+                ToFront::ListenGit { .. } if git.is_some() => {
+                    return refuse("a second git listener");
+                }
+                ToFront::ListenGit { limits } => {
+                    let fd = descriptor.expect("taken with the message");
+                    let listener = std::net::TcpListener::from(fd);
+                    let listener = match listener
+                        .set_nonblocking(true)
+                        .and_then(|()| tokio::net::TcpListener::from_std(listener))
+                    {
+                        Ok(listener) => listener,
+                        Err(e) => return refuse(&format!("the git listener: {e}")),
+                    };
+                    let routes = Arc::new(crate::git_proxy::FrontRoutes::default());
+                    git = Some(routes.clone());
+                    tokio::spawn(crate::git_proxy::serve_in_front(
+                        listener,
+                        routes,
+                        Arc::new(ServiceWire::new(&requests, Service::Git)),
+                        limits,
+                        git_shutdown.clone(),
+                    ));
+                    continue;
+                }
+                ToFront::GitRoutes { routes, mcp } => {
+                    let Some(table) = &git else {
+                        return refuse("routes for no git listener");
+                    };
+                    table.replace(routes, mcp);
                     continue;
                 }
                 ToFront::Unlisten { service } => {
                     match service {
                         Service::Egress => egress_shutdown.cancel(),
                         Service::Model => model_shutdown.cancel(),
+                        Service::Git => git_shutdown.cancel(),
                     }
                     continue;
                 }
                 ToFront::Body { req } => {
                     let fd = descriptor.expect("taken with the message");
-                    if !model.as_ref().is_some_and(|m| m.body(req, fd)) {
+                    if !requests.body(req, fd) {
                         return refuse("a socket for no request of this front");
                     }
                     continue;
                 }
                 ToFront::Response { req, head } => {
-                    if !model.as_ref().is_some_and(|m| m.response(req, head)) {
+                    if !requests.response(req, head) {
                         return refuse("an answer to no request of this front");
                     }
                     continue;
                 }
                 ToFront::End { req, ok } => {
-                    if !model.as_ref().is_some_and(|m| m.end(req, ok)) {
+                    if !requests.end(req, ok) {
                         return refuse("an end of no request of this front");
                     }
                     continue;
@@ -717,6 +773,7 @@ pub fn serve(status: Status) -> ExitCode {
         }
         egress_shutdown.cancel();
         model_shutdown.cancel();
+        git_shutdown.cancel();
         ExitCode::SUCCESS
     })
 }

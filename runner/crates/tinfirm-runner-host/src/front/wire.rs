@@ -17,7 +17,9 @@
 //! front asks `run` for ([`ToMain::Connect`]) and `run` connects or refuses; the model proxy's
 //! listener ([`ToFront::ListenModel`]), and its requests ([`ToMain::Request`]), whose bodies
 //! go each on a socket of its own ([`ToFront::Body`]) while the control channel carries their
-//! heads and ends. The next slices add git's proxy, the bridge's and the files' messages.
+//! heads and ends; a run's listener of the git proxy and the platform tools
+//! ([`ToFront::ListenGit`]) and its routes ([`ToFront::GitRoutes`]), whose requests go the same
+//! way. The next slices add the bridge's and the files' messages.
 //!
 //! Every request of a front has an id that grows with each request ([`ToMain::Connect`] and
 //! [`ToMain::Request`] share them), so that `run` can tell an answer to a request it ended
@@ -88,7 +90,53 @@ pub enum ToFront {
     /// `run` is done with `req`: the answer's body ended whole (`ok`), or was cut off. Nothing
     /// of `req` comes after this.
     End { req: u64, ok: bool },
+    /// With a descriptor, a TCP listener that `run` bound for one run: serve the git proxy's
+    /// fetches and the platform tools' endpoint on it (crate::git_proxy), within `limits`, for
+    /// the routes of [`ToFront::GitRoutes`]. Their requests go to `run` ([`ToMain::Request`]);
+    /// no git token and no tool comes here.
+    ListenGit { limits: FrontLimits },
+    /// The run's routes as they are now, which replace those the front had: each with its
+    /// number, which is all that the front hands `run` of it.
+    GitRoutes {
+        routes: Vec<GitRouteSpec>,
+        mcp: Vec<McpRouteSpec>,
+    },
 }
+
+/// The bounds of a listener that a front serves: its open connections, the time a request's
+/// headers have, and the time a connection may stay idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrontLimits {
+    pub max_connections: u32,
+    pub header_read_ms: u64,
+    pub idle_ms: u64,
+}
+
+/// A repository route of a run, as its front sees it: the secret and repository path of its
+/// URL, and the branch the host pushes (for the refusal of a push).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitRouteSpec {
+    pub route: u64,
+    pub secret: String,
+    pub path: String,
+    pub branch: String,
+}
+
+/// A run's platform tools' endpoint, as its front sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpRouteSpec {
+    pub route: u64,
+    pub secret: String,
+}
+
+/// The most routes of one listener, and the longest parts of one.
+pub const MAX_ROUTES: usize = 64;
+pub const MAX_ROUTE_SECRET: usize = 128;
+pub const MAX_ROUTE_PATH: usize = 1024;
+pub const MAX_ROUTE_BRANCH: usize = 256;
 
 /// A listener of the front.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -96,6 +144,8 @@ pub enum ToFront {
 pub enum Service {
     Egress,
     Model,
+    /// A run's git proxy and platform tools, which share a listener.
+    Git,
 }
 
 /// The longest proxy credential `run` gives a front.
@@ -105,9 +155,10 @@ pub const MAX_HOST: usize = 253;
 /// The connections a front may have asked for and not yet seen end: its open tunnels and
 /// plain HTTP requests (256 each per run, as in-process), with room for those `run` decides.
 pub const MAX_FRONT_REQUESTS: usize = 512;
-/// The model requests a front may have open at `run`, from its `request` to `run`'s `end`:
-/// the model proxy's connections per run, each with one request at a time.
-pub const MAX_MODEL_REQUESTS: usize = crate::model_proxy::MAX_CONNECTIONS;
+/// The requests of one service (the model proxy's, or the git proxy's and the platform
+/// tools') that a front may have open at `run`, from its `request` to `run`'s `end`; more wait
+/// in the front.
+pub const MAX_SERVICE_REQUESTS: usize = 64;
 /// The longest secret and base path of a model listener.
 pub const MAX_MODEL_LISTENER: usize = 1024;
 
@@ -120,6 +171,7 @@ impl ToFront {
                 | ToFront::ListenEgress { .. }
                 | ToFront::Connected { .. }
                 | ToFront::ListenModel { .. }
+                | ToFront::ListenGit { .. }
                 | ToFront::Body { .. }
         )
     }
@@ -153,6 +205,21 @@ impl ToFront {
                 secret, base_path, ..
             } if secret.len() > MAX_MODEL_LISTENER || base_path.len() > MAX_MODEL_LISTENER => {
                 Err("a model listener's secret or base path out of bounds".into())
+            }
+            ToFront::GitRoutes { routes, mcp } => {
+                if routes.len() > MAX_ROUTES || mcp.len() > MAX_ROUTES {
+                    return Err("too many routes".into());
+                }
+                let fits = |secret: &String| !secret.is_empty() && secret.len() <= MAX_ROUTE_SECRET;
+                if !routes.iter().all(|r| {
+                    fits(&r.secret)
+                        && r.path.len() <= MAX_ROUTE_PATH
+                        && r.branch.len() <= MAX_ROUTE_BRANCH
+                }) || !mcp.iter().all(|r| fits(&r.secret))
+                {
+                    return Err("a route out of its bounds".into());
+                }
+                Ok(())
             }
             ToFront::Response { head, .. } => {
                 if !(100..=599).contains(&head.status) {
@@ -448,9 +515,9 @@ mod tests {
 
     #[test]
     fn a_model_request_is_a_head_that_http_allows_within_its_bounds() {
-        use crate::model_proxy::{BodyLength, ModelEndpoint, RequestHead, ResponseHead};
+        use crate::model_proxy::{BodyLength, ModelEndpoint, RequestHead, ResponseHead, Target};
         let head = RequestHead {
-            endpoint: ModelEndpoint::AnthropicMessages,
+            target: Target::Model(ModelEndpoint::AnthropicMessages),
             method: "POST".into(),
             query: Some("beta=true".into()),
             headers: vec![("anthropic-version".into(), "2023-06-01".into())],
