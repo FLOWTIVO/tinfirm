@@ -346,6 +346,36 @@ async fn stop_terminates_the_adapter_and_kills_it_after_the_grace() {
 }
 
 #[tokio::test]
+async fn a_stop_that_comes_after_the_adapter_ended_leaves_the_files_to_the_host() {
+    let server = server().await;
+    let (mut session, bridge) = connect(&server, "run-late-stop").await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("work.txt"), "the agent's work\n").unwrap();
+    let root = dir.path().to_str().unwrap().to_string();
+    // The adapter ends by itself, as an agent does when its stdin closes.
+    let mut io = session.start(shell("echo done", &[])).await.unwrap();
+    assert_eq!(
+        exit(&mut io).await,
+        Exit::Exited {
+            code: Some(0),
+            signal: None
+        }
+    );
+    // The host's stop crossed the end on the wire: it reaches a bridge whose adapter is gone.
+    session.stop(Duration::from_secs(1)).await.unwrap();
+    // The session goes on, and the host takes the work, as it does after every run.
+    let files = session.files();
+    let out = files
+        .exec(&["cat", "work.txt"], &[], Some(&root), None, WAIT)
+        .await
+        .unwrap();
+    assert!(out.success(), "{out:?}");
+    assert_eq!(out.stdout, "the agent's work\n");
+    assert!(!session.has_ended());
+    assert_eq!(finish(&session, bridge).await, 0);
+}
+
+#[tokio::test]
 async fn the_host_ends_the_output_when_the_bridge_is_gone() {
     let server = server().await;
     let (mut session, bridge) = connect(&server, "run-lost").await;

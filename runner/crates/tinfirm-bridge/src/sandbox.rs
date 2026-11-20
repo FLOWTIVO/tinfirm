@@ -824,7 +824,9 @@ impl Bridge {
     }
 
     /// After the adapter (step 4): the host takes the sandbox's files and runs its git steps,
-    /// then sends `close`. Ends there, when the host is gone, or after
+    /// then sends `close`. A `stop` that comes now changes nothing: the adapter it is meant for
+    /// has ended, and the host sent it before the end reached it. Ends at `close`, when the
+    /// host is gone, or after
     /// [`SandboxTiming::idle_after_exit`] without a word from a connected host. Without a
     /// connection it waits [`SandboxTiming::reclaim_wait`] for one: a host that restarted
     /// takes the files then (ADR-0101). Returns whether the host closed the session.
@@ -855,7 +857,10 @@ impl Bridge {
                             closed = true;
                             break;
                         }
-                        Some(Inbound::Control(Control::Stop { .. })) => break,
+                        // A `stop` is for the adapter, which has ended already: the host sent it
+                        // before it learned of the end, and still takes the files. Only `close`
+                        // ends the session here.
+                        Some(Inbound::Control(Control::Stop { .. })) => {}
                         Some(Inbound::Control(Control::Reclaim { id })) => {
                             let _ = dial.link.send_control(&Control::Reclaimed { id, running: false }).await;
                         }
