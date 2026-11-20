@@ -397,11 +397,26 @@ class RunnerSessionHandler implements RunnerSessionListener {
         if (run.status() == RunStatus.QUEUED && run.dispatchedAt() != null) {
             log.info("Runner host {} rejected run {} ({}): {}", host.runnerHostId(), run.id(),
                     abbreviate(rejected.code(), 300), abbreviate(rejected.reason(), 300));
-            // The run waits until retryAt: the dispatcher does not look at it before, so the reason stays.
+            // The run waits until retryAt: the dispatcher does not look at it before, so the reason stays. A host that
+            // rejects the same run again makes it wait twice as long each time, up to rejectBackoffMax: each attempt
+            // assigns the run anew, with its audit events, its credentials and a new epoch, which a host that cannot
+            // run anything for hours would otherwise cost every rejectBackoff. TASK_RUN_ACTIVE passes by itself
+            // once the previous turn ends there: it keeps the short wait and leaves the count as it was.
             Instant now = time.now();
-            Instant retryAt = now.plus(properties.rejectBackoff());
+            QueueReason.Rejections before = run.queueReason() != null
+                    ? run.queueReason().rejectionsBy(host.runnerHostId()) : null;
+            QueueReason.Rejections counted;
+            Instant retryAt;
+            if (RunnerMessages.TASK_RUN_ACTIVE.equals(rejected.code())) {
+                counted = before;
+                retryAt = now.plus(properties.rejectBackoff());
+            }
+            else {
+                counted = new QueueReason.Rejections(host.runnerHostId(), before != null ? before.count() + 1 : 1);
+                retryAt = now.plus(properties.rejectBackoff(counted.count()));
+            }
             QueueReason reason = QueueReason.rejected(run.runnerHostId(), run.runnerHostName(), rejected.code(),
-                    rejected.reason(), retryAt);
+                    rejected.reason(), retryAt).withRejections(counted);
             runs.requeue(run.id(), retryAt, reason, now);
             publisher.publishEvent(TurnStarter.queueReasonChanged(run, reason));
             hub.changedAfterCommit(run.id());

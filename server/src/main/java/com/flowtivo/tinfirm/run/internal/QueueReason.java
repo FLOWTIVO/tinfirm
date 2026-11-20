@@ -32,12 +32,20 @@ import tools.jackson.databind.json.JsonMapper;
  * @param levelChosen     with {@code isolationLevel}: whether the level was chosen for the agent (true) or is the
  *                        strongest the hosts report (false); the text says "only" for the one, "not weaker" for the
  *                        other
+ * @param rejections      how often in a row one host rejected the run, which sets the next back-off
+ *                        ({@link RunProperties#rejectBackoff(int)}). Not in the API. It stays with the run's later
+ *                        reasons while the run waits, and with its assignment to the same host; an assignment to
+ *                        another host, and the run's start, drop it.
  */
 record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable String runnerHostName,
         @Nullable String credentialLabel, @Nullable Integer used, @Nullable Integer limit,
         @Nullable Instant lastSeenAt, @Nullable Instant retryAt, @Nullable String reason,
         @Nullable String rejectCode, @Nullable String message, @Nullable RuntimeKind runtime,
-        @Nullable IsolationLevel isolationLevel, @Nullable Boolean levelChosen) {
+        @Nullable IsolationLevel isolationLevel, @Nullable Boolean levelChosen, @Nullable Rejections rejections) {
+
+    /** {@code count} rejections in a row of the run by the host {@code runnerHostId}, the latest included. */
+    record Rejections(UUID runnerHostId, int count) {
+    }
 
     /** A reason without a level. */
     QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable String runnerHostName,
@@ -45,7 +53,7 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
             @Nullable Instant lastSeenAt, @Nullable Instant retryAt, @Nullable String reason,
             @Nullable String rejectCode, @Nullable String message, @Nullable RuntimeKind runtime) {
         this(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt, reason, rejectCode,
-                message, runtime, null, null);
+                message, runtime, null, null, null);
     }
 
     /** Texts from hosts and other modules are cut to this length. */
@@ -156,7 +164,18 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
      */
     QueueReason withIsolationLevel(IsolationLevel level, boolean chosen) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
-                reason, rejectCode, message, runtime, level, chosen);
+                reason, rejectCode, message, runtime, level, chosen, rejections);
+    }
+
+    /** This reason with the run's count of rejections in a row; null drops it. */
+    QueueReason withRejections(@Nullable Rejections counted) {
+        return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
+                reason, rejectCode, message, runtime, isolationLevel, levelChosen, counted);
+    }
+
+    /** The count of rejections in a row when the host made them, else null: another host starts again from none. */
+    @Nullable Rejections rejectionsBy(@Nullable UUID hostId) {
+        return rejections != null && rejections.runnerHostId().equals(hostId) ? rejections : null;
     }
 
     /** Sent to the chosen host; waiting for {@code run.accepted}. */
@@ -302,6 +321,12 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
         put(details, "runtime", runtime != null ? runtime.name() : null);
         put(details, "isolationLevel", isolationLevel != null ? isolationLevel.name() : null);
         put(details, "levelChosen", levelChosen);
+        if (rejections != null) {
+            Map<String, Object> counted = new LinkedHashMap<>();
+            counted.put("runnerHostId", rejections.runnerHostId().toString());
+            counted.put("count", rejections.count());
+            details.put("rejections", counted);
+        }
         return JSON.writeValueAsString(details);
     }
 
@@ -317,49 +342,59 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
                 integer(details, "limit"), instantOf(details, "lastSeenAt"), instantOf(details, "retryAt"),
                 text(details, "reason"), text(details, "rejectCode"), text(details, "message"),
                 runtime != null ? RuntimeKind.valueOf(runtime) : null,
-                IsolationLevel.ofName(text(details, "isolationLevel")), bool(details, "levelChosen"));
+                IsolationLevel.ofName(text(details, "isolationLevel")), bool(details, "levelChosen"),
+                rejections(details.get("rejections")));
+    }
+
+    private static @Nullable Rejections rejections(@Nullable JsonNode counted) {
+        if (counted == null || !counted.isObject()) {
+            return null;
+        }
+        UUID hostId = uuid(counted, "runnerHostId");
+        Integer count = integer(counted, "count");
+        return hostId != null && count != null && count > 0 ? new Rejections(hostId, count) : null;
     }
 
     // ---- helpers -------------------------------------------------------------------------------------------------
 
     private QueueReason withHost(@Nullable UUID hostId, @Nullable String hostName) {
         return new QueueReason(code, hostId, hostName, credentialLabel, used, limit, lastSeenAt, retryAt, reason,
-                rejectCode, message, runtime, isolationLevel, levelChosen);
+                rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withLabel(@Nullable String label) {
         return new QueueReason(code, runnerHostId, runnerHostName, label, used, limit, lastSeenAt, retryAt, reason,
-                rejectCode, message, runtime, isolationLevel, levelChosen);
+                rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withLastSeenAt(@Nullable Instant at) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, at, retryAt, reason,
-                rejectCode, message, runtime, isolationLevel, levelChosen);
+                rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withRetryAt(@Nullable Instant at) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, at,
-                reason, rejectCode, message, runtime, isolationLevel, levelChosen);
+                reason, rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withReason(@Nullable String cause) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
-                cut(cause, MAX_CODE_LENGTH), rejectCode, message, runtime, isolationLevel, levelChosen);
+                cut(cause, MAX_CODE_LENGTH), rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withMessage(@Nullable String text) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
-                reason, rejectCode, cut(text, MAX_MESSAGE_LENGTH), runtime, isolationLevel, levelChosen);
+                reason, rejectCode, cut(text, MAX_MESSAGE_LENGTH), runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withUsage(int usedSlots, int slotLimit) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, usedSlots, slotLimit, lastSeenAt,
-                retryAt, reason, rejectCode, message, runtime, isolationLevel, levelChosen);
+                retryAt, reason, rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withRuntime(RuntimeKind kind) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
-                reason, rejectCode, message, kind, isolationLevel, levelChosen);
+                reason, rejectCode, message, kind, isolationLevel, levelChosen, rejections);
     }
 
     private static @Nullable String cut(@Nullable String text, int max) {

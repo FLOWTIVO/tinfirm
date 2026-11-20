@@ -512,7 +512,10 @@ class RunDispatcher {
         // 6. Assign.
         RunnerHostInfo host = chosen.info();
         long epoch = run.epoch() + 1;
-        QueueReason assigned = QueueReason.assigned(host, label);
+        // The count of the run's rejections goes with an assignment to the host that made them, which sets the next
+        // back-off if it rejects again; another host starts from none.
+        QueueReason assigned = QueueReason.assigned(host, label)
+            .withRejections(run.queueReason() != null ? run.queueReason().rejectionsBy(host.id()) : null);
         IsolationLevel placedAt = Isolation.placedAt(host);
         PlacementNote note = IsolationPlacement.note(placement, host, session,
                 session != null && session.bundleCarried() && chosen.restores());
@@ -596,8 +599,10 @@ class RunDispatcher {
      * The run stays queued for this reason. It is written only when the code or a field changed; {@code since} moves
      * only with the code.
      */
-    private Optional<Assignment> waiting(RunStore.RunRow run, QueueReason reason, Instant now) {
+    private Optional<Assignment> waiting(RunStore.RunRow run, QueueReason waits, Instant now) {
         QueueReason current = run.queueReason();
+        // A run that waits for another reason after its back-off keeps the count of its host's rejections.
+        QueueReason reason = waits.withRejections(current != null ? current.rejections() : null);
         if (!reason.equals(current)) {
             boolean sameCode = current != null && current.code() == reason.code();
             Instant since = sameCode && run.queueReasonSince() != null ? run.queueReasonSince() : now;
