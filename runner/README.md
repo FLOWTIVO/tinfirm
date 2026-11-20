@@ -796,8 +796,15 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   the AWS, GCP and Azure metadata services. A VM that reaches any of them is deleted, and its run fails
   with `INFRA`. `--vm-probe` adds checks of your own: your database, your other networks.
 - **Checked at start.** `run` asks the driver to verify the template against the contract of a sandbox
-  VM, and refuses to start when it finds a problem, or when the account may not have
-  `--max-concurrent-runs` more VMs.
+  VM, and refuses to start when it finds a problem, or when the driver has too little room for
+  `--max-concurrent-runs` VMs. The driver's room (`maxVms`) is what is left: the nodes' free slots
+  with `--vm-driver node`, the account's remaining quota with a cloud's driver. The VMs that already
+  carry this host's `tinfirm-host` label count as this host's own room: after a crash or a restart
+  they are the runs it takes back and the leftovers it deletes, so a host sized to its nodes starts
+  again with them in place. Only when the room is short does `run` list them (`list`), and the
+  refusal says both numbers: "--max-concurrent-runs is 4, but the VM driver `node` has room for 1
+  more VM(s), and this host holds 2 VM(s) of its own". A host that has never been welcomed has no
+  VMs of its own. A driver that names no `maxVms` is not checked.
 - **Leftovers.** After each connection to the server, this host lists its VMs and deletes those it does
   not hold: after a crash of this host, or a delete that failed. Each VM has the labels `tinfirm-host`
   (this host's id) and `tinfirm-vm` (the VM's own id); the run that takes it is in this host's log.
@@ -958,7 +965,8 @@ run against one. Here, the driver is tested against node agents with their fake 
   nodes that offer the template, answer and report no problem; the first in the file's order on a tie.
 - **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer with no
   problem. A node that does not answer is not counted and is named in the start's log; a node that
-  reports a problem, or a template that no node offers, refuses the start.
+  reports a problem, or a template that no node offers, refuses the start. The start check adds
+  this host's own VMs on the nodes that answer to that sum ([Checked at start](#a-vm-per-run)).
 - **Ids.** A VM's id is `<node>:<the agent's id>`, so the driver, which this host starts again at will,
   finds the node of each.
 - **A node that is down.** `describe` and `delete` of its VMs fail (never `gone`), and the run that

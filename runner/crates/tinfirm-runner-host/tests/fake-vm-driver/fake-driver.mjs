@@ -9,6 +9,9 @@
 //   FAKE_VM_AGENT      the sandbox's own command, a JSON array (TINFIRM_BRIDGE_COMMAND)
 //   FAKE_VM_LOG        a file that gets one JSON line per call: {method, params}
 //   FAKE_VM_LIMIT      verify's maxVms (default: none)
+//   FAKE_VM_SLOTS      the slots of the "nodes": verify's maxVms is the slots that the VMs
+//                      not gone leave free, every host's VMs counted, as the node driver's
+//                      sum of the nodes' free slots is (wins over FAKE_VM_LIMIT)
 //   FAKE_VM_PROBLEMS   verify's problems, a JSON array (default: none)
 //   FAKE_VM_LEFTOVERS  VMs that are there from the start, a JSON array of {id, labels}
 //   FAKE_VM_BOOT_MS    how long a VM takes to come up (default 100)
@@ -80,7 +83,11 @@ const methods = {
   verify({ template }) {
     return {
       problems: JSON.parse(env.FAKE_VM_PROBLEMS || "[]"),
-      maxVms: env.FAKE_VM_LIMIT ? Number(env.FAKE_VM_LIMIT) : null,
+      maxVms: env.FAKE_VM_SLOTS
+        ? Math.max(0, Number(env.FAKE_VM_SLOTS) - [...vms.values()].filter((vm) => vm.state !== "gone").length)
+        : env.FAKE_VM_LIMIT
+          ? Number(env.FAKE_VM_LIMIT)
+          : null,
       checked: [`template ${template}`],
     };
   },

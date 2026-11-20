@@ -436,15 +436,19 @@ async fn run_refuses_a_template_that_breaks_the_contract_or_a_limit_below_its_ce
     let log = dir.path().join("driver.log");
     let check = |env: &[(&str, &str)], max: u32| {
         let vms = Vms::new(vm_options(&log, env));
-        async move { vms.check(max).await }
+        async move { vms.check(max, Some("this-host")).await }
     };
-    let (hello, verified) = check(&[("FAKE_VM_LIMIT", "4")], 4).await.unwrap();
+    let (hello, verified, _) = check(&[("FAKE_VM_LIMIT", "4")], 4).await.unwrap();
     assert_eq!(hello.driver, "fake");
     assert_eq!(verified.max_vms, Some(4));
     let error = check(&[("FAKE_VM_LIMIT", "3")], 4).await.unwrap_err();
     let error = format!("{error:#}");
     assert!(error.contains("--max-concurrent-runs is 4"), "{error}");
-    assert!(error.contains("3 more VM(s)"), "{error}");
+    assert!(error.contains("room for 3 more VM(s)"), "{error}");
+    assert!(
+        error.contains("this host holds 0 VM(s) of its own"),
+        "{error}"
+    );
     let problems = json!(["the firewall allows outbound tcp to 0.0.0.0/0"]).to_string();
     let error = check(&[("FAKE_VM_PROBLEMS", &problems)], 1)
         .await
@@ -456,6 +460,85 @@ async fn run_refuses_a_template_that_breaks_the_contract_or_a_limit_below_its_ce
     assert_eq!(calls[0]["method"], "hello");
     assert_eq!(calls[1]["method"], "verify");
     assert_eq!(calls[1]["params"]["template"], "sandbox-test");
+}
+
+/// `count` VMs of `host`'s, running, for `FAKE_VM_LEFTOVERS`.
+fn vms_of(host: &str, count: usize) -> String {
+    json!(
+        (0..count)
+            .map(|i| json!({"id": format!("vm-{host}-{i}"), "labels": {"tinfirm-host": host, "tinfirm-vm": format!("{host}-{i}")}}))
+            .collect::<Vec<_>>()
+    )
+    .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_whose_own_vms_fill_its_nodes_starts_and_one_with_too_few_slots_does_not() {
+    use tinfirm_runner_host::vm::Vms;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("driver.log");
+    let check = |env: Vec<(&'static str, String)>, max: u32, own: Option<&'static str>| {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let vms = Vms::new(vm_options(&log, &env));
+        async move { vms.check(max, own).await }
+    };
+    // Nodes with 3 slots, all held by this host's VMs (runs to take back, leftovers): no free
+    // slot, and the host starts.
+    let (_, verified, own) = check(
+        vec![
+            ("FAKE_VM_SLOTS", "3".into()),
+            ("FAKE_VM_LEFTOVERS", vms_of("host-a", 3)),
+        ],
+        3,
+        Some("host-a"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(verified.max_vms, Some(0));
+    assert_eq!(own, 3);
+    // Two of this host's and one of another's on the same 3 slots: the other host's VM is no
+    // room of this host's.
+    let both = json!([
+        {"id": "a1", "labels": {"tinfirm-host": "host-a"}},
+        {"id": "a2", "labels": {"tinfirm-host": "host-a"}},
+        {"id": "b1", "labels": {"tinfirm-host": "host-b"}},
+    ])
+    .to_string();
+    let error = check(
+        vec![("FAKE_VM_SLOTS", "3".into()), ("FAKE_VM_LEFTOVERS", both)],
+        3,
+        Some("host-a"),
+    )
+    .await
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("room for 0 more VM(s), and this host holds 2 VM(s) of its own"),
+        "{error}"
+    );
+    // Nodes too small for the ceiling: refused, with what is missing.
+    let error = check(vec![("FAKE_VM_SLOTS", "2".into())], 3, Some("host-a"))
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("--max-concurrent-runs is 3"), "{error}");
+    assert!(error.contains("room for 2 more VM(s)"), "{error}");
+    assert!(error.contains("more nodes or slots"), "{error}");
+    // A host before its first welcome has no VMs of its own, and is asked for none.
+    let error = check(
+        vec![
+            ("FAKE_VM_SLOTS", "3".into()),
+            ("FAKE_VM_LEFTOVERS", vms_of("host-a", 3)),
+        ],
+        3,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("has none of its own yet"),
+        "{error:#}"
+    );
 }
 
 /// The canonical zip of a skill: `SKILL.md` and a script, deflated.
@@ -646,6 +729,24 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool) {
         }
     }
 
+    // Nodes with one slot, which host A's VM holds: no room is free. Host B's start check, as
+    // `run --executor vm` makes it, counts that VM as its own and lets it start.
+    {
+        let paths = tinfirm_runner_host::paths::Paths::new(
+            dir.path().join("host/config"),
+            dir.path().join("host/data"),
+        );
+        let (_, state) = tinfirm_runner_host::config::HostStateFile::load(&paths);
+        let own = state.runner_host_id.map(|id| id.to_string());
+        assert_eq!(own, Some(server.runner_host_id.to_string()));
+        let state_file = dir.path().join("vms.json").to_string_lossy().into_owned();
+        let vms = tinfirm_runner_host::vm::Vms::new(vm_options(
+            &log,
+            &[("FAKE_VM_STATE", &state_file), ("FAKE_VM_SLOTS", "1")],
+        ));
+        let (_, verified, held) = vms.check(1, own.as_deref()).await.unwrap();
+        assert_eq!((verified.max_vms, held), (Some(0), 1));
+    }
     // Host B dials the VM's bridge, as A did, and takes the run back.
     let host = start_host_at(
         &dir.path().join("host"),

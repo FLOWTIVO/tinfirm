@@ -2532,8 +2532,11 @@ async fn vm_executor(
     let refuse_other_images =
         options.image_version == tinfirm_runner_host::vm::ImageVersion::Refuse;
     let vms = tinfirm_runner_host::vm::Vms::new(options);
-    let (hello, verified) = vms
-        .check(max_concurrent_runs)
+    // The VMs this host already holds count as its own room (a restart with runs to take back).
+    let (_, state) = tinfirm_runner_host::config::HostStateFile::load(paths);
+    let own = state.runner_host_id.map(|id| id.to_string());
+    let (hello, verified, own_vms) = vms
+        .check(max_concurrent_runs, own.as_deref())
         .await
         .context("--executor vm: the VM driver's checks failed")?;
     tracing::info!(
@@ -2548,6 +2551,7 @@ async fn vm_executor(
         vm_driver_version = hello.version.as_deref().unwrap_or("-"),
         vm_template = %template,
         vm_limit = ?verified.max_vms,
+        vm_own = own_vms,
         pool_max_ready = pool.max_ready,
         pool_runtime = if pool.multi_runtime { "any" } else { pool.runtime.as_str() },
         vm_checked = ?verified.checked,

@@ -702,9 +702,19 @@ impl Vms {
     }
 
     /// At `run`'s start: the driver speaks this protocol, the template's setup keeps the
-    /// contract, and the account may have as many VMs as the host's ceiling. Returns the
-    /// driver's `hello` and `verify`.
-    pub async fn check(&self, max_concurrent_runs: u32) -> Result<(DriverHello, Verified)> {
+    /// contract, and the host can have as many VMs as its ceiling. The driver's `maxVms` is the
+    /// room that is left: the free slots of the nodes (`node`), or what the account's quota
+    /// still allows (a cloud's driver). The VMs that already carry this host's label (`own`,
+    /// the runner host's id from `state.json`; `None` before its first `welcome`) hold part of
+    /// that room for this host: the runs it takes back, its ready VMs, and the leftovers it
+    /// deletes after its hello. They count as this host's own, so a host that restarts with its
+    /// VMs still there is not refused for the room they hold. Returns the driver's `hello`,
+    /// its `verify`, and the number of such VMs.
+    pub async fn check(
+        &self,
+        max_concurrent_runs: u32,
+        own: Option<&str>,
+    ) -> Result<(DriverHello, Verified, u32)> {
         let hello = self.driver.hello().await?;
         let verified = self.driver.verify(&self.options.template).await?;
         if !verified.problems.is_empty() {
@@ -715,15 +725,55 @@ impl Vms {
                 verified.problems.join("; ")
             );
         }
+        let mut held = 0;
         if let Some(max) = verified.max_vms
             && max < max_concurrent_runs
         {
-            bail!(
-                "--max-concurrent-runs is {max_concurrent_runs}, but the provider lets the account have {max} more VM(s) (the VM driver `{}`); lower it, or raise the account's limit",
-                hello.driver
+            // Only now: a host with room enough asks the driver for nothing more.
+            let listed = match own {
+                Some(host) => Some(self.own_vms(host).await),
+                None => None,
+            };
+            let why = match listed {
+                Some(Ok(count)) => {
+                    held = count;
+                    format!("and this host holds {count} VM(s) of its own")
+                }
+                Some(Err(e)) => {
+                    format!("and this host's own VMs cannot be listed ({e:#})")
+                }
+                None => "and this host has none of its own yet".to_string(),
+            };
+            if max.saturating_add(held) < max_concurrent_runs {
+                bail!(
+                    "--max-concurrent-runs is {max_concurrent_runs}, but the VM driver `{}` has room for {max} more VM(s), {why}; lower --max-concurrent-runs, or give the driver more room (more nodes or slots, or a higher limit of the account)",
+                    hello.driver
+                );
+            }
+            tracing::info!(
+                driver = %hello.driver,
+                room = max,
+                own = held,
+                max_concurrent_runs,
+                "the VM driver has less room than the ceiling, but this host's own VMs hold the rest"
             );
         }
-        Ok((hello, verified))
+        Ok((hello, verified, held))
+    }
+
+    /// How many VMs that are not gone carry this host's label.
+    async fn own_vms(&self, host: &str) -> Result<u32> {
+        let labels = BTreeMap::from([(HOST_LABEL.to_string(), host.to_string())]);
+        let count = self
+            .driver
+            .list(&labels)
+            .await?
+            .iter()
+            // A driver that lists more than asked: only this host's count.
+            .filter(|vm| vm.labels.get(HOST_LABEL).map(String::as_str) == Some(host))
+            .filter(|vm| vm.state != VmState::Gone)
+            .count();
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// The labels of a VM: the host's, and the VM's own id.
