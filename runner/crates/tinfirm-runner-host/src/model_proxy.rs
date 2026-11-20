@@ -2296,11 +2296,27 @@ mod tests {
             MAX_REQUEST_BODY + 1
         );
         stream.write_all(head.as_bytes()).await.unwrap();
-        let mut answer = vec![0u8; 1024];
-        let n = stream.read(&mut answer).await.unwrap();
-        let answer = String::from_utf8_lossy(&answer[..n]);
+        let answer = read_head(&mut stream).await;
         assert!(answer.starts_with("HTTP/1.1 413"), "{answer}");
         assert!(gateway.seen().is_empty());
+    }
+
+    /// An answer's head: what comes until its blank line, the connection's end or an error,
+    /// however many reads it takes.
+    async fn read_head(stream: &mut TcpStream) -> String {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0u8; 4096];
+            while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+        .await
+        .expect("the proxy answers");
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     async fn the_gateways_address_is_checked(mode: Mode) {
