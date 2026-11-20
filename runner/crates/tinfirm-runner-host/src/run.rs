@@ -50,7 +50,7 @@ use crate::sandbox_files::{self, Layout};
 use crate::session_bundles;
 use crate::skills::{self, ProvidedSkill};
 use crate::steer::Steering;
-use crate::takeback::{RecordHandle, RepoRecord, RunRecord};
+use crate::takeback::{CollectedRecord, RecordHandle, RepoRecord, RunRecord};
 use crate::usage::{UsageMode, prompt_usage};
 use crate::util::{
     EVENT_PAYLOAD_MAX, LOG_MESSAGE_MAX, SUMMARY_MAX, shrink_json, truncate_with_marker,
@@ -178,6 +178,10 @@ impl EventSink {
         }
     }
 
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
     fn numbering(&self) -> std::sync::MutexGuard<'_, Numbering> {
         self.numbering.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -187,7 +191,7 @@ impl EventSink {
         self.numbering().record = Some(record);
     }
 
-    /// The sandbox is gone: its record too.
+    /// Nothing is left to take back: the record goes.
     pub fn drop_record(&mut self) {
         let record = self.numbering().record.take();
         if let Some(record) = record {
@@ -819,6 +823,7 @@ pub async fn execute(
                         session_id: None,
                         seq_floor: sink.last_seq() + crate::takeback::SEQ_BLOCK,
                         revoked,
+                        collected: false,
                     };
                     match RecordHandle::create(&shared.records, record) {
                         Ok(record) => {
@@ -1060,20 +1065,36 @@ const TAKE_BACK_WAIT: Duration = Duration::from_secs(120);
 /// How long the agent of the earlier process has to stop.
 const RECLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Takes back a run of the process this host restarted from (ADR-0101): its sandbox
-/// (`sandbox`, held since the host started) comes back over `registration` with the session
-/// key. The agent stops, and the run ends as a run that the host stopped does: the work comes
-/// back from the sandbox and is pushed, the session's bundle is stored, and the run is reported
-/// failed with `INFRA`, or cancelled when the server cancels it meanwhile. Returns `None` when
-/// the run was aborted (stale epoch) and must not report anything.
+/// How a run taken back ends ([`take_back`]).
+#[derive(Debug)]
+pub enum TakenBackEnd {
+    /// The run ends, and this is its report.
+    Finished(Box<RunFinished>),
+    /// Aborted (a stale epoch): it pushes and reports nothing, and its record and work go.
+    Aborted,
+    /// The host shuts down while the run waits for the server before its push: the record and
+    /// the work stay on this host, and the next start takes the run back from them.
+    Left,
+}
+
+/// Takes back a run of the process this host restarted from (ADR-0101). `sandbox` is the
+/// run's sandbox (held since the host started) and the registration over which it comes back
+/// with the session key; `None` for a run whose work came back from its sandbox already
+/// ([`RunRecord::collected`]), before an earlier restart. The agent stops, and the run ends as a
+/// run that the host stopped does: the work comes back from the sandbox and is pushed, once the
+/// server has answered the hello (ADR-0116, decision 10), the session's bundle is stored, and
+/// the run is reported failed with `INFRA`, or cancelled when the server cancels it meanwhile.
+/// The record stays until the run ends, so a restart while the run waits takes it back again.
 pub async fn take_back(
     shared: &Arc<Shared>,
     record: RunRecord,
     tokens: &Arc<RunGitTokens>,
-    sandbox: crate::sandbox::TakenBack,
-    registration: tinfirm_bridge::host::Registration,
+    sandbox: Option<(
+        crate::sandbox::TakenBack,
+        tinfirm_bridge::host::Registration,
+    )>,
     mut stop_rx: watch::Receiver<Option<StopRequest>>,
-) -> Option<RunFinished> {
+) -> TakenBackEnd {
     let assign = &record.assign;
     let paths = shared.opts.paths.clone();
     let mut sink = EventSink::after(
@@ -1086,7 +1107,7 @@ pub async fn take_back(
     sink.keep_record(kept.clone());
     tokens.attach_log(sink.side());
     // A revocation that the server sends again at the hello writes the record again.
-    tokens.keep_record(kept);
+    tokens.keep_record(kept.clone());
     let mut secrets = Vec::new();
     if let Some(tinfirm_protocol::AssignedCredential::Model(access)) = assign.credential() {
         secrets.push(access.api_key.expose().to_string());
@@ -1104,7 +1125,11 @@ pub async fn take_back(
     }
     sink.log(
         LogLevel::Warn,
-        "the runner host restarted during the run and takes it back: the agent stops, and its work and its session are saved",
+        if record.collected {
+            "the runner host restarted again before it pushed the run's work: the work it took from the sandbox is pushed from this host"
+        } else {
+            "the runner host restarted during the run and takes it back: the agent stops, and its work and its session are saved"
+        },
     );
     sink.status(Phase::Finalizing, None);
 
@@ -1148,7 +1173,7 @@ pub async fn take_back(
                 .with_tokens(tokens.repo(ws.component_id)),
                 cloned_head: kept.cloned_head.clone(),
                 cloned_commits: kept.cloned_commits,
-                collected: None,
+                collected: kept.collected.as_ref().map(CollectedRecord::restore),
             })
         })
         .collect();
@@ -1157,87 +1182,111 @@ pub async fn take_back(
     // A cancel meanwhile still saves the work, as a run's cancel does; only an abort (a stale
     // epoch) stops the wait.
     let mut failure = Failure::default();
-    let mut came_back = false;
-    let connected = tokio::select! {
-        session = registration.connected(TAKE_BACK_WAIT) => Some(session),
-        _ = wait_for_abort(&mut stop_rx) => None,
-    };
-    match connected {
-        Some(Ok(session)) => {
-            came_back = true;
-            let mut sandbox = sandbox.connected(session);
-            match sandbox.reclaim(RECLAIM_TIMEOUT).await {
-                Ok(true) => sink.log(
-                    LogLevel::Info,
-                    "the agent of the host before its restart was stopped",
-                ),
-                Ok(false) => sink.log(
-                    LogLevel::Info,
-                    "the agent had stopped already: its host was gone for too long",
-                ),
-                Err(e) => sink.log(
-                    LogLevel::Warn,
+    let mut came_back = record.collected;
+    if let Some((sandbox, registration)) = sandbox {
+        let connected = tokio::select! {
+            session = registration.connected(TAKE_BACK_WAIT) => Some(session),
+            _ = wait_for_abort(&mut stop_rx) => None,
+        };
+        match connected {
+            Some(Ok(session)) => {
+                came_back = true;
+                let mut sandbox = sandbox.connected(session);
+                match sandbox.reclaim(RECLAIM_TIMEOUT).await {
+                    Ok(true) => sink.log(
+                        LogLevel::Info,
+                        "the agent of the host before its restart was stopped",
+                    ),
+                    Ok(false) => sink.log(
+                        LogLevel::Info,
+                        "the agent had stopped already: its host was gone for too long",
+                    ),
+                    Err(e) => sink.log(
+                        LogLevel::Warn,
+                        format!(
+                            "the agent did not stop as asked: {}",
+                            sink.redact(&format!("{e:#}"))
+                        ),
+                    ),
+                }
+                if let Some(files) = sandbox.files()
+                    && *stop_rx.borrow() != Some(StopRequest::Abort)
+                {
+                    collect_from_sandbox(
+                        &mut sink,
+                        assign,
+                        &files,
+                        &reader_of(shared),
+                        &layout,
+                        &mut repos,
+                        &home_dir,
+                        record.home_exclude.clone(),
+                        output_root.as_ref().map(OutputRoot::path),
+                    )
+                    .await;
+                }
+                sandbox.stop(Duration::from_secs(5)).await;
+                if *stop_rx.borrow() != Some(StopRequest::Abort) {
+                    // From now on the run's work is on this host alone: a restart takes the
+                    // run back from here, without a sandbox.
+                    let collected: Vec<(String, CollectedRecord)> = repos
+                        .iter()
+                        .filter_map(|repo| {
+                            let collected = repo.collected.as_ref()?;
+                            Some((repo.ws.dir.clone(), CollectedRecord::of(collected)))
+                        })
+                        .collect();
+                    kept.collected(&collected);
+                }
+            }
+            Some(Err(e)) => {
+                failure.set(
+                    FailureClass::Infra,
                     format!(
-                        "the agent did not stop as asked: {}",
+                        "The runner host restarted during the run, and the run's sandbox did not come back to it ({}); the work of the run is lost.",
                         sink.redact(&format!("{e:#}"))
                     ),
-                ),
+                );
+                sandbox.discard(Duration::from_secs(5)).await;
             }
-            if let Some(files) = sandbox.files()
-                && *stop_rx.borrow() != Some(StopRequest::Abort)
-            {
-                collect_from_sandbox(
-                    &mut sink,
-                    assign,
-                    &files,
-                    &reader_of(shared),
-                    &layout,
-                    &mut repos,
-                    &home_dir,
-                    record.home_exclude.clone(),
-                    output_root.as_ref().map(OutputRoot::path),
-                )
-                .await;
-            }
-            sandbox.stop(Duration::from_secs(5)).await;
+            None => sandbox.discard(Duration::from_secs(5)).await,
         }
-        Some(Err(e)) => {
-            failure.set(
-                FailureClass::Infra,
-                format!(
-                    "The runner host restarted during the run, and the run's sandbox did not come back to it ({}); the work of the run is lost.",
-                    sink.redact(&format!("{e:#}"))
-                ),
-            );
-            sandbox.discard(Duration::from_secs(5)).await;
-        }
-        None => sandbox.discard(Duration::from_secs(5)).await,
     }
-    tokens.drop_record();
-    sink.drop_record();
+    if !came_back {
+        // Nothing came back: there is nothing left to take back either.
+        tokens.drop_record();
+        sink.drop_record();
+    }
 
-    // The push waits for the server: a revocation that came while this host was away comes
-    // again in its answer to the hello (ADR-0116, decision 10). A host of protocol 1 knows no
-    // revocation, and pushes as before. Then every token of the run that expires is renewed,
-    // an expired one included: after `welcome.done`, or right after the `welcome` of an older
-    // server, which never sent `expiresAt`, so that its runs have nothing to renew
-    // (`git_refresh::renew` asks for no repository then). The stop is looked at after this,
-    // so that an abort meanwhile pushes and reports nothing.
-    if came_back
-        && shared.speaks_v2()
-        && repos.iter().any(|repo| tokens.holds(repo.ws.component_id))
-    {
-        wait_for_the_server(shared, &mut sink, &mut stop_rx).await;
-        if *stop_rx.borrow() != Some(StopRequest::Abort) {
+    // The push waits for the server (ADR-0116, decision 10): this process pushes nothing and
+    // uses no git token of the run before the server has welcomed it, and, from a server that
+    // lists `run.git.revoke`, before `welcome.done`, which comes after every revocation it
+    // held for the run. There is no cap: the work and the record stay on this host while it
+    // waits. Then every token of the run that expires is renewed, an expired one included
+    // (an older server never sent `expiresAt`, so `git_refresh::renew` asks for nothing then).
+    // The stop is looked at after this, so that an abort meanwhile pushes and reports nothing.
+    if came_back && !repos.is_empty() {
+        match wait_for_the_server(shared, &mut sink, &mut stop_rx).await {
+            Waited::Answered | Waited::Aborted => {}
+            Waited::Left => {
+                tracing::info!(run_id = %assign.run_id, epoch = assign.epoch, "the host stops while a run taken back waits for the server; the next start takes it back");
+                // The record stays, and so does the work: neither is removed here.
+                tokens.drop_record();
+                return TakenBackEnd::Left;
+            }
+        }
+        if *stop_rx.borrow() != Some(StopRequest::Abort) && shared.speaks_v2() {
             crate::git_refresh::renew(shared, tokens, None).await;
         }
     }
 
     let cancelled = match *stop_rx.borrow() {
         Some(StopRequest::Abort) => {
+            tokens.drop_record();
+            sink.drop_record();
             let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
             cleanup_workspace(shared, &workspace_dir, false);
-            return None;
+            return TakenBackEnd::Aborted;
         }
         Some(StopRequest::Cancel) => true,
         None => false,
@@ -1318,55 +1367,68 @@ pub async fn take_back(
         ..Report::default()
     };
     let finished = finish(&mut sink, assign, failure, cancelled, report);
+    // The run has ended: nothing is left to take back.
+    tokens.drop_record();
+    sink.drop_record();
     let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
     cleanup_workspace(
         shared,
         &workspace_dir,
         finished.outcome == Outcome::Failed || failed_git,
     );
-    Some(finished)
+    TakenBackEnd::Finished(Box::new(finished))
 }
 
-/// Before a run taken back pushes with its git tokens (ADR-0116, decision 10): waits for the
-/// server's answer to the hello. A server that lists `run.git.revoke` in `welcome.features`
-/// sends `welcome.done` after every pending `run.git.revoke` of the runs the hello listed, and
-/// the host has applied those by then, since it handles the server's frames in order; the run
-/// waits for it. An older server (no such feature in `welcome`) keeps no revocation and sends
-/// no `welcome.done`: the run pushes once it is welcomed, as before. Without either within
-/// [`HostOptions::welcome_done_wait`] (no connection, or a server that lists the feature and
-/// sends no `welcome.done`) the run pushes with what its record holds, and the log says which
-/// of the two it was. An abort stops the wait; the caller looks at the stop again.
-///
-/// [`HostOptions::welcome_done_wait`]: crate::host::HostOptions::welcome_done_wait
+/// How [`wait_for_the_server`] ended.
+enum Waited {
+    /// The server has answered: the run may use its tokens and push.
+    Answered,
+    /// An abort came: the caller pushes and reports nothing.
+    Aborted,
+    /// The host shuts down: the run stays for the next start.
+    Left,
+}
+
+/// Before a run taken back uses its git tokens or pushes (ADR-0116, decision 10): waits until
+/// this process has had the server's answer to its hello. A server that lists `run.git.revoke`
+/// in `welcome.features` sends `welcome.done` after every pending `run.git.revoke` of the runs
+/// the hello listed, and the host has applied those by then, since it handles the server's
+/// frames in order; the run waits for it. An older server (no such feature in `welcome`) keeps
+/// no revocation and sends no `welcome.done`: the run goes on once it is welcomed. There is no
+/// cap: without a connection the run waits, its work and its record on this host, and says so
+/// once in the host's log and in the run's events. An abort stops the wait, and so does the
+/// host's shutdown, which leaves the run for the next start; a cancel from the server does
+/// not, since it comes before `welcome.done`. The caller looks at the stop again.
 async fn wait_for_the_server(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     stop_rx: &mut watch::Receiver<Option<StopRequest>>,
-) {
+) -> Waited {
     let mut answer = shared.hello_answer();
-    let deadline = tokio::time::sleep(shared.opts.welcome_done_wait);
-    tokio::pin!(deadline);
+    let mut said = false;
     loop {
-        if *stop_rx.borrow() == Some(StopRequest::Abort) || answer.borrow_and_update().complete() {
-            return;
+        let stop = *stop_rx.borrow_and_update();
+        if stop == Some(StopRequest::Abort) {
+            return Waited::Aborted;
+        }
+        if answer.borrow_and_update().complete() {
+            return Waited::Answered;
+        }
+        if stop == Some(StopRequest::Cancel) && shared.is_shutting_down() {
+            return Waited::Left;
+        }
+        if !said {
+            said = true;
+            tracing::warn!(run_id = %sink.run_id(), "a run taken back waits for the server's answer to the hello before it pushes; its work stays on this host until then");
+            sink.log(
+                LogLevel::Info,
+                "the run's work waits on the runner host until the server has answered the host's hello, so that no git token the server revoked meanwhile is used; it is pushed then",
+            );
         }
         tokio::select! {
             Ok(()) = answer.changed() => {}
             Ok(()) = stop_rx.changed() => {}
-            _ = &mut deadline => {
-                let why = if shared.is_connected() {
-                    "the server did not say that it had sent every revocation of the run's git tokens (no welcome.done)"
-                } else {
-                    "the runner host is not connected to the server"
-                };
-                sink.log(
-                    LogLevel::Warn,
-                    format!(
-                        "{why}: the run's work is pushed without knowing whether a git token of the run was revoked meanwhile"
-                    ),
-                );
-                return;
-            }
+            else => return Waited::Left,
         }
     }
 }

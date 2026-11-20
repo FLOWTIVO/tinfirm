@@ -13,9 +13,9 @@ use tinfirm_protocol::{
     AssignedCredential, CredentialKind, CredentialState, CredentialStatus, ErrorMessage,
     Executor as ExecutorKind, Hello, IsolationTier, MAX_WORKSPACES, Message, ModelAccess,
     PslUpdate, PublicSuffixListVersion, RequestKind, RunAccepted, RunAsk, RunAskAck, RunAssign,
-    RunCancel, RunGitRevoke, RunRef, RunRejected, RunRepositoryRequest, RunRequest, RunRequestAck,
-    RunSteer, RunTaskCreate, RunTaskCreateAck, Runtime, RuntimeInfo, WorkspaceSpec, feature,
-    is_valid_workspace_dir, reject_code,
+    RunCancel, RunGitRevoke, RunGitRevoked, RunRef, RunRejected, RunRepositoryRequest, RunRequest,
+    RunRequestAck, RunSteer, RunTaskCreate, RunTaskCreateAck, Runtime, RuntimeInfo, WorkspaceSpec,
+    feature, is_valid_workspace_dir, reject_code,
 };
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -100,10 +100,6 @@ pub struct HostOptions {
     /// How long a `run.request` of kind TOOL waits for its ack: the server's tool timeout
     /// (60 s by default) plus 5 s.
     pub tool_request_timeout: Duration,
-    /// How long a run taken back after a restart waits for the server's `welcome.done` before
-    /// it pushes with what its record holds (ADR-0116, decision 10): 2 minutes, the server's
-    /// reconnect grace; tests shorten it.
-    pub welcome_done_wait: Duration,
     /// Deletion and gc of mirrors, deletion of session homes and of cached skills
     /// (`TINFIRM_RUNNER_MIRROR_MAX_IDLE_DAYS`, `TINFIRM_RUNNER_MIRROR_MAX_BYTES`,
     /// `TINFIRM_RUNNER_HOME_MAX_IDLE_DAYS`, `TINFIRM_RUNNER_SKILL_CACHE_MAX_IDLE_DAYS`).
@@ -158,7 +154,6 @@ impl HostOptions {
             model_proxy: ModelProxySettings::default(),
             repository_request_timeout: REPOSITORY_REQUEST_TIMEOUT,
             tool_request_timeout: TOOL_REQUEST_TIMEOUT,
-            welcome_done_wait: WELCOME_DONE_WAIT,
             maintenance: maintenance::Settings::from_env(),
             bridge: None,
             ready_vms: crate::ready_vms::ReadyVmOptions::default(),
@@ -286,9 +281,6 @@ const STALE_COPY_WAIT: Duration = Duration::from_secs(20);
 /// How long `hello` waits for Docker to report the runtime images.
 const HELLO_IMAGE_CHECK: Duration = Duration::from_secs(5);
 
-/// [`HostOptions::welcome_done_wait`] by default.
-pub const WELCOME_DONE_WAIT: Duration = Duration::from_secs(120);
-
 /// How often a draining host checks whether its last run has ended.
 const DRAIN_POLL: Duration = Duration::from_millis(200);
 
@@ -309,8 +301,10 @@ pub enum HelloAnswer {
 }
 
 impl HelloAnswer {
-    /// Whether a run taken back may push now: the server sent every revocation it keeps for the
-    /// run (`welcome.done`), or it is an older one, which keeps none.
+    /// Whether a run taken back may use its git tokens and push now: this process has been
+    /// welcomed, and the server sent every revocation it keeps for the run (`welcome.done`), or
+    /// it is an older one, which keeps none. There is no time after which a run goes on
+    /// without it.
     pub fn complete(self) -> bool {
         matches!(
             self,
@@ -341,6 +335,9 @@ struct RunEntry {
     steering: Arc<Steering>,
     /// The execution's git tokens, which a `run.git.revoke` drops (ADR-0116).
     git_tokens: Arc<RunGitTokens>,
+    /// `run.git.revoked` frames of a run still being admitted, which has no queue in the
+    /// outbox yet: [`Shared::admit`] queues them after its `run.accepted`.
+    unqueued_revoked: Vec<RunGitRevoked>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -689,6 +686,18 @@ impl Shared {
         let mut held = Vec::new();
         for record in std::mem::take(&mut records) {
             let run_id = record.run_id();
+            if record.collected {
+                // Its work came back from the sandbox before an earlier restart: only the push
+                // and the report are left, from this host's disk (ADR-0116, decision 10).
+                if self.opts.paths.workspace(run_id).is_dir() {
+                    tracing::info!(%run_id, epoch = record.assign.epoch, "taking back a run whose work this host holds; it waits for the server before it pushes");
+                    self.spawn_taken_back(record, None);
+                } else {
+                    tracing::warn!(%run_id, "a run of the process before this one cannot be taken back: its work is no longer on this host");
+                    self.records.remove(run_id);
+                }
+                continue;
+            }
             let sandbox = if self.opts.bridge.is_none() {
                 Err(anyhow::anyhow!(
                     "this host runs no agent over the sandbox bridge now"
@@ -732,7 +741,6 @@ impl Shared {
             return;
         }
         for ((record, sandbox), registration) in held.into_iter().zip(registrations) {
-            let (run_id, epoch) = (record.run_id(), record.assign.epoch);
             if let crate::takeback::SandboxRecord::Vm { address, port, .. } = &record.sandbox
                 && let Executor::Vm(vms) = &self.opts.executor
             {
@@ -743,55 +751,71 @@ impl Shared {
                     port.unwrap_or(vms.options.port),
                 ));
             }
-            tracing::info!(%run_id, epoch, "taking back a run of the process before this one");
-            let (stop_tx, stop_rx) = watch::channel(None);
-            let steering = Steering::new(run_id, epoch, self.outbox.clone());
-            // No token that the server revoked comes back (ADR-0116).
-            let git_tokens = RunGitTokens::restored(&record.assign, &record.revoked);
-            lock(&self.runs).insert(
-                run_id,
-                RunEntry {
-                    epoch,
-                    task_id: record.assign.work_item().id,
-                    credential_label: record.assign.credential_label.clone(),
-                    stop: stop_tx,
-                    steering: steering.clone(),
-                    git_tokens: git_tokens.clone(),
-                    handle: None,
-                },
-            );
-            self.outbox.resume_run(run_id, epoch, record.seq_floor);
-            let shared = self.clone();
-            let handle = tokio::spawn(async move {
-                let finished =
-                    run::take_back(&shared, record, &git_tokens, sandbox, registration, stop_rx)
-                        .await;
-                git_tokens.close_log();
-                steering.close("the run ended");
-                match finished {
-                    Some(finished) => {
-                        tracing::info!(%run_id, outcome = ?finished.outcome, class = ?finished.failure_class, "run taken back and finished");
-                        shared.outbox.push_finished(finished);
-                    }
-                    None => {
-                        tracing::info!(%run_id, epoch, "run taken back and aborted (stale epoch)");
-                        shared.outbox.drop_run(run_id, epoch);
-                    }
+            tracing::info!(run_id = %record.run_id(), epoch = record.assign.epoch, "taking back a run of the process before this one");
+            self.spawn_taken_back(record, Some((sandbox, registration)));
+        }
+    }
+
+    /// Registers a run taken back as a run of this host's, listed in `hello.activeRuns`, and
+    /// starts its task ([`run::take_back`]).
+    fn spawn_taken_back(
+        self: &Arc<Self>,
+        record: crate::takeback::RunRecord,
+        sandbox: Option<(
+            crate::sandbox::TakenBack,
+            tinfirm_bridge::host::Registration,
+        )>,
+    ) {
+        let (run_id, epoch) = (record.run_id(), record.assign.epoch);
+        let (stop_tx, stop_rx) = watch::channel(None);
+        let steering = Steering::new(run_id, epoch, self.outbox.clone());
+        // No token that the server revoked comes back (ADR-0116).
+        let git_tokens = RunGitTokens::restored(&record.assign, &record.revoked);
+        lock(&self.runs).insert(
+            run_id,
+            RunEntry {
+                epoch,
+                task_id: record.assign.work_item().id,
+                credential_label: record.assign.credential_label.clone(),
+                stop: stop_tx,
+                steering: steering.clone(),
+                git_tokens: git_tokens.clone(),
+                unqueued_revoked: Vec::new(),
+                handle: None,
+            },
+        );
+        self.outbox.resume_run(run_id, epoch, record.seq_floor);
+        let shared = self.clone();
+        let handle = tokio::spawn(async move {
+            let end = run::take_back(&shared, record, &git_tokens, sandbox, stop_rx).await;
+            git_tokens.close_log();
+            steering.close("the run ended");
+            match end {
+                run::TakenBackEnd::Finished(finished) => {
+                    tracing::info!(%run_id, outcome = ?finished.outcome, class = ?finished.failure_class, "run taken back and finished");
+                    shared.outbox.push_finished(*finished);
                 }
-                {
-                    let mut runs = lock(&shared.runs);
-                    if runs.get(&run_id).is_some_and(|e| e.epoch == epoch) {
-                        runs.remove(&run_id);
-                    }
+                run::TakenBackEnd::Aborted => {
+                    tracing::info!(%run_id, epoch, "run taken back and aborted (stale epoch)");
+                    shared.outbox.drop_run(run_id, epoch);
                 }
-                shared.drop_platform_requests(run_id, epoch);
-                shared.remove_run_secrets(run_id, epoch);
-            });
-            if let Some(entry) = lock(&self.runs).get_mut(&run_id)
-                && entry.epoch == epoch
-            {
-                entry.handle = Some(handle);
+                run::TakenBackEnd::Left => {
+                    tracing::info!(%run_id, epoch, "run taken back and left for the next start of the host");
+                }
             }
+            {
+                let mut runs = lock(&shared.runs);
+                if runs.get(&run_id).is_some_and(|e| e.epoch == epoch) {
+                    runs.remove(&run_id);
+                }
+            }
+            shared.drop_platform_requests(run_id, epoch);
+            shared.remove_run_secrets(run_id, epoch);
+        });
+        if let Some(entry) = lock(&self.runs).get_mut(&run_id)
+            && entry.epoch == epoch
+        {
+            entry.handle = Some(handle);
         }
     }
 
@@ -1518,6 +1542,7 @@ impl Shared {
                             stop: stop_tx,
                             steering: steering.clone(),
                             git_tokens: git_tokens.clone(),
+                            unqueued_revoked: Vec::new(),
                             handle: None,
                         },
                     )
@@ -1703,8 +1728,11 @@ impl Shared {
                 )),
             };
         }
-        let runs = lock(&self.runs);
-        let Some(entry) = runs.get(&assign.run_id).filter(|e| e.epoch == assign.epoch) else {
+        let mut runs = lock(&self.runs);
+        let Some(entry) = runs
+            .get_mut(&assign.run_id)
+            .filter(|e| e.epoch == assign.epoch)
+        else {
             // A newer epoch took the run over; that one answers the server.
             return false;
         };
@@ -1734,6 +1762,10 @@ impl Shared {
             run_id: assign.run_id,
             epoch: assign.epoch,
         });
+        // A `run.git.revoke` that came during the admission is confirmed after the accept.
+        for revoked in std::mem::take(&mut entry.unqueued_revoked) {
+            self.outbox.push_revoked(revoked);
+        }
         true
     }
 
@@ -1789,22 +1821,47 @@ impl Shared {
     }
 
     /// `run.git.revoke` (ADR-0116): the execution's holder drops the named repositories'
-    /// tokens. There is no ack: a frame for another epoch, for a run this host does not hold or
-    /// no longer holds, or for repositories revoked already, is ignored, as the server sends the
-    /// frame again at every hello until the run ends.
+    /// tokens, and its take-back record is written again without them. Then the host confirms
+    /// the frame with `run.git.revoked`, in the run's order through the outbox, naming every
+    /// repository of the frame that the run has, those revoked already included: a frame that
+    /// comes twice is confirmed twice. A frame for another epoch, or for a run this host does
+    /// not hold or no longer holds, is ignored and confirmed by nothing, as is one that names
+    /// none of the run's repositories. A record that could not be written is not confirmed: the
+    /// server sends the frame again at the next hello, and the write is tried again then.
     fn handle_git_revoke(&self, revoke: RunGitRevoke) {
         let tokens = lock(&self.runs)
             .get(&revoke.run_id)
             .filter(|e| e.epoch == revoke.epoch)
             .map(|e| e.git_tokens.clone());
-        match tokens {
-            Some(tokens) => {
-                tracing::info!(run_id = %revoke.run_id, epoch = revoke.epoch, reason = %revoke.reason, "the server revokes git tokens of a run");
-                tokens.revoke(&revoke.component_ids, &revoke.reason, &revoke.message);
-            }
-            None => {
-                tracing::debug!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke for an execution this host does not run; ignored");
-            }
+        let Some(tokens) = tokens else {
+            tracing::debug!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke for an execution this host does not run; ignored");
+            return;
+        };
+        tracing::info!(run_id = %revoke.run_id, epoch = revoke.epoch, reason = %revoke.reason, "the server revokes git tokens of a run");
+        let applied = tokens.revoke(&revoke.component_ids, &revoke.reason, &revoke.message);
+        if !applied.recorded {
+            tracing::warn!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke not confirmed: the run's take-back record still holds the token");
+            return;
+        }
+        if applied.named.is_empty() {
+            tracing::debug!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke names none of the run's repositories; nothing to confirm");
+            return;
+        }
+        let revoked = RunGitRevoked {
+            run_id: revoke.run_id,
+            epoch: revoke.epoch,
+            component_ids: applied.named,
+        };
+        // Under the lock of the runs, as the admission opens the run's queue.
+        let mut runs = lock(&self.runs);
+        let Some(entry) = runs
+            .get_mut(&revoke.run_id)
+            .filter(|e| e.epoch == revoke.epoch)
+        else {
+            return;
+        };
+        if !self.outbox.push_revoked(revoked.clone()) {
+            entry.unqueued_revoked.push(revoked);
         }
     }
 
@@ -1963,6 +2020,7 @@ impl Shared {
                 stop,
                 steering: Steering::new(run_id, epoch, self.outbox.clone()),
                 git_tokens: RunGitTokens::new_empty(run_id, epoch),
+                unqueued_revoked: Vec::new(),
                 handle: None,
             },
         );

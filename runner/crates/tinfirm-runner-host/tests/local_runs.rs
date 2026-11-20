@@ -3897,6 +3897,53 @@ fn host_errors(conn: &Conn) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The `run.git.revoked` frames the host sent.
+fn confirmations(conn: &Conn) -> Vec<serde_json::Value> {
+    conn.frames
+        .iter()
+        .filter(|f| f["type"] == "run.git.revoked")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_the_connection_lost_is_sent_after_the_next_welcome() {
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let mut spec = AssignSpec::v2("rebase", Some(&repo.url));
+        spec.prompt_extra = " [commit:repo] [wait]".into();
+        let component = spec.workspaces[0].component_id;
+        conn.send(spec.to_json());
+        conn.until_agent_says(spec.run_id, "waiting for release")
+            .await;
+        // The connection ends right after the frame: the confirmation is written to it or
+        // not, and goes again either way after the next welcome.
+        conn.send(git_revoke(spec.run_id, 1, &[component], REVOKED));
+        conn.kill();
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let id = spec.run_id.to_string();
+        let confirmed = conn
+            .take_where("run.git.revoked", |f| {
+                f["type"] == "run.git.revoked" && f["runId"] == id
+            })
+            .await;
+        assert_eq!(confirmed["epoch"], 1);
+        assert_eq!(confirmed["componentIds"], json!([component]));
+        release(&host.paths, spec.run_id);
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["git"][0]["pushed"], false, "{}", t.text());
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_token_stops_the_sandboxs_next_fetch_and_the_push() {
     use common::git_http::{GitHttpServer, test_git_authorization};
@@ -3981,13 +4028,31 @@ async fn a_revoked_token_stops_the_sandboxs_next_fetch_and_the_push() {
         assert_eq!(warnings[0]["payload"]["level"], "warn");
         assert!(!t.text().contains("another epoch") && !t.text().contains("another run"));
         assert!(host_errors(&conn).is_empty(), "{:#?}", host_errors(&conn));
-        // A frame for the run once it has ended is ignored too.
+        // Each frame applied is confirmed, the second as the first, naming only the run's
+        // repository; the frames of another epoch or run are confirmed by nothing.
+        assert_eq!(
+            confirmations(&conn),
+            vec![
+                json!({"type": "run.git.revoked", "runId": spec.run_id, "epoch": 1, "componentIds": [component]}),
+                json!({"type": "run.git.revoked", "runId": spec.run_id, "epoch": 1, "componentIds": [component]}),
+            ]
+        );
+        // In the run's order: after the warning, before the run's end.
+        let position = |wanted: &dyn Fn(&serde_json::Value) -> bool| {
+            conn.frames.iter().position(wanted).unwrap()
+        };
+        let warned = position(&|f| f["eventType"] == "LOG" && f["payload"]["message"] == REVOKED);
+        let first = position(&|f| f["type"] == "run.git.revoked");
+        let ended = position(&|f| f["type"] == "run.finished");
+        assert!(warned < first && first < ended, "{warned} {first} {ended}");
+        // A frame for the run once it has ended is ignored too, and confirmed by nothing.
         conn.send(git_revoke(spec.run_id, 1, &[component], REVOKED));
         let _ = tokio::time::timeout(Duration::from_millis(1500), async {
             while conn.next().await.is_some() {}
         })
         .await;
         assert!(host_errors(&conn).is_empty(), "{:#?}", host_errors(&conn));
+        assert_eq!(confirmations(&conn).len(), 2);
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

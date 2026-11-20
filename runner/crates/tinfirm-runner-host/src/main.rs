@@ -1479,6 +1479,21 @@ async fn doctor(paths: &Paths) -> Result<()> {
         ),
         Err(e) => checks.warn("mirrors", format!("{e:#}")),
     }
+    // The runs that the next start of `run` takes back (ADR-0101), and those of them whose work
+    // is on this host and waits for the server before it is pushed (ADR-0116, decision 10).
+    match tinfirm_runner_host::takeback::Records::new(paths).census() {
+        (0, _) => checks.ok("runs to take back", "none"),
+        (runs, 0) => checks.info(
+            "runs to take back",
+            format!("{runs}; `run` takes them back when it starts"),
+        ),
+        (runs, waiting) => checks.warn(
+            "runs to take back",
+            format!(
+                "{runs}; {waiting} of them hold work that waits on this host for the server: `run` pushes it once the server has answered its hello"
+            ),
+        ),
+    }
     // The level of isolation that `run` reports with the environment's settings (ADR-0113).
     doctor_isolation(&mut checks);
     // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1).

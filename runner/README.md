@@ -644,19 +644,26 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     whole and 0600, without the token and with the repository in its `revoked` list (the
     server's reason and message). A host that takes the run back then neither uses that token
     nor pushes the repository.
-  - A host of protocol 2 that took a run back pushes its work only once the server has answered
-    its `hello` whole. A server that lists `run.git.revoke` in `welcome.features` sends
-    `welcome.done` last, after every revocation (and cancel) it keeps for the runs the `hello`
-    listed, which the host has applied by then; the run waits for it, so a revocation that
-    Tinfirm sent while the host was away comes first. A server that lists no such feature (one
-    from before ADR-0116) keeps no revocation, and the run pushes as soon as it is welcomed.
-    Without either within 2 minutes (no connection, or a server that lists the feature and sends
-    no `welcome.done`) the run pushes with what the record holds, and a warning in its log says
-    which of the two it was. A stop that comes during the wait is applied after it: a cancel
-    still pushes, an abort (a stale epoch) pushes and reports nothing.
-    Then it renews every token of the run that expires
+  - A host that took a run back uses none of the run's git tokens and pushes nothing before this
+    process has been welcomed by the server. A server that lists `run.git.revoke` in
+    `welcome.features` sends `welcome.done` last, after every revocation (and cancel) it keeps for
+    the runs the `hello` listed, which the host has applied by then; the run waits for it, so a
+    revocation that Tinfirm sent while the host was away comes first. A server that lists no such
+    feature (one from before ADR-0116) keeps no revocation, and the run goes on as soon as it is
+    welcomed. There is no time limit: without a connection, or without `welcome.done`, the run
+    waits as long as it takes. Then it renews every token of the run that expires
     ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)), an expired one included,
-    before the push. The record keeps a token's latest value and its expiry.
+    before the push.
+  - While the run waits, its agent is stopped and its sandbox is gone: the work, the session
+    home and `/output` are on this host, and the record stays, marked `collected`, with how each
+    repository came back. The run's wall-clock limit no longer matters then, since nothing of the
+    run executes. The host logs one warning when the wait begins ("a run taken back waits for the
+    server's answer to the hello before it pushes"), the run's events say it once, and `doctor`
+    counts such runs under "runs to take back". A cancel from the server is applied after the wait,
+    and still pushes; an abort (a stale epoch) ends the wait and pushes and reports nothing. When
+    the host stops (SIGTERM) during the wait, the run neither pushes nor reports, and the next
+    `run` takes it back from the record and its own disk, without a sandbox; so does a `run` after
+    a second crash. The record keeps a token's latest value and its expiry until the run ends.
   - `run` must start with the same data directory and, for Docker, the same sandbox network, within
     the 15 minutes; `run --sandbox-bridge` must stay on.
 
@@ -1086,7 +1093,7 @@ firewall, the probe from a Droplet) and the nightly conformance test.
 | `credential add anthropic-api-key\|openai-api-key --label <l> [--pool 3]` | Stores an API key; the pool (1–16) is a ceiling |
 | `credential list`, `credential remove <label>` | Manage credentials |
 | `images build [--runtime claude\|codex\|pi\|opencode\|all\|multi] [--no-cache] [--build-arg KEY=VALUE]…` | Builds the runner images locally, with the [build arguments](#image-build-arguments) of a host without internet access, and records the arguments and runtimes in `images.json` for [the rebuilds of `run`](#rebuilds-after-an-upgrade) |
-| `doctor` | Checks the setup (directories and their modes, git, Docker, images, credentials, server, [the reader](#the-reader)); shows Docker's runtimes, the names of the recorded image build arguments, each image that `run` would rebuild, and the number of mirrors and their total size |
+| `doctor` | Checks the setup (directories and their modes, git, Docker, images, credentials, server, [the reader](#the-reader)); shows Docker's runtimes, the names of the recorded image build arguments, each image that `run` would rebuild, the number of mirrors and their total size, and the runs that the next `run` takes back, with those whose work waits on this host for the server |
 | `mirrors list` | Lists the repository mirrors: key, size, last use, last gc, repository URL |
 | `mirrors prune [--older-than-days N] [--dry-run]` | Deletes idle mirrors and collects garbage in the others, like `run` does every 6 hours; refused while `run` is active (`--dry-run` only shows what it would do) |
 | `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |
@@ -1996,9 +2003,19 @@ repository it names:
 | The redaction | The token stays on the run's list until the run ends: what was revealed stays redacted, and the agent printing it is still `CREDENTIAL_LEAK` |
 | The run's events | A `LOG` event at `warn` with the message |
 
+Once the holder has dropped the tokens and the take-back record is written again, the host
+confirms the frame with `run.git.revoked` (`runId`, `epoch`, `componentIds`): it names every
+repository of the frame that the run has, those revoked already included, so a frame that comes
+twice is confirmed twice. It goes in the run's order with its events, so a confirmation written
+while the host is disconnected, or lost with the connection, goes again after the next
+`welcome`. A record that cannot be written leaves the frame unconfirmed; Tinfirm sends it again at
+the next `hello`. A host that restarts between a revocation and its confirmation takes the run
+back without the token, and confirms the frame that Tinfirm sends again at its `hello`.
+
 The other repositories go on as before, and so does the agent: it works on without git for the
-repositories revoked. A frame for another epoch, for a run the host does not hold, for a
-repository it does not have or one revoked already, changes nothing, and is not answered. A
+repositories revoked. A frame for another epoch, for a run the host does not hold, or one that
+names none of the run's repositories, changes nothing, and is confirmed by nothing. A repository
+revoked already keeps its first reason. A
 cancelled run whose token was revoked ends `CANCELLED` as before, with the repository not pushed
 and the reason in the log. A host of protocol 1 knows no such frame (`error` `UNKNOWN_TYPE`), and
 Tinfirm sends it only to a host that lists the feature: such a run keeps its token until it ends.
@@ -2014,8 +2031,9 @@ hour away) and `git.mirrorKey`; any other token has neither and lives until the 
   is due: while the run works, when a token has 10 minutes or less left (the host looks every
   15 s); before the push at the run's end, when it has 20 minutes or less left; and for a run
   taken back after a restart, every token that expires, once the server has answered the
-  `hello` whole (after `welcome.done`; a server without `run.git.revoke` in `welcome.features`
-  never sent `expiresAt`, so such a run has none to renew). It asks at most
+  `hello` whole (after `welcome.done`, however long that takes; a server without
+  `run.git.revoke` in `welcome.features` never sent `expiresAt`, so such a run has none to
+  renew). It asks at most
   once a minute per repository, and only while connected.
 - **The answer.** DONE: each renewed token goes into the run's holder (so the git proxy's routes,
   the host's git and the take-back record use it from then on) and onto the run's redaction list,

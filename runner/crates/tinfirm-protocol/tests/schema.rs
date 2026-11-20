@@ -1848,6 +1848,11 @@ fn constructed_messages_v2() -> Vec<Message> {
         reason: "SYSTEM_PAUSED".into(),
         message: "Tinfirm revoked this run's access: the system was paused.".into(),
     }));
+    out.push(Message::RunGitRevoked(RunGitRevoked {
+        run_id: run_id(),
+        epoch: 1,
+        component_ids: vec![component_id(), Uuid::new_v4()],
+    }));
     for (i, event) in all_payloads(true).into_iter().enumerate() {
         out.push(Message::RunEvent(RunEvent {
             run_id: run_id(),
@@ -2729,6 +2734,52 @@ fn git_revoke_bounds_and_versions() {
     let mut hello = sample_v2("hello.json");
     hello["features"] = json!([feature::RUN_STEER, feature::RUN_GIT_REVOKE]);
     assert_valid(&v2, &hello, "hello with run.git.revoke");
+}
+
+#[test]
+fn git_revoked_names_one_to_twenty_distinct_repositories_and_only_in_v2() {
+    let v1 = validator();
+    let v2 = validator_v2();
+    let revoked = sample_v2("run.git.revoked.json");
+    assert_valid(&v2, &revoked, "run.git.revoked");
+    // A v2 feature (ADR-0116): v1 knows no such frame.
+    assert!(!v1.is_valid(&revoked), "run.git.revoked is not a v1 frame");
+    assert!(Message::from_value_version(revoked.clone(), PROTOCOL_VERSION).is_err());
+    let Message::RunGitRevoked(parsed) =
+        Message::from_value_version(revoked.clone(), PROTOCOL_VERSION_V2).unwrap()
+    else {
+        panic!("not run.git.revoked");
+    };
+    assert_eq!(parsed.component_ids, vec![component_id()]);
+    assert_eq!(parsed.epoch, 1);
+    for field in ["runId", "epoch", "componentIds"] {
+        let mut frame = revoked.clone();
+        frame.as_object_mut().unwrap().remove(field);
+        assert!(!v2.is_valid(&frame), "run.git.revoked without {field}");
+        assert!(
+            Message::from_value(frame).is_err(),
+            "run.git.revoked without {field}"
+        );
+    }
+    let mut none = revoked.clone();
+    none["componentIds"] = json!([]);
+    assert!(!v2.is_valid(&none), "no repository");
+    let ids: Vec<String> = (0..GIT_REVOKE_MAX_COMPONENTS)
+        .map(|_| Uuid::new_v4().to_string())
+        .collect();
+    let mut many = revoked.clone();
+    many["componentIds"] = json!(ids);
+    assert_valid(&v2, &many, "repositories at the limit");
+    let mut more = ids.clone();
+    more.push(Uuid::new_v4().to_string());
+    many["componentIds"] = json!(more);
+    assert!(!v2.is_valid(&many), "too many repositories");
+    let mut twice = revoked.clone();
+    twice["componentIds"] = json!([component_id(), component_id()]);
+    assert!(!v2.is_valid(&twice), "a repository named twice");
+    let mut not_an_id = revoked.clone();
+    not_an_id["componentIds"] = json!(["shop"]);
+    assert!(!v2.is_valid(&not_an_id), "not a uuid");
 }
 
 #[test]

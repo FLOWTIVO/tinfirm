@@ -69,6 +69,18 @@ pub struct RevokedRepository {
     pub message: String,
 }
 
+/// What a [`RunGitTokens::revoke`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revoked {
+    /// The repositories whose token went now, in the order the frame named them.
+    pub now: Vec<Uuid>,
+    /// Every repository the frame named that the run has, revoked now or before, each once,
+    /// in the frame's order: what `run.git.revoked` confirms.
+    pub named: Vec<Uuid>,
+    /// The take-back record on disk holds none of these tokens (or the run has no record).
+    pub recorded: bool,
+}
+
 /// The reason code of a token whose expiry passed without a new one.
 pub const EXPIRED: &str = "EXPIRED";
 /// The message of such a token (ADR-0116, decision 9).
@@ -374,33 +386,47 @@ impl RunGitTokens {
     /// Drops the tokens of `component_ids` (ADR-0116, decision 3): an id the run does not have
     /// is ignored, and a repository revoked already keeps its first reason. Each repository
     /// revoked now is logged as a warning in the run's events, and the take-back record is
-    /// written again without its token. Returns the repositories revoked now.
-    pub fn revoke(&self, component_ids: &[Uuid], reason: &str, message: &str) -> Vec<Uuid> {
+    /// written again without its token.
+    pub fn revoke(&self, component_ids: &[Uuid], reason: &str, message: &str) -> Revoked {
         let revocation = Revocation {
             reason: reason.to_string(),
             message: message.to_string(),
         };
-        let mut revoked = Vec::new();
+        let mut now = Vec::new();
+        let mut named = Vec::new();
         {
             let mut entries = lock(&self.entries);
-            for entry in entries.iter_mut() {
-                if component_ids.contains(&entry.component_id)
-                    && !matches!(entry.slot, Slot::Revoked(_))
-                {
+            for id in component_ids {
+                let Some(entry) = entries.iter_mut().find(|e| e.component_id == *id) else {
+                    continue;
+                };
+                if named.contains(id) {
+                    continue;
+                }
+                named.push(*id);
+                if !matches!(entry.slot, Slot::Revoked(_)) {
                     // The token's value goes with the slot; the redaction list keeps its own.
                     entry.slot = Slot::Revoked(revocation.clone());
-                    revoked.push(entry.component_id);
+                    now.push(*id);
                 }
             }
         }
-        if revoked.is_empty() {
+        // Also when nothing changed now: a record whose last write failed is written again.
+        let recorded = self.sync_record();
+        if now.is_empty() {
             tracing::debug!(run_id = %self.run_id, epoch = self.epoch, reason, "run.git.revoke names no repository whose token this run still holds");
-            return revoked;
+        } else {
+            tracing::warn!(run_id = %self.run_id, epoch = self.epoch, reason, repositories = now.len(), "the server revoked git tokens of the run");
+            self.log_warn(message);
         }
-        tracing::warn!(run_id = %self.run_id, epoch = self.epoch, reason, repositories = revoked.len(), "the server revoked git tokens of the run");
-        self.sync_record();
-        self.log_warn(message);
-        revoked
+        if !recorded {
+            tracing::warn!(run_id = %self.run_id, epoch = self.epoch, "the run's take-back record could not be written without the revoked tokens");
+        }
+        Revoked {
+            now,
+            named,
+            recorded,
+        }
     }
 
     /// Keeps the run's take-back record in step with the holder from now on, and writes it at
@@ -415,10 +441,13 @@ impl RunGitTokens {
         lock(&self.record).take();
     }
 
-    fn sync_record(&self) {
+    /// Writes the take-back record again if the holder changed since. `true` when the record
+    /// on disk is in step with the holder, or the run has none.
+    fn sync_record(&self) -> bool {
         let record = lock(&self.record).clone();
-        if let Some(record) = record {
-            record.sync_git(self);
+        match record {
+            Some(record) => record.sync_git(self),
+            None => true,
         }
     }
 
@@ -584,18 +613,19 @@ mod tests {
 
         // An id of no workspace is ignored; a named one goes.
         let revoked = tokens.revoke(&[ids[0], Uuid::new_v4()], "GRANT_REMOVED", "no more");
-        assert_eq!(revoked, vec![ids[0]]);
+        assert_eq!(revoked.now, vec![ids[0]]);
+        assert_eq!(revoked.named, vec![ids[0]]);
+        assert!(revoked.recorded, "no record to write");
         let err = a.authorization().unwrap_err();
         assert_eq!(err.message, "no more");
         assert_eq!(err.reason, "GRANT_REMOVED");
         assert_eq!(a.revocation(), Some(err));
         assert!(tokens.authorization(ids[1]).unwrap().is_some(), "b goes on");
-        // Applied once: a second frame changes nothing, the first reason stays.
-        assert!(
-            tokens
-                .revoke(&[ids[0]], "SYSTEM_PAUSED", "again")
-                .is_empty()
-        );
+        // Applied once: a second frame changes nothing, the first reason stays, and it names
+        // the same repository, once, for its confirmation.
+        let again = tokens.revoke(&[ids[0], Uuid::new_v4(), ids[0]], "SYSTEM_PAUSED", "again");
+        assert!(again.now.is_empty(), "{again:?}");
+        assert_eq!(again.named, vec![ids[0]]);
         assert_eq!(a.revocation().unwrap().reason, "GRANT_REMOVED");
 
         let mut view = assign.clone();

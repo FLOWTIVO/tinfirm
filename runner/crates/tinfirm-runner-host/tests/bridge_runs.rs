@@ -507,6 +507,21 @@ fn restart_test_host_a() {
         });
 }
 
+/// A host on the directories under `dir`, in a process of its own ([`restart_test_host_a`]),
+/// which the test kills as a crash would.
+fn host_process(dir: &std::path::Path, url: &str, v2: bool) -> std::process::Child {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["restart_test_host_a", "--exact", "--ignored", "--nocapture"])
+        .env(RESTART_DIR, dir)
+        .env(RESTART_URL, url)
+        .stdout(std::process::Stdio::null());
+    if v2 {
+        command.env(RESTART_V2, "1");
+    }
+    command.spawn().unwrap()
+}
+
 /// Host A, in a process of its own, runs the `slow` scenario until the agent has written its
 /// work, and is killed (SIGKILL). The directories, the run, the record's path and the last
 /// event number A sent.
@@ -550,16 +565,7 @@ async fn a_host_killed_when(
     ready: Option<&str>,
 ) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf, u64) {
     let dir = tempfile::tempdir().unwrap();
-    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command
-        .args(["restart_test_host_a", "--exact", "--ignored", "--nocapture"])
-        .env(RESTART_DIR, dir.path())
-        .env(RESTART_URL, &server.url)
-        .stdout(std::process::Stdio::null());
-    if v2 {
-        command.env(RESTART_V2, "1");
-    }
-    let mut host_a = command.spawn().unwrap();
+    let mut host_a = host_process(dir.path(), &server.url, v2);
     let mut conn = server.accept().await;
     conn.handshake(1).await;
     let mut spec = AssignSpec::new("slow", Some(&repo.url));
@@ -789,26 +795,13 @@ async fn a_revocation_sent_again_at_the_hello_comes_before_the_push_of_a_run_tak
     .await;
 }
 
-/// Host B of a restart test, whose wait for `welcome.done` is `wait`.
-fn restart_setup_waiting(wait: Duration) -> HostSetup {
-    HostSetup {
-        options: Some(Box::new(move |opts| opts.welcome_done_wait = wait)),
-        ..restart_setup(true)
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_taken_back_pushes_only_once_the_server_says_welcome_done() {
     with_timeout(180, async {
         let repo = TestRepo::new();
         let mut server = FakeServer::start().await;
         let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
-        let host = start_host_at(
-            dir.path(),
-            &server.url,
-            restart_setup_waiting(Duration::from_secs(120)),
-        )
-        .await;
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
         let mut conn = server.accept().await;
         conn.handshake_listing(1, SERVER_FEATURES).await;
         // The sandbox came back and its agent stopped: the run is ready to push, and waits.
@@ -845,40 +838,211 @@ async fn a_run_taken_back_pushes_only_once_the_server_says_welcome_done() {
     .await;
 }
 
+/// Waits until the take-back record at `record` says that the run's work came back from its
+/// sandbox, which then has stopped: the run waits for the server to push.
+async fn until_collected(record: &std::path::Path) -> serde_json::Value {
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(record)
+            && let Ok(kept) = serde_json::from_str::<serde_json::Value>(&text)
+            && kept["collected"] == true
+        {
+            return kept;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "the run's work never came back from its sandbox"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_run_taken_back_without_welcome_done_pushes_after_the_cap_and_says_so() {
+async fn a_run_taken_back_without_a_connection_waits_past_the_old_cap_and_pushes_after_welcome_done()
+ {
+    with_timeout(330, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        // Host B gets no connection: the server drops every one before the handshake.
+        server.set_refusing(true);
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let kept = until_collected(&record).await;
+        assert_eq!(kept["repos"][0]["collected"]["result"], "ok", "{kept:#}");
+        assert!(!host.host.is_connected());
+        // Longer than the 2 minutes after which the host used to push with what its record
+        // held: nothing is pushed, and the run and its record stay.
+        tokio::time::sleep(Duration::from_secs(125)).await;
+        assert!(
+            repo.branch_head("agent/TEST-1").is_none(),
+            "pushed without the server's answer"
+        );
+        assert!(record.exists(), "the record went while the run waits");
+        assert!(host.paths.workspace(spec.run_id).is_dir());
+        assert_eq!(host.host.active_run_count(), 1);
+
+        // The connection, `welcome`, then `welcome.done`: the push.
+        server.set_refusing(false);
+        let mut conn = server.accept().await;
+        let hello = conn.handshake_listing(1, SERVER_FEATURES).await;
+        assert_eq!(hello["activeRuns"][0]["runId"], spec.run_id.to_string());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            repo.branch_head("agent/TEST-1").is_none(),
+            "pushed at welcome, before welcome.done"
+        );
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        // The wait is said once in the run's events, and no push happened without the answer.
+        let said: Vec<_> = t
+            .events_of("LOG")
+            .into_iter()
+            .filter(|e| {
+                e["payload"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("waits on the runner host"))
+            })
+            .collect();
+        assert_eq!(said.len(), 1, "{}", t.text());
+        assert!(!t.text().contains("pushed without knowing"), "{}", t.text());
+        assert!(!record.exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_restarts_again_while_a_run_taken_back_waits_keeps_the_run() {
+    with_timeout(240, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        // Host B, in a process of its own, takes the run back without a connection, collects
+        // its work, waits, and is killed.
+        server.set_refusing(true);
+        let mut host_b = host_process(dir.path(), &server.url, true);
+        until_collected(&record).await;
+        host_b.kill().unwrap();
+        host_b.wait().unwrap();
+        assert!(record.exists(), "a second restart lost the run");
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+
+        // Host C takes the run back from its own disk: no sandbox, no bridge.
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        server.set_refusing(false);
+        let mut conn = server.accept().await;
+        let hello = conn.handshake_listing(1, SERVER_FEATURES).await;
+        assert_eq!(hello["activeRuns"][0]["runId"], spec.run_id.to_string());
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert!(
+            t.text().contains("restarted again before it pushed"),
+            "{}",
+            t.text()
+        );
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        assert!(!record.exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_shuts_down_while_a_run_taken_back_waits_leaves_the_run_for_its_next_start() {
+    with_timeout(240, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        server.set_refusing(true);
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        until_collected(&record).await;
+        // SIGTERM: the run that waits neither pushes nor reports, and is not held for the
+        // shutdown's 2 minutes of grace.
+        let started = std::time::Instant::now();
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(record.exists());
+        assert!(host.paths.workspace(spec.run_id).is_dir());
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+
+        let again = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        server.set_refusing(false);
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["git"][0]["pushed"], true, "{}", t.text());
+        assert!(!record.exists());
+        again.shutdown.cancel();
+        again.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_applied_before_a_restart_is_confirmed_again_after_it() {
     with_timeout(180, async {
         let repo = TestRepo::new();
         let mut server = FakeServer::start().await;
-        let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
-        let host = start_host_at(
-            dir.path(),
-            &server.url,
-            restart_setup_waiting(Duration::from_secs(2)),
-        )
-        .await;
-        let mut conn = server.accept().await;
-        // A server that never sends welcome.done.
-        conn.handshake_listing(1, SERVER_FEATURES).await;
-        let t = conn.until_finished(spec.run_id).await;
-        let finished = t.finished();
-        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
-        let warning = t
-            .events_of("LOG")
-            .into_iter()
-            .find(|e| {
-                e["payload"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("no welcome.done"))
-            })
-            .unwrap_or_else(|| panic!("no warning: {}", t.text()))
-            .clone();
-        assert_eq!(warning["payload"]["level"], "warn");
+        // Host A applies the revocation and is killed, its confirmation written or not.
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_after(&mut server, &repo, true, Some(REVOKED)).await;
         assert!(
-            warning["payload"]["message"]
-                .as_str()
+            !std::fs::read_to_string(&record)
                 .unwrap()
-                .contains("pushed without knowing whether a git token of the run was revoked")
+                .contains(TEST_GIT_TOKEN)
+        );
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
+        // The server has no confirmation it trusts: it sends the frame again at the hello.
+        let component = spec.workspaces[0].component_id;
+        conn.send(git_revoke(spec.run_id, 1, &[component], REVOKED));
+        let id = spec.run_id.to_string();
+        let confirmed = conn
+            .take_where("run.git.revoked", |f| {
+                f["type"] == "run.git.revoked" && f["runId"] == id
+            })
+            .await;
+        assert_eq!(confirmed["epoch"], 1);
+        assert_eq!(confirmed["componentIds"], json!([component]));
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        assert_eq!(t.finished()["git"][0]["pushed"], false, "{}", t.text());
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        // The revocation came back with the record, not with this frame: no second warning.
+        assert!(
+            t.events_of("LOG")
+                .iter()
+                .all(|e| e["payload"]["message"] != REVOKED),
+            "{}",
+            t.text()
         );
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
@@ -972,12 +1136,7 @@ async fn a_run_taken_back_by_an_older_servers_host_pushes_without_waiting() {
         let repo = TestRepo::new();
         let mut server = FakeServer::start().await;
         let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
-        let host = start_host_at(
-            dir.path(),
-            &server.url,
-            restart_setup_waiting(Duration::from_secs(120)),
-        )
-        .await;
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
         let mut conn = server.accept().await;
         // A server of before ADR-0116: no `welcome.features`, and never a `welcome.done`.
         conn.handshake(1).await;
@@ -999,12 +1158,7 @@ async fn an_abort_while_a_run_taken_back_waits_for_welcome_done_pushes_and_repor
         let repo = TestRepo::new();
         let mut server = FakeServer::start().await;
         let (dir, spec, _, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
-        let host = start_host_at(
-            dir.path(),
-            &server.url,
-            restart_setup_waiting(Duration::from_secs(120)),
-        )
-        .await;
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
         let mut conn = server.accept().await;
         conn.handshake_listing(1, SERVER_FEATURES).await;
         let id = spec.run_id.to_string();

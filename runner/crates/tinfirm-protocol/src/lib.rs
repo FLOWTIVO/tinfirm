@@ -100,7 +100,7 @@ pub const MESSAGE_TYPES: [&str; 19] = [
 /// Every `type` value defined by the v2 schema, in schema order: v1 without the three
 /// bespoke request pairs, plus `run.request` and `run.request.ack`, and the frames of the
 /// optional features ([`feature`]).
-pub const MESSAGE_TYPES_V2: [&str; 21] = [
+pub const MESSAGE_TYPES_V2: [&str; 22] = [
     "hello",
     "welcome",
     "run.assign",
@@ -111,6 +111,7 @@ pub const MESSAGE_TYPES_V2: [&str; 21] = [
     "run.finished",
     "run.cancel",
     "run.git.revoke",
+    "run.git.revoked",
     "welcome.done",
     "run.request",
     "run.request.ack",
@@ -125,7 +126,7 @@ pub const MESSAGE_TYPES_V2: [&str; 21] = [
 ];
 
 /// Every `type` value of any version: what [`Message::parse`] accepts.
-const KNOWN_MESSAGE_TYPES: [&str; 27] = [
+const KNOWN_MESSAGE_TYPES: [&str; 28] = [
     "hello",
     "welcome",
     "run.assign",
@@ -136,6 +137,7 @@ const KNOWN_MESSAGE_TYPES: [&str; 27] = [
     "run.finished",
     "run.cancel",
     "run.git.revoke",
+    "run.git.revoked",
     "welcome.done",
     "run.repository_request",
     "run.repository_request.ack",
@@ -528,6 +530,9 @@ pub enum Message {
     /// v2 feature [`feature::RUN_GIT_REVOKE`], server -> host: drop git tokens of a run.
     #[serde(rename = "run.git.revoke")]
     RunGitRevoke(RunGitRevoke),
+    /// v2 feature [`feature::RUN_GIT_REVOKE`], host -> server: a `run.git.revoke` is applied.
+    #[serde(rename = "run.git.revoked")]
+    RunGitRevoked(RunGitRevoked),
     /// v2 feature [`feature::RUN_GIT_REVOKE`], server -> host: the server's answer to the hello
     /// is complete, every pending revocation of the runs it listed included.
     #[serde(rename = "welcome.done")]
@@ -657,6 +662,7 @@ impl Message {
             Message::RunFinished(_) => "run.finished",
             Message::RunCancel(_) => "run.cancel",
             Message::RunGitRevoke(_) => "run.git.revoke",
+            Message::RunGitRevoked(_) => "run.git.revoked",
             Message::WelcomeDone(_) => "welcome.done",
             Message::RunRepositoryRequest(_) => "run.repository_request",
             Message::RunRepositoryRequestAck(_) => "run.repository_request.ack",
@@ -776,7 +782,8 @@ pub mod feature {
     /// list it.
     pub const SANDBOX_ELASTIC: &str = "sandbox.elastic";
     /// The host takes [`super::RunGitRevoke`] (ADR-0116): it drops the named repositories' git
-    /// tokens from its git proxy, its own git and its take-back record.
+    /// tokens from its git proxy, its own git and its take-back record, and confirms each frame
+    /// it applied with [`super::RunGitRevoked`].
     pub const RUN_GIT_REVOKE: &str = "run.git.revoke";
     /// The host reads `workspaces[].git.expiresAt` and `mirrorKey`, and renews a token that
     /// expires with a [`super::RunRequest`] of kind [`super::RequestKind::GitToken`] (ADR-0116).
@@ -1842,6 +1849,23 @@ pub struct RunGitRevoke {
     /// The server's text for the run's log and the agent (1 to
     /// [`GIT_REVOKE_MESSAGE_MAX_CHARS`] characters).
     pub message: String,
+}
+
+/// Runner host -> server (v2 feature [`feature::RUN_GIT_REVOKE`], ADR-0116): the host has applied
+/// a [`RunGitRevoke`] of the run's current epoch. The tokens of the repositories named are gone
+/// from the run's holder, and its take-back record was written again without them. It names
+/// every repository of that frame that the run has, those revoked already included, so a frame
+/// that comes twice is answered twice with the same ids. The host sends nothing for a frame of
+/// another epoch or of a run it does not hold, nor for a frame that names none of the run's
+/// repositories. It goes in the run's order through the host's outbox, so one written while the
+/// host is disconnected is sent after the next `welcome`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunGitRevoked {
+    pub run_id: Uuid,
+    pub epoch: i64,
+    /// 1 to [`GIT_REVOKE_MAX_COMPONENTS`], each once, in the order of the frame they answer.
+    pub component_ids: Vec<Uuid>,
 }
 
 /// Server -> runner host (v2 feature [`feature::RUN_GIT_REVOKE`], ADR-0116), once per

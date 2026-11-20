@@ -36,6 +36,7 @@ use uuid::Uuid;
 use crate::git::MirrorRef;
 use crate::git_tokens::{RevokedRepository, RunGitTokens};
 use crate::paths::Paths;
+use crate::sandbox_files::Collected;
 
 /// The format of the records. A record of another one is not taken back.
 pub const RECORD_VERSION: u32 = 1;
@@ -71,6 +72,13 @@ pub struct RunRecord {
     /// null, and a host that takes the run back pushes none of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked: Vec<RevokedRepository>,
+    /// The work came back from the sandbox, and the sandbox has stopped: the run's
+    /// repositories, its session home and its `/output` are on this host, and only the push and
+    /// the report are left (ADR-0116, decision 10: they wait for the server). A host that takes
+    /// such a run back needs no sandbox and no bridge. An older host ignores the field: it
+    /// finds no sandbox, and reports the run's work as lost.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collected: bool,
 }
 
 impl RunRecord {
@@ -116,6 +124,43 @@ pub struct RepoRecord {
     /// `.git/config` as the clone wrote it, base64 (it holds no secret).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_snapshot: Option<String>,
+    /// How the repository came back from the sandbox, once it did ([`RunRecord::collected`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collected: Option<CollectedRecord>,
+}
+
+/// How one repository came back from the sandbox: its WIP commit and head, or why it did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "result")]
+pub enum CollectedRecord {
+    #[serde(rename = "ok")]
+    Ok { wip: bool, head: String },
+    #[serde(rename = "failed")]
+    Failed { message: String },
+}
+
+impl CollectedRecord {
+    pub fn of(collected: &std::result::Result<Collected, String>) -> CollectedRecord {
+        match collected {
+            Ok(c) => CollectedRecord::Ok {
+                wip: c.wip,
+                head: c.head.clone(),
+            },
+            Err(message) => CollectedRecord::Failed {
+                message: message.clone(),
+            },
+        }
+    }
+
+    pub fn restore(&self) -> std::result::Result<Collected, String> {
+        match self {
+            CollectedRecord::Ok { wip, head } => Ok(Collected {
+                wip: *wip,
+                head: head.clone(),
+            }),
+            CollectedRecord::Failed { message } => Err(message.clone()),
+        }
+    }
 }
 
 impl RepoRecord {
@@ -135,6 +180,7 @@ impl RepoRecord {
                 .map(|r| (r.name.clone(), r.sha.clone()))
                 .collect(),
             config_snapshot: config_snapshot.map(|bytes| B64.encode(bytes)),
+            collected: None,
         }
     }
 
@@ -239,6 +285,38 @@ impl Records {
         records
     }
 
+    /// What `doctor` says of the records, without changing any: how many runs a start of
+    /// `run` takes back, and how many of those have their work on this host already and wait
+    /// for the server before they push it ([`RunRecord::collected`]). A record that cannot be
+    /// read counts in neither.
+    pub fn census(&self) -> (usize, usize) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return (0, 0);
+        };
+        let (mut runs, mut waiting) = (0, 0);
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let is_record = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".json"))
+                .is_some_and(|id| Uuid::parse_str(id).is_ok());
+            if !is_record {
+                continue;
+            }
+            let Ok(record) = crate::secure_fs::read_private_file(&path)
+                .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).map_err(Into::into))
+            else {
+                continue;
+            };
+            runs += 1;
+            if record.collected {
+                waiting += 1;
+            }
+        }
+        (runs, waiting)
+    }
+
     /// The bridge listener's identity and port, as the listener kept them.
     pub fn listener(&self) -> Option<(Identity, u16)> {
         let bytes = crate::secure_fs::read_private_file(&self.listener_path()).ok()?;
@@ -275,6 +353,8 @@ pub struct RecordHandle {
     record: Mutex<RunRecord>,
     /// Set by [`RecordHandle::remove`]: a change that comes later writes nothing.
     removed: AtomicBool,
+    /// The last write failed: the next update writes the record even if it changes nothing.
+    unsaved: AtomicBool,
 }
 
 impl std::fmt::Debug for RecordHandle {
@@ -296,22 +376,37 @@ impl RecordHandle {
             records: records.clone(),
             record: Mutex::new(record),
             removed: AtomicBool::new(false),
+            unsaved: AtomicBool::new(false),
         }
     }
 
-    fn update(&self, change: impl FnOnce(&mut RunRecord) -> bool) {
+    /// Applies `change` and writes the record when it changed it, or when an earlier write
+    /// failed. `true` when the record on disk is the one in memory now (or it was removed).
+    fn update(&self, change: impl FnOnce(&mut RunRecord) -> bool) -> bool {
         let mut record = self.record.lock().unwrap_or_else(|e| e.into_inner());
-        if change(&mut record)
-            && !self.removed.load(Ordering::SeqCst)
-            && let Err(e) = self.records.save(&record)
-        {
-            tracing::warn!(run_id = %record.run_id(), error = %format!("{e:#}"), "cannot update the run's record");
+        let changed = change(&mut record);
+        if self.removed.load(Ordering::SeqCst) {
+            return true;
+        }
+        if !changed && !self.unsaved.load(Ordering::SeqCst) {
+            return true;
+        }
+        match self.records.save(&record) {
+            Ok(()) => {
+                self.unsaved.store(false, Ordering::SeqCst);
+                true
+            }
+            Err(e) => {
+                self.unsaved.store(true, Ordering::SeqCst);
+                tracing::warn!(run_id = %record.run_id(), error = %format!("{e:#}"), "cannot update the run's record");
+                false
+            }
         }
     }
 
     /// The agent's session is open.
     pub fn session_opened(&self, session_id: &str) {
-        self.update(|record| {
+        let _ = self.update(|record| {
             if record.session_id.as_deref() == Some(session_id) {
                 return false;
             }
@@ -322,7 +417,7 @@ impl RecordHandle {
 
     /// The run has numbered an event `seq`: the record reserves the next block when it is due.
     pub fn numbered(&self, seq: u64) {
-        self.update(|record| {
+        let _ = self.update(|record| {
             if seq < record.seq_floor {
                 return false;
             }
@@ -332,8 +427,9 @@ impl RecordHandle {
     }
 
     /// The run's git tokens as `tokens` holds them now: the record is written again, whole,
-    /// when a token was revoked (or, later, renewed) since it was last written.
-    pub fn sync_git(&self, tokens: &RunGitTokens) {
+    /// when a token was revoked or renewed since it was last written. `true` when the record
+    /// on disk holds them as `tokens` does.
+    pub fn sync_git(&self, tokens: &RunGitTokens) -> bool {
         self.update(|record| {
             let mut assign = record.assign.clone();
             let revoked = tokens.write_to(&mut assign);
@@ -343,10 +439,26 @@ impl RecordHandle {
             record.assign = assign;
             record.revoked = revoked;
             true
-        });
+        })
     }
 
-    /// The sandbox has stopped: nothing is left to take back.
+    /// The work came back from the sandbox and the sandbox has stopped
+    /// ([`RunRecord::collected`]): `repos` is how each repository (by `dir`) came back. A host
+    /// that restarts from now on takes the run back from this host's own disk.
+    pub fn collected(&self, repos: &[(String, CollectedRecord)]) -> bool {
+        self.update(|record| {
+            record.collected = true;
+            for kept in &mut record.repos {
+                kept.collected = repos
+                    .iter()
+                    .find(|(dir, _)| *dir == kept.dir)
+                    .map(|(_, collected)| collected.clone());
+            }
+            true
+        })
+    }
+
+    /// Nothing is left to take back: the run has ended, or its sandbox did not come back.
     pub fn remove(&self) {
         let record = self.record.lock().unwrap_or_else(|e| e.into_inner());
         self.removed.store(true, Ordering::SeqCst);
@@ -395,6 +507,7 @@ mod tests {
             session_id: None,
             seq_floor: SEQ_BLOCK,
             revoked: Vec::new(),
+            collected: false,
         }
     }
 
@@ -478,6 +591,58 @@ mod tests {
         handle.numbered(10 * SEQ_BLOCK);
         tokens.revoke(&[Uuid::new_v4()], "SUSPENDED", "nothing");
         assert!(!path.exists(), "a removed record is not written again");
+    }
+
+    #[test]
+    fn a_collected_record_keeps_how_each_repository_came_back_and_reads_as_before_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let first = record();
+        let handle = RecordHandle::create(&records, first.clone()).unwrap();
+        let text = serde_json::to_string(&records.load_all()[0]).unwrap();
+        assert!(!text.contains("collected"), "{text}");
+        assert!(handle.collected(&[(
+            "repo".into(),
+            CollectedRecord::Ok {
+                wip: true,
+                head: "def".into()
+            }
+        )]));
+        assert_eq!(records.census(), (1, 1));
+        let loaded = records.load_all();
+        assert!(loaded[0].collected);
+        assert_eq!(
+            loaded[0].repos[0].collected.as_ref().unwrap().restore(),
+            Ok(Collected {
+                wip: true,
+                head: "def".into()
+            })
+        );
+        let failed = CollectedRecord::of(&Err("the bundle was refused".into()));
+        assert_eq!(failed.restore(), Err("the bundle was refused".to_string()));
+    }
+
+    #[test]
+    fn a_record_whose_write_failed_is_written_again_by_the_next_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let first = record();
+        let run_id = first.run_id();
+        let handle = RecordHandle::create(&records, first).unwrap();
+        // A directory where the temporary file goes: the next write fails.
+        let blocker = dir.path().join(format!("data/runs/{run_id}.json.tmp"));
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(!handle.update(|record| {
+            record.session_id = Some("s".into());
+            true
+        }));
+        assert_eq!(records.load_all()[0].session_id, None);
+        std::fs::remove_dir(&blocker).unwrap();
+        // Nothing changes now, but the record on disk is behind: it is written.
+        assert!(handle.update(|_| false));
+        assert_eq!(records.load_all()[0].session_id.as_deref(), Some("s"));
     }
 
     #[test]
