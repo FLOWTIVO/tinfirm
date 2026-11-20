@@ -11,8 +11,11 @@
 --                             earlier one of its epoch named, so the one pending row per run and type holds for CANCEL
 --                             alone.
 --   run_command.delivery      a REVOKE_GIT row's delivery: SENT once its frame was written to the host's connection
---                             (last_sent_at says when), ON_RECONNECT while it was not (the host was not connected, or a
---                             send failed), UNSUPPORTED while the run's host does not list run.git.revoke. NULL for CANCEL
+--                             (last_sent_at says when), CONFIRMED once the host answered run.git.revoked for it
+--                             (confirmed_at says when; never back to SENT), ON_RECONNECT while it was not written (the
+--                             host was not connected, or a send failed), UNSUPPORTED while the run's host does not list
+--                             run.git.revoke. NULL for CANCEL
+--   run_command.confirmed_at  when the run's host first confirmed the revocation; set exactly when CONFIRMED
 --   run_repository.component_id  the repository's id as run.assign named it (workspaces[].componentId): the same as
 --                             repository_id, but kept after the repository is removed, which nulls repository_id;
 --                             NULL for rows from before V087 whose repository is gone
@@ -20,20 +23,29 @@
 --                             before V087 that no current assignment wrote: a revocation names only the repositories
 --                             of the run's current assignment
 --   run_repository.binding_version  conversation_binding.version when the assignment's token came from the binding;
---                             NULL for a public repository and for rows from before V087
+--                             NULL for a public repository and for rows from before V087 of runs not under way
+--   run_assignment_repository what each assignment of a run cloned with a binding's token, by epoch: the repository
+--                             (component_id, its name and system), the binding and its version, and the host the
+--                             assignment went to (runner_host_id, and personal_host_id, the machine, for a member's
+--                             personal host). A later assignment adds its own and replaces none, so that a host that
+--                             reports an earlier execution, or a run of a company it is no longer in, can be checked
+--                             (ADR-0116). The rows stay with their run, which is never deleted (V004): a host may report
+--                             an execution at any later time, from its take-back record. No foreign key but the run's:
+--                             the rows outlive their system, binding and host, whose absence the check reads as such
 --   conversation_binding.version  counts the changes of the binding's state, kind, account, holder and grant: a
 --                             trigger (conversation_binding_version_trg) adds one at each such update, whatever writes
 --                             it, conversation_rebind included. The assignment's third phase and a host's hello compare
 --                             it with the version the token was revealed at
 --
--- The tables keep their forced row-level security and their grants; no table is added.
+-- The tables keep their forced row-level security and their grants; run_assignment_repository is added with its own.
 
 ALTER TABLE run_command
     ADD COLUMN epoch         bigint,
     ADD COLUMN component_ids uuid[],
     ADD COLUMN reason        varchar(64),
     ADD COLUMN message       varchar(1000),
-    ADD COLUMN delivery      varchar(16);
+    ADD COLUMN delivery      varchar(16),
+    ADD COLUMN confirmed_at  timestamptz;
 
 ALTER TABLE run_command DROP CONSTRAINT run_command_type_ck;
 ALTER TABLE run_command ADD CONSTRAINT run_command_type_ck CHECK (type IN ('CANCEL', 'REVOKE_GIT'));
@@ -44,7 +56,8 @@ ALTER TABLE run_command ADD CONSTRAINT run_command_revoke_git_ck CHECK (
         AND cardinality(component_ids) BETWEEN 1 AND 20 AND array_position(component_ids, NULL) IS NULL
         AND reason IS NOT NULL AND reason ~ '^[A-Z][A-Z0-9_]{0,63}$'
         AND message IS NOT NULL AND length(message) BETWEEN 1 AND 1000
-        AND delivery IN ('SENT', 'ON_RECONNECT', 'UNSUPPORTED')));
+        AND delivery IN ('SENT', 'CONFIRMED', 'ON_RECONNECT', 'UNSUPPORTED')
+        AND (delivery = 'CONFIRMED') = (confirmed_at IS NOT NULL)));
 
 DROP INDEX run_command_pending_uq;
 CREATE UNIQUE INDEX run_command_pending_uq ON run_command (run_id, type) WHERE status = 'PENDING' AND type = 'CANCEL';
@@ -56,6 +69,33 @@ ALTER TABLE run_repository
     ADD COLUMN binding_version bigint;
 
 ALTER TABLE conversation_binding ADD COLUMN version bigint NOT NULL DEFAULT 0;
+
+CREATE TABLE run_assignment_repository (
+    run_id           uuid         NOT NULL,
+    company_id       uuid         NOT NULL,
+    epoch            bigint       NOT NULL,
+    component_id     uuid         NOT NULL,
+    position         smallint     NOT NULL,
+    name             varchar(200) NOT NULL,
+    system_id        uuid,
+    binding_id       uuid         NOT NULL,
+    binding_version  bigint,
+    runner_host_id   uuid         NOT NULL,
+    personal_host_id uuid,
+    CONSTRAINT run_assignment_repository_pk PRIMARY KEY (run_id, epoch, component_id),
+    CONSTRAINT run_assignment_repository_run_fk FOREIGN KEY (run_id, company_id) REFERENCES run (id, company_id),
+    CONSTRAINT run_assignment_repository_position_ck CHECK (position BETWEEN 0 AND 19)
+);
+
+ALTER TABLE run_assignment_repository ENABLE ROW LEVEL SECURITY;
+ALTER TABLE run_assignment_repository FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY run_assignment_repository_tenant ON run_assignment_repository FOR ALL
+    USING (company_id = app_company_id())
+    WITH CHECK (company_id = app_company_id());
+
+-- Written once per assignment, never changed or deleted.
+GRANT SELECT, INSERT ON run_assignment_repository TO ${app_role};
 
 -- Not SECURITY DEFINER: it runs as whoever updates the row, and names no table.
 CREATE FUNCTION conversation_binding_version() RETURNS trigger
@@ -89,6 +129,8 @@ CREATE TRIGGER conversation_binding_version_trg BEFORE UPDATE ON conversation_bi
 -- run back to the queue.
 ALTER TABLE run_repository NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE run NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE runner_host NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE run_assignment_repository NO FORCE ROW LEVEL SECURITY;
 
 UPDATE run_repository SET component_id = repository_id WHERE repository_id IS NOT NULL;
 
@@ -98,5 +140,23 @@ UPDATE run_repository rr
  WHERE r.id = rr.run_id AND r.company_id = rr.company_id
    AND (r.status IN ('RUNNING', 'LOST') OR (r.status = 'QUEUED' AND r.dispatched_at IS NOT NULL));
 
+-- The version of the binding each of those rows cloned with: every binding is at version 0 now, and the check of a
+-- host's report compares with that from here on. A change of the binding before this upgrade cannot be told apart. A
+-- row without a binding_id was cloned with no binding's token and is not checked.
+UPDATE run_repository SET binding_version = 0 WHERE epoch IS NOT NULL AND binding_id IS NOT NULL;
+
+-- Their assignment's record, for the check of a later report. The host is the run's; a run without one (its host
+-- was removed) has nothing to record, since no host can show that it holds it.
+INSERT INTO run_assignment_repository (run_id, company_id, epoch, component_id, position, name, system_id,
+                                       binding_id, binding_version, runner_host_id, personal_host_id)
+SELECT rr.run_id, rr.company_id, rr.epoch, rr.component_id, rr.position, rr.name, rr.system_id, rr.binding_id,
+       rr.binding_version, r.runner_host_id, h.personal_host_id
+  FROM run_repository rr
+  JOIN run r ON r.id = rr.run_id AND r.company_id = rr.company_id
+  JOIN runner_host h ON h.id = r.runner_host_id AND h.company_id = r.company_id
+ WHERE rr.epoch IS NOT NULL AND rr.component_id IS NOT NULL AND rr.binding_id IS NOT NULL;
+
+ALTER TABLE run_assignment_repository FORCE ROW LEVEL SECURITY;
+ALTER TABLE runner_host FORCE ROW LEVEL SECURITY;
 ALTER TABLE run FORCE ROW LEVEL SECURITY;
 ALTER TABLE run_repository FORCE ROW LEVEL SECURITY;

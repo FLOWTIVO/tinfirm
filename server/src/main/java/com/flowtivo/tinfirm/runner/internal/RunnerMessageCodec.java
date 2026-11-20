@@ -52,7 +52,8 @@ class RunnerMessageCodec {
             "run.ask");
 
     /** What only a v2 host sends. */
-    private static final Set<String> V2_INBOUND_TYPES = Set.of("run.request", "run.steer.ack", "host.pool.status");
+    private static final Set<String> V2_INBOUND_TYPES = Set.of("run.request", "run.steer.ack", "host.pool.status",
+            "run.git.revoked");
 
     private static final Set<String> OUTBOUND_TYPES = Set.of("welcome", "run.assign", "run.cancel", "run.git.revoke", "welcome.done",
             "run.repository_request.ack", "run.task_create.ack", "run.ask.ack", "run.request.ack", "run.steer",

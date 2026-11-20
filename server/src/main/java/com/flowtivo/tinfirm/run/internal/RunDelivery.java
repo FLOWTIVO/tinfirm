@@ -429,6 +429,9 @@ class RunDelivery {
         for (int position = 0; position < turn.workspaces().size(); position++) {
             repositories.insert(run.companyId(), run.id(), assignment.epoch(), position,
                     turn.workspaces().get(position), dirs.get(position));
+            // Kept by epoch, for a later report of this execution (ADR-0116).
+            repositories.recordAssignment(run.companyId(), run.id(), assignment.epoch(), position,
+                    turn.workspaces().get(position), assignment.host().id(), assignment.host().personalHostId());
         }
         // What its host may download: the skills of this assignment (the skills contract, §7.2).
         skills.replace(run.companyId(), run.id(), skills(assignment.settings()));

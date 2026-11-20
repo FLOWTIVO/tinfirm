@@ -842,6 +842,29 @@ class RunnerProtocolSchemaTest {
     }
 
     @Test
+    void theConfirmationOfARevocationMatchesTheV2Schema() {
+        UUID runId = UUID.randomUUID();
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        String frame = """
+                {"type":"run.git.revoked","runId":"%s","epoch":4,"componentIds":[%s]}""";
+        String valid = frame.formatted(runId, "\"" + first + "\",\"" + second + "\"");
+        assertThat(ProtocolSchema.violations(2, valid)).isEmpty();
+        RunnerMessages.RunGitRevoked revoked = (RunnerMessages.RunGitRevoked) codec.decode(valid, 2);
+        assertThat(revoked.runId()).isEqualTo(runId);
+        assertThat(revoked.epoch()).isEqualTo(4L);
+        assertThat(revoked.componentIds()).containsExactly(first, second);
+        // One to 20 repositories, each once, as the schema says; a frame of protocol 2 only.
+        String none = frame.formatted(runId, "");
+        String twice = frame.formatted(runId, "\"" + first + "\",\"" + first + "\"");
+        assertThat(ProtocolSchema.violations(2, none)).isNotEmpty();
+        assertThat(ProtocolSchema.violations(2, twice)).isNotEmpty();
+        assertThat(code(none, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        assertThat(code(twice, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        assertThat(code(valid, 1)).isEqualTo(RunnerMessages.UNKNOWN_TYPE);
+    }
+
+    @Test
     void thePublicSuffixListFramesMatchTheV2Schema() {
         String sha = "a".repeat(64);
         RunnerMessages.PslUpdate update = new RunnerMessages.PslUpdate(sha, "2026-10-07T08:00:00Z", 9000,

@@ -167,9 +167,17 @@ public enum AuditAction {
      * credential) or {@code systemId} (a paused system), {@code componentIds}, {@code reason}, {@code epoch},
      * {@code sent} (whether {@code run.git.revoke} went to the host at once) and {@code delivery} ({@code SENT},
      * {@code ON_RECONNECT}, or {@code UNSUPPORTED}: the host does not list {@code run.git.revoke}, and the run keeps
-     * its tokens until it ends). The actor is the change's. Never a token.
+     * its tokens until it ends). The actor is the change's. Never a token. What was meant at the commit: the host's
+     * confirmation is {@link #RUN_GIT_REVOKE_CONFIRMED}.
      */
     RUN_GIT_REVOKED("run.git_revoked"),
+    /**
+     * The run's host confirmed a revocation of its git tokens ({@code run.git.revoked}, ADR-0116): it dropped them and
+     * wrote its take-back record again. Once per revocation, when it is first confirmed: {@code conversationId},
+     * {@code componentIds} (the revocation's), {@code reason}, {@code epoch}, {@code runnerHostId} (the host that
+     * confirmed). The actor is SYSTEM.
+     */
+    RUN_GIT_REVOKE_CONFIRMED("run.git_revoke_confirmed"),
     /**
      * A conversation's tool call ran on its system (the package 3 contract, §8), by the agent: {@code conversationId},
      * {@code runId}, {@code systemId}, {@code tool}, {@code effect}, {@code mode}, {@code accountId},

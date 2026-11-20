@@ -19,7 +19,8 @@ import com.flowtivo.tinfirm.run.TurnSource;
 
 /**
  * SQL access to {@code run_repository} (V004): the workspace a run was assigned with, in order, with each
- * repository's git result once the run ended.
+ * repository's git result once the run ended; and to {@code run_assignment_repository} (V087): what each assignment
+ * cloned with a binding's token, by epoch, which a later assignment does not replace (ADR-0116).
  */
 @Repository
 class RunRepositoryStore {
@@ -119,11 +120,52 @@ class RunRepositoryStore {
         jdbc.sql("DELETE FROM run_repository WHERE run_id = ?").param(runId).update();
     }
 
-    /** The repositories the run's assignment of {@code epoch} cloned, if its rows are still that assignment's. */
-    List<RepositoryRow> ofAssignment(UUID runId, long epoch) {
-        return jdbc.sql("SELECT " + COLUMNS + " FROM run_repository WHERE run_id = ? AND epoch = ? ORDER BY position")
+    /**
+     * A repository that an assignment cloned with a binding's token ({@code run_assignment_repository}, V087), kept
+     * with the run whatever later assignments do (ADR-0116).
+     *
+     * @param personalHostId the machine the assignment went to, for a member's personal host; null for a company host
+     */
+    record AssignedRepository(UUID runId, long epoch, UUID componentId, int position, String name,
+            @Nullable UUID systemId, UUID bindingId, @Nullable Long bindingVersion, UUID runnerHostId,
+            @Nullable UUID personalHostId) {
+    }
+
+    /**
+     * Records what the assignment of {@code epoch} cloned with a binding's token, and where it went: one row per such
+     * repository, never changed or deleted.
+     */
+    void recordAssignment(UUID companyId, UUID runId, long epoch, int position, TurnSource.Workspace workspace,
+            UUID runnerHostId, @Nullable UUID personalHostId) {
+        if (workspace.bindingId() == null || workspace.git() == null) {
+            return;
+        }
+        jdbc.sql("""
+                INSERT INTO run_assignment_repository (run_id, company_id, epoch, component_id, position, name,
+                                                       system_id, binding_id, binding_version, runner_host_id,
+                                                       personal_host_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (run_id, epoch, component_id) DO NOTHING""")
+            .params(runId, companyId, epoch, workspace.repositoryId(), position, workspace.name(),
+                    workspace.systemId(), workspace.bindingId(), workspace.bindingVersion(), runnerHostId,
+                    personalHostId)
+            .update();
+    }
+
+    /** The repositories the run's assignment of {@code epoch} cloned with a binding's token, in workspace order. */
+    List<AssignedRepository> ofAssignment(UUID runId, long epoch) {
+        return jdbc.sql("""
+                SELECT run_id, epoch, component_id, position, name, system_id, binding_id, binding_version,
+                       runner_host_id, personal_host_id
+                  FROM run_assignment_repository
+                 WHERE run_id = ? AND epoch = ?
+                 ORDER BY position""")
             .params(runId, epoch)
-            .query(RunRepositoryStore::row)
+            .query((rs, row) -> new AssignedRepository(rs.getObject("run_id", UUID.class), rs.getLong("epoch"),
+                    rs.getObject("component_id", UUID.class), rs.getInt("position"), rs.getString("name"),
+                    rs.getObject("system_id", UUID.class), rs.getObject("binding_id", UUID.class),
+                    rs.getObject("binding_version", Long.class), rs.getObject("runner_host_id", UUID.class),
+                    rs.getObject("personal_host_id", UUID.class)))
             .list();
     }
 

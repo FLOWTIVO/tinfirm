@@ -3,8 +3,11 @@ package com.flowtivo.tinfirm.runner;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -248,6 +251,7 @@ public final class RunnerMessages {
             @JsonSubTypes.Type(value = RunFinished.class, name = "run.finished"),
             @JsonSubTypes.Type(value = RunCancel.class, name = "run.cancel"),
             @JsonSubTypes.Type(value = RunGitRevoke.class, name = "run.git.revoke"),
+            @JsonSubTypes.Type(value = RunGitRevoked.class, name = "run.git.revoked"),
             @JsonSubTypes.Type(value = WelcomeDone.class, name = "welcome.done"),
             @JsonSubTypes.Type(value = RunRepositoryRequest.class, name = "run.repository_request"),
             @JsonSubTypes.Type(value = RunRepositoryRequestAck.class, name = "run.repository_request.ack"),
@@ -936,8 +940,9 @@ public final class RunnerMessages {
 
     /**
      * v2, the feature {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116): the host drops the git tokens of the repositories
-     * named ({@code workspaces[].componentId}) for the run's assignment of {@code epoch}. No ack: the server sends it
-     * after the change's commit and again at every {@code hello} that lists the run, until the run ends.
+     * named ({@code workspaces[].componentId}) for the run's assignment of {@code epoch}, and confirms it with
+     * {@link RunGitRevoked}. The server sends it after the change's commit and again at every {@code hello} that lists
+     * the run, until the run ends.
      *
      * @param reason  a code: the binding's reason, {@code SYSTEM_PAUSED}, {@code CREDENTIAL_REPLACED} or
      *                {@code REFRESH_REFUSED}
@@ -952,6 +957,28 @@ public final class RunnerMessages {
                     || message.length() > MAX_GIT_REVOKE_MESSAGE) {
                 throw new IllegalArgumentException("A run.git.revoke names 1 to " + MAX_GIT_REVOKE_COMPONENTS
                         + " repositories, with a message of 1 to " + MAX_GIT_REVOKE_MESSAGE + " characters");
+            }
+        }
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116): the host applied a {@link RunGitRevoke} for a run of
+     * its current epoch; the tokens of these repositories, those of that frame the run has, are dropped from its holder
+     * and its take-back record was written again. The same answer for a frame that comes twice. The server takes it
+     * only from the run's host for the run's epoch, and ignores any other without an {@code error}.
+     *
+     * @param componentIds 1 to {@value #MAX_GIT_REVOKE_COMPONENTS} repositories, each once
+     */
+    public record RunGitRevoked(@NotNull UUID runId, @NotNull Long epoch,
+            @NotNull @Size(min = 1, max = MAX_GIT_REVOKE_COMPONENTS) List<@NotNull UUID> componentIds)
+            implements OneRunMessage {
+
+        public RunGitRevoked {
+            if (componentIds != null) {
+                if (new HashSet<>(componentIds).size() != componentIds.size()) {
+                    throw new IllegalArgumentException("A run.git.revoked names each repository once");
+                }
+                componentIds = Collections.unmodifiableList(new ArrayList<>(componentIds));
             }
         }
     }

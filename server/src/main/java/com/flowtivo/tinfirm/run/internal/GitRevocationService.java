@@ -11,10 +11,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
@@ -25,6 +27,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import com.flowtivo.tinfirm.audit.AuditAction;
 import com.flowtivo.tinfirm.audit.AuditLog;
 import com.flowtivo.tinfirm.audit.AuditRecord;
+import com.flowtivo.tinfirm.run.RunEvents;
 import com.flowtivo.tinfirm.run.RunGitRevocations;
 import com.flowtivo.tinfirm.run.RunStatus;
 import com.flowtivo.tinfirm.run.TurnSource;
@@ -37,6 +40,7 @@ import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.shared.tx.AfterCommit;
+import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 
 /**
  * {@link RunGitRevocations} (ADR-0116, decisions 1 and 2): finds the runs whose current assignment holds a token the
@@ -79,9 +83,16 @@ class GitRevocationService implements RunGitRevocations {
     /** The transaction that records a frame written after the change's commit: a new one, in the run's company. */
     private final TransactionTemplate separate;
 
+    private final SystemTransactions transactions;
+
+    private final ApplicationEventPublisher publisher;
+
     GitRevocationService(RunStore runs, RunLocks locks, RunRepositoryStore repositories, RunCommandStore commands,
             RunnerConnections connections, RunnerProperties runnerProperties, AuditLog auditLog, RunEventHub hub,
-            TimeSource time, RunPorts ports, PlatformTransactionManager transactionManager) {
+            TimeSource time, RunPorts ports, PlatformTransactionManager transactionManager,
+            SystemTransactions transactions, ApplicationEventPublisher publisher) {
+        this.publisher = publisher;
+        this.transactions = transactions;
         this.ports = ports;
         this.separate = new TransactionTemplate(transactionManager);
         this.separate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -195,6 +206,10 @@ class GitRevocationService implements RunGitRevocations {
         // A LOST run's host too, when it is connected: it may still run the run, and resume it with a heartbeat.
         Delivery delivery = hostId == null || !connections.isConnected(hostId) ? Delivery.ON_RECONNECT
                 : takesRevocations(hostId) ? Delivery.SENT : Delivery.UNSUPPORTED;
+        if (hostId != null) {
+            // Not while a hello's answer of the host ends: it waits for this commit, or this for its end (decision 1).
+            commands.lockRevocationsOf(hostId);
+        }
         // SENT is what goes after the commit; the row says so once the frame was written to the host's connection.
         UUID commandId = commands.insertRevocation(run.companyId(), run.id(), run.epoch(), componentIds, reason,
                 message, currentUser(), now, lost ? run.finishedAt() : null,
@@ -224,6 +239,11 @@ class GitRevocationService implements RunGitRevocations {
             .detail("sent", delivery == Delivery.SENT)
             .detail("delivery", delivery.name())
             .build());
+        if (delivery == Delivery.UNSUPPORTED) {
+            // Whatever the cause, the suspension's and a leaving member's included: the conversation says so.
+            publisher.publishEvent(new RunEvents.GitTokensKept(run.companyId(), run.id(), run.conversationId(),
+                    repositoryNames));
+        }
         hub.changedAfterCommit(run.id());
         log.info("Run {} of conversation {}: git token of {} revoked ({}, {})", run.id(), run.conversationKey(),
                 componentIds, reason, delivery);
@@ -333,16 +353,16 @@ class GitRevocationService implements RunGitRevocations {
         for (RunnerMessages.Outbound frame : answer) {
             if (frame instanceof RunnerMessages.RunCancel cancel) {
                 Set<UUID> sent = named.computeIfAbsent(cancel.runId() + "/" + cancel.epoch(), key -> new HashSet<>());
-                frames.addAll(beforeCancel(host, cancel.runId(), cancel.epoch(), locked.contains(cancel.runId()),
-                        sent, now));
+                frames.addAll(beforeCancel(cancel.runId(), cancel.epoch(), locked.contains(cancel.runId()), sent,
+                        now));
             }
             frames.add(frame);
         }
         return frames;
     }
 
-    private List<RunnerMessages.Outbound> beforeCancel(ConnectedHost host, UUID runId, long epoch, boolean locked,
-            Set<UUID> sent, Instant now) {
+    private List<RunnerMessages.Outbound> beforeCancel(UUID runId, long epoch, boolean locked, Set<UUID> sent,
+            Instant now) {
         // The run is of the host's company (the tenant context); the host reports it with that epoch.
         RunStore.RunRow run = runs.find(runId).orElse(null);
         if (run == null) {
@@ -366,10 +386,10 @@ class GitRevocationService implements RunGitRevocations {
         if (!locked || tracked || source == null) {
             return frames;
         }
-        Map<UUID, RunRepositoryStore.RepositoryRow> cloned = new LinkedHashMap<>();
-        for (RunRepositoryStore.RepositoryRow row : repositories.ofAssignment(runId, epoch)) {
-            if (row.componentId() != null && row.bindingId() != null && !recorded.contains(row.componentId())
-                    && !sent.contains(row.componentId())) {
+        // What that assignment cloned, kept by epoch whatever later assignments did (V087).
+        Map<UUID, RunRepositoryStore.AssignedRepository> cloned = new LinkedHashMap<>();
+        for (RunRepositoryStore.AssignedRepository row : repositories.ofAssignment(runId, epoch)) {
+            if (!recorded.contains(row.componentId()) && !sent.contains(row.componentId())) {
                 cloned.put(row.componentId(), row);
             }
         }
@@ -411,6 +431,116 @@ class GitRevocationService implements RunGitRevocations {
             hub.changedAfterCommit(runId);
         }
         return frames;
+    }
+
+    /**
+     * The host before which the run of a company it is no longer in is cancelled (a machine whose owner left it,
+     * ADR-0116): the revocations of that run's assignment of {@code epoch}, as {@link #beforeCancels} gives them, in
+     * the run's company's transaction, with the run locked (its conversation first). Only when that assignment went to
+     * this machine ({@code run_assignment_repository.personal_host_id}): a host learns nothing of a run it does not
+     * hold, and an assignment with no repository of a binding's token has nothing to revoke. A host that does not take
+     * revocations gets none, and those of that assignment it was never sent are {@code UNSUPPORTED}.
+     */
+    List<RunnerMessages.Outbound> beforeForeignCancel(UUID personalHostId, UUID runId, long epoch,
+            boolean takesRevocations) {
+        RunStore.RunRow found = runs.find(runId).orElse(null);
+        if (found == null || repositories.ofAssignment(runId, epoch)
+            .stream()
+            .noneMatch(row -> personalHostId.equals(row.personalHostId()))) {
+            return List.of();
+        }
+        locks.lockConversations(List.of(found));
+        if (runs.lock(runId).isEmpty()) {
+            return List.of();
+        }
+        if (!takesRevocations) {
+            commands.markRevocationsUnsupported(runId, epoch);
+            return List.of();
+        }
+        return beforeCancel(runId, epoch, true, new HashSet<>(), time.now());
+    }
+
+    /**
+     * The end of the answer to a {@code hello} that lists {@code run.git.revoke} (ADR-0116, decision 1): it holds back
+     * the commit of every revocation of a run on the host's presences ({@link RunCommandStore#holdRevocationsOf}, which
+     * also waits for those that took their lock to commit), reads in each company, in a transaction of its own, the
+     * revocations of the runs the hello listed there, for the epoch it listed and of an assignment that went to that
+     * presence, that were never written to a connection, writes them, writes {@code welcome.done}, and only then lets
+     * them commit. So every revocation of those runs that committed before {@code welcome.done} was written went
+     * before it: one that committed before the hold is read here, unless it was written already, and one that did not
+     * cannot commit until {@code welcome.done} was written. The after-commit send of a revocation read here may write
+     * it again: a host applies a frame once. The frames written count as sent afterwards ({@link #written}).
+     */
+    void endHelloAnswer(Map<ConnectedHost, List<RunnerMessages.ActiveRun>> listed,
+            Predicate<RunnerMessages.Outbound> write) {
+        Map<UUID, List<RunnerMessages.RunGitRevoke>> written = new LinkedHashMap<>();
+        transactions.unscoped(() -> {
+            commands.holdRevocationsOf(listed.keySet().stream().map(ConnectedHost::runnerHostId).toList());
+            for (Map.Entry<ConnectedHost, List<RunnerMessages.ActiveRun>> entry : listed.entrySet()) {
+                ConnectedHost placed = entry.getKey();
+                if (entry.getValue().isEmpty()) {
+                    continue;
+                }
+                List<RunnerMessages.RunGitRevoke> frames = SystemContext.callInCompany(placed.company(),
+                        () -> separate.execute(status -> unwritten(placed, entry.getValue())));
+                for (RunnerMessages.RunGitRevoke frame : frames) {
+                    if (write.test(frame)) {
+                        written.computeIfAbsent(placed.company(), id -> new ArrayList<>()).add(frame);
+                    }
+                }
+            }
+            write.test(new RunnerMessages.WelcomeDone());
+            return null;
+        });
+        written.forEach((company, frames) -> SystemContext.runInCompany(company, () -> written(frames)));
+    }
+
+    /** The revocations of the listed runs' assignments that went to the presence and were never written. */
+    private List<RunnerMessages.RunGitRevoke> unwritten(ConnectedHost placed, List<RunnerMessages.ActiveRun> listed) {
+        List<RunnerMessages.RunGitRevoke> frames = new ArrayList<>();
+        for (RunnerMessages.ActiveRun run : listed) {
+            List<RunCommandStore.GitRevocation> found = commands.unwrittenRevocations(run.runId(), run.epoch());
+            if (found.isEmpty() || repositories.ofAssignment(run.runId(), run.epoch())
+                .stream()
+                .noneMatch(row -> placed.runnerHostId().equals(row.runnerHostId()))) {
+                continue;
+            }
+            found.forEach(revocation -> frames.add(new RunnerMessages.RunGitRevoke(run.runId(), run.epoch(),
+                    revocation.componentIds(), revocation.reason(), revocation.message())));
+        }
+        return frames;
+    }
+
+    /**
+     * {@code run.git.revoked} (ADR-0116): the host applied the revocations of the run's assignment of its epoch that
+     * name these repositories. Taken only from the host the run is assigned to, for the run's epoch, and ignored
+     * otherwise, without an {@code error}. A revocation confirmed for the first time is {@code CONFIRMED} with the
+     * time and audited {@code run.git_revoke_confirmed}; a confirmation that comes again changes nothing.
+     */
+    List<RunnerMessages.Outbound> confirmed(ConnectedHost host, RunnerMessages.RunGitRevoked frame) {
+        RunStore.RunRow run = runs.find(frame.runId()).orElse(null);
+        if (run == null || run.epoch() != frame.epoch() || !host.runnerHostId().equals(run.runnerHostId())) {
+            return List.of();
+        }
+        List<RunCommandStore.Confirmed> confirmed = commands.confirmRevocations(run.id(), run.epoch(),
+                frame.componentIds(), time.now());
+        for (RunCommandStore.Confirmed one : confirmed) {
+            auditLog.record(AuditRecord.company(run.companyId(), AuditAction.RUN_GIT_REVOKE_CONFIRMED,
+                    CurrentActor.actor())
+                .target(RunCompletion.TARGET, run.id())
+                .detail("conversationId", run.conversationId().toString())
+                .detail("componentIds", one.componentIds().stream().map(UUID::toString).toList())
+                .detail("reason", one.reason())
+                .detail("epoch", run.epoch())
+                .detail("runnerHostId", host.runnerHostId().toString())
+                .build());
+            log.info("Run {} of conversation {}: runner host {} confirmed the revocation of {}", run.id(),
+                    run.conversationKey(), host.runnerHostId(), one.componentIds());
+        }
+        if (!confirmed.isEmpty()) {
+            hub.changedAfterCommit(run.id());
+        }
+        return List.of();
     }
 
     private static @Nullable UUID currentUser() {

@@ -40,11 +40,14 @@ final class RunViews {
     /**
      * ADR-0116: the revocation of a repository's git token in the run's current assignment.
      *
-     * @param delivery {@code SENT}, the frame was written to the host's connection; {@code PENDING}, the host was not
-     *                 connected, or a send failed, and it goes at the host's next {@code hello}; {@code UNSUPPORTED},
-     *                 the host cannot drop a token
+     * @param delivery    {@code CONFIRMED}, the host answered {@code run.git.revoked}; {@code SENT}, the frame was
+     *                    written to the host's connection and not confirmed yet; {@code PENDING}, the host was not
+     *                    connected, or a send failed, and it goes at the host's next {@code hello};
+     *                    {@code UNSUPPORTED}, the host cannot drop a token
+     * @param confirmedAt when the host first confirmed it; null unless {@code CONFIRMED}
      */
-    record GitRevocationDetails(String reason, String message, Instant revokedAt, String delivery) {
+    record GitRevocationDetails(String reason, String message, Instant revokedAt, String delivery,
+            @Nullable Instant confirmedAt) {
     }
 
     record ResultDetails(String outcome, String summary, List<String> nextSteps, List<String> openQuestions) {

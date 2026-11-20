@@ -87,6 +87,11 @@ class RunnerHostSessions {
         return Optional.of(ConnectedHost.machine(first.personalHostId(), presences));
     }
 
+    /** The company of a run, whatever company the host is in; empty for a run the server does not know. */
+    Optional<UUID> runCompany(UUID runId) {
+        return transactions.unscoped(() -> store.runCompany(runId));
+    }
+
     /**
      * The host placed in the company of the run: a company host when the run is its company's, a machine's presence
      * there. Empty for an unknown run, or one of a company the host is not in. A machine whose owner joined a company

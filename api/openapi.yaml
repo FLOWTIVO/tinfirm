@@ -11453,13 +11453,19 @@ components:
         revokedAt: { type: string, format: date-time }
         delivery:
           type: string
-          enum: [SENT, PENDING, UNSUPPORTED]
+          enum: [CONFIRMED, SENT, PENDING, UNSUPPORTED]
           description: >-
-            Whether the run's host heard of it. `SENT`: the revocation was written to the host's connection. `PENDING`:
-            the host was not connected, or the send failed; the revocation goes when the host reconnects, before it
-            can push the run's work. `UNSUPPORTED`: the host cannot drop a token (an older runner host), so the run
-            keeps its git access until it ends.
-          example: SENT
+            Whether the run's host heard of it. `CONFIRMED`: the host answered that it dropped the token and wrote its
+            take-back record again without it (`confirmedAt`). `SENT`: the revocation was written to the host's
+            connection, and the host has not confirmed it yet; it goes again when the host reconnects. `PENDING`: the
+            host was not connected, or the send failed; the revocation goes when the host reconnects, before it can
+            push the run's work. `UNSUPPORTED`: the host cannot drop a token (an older runner host), so the run keeps
+            its git access until it ends.
+          example: CONFIRMED
+        confirmedAt:
+          type: string
+          format: date-time
+          description: When the run's host first confirmed the revocation; only with `delivery` `CONFIRMED`
     RunCounts:
       type: object
       description: The work of a finished run as its transcript shows it

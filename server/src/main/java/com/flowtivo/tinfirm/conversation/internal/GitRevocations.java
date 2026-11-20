@@ -1,6 +1,5 @@
 package com.flowtivo.tinfirm.conversation.internal;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
 
@@ -9,6 +8,7 @@ import org.springframework.stereotype.Component;
 
 import com.flowtivo.tinfirm.conversation.BindingInfo;
 import com.flowtivo.tinfirm.conversation.ConversationEvents;
+import com.flowtivo.tinfirm.run.RunEvents;
 import com.flowtivo.tinfirm.run.RunGitRevocations;
 
 /**
@@ -57,9 +57,8 @@ class GitRevocations {
     @EventListener
     void bindingFollowed(ConversationEvents.BindingFollowed event) {
         String system = texts.systemName(event.companyId(), event.systemId());
-        told(event.companyId(), revocations.ofBinding(event.companyId(), event.bindingId(),
-                RunGitRevocations.CREDENTIAL_REPLACED, "the trigger's service account borrows another credential on "
-                        + system + " now"));
+        revocations.ofBinding(event.companyId(), event.bindingId(), RunGitRevocations.CREDENTIAL_REPLACED,
+                "the trigger's service account borrows another credential on " + system + " now");
     }
 
     private void failed(UUID companyId, UUID bindingId, BindingInfo.Reason reason) {
@@ -67,7 +66,7 @@ class GitRevocations {
         if (binding == null) {
             return;
         }
-        told(companyId, revocations.ofBinding(companyId, bindingId, reason.name(), texts.revoked(binding)));
+        revocations.ofBinding(companyId, bindingId, reason.name(), texts.revoked(binding));
     }
 
     /**
@@ -91,23 +90,21 @@ class GitRevocations {
 
     /** The runs of a paused system, in the pause's transaction, before any of them is cancelled. */
     List<RunGitRevocations.Revoked> systemPaused(UUID companyId, UUID systemId) {
-        List<RunGitRevocations.Revoked> revoked = revocations.ofSystem(companyId, systemId,
-                texts.systemName(companyId, systemId) + " was paused by an admin");
-        told(companyId, revoked);
-        return revoked;
+        return revocations.ofSystem(companyId, systemId, texts.systemName(companyId, systemId)
+                + " was paused by an admin");
     }
 
     /**
      * The conversation of a run whose host does not take revocations is told that its turn keeps its git access until
-     * it ends; the others learn it from the binding's card and the run's page.
+     * it ends; the others learn it from the binding's card and the run's page. Published by the run module for every
+     * revocation, whatever the cause (a binding's, a pause, a suspension in the run module, a leaving member), once per
+     * revocation and in its transaction, which holds the conversation's lock; the leaving member's conversation ends
+     * later in the same transaction.
      */
-    private void told(UUID companyId, Collection<RunGitRevocations.Revoked> revoked) {
-        for (RunGitRevocations.Revoked run : revoked) {
-            if (run.delivery() == RunGitRevocations.Delivery.UNSUPPORTED) {
-                messages.system(companyId, run.conversationId(), "The turn under way keeps its git access to "
-                        + String.join(", ", run.repositories()) + " until it ends: its runner host cannot drop a "
-                        + "token yet. Upgrade the runner host to revoke at once.", run.runId());
-            }
-        }
+    @EventListener
+    void tokensKept(RunEvents.GitTokensKept event) {
+        messages.system(event.companyId(), event.conversationId(), "The turn under way keeps its git access to "
+                + String.join(", ", event.repositories()) + " until it ends: its runner host cannot drop a token yet. "
+                + "Upgrade the runner host to revoke at once.", event.runId());
     }
 }

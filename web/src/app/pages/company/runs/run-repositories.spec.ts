@@ -55,7 +55,15 @@ describe('revokedNote', () => {
 
   it('says why the git access went, and whether the host could drop it', () => {
     expect(revokedNote(WEB)).toBeNull();
-    expect(revokedNote({ ...WEB, gitRevoked: revoked })).toBe(revoked.message);
+    expect(revokedNote({ ...WEB, gitRevoked: revoked })).toBe(
+      `${revoked.message} The runner host was sent this and has not confirmed it yet. It is sent again when the host reconnects.`,
+    );
+    expect(
+      revokedNote({
+        ...WEB,
+        gitRevoked: { ...revoked, delivery: 'CONFIRMED', confirmedAt: '2026-11-19T10:00:01Z' },
+      }),
+    ).toBe(`${revoked.message} The runner host dropped the token.`);
     expect(revokedNote({ ...WEB, gitRevoked: { ...revoked, delivery: 'PENDING' } })).toContain(
       'It is told when it reconnects, before it pushes',
     );
@@ -72,7 +80,7 @@ describe('revokedNote', () => {
     const row = el.querySelector('[data-testid=run-repository]')!;
     expect(row.querySelector('[data-testid=git-revoked]')?.textContent).toBe('Git access revoked');
     expect(row.querySelector('[data-testid=git-revoked-note]')?.textContent?.trim()).toBe(
-      revoked.message,
+      revokedNote({ ...WEB, gitRevoked: revoked }),
     );
     expect(row.textContent).toContain('1 commit, not pushed (access revoked)');
   });
