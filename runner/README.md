@@ -1034,8 +1034,9 @@ protocol has no notifications and no batches. A method that fails is answered wi
 -32000 and a message for this host's log, an unknown method too. A line that is not JSON is
 answered with -32700 and `id` `null`, JSON that is no request with -32600 (with its `id` when it has
 one), and an empty line with nothing. This binary's drivers (`vm-driver digitalocean` and `vm-driver
-node`) do so, and exit non-zero when their input ended after such lines and no request. This host
-reads only the answers to its own ids. You can write one for another provider or
+node`) do so, and exit non-zero when their input ended after such lines and no request. One whose
+input cannot be read (a broken pipe, not its end) sends the answers already under way and exits
+non-zero with the read error. This host reads only the answers to its own ids. You can write one for another provider or
 your own hypervisor, in any edition: such a host lists no paid feature. A driver must keep the contract C1 to
 C7 of the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#62-any-provider-one-contract-a-driver-per-provider).

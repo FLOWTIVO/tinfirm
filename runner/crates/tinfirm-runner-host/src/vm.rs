@@ -759,6 +759,7 @@ where
         }
     });
     let (mut requests, mut refused) = (0u64, 0u64);
+    let mut failed = None;
     let mut reader = BufReader::new(input);
     loop {
         let mut line = Vec::new();
@@ -767,7 +768,12 @@ where
             .read_until(b'\n', &mut line)
             .await
         {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // Not the input's end: the answers under way go out, then the driver fails.
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
             Ok(_) if line.last() == Some(&b'\n') => {
                 line.pop();
             }
@@ -812,6 +818,9 @@ where
     }
     drop(tx);
     let _ = writer.await;
+    if let Some(e) = failed {
+        return Err(e).context("cannot read the driver's input");
+    }
     if refused > 0 && requests == 0 {
         bail!(
             "the input held {refused} line(s) that are no request of the driver protocol, each answered with an error, and no request"
@@ -1674,6 +1683,46 @@ mod tests {
         assert!(reason.contains("the table is missing"), "{reason}");
         vms.record(Health::Clean);
         assert_eq!(cause(), None);
+    }
+
+    /// An input that holds `first`, then fails to read.
+    struct Breaks(Option<&'static [u8]>);
+
+    impl tokio::io::AsyncRead for Breaks {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(match self.0.take() {
+                Some(first) => {
+                    buf.put_slice(first);
+                    Ok(())
+                }
+                None => Err(std::io::Error::other("the pipe broke")),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_error_of_the_input_fails_after_the_answers_under_way() {
+        let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
+        let input = Breaks(Some(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"hello\"}\n",
+        ));
+        let served = serve_driver(input, theirs, |method, _| async move {
+            // Slower than the read error: the answer is still under way when it comes.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(json!({ "method": method }))
+        })
+        .await;
+        let error = format!("{:#}", served.unwrap_err());
+        assert!(error.contains("the pipe broke"), "{error}");
+        let mut out = String::new();
+        ours.read_to_string(&mut out).await.unwrap();
+        let answer: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(answer["id"], 1);
+        assert_eq!(answer["result"]["method"], "hello");
     }
 
     /// A driver in `sh`: answers each request after `delay` with its method's line of
