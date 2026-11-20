@@ -41,6 +41,93 @@
         mode: "0644"
       loop: [helper.json, listener.json, firewall.nft, listener-control-host.conf]
 
+    # The hardening: every switch on (the node's settings as example-vars.yml reads them), each
+    # switch off in turn, the master switch off, and a node whose settings are below the
+    # hardening's (check-rendered.py, "hardening").
+    - name: Render the hardening with every switch on
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: all-on
+
+    - name: Render the hardening with the master switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: master-off
+        tinfirm_sandbox_node_harden: false
+
+    - name: Render the hardening with eBPF's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: bpf-off
+        tinfirm_sandbox_node_harden_bpf: false
+
+    - name: Render the hardening with io_uring's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: io_uring-off
+        tinfirm_sandbox_node_harden_io_uring: false
+
+    - name: Render the hardening with AppArmor's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: mac-off
+        tinfirm_sandbox_node_harden_mac: false
+
+    - name: Render the hardening with panic on oops off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: panic_on_oops-off
+        tinfirm_sandbox_node_harden_panic_on_oops: false
+
+    - name: Render the hardening with module loading's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: modules-off
+        tinfirm_sandbox_node_harden_modules: false
+
+    - name: Render the hardening with kexec's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: kexec-off
+        tinfirm_sandbox_node_harden_kexec: false
+
+    - name: Render the hardening with lockdown's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: lockdown-off
+        tinfirm_sandbox_node_harden_lockdown: false
+
+    - name: Render the hardening with the setuid switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: setuid-off
+        tinfirm_sandbox_node_harden_setuid: false
+
+    - name: Render the hardening with the distribution's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: distribution-off
+        tinfirm_sandbox_node_harden_distribution: false
+
+    - name: Render the hardening on a node below every setting, with a panic's reboot and other bounds
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: below
+        tinfirm_sandbox_node_kernel_panic: 10
+        tinfirm_sandbox_node_max_uptime_days: 7
+        tinfirm_sandbox_node_ssh_port: 2222
+        _tinfirm_sandbox_node_sysctl_current:
+          kernel.unprivileged_bpf_disabled: 0
+          kernel.io_uring_disabled: 0
+          kernel.panic_on_oops: 0
+          kernel.panic: 0
+          kernel.kptr_restrict: 0
+          kernel.dmesg_restrict: 0
+          kernel.perf_event_paranoid: 1
+          kernel.randomize_va_space: 1
+          fs.protected_symlinks: 0
+          fs.protected_hardlinks: 0
+
     - name: Render the node's firewall for one VM, a static address and SSH on another port
       ansible.builtin.template:
         src: "{{ _node }}/templates/firewall.nft.j2"
@@ -92,3 +179,4 @@
           nodes_unpinned: "{{ _tinfirm_runner_host_nodes_unpinned }}"
           nodes_pinned: "{{ _tinfirm_runner_host_nodes_pinned | map(attribute='name') | list }}"
           packages: "{{ _tinfirm_sandbox_node_packages }}"
+          units: "{{ _tinfirm_sandbox_node_units }}"

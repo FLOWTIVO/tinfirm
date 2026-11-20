@@ -19,6 +19,20 @@
     state: reloaded
     daemon_reload: true
 
+# The profile confines each VMM that starts after it is loaded; VMMs that run keep their label.
+- name: Load the VMMs' AppArmor profile
+  ansible.builtin.command:
+    argv: [apparmor_parser, -r, /etc/apparmor.d/tinfirm-vmm]
+  changed_when: true
+
+# A oneshot: a restart runs `harden` again, with the new hardening.json. What it set stays set
+# until a reboot, whatever the file now says.
+- name: Run the node's hardening again
+  ansible.builtin.systemd_service:
+    name: tinfirm-node-agent-hardening.service
+    state: restarted
+    daemon_reload: true
+
 - name: Restart the node agent's helper
   ansible.builtin.systemd_service:
     name: tinfirm-node-agent-helper.service

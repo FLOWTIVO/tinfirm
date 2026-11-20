@@ -503,7 +503,7 @@ Exactly these three fields, each key once; `lockdown` is `"integrity"` or `"none
 
 ### The VMM's profile
 
-`units/tinfirm-vmm.apparmor`, the profile `tinfirm-vmm` (ADR-0113, decision 5): one profile for every VM's VMM. **Unverified:** it has not been parsed (`apparmor_parser -Q -K`) or loaded on any machine. The first round on a node loads it in complain mode, runs VMs with and without `guestConsole` and a make that fails on purpose, and reads the `apparmor="ALLOWED"` lines before it enforces it, with `vmmProfile` `"not-required"` until then.
+`units/tinfirm-vmm.apparmor`, the profile `tinfirm-vmm` (ADR-0113, decision 5): one profile for every VM's VMM. **Unverified:** CI parses it (`apparmor_parser -Q -K`, which checks its syntax and its rules' form), and it has not been loaded on any machine. The first round on a node loads it in complain mode, runs VMs with and without `guestConsole` and a make that fails on purpose, and reads the `apparmor="ALLOWED"` lines before it enforces it, with `vmmProfile` `"not-required"` until then.
 
 It attaches by the exec's path: the helper, `start-jailer` and the jailer are unconfined, and the jailer execs `/firecracker` after its `pivot_root` into the jail. It grants no capability and no `/proc` or `/sys` rule. Each rule comes from what `src/linux.rs` hands the VMM:
 

@@ -11,7 +11,9 @@
 
 - name: Read the agent's log where a unit does not run
   ansible.builtin.command:
-    argv: [journalctl, --no-pager, -n, "30", -u, tinfirm-node-agent-helper.service, -u, tinfirm-node-agent-listener.service]
+    argv:
+      [journalctl, --no-pager, -n, "30", -u, tinfirm-node-agent-hardening.service, -u, tinfirm-node-agent-helper.service,
+       -u, tinfirm-node-agent-listener.service]
   register: _tinfirm_sandbox_node_journal
   changed_when: false
   when: _tinfirm_sandbox_node_active.rc != 0
@@ -101,8 +103,44 @@
           first: "{{ tinfirm_sandbox_node_first_port | int }}"
           last: "{{ _tinfirm_sandbox_node_last_port | int }}"
       - >-
-        Not done by this role: the hardening of ADR-0113 decision 5 (lockdown, modules disabled,
-        AppArmor), which is not specified yet, and `verify` trying the node's own egress. The
-        network outside the node is yours to close: the node reaches nothing, and only the control
+        Not done by this role: `verify` trying the node's own egress. The network outside the
+        node is yours to close: the node reaches nothing, and only the control
         host reaches the node's ports {{ tinfirm_sandbox_node_agent_port }} and
         {{ tinfirm_sandbox_node_first_port }} to {{ _tinfirm_sandbox_node_last_port }}.
+
+# The hardening mark, as the helper's check found it (the same for every template). A line whose
+# switch is off is shown as off; one whose switch is on must hold. Last, so that the node's
+# fingerprint above is shown either way.
+- name: Show each line of the node's hardening mark
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.line }}: {{ 'holds' if item.holds else ('DOES NOT HOLD' if _tinfirm_sandbox_node_mark_lines[item.line] | default(false) | bool
+                                                     else 'does not hold, and its switch is off') }} ({{ item.found }})
+  loop: "{{ _tinfirm_sandbox_node_mark.lines | default([]) }}"
+  loop_control:
+    label: "{{ item.line }}"
+  vars:
+    _tinfirm_sandbox_node_mark: "{{ (_tinfirm_sandbox_node_checks.results[0].stdout | from_json).ok.hardening | default({}) }}"
+
+- name: Fail when a line of the hardening whose switch is on does not hold
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_mark.lines is defined
+      - _failing | length == 0
+    fail_msg: >-
+      {{ 'The helper sent no hardening mark: the node agent is older than this role.'
+         if _tinfirm_sandbox_node_mark.lines is not defined
+         else 'Lines of the hardening whose switch is on do not hold: ' ~ (_failing | join('; ')) ~ '.' }}
+      Each line's switch is in the role's defaults ("The hardening"). VMMs that ran before the
+      AppArmor profile was loaded keep vmm-mac failing until they are deleted.
+    success_msg: "The hardening mark: {{ _tinfirm_sandbox_node_mark.hardened }}."
+  vars:
+    _tinfirm_sandbox_node_mark: "{{ (_tinfirm_sandbox_node_checks.results[0].stdout | from_json).ok.hardening | default({}) }}"
+    _failing: >-
+      {%- set failing = [] -%}
+      {%- for line in _tinfirm_sandbox_node_mark.lines | default([]) -%}
+      {%-   if not line.holds and (_tinfirm_sandbox_node_mark_lines[line.line] | default(false) | bool) -%}
+      {%-     set _ = failing.append(line.line ~ ': ' ~ line.found) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ failing }}

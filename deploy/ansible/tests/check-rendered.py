@@ -7,7 +7,8 @@ runner host's README, without a target machine (deploy/ansible/README.md, "Check
 It checks helper.json and listener.json field by field against the tables of
 runner/crates/tinfirm-node-agent/README.md ("Configuration"), node-driver.json against
 runner/README.md ("Sandbox nodes"), the rendered firewall against the units' own file with the
-same values, and the units' command lines. Where nft can check a ruleset here (as root, or in a
+same values, the units' command lines and order, and the hardening's files for each switch
+(README.md of the node agent, "The hardening mark" and "Hardening at each boot"). Where nft can check a ruleset here (as root, or in a
 user and network namespace of its own), it checks both firewall files with `nft -c -f`.
 """
 
@@ -49,7 +50,13 @@ def keys(obj, required, optional=()):
 
 def helper(h):
     check(keys(h, ["listenerUid", "socket", "spool", "state", "maxVms", "vmUidBase", "nodeFirewall",
-                   "network", "firecracker", "templates"]), "helper.json: exactly the README's fields")
+                   "vmmProfile", "network", "firecracker", "hardening", "templates"]),
+          "helper.json: exactly the README's fields")
+    check(h["vmmProfile"] in ("required", "not-required"), "helper.json: vmmProfile required or not-required")
+    hd = h["hardening"]
+    check(keys(hd, ["agentPort", "sshPort", "maxUptimeDays"]), "helper.json: hardening's three fields")
+    check(all(is_int(hd[k]) for k in hd) and 1 <= hd["agentPort"] <= 65535 and 1 <= hd["sshPort"] <= 65535
+          and 1 <= hd["maxUptimeDays"] <= 3650, "helper.json: hardening's ports 1 to 65535, maxUptimeDays 1 to 3650")
     # The role loads the node's own firewall table, so the helper requires it.
     check(h["nodeFirewall"] == "required", "helper.json: nodeFirewall required")
     check(is_int(h["listenerUid"]) and h["listenerUid"] != 0, "helper.json: listenerUid a number, not 0")
@@ -88,6 +95,12 @@ def helper(h):
               and 1 <= t["pidsMax"] <= 4096 and t["bridgePort"] != 0, f"helper.json: template {name}'s ranges")
         paths += [t["image"], t["kernel"]]
     check(all(plain(p) for p in paths), "helper.json: every path absolute and plain")
+    # The VMMs' AppArmor profile names the chroot base and the work directory: the helper refuses
+    # vmmProfile required with others (PROFILE_CHROOT_BASE, PROFILE_WORK).
+    if h["vmmProfile"] == "required":
+        check(h["firecracker"]["chrootBase"] == "/srv/tinfirm-jails"
+              and h["firecracker"]["work"] == "/var/lib/tinfirm-node-agent/work",
+              "helper.json: vmmProfile required with the profile's chroot base and work directory")
     # The units name these paths.
     check(h["socket"] == "/run/tinfirm-node-agent-helper/helper.sock" and h["state"] == "/var/lib/tinfirm-node-agent/helper"
           and f["work"] == "/var/lib/tinfirm-node-agent/work" and f["chrootBase"] == "/srv/tinfirm-jails",
@@ -156,6 +169,96 @@ def units(docker, vm):
     check("\n\n\n" not in v and "{" not in v.replace("${", ""), "control host unit: no Jinja left, no double blank line")
 
 
+SWITCHES = ["bpf", "io_uring", "mac", "panic_on_oops", "modules", "kexec", "lockdown", "setuid", "distribution"]
+# What each switch puts into the hardening's files: its sysctl settings, its field of
+# hardening.json, and its line of the mark.
+SETTINGS = {
+    "bpf": ["kernel.unprivileged_bpf_disabled"],
+    "io_uring": ["kernel.io_uring_disabled"],
+    "panic_on_oops": ["kernel.panic_on_oops", "kernel.panic"],
+    "distribution": ["kernel.kptr_restrict", "kernel.dmesg_restrict", "kernel.perf_event_paranoid",
+                     "kernel.randomize_va_space", "fs.protected_symlinks", "fs.protected_hardlinks"],
+}
+HARDEN_JSON = {"modules": "modulesDisabled", "kexec": "kexecDisabled", "lockdown": "lockdown"}
+MARK_LINE = {"bpf": "unprivileged-bpf", "io_uring": "io-uring", "mac": "vmm-mac", "panic_on_oops": "panic-on-oops",
+             "modules": "modules-disabled", "kexec": "kexec-disabled", "lockdown": "lockdown",
+             "setuid": "no-setuid", "distribution": "distribution-hardening"}
+# The lines of no switch of their own: the master switch's, but user-namespaces, always set.
+MASTER_LINES = ["no-docker", "listening-sockets", "max-uptime"]
+# Every setting all on writes, on a node that reads as example-vars.yml says (Ubuntu's
+# kernel.perf_event_paranoid = 4, which the file leaves out).
+ALL_ON = {
+    "kernel.unprivileged_bpf_disabled": 1, "kernel.io_uring_disabled": 2, "kernel.panic_on_oops": 1,
+    "kernel.panic": 0, "kernel.kptr_restrict": 1, "kernel.dmesg_restrict": 1, "kernel.randomize_va_space": 2,
+    "fs.protected_symlinks": 1, "fs.protected_hardlinks": 1,
+}
+
+
+def hardening_case(out, case):
+    d = out / "hardening" / case
+    lines = [line for line in (d / "61-tinfirm-node-hardening.conf").read_text().splitlines()
+             if line and not line.startswith("#")]
+    settings = {}
+    for line in lines:
+        key, _, value = line.partition(" = ")
+        check(bool(re.match(r"^(kernel|fs)\.[a-z_]+$", key)) and value.isdigit(), f"hardening {case}: `{line}` a setting")
+        settings[key] = int(value)
+    harden = json.loads((d / "hardening.json").read_text())
+    check(keys(harden, ["modulesDisabled", "kexecDisabled", "lockdown"])
+          and isinstance(harden["modulesDisabled"], bool) and isinstance(harden["kexecDisabled"], bool)
+          and harden["lockdown"] in ("integrity", "none"),
+          f"hardening {case}: hardening.json exactly its three fields, as `harden` reads them")
+    h = json.loads((d / "helper.json").read_text())
+    helper(h)
+    return settings, harden, h, json.loads((d / "derived.json").read_text())
+
+
+def hardening(out):
+    settings, harden, h, derived = hardening_case(out, "all-on")
+    check(settings == ALL_ON, "hardening all on: every setting, perf_event_paranoid left at the node's stricter 4")
+    check(harden == {"modulesDisabled": True, "kexecDisabled": True, "lockdown": "integrity"},
+          "hardening all on: harden sets module loading, kexec and lockdown")
+    check(h["vmmProfile"] == "required", "hardening all on: vmmProfile required")
+    check(h["hardening"] == {"agentPort": 7700, "sshPort": 22, "maxUptimeDays": 30},
+          "hardening all on: the agent's port, SSH's and the most days since the boot")
+    check(derived["pending"] == [], "hardening all on: a node that has every setting gets none applied again")
+    check("apparmor" in derived["packages"], "hardening all on: AppArmor's package")
+    check(all(derived["mark_lines"].values()) and len(derived["mark_lines"]) == 13,
+          "hardening all on: the proof requires every line of the mark")
+
+    settings, harden, h, derived = hardening_case(out, "master-off")
+    check(settings == {}, "hardening master off: no setting")
+    check(harden == {"modulesDisabled": False, "kexecDisabled": False, "lockdown": "none"},
+          "hardening master off: harden sets nothing")
+    check(h["vmmProfile"] == "not-required" and "apparmor" not in derived["packages"],
+          "hardening master off: vmmProfile not-required, no AppArmor package")
+    check([k for k, v in derived["mark_lines"].items() if v] == ["user-namespaces"],
+          "hardening master off: the proof requires user-namespaces alone")
+
+    for switch in SWITCHES:
+        settings, harden, h, derived = hardening_case(out, f"{switch}-off")
+        gone = set(SETTINGS.get(switch, []))
+        check(settings == {k: v for k, v in ALL_ON.items() if k not in gone},
+              f"hardening {switch} off: its settings alone are gone")
+        wanted = {"modulesDisabled": True, "kexecDisabled": True, "lockdown": "integrity"}
+        if switch in HARDEN_JSON:
+            wanted[HARDEN_JSON[switch]] = "none" if switch == "lockdown" else False
+        check(harden == wanted, f"hardening {switch} off: hardening.json changes only its own field")
+        mac = switch != "mac"
+        check((h["vmmProfile"] == "required") == mac and ("apparmor" in derived["packages"]) == mac,
+              f"hardening {switch} off: vmmProfile and AppArmor's package follow the AppArmor switch alone")
+        off = [k for k, v in derived["mark_lines"].items() if not v]
+        check(off == [MARK_LINE[switch]], f"hardening {switch} off: the proof leaves out {MARK_LINE[switch]} alone")
+
+    settings, harden, h, derived = hardening_case(out, "below")
+    check(settings == {**ALL_ON, "kernel.panic": 10, "kernel.perf_event_paranoid": 2},
+          "hardening on a node below every setting: each written, perf_event_paranoid 2, kernel.panic 10")
+    check(sorted(derived["pending"]) == sorted(settings), "hardening on a node below every setting: each one applied")
+    check(h["hardening"] == {"agentPort": 7700, "sshPort": 2222, "maxUptimeDays": 7},
+          "hardening: helper.json's sshPort and maxUptimeDays from the role's variables")
+    check(set(MASTER_LINES) <= set(derived["mark_lines"]), "hardening: the lines of the master switch are named")
+
+
 def nft_check(path):
     nft = shutil.which("nft")
     if not nft:
@@ -186,6 +289,14 @@ def main():
     derived = json.loads((out / "derived.json").read_text())
     check(derived["nodes_unpinned"] == ["node-3"] and derived["nodes_pinned"] == ["node-1", "node-2"],
           "the play names node-3 as waiting, and pins node-1 and node-2")
+    check(derived["units"] == ["tinfirm-node-agent-modules.service", "tinfirm-node-agent-firewall.service",
+                               "tinfirm-node-agent-hardening.service", "tinfirm-node-agent-helper.service",
+                               "tinfirm-node-agent-listener.service"],
+          "the units in their order: modules, firewall, hardening, helper, listener")
+    for unit in derived["units"]:
+        check((HERE.parent / "roles" / "tinfirm_sandbox_node" / "files" / unit).read_text()
+              == (UNITS / unit).read_text(), f"files/{unit}: a copy of the agent's unit")
+    hardening(out)
     firewall((out / "firewall.nft").read_text())
     one = (out / "firewall-one-vm-static.nft").read_text()
     check("define published_ports = 20000\n" in one and "udp sport 67" not in one,

@@ -6,11 +6,9 @@
 # on the node and never leaves it. Headers for a mirror that needs authentication belong in
 # Ansible Vault.
 #
-# Not done by this role, and not specified yet: the hardening of ADR-0113 decision 5 (kernel
-# lockdown, kernel.modules_disabled, an AppArmor profile for the VMMs); the single machine
-# (ADR-0112 decision 5), which the node agent refuses today; and `verify` trying the node's own
-# egress. Sandbox nodes are not ready for production: a node's hardening and the published VM
-# image are not built.
+# Not done by this role: the single machine (ADR-0112 decision 5), which the node agent refuses
+# today, and `verify` trying the node's own egress. Sandbox nodes are not ready for production:
+# the hardening below has not run on a machine yet, and the published VM image is not built.
 
 # --- The node agent's binary -----------------------------------------------------------------
 
@@ -161,3 +159,58 @@ tinfirm_sandbox_node_watch_ms: 1000
 # The node's name in the control host's configuration, which the role prints with the
 # fingerprint: 1 to 32 bytes of a-z, 0-9 and -.
 tinfirm_sandbox_node_name: "{{ inventory_hostname_short | lower | regex_replace('[^a-z0-9-]', '-') | truncate(32, true, '') }}"
+
+# --- The hardening (ADR-0113 decision 5) ----------------------------------------------------------
+
+# The hardening mark: each line below that holds on the node, and every one must for the helper
+# to report `yes` (runner/crates/tinfirm-node-agent/README.md, "The hardening mark"). A switch
+# that is off leaves its setting as the machine has it: its line of the mark may then fail, the
+# mark is `no`, and nothing else stops. user.max_user_namespaces = 0 has no switch: the jail
+# relies on it (ADR-0112), and the role always sets it.
+#
+# The master switch: false leaves every line below off, whatever its own switch says.
+tinfirm_sandbox_node_harden: true
+# kernel.unprivileged_bpf_disabled = 1: no eBPF for users. One-way: switching it off again
+# takes a reboot. Off: the line `unprivileged-bpf` holds only where the machine has 1 or 2.
+tinfirm_sandbox_node_harden_bpf: true
+# kernel.io_uring_disabled = 2: no io_uring for anyone. It needs Linux 6.6 or later (Debian 12's
+# 6.1 has no such setting: the role refuses the switch there). Off: `io-uring` fails.
+tinfirm_sandbox_node_harden_io_uring: true
+# AppArmor: the package, the VMMs' profile tinfirm-vmm (unverified until it has run on a node),
+# and `"vmmProfile": "required"` in helper.json, so that a make fails for a VMM that the profile
+# does not confine. VMMs that ran before the profile was loaded stay unconfined until they are
+# deleted, and the mark is `no` until then. A Red Hat family node has SELinux and no AppArmor:
+# the role refuses the switch there. Off: `vmm-mac` fails, and makes do not ask.
+tinfirm_sandbox_node_harden_mac: true
+# kernel.panic_on_oops = 1, and kernel.panic = tinfirm_sandbox_node_kernel_panic: an exploit that
+# fails takes the node down instead of trying again, and ends every run on it. Off:
+# `panic-on-oops` fails.
+tinfirm_sandbox_node_harden_panic_on_oops: true
+# Seconds after a panic before the node reboots; 0: it stays down until an operator looks.
+tinfirm_sandbox_node_kernel_panic: 0
+# kernel.modules_disabled = 1, set at each boot by tinfirm-node-agent-hardening.service once the
+# modules the agent needs are loaded. Until the next reboot no module loads: a firewall rule or a
+# tool that needs a new one fails. Off: `modules-disabled` fails.
+tinfirm_sandbox_node_harden_modules: true
+# kernel.kexec_load_disabled = 1, set at each boot after kdump's unit: a crash kernel loaded at
+# boot stays, no other kernel can be loaded. Off: `kexec-disabled` fails.
+tinfirm_sandbox_node_harden_kexec: true
+# Lockdown at integrity, set at each boot unless the kernel is there already: unsigned modules
+# and writes to kernel memory are refused. It needs the lockdown LSM: the role refuses the
+# switch on a kernel without it. Off: `lockdown` fails.
+tinfirm_sandbox_node_harden_lockdown: true
+# Strips the setuid and setgid bits from every program under /usr, /opt, /bin and /sbin that
+# others may run, and keeps sudo as 4750 root and the distribution's admin group (sudo on Debian
+# and Ubuntu, wheel on the Red Hat family): su, passwd, chsh, mount and the like no longer work
+# for users, snaps no longer start (snap-confine), and only the admin group can use sudo. On
+# Debian and Ubuntu each change is recorded with dpkg-statoverride, so that upgrades keep it.
+# Off: `no-setuid` fails while such a program is there.
+tinfirm_sandbox_node_harden_setuid: true
+# The distribution's hardening, as the narrower facts of the mark: kernel.kptr_restrict >= 1,
+# kernel.dmesg_restrict = 1, kernel.perf_event_paranoid >= 2, kernel.randomize_va_space = 2,
+# fs.protected_symlinks = 1, fs.protected_hardlinks = 1. A value the machine has stricter
+# already is left as it is. Off: `distribution-hardening` fails where the machine has less.
+tinfirm_sandbox_node_harden_distribution: true
+# The most days the node may run since its boot before its mark is `no` (the line `max-uptime`,
+# which stands for a patched kernel: re-image or reboot the node before then). 1 to 3650.
+tinfirm_sandbox_node_max_uptime_days: 30

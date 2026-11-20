@@ -1,6 +1,6 @@
 # The AppArmor profile of every VM's VMM (ADR-0113, decision 5): one profile for all of them,
 # since every VM's files have the same names in its own jail and the users keep the VMs
-# apart. UNVERIFIED: it has not been parsed or loaded on a node yet. Load it first in complain
+# apart. UNVERIFIED: CI parses it, and it has not been loaded on a node yet. Load it first in complain
 # mode, run VMs with and without guestConsole and a make that fails, and read the
 # apparmor="ALLOWED" lines before it is enforced (the crate's README, "The VMM's profile").
 #

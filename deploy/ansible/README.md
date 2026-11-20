@@ -9,8 +9,9 @@ Three playbooks:
 | `sandbox-node.yml` | `tinfirm_sandbox_node` | A sandbox node: the node agent, Firecracker, the guest kernel, the VM image and the node's own firewall. It holds no credential |
 
 The last two are not ready for production. The roles ran on machines once (2026-11-20, Ubuntu
-24.04), with ten conversations with real runtimes through the node; a node's hardening and the
-published VM image are not built ([below](#sandbox-nodes-and-their-control-host)).
+24.04), with ten conversations with real runtimes through the node; a node's hardening has not
+run on a machine yet, and the published VM image is not built
+([below](#sandbox-nodes-and-their-control-host)).
 
 ## Runner hosts with Kata Containers
 
@@ -211,7 +212,8 @@ on large workspaces).
 
 > **Not ready for production.** The two plays ran on machines once, on 2026-11-20, on one
 > distribution: [Test on two machines](#test-on-two-machines) says what ran and what it found. A
-> node's hardening and the published VM image are not built. Use them to prepare and to test.
+> node's hardening has not run on a machine yet, and the published VM image is not built. Use them
+> to prepare and to test.
 
 [ADR-0112](../../docs/adr/0112-no-credential-on-a-sandbox-machine.md) splits a runner host with
 VMs in two. The **control host** keeps every credential (the host's token, the runs' git and
@@ -299,17 +301,23 @@ The role `tinfirm_sandbox_node`:
    compares), the listener's drop-in with `IPAddressAllow=` the control host, the sysctl file
    (`net.ipv4.ip_forward = 1`, `user.max_user_namespaces = 0`), and the node's firewall table with
    this node's values in its `define` lines, checked with `nft -c` before it is written;
-9. makes the node's TLS identity on the node with `tinfirm-node-agent identity`: the key is the
-   listener's (0600), the certificate root's (0644). It never leaves the node;
-10. writes `helper.json` (root's, 0644, which the helper requires) and `listener.json`
+9. hardens the node by its switches ([The hardening](#the-hardening)): the hardening's sysctl
+   file, AppArmor and the VMMs' profile, `hardening.json` for the unit that sets kexec, lockdown
+   and module loading at each boot, and the setuid and setgid bits;
+10. makes the node's TLS identity on the node with `tinfirm-node-agent identity`: the key is the
+    listener's (0600), the certificate root's (0644). It never leaves the node;
+11. writes `helper.json` (root's, 0644, which the helper requires) and `listener.json`
     (`root:tinfirm-node-listener`, 0640) from the variables. `helper.json` says
     `"nodeFirewall": "required"`: the helper makes no VM while the node's firewall table is
-    missing;
-11. starts the modules' unit, the firewall's, the helper and the listener, in that order;
-12. proves the node: every unit active, both sysctl settings read back, the firewall table
+    missing. With the AppArmor switch on it says `"vmmProfile": "required"`, and its `hardening`
+    names the agent's port, the SSH port and the most days since the boot;
+12. starts the modules' unit, the firewall's, the hardening's, the helper and the listener, in
+    that order;
+13. proves the node: every unit active, both sysctl settings read back, the firewall table
     loaded, and the helper's own `check` of every template, asked on its socket as the listener's
     user, exactly as the listener asks it. A problem fails the play. Then it shows the node's
-    fingerprint and the node's entry for the control host's inventory.
+    fingerprint and the node's entry for the control host's inventory, prints each line of the
+    hardening mark, and fails when a line whose switch is on does not hold.
 
 The image, the kernel, Firecracker and the agent are downloaded only while what is installed is
 not what the variables name. A second run downloads nothing: once the firewall is loaded, the
@@ -482,11 +490,40 @@ stop it, and then re-image the machine.
   the code hosts, the control host's ports, the other nodes and the metadata services is yours too.
   It is the guard against root on a node, which the node's own table is not.
 
+### The hardening
+
+[ADR-0113](../../docs/adr/0113-levels-of-isolation-and-placement.md) decision 5: a mark beside the
+level, `yes` when every line holds on the node. The node agent's helper checks each line in its
+`check`, and writes none (the agent's README, "The hardening mark"); the role sets them up, each
+by a switch, all on by default, and `tinfirm_sandbox_node_harden: false` turns every one off. A
+switch that is off leaves the machine's setting as it is: the line may then fail, the mark says
+`no`, and the node runs on. The control host does not report the mark to the server yet (planned).
+
+| Switch (`tinfirm_sandbox_node_harden_…`) | What the role does | What it costs |
+|---|---|---|
+| (none) | `user.max_user_namespaces = 0`, always (`60-tinfirm-node-agent.conf`): the jail relies on it | No user namespaces on the node |
+| `bpf` | `kernel.unprivileged_bpf_disabled = 1` in `/etc/sysctl.d/61-tinfirm-node-hardening.conf` | One-way until a reboot |
+| `io_uring` | `kernel.io_uring_disabled = 2`, same file. Refused on a kernel without the setting (older than 6.6: Debian 12's 6.1) | No io_uring on the node |
+| `panic_on_oops` | `kernel.panic_on_oops = 1` and `kernel.panic = tinfirm_sandbox_node_kernel_panic` (0: the node stays down) | An oops ends every run on the node |
+| `distribution` | `kernel.kptr_restrict`, `kernel.dmesg_restrict`, `kernel.perf_event_paranoid`, `kernel.randomize_va_space`, `fs.protected_symlinks`, `fs.protected_hardlinks` at the mark's values; a value the node has stricter already (Ubuntu's `perf_event_paranoid = 4`) is left out, never lowered | Users cannot read the kernel's log or addresses |
+| `mac` | Installs AppArmor, writes the VMMs' profile `/etc/apparmor.d/tinfirm-vmm` (checked with `apparmor_parser -Q -K` first), loads it, and writes `"vmmProfile": "required"`: a make fails for a VMM the profile does not confine. Refused on a node without AppArmor, which a Red Hat family node is | **The profile is unverified** until the round on a real machine: it parses, and has not confined a VMM yet. VMMs that ran before it was loaded stay unconfined, and the mark `no`, until they are deleted. The profile names `/srv/tinfirm-jails` and `/var/lib/tinfirm-node-agent/work`, which the role does not let a site change |
+| `modules`, `kexec`, `lockdown` | `/etc/tinfirm/node-agent/hardening.json`, which `tinfirm-node-agent-hardening.service` applies at each boot after the modules' and firewall's units and after kdump: kexec off, lockdown at `integrity`, then module loading off once every module the agent needs is loaded. Lockdown is refused on a kernel without the lockdown LSM | **All three last until a reboot, and only a reboot undoes them.** No module loads after it: a firewall rule or a tool that needs a new one fails. A change of the modules' list while module loading is off stops the play with "reboot the node": the new unit is installed and loads at the next boot |
+| `setuid` | Finds the setuid and setgid programs under `/usr`, `/opt`, `/bin` and `/sbin` that others may run, as the helper's scan does, and strips both bits; keeps `sudo` as `4750 root:sudo` (`root:wheel` on the Red Hat family). On Debian and Ubuntu each change is recorded with `dpkg-statoverride`, so that a package upgrade keeps it; on the Red Hat family an upgrade puts the bits back, and the next run of the role removes them again. Refused for a play whose user is neither root nor in that group | Users lose `su`, `passwd`, `chsh`, `chfn`, `newgrp`, `gpasswd`, `mount`, `umount`, `fusermount3`, `pkexec`, `ssh-keysign`, `crontab`, `wall`, snaps (`snap-confine`), and every other such program; `sudo` stays for the admin group alone |
+
+The lines of no switch of their own follow the master switch: `no-docker` (no Docker, containerd or
+podman socket), `listening-sockets` (no TCP listener beyond loopback but the agent's port and
+`tinfirm_sandbox_node_ssh_port`) and `max-uptime` (at most `tinfirm_sandbox_node_max_uptime_days`
+since the boot: re-image or reboot the node before then). A line whose switch is off is printed as
+off by the proof, not failed.
+
+**A reboot** keeps the hardening: the sysctl files and the profile are loaded at boot, and the
+hardening's unit sets kexec, lockdown and module loading again before the helper starts. Its
+failure does not stop the helper: the mark says `no`, and the unit's journal says why.
+
 ### Not done by these roles
 
-- **The hardening of [ADR-0113](../../docs/adr/0113-levels-of-isolation-and-placement.md) decision
-  5** (kernel lockdown, `kernel.modules_disabled`, an AppArmor profile for the VMMs). It is not
-  specified yet, and the control host reports its nodes as not hardened.
+- **SELinux on a Red Hat family node** (ADR-0113 decision 5): such a node reports `no` for the line
+  `vmm-mac`, and the role refuses the AppArmor switch there.
 - **The single machine** (ADR-0112 decision 5): the runner host and the node agent on one machine.
   The helper refuses a control host on the node's own machine, and so does the role.
 - **`verify` trying the node's own egress** (the server, the model gateway, the code hosts, a
@@ -535,6 +572,10 @@ stop it, and then re-image the machine.
 | `tinfirm_sandbox_node_guest_console` | `false` | The guest's serial console in a file on the node; leave it off where runs are real |
 | `tinfirm_sandbox_node_cgroup_parent`, `_watch_ms` | `tinfirm-vms`, `1000` | `firecracker.cgroupParent`, the listener's `watchMs` |
 | `tinfirm_sandbox_node_name` | the inventory name | The node's name in the entry the play shows |
+| `tinfirm_sandbox_node_harden` | `true` | The master switch of the hardening: `false` turns every line off |
+| `tinfirm_sandbox_node_harden_bpf`, `_io_uring`, `_mac`, `_panic_on_oops`, `_modules`, `_kexec`, `_lockdown`, `_setuid`, `_distribution` | `true` each | One line of the hardening each ([The hardening](#the-hardening)) |
+| `tinfirm_sandbox_node_kernel_panic` | `0` | `kernel.panic`: seconds before a node that panicked reboots; 0, it stays down |
+| `tinfirm_sandbox_node_max_uptime_days` | `30` | The most days since the boot before the mark is `no` (`hardening.maxUptimeDays`) |
 
 ### Variables of a control host
 
@@ -564,8 +605,10 @@ python3 -I deploy/ansible/tests/check-rendered.py /tmp/rendered
 
 `check-rendered.py` checks `helper.json` and `listener.json` field by field against the agent's
 README, `node-driver.json` against the runner host's, the rendered firewall against the units' own
-file with the same values, the control host's command line, and the firewall with `nft -c -f`
-where `nft` may check a ruleset.
+file with the same values, the control host's command line, the units' order and copies, the
+firewall with `nft -c -f` where `nft` may check a ruleset, and the hardening's files: all switches
+on, each off in turn (its lines alone gone), the master switch off (none), and a node below every
+setting. CI's deploy job also parses the VMMs' profile with `apparmor_parser -Q -K`.
 
 On a node, after the play, check its egress yourself, as root: each of these must time out.
 

@@ -262,3 +262,134 @@
       ufw is enabled on this node; its forward policy drops what the VMs' published ports need.
       Disable it (`ufw disable`): the role's own table is the node's firewall.
     quiet: true
+
+# --- The hardening (ADR-0113 decision 5) ----------------------------------------------------------
+
+- name: Check the hardening's settings
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_kernel_panic | string is match('^[0-9]+$')
+      - tinfirm_sandbox_node_max_uptime_days | string is match('^[0-9]+$')
+      - tinfirm_sandbox_node_max_uptime_days | int >= 1
+      - tinfirm_sandbox_node_max_uptime_days | int <= 3650
+    fail_msg: >-
+      tinfirm_sandbox_node_kernel_panic is a number of seconds, 0 or more (0: a node that
+      panicked stays down); tinfirm_sandbox_node_max_uptime_days is 1 to 3650.
+    quiet: true
+
+# What each switched-on line needs of the machine, looked at before anything changes.
+- name: Look for what the hardening's lines need
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - /proc/sys/kernel/io_uring_disabled
+    - /sys/module/apparmor/parameters/enabled
+    - /sys/kernel/security/lockdown
+    - /proc/sys/kernel/kexec_load_disabled
+    - /proc/sys/kernel/modules_disabled
+  register: _tinfirm_sandbox_node_harden_needs
+
+- name: Refuse io_uring's switch on a kernel without its setting
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_harden_needs.results[0].stat.exists
+    fail_msg: >-
+      This kernel ({{ ansible_facts['kernel'] }}) has no kernel.io_uring_disabled, which came with
+      Linux 6.6 (Debian 12's 6.1 has none). Boot a newer kernel (Debian 13, or Debian 12's
+      backports kernel), or set tinfirm_sandbox_node_harden_io_uring: false, and the node's
+      hardening mark says `no` for io-uring.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.io_uring | bool
+
+- name: Read whether AppArmor is on
+  ansible.builtin.slurp:
+    src: /sys/module/apparmor/parameters/enabled
+  register: _tinfirm_sandbox_node_apparmor
+  failed_when: false
+  when:
+    - _tinfirm_sandbox_node_harden_on.mac | bool
+    - _tinfirm_sandbox_node_harden_needs.results[1].stat.exists
+
+- name: Refuse the AppArmor switch on a machine without AppArmor
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == 'Debian'
+      - (_tinfirm_sandbox_node_apparmor.content | default('') | b64decode | trim) == 'Y'
+    fail_msg: >-
+      {{ 'This is a Red Hat family node: it has SELinux and no AppArmor, and the SELinux form
+      for the VMMs is not built yet.' if ansible_facts['os_family'] != 'Debian'
+      else 'AppArmor is not on in this kernel (/sys/module/apparmor/parameters/enabled is not Y).' }}
+      Set tinfirm_sandbox_node_harden_mac: false, and the node's hardening mark says `no` for
+      vmm-mac.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.mac | bool
+
+- name: Refuse the lockdown switch on a kernel without lockdown
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_harden_needs.results[2].stat.exists
+    fail_msg: >-
+      This kernel ({{ ansible_facts['kernel'] }}) has no lockdown LSM
+      (/sys/kernel/security/lockdown). Boot a kernel with it, or set
+      tinfirm_sandbox_node_harden_lockdown: false, and the node's hardening mark says `no` for
+      lockdown.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.lockdown | bool
+
+- name: Refuse the kexec switch on a kernel without its setting
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_harden_needs.results[3].stat.exists
+    fail_msg: >-
+      This kernel ({{ ansible_facts['kernel'] }}) has no kernel.kexec_load_disabled. Set
+      tinfirm_sandbox_node_harden_kexec: false, and the node's hardening mark says `no` for
+      kexec-disabled.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.kexec | bool
+
+# sudo is cut to the admin group (4750): a play whose user is not root and not in that group
+# would lose its own way to root halfway through.
+- name: Read the groups of this play's user
+  ansible.builtin.command:
+    argv: [id]
+  become: false
+  register: _tinfirm_sandbox_node_play_user
+  changed_when: false
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+- name: Refuse the setuid switch for a play that would lose sudo
+  ansible.builtin.assert:
+    that:
+      - >-
+        _tinfirm_sandbox_node_play_user.stdout is match('uid=0[(]')
+        or _tinfirm_sandbox_node_play_user.stdout is search('groups=(.*,)?[0-9]+[(]' ~ _tinfirm_sandbox_node_admin_group ~ '[)]')
+    fail_msg: >-
+      This play's user ({{ _tinfirm_sandbox_node_play_user.stdout }}) is not in the
+      group {{ _tinfirm_sandbox_node_admin_group }}, to which the role cuts sudo: it would lose
+      sudo, and so would every operator outside that group. Add the operators to
+      {{ _tinfirm_sandbox_node_admin_group }}, or set tinfirm_sandbox_node_harden_setuid: false.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+# Once kernel.modules_disabled is 1, no module loads until a reboot: a changed modules' unit
+# (a module added to it) is installed, and service.yml then stops the play for a reboot.
+- name: Read whether module loading is off
+  ansible.builtin.slurp:
+    src: /proc/sys/kernel/modules_disabled
+  register: _tinfirm_sandbox_node_modules_disabled
+  failed_when: false
+
+- name: Look at the installed modules' unit
+  ansible.builtin.stat:
+    path: /etc/systemd/system/tinfirm-node-agent-modules.service
+    checksum_algorithm: sha256
+  register: _tinfirm_sandbox_node_modules_unit
+
+- name: Note a modules' unit that changed while module loading is off
+  ansible.builtin.set_fact:
+    _tinfirm_sandbox_node_modules_locked: >-
+      {{ (_tinfirm_sandbox_node_modules_disabled.content | default('MA==') | b64decode | trim) == '1'
+         and _tinfirm_sandbox_node_modules_unit.stat.exists
+         and _tinfirm_sandbox_node_modules_unit.stat.checksum
+             != (lookup('ansible.builtin.file', 'tinfirm-node-agent-modules.service', rstrip=false) | hash('sha256')) }}

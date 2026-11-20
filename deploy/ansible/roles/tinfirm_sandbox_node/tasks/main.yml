@@ -2,10 +2,12 @@
 # A sandbox node (ADR-0112 decision 4): the node agent, Firecracker and its jailer, the guest
 # kernel and the VM image, the node's own firewall, the sysctl and the modules, the agent's two
 # services, its configuration, and the node's TLS identity, made here and never copied off.
-# It ends with the helper's own check of every template, and fails when it names a problem.
+# The hardening of ADR-0113 decision 5, by its switches (hardening.yml). It ends with the
+# helper's own check of every template, and fails when it names a problem or when a line of the
+# hardening whose switch is on does not hold.
 #
-# Not done here (deploy/ansible/README.md): the hardening of ADR-0113 decision 5, the single
-# machine, and `verify` trying the node's own egress.
+# Not done here (deploy/ansible/README.md): the single machine, and `verify` trying the node's
+# own egress.
 
 - name: Check the target and the variables
   ansible.builtin.import_tasks: checks.yml
@@ -30,6 +32,9 @@
 
 - name: Install the node's firewall, sysctl, modules and units
   ansible.builtin.import_tasks: system.yml
+
+- name: Harden the node
+  ansible.builtin.import_tasks: hardening.yml
 
 - name: Make the node's identity and write the agent's configuration
   ansible.builtin.import_tasks: config.yml

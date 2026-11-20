@@ -16,6 +16,20 @@ tinfirm_sandbox_node_templates:
     snapshotMib: 20480
     pidsMax: 64
 _tinfirm_sandbox_node_listener_uid: "991"
+# The node's kernel settings as tasks/hardening.yml reads them: Ubuntu 24.04's, where
+# kernel.perf_event_paranoid is 4 and kernel.unprivileged_bpf_disabled 2, after a first run of
+# the role for the rest. A second run must write the same file and apply nothing.
+_tinfirm_sandbox_node_sysctl_current:
+  kernel.unprivileged_bpf_disabled: 1
+  kernel.io_uring_disabled: 2
+  kernel.panic_on_oops: 1
+  kernel.panic: 0
+  kernel.kptr_restrict: 1
+  kernel.dmesg_restrict: 1
+  kernel.perf_event_paranoid: 4
+  kernel.randomize_va_space: 2
+  fs.protected_symlinks: 1
+  fs.protected_hardlinks: 1
 
 tinfirm_runner_host_binary_url: https://example.invalid/tinfirm-runner-host-1.0.0-x86_64-unknown-linux-musl.tar.gz
 tinfirm_runner_host_vm_template: sandbox-4c8g

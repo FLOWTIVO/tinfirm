@@ -380,15 +380,26 @@ jobs:
           set -euo pipefail
           units=runner/crates/tinfirm-node-agent/units
           role=deploy/ansible/roles/tinfirm_sandbox_node
-          for unit in tinfirm-node-agent-firewall.service tinfirm-node-agent-helper.service \
-            tinfirm-node-agent-listener.service tinfirm-node-agent-modules.service \
-            tinfirm-node-agent.sysctl.conf tinfirm-node-agent.tmpfiles.conf; do
+          for unit in tinfirm-node-agent-firewall.service tinfirm-node-agent-hardening.service \
+            tinfirm-node-agent-helper.service tinfirm-node-agent-listener.service \
+            tinfirm-node-agent-modules.service tinfirm-node-agent.sysctl.conf \
+            tinfirm-node-agent.tmpfiles.conf tinfirm-vmm.apparmor; do
             cmp "$units/$unit" "$role/files/$unit" \
               || { echo "::error::$role/files/$unit must be a copy of $units/$unit"; exit 1; }
           done
           diff <(grep -v '^define ' "$units/tinfirm-node-agent.nft") \
             <(grep -v -e '^define ' -e '^{%' -e '^# {{ ansible_managed }}$' "$role/templates/firewall.nft.j2") \
             || { echo "::error::$role/templates/firewall.nft.j2 must be $units/tinfirm-node-agent.nft with the node's values in its define lines"; exit 1; }
+      # The VMMs' AppArmor profile, parsed and compiled as the role's `validate` does on a node,
+      # without loading it (-Q) or touching a cache (-K): its syntax and its rules, not what it
+      # allows, which only a node shows.
+      - name: The VMMs' AppArmor profile parses
+        run: |
+          set -euo pipefail
+          command -v apparmor_parser >/dev/null \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends apparmor; }
+          apparmor_parser --version | head -n 1
+          apparmor_parser -Q -K runner/crates/tinfirm-node-agent/units/tinfirm-vmm.apparmor
       # The check the auto-deploy hosts run on SHA256SUMS.sig (openssl, no cosign), against
       # a throwaway P-256 key and a signature in cosign's format (base64 DER).
       - name: The signature check of SHA256SUMS

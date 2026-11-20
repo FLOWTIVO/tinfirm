@@ -36,18 +36,107 @@ _tinfirm_sandbox_node_packages_apt:
   [ca-certificates, coreutils, dmsetup, iproute2, kmod, nftables, openssl, procps, python3, tar, util-linux, zstd]
 _tinfirm_sandbox_node_packages_dnf:
   [ca-certificates, coreutils, device-mapper, iproute, kmod, nftables, openssl, procps-ng, python3, tar, util-linux, zstd]
+# With the AppArmor switch on, AppArmor's parser (the RHEL family has none: checks.yml refuses
+# the switch there).
 _tinfirm_sandbox_node_packages: >-
-  {{ _tinfirm_sandbox_node_packages_apt if ansible_facts['os_family'] == 'Debian'
+  {{ (_tinfirm_sandbox_node_packages_apt + (['apparmor'] if _tinfirm_sandbox_node_harden_on.mac | bool else []))
+     if ansible_facts['os_family'] == 'Debian'
      else _tinfirm_sandbox_node_packages_dnf }}
 
 # The units, in the order they start. The modules' unit loads what the helper may not load,
-# the firewall's loads the node's table before the agent starts, and the listener needs the
-# helper's socket.
+# the firewall's loads the node's table before the agent starts, the hardening's sets what lasts
+# until a reboot once both are done, and the listener needs the helper's socket.
 _tinfirm_sandbox_node_units:
   - tinfirm-node-agent-modules.service
   - tinfirm-node-agent-firewall.service
+  - tinfirm-node-agent-hardening.service
   - tinfirm-node-agent-helper.service
   - tinfirm-node-agent-listener.service
+
+# --- The hardening (ADR-0113 decision 5) ----------------------------------------------------------
+
+_tinfirm_sandbox_node_hardening_config: /etc/tinfirm/node-agent/hardening.json
+_tinfirm_sandbox_node_hardening_sysctl: /etc/sysctl.d/61-tinfirm-node-hardening.conf
+_tinfirm_sandbox_node_profile: /etc/apparmor.d/tinfirm-vmm
+# The group whose members keep sudo once its setuid bit is cut to the group (4750).
+_tinfirm_sandbox_node_admin_group: "{{ 'sudo' if ansible_facts['os_family'] == 'Debian' else 'wheel' }}"
+# Where the setuid scan looks, as the helper's line `no-setuid` does.
+_tinfirm_sandbox_node_setuid_dirs: [/usr, /opt, /bin, /sbin]
+
+# Each line's switch as it takes effect: its own, and the master switch.
+_tinfirm_sandbox_node_harden_on:
+  bpf: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_bpf | bool }}"
+  io_uring: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_io_uring | bool }}"
+  mac: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_mac | bool }}"
+  panic_on_oops: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_panic_on_oops | bool }}"
+  modules: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_modules | bool }}"
+  kexec: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_kexec | bool }}"
+  lockdown: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_lockdown | bool }}"
+  setuid: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_setuid | bool }}"
+  distribution: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_distribution | bool }}"
+
+# Each line of the mark, and whether the role sets it up: what the proof requires to hold. A
+# line of no switch of its own follows the master switch; user-namespaces always holds, since the
+# role always sets it (60-tinfirm-node-agent.conf).
+_tinfirm_sandbox_node_mark_lines:
+  user-namespaces: true
+  unprivileged-bpf: "{{ _tinfirm_sandbox_node_harden_on.bpf | bool }}"
+  io-uring: "{{ _tinfirm_sandbox_node_harden_on.io_uring | bool }}"
+  vmm-mac: "{{ _tinfirm_sandbox_node_harden_on.mac | bool }}"
+  panic-on-oops: "{{ _tinfirm_sandbox_node_harden_on.panic_on_oops | bool }}"
+  modules-disabled: "{{ _tinfirm_sandbox_node_harden_on.modules | bool }}"
+  kexec-disabled: "{{ _tinfirm_sandbox_node_harden_on.kexec | bool }}"
+  lockdown: "{{ _tinfirm_sandbox_node_harden_on.lockdown | bool }}"
+  distribution-hardening: "{{ _tinfirm_sandbox_node_harden_on.distribution | bool }}"
+  no-docker: "{{ tinfirm_sandbox_node_harden | bool }}"
+  no-setuid: "{{ _tinfirm_sandbox_node_harden_on.setuid | bool }}"
+  listening-sockets: "{{ tinfirm_sandbox_node_harden | bool }}"
+  max-uptime: "{{ tinfirm_sandbox_node_harden | bool }}"
+
+# The settings the role reads before it writes the hardening's sysctl file.
+_tinfirm_sandbox_node_hardening_keys:
+  - kernel.unprivileged_bpf_disabled
+  - kernel.io_uring_disabled
+  - kernel.panic_on_oops
+  - kernel.panic
+  - kernel.kptr_restrict
+  - kernel.dmesg_restrict
+  - kernel.perf_event_paranoid
+  - kernel.randomize_va_space
+  - fs.protected_symlinks
+  - fs.protected_hardlinks
+
+# The hardening's sysctl settings, by the switches and the values the node has now
+# (_tinfirm_sandbox_node_sysctl_current, read by tasks/hardening.yml). Where a line asks for "at
+# least", a value the node has higher already is left out, so the role never lowers it (Ubuntu
+# ships kernel.perf_event_paranoid = 4); once written, the value read back is the one written, so
+# a second run writes the same file.
+_tinfirm_sandbox_node_hardening_sysctls: >-
+  {%- set on = _tinfirm_sandbox_node_harden_on -%}
+  {%- set now = _tinfirm_sandbox_node_sysctl_current | default({}) -%}
+  {%- set s = {} -%}
+  {%- if on.bpf | bool -%}{%- set _ = s.update({'kernel.unprivileged_bpf_disabled': 1}) -%}{%- endif -%}
+  {%- if on.io_uring | bool -%}{%- set _ = s.update({'kernel.io_uring_disabled': 2}) -%}{%- endif -%}
+  {%- if on.panic_on_oops | bool -%}
+  {%-   set _ = s.update({'kernel.panic_on_oops': 1, 'kernel.panic': tinfirm_sandbox_node_kernel_panic | int}) -%}
+  {%- endif -%}
+  {%- if on.distribution | bool -%}
+  {%-   for key, least, exact in [('kernel.kptr_restrict', 1, false), ('kernel.dmesg_restrict', 1, true),
+                                  ('kernel.perf_event_paranoid', 2, false), ('kernel.randomize_va_space', 2, true),
+                                  ('fs.protected_symlinks', 1, true), ('fs.protected_hardlinks', 1, true)] -%}
+  {%-     if exact or (now[key] | default(-1) | int) <= least -%}{%- set _ = s.update({key: least}) -%}{%- endif -%}
+  {%-   endfor -%}
+  {%- endif -%}
+  {{ s }}
+# The settings of that file that the node does not have now: the role applies the file when
+# there is one.
+_tinfirm_sandbox_node_hardening_pending: >-
+  {%- set now = _tinfirm_sandbox_node_sysctl_current | default({}) -%}
+  {%- set p = [] -%}
+  {%- for key, value in _tinfirm_sandbox_node_hardening_sysctls.items() -%}
+  {%-   if (now[key] | default(none)) != value -%}{%- set _ = p.append(key) -%}{%- endif -%}
+  {%- endfor -%}
+  {{ p }}
 
 # The SHA-256 of each pinned Firecracker release, by version and architecture: the archive's
 # from the release's firecracker-v<version>-<arch>.tgz.sha256.txt, and the two binaries' from

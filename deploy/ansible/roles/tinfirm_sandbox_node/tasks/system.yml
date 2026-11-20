@@ -13,6 +13,7 @@
   notify:
     - Restart the node's kernel modules
     - Reload the node's firewall
+    - Run the node's hardening again
     - Restart the node agent's helper
     - Restart the node agent's listener
 
