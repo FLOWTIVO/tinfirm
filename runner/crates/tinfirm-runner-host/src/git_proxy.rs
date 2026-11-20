@@ -2711,6 +2711,54 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
     }
 
+    /// A tool call's body over the bound is refused with 413 whether its head declares it
+    /// (the front half refuses it) or it streams (the run half stops reading at the bound).
+    async fn a_tool_call_over_its_bound_is_too_large(mode: Mode) {
+        let proxy = proxy_in(mode).await;
+        let guard = proxy
+            .register_mcp(mcp_tools(pending("Requested.")))
+            .unwrap();
+        let path = mcp_path(&guard);
+        let declared = connect(&proxy).await;
+        let streamed = connect(&proxy).await;
+        for (mut stream, chunked) in [(declared, false), (streamed, true)] {
+            let framing = if chunked {
+                "transfer-encoding: chunked".to_string()
+            } else {
+                format!("content-length: {}", mcp::MAX_BODY + 1)
+            };
+            stream
+                .write_all(
+                    format!("POST {path} HTTP/1.1\r\nhost: p\r\ncontent-type: application/json\r\n{framing}\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            if chunked {
+                // One chunk over the bound; the run half stops reading at the bound and
+                // answers, so the writer must not wait for its last bytes to be taken.
+                let (mut read, mut write) = stream.into_split();
+                let writer = tokio::spawn(async move {
+                    let size = mcp::MAX_BODY + 1;
+                    let _ = write.write_all(format!("{size:x}\r\n").as_bytes()).await;
+                    let _ = write.write_all(&vec![b' '; size]).await;
+                    let _ = write.write_all(b"\r\n0\r\n\r\n").await;
+                    write
+                });
+                let mut answer = vec![0u8; 1024];
+                let n = read.read(&mut answer).await.unwrap();
+                let answer = String::from_utf8_lossy(&answer[..n]);
+                assert!(answer.starts_with("HTTP/1.1 413"), "chunked: {answer}");
+                writer.abort();
+            } else {
+                let mut answer = vec![0u8; 1024];
+                let n = stream.read(&mut answer).await.unwrap();
+                let answer = String::from_utf8_lossy(&answer[..n]);
+                assert!(answer.starts_with("HTTP/1.1 413"), "declared: {answer}");
+            }
+        }
+    }
+
     async fn a_route_serves_at_most_its_share_of_requests_at_once(mode: Mode) {
         let hanging = hanging_upstream(b"").await;
         let proxy = proxy_with_in(
@@ -3549,6 +3597,63 @@ mod tests {
             upstream.seen()
         );
         assert!(upstream.seen().iter().all(|seen| seen.body.len() <= 4));
+        // A tool call whose body does not have its declared length is a bad request, one over
+        // the bound is too large, and one whose body broke is a bad request too, never a size
+        // problem.
+        let broken = || {
+            let stream = futures::stream::iter([
+                Ok(hyper::body::Frame::data(Bytes::from_static(b"{"))),
+                Err::<_, crate::front::head::BoxError>("the request body did not end".into()),
+            ]);
+            http_body_util::StreamBody::new(stream).boxed_unsync()
+        };
+        let over = || {
+            Full::new(Bytes::from(vec![b' '; mcp::MAX_BODY + 1]))
+                .map_err(|never| match never {})
+                .boxed_unsync()
+        };
+        let ping = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let tool_call = |length| head(Target::Mcp { route: mcp_id }, "POST", None, length);
+        let tools: Vec<(RequestHead, ProxyBody, StatusCode, &str)> = vec![
+            (
+                tool_call(BodyLength::Exact(4)),
+                bytes(ping),
+                StatusCode::BAD_REQUEST,
+                "the request body does not have the length its head declared",
+            ),
+            (
+                tool_call(BodyLength::Exact(ping.len() as u64 + 8)),
+                bytes(ping),
+                StatusCode::BAD_REQUEST,
+                "the request body does not have the length its head declared",
+            ),
+            (
+                tool_call(BodyLength::Streamed),
+                over(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "the request is too large",
+            ),
+            (
+                tool_call(BodyLength::Streamed),
+                broken(),
+                StatusCode::BAD_REQUEST,
+                "bad request body",
+            ),
+            (
+                tool_call(BodyLength::Exact(ping.len() as u64)),
+                bytes(ping),
+                StatusCode::OK,
+                "",
+            ),
+        ];
+        for (head, body, want, text) in tools {
+            let shown = format!("{head:?}");
+            let (answer, body) = backend.call(head, body).await;
+            assert_eq!(answer.status, want.as_u16(), "{shown}");
+            let body = body.collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains(text), "{shown}: {body}");
+        }
         drop((route, mcp));
     }
 
@@ -3771,6 +3876,7 @@ mod tests {
         an_unreachable_upstream_is_a_bad_gateway,
         a_slow_git_body_is_cut_by_the_deadline,
         a_slow_mcp_body_is_cut_by_the_deadline,
+        a_tool_call_over_its_bound_is_too_large,
         a_route_serves_at_most_its_share_of_requests_at_once,
         an_idle_connection_is_closed,
         serves_the_mcp_handshake_and_tools_of_a_run,

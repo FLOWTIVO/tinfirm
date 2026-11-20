@@ -2096,18 +2096,35 @@ fn plain(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     response
 }
 
-/// A request body of at most [`MAX_BODY`] bytes: `None` when it is longer, or broke.
-async fn read_bounded(mut body: crate::front::head::ProxyBody) -> Option<Bytes> {
+/// Why a request body could not be read whole ([`read_bounded`]).
+enum BodyRefused {
+    /// It is longer than [`MAX_BODY`].
+    TooLarge,
+    /// It does not have the length its head declared.
+    LengthMismatch,
+    /// Its stream broke: the client left, or the front said that it did not end.
+    Broken,
+}
+
+/// A request body of at most [`MAX_BODY`] bytes, or why it is refused.
+async fn read_bounded(mut body: crate::front::head::ProxyBody) -> Result<Bytes, BodyRefused> {
     let mut out = Vec::new();
     while let Some(frame) = body.frame().await {
-        if let Ok(data) = frame.ok()?.into_data() {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) if crate::front::head::length_mismatch(e.as_ref()) => {
+                return Err(BodyRefused::LengthMismatch);
+            }
+            Err(_) => return Err(BodyRefused::Broken),
+        };
+        if let Ok(data) = frame.into_data() {
             if out.len() + data.len() > MAX_BODY {
-                return None;
+                return Err(BodyRefused::TooLarge);
             }
             out.extend_from_slice(&data);
         }
     }
-    Some(Bytes::from(out))
+    Ok(Bytes::from(out))
 }
 
 /// Serves one HTTP request to a run's MCP endpoint.
@@ -2134,8 +2151,22 @@ pub async fn handle_http(
         return response;
     }
     let body = match tokio::time::timeout(body_timeout, read_bounded(req.into_body())).await {
-        Ok(Some(body)) => body,
-        Ok(None) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large"),
+        Ok(Ok(body)) => body,
+        Ok(Err(BodyRefused::TooLarge)) => {
+            return plain(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large");
+        }
+        // The git proxy's and the model proxy's rule: a body that does not have its declared
+        // length is a bad request, not a size problem.
+        Ok(Err(BodyRefused::LengthMismatch)) => {
+            tracing::warn!(
+                "platform MCP endpoint: a request body did not have the length its head declared"
+            );
+            return plain(
+                StatusCode::BAD_REQUEST,
+                "the request body does not have the length its head declared",
+            );
+        }
+        Ok(Err(BodyRefused::Broken)) => return plain(StatusCode::BAD_REQUEST, "bad request body"),
         Err(_) => {
             return plain(
                 StatusCode::REQUEST_TIMEOUT,
