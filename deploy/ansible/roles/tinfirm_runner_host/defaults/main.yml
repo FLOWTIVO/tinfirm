@@ -13,7 +13,8 @@
 # `docker`: `run` with Docker and Kata on this machine. `vm`: a control host,
 # `run --executor vm --vm-driver node`, whose VMs run on the sandbox nodes of
 # tinfirm_runner_host_nodes (the sandbox node role, sandbox-node.yml). control-host.yml sets
-# `vm`. Sandbox nodes are not ready for production: no conversation has run through one.
+# `vm`. Sandbox nodes are not ready for production: no conversation with a real runtime has
+# run through one.
 tinfirm_runner_host_executor: docker
 
 # --- Docker Engine -----------------------------------------------------------------------

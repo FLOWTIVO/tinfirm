@@ -341,7 +341,7 @@ With `runner.enabled: true` the chart also runs a runner host, as a pod: the com
 
 | `runner.vm.driver` | Where the VMs run | Edition | State |
 |---|---|---|---|
-| `node` | On sandbox nodes outside the cluster: your machines with KVM, each running the node agent, which hold no credential | Every edition, Community included | Not ready for production: the node agent makes VMs, and the role that sets up a node has not run on a machine yet; a node's hardening is planned (below) |
+| `node` | On sandbox nodes outside the cluster: your machines with KVM, each running the node agent, which hold no credential | Every edition, Community included | Not ready for production: the node agent makes VMs, and the role that sets up a node ran on a machine once; no conversation with a real runtime has run through a node, and a node's hardening is planned (below) |
 | `digitalocean` (the default) | A DigitalOcean Droplet per run | Pro and Enterprise ([Licence](licence.md)). Without such a key the server refuses the host, and the pod stops. | Available |
 
 Ready VMs, which wait for runs so that a run starts in seconds, are Pro's and Enterprise's with either driver: `runner.pool.maxReady` stays `0`, its default, in Community.
@@ -357,7 +357,7 @@ kubectl -n tinfirm create secret generic tinfirm-runner --from-file=token=./runn
 
 !!! warning "Not ready for production"
 
-    The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host's `node` driver. The Ansible role that installs a node, with the agent's service units and the node's own firewall, is built and has not run on a machine yet ([Sandbox nodes on your own machines](sandbox-nodes.md)). The node's hardening and the published VM image are planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). The chart's pod has not run against a node, and no conversation has run through one. The runner host refuses to start with the `node` driver while a node's check reports a problem. Use this form to prepare and to test, and DigitalOcean's driver for production until then.
+    The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host's `node` driver. The Ansible role that installs a node, with the agent's service units and the node's own firewall, ran on a machine once, on 2026-11-20 ([Sandbox nodes on your own machines](sandbox-nodes.md)). The node's hardening and the published VM image are planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). The chart's pod has not run against a node, and no conversation with a real runtime has run through one. The runner host refuses to start with the `node` driver while a node's check reports a problem. Use this form to prepare and to test, and DigitalOcean's driver for production until then.
 
 The pod is then a control host: it holds the credentials and runs no agent code. The VMs run on sandbox nodes, machines outside the cluster that hold nothing, each with the node agent. The pod reaches each node's agent over TLS, with the node's certificate pinned by its SHA-256 and the pod's own client certificate, which each node pins in turn. A node's local socket, for a runner host on the node's own machine, is not for a pod. Such a host would report the isolation level `machine`.
 

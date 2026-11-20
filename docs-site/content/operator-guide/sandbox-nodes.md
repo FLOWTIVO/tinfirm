@@ -4,7 +4,7 @@ This page is for the people who run a company's runner hosts on plain Linux mach
 
 !!! warning "Not ready for production"
 
-    No conversation has run through a sandbox node, and the two plays have not run on a machine yet. The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host over TLS. The node's hardening and the published VM image are planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). Use this form to prepare and to test, and a runner host of its own or DigitalOcean's driver for production until then.
+    No conversation with a real runtime has run through a sandbox node. The two plays ran on machines once, on 2026-11-20, with runs of a stand-in agent. The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host over TLS. The node's hardening and the published VM image are planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). Use this form to prepare and to test, and a runner host of its own or DigitalOcean's driver for production until then.
 
 ## How it works
 
