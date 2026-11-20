@@ -102,6 +102,23 @@
     - tinfirm_runner_host_create_user | bool
     - not (_tinfirm_runner_host_vm | bool)
 
+# `run --sandbox-bridge-ports`: FROM-TO (or one port), 1 to 65535, with a port for every run at
+# once. It is a setting of the sandbox bridge on a Docker host; a control host's VMs do not use it.
+- name: Check the sandbox bridge's ports
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_runner_host_bridge_ports_ok | bool
+    fail_msg: >-
+      tinfirm_runner_host_sandbox_bridge_ports is FROM-TO, two ports from 1 to 65535 with FROM at
+      most TO, holding at least tinfirm_runner_host_max_concurrent_runs
+      ({{ tinfirm_runner_host_max_concurrent_runs }}) ports, not "{{ _range }}"; and it is a
+      setting of the sandbox bridge on a Docker host (tinfirm_runner_host_sandbox_bridge: true,
+      not a control host). Leave it empty to let the system pick each port.
+    quiet: true
+  vars:
+    _range: "{{ tinfirm_runner_host_sandbox_bridge_ports | string | trim }}"
+  when: tinfirm_runner_host_sandbox_bridge_ports | string | trim | length > 0
+
 # The unit's ProtectHome hides /home, /root and /run/user from the service.
 - name: Check that the runner host's directories are outside the hidden homes
   ansible.builtin.assert:

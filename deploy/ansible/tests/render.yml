@@ -164,6 +164,55 @@
       vars:
         tinfirm_runner_host_executor: docker
 
+    - name: Render the runner host's unit with the sandbox bridge's ports
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker-ports.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+        tinfirm_runner_host_sandbox_bridge_ports: 41000-41063
+
+    - name: Render the runner host's unit with ports but without the sandbox bridge
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker-nobridge.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+        tinfirm_runner_host_sandbox_bridge: false
+        tinfirm_runner_host_sandbox_bridge_ports: 41000-41063
+
+    # What checks.yml takes of tinfirm_runner_host_sandbox_bridge_ports, for each value, with
+    # tinfirm_runner_host_max_concurrent_runs 8 (example-vars.yml).
+    - name: Judge the sandbox bridge's ports
+      ansible.builtin.set_fact:
+        _bridge_ports: "{{ _bridge_ports | default({}) | combine({item.case: _tinfirm_runner_host_bridge_ports_ok | bool}) }}"
+      loop:
+        - {case: empty, ports: "", bridge: true, executor: docker}
+        - {case: range, ports: 41000-41063, bridge: true, executor: docker}
+        - {case: exactly-8, ports: 41000-41007, bridge: true, executor: docker}
+        - {case: too-small, ports: 41000-41006, bridge: true, executor: docker}
+        - {case: one-port, ports: "41000", bridge: true, executor: docker}
+        - {case: reversed, ports: 41063-41000, bridge: true, executor: docker}
+        - {case: zero, ports: 0-100, bridge: true, executor: docker}
+        - {case: too-high, ports: 65530-65540, bridge: true, executor: docker}
+        - {case: malformed, ports: "41000:41063", bridge: true, executor: docker}
+        - {case: no-bridge, ports: 41000-41063, bridge: false, executor: docker}
+        - {case: vm, ports: 41000-41063, bridge: true, executor: vm}
+      loop_control:
+        label: "{{ item.case }}"
+      vars:
+        tinfirm_runner_host_sandbox_bridge_ports: "{{ item.ports }}"
+        tinfirm_runner_host_sandbox_bridge: "{{ item.bridge }}"
+        tinfirm_runner_host_executor: "{{ item.executor }}"
+
+    - name: Write what checks.yml takes
+      ansible.builtin.copy:
+        content: "{{ _bridge_ports | to_nice_json }}\n"
+        dest: "{{ render_dir }}/bridge-ports.json"
+        mode: "0644"
+
     - name: Render the control host's unit
       ansible.builtin.template:
         src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"

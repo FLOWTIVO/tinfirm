@@ -143,6 +143,12 @@ tinfirm_runner_host_egress_allow: []
 # is in every edition (ADR-0114): a Community server accepts such a host. The role runs the
 # Docker executor, so it keeps no ready VMs (`run --pool-max-ready`), which are paid.
 tinfirm_runner_host_sandbox_bridge: true
+# With the sandbox bridge, the ports from which each sandbox's bridge listener takes one, on the
+# sandbox network's gateway address (`run --sandbox-bridge-ports FROM-TO`, both included): what a
+# host firewall between the sandboxes and this host must admit. It must hold at least
+# tinfirm_runner_host_max_concurrent_runs ports, since a run that finds no free port fails.
+# Empty: the system picks each port from its range for local ports (net.ipv4.ip_local_port_range).
+tinfirm_runner_host_sandbox_bridge_ports: ""
 # A static Linux build of the runner host for the sandboxes (TINFIRM_RUNNER_BRIDGE_BINARY).
 # Empty: the installed binary itself.
 tinfirm_runner_host_bridge_binary: ""

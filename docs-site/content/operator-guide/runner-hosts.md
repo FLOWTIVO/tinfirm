@@ -156,6 +156,8 @@ Each run gets a container `tinfirm-run-<run id>` with these limits, which are fi
 
 It mounts the workspace at `/workspace`, the agent's home at `/home/agent` (kept per conversation, so that the next turn resumes the session), the conversation's files read-only at `/attachments`, an empty writable `/output`, and the agent's skills read-only. It never mounts a mirror, and a sandbox is never `--privileged`.
 
+**The sandbox bridge.** With `--sandbox-bridge`, each sandbox's bridge has a listener of its own on the sandbox network's gateway address, on a port the system picks, or one of `--sandbox-bridge-ports FROM-TO` (`TINFIRM_RUNNER_SANDBOX_BRIDGE_PORTS`) for a firewall ([Firewalls](#firewalls)). The range must hold a port for each run the host runs at once: a run that finds none free fails. Inside the sandbox, the bridge listens on 127.0.0.1 port 18761 for the git proxy and the platform tools, 18762 for the model proxy and 18763 for the egress proxy, and the host opens no listener for them. **An image must leave those three ports free:** a program of the image that holds one of them fails the run at its start, with an error that names the service and the port. A run's record (`runs/<run>.json` in the data directory, mode 0600) keeps its bridge's TLS identity, port and peer, so that a host that restarts takes the run back on the same port. A host with VMs, on sandbox nodes or a provider's, keeps one bridge port for all its VMs for now.
+
 ### Isolation
 
 By default a sandbox is a container under Docker's default runtime, runc, which shares the machine's kernel. `--sandbox-runtime <name>` picks another runtime that Docker knows. Every host with Docker reports the level of isolation `container`, since its credentials are on the machine that runs the sandboxes; the runtime changes what an escape must get through first:
@@ -216,7 +218,7 @@ Loopback and link-local addresses, cloud metadata among them, are always refused
 
 A run paid by a budget gets the address of the server's model relay and a token for that run alone. The host never puts that token into the sandbox: it starts a listener for the run that holds it, and the agent gets the listener's address and a dummy key. The listener forwards only the model API's paths, adds the token and the host's own token, and refuses everything else. This is always on in every runner host that speaks runner protocol 2, so the server sends runs paid by a budget to any of them. `--model-proxy` is a former option that does nothing; remove it from service files.
 
-The listeners bind the address of the host's git proxy, each on a port the system picks:
+With `--sandbox-bridge` the host opens no listener for it: the sandbox reaches it through its bridge ([The sandbox](#the-sandbox)). Without the bridge, the listeners bind the address of the host's git proxy, each on a port the system picks:
 
 | Setup | Listeners on | Sandboxes connect to |
 |---|---|---|
@@ -292,6 +294,7 @@ Mirrors in use are never deleted; the others are garbage-collected when due. `mi
 ## Firewalls
 
 - **Inbound:** a host needs no inbound port.
-- **From the sandboxes:** they reach the host's git proxy, its platform tools and, for runs paid by a budget, the model proxy's listeners on the gateway address of the sandbox network, the latter on ports the system picks. With ufw or firewalld, allow traffic from `docker0` (and `tinfirm-sandbox-egress` with the egress proxy) to that address on every port. A rule for one fixed port leaves the model proxy closed, and runs paid by a budget fail.
+- **From the sandboxes, with `--sandbox-bridge`:** they reach only their bridges' ports on the gateway address of the sandbox network; the git proxy, the platform tools, the model proxy and the egress proxy come through the bridge and need no rule. With ufw or firewalld, allow TCP from `docker0` (and `tinfirm-sandbox-egress` with the egress proxy) to that address on the range of `--sandbox-bridge-ports`, or, without it, on the system's range for local ports (`net.ipv4.ip_local_port_range`). During the first start after an upgrade from a release with one shared bridge port, that port (kept in `runs/bridge.json` in the data directory) is opened once more while the runs of the release before are taken back: keep it allowed until they have ended.
+- **From the sandboxes, without the bridge:** they reach the host's git proxy, its platform tools and, for runs paid by a budget, the model proxy's listeners on the gateway address of the sandbox network, the latter on ports the system picks. Allow traffic from those networks to that address on every port. A rule for one fixed port leaves the model proxy closed, and runs paid by a budget fail.
 - **Other services of the machine**, such as SSH or a metrics exporter, answer a sandbox when they listen on all interfaces. Bind them to other interfaces, or drop input from the sandbox bridges except for the runner host's own listeners.
 - **Outbound:** the server's public URL over https, the git hosts of the company's repositories, and, for building images, Docker Hub and the package registries, or your mirrors of them ([Image build arguments](../reference/runner-host.md#image-build-arguments)).

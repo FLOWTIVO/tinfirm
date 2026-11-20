@@ -106,3 +106,16 @@ _tinfirm_runner_host_images_build_argv: >-
   {{ [tinfirm_runner_host_binary_path, 'images', 'build', '--runtime', tinfirm_runner_host_images_runtime]
      + (tinfirm_runner_host_images_build_args.items() | map('join', '=')
         | map('regex_replace', '^', '--build-arg=') | list) }}
+
+# tinfirm_runner_host_sandbox_bridge_ports as checks.yml takes it: empty, or FROM-TO (or one
+# port) from 1 to 65535 with a port for every run at once, on a Docker host with the sandbox
+# bridge (`run --sandbox-bridge-ports`, as bridge.rs `parse_port_range` reads it).
+_tinfirm_runner_host_bridge_ports_ok: >-
+  {%- set r = tinfirm_runner_host_sandbox_bridge_ports | string | trim -%}
+  {%- if r | length == 0 -%}{{ true }}
+  {%- elif not (r is match('^[0-9]{1,5}(-[0-9]{1,5})?$')) -%}{{ false }}
+  {%- else -%}
+  {%-   set from = r.split('-') | first | int -%}{%- set to = r.split('-') | last | int -%}
+  {{ (tinfirm_runner_host_sandbox_bridge | bool) and not (_tinfirm_runner_host_vm | bool)
+     and 1 <= from <= to <= 65535 and (to - from + 1) >= (tinfirm_runner_host_max_concurrent_runs | int) }}
+  {%- endif -%}

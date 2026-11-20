@@ -119,6 +119,7 @@ The main ones:
 | `tinfirm_runner_host_egress_proxy` | `true` | `run --egress-proxy`: the sandboxes reach only the model, the mirrors of the sandbox settings and `tinfirm_runner_host_egress_allow` (ADR-0044). `false` is open egress (R24) |
 | `tinfirm_runner_host_egress_allow` | `[]` | `run --egress-allow`, one per entry |
 | `tinfirm_runner_host_sandbox_bridge` | `true` | `run --sandbox-bridge` (ADR-0095): the host's listeners on loopback, the run's credentials out of the container's settings. Needs a static build of the runner host (the release archives are), else `tinfirm_runner_host_bridge_binary`. `false` puts the listeners on Docker's bridge (R28) |
+| `tinfirm_runner_host_sandbox_bridge_ports` | empty | `run --sandbox-bridge-ports FROM-TO`, with the sandbox bridge only: the ports from which each sandbox's bridge listener takes one, on the sandbox network's gateway address, for a host firewall (below). At least `tinfirm_runner_host_max_concurrent_runs` ports: a run that finds none free fails. Empty: the system picks each port from `net.ipv4.ip_local_port_range` |
 | `tinfirm_runner_host_public_key` | `cosign.pub` (the role's `files/`) | The key the release's `SHA256SUMS.sig` must verify against before any checksum in `SHA256SUMS` is trusted (with `openssl`, as auto-deploy does): FLOWTIVO's release key, a copy of `deploy/compose/auto-deploy/cosign.pub`. For `rolling`, the rolling key `deploy/compose/auto-deploy/cosign-rolling.pub` |
 | `tinfirm_runner_host_release_url` | the archive's directory | Where the release's `SHA256SUMS` and `SHA256SUMS.sig` are |
 | `tinfirm_runner_host_allow_unsigned` | `false` | `true` installs a release whose `SHA256SUMS.sig` is missing (404) against `tinfirm_runner_host_binary_checksum`, with a warning; a signature that does not verify is refused even then |
@@ -139,8 +140,8 @@ The main ones:
   sandbox network's gateway address, which is an address of the VM: SSH on port 22 answers from
   a sandbox there. Bind other services to specific interfaces, or drop input from the
   sandbox bridge (`tinfirm-sandbox-egress`) in the host firewall except for the runner host's own
-  listeners; the egress listeners' ports are chosen by the system, so a rule needs a fixed range
-  first (a possible follow-up). The role does not set such a rule.
+  listeners: with the sandbox bridge, those are the sandboxes' bridge ports alone (below). The
+  role does not set such a rule.
 - **uid 1990, not 1000.** The sandbox runs the agent as uid 1000. With the sandbox bridge the
   workspaces and homes travel over the bridge, so the runner host's user needs no uid of the
   sandbox's, and the role creates `tinfirm` with uid 1990: a file the agent leaves is never
@@ -172,14 +173,25 @@ The main ones:
 - **The Kata configuration** is `/etc/kata-containers/configuration.toml`, copied from Cloud
   Hypervisor's configuration when Kata is installed or upgraded. Change it with
   `tinfirm_runner_host_kata_config_lines` (for example `default_memory`), not by hand.
-- **Firewalls.** The sandboxes reach the runner host's git proxy and platform tools on the
-  gateway of Docker's bridge (runner/README.md, "Git in the sandbox"); a run paid by a budget
-  also reaches its model proxy, which is always on, on a port of the same address that the
-  system picks (runner/README.md, "Model proxy"). With ufw or firewalld, allow traffic from
-  `docker0` to the bridge's gateway address on every port: a rule for the git proxy's port
-  alone (fixed with `TINFIRM_RUNNER_GIT_PROXY_BIND` in the unit) leaves the model proxy's
-  ports closed, and runs paid by a budget fail. Bind this machine's other services to other
-  interfaces, so that the sandboxes do not reach them (ADR-0044).
+- **Firewalls.** With the sandbox bridge (the default), each sandbox's bridge listens on a port
+  of its own on the sandbox network's gateway address, and the sandbox reaches the git proxy and
+  tools, its model proxy and the egress proxy only through tunnels inside that bridge: the
+  proxies need no rule. A host firewall (ufw, firewalld) between the sandbox network and that
+  address must admit TCP to the bridge ports: set `tinfirm_runner_host_sandbox_bridge_ports`
+  to a range of at least `tinfirm_runner_host_max_concurrent_runs` ports and admit that range,
+  or, without it, the system's local port range (`net.ipv4.ip_local_port_range`). During the
+  first start after an upgrade from a version with one shared bridge port, that port (kept in
+  `runs/bridge.json` under the data directory) is opened once more, only while the runs of the
+  version before are taken back: keep it admitted until then. Without the bridge
+  (`tinfirm_runner_host_sandbox_bridge: false`) the sandboxes reach the git proxy and the model
+  proxies on the gateway of Docker's bridge, on ports the system picks: allow traffic from
+  `docker0` to that address on every port (runner/README.md, "Git in the sandbox", "Model
+  proxy"). Bind this machine's other services to other interfaces, so that the sandboxes do not
+  reach them (ADR-0044).
+- **Ports an image leaves free.** With the sandbox bridge, the bridge listens inside each
+  sandbox on 127.0.0.1 ports 18761 (git proxy and tools), 18762 (model proxy) and 18763 (egress
+  proxy). A program of a sandbox image that holds one of them fails the run at its start, with
+  an error that names the service and the port.
 - **Smoke test.** With `tinfirm_runner_host_kata_smoke_test_image` set (an image this VM can
   pull, such as a mirrored `alpine`), the role runs `uname -r` in it under Kata and checks
   that the kernel differs from the VM's.

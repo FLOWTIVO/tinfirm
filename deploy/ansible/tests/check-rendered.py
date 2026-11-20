@@ -300,6 +300,24 @@ def hardening(out):
     check(set(MASTER_LINES) <= set(derived["mark_lines"]), "hardening: the lines of the master switch are named")
 
 
+def bridge_ports(out):
+    """`run --sandbox-bridge-ports` in the Docker host's unit, and what checks.yml takes of the
+    role's variable (runner/crates/tinfirm-runner-host/src/bridge.rs, `parse_port_range`)."""
+    default = unit_lines((out / "tinfirm-runner-host.docker.service").read_text())
+    ports = unit_lines((out / "tinfirm-runner-host.docker-ports.service").read_text())
+    nobridge = unit_lines((out / "tinfirm-runner-host.docker-nobridge.service").read_text())
+    exec_ports = next(line for line in ports.splitlines() if line.startswith("ExecStart="))
+    check("--sandbox-bridge-ports" not in default, "docker unit: no --sandbox-bridge-ports by default (the system picks)")
+    check("--sandbox-bridge --sandbox-bridge-ports \"41000-41063\"" in exec_ports,
+          "docker unit: --sandbox-bridge-ports with the range, after --sandbox-bridge")
+    check("--sandbox-bridge" not in nobridge, "docker unit without the bridge: neither --sandbox-bridge nor its ports")
+    judged = json.loads((out / "bridge-ports.json").read_text())
+    wanted = {"empty": True, "range": True, "exactly-8": True, "too-small": False, "one-port": False,
+              "reversed": False, "zero": False, "too-high": False, "malformed": False, "no-bridge": False, "vm": False}
+    for case, ok in wanted.items():
+        check(judged.get(case) is ok, f"bridge ports {case}: {'taken' if ok else 'refused'} by checks.yml")
+
+
 def nft_check(path):
     nft = shutil.which("nft")
     if not nft:
@@ -347,6 +365,7 @@ def main():
     dropin = (out / "listener-control-host.conf").read_text()
     check("\n[Service]\nIPAddressAllow=10.0.0.5\n" in dropin, "listener's drop-in: IPAddressAllow the control host")
     units((out / "tinfirm-runner-host.docker.service").read_text(), (out / "tinfirm-runner-host.vm.service").read_text())
+    bridge_ports(out)
     for name in ("firewall.nft", "firewall-one-vm-static.nft"):
         nft_check(out / name)
     print(f"\n{len(failures)} failed" if failures else "\nall passed")
