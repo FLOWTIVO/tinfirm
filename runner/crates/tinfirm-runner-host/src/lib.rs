@@ -3,8 +3,8 @@
 //!
 //! The modules here are MIT. The binary also compiles in the paid modules of
 //! `ee/runner/tinfirm-runner-host/src` (the Tinfirm Enterprise licence, ADR-0100, ADR-0114):
-//! DigitalOcean's VM driver ([`digitalocean`]), ready VMs ([`ready_vms`]) and session bundles
-//! ([`session_bundles`]).
+//! DigitalOcean's VM driver ([`digitalocean`]), the Kubernetes API client of the pod driver
+//! ([`kubernetes`]), ready VMs ([`ready_vms`]) and session bundles ([`session_bundles`]).
 
 pub mod acp;
 pub mod attachments;
@@ -28,6 +28,8 @@ pub mod homes;
 pub mod host;
 pub mod images;
 pub mod isolation;
+#[path = "../../../../ee/runner/tinfirm-runner-host/src/kubernetes/mod.rs"]
+pub mod kubernetes;
 pub mod limits;
 pub mod maintenance;
 pub mod mapper;
