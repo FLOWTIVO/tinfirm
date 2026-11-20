@@ -285,7 +285,8 @@ mod tests {
     use super::*;
     use base64::Engine;
 
-    const TOKEN: &str = "ghs_TESTONLYabcdefghijklmnopqrstuvwxyz0123";
+    // Underscores keep these made-up tokens out of the shape that secret scanners look for.
+    const TOKEN: &str = "ghs_TEST_ONLY_abcdefghijklmnopqrstuvwxyz0123";
 
     #[test]
     fn a_token_is_found_in_every_form_the_redactor_matches_and_never_stored_in_any() {
@@ -325,14 +326,14 @@ mod tests {
         assert!(matcher.contains(header.expose().as_bytes()));
         println!("forms of one token: {}", hashes.forms.len());
         // Another token, or one character off, is not found.
-        assert!(!matcher.contains(b"ghs_TESTONLYabcdefghijklmnopqrstuvwxyz0124"));
+        assert!(!matcher.contains(b"ghs_TEST_ONLY_abcdefghijklmnopqrstuvwxyz0124"));
         assert!(!matcher.contains(b""));
         // A record read back keeps the salt and finds the same.
         let read: SecretHashes = serde_json::from_str(&stored).unwrap();
         assert!(HashedMatcher::new(&read).unwrap().contains(raw.as_bytes()));
         // Another salt, another record: its hashes find nothing of this one's.
         let mut other = SecretHashes::new();
-        other.add("ghs_TESTONLYanotherrecordstoken0123456789");
+        other.add("ghs_TEST_ONLY_another_records_token_0123");
         assert_ne!(other.salt, hashes.salt);
         assert!(!HashedMatcher::new(&other).unwrap().contains(raw.as_bytes()));
     }
