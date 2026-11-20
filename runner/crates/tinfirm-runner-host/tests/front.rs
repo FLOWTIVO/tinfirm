@@ -316,6 +316,11 @@ fn hostile_front_child() {
             let _ = next_message_init(&socket);
             std::process::exit(0);
         }
+        "deaf" => {
+            // Ready, and then it never reads its channel.
+            let _ = out.write_all(&frame(&ready()));
+            std::thread::sleep(Duration::from_secs(60));
+        }
         "mute" => {
             let _ = out.write_all(&frame(&ready()));
             while next_ping().is_some() {}
@@ -612,6 +617,42 @@ async fn a_front_that_does_not_answer_is_ended_and_leaves_no_request_waiting() {
     assert!(handle.ping().await.is_err());
     assert!(handle.check_descriptor().await.is_err());
     assert_eq!(handle.waiting(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_front_that_stops_reading_its_channel_is_ended_and_blocks_no_send() {
+    let mut handle = FrontHandle::spawn(&hostile_front("deaf", &[]), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    handle.set_send_timeout(Duration::from_millis(500));
+    let handle = std::sync::Arc::new(handle);
+    // Messages without an answer to wait for, until the channel's buffer is full.
+    let started = std::time::Instant::now();
+    let mut error = None;
+    for id in 1..1_000_000u64 {
+        if let Err(e) = handle.send(&ToFront::Ping { id }, None).await {
+            error = Some(format!("{e:#}"));
+            break;
+        }
+    }
+    let error = error.expect("the channel never filled");
+    assert!(error.contains("did not take a message"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(10), handle.wait_ended())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&ended, Ended::Broken(why) if why.contains("did not take a message")),
+        "{ended:?}"
+    );
+    // Nothing waits behind it: a later send fails at once.
+    let later = std::time::Instant::now();
+    assert!(handle.send(&ToFront::Ping { id: 0 }, None).await.is_err());
+    assert!(later.elapsed() < Duration::from_secs(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

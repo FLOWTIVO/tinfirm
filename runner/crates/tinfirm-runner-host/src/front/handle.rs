@@ -12,6 +12,13 @@
 //! exit status and the start of what it wrote on stderr. A front that does not answer within
 //! its time is ended too, and so is one whose channel ends inside a frame.
 //!
+//! Where back-pressure is right and where a deadline is: the control channel carries small
+//! messages only, so a message that cannot be written within [`SEND_TIMEOUT`] (the wait for
+//! the channel's lock included) ends the front as a broken wire: it does not read, so it is
+//! stuck or hostile. A sandbox's bytes (tunnels, request and answer bodies, the bridge's
+//! streams in later slices) never go on this channel: each goes on a descriptor of its own,
+//! where a front that reads slowly, because its sandbox is slow, only slows that stream down.
+//!
 //! Its process group is signalled only while the front is not yet reaped: every signal, and
 //! the step that reaps the front, happen under one lock, which the reaping step clears, so a
 //! group id that the system gave to another process since is never signalled. The reader always runs to the end and reaps the front, also after the
@@ -40,6 +47,10 @@ use super::wire::{self, MAX_TO_FRONT, MAX_TO_MAIN, ToFront, ToMain};
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a round trip or a check may take.
 pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a message to the front may take to be written, the wait for the channel's lock
+/// included: the control channel carries small messages only, so a front that does not take
+/// one within this time is stuck or hostile.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How much of a front's stderr is kept for its end.
 const STDERR_KEPT: usize = 4 * 1024;
 
@@ -144,6 +155,7 @@ pub struct FrontHandle {
     ended: watch::Receiver<Option<Ended>>,
     life: Arc<Life>,
     answer_timeout: Duration,
+    send_timeout: Duration,
 }
 
 impl std::fmt::Debug for FrontHandle {
@@ -246,6 +258,7 @@ impl FrontHandle {
             ended,
             life,
             answer_timeout: ANSWER_TIMEOUT,
+            send_timeout: SEND_TIMEOUT,
         };
         handle.send(&ToFront::Init { run: run_id }, None).await?;
         Ok(handle)
@@ -264,6 +277,11 @@ impl FrontHandle {
     /// How long a round trip or a check may take from now on (tests shorten it).
     pub fn set_answer_timeout(&mut self, timeout: Duration) {
         self.answer_timeout = timeout;
+    }
+
+    /// How long a message may take to be written from now on (tests shorten it).
+    pub fn set_send_timeout(&mut self, timeout: Duration) {
+        self.send_timeout = timeout;
     }
 
     /// The process group that the handle would still signal: `None` once the front is reaped.
@@ -304,18 +322,33 @@ impl FrontHandle {
             bail!("{ended}");
         }
         let frame = wire::encode(message, MAX_TO_FRONT)?;
-        let mut writer = self.writer.lock().await;
-        let stream: &UnixStream = (*writer).as_ref();
-        let written = stream
-            .async_io(Interest::WRITABLE, || {
-                wire::send_with(stream.as_fd(), &frame, descriptor.as_ref())
-            })
-            .await
-            .context("cannot write to the front")?;
-        writer
-            .write_all(&frame[written..])
-            .await
-            .context("cannot write to the front")?;
+        let write = async {
+            let mut writer = self.writer.lock().await;
+            let stream: &UnixStream = (*writer).as_ref();
+            let written = stream
+                .async_io(Interest::WRITABLE, || {
+                    wire::send_with(stream.as_fd(), &frame, descriptor.as_ref())
+                })
+                .await
+                .context("cannot write to the front")?;
+            writer
+                .write_all(&frame[written..])
+                .await
+                .context("cannot write to the front")
+        };
+        match tokio::time::timeout(self.send_timeout, write).await {
+            Ok(written) => written?,
+            Err(_) => {
+                // A front that does not read its channel: back-pressure is for the streams of
+                // a sandbox's bytes, each on its own descriptor, never for this channel.
+                let why = format!(
+                    "the front did not take a message within {:?}",
+                    self.send_timeout
+                );
+                self.life.break_wire(why.clone());
+                bail!("{why}");
+            }
+        }
         // The descriptor is the front's now; `run`'s copy goes.
         drop(descriptor);
         Ok(())
@@ -496,7 +529,9 @@ async fn read_loop(
     let status = reap(&life, &mut child, true).await;
     // Its stderr is read to its end, or the group's kill ended it.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let broken = broken.or_else(|| lock(&life.broken).take());
+    // When `run` ended the front, its reason is the one to report: what the read saw after
+    // the kill (a reset of the channel) follows from it.
+    let broken = lock(&life.broken).take().or(broken);
     let how = match broken {
         Some(why) => Ended::Broken(why),
         None => {

@@ -806,7 +806,10 @@ not run by hand; `reader.rs`, `confine.rs`).
     sends anything else (a frame over its bound, bytes that are not one of the messages, a
     second `ready`, an answer to nothing `run` asked) is ended at once, its process group
     killed, and only its own handle says why; every other front goes on. So is a channel that
-    ends inside a frame, and a front that does not answer a request within 10 s. A front that is
+    ends inside a frame, a front that does not answer a request within 10 s, and one that does
+    not take a message of `run`'s within 10 s: the channel carries small messages only, so a
+    front that stops reading it is stuck or hostile. A sandbox's own bytes never go on this
+    channel but each on a descriptor of its own, where a slow sandbox only slows its stream. A front that is
     not ready within 10 s, or exits, is reported with its exit status and the start of its
     stderr. A front's process group is signalled only until the front is reaped, under one lock
     with the reaping, so a group id given to another process since is never signalled; the host
