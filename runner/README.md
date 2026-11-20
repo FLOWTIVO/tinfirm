@@ -731,6 +731,16 @@ not run by hand; `reader.rs`, `confine.rs`).
   failure where `run` would refuse (`TINFIRM_RUNNER_SANDBOX_BRIDGE` or `TINFIRM_RUNNER_EXECUTOR=vm`
   set, without `TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), a warning where the flag accepts it, and
   a note where the bridge is off. `host memory` says whether `run` can make itself not dumpable.
+- **The front process (being built).** Path C's second part moves the rest of what `run` parses
+  from a sandbox (the bridge's TLS, frames and tunnels, and the HTTP of the proxies and the
+  platform tools) into a confined process per sandbox, the front, which holds that sandbox's own
+  powers and no credential. `run` does not start it yet. What exists is its confinement, which it
+  applies to itself before it builds its runtime: limits of 512 MiB of data, 1024 descriptors and
+  no core file; not dumpable; Landlock with no directory at all (only `/dev/null` and
+  `/dev/urandom`); and the reader's seccomp filter, with on top of it no `execve`, no new process
+  (threads only), no `connect`, `bind` or `listen`, and no signal outside its own process group,
+  the signal 0 included. A pair of Unix sockets stays allowed, which reaches no other process.
+  `doctor` starts one and says `front: confined: …`, or why not, as a note.
 
 ## A VM per run
 

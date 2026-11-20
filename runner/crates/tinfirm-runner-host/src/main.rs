@@ -168,6 +168,15 @@ enum Command {
         #[arg(long)]
         bridge: Option<PathBuf>,
     },
+    /// The front process of a sandbox (ADR-0112, path C): confined, it is to parse what the
+    /// sandbox sends in `run`'s place. This version runs only its probe (`doctor`); it is not
+    /// run by hand.
+    #[command(hide = true)]
+    Front {
+        /// Confine as a front does, try what a front must be refused, and answer on stdout.
+        #[arg(long, allow_hyphen_values = true)]
+        probe: Option<String>,
+    },
     /// The reader of what a sandbox sends back (ADR-0112, open question 1): `run` starts one
     /// for each archive and git bundle of a run, with no credential, confined to that run's
     /// directories, and reads its answer on stdout; it is not run by hand.
@@ -762,6 +771,10 @@ fn main() -> ExitCode {
     if let Command::Reader { job } = &cli.command {
         return tinfirm_runner_host::reader::child_main(job);
     }
+    // So does a front.
+    if let Command::Front { probe } = &cli.command {
+        return tinfirm_runner_host::front::child_main(probe.as_deref());
+    }
     init_tracing(&cli.log);
     if matches!(cli.command, Command::Bridge) {
         return bridge();
@@ -940,7 +953,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Bridge => bail!("`bridge` runs in a sandbox, started by `run --sandbox-bridge`"),
-        Command::VmDriver { .. } | Command::VmBoot { .. } | Command::Reader { .. } => {
+        Command::VmDriver { .. }
+        | Command::VmBoot { .. }
+        | Command::Reader { .. }
+        | Command::Front { .. } => {
             unreachable!("handled before the dispatch")
         }
     }
@@ -1467,6 +1483,7 @@ async fn doctor(paths: &Paths) -> Result<()> {
     doctor_isolation(&mut checks);
     // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1).
     doctor_reader(&mut checks, paths).await;
+    doctor_front(&mut checks, paths).await;
     // git.
     match git::git_version().await {
         Some(v) => checks.ok("git", v),
@@ -2266,6 +2283,42 @@ async fn probe_reader(
     .await
     .context("the reader's probe did not end")?
     .context("the reader's probe failed")
+}
+
+/// What `doctor` says of the front process of a sandbox (ADR-0112, path C, part 2), which
+/// `run` does not start yet: a front confines itself and tries to open this host's
+/// directories and memory, to make a socket, to reach this process and to start a program.
+async fn doctor_front(checks: &mut Checks, paths: &Paths) {
+    let job = tinfirm_runner_host::front::ProbeJob {
+        deny_read: vec![
+            paths.config_dir.clone(),
+            paths.data_dir.clone(),
+            PathBuf::from(format!("/proc/{}/mem", std::process::id())),
+        ],
+        signal: vec![std::process::id()],
+        linger: false,
+    };
+    let probe = match std::env::current_exe() {
+        Ok(binary) => tokio::task::spawn_blocking(move || {
+            tinfirm_runner_host::front::probe(&binary, &job, std::time::Duration::from_secs(30))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|probe| probe),
+        Err(e) => Err(anyhow::Error::from(e)),
+    };
+    const UNUSED: &str = "the front process of a sandbox; `run` does not start it yet";
+    match probe {
+        Ok(probe) if probe.confined() => checks.ok(
+            "front",
+            format!("confined: {} ({UNUSED})", probe.describe()),
+        ),
+        Ok(probe) => checks.info(
+            "front",
+            format!("cannot be confined here: {} ({UNUSED})", probe.describe()),
+        ),
+        Err(e) => checks.info("front", format!("{e:#} ({UNUSED})")),
+    }
 }
 
 /// What `doctor` says of the reader (ADR-0112, open question 1) and of this process's memory.

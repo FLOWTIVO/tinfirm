@@ -49,7 +49,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// What a reader may touch.
+/// What a reader or a front may touch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     /// Read beneath, and nothing else.
@@ -58,6 +58,33 @@ pub struct Plan {
     pub write: Vec<PathBuf>,
     /// The job runs git, so the system's directories may be read and executed.
     pub git: bool,
+    /// Which seccomp filter applies.
+    pub profile: Profile,
+}
+
+/// The kind of process that confines itself, which decides its seccomp filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// A reader ([`crate::reader`]): it runs git, which starts processes of its own.
+    #[default]
+    Reader,
+    /// A sandbox's front process ([`crate::front`]): long-lived, it starts nothing and makes no
+    /// connection. On top of the reader's filter it is refused `execve` and `execveat`, `fork`
+    /// and `vfork`, `clone` without `CLONE_THREAD` (threads still start), `connect`, `bind` and
+    /// `listen`, and every signal outside its own process group, the signal 0 (a check that a
+    /// process exists) included. `socketpair` stays: tokio's signal driver makes one, and a pair
+    /// of Unix sockets reaches no other process. Its plan reads and writes nothing.
+    Front,
+}
+
+impl Plan {
+    /// A front's plan: no directory at all, so only `/dev/null` and `/dev/urandom`.
+    pub fn front() -> Plan {
+        Plan {
+            profile: Profile::Front,
+            ..Plan::default()
+        }
+    }
 }
 
 /// How far a reader is confined, as it found when it confined itself.
@@ -240,7 +267,7 @@ pub fn confine(plan: &Plan) -> Status {
             (0, false, false, false, false)
         }
     };
-    let seccomp = match seccomp::apply() {
+    let seccomp = match seccomp::apply(plan.profile) {
         Ok(()) => true,
         Err(e) => {
             problem.get_or_insert(format!("no seccomp filter: {e}"));
@@ -357,6 +384,8 @@ pub fn kill_group(pgid: u32) {
 ))]
 mod seccomp {
     use std::collections::BTreeMap;
+
+    use super::Profile;
 
     use seccompiler::{
         BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -493,49 +522,49 @@ mod seccomp {
         rules: &mut BTreeMap<i64, Vec<SeccompRule>>,
         own: i32,
         group: i32,
+        profile: Profile,
     ) -> Result<(), seccompiler::Error> {
         use SeccompCmpOp::Ne;
-        let not_a_check = |index: u8| arg(index, Ne, 0);
-        // kill(pid, sig)
+        // A reader may check that any process exists (signal 0): git does, for its locks. A
+        // front never needs to, so its rules leave that exception out.
+        let rule = |mut conditions: Vec<SeccompCondition>,
+                    sig: u8|
+         -> Result<SeccompRule, seccompiler::Error> {
+            if profile == Profile::Reader {
+                conditions.push(arg(sig, Ne, 0)?);
+            }
+            Ok(SeccompRule::new(conditions)?)
+        };
+        // kill(pid, sig): only to its own group (0, -group) or itself.
         rules.insert(
             libc::SYS_kill,
-            vec![SeccompRule::new(vec![
-                arg(0, Ne, 0)?,
-                arg(0, Ne, dword(-group))?,
-                arg(0, Ne, dword(own))?,
-                not_a_check(1)?,
-            ])?],
+            vec![rule(
+                vec![
+                    arg(0, Ne, 0)?,
+                    arg(0, Ne, dword(-group))?,
+                    arg(0, Ne, dword(own))?,
+                ],
+                1,
+            )?],
         );
-        // tkill(tid, sig): the reader's main thread only.
+        // tkill(tid, sig): its main thread only.
         rules.insert(
             libc::SYS_tkill,
-            vec![SeccompRule::new(vec![
-                arg(0, Ne, dword(own))?,
-                not_a_check(1)?,
-            ])?],
+            vec![rule(vec![arg(0, Ne, dword(own))?], 1)?],
         );
-        // tgkill(tgid, tid, sig): a thread of the reader only.
+        // tgkill(tgid, tid, sig), rt_sigqueueinfo(tgid, sig, info),
+        // rt_tgsigqueueinfo(tgid, tid, sig, info): its own threads only.
         rules.insert(
             libc::SYS_tgkill,
-            vec![SeccompRule::new(vec![
-                arg(0, Ne, dword(own))?,
-                not_a_check(2)?,
-            ])?],
+            vec![rule(vec![arg(0, Ne, dword(own))?], 2)?],
         );
-        // rt_sigqueueinfo(tgid, sig, info), rt_tgsigqueueinfo(tgid, tid, sig, info).
         rules.insert(
             libc::SYS_rt_sigqueueinfo,
-            vec![SeccompRule::new(vec![
-                arg(0, Ne, dword(own))?,
-                not_a_check(1)?,
-            ])?],
+            vec![rule(vec![arg(0, Ne, dword(own))?], 1)?],
         );
         rules.insert(
             libc::SYS_rt_tgsigqueueinfo,
-            vec![SeccompRule::new(vec![
-                arg(0, Ne, dword(own))?,
-                not_a_check(2)?,
-            ])?],
+            vec![rule(vec![arg(0, Ne, dword(own))?], 2)?],
         );
         for &call in OTHERS_DENIED {
             rules.insert(call, Vec::new());
@@ -566,14 +595,34 @@ mod seccomp {
         Ok(())
     }
 
+    /// Refused to a front whatever their arguments: it runs no program and makes no connection
+    /// or listener of its own (`run` hands it the descriptors it needs).
+    const FRONT_DENIED: &[i64] = &[
+        libc::SYS_execve,
+        libc::SYS_execveat,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_fork,
+        #[cfg(target_arch = "x86_64")]
+        libc::SYS_vfork,
+    ];
+
     fn filters(
         arch: TargetArch,
         own: i32,
         group: i32,
+        profile: Profile,
     ) -> Result<(BpfProgram, BpfProgram), seccompiler::Error> {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
             DENIED.iter().map(|&call| (call, Vec::new())).collect();
-        signal_rules(&mut rules, own, group)?;
+        signal_rules(&mut rules, own, group, profile)?;
+        if profile == Profile::Front {
+            for &call in FRONT_DENIED {
+                rules.insert(call, Vec::new());
+            }
+        }
         let mut clone = Vec::new();
         for &flag in NAMESPACES {
             let flag = u64::from(flag as u32);
@@ -582,6 +631,16 @@ mod seccomp {
                 SeccompCmpArgLen::Qword,
                 SeccompCmpOp::MaskedEq(flag),
                 flag,
+            )?])?);
+        }
+        if profile == Profile::Front {
+            // A new process, not a thread: no CLONE_THREAD in the flags.
+            let thread = u64::from(libc::CLONE_THREAD as u32);
+            clone.push(SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Qword,
+                SeccompCmpOp::MaskedEq(thread),
+                0,
             )?])?);
         }
         rules.insert(libc::SYS_clone, clone);
@@ -613,11 +672,11 @@ mod seccomp {
         Ok((denied, clone3))
     }
 
-    pub fn apply() -> Result<(), String> {
+    pub fn apply(profile: Profile) -> Result<(), String> {
         let arch = ARCH.ok_or("this architecture has no seccomp filter of Tinfirm's")?;
         let own = rustix::process::getpid().as_raw_nonzero().get();
         let group = rustix::process::getpgrp().as_raw_nonzero().get();
-        let (denied, clone3) = filters(arch, own, group).map_err(|e| e.to_string())?;
+        let (denied, clone3) = filters(arch, own, group, profile).map_err(|e| e.to_string())?;
         seccompiler::apply_filter(&denied).map_err(|e| e.to_string())?;
         seccompiler::apply_filter(&clone3).map_err(|e| e.to_string())
     }
@@ -630,8 +689,10 @@ mod seccomp {
         fn the_filters_compile_for_this_architecture() {
             assert!(ARCH.is_some());
             if let Some(arch) = ARCH {
-                let (denied, clone3) = filters(arch, 4242, 4242).unwrap();
-                assert!(!denied.is_empty() && !clone3.is_empty());
+                for profile in [Profile::Reader, Profile::Front] {
+                    let (denied, clone3) = filters(arch, 4242, 4242, profile).unwrap();
+                    assert!(!denied.is_empty() && !clone3.is_empty());
+                }
             }
         }
     }
@@ -643,7 +704,7 @@ mod seccomp {
     not(any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
 mod seccomp {
-    pub fn apply() -> Result<(), String> {
+    pub fn apply(_profile: super::Profile) -> Result<(), String> {
         Err("this architecture has no seccomp filter of Tinfirm's".into())
     }
 }

@@ -1413,6 +1413,12 @@ fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
         );
     }
     let report = doctor(&[]);
+    // The front, which `run` does not start yet, is a note either way.
+    assert!(
+        report.contains("[info] front: cannot be confined here")
+            && report.contains("`run` does not start it yet"),
+        "{report}"
+    );
     assert!(
         report.contains("[info] reader: cannot be confined here")
             && report.contains("only used with --sandbox-bridge or --executor vm"),
