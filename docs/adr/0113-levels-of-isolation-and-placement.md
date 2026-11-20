@@ -94,6 +94,14 @@
    - On a sandbox node, no other service: no Docker, no SSH for anything but the operator's own access path, no setuid program that a VMM's user can run. The agent's helper is the only root process of Tinfirm's, with no socket in any chroot and none in a VM's network namespace. On a single machine the runner host is there too, as a user of its own.
    - **A node image is the recommended form:** an image with a read-only, verified root file system that the operator boots nodes from and replaces to upgrade, with nodes re-imaged on a schedule. Then nothing an attacker changed on a node outlasts a reboot, and every node is the image that was tested. A hardened standard distribution is the requirement; the image is what Tinfirm recommends and publishes later (planned).
 
+   How the mark is checked (the owner, 2026-11-20):
+
+   - **The helper checks each line where a program can.** Three lines cannot be checked as written, and the mark requires narrower facts for them, on the stricter side:
+     - "The distribution's hardening on": a fixed set of kernel settings: kernel pointers, the kernel's log and performance events closed to users, address randomisation on, and protected links.
+     - "No other service": no Docker, containerd or podman socket, no setuid or setgid program that a VMM's user can run, and no listening socket on an address other than loopback beyond the agent's port and SSH.
+     - "The kernel patched": a maximum uptime, after which a node that was neither re-imaged nor rebooted reports `no`. The helper also shows the kernel's release and the boot time. Whether the kernel is patched stays the operator's duty: a node has no way out to fetch updates, and is patched with a new image.
+   - **A line that stops holding lowers the mark and stops nothing.** The host then reports `no`, the server records the change in the audit log (`runner_host.isolation_changed`), and the node keeps taking VMs: no host is refused for its hardening.
+
    Where the list does not fit:
 
    - **A machine with Docker for containers.** User-namespace remapping and rootless Docker, which ADR-0006 planned for containers, need user namespaces. A hardened machine has none, so the two do not go together on one machine.
@@ -125,7 +133,7 @@
 
 ## The owner's decisions so far
 
-Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 where the date says so.
+Decided by the owner, 2026-11-11 to 2026-11-14, and later where a date says so.
 
 - The levels are named `machine`, `vm-jail` and `container` (decision 1).
 - No isolation is required of an agent or a company. An agent's isolation is automatic, the strongest its company's hosts offer, and can be chosen per agent where the company has more than one kind (decision 4).
@@ -133,10 +141,12 @@ Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 where the date
 - The node's operating system: a hardened standard distribution is required, a node image recommended (decision 5).
 - The server and its hosts take the release together, with no reading of the old values of `hello.isolationTiers`. The draft proposed otherwise; the owner kept the decision on 2026-11-19, with the refusal of `microvm` alone, and amended ADR-0109 for this one change (decision 2).
 - 2026-11-19: one level per host (decision 2); a Kata host reports `container`, and a host with a driver of the operator's own and no statement too (decisions 2 and 3); only the company's hosts set the level, and no run waits for a personal host (decision 4); a run waits rather than go to a weaker host (decision 4); "from outside the company" is a live or paused trigger on a tracker, a chat channel or a webhook (decision 4); a cluster's worker with user namespaces reports `hardened: no` (decision 5).
+- 2026-11-20: how decision 5's mark is checked. The three lines that a program cannot check as written get narrower facts, with a maximum uptime and with no listening socket beyond the agent's port and SSH; a line that stops holding lowers the mark and stops no VM (decision 5).
 
 ## To specify and verify during the build
 
-- Decision 5's hardening: the role's settings, the agent helper's checks of each line, and the node image.
+- Decision 5's hardening: the role's settings, the agent helper's checks of each line, the exact kernel settings and the maximum uptime's default, and the node image.
+- The AppArmor profile's list. Decision 5 names the VMM's disks, `/dev/kvm`, `/dev/net/tun` and its API socket. A VMM also opens its kernel image, its configuration, its log and its own binary, and inherits two descriptors from the helper. The profile is written from what a VMM opens on a real machine.
 - How a control host with several nodes reports `hardened` when its nodes differ: `yes` only when every node checks out, once the checks exist.
 - How the control host takes a node that panics again and again out of use (Consequences).
 
