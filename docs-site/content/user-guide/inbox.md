@@ -14,6 +14,8 @@ Tinfirm opens on your **Inbox**. It holds three groups, each in its own section:
 
 The pills above them, **All**, **Needs you**, **Stopped** and **Notices**, show all groups or one alone, with their counts. The **Inbox** item in the sidebar shows how many questions, approvals and accounts wait for you. The inbox reads itself again every 15 seconds while it is open. It lists at most 100 items of each kind, longest waiting first; the rest follow as you handle them.
 
+![The inbox of a member, with three items under Needs you: a review of an agent's result, a question with its two answers, and an approval with Approve and Deny](../assets/images/user-guide/inbox.png){ width="960" }
+
 Each item says how long it has waited and names its conversation; **Open** goes there. What you decide in the inbox is the same as deciding it in the conversation, where the same card shows. Once you act on an item, its row folds into a line of what you did, such as **Answered** or **Approved**, and what happens next.
 
 ## Answer a question
@@ -30,6 +32,8 @@ In a trigger's conversation, the trigger's author and team answer in Tinfirm. Wh
 ## Decide an approval
 
 An approval asks permission for one action. **Approve** and **Deny** are in the row; the whole card adds a **Note for {agent}**, which the agent gets with your decision.
+
+![The card of an approval: Developer wants to comment on SHOP-241. It shows What, System and Runs as, the arguments folded, a note for the agent, and Approve and Deny](../assets/images/user-guide/approval-card.png){ width="544" }
 
 | The agent wants | The card shows | What your decision does |
 |---|---|---|
@@ -52,6 +56,8 @@ In the row, **Allow for this conversation** and **Deny** decide at once; **Moreâ
 ## Review a trigger's result
 
 A trigger can ask for a review before its result is written back to an issue. The card says *{agent}'s result waits for a review before anything is written*, and shows the agent's result and exactly what would be written to the issue: the comment, then each action in words.
+
+![The card of a review: Analyst finished, review it before it is written. It shows the agent's result, then what will be written, a comment and a link on SHOP-238, with Approve and write it and Return with the note](../assets/images/user-guide/review-card.png){ width="544" }
 
 - **Approve and write it**: exactly what is shown is written to the issue.
 - To send it back, write what should change in the note, then **Send back** (in the conversation, **Return with the note**). The agent gets your note and works on it again. A note is required.
