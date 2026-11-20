@@ -536,21 +536,27 @@ impl ModelProxy {
     /// Starts a run's listener, which forwards to the gateway of `access` with its key until
     /// the guard is dropped.
     pub async fn start_run(&self, run_id: Uuid, access: &ModelAccess) -> Result<ModelProxyGuard> {
-        self.start_run_at(run_id, access, None, None).await
+        self.start_run_at(run_id, access, None, None, None).await
     }
 
     /// [`ModelProxy::start_run`], with a base URL that names `sandbox_host` in place of the
     /// endpoint's (a local test executor's sandbox over the bridge), and with the listener's
     /// HTTP served by the sandbox's `front` when it has one: this process then keeps the run
-    /// half only.
+    /// half only. With `tunnel_port` the front serves it for the sandbox's tunnels alone, on
+    /// that port of the sandbox's own loopback, and this host binds no listener.
     pub async fn start_run_at(
         &self,
         run_id: Uuid,
         access: &ModelAccess,
         sandbox_host: Option<&str>,
         front: Option<Arc<SandboxFront>>,
+        tunnel_port: Option<u16>,
     ) -> Result<ModelProxyGuard> {
         anyhow::ensure!(!self.bind_ip.is_unspecified(), UNSPECIFIED_BIND);
+        anyhow::ensure!(
+            tunnel_port.is_none() || front.is_some(),
+            "only a sandbox's front serves the model proxy through its tunnels"
+        );
         let gateway = Gateway::parse(access, self.settings.allow_http, self.host_token.as_ref())?;
         let local_gateway = self
             .settings
@@ -561,10 +567,18 @@ impl ModelProxy {
             .https
             .then(|| self.tls.get_or_init(tls_config).clone());
         let secret = new_secret()?;
-        let listener = TcpListener::bind(SocketAddr::new(self.bind_ip, 0))
-            .await
-            .with_context(|| format!("cannot listen on {} for the model proxy", self.bind_ip))?;
-        let port = listener.local_addr()?.port();
+        let (listener, port) = match tunnel_port {
+            Some(port) => (None, port),
+            None => {
+                let listener = TcpListener::bind(SocketAddr::new(self.bind_ip, 0))
+                    .await
+                    .with_context(|| {
+                        format!("cannot listen on {} for the model proxy", self.bind_ip)
+                    })?;
+                let port = listener.local_addr()?.port();
+                (Some(listener), port)
+            }
+        };
         let base_url = format!(
             "http://{}/{secret}{}",
             host_port(sandbox_host.unwrap_or(&self.sandbox_host), port),
@@ -592,6 +606,7 @@ impl ModelProxy {
                     backend,
                     state.shutdown.clone(),
                 );
+                let listener = listener.context("a listener in this process")?;
                 tokio::spawn(serve(
                     crate::front::conn::Acceptor::listener(listener, true),
                     half,
@@ -1586,6 +1601,7 @@ mod tests {
                 &access(format, base_url),
                 None,
                 front(mode).await,
+                None,
             )
             .await
             .unwrap()
@@ -2342,6 +2358,7 @@ mod tests {
                     &access(ModelFormat::Anthropic, &url),
                     None,
                     front(mode).await,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2400,6 +2417,7 @@ mod tests {
                         &access(ModelFormat::Anthropic, &url),
                         None,
                         front(mode).await,
+                        None,
                     )
                     .await
                     .unwrap()
@@ -2449,6 +2467,7 @@ mod tests {
                     &access(ModelFormat::Anthropic, url),
                     None,
                     front(mode).await,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2474,6 +2493,7 @@ mod tests {
                 &access(format, base_url),
                 None,
                 front(mode).await,
+                None,
             )
             .await
             .unwrap()

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tinfirm_bridge::host::{BridgeServer, HostTiming, Registration, TunnelTarget};
+use tinfirm_bridge::host::{BridgeServer, HostTiming, TunnelTarget};
 
 use crate::git_proxy::Endpoint;
 
@@ -73,6 +73,20 @@ impl BridgeListener {
     /// `HOST:PORT` that a sandbox connects to.
     pub fn sandbox_addr(&self) -> String {
         crate::git_proxy::host_port(&self.sandbox_host, self.server.local_addr().port())
+    }
+}
+
+/// Where a sandbox's tunnel to a service of its front listens, on the sandbox's own loopback,
+/// when the front serves that service for the tunnels alone (no listener of this host's):
+/// fixed per service, below the range that Linux gives out for outgoing connections, so that
+/// the sandbox's own connections never hold them. The bridge listens on them before the agent
+/// starts; a program in the image that listens there first makes the run fail at its start.
+pub fn tunnel_port(service: crate::front::wire::Service) -> u16 {
+    use crate::front::wire::Service;
+    match service {
+        Service::Git => 18_761,
+        Service::Model => 18_762,
+        Service::Egress => 18_763,
     }
 }
 
@@ -153,21 +167,12 @@ pub fn split_env(env: &[(String, String)]) -> (Env, Env) {
 }
 
 /// The bridge's own settings: where the host is, the run, its ticket and the pin.
-pub fn bootstrap_env(registration: &Registration, addr: &str) -> Vec<(String, String)> {
+pub fn bootstrap_env(run_id: &str, ticket: &str, pin: &str, addr: &str) -> Vec<(String, String)> {
     vec![
         (tinfirm_bridge::ENV_ADDR.to_string(), addr.to_string()),
-        (
-            tinfirm_bridge::ENV_RUN.to_string(),
-            registration.run_id().to_string(),
-        ),
-        (
-            tinfirm_bridge::ENV_TICKET.to_string(),
-            registration.ticket().to_string(),
-        ),
-        (
-            tinfirm_bridge::ENV_PIN.to_string(),
-            registration.pin().to_string(),
-        ),
+        (tinfirm_bridge::ENV_RUN.to_string(), run_id.to_string()),
+        (tinfirm_bridge::ENV_TICKET.to_string(), ticket.to_string()),
+        (tinfirm_bridge::ENV_PIN.to_string(), pin.to_string()),
     ]
 }
 

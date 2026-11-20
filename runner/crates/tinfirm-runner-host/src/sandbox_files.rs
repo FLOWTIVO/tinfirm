@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tinfirm_bridge::files::{Limits, Unpacked};
-use tinfirm_bridge::host::{ExecOutput, SandboxFiles};
+use tinfirm_bridge::host::ExecOutput;
+
+use crate::sandbox::Files;
 
 use crate::git::Git;
 use crate::reader::Reader;
@@ -220,7 +222,7 @@ pub struct Collected {
 
 /// A repository of the run, as it is in the sandbox.
 pub struct SandboxRepo<'a> {
-    pub files: &'a SandboxFiles,
+    pub files: &'a Files,
     /// Its directory in the sandbox.
     pub dir: String,
     pub scratch: &'a str,
@@ -366,7 +368,7 @@ pub async fn collect_repository(
             Vec::new(),
             GET_TIMEOUT,
             move |input| {
-                reader.import_bundle(
+                reader.import_bundle_from(
                     input,
                     &clone,
                     &scratch,
@@ -394,7 +396,7 @@ pub async fn collect_repository(
 /// own: what came replaces `home_dir`, so that the next turn finds the runtime's session there.
 /// `tag` names the run's temporary directory.
 pub async fn collect_home(
-    files: &SandboxFiles,
+    files: &Files,
     reader: &Reader,
     layout: &Layout,
     exclude: Vec<String>,
@@ -421,7 +423,7 @@ pub async fn collect_home(
             Vec::new(),
             exclude,
             GET_TIMEOUT,
-            move |input| reader.unpack(input, &dest, &HOME_LIMITS, false, GET_TIMEOUT),
+            move |input| reader.unpack_from(input, &dest, &HOME_LIMITS, false, GET_TIMEOUT),
         )
         .await
     {
@@ -441,7 +443,7 @@ pub async fn collect_home(
 
 /// Brings `/output` back into `output_dir`, which is empty, unpacked by a reader.
 pub async fn collect_output(
-    files: &SandboxFiles,
+    files: &Files,
     reader: &Reader,
     layout: &Layout,
     output_dir: &Path,
@@ -453,7 +455,7 @@ pub async fn collect_output(
             Vec::new(),
             Vec::new(),
             GET_TIMEOUT,
-            move |input| reader.unpack(input, &dest, &OUTPUT_LIMITS, false, GET_TIMEOUT),
+            move |input| reader.unpack_from(input, &dest, &OUTPUT_LIMITS, false, GET_TIMEOUT),
         )
         .await
 }

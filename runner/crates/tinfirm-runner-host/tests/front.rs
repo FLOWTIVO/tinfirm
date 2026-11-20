@@ -1263,6 +1263,7 @@ async fn egress_with(front: Option<FrontCommand>, allow: &[String], loopback: bo
             Vec::new(),
             None,
             sandbox_front(front).await,
+            None,
         )
         .await
         .unwrap()
@@ -1669,6 +1670,7 @@ async fn measure_the_egress_proxy() {
                 Vec::new(),
                 None,
                 sandbox_front(front).await,
+                None,
             )
             .await
             .unwrap();
@@ -1755,6 +1757,7 @@ async fn model_through(
             &access,
             None,
             sandbox_front(Some(front)).await,
+            None,
         )
         .await
         .unwrap()
@@ -1891,7 +1894,7 @@ async fn measure_the_model_proxy() {
         };
         let front = sandbox_front(in_front.then(the_front)).await;
         let guard = ModelProxy::new(settings, &endpoint)
-            .start_run_at(uuid::Uuid::new_v4(), &access, None, front)
+            .start_run_at(uuid::Uuid::new_v4(), &access, None, front, None)
             .await
             .unwrap();
         let path = format!(
@@ -2033,7 +2036,13 @@ async fn one_front_serves_a_sandboxs_egress_and_model_proxies_and_ends_with_the_
         extra_hosts: Vec::new(),
     };
     let egress = EgressProxy::new(settings, &endpoint)
-        .start_run_at(uuid::Uuid::new_v4(), Vec::new(), None, Some(front.clone()))
+        .start_run_at(
+            uuid::Uuid::new_v4(),
+            Vec::new(),
+            None,
+            Some(front.clone()),
+            None,
+        )
         .await
         .unwrap();
     let gateway = measuring_gateway().await;
@@ -2051,7 +2060,13 @@ async fn one_front_serves_a_sandboxs_egress_and_model_proxies_and_ends_with_the_
         allow_http: true,
     };
     let model = ModelProxy::new(model_settings, &endpoint)
-        .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front.clone()))
+        .start_run_at(
+            uuid::Uuid::new_v4(),
+            &access,
+            None,
+            Some(front.clone()),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(egress.front().unwrap().pgid(), pid);
@@ -2154,7 +2169,7 @@ async fn a_front_serves_one_listener_of_each_service_and_run_refuses_a_second() 
             api_key: tinfirm_protocol::Secret::new("sk-TEST-ONLY-one-listener-key"),
         };
         ModelProxy::new(settings, &endpoint)
-            .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front))
+            .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front), None)
             .await
     };
     let server = echo_and_http().await;
@@ -2170,7 +2185,13 @@ async fn a_front_serves_one_listener_of_each_service_and_run_refuses_a_second() 
             extra_hosts: Vec::new(),
         },
     )
-    .start_run_at(uuid::Uuid::new_v4(), Vec::new(), None, Some(front.clone()))
+    .start_run_at(
+        uuid::Uuid::new_v4(),
+        Vec::new(),
+        None,
+        Some(front.clone()),
+        None,
+    )
     .await
     .unwrap();
     let model = start_model(front.clone()).await.unwrap();
@@ -2213,7 +2234,7 @@ async fn a_hostile_front_gets_from_runs_git_proxy_only_what_its_rules_allow() {
             extra_hosts: Vec::new(),
         };
         let (proxy, listener) =
-            GitProxy::start_in_front(endpoint, true, ListenerLimits::default(), &front)
+            GitProxy::start_in_front(endpoint, true, ListenerLimits::default(), &front, None)
                 .await
                 .unwrap();
         // Nine routes: room for more than 64 requests held open at 8 per route.
@@ -2288,7 +2309,13 @@ async fn a_front_that_ends_with_its_run_is_no_broken_wire() {
             },
             &endpoint,
         )
-        .start_run_at(uuid::Uuid::new_v4(), Vec::new(), None, Some(front.clone()))
+        .start_run_at(
+            uuid::Uuid::new_v4(),
+            Vec::new(),
+            None,
+            Some(front.clone()),
+            None,
+        )
         .await
         .unwrap();
         let access = tinfirm_protocol::ModelAccess {
@@ -2307,7 +2334,13 @@ async fn a_front_that_ends_with_its_run_is_no_broken_wire() {
             },
             &endpoint,
         )
-        .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front.clone()))
+        .start_run_at(
+            uuid::Uuid::new_v4(),
+            &access,
+            None,
+            Some(front.clone()),
+            None,
+        )
         .await
         .unwrap();
         let mut open = Vec::new();

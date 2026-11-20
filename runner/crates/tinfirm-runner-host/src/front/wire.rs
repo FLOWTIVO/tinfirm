@@ -74,11 +74,13 @@ pub enum ToFront {
     Check {
         id: u64,
     },
-    /// With a descriptor, a TCP listener that `run` bound: serve the egress proxy's HTTP on
-    /// it, for clients that send `Proxy-Authorization: <authorization>` (crate::egress_proxy).
+    /// Serve the egress proxy's HTTP, for clients that send
+    /// `Proxy-Authorization: <authorization>` (crate::egress_proxy): with `listener`, on the
+    /// TCP listener that `run` bound and passes along; always for the tunnels that name it.
     /// Every destination is `run`'s to decide ([`ToMain::Connect`]).
     ListenEgress {
         authorization: String,
+        listener: bool,
     },
     /// With a descriptor, the TCP connection `run` made for [`ToMain::Connect`] `req`.
     Connected {
@@ -93,13 +95,14 @@ pub enum ToFront {
         message: String,
         off_allowlist: bool,
     },
-    /// With a descriptor, a TCP listener that `run` bound: serve the model proxy's HTTP on it
-    /// for the run whose secret is `secret` (crate::model_proxy). Its requests go to `run`
-    /// ([`ToMain::Request`]); the key never comes here.
+    /// Serve the model proxy's HTTP for the run whose secret is `secret` (crate::model_proxy):
+    /// with `listener`, on the TCP listener that `run` passes along; always for the tunnels
+    /// that name it. Its requests go to `run` ([`ToMain::Request`]); the key never comes here.
     ListenModel {
         secret: String,
         api: ModelApi,
         base_path: String,
+        listener: bool,
     },
     /// Stop serving `service`'s listener and end its connections.
     Unlisten {
@@ -122,12 +125,13 @@ pub enum ToFront {
         req: u64,
         ok: bool,
     },
-    /// With a descriptor, a TCP listener that `run` bound for one run: serve the git proxy's
-    /// fetches and the platform tools' endpoint on it (crate::git_proxy), within `limits`, for
-    /// the routes of [`ToFront::GitRoutes`]. Their requests go to `run` ([`ToMain::Request`]);
-    /// no git token and no tool comes here.
+    /// Serve one run's git proxy fetches and platform tools' endpoint (crate::git_proxy),
+    /// within `limits`, for the routes of [`ToFront::GitRoutes`]: with `listener`, on the TCP
+    /// listener that `run` passes along; always for the tunnels that name it. Their requests
+    /// go to `run` ([`ToMain::Request`]); no git token and no tool comes here.
     ListenGit {
         limits: FrontLimits,
+        listener: bool,
     },
     /// The run's routes as they are now, which replace those the front had: each with its
     /// number, which is all that the front hands `run` of it.
@@ -490,11 +494,11 @@ impl ToFront {
     /// How many descriptors come with this message.
     pub fn descriptors(&self) -> usize {
         match self {
+            ToFront::ListenEgress { listener, .. }
+            | ToFront::ListenModel { listener, .. }
+            | ToFront::ListenGit { listener, .. } => usize::from(*listener),
             ToFront::Check { .. }
-            | ToFront::ListenEgress { .. }
             | ToFront::Connected { .. }
-            | ToFront::ListenModel { .. }
-            | ToFront::ListenGit { .. }
             | ToFront::Body { .. }
             | ToFront::Dialed {}
             | ToFront::Put { .. }
@@ -508,7 +512,9 @@ impl ToFront {
     /// The bounds of `run`'s messages, which a front checks too.
     pub fn check(&self) -> Result<(), String> {
         match self {
-            ToFront::ListenEgress { authorization } if authorization.len() > MAX_AUTHORIZATION => {
+            ToFront::ListenEgress { authorization, .. }
+                if authorization.len() > MAX_AUTHORIZATION =>
+            {
                 Err(format!("a proxy credential over {MAX_AUTHORIZATION} bytes"))
             }
             ToFront::Refused {

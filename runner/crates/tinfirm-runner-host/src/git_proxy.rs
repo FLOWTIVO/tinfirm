@@ -587,11 +587,21 @@ impl GitProxy {
         allow_http: bool,
         limits: ListenerLimits,
         front: &Arc<SandboxFront>,
+        tunnel_port: Option<u16>,
     ) -> Result<(GitProxy, FrontListenerGuard)> {
-        let listener = TcpListener::bind(endpoint.bind)
-            .await
-            .with_context(|| format!("cannot listen on {} for a run's git proxy", endpoint.bind))?;
-        let addr = listener.local_addr()?;
+        // With `tunnel_port` the front serves it for the sandbox's tunnels alone, on that port
+        // of the sandbox's own loopback, and this host binds no listener: the routes' URLs
+        // name that port.
+        let (listener, addr) = match tunnel_port {
+            Some(port) => (None, SocketAddr::new(endpoint.bind.ip(), port)),
+            None => {
+                let listener = TcpListener::bind(endpoint.bind).await.with_context(|| {
+                    format!("cannot listen on {} for a run's git proxy", endpoint.bind)
+                })?;
+                let addr = listener.local_addr()?;
+                (Some(listener), addr)
+            }
+        };
         let inner = Arc::new(Inner {
             routes: Mutex::new(HashMap::new()),
             mcp_routes: Mutex::new(HashMap::new()),
@@ -1915,9 +1925,10 @@ mod tests {
                 let front = SandboxFront::start(&crate::front::test_command())
                     .await
                     .unwrap();
-                let (proxy, listener) = GitProxy::start_in_front(endpoint, true, limits, &front)
-                    .await
-                    .unwrap();
+                let (proxy, listener) =
+                    GitProxy::start_in_front(endpoint, true, limits, &front, None)
+                        .await
+                        .unwrap();
                 Proxy {
                     proxy,
                     _listener: Some(listener),

@@ -791,7 +791,10 @@ impl Shared {
                 ));
             }
             tracing::info!(run_id = %record.run_id(), epoch = record.assign.epoch, "taking back a run of the process before this one");
-            self.spawn_taken_back(record, Some((sandbox, registration)));
+            self.spawn_taken_back(
+                record,
+                Some((sandbox, crate::sandbox::Registered::Shared(registration))),
+            );
         }
     }
 
@@ -800,10 +803,7 @@ impl Shared {
     fn spawn_taken_back(
         self: &Arc<Self>,
         record: crate::takeback::RunRecord,
-        sandbox: Option<(
-            crate::sandbox::TakenBack,
-            tinfirm_bridge::host::Registration,
-        )>,
+        sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
     ) {
         let (run_id, epoch) = (record.run_id(), record.assign.epoch);
         let (stop_tx, stop_rx) = watch::channel(None);
@@ -888,6 +888,12 @@ impl Shared {
         let proxy = Arc::new(EgressProxy::new(settings.clone(), git_proxy.endpoint()));
         *slot = Some(proxy.clone());
         Ok(Some(proxy))
+    }
+
+    /// Whether a run's sandbox reaches its proxies through tunnels that end in its front, with no
+    /// listener of this host's for them: on a host whose sandboxes' bridges are their fronts'.
+    pub fn sandboxes_tunnel_to_their_front(&self) -> bool {
+        false
     }
 
     /// A new sandbox's front process, which serves the HTTP of that sandbox's proxy listeners

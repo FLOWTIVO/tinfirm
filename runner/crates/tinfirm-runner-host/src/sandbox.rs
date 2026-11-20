@@ -27,8 +27,12 @@ use bollard::query_parameters::{
 use futures::StreamExt;
 use tinfirm_bridge::control::{Hidden, ProbeCheck, Start};
 use tinfirm_bridge::host::{
-    Exit, HostIo, HostSession, Output, Registration, SandboxFiles, TunnelTarget,
+    ExecOutput, Exit, HostIo, HostSession, Output, Registration, SandboxFiles, TunnelTarget,
 };
+
+use crate::front::session::{BridgeRegistration, FrontFiles, FrontSession};
+use crate::front::wire::Service;
+use crate::reader::Input;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 
@@ -448,7 +452,7 @@ enum SandboxKind {
     /// A sandbox whose adapter runs over the bridge (ADR-0095); `inner` is its container or
     /// its local bridge process.
     Bridged {
-        session: HostSession,
+        session: Session,
         exit: watch::Receiver<Option<Exit>>,
         inner: Box<SandboxKind>,
     },
@@ -457,17 +461,235 @@ enum SandboxKind {
     Adopted,
 }
 
-/// What a sandbox started with the bridge needs: its registration with the host's listener,
-/// the address the sandbox connects to, the binary that runs the bridge there, the tunnels to
-/// the host's listeners that the run uses, and the directories it gets before the adapter
-/// starts.
+/// What a sandbox started with the bridge needs: its registration (with the host's shared
+/// listener, or with the sandbox's front), the bridge's own settings (where it connects, its
+/// run's name, its ticket and the pin), the binary that runs the bridge there, the tunnels that
+/// the run uses, and the directories it gets before the adapter starts.
 pub struct Bridged {
-    pub registration: Registration,
-    pub addr: String,
+    pub registration: Registered,
+    pub bootstrap: Vec<(String, String)>,
     pub binary: PathBuf,
     pub connect_timeout: Duration,
-    pub tunnels: Vec<TunnelTarget>,
+    pub tunnels: Tunnels,
     pub puts: Vec<Put>,
+}
+
+/// A run's bridge, registered and not yet connected.
+pub enum Registered {
+    /// With this process's shared listener: a VM's (until its front holds its bridge), or a
+    /// run taken back from a record of the previous version.
+    Shared(Registration),
+    /// With the sandbox's front.
+    Front(BridgeRegistration),
+}
+
+impl Registered {
+    /// Waits for the bridge's first connection.
+    pub async fn connected(self, timeout: Duration) -> Result<Session> {
+        match self {
+            Registered::Shared(registration) => {
+                registration.connected(timeout).await.map(Session::Shared)
+            }
+            Registered::Front(registration) => {
+                registration.connected(timeout).await.map(Session::Front)
+            }
+        }
+    }
+}
+
+/// The tunnels a run asks its sandbox for: each to a listener of this host's, or to a service
+/// of the sandbox's front.
+pub enum Tunnels {
+    Targets(Vec<TunnelTarget>),
+    Services(Vec<(std::net::SocketAddr, Service)>),
+}
+
+impl Tunnels {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Tunnels::Targets(tunnels) => tunnels.is_empty(),
+            Tunnels::Services(tunnels) => tunnels.is_empty(),
+        }
+    }
+}
+
+/// A run's bridge, connected: in this process's shared listener, or in the sandbox's front.
+pub enum Session {
+    Shared(HostSession),
+    Front(FrontSession),
+}
+
+impl Session {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Session::Shared(session) => session.run_id(),
+            Session::Front(session) => session.run_id(),
+        }
+    }
+
+    pub fn session_key(&self) -> &Hidden {
+        match self {
+            Session::Shared(session) => session.session_key(),
+            Session::Front(session) => session.session_key(),
+        }
+    }
+
+    pub fn bridge_build(&self) -> Option<&str> {
+        match self {
+            Session::Shared(session) => session.bridge_build(),
+            Session::Front(session) => session.bridge_build(),
+        }
+    }
+
+    pub fn exit(&self) -> watch::Receiver<Option<Exit>> {
+        match self {
+            Session::Shared(session) => session.exit(),
+            Session::Front(session) => session.exit(),
+        }
+    }
+
+    pub fn has_ended(&self) -> bool {
+        match self {
+            Session::Shared(session) => session.has_ended(),
+            Session::Front(session) => session.has_ended(),
+        }
+    }
+
+    pub fn files(&self) -> Files {
+        match self {
+            Session::Shared(session) => Files::Shared(session.files()),
+            Session::Front(session) => Files::Front(session.files()),
+        }
+    }
+
+    async fn open_tunnels(&mut self, tunnels: &Tunnels, timeout: Duration) -> Result<()> {
+        match (self, tunnels) {
+            (Session::Shared(session), Tunnels::Targets(tunnels)) => {
+                session.open_tunnels(tunnels, timeout).await.map(drop)
+            }
+            (Session::Front(session), Tunnels::Services(tunnels)) => {
+                session.open_tunnels(tunnels, timeout).await.map(drop)
+            }
+            _ => bail!("the run's tunnels are not of its bridge's kind"),
+        }
+    }
+
+    /// Starts the adapter: its stdin, and its output.
+    async fn start(
+        &mut self,
+        start: Start,
+    ) -> Result<(
+        Pin<Box<dyn AsyncWrite + Send>>,
+        mpsc::Receiver<Output>,
+        watch::Receiver<Option<Exit>>,
+    )> {
+        match self {
+            Session::Shared(session) => {
+                let HostIo {
+                    stdin,
+                    output,
+                    exit,
+                } = session.start(start).await?;
+                Ok((Box::pin(stdin), output, exit))
+            }
+            Session::Front(session) => {
+                let io = session.start(start).await?;
+                Ok((Box::pin(io.stdin), io.output, io.exit))
+            }
+        }
+    }
+
+    async fn stop(&self, grace: Duration) -> Result<()> {
+        match self {
+            Session::Shared(session) => session.stop(grace).await,
+            Session::Front(session) => session.stop(grace).await,
+        }
+    }
+
+    async fn close(&self, timeout: Duration) {
+        match self {
+            Session::Shared(session) => session.close(timeout).await,
+            Session::Front(session) => session.close(timeout).await,
+        }
+    }
+
+    async fn reclaim(&mut self, timeout: Duration) -> Result<bool> {
+        match self {
+            Session::Shared(session) => session.reclaim(timeout).await,
+            Session::Front(session) => session.reclaim(timeout).await,
+        }
+    }
+}
+
+/// The sandbox's files and the host's commands there, over either kind of bridge. Clones share
+/// the session.
+#[derive(Clone)]
+pub enum Files {
+    Shared(SandboxFiles),
+    Front(FrontFiles),
+}
+
+impl Files {
+    pub async fn exec(
+        &self,
+        argv: &[&str],
+        env: &[(&str, &str)],
+        cwd: Option<&str>,
+        stdin: Option<String>,
+        timeout: Duration,
+    ) -> Result<ExecOutput> {
+        match self {
+            Files::Shared(files) => files.exec(argv, env, cwd, stdin, timeout).await,
+            Files::Front(files) => files.exec(argv, env, cwd, stdin, timeout).await,
+        }
+    }
+
+    pub async fn probe(&self, checks: Vec<ProbeCheck>, timeout: Duration) -> Result<Vec<String>> {
+        match self {
+            Files::Shared(files) => files.probe(checks, timeout).await,
+            Files::Front(files) => files.probe(checks, timeout).await,
+        }
+    }
+
+    pub async fn put_dir(
+        &self,
+        host_dir: &std::path::Path,
+        dir: &str,
+        exclude: Vec<String>,
+        timeout: Duration,
+    ) -> Result<()> {
+        match self {
+            Files::Shared(files) => files.put_dir(host_dir, dir, exclude, timeout).await,
+            Files::Front(files) => files.put_dir(host_dir, dir, exclude, timeout).await,
+        }
+    }
+
+    /// Asks the sandbox for `paths` of its directory `dir` (all of it when empty), without
+    /// `exclude`, as a tar archive, which `consume` reads: through this process from the
+    /// shared listener, or on a pipe straight from the front ([`Input`]).
+    pub async fn receive<T, F>(
+        &self,
+        dir: &str,
+        paths: Vec<String>,
+        exclude: Vec<String>,
+        timeout: Duration,
+        consume: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(Input<'a>) -> Result<T> + Send + 'static,
+    {
+        match self {
+            Files::Shared(files) => {
+                files
+                    .receive(dir, paths, exclude, timeout, move |input| {
+                        consume(Input::Read(input))
+                    })
+                    .await
+            }
+            Files::Front(files) => files.receive(dir, paths, exclude, timeout, consume).await,
+        }
+    }
 }
 
 /// A directory of the host's that goes into the sandbox, in place of a mount (ADR-0095).
@@ -536,7 +758,7 @@ impl Executor {
         bridged: Bridged,
     ) -> Result<(Sandbox, SandboxIo)> {
         let (settings, run_env) = crate::bridge::split_env(&spec.env);
-        let bootstrap = crate::bridge::bootstrap_env(&bridged.registration, &bridged.addr);
+        let bootstrap = bridged.bootstrap.clone();
         match self {
             Executor::Docker(docker) => {
                 let argv = match &spec.command {
@@ -625,7 +847,7 @@ impl Executor {
         spec: &SandboxSpec,
         claimed: crate::pool::Claimed,
         reprobe_after: Duration,
-        tunnels: Vec<TunnelTarget>,
+        tunnels: Tunnels,
         puts: Vec<Put>,
     ) -> Result<(Sandbox, SandboxIo)> {
         let Executor::Vm(vms) = self else {
@@ -677,7 +899,7 @@ impl Executor {
                 vm,
                 busy: Some(busy),
             },
-            session,
+            Session::Shared(session),
             tunnels,
             puts,
             start,
@@ -689,14 +911,11 @@ impl Executor {
 
 /// Probes the sandbox's network from inside with `checks`, all at once: anything that gets
 /// through is an error that names it.
-pub async fn probe(session: &HostSession, checks: &[ProbeCheck]) -> Result<()> {
+pub async fn probe(files: &Files, checks: &[ProbeCheck]) -> Result<()> {
     if checks.is_empty() {
         return Ok(());
     }
-    let open = session
-        .files()
-        .probe(checks.to_vec(), PROBE_TIMEOUT)
-        .await?;
+    let open = files.probe(checks.to_vec(), PROBE_TIMEOUT).await?;
     if open.is_empty() {
         return Ok(());
     }
@@ -743,14 +962,14 @@ async fn stopped(inner: &mut SandboxKind, e: anyhow::Error) -> anyhow::Error {
 /// hands its stdio to the run.
 async fn finish_session(
     mut inner: SandboxKind,
-    mut session: HostSession,
-    tunnels: Vec<TunnelTarget>,
+    mut session: Session,
+    tunnels: Tunnels,
     puts: Vec<Put>,
     start: Start,
     probe: &[ProbeCheck],
 ) -> Result<(Sandbox, SandboxIo)> {
     let started = async {
-        self::probe(&session, probe).await?;
+        self::probe(&session.files(), probe).await?;
         if !tunnels.is_empty() {
             session.open_tunnels(&tunnels, TUNNELS_TIMEOUT).await?;
         }
@@ -762,11 +981,7 @@ async fn finish_session(
         Ok(started) => started,
         Err(e) => return Err(stopped(&mut inner, e).await),
     };
-    let HostIo {
-        stdin,
-        mut output,
-        exit,
-    } = io;
+    let (stdin, mut output, exit) = io;
     let (tx, rx) = mpsc::channel(OUTPUT_QUEUE);
     tokio::spawn(async move {
         while let Some(item) = output.recv().await {
@@ -789,15 +1004,12 @@ async fn finish_session(
                 inner: Box::new(inner),
             },
         },
-        SandboxIo {
-            stdin: Box::pin(stdin),
-            output: rx,
-        },
+        SandboxIo { stdin, output: rx },
     ))
 }
 
 /// Puts the run's directories into the sandbox, in order.
-async fn put_all(files: &SandboxFiles, puts: &[Put]) -> Result<()> {
+async fn put_all(files: &Files, puts: &[Put]) -> Result<()> {
     for put in puts {
         files
             .put_dir(&put.host, &put.sandbox, put.exclude.clone(), PUT_TIMEOUT)
@@ -1152,7 +1364,7 @@ impl TakenBack {
     }
 
     /// The sandbox, now that its bridge `session` has come back.
-    pub fn connected(self, session: HostSession) -> Sandbox {
+    pub fn connected(self, session: Session) -> Sandbox {
         let exit = session.exit();
         Sandbox {
             kind: SandboxKind::Bridged {
@@ -1203,7 +1415,7 @@ impl Sandbox {
     }
 
     /// The sandbox's files over the bridge (ADR-0095); `None` for a sandbox without it.
-    pub fn files(&self) -> Option<SandboxFiles> {
+    pub fn files(&self) -> Option<Files> {
         match &self.kind {
             SandboxKind::Bridged { session, .. } => Some(session.files()),
             _ => None,

@@ -70,8 +70,8 @@ use tinfirm_protocol::{
 };
 use uuid::Uuid;
 
+use crate::sandbox::Files;
 use tinfirm_bridge::files::ReadOne;
-use tinfirm_bridge::host::SandboxFiles;
 
 use crate::attachments::{Upload, UploadResponse, UploadSource};
 
@@ -216,11 +216,11 @@ pub struct FileRoot {
 /// The sandbox's files once its bridge has connected (`run --sandbox-bridge`), for the tools
 /// that read them; until then, and once the sandbox is gone, they cannot be read.
 #[derive(Clone, Default)]
-pub struct SandboxReader(Arc<std::sync::OnceLock<(SandboxFiles, crate::reader::Reader)>>);
+pub struct SandboxReader(Arc<std::sync::OnceLock<(Files, crate::reader::Reader)>>);
 
 impl SandboxReader {
     /// The sandbox's files, and the readers that parse what comes of them (crate::reader).
-    pub fn set(&self, files: SandboxFiles, reader: crate::reader::Reader) {
+    pub fn set(&self, files: Files, reader: crate::reader::Reader) {
         let _ = self.0.set((files, reader));
     }
 }
@@ -258,7 +258,7 @@ async fn read_from_sandbox(
             vec![path],
             Vec::new(),
             SANDBOX_READ_TIMEOUT,
-            move |input| parser.read_one(input, max, SANDBOX_READ_TIMEOUT),
+            move |input| parser.read_one_from(input, max, SANDBOX_READ_TIMEOUT),
         )
         .await
     {

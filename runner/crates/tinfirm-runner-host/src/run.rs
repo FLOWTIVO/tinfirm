@@ -35,6 +35,7 @@ use crate::attachments::{self, AttachmentsDir, Upload, UploadSource};
 use crate::credentials::Credential;
 use crate::docker;
 use crate::egress_proxy::{EgressGuard, Rule};
+use crate::front::wire::Service;
 use crate::git::{self, Git, branch_tip, ref_shas};
 use crate::git_proxy::{GitProxy, McpGuard, RouteGuard};
 use crate::git_tokens::RunGitTokens;
@@ -1110,10 +1111,7 @@ pub async fn take_back(
     record: RunRecord,
     kept: Arc<RecordHandle>,
     tokens: &Arc<RunGitTokens>,
-    sandbox: Option<(
-        crate::sandbox::TakenBack,
-        tinfirm_bridge::host::Registration,
-    )>,
+    sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
     mut stop_rx: watch::Receiver<Option<StopRequest>>,
 ) -> TakenBackEnd {
     let assign = &record.assign;
@@ -1883,7 +1881,13 @@ async fn start_model_proxy(
         }
     }
     let guard = match proxy
-        .start_run_at(assign.run_id, model, sandbox_host, front.clone())
+        .start_run_at(
+            assign.run_id,
+            model,
+            sandbox_host,
+            front.clone(),
+            tunnel_port(shared, Service::Model),
+        )
         .await
     {
         Ok(guard) => guard,
@@ -1975,7 +1979,13 @@ async fn start_egress(
                 }
             }
             match proxy
-                .start_run_at(assign.run_id, rules, sandbox_host, front.clone())
+                .start_run_at(
+                    assign.run_id,
+                    rules,
+                    sandbox_host,
+                    front.clone(),
+                    tunnel_port(shared, Service::Egress),
+                )
                 .await
             {
                 Ok(guard) => guard,
@@ -2182,9 +2192,18 @@ async fn run_listener(
         shared.opts.allow_insecure_repo_urls,
         crate::git_proxy::ListenerLimits::default(),
         front,
+        tunnel_port(shared, Service::Git),
     )
     .await?;
     Ok(Some((proxy, guard)))
+}
+
+/// The port in the sandbox where a run's tunnel to `service` listens, when its sandbox's front
+/// serves the service for the tunnels alone; `None` where this host binds a listener for it.
+fn tunnel_port(shared: &Shared, service: Service) -> Option<u16> {
+    shared
+        .sandboxes_tunnel_to_their_front()
+        .then(|| crate::bridge::tunnel_port(service))
 }
 
 /// Registers one repository with the git proxy and points its `origin` at it, so the agent
@@ -2307,7 +2326,13 @@ async fn start_sandbox(
         return shared
             .opts
             .executor
-            .start_claimed(spec, claimed, shared.opts.vm_reprobe_after, tunnels, puts)
+            .start_claimed(
+                spec,
+                claimed,
+                shared.opts.vm_reprobe_after,
+                crate::sandbox::Tunnels::Targets(tunnels),
+                puts,
+            )
             .await;
     }
     let listener = shared.bridge().await?.context(
@@ -2327,12 +2352,18 @@ async fn start_sandbox(
         vec![registration.ticket().to_string()],
     );
     sink.log(LogLevel::Debug, bridge_note);
+    let bootstrap = crate::bridge::bootstrap_env(
+        registration.run_id(),
+        registration.ticket(),
+        registration.pin(),
+        &listener.sandbox_addr(),
+    );
     let bridged = crate::sandbox::Bridged {
-        registration,
-        addr: listener.sandbox_addr(),
+        registration: crate::sandbox::Registered::Shared(registration),
+        bootstrap,
         binary: options.binary,
         connect_timeout: options.connect_timeout,
-        tunnels,
+        tunnels: crate::sandbox::Tunnels::Targets(tunnels),
         puts,
     };
     shared.opts.executor.start_bridged(spec, bridged).await
@@ -2551,7 +2582,7 @@ fn reader_of(shared: &Shared) -> crate::reader::Reader {
 async fn collect_from_sandbox(
     sink: &mut EventSink,
     assign: &RunAssign,
-    files: &tinfirm_bridge::host::SandboxFiles,
+    files: &crate::sandbox::Files,
     reader: &crate::reader::Reader,
     layout: &Layout,
     repos: &mut [Repo<'_>],

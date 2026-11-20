@@ -162,19 +162,26 @@ impl SandboxFront {
         Ok(())
     }
 
-    /// The front serves the egress proxy's HTTP on `listener`, for clients that send
-    /// `authorization`; `connector` decides and connects each destination.
+    /// The front serves the egress proxy's HTTP, for clients that send `authorization`: on
+    /// `listener` when there is one, and for the tunnels that name it; `connector` decides and
+    /// connects each destination.
     pub async fn listen_egress(
         &self,
-        listener: TcpListener,
+        listener: Option<TcpListener>,
         authorization: String,
         connector: Arc<dyn Connector>,
     ) -> Result<()> {
         self.first(Service::Egress)?;
         *lock(&self.router.egress) = Some(connector);
-        let listener = OwnedFd::from(listener.into_std()?);
+        let listener = descriptor(listener)?;
         self.handle
-            .send(&ToFront::ListenEgress { authorization }, Some(listener))
+            .send(
+                &ToFront::ListenEgress {
+                    authorization,
+                    listener: listener.is_some(),
+                },
+                listener,
+            )
             .await
     }
 
@@ -182,7 +189,7 @@ impl SandboxFront {
     /// `secret`; `backend` answers each request it lets through.
     pub(crate) async fn listen_model(
         &self,
-        listener: TcpListener,
+        listener: Option<TcpListener>,
         secret: String,
         api: ModelApi,
         base_path: String,
@@ -190,15 +197,16 @@ impl SandboxFront {
     ) -> Result<()> {
         self.first(Service::Model)?;
         *lock(&self.router.model) = Some(backend);
-        let listener = OwnedFd::from(listener.into_std()?);
+        let listener = descriptor(listener)?;
         self.handle
             .send(
                 &ToFront::ListenModel {
                     secret,
                     api,
                     base_path,
+                    listener: listener.is_some(),
                 },
-                Some(listener),
+                listener,
             )
             .await
     }
@@ -208,15 +216,21 @@ impl SandboxFront {
     /// it lets through.
     pub(crate) async fn listen_git(
         &self,
-        listener: TcpListener,
+        listener: Option<TcpListener>,
         limits: FrontLimits,
         backend: Arc<dyn Backend>,
     ) -> Result<()> {
         self.first(Service::Git)?;
         *lock(&self.router.git) = Some(backend);
-        let listener = OwnedFd::from(listener.into_std()?);
+        let listener = descriptor(listener)?;
         self.handle
-            .send(&ToFront::ListenGit { limits }, Some(listener))
+            .send(
+                &ToFront::ListenGit {
+                    limits,
+                    listener: listener.is_some(),
+                },
+                listener,
+            )
             .await
     }
 
@@ -285,6 +299,14 @@ impl Drop for SandboxFront {
         }
         // The front goes with the handle's last owner: its group is killed and it is reaped.
     }
+}
+
+/// A listener's descriptor, to pass to the front.
+fn descriptor(listener: Option<TcpListener>) -> Result<Option<OwnedFd>> {
+    Ok(match listener {
+        Some(listener) => Some(OwnedFd::from(listener.into_std()?)),
+        None => None,
+    })
 }
 
 /// Answers the front's requests until it ends.

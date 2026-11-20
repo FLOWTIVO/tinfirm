@@ -436,7 +436,13 @@ impl Pool {
         let egress = match host.egress_proxy().await? {
             Some(proxy) => {
                 let front = host.sandbox_front().await?;
-                Some(proxy.start_slot(sandbox_host.as_deref(), front).await?)
+                // The VM's bridge is still served by this process's shared listener: its
+                // tunnels reach a listener of this host's.
+                Some(
+                    proxy
+                        .start_slot(sandbox_host.as_deref(), front, None)
+                        .await?,
+                )
             }
             None => None,
         };
@@ -450,7 +456,12 @@ impl Pool {
             );
         }
         boot_settings.sort();
-        let bootstrap = crate::bridge::bootstrap_env(&registration, &listener.sandbox_addr());
+        let bootstrap = crate::bridge::bootstrap_env(
+            registration.run_id(),
+            registration.ticket(),
+            registration.pin(),
+            &listener.sandbox_addr(),
+        );
         let ticket = registration.ticket().to_string();
         let data = crate::vm::user_data(&shape.image, &boot_settings, &bootstrap, options.port);
         let labels = Vms::labels(&host.host_label(), &id);
@@ -489,7 +500,8 @@ impl Pool {
             vm.delete().await;
             return Err(e);
         }
-        if let Err(e) = crate::sandbox::probe(&session, &options.probe).await {
+        let files = crate::sandbox::Files::Shared(session.files());
+        if let Err(e) = crate::sandbox::probe(&files, &options.probe).await {
             vm.delete().await;
             return Err(e);
         }

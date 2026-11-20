@@ -1482,7 +1482,7 @@ async fn a_tunnel_reaches_the_fronts_service_and_no_address() {
     let (front, mut session, bridge, _, _) = connected("run-front-tunnel").await;
     let egress = TcpListener::bind("127.0.0.1:0").await.unwrap();
     front
-        .listen_egress(egress, "Basic c2VjcmV0".into(), Arc::new(Refusing))
+        .listen_egress(Some(egress), "Basic c2VjcmV0".into(), Arc::new(Refusing))
         .await
         .unwrap();
     let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1540,7 +1540,7 @@ async fn a_tunnel_not_asked_for_and_streams_past_the_bound_are_refused() {
         .unwrap();
     front
         .listen_egress(
-            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            Some(TcpListener::bind("127.0.0.1:0").await.unwrap()),
             "Basic c2VjcmV0".into(),
             Arc::new(Refusing),
         )

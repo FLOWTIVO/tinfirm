@@ -636,13 +636,11 @@ pub fn serve(status: Status) -> ExitCode {
                 ToFront::ListenEgress { .. } if egress.is_some() => {
                     return refuse("a second egress listener");
                 }
-                ToFront::ListenEgress { authorization } => {
-                    let fd = descriptors.pop().expect("taken with the message");
-                    let listener = std::net::TcpListener::from(fd);
-                    let listener = match listener
-                        .set_nonblocking(true)
-                        .and_then(|()| tokio::net::TcpListener::from_std(listener))
-                    {
+                ToFront::ListenEgress {
+                    authorization,
+                    listener,
+                } => {
+                    let listener = match take_listener(&mut descriptors, listener) {
                         Ok(listener) => listener,
                         Err(e) => return refuse(&format!("the egress listener: {e}")),
                     };
@@ -652,8 +650,7 @@ pub fn serve(status: Status) -> ExitCode {
                     });
                     egress = Some(connector.clone());
                     let half = FrontHalf::new(authorization, connector, egress_shutdown.clone());
-                    let (acceptor, handoff) =
-                        crate::front::conn::Acceptor::new(Some(listener), false);
+                    let (acceptor, handoff) = crate::front::conn::Acceptor::new(listener, false);
                     services
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -691,13 +688,9 @@ pub fn serve(status: Status) -> ExitCode {
                     secret,
                     api,
                     base_path,
+                    listener,
                 } => {
-                    let fd = descriptors.pop().expect("taken with the message");
-                    let listener = std::net::TcpListener::from(fd);
-                    let listener = match listener
-                        .set_nonblocking(true)
-                        .and_then(|()| tokio::net::TcpListener::from_std(listener))
-                    {
+                    let listener = match take_listener(&mut descriptors, listener) {
                         Ok(listener) => listener,
                         Err(e) => return refuse(&format!("the model listener: {e}")),
                     };
@@ -709,8 +702,7 @@ pub fn serve(status: Status) -> ExitCode {
                         Arc::new(ServiceWire::new(&requests, Service::Model)),
                         model_shutdown.clone(),
                     );
-                    let (acceptor, handoff) =
-                        crate::front::conn::Acceptor::new(Some(listener), true);
+                    let (acceptor, handoff) = crate::front::conn::Acceptor::new(listener, true);
                     services
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -721,20 +713,14 @@ pub fn serve(status: Status) -> ExitCode {
                 ToFront::ListenGit { .. } if git.is_some() => {
                     return refuse("a second git listener");
                 }
-                ToFront::ListenGit { limits } => {
-                    let fd = descriptors.pop().expect("taken with the message");
-                    let listener = std::net::TcpListener::from(fd);
-                    let listener = match listener
-                        .set_nonblocking(true)
-                        .and_then(|()| tokio::net::TcpListener::from_std(listener))
-                    {
+                ToFront::ListenGit { limits, listener } => {
+                    let listener = match take_listener(&mut descriptors, listener) {
                         Ok(listener) => listener,
                         Err(e) => return refuse(&format!("the git listener: {e}")),
                     };
                     let routes = Arc::new(crate::git_proxy::FrontRoutes::default());
                     git = Some(routes.clone());
-                    let (acceptor, handoff) =
-                        crate::front::conn::Acceptor::new(Some(listener), true);
+                    let (acceptor, handoff) = crate::front::conn::Acceptor::new(listener, true);
                     services
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -950,6 +936,20 @@ pub fn serve(status: Status) -> ExitCode {
         git_shutdown.cancel();
         ExitCode::SUCCESS
     })
+}
+
+/// The TCP listener that came with a listen message, when it says one did.
+fn take_listener(
+    descriptors: &mut Vec<OwnedFd>,
+    wanted: bool,
+) -> std::io::Result<Option<tokio::net::TcpListener>> {
+    if !wanted {
+        return Ok(None);
+    }
+    let fd = descriptors.pop().expect("taken with the message");
+    let listener = std::net::TcpListener::from(fd);
+    listener.set_nonblocking(true)?;
+    Ok(Some(tokio::net::TcpListener::from_std(listener)?))
 }
 
 fn refuse(why: &str) -> ExitCode {

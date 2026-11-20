@@ -518,21 +518,23 @@ impl EgressProxy {
     /// Starts a run's listener: the host-wide rules and `run_rules` apply until the guard is
     /// dropped.
     pub async fn start_run(&self, run_id: Uuid, run_rules: Vec<Rule>) -> Result<EgressGuard> {
-        self.start_run_at(run_id, run_rules, None, None).await
+        self.start_run_at(run_id, run_rules, None, None, None).await
     }
 
     /// [`EgressProxy::start_run`], with a proxy URL that names `sandbox_host` in place of the
     /// endpoint's (a local test executor's sandbox over the bridge), and with the listener's
     /// HTTP served by the sandbox's `front` when it has one: this process then only decides
-    /// and connects.
+    /// and connects. With `tunnel_port` the front serves it for the sandbox's tunnels alone,
+    /// on that port of the sandbox's own loopback, and this host binds no listener.
     pub async fn start_run_at(
         &self,
         run_id: Uuid,
         run_rules: Vec<Rule>,
         sandbox_host: Option<&str>,
         front: Option<Arc<SandboxFront>>,
+        tunnel_port: Option<u16>,
     ) -> Result<EgressGuard> {
-        let guard = self.start_slot(sandbox_host, front).await?;
+        let guard = self.start_slot(sandbox_host, front, tunnel_port).await?;
         guard.bind(run_id, run_rules);
         Ok(guard)
     }
@@ -544,16 +546,29 @@ impl EgressProxy {
         &self,
         sandbox_host: Option<&str>,
         front: Option<Arc<SandboxFront>>,
+        tunnel_port: Option<u16>,
     ) -> Result<EgressGuard> {
         anyhow::ensure!(
             !self.bind_ip.is_unspecified(),
             "the egress proxy must listen on the sandbox network's gateway, not on every address; leave TINFIRM_RUNNER_GIT_PROXY_BIND to an address of that network"
         );
+        anyhow::ensure!(
+            tunnel_port.is_none() || front.is_some(),
+            "only a sandbox's front serves the egress proxy through its tunnels"
+        );
         let secret = new_secret()?;
-        let listener = TcpListener::bind(SocketAddr::new(self.bind_ip, 0))
-            .await
-            .with_context(|| format!("cannot listen on {} for the egress proxy", self.bind_ip))?;
-        let port = listener.local_addr()?.port();
+        let (listener, port) = match tunnel_port {
+            Some(port) => (None, port),
+            None => {
+                let listener = TcpListener::bind(SocketAddr::new(self.bind_ip, 0))
+                    .await
+                    .with_context(|| {
+                        format!("cannot listen on {} for the egress proxy", self.bind_ip)
+                    })?;
+                let port = listener.local_addr()?.port();
+                (Some(listener), port)
+            }
+        };
         let state = Arc::new(RunState {
             binding: RwLock::new(None),
             settings: self.settings.clone(),
@@ -573,6 +588,7 @@ impl EgressProxy {
                     connector,
                     state.shutdown.clone(),
                 );
+                let listener = listener.context("a listener in this process")?;
                 tokio::spawn(serve(
                     crate::front::conn::Acceptor::listener(listener, false),
                     half,
@@ -1739,7 +1755,7 @@ mod tests {
             extra_hosts: Vec::new(),
         };
         let slot = EgressProxy::new(settings, &endpoint)
-            .start_slot(None, None)
+            .start_slot(None, None, None)
             .await
             .unwrap();
         // Unbound: not even a host-wide destination.
