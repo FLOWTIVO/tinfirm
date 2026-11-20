@@ -23,7 +23,7 @@ services:
     profiles: [oidc]
     # The image of the bundled LiteLLM, for its Python: it fetches the descriptor once. As root,
     # not as the image's non-root user: Docker creates the fresh volume root-owned.
-    image: ghcr.io/berriai/litellm-non_root:v1.109.1@sha256:e9e15fe17b66fc8cda6ff7e18914e1d452785ca404fa20336ec447152f86daba
+    image: ghcr.io/berriai/litellm-non_root:1.110.2@sha256:c3b5e373cb990e361b0e4934f77f075a9459d5e7f1a8d0e80c7d9199111ef688
     user: "0:0"
     entrypoint:
       - python3
