@@ -12,8 +12,10 @@
 //! descriptor that a front sends the other way is closed by the kernel, never received.
 //!
 //! The messages of this version: the front's [`ToMain::Ready`] with its confinement, then a
-//! round trip ([`ToFront::Ping`]) and a check that descriptors arrive ([`ToFront::Check`]).
-//! The next slices add the bridge's, the proxies' and the files' messages.
+//! round trip ([`ToFront::Ping`]) and a check that descriptors arrive ([`ToFront::Check`]);
+//! the egress proxy's listener ([`ToFront::ListenEgress`]), and its destinations, which the
+//! front asks `run` for ([`ToMain::Connect`]) and `run` connects or refuses. The next slices
+//! add the model's and git's proxies, the bridge's and the files' messages.
 
 use std::io::{IoSlice, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -45,17 +47,67 @@ pub enum ToFront {
     /// With a descriptor: write [`CHECK_REPLY`] on it, close it, and answer
     /// [`ToMain::Checked`] with the same id.
     Check { id: u64 },
+    /// With a descriptor, a TCP listener that `run` bound: serve the egress proxy's HTTP on
+    /// it, for clients that send `Proxy-Authorization: <authorization>` (crate::egress_proxy).
+    /// Every destination is `run`'s to decide ([`ToMain::Connect`]).
+    ListenEgress { authorization: String },
+    /// With a descriptor, the TCP connection `run` made for [`ToMain::Connect`] `req`.
+    Connected { req: u64 },
+    /// `run` refused [`ToMain::Connect`] `req`: the front answers its client with `status`
+    /// and `message`, and with the header `x-tinfirm-egress: denied` when `off_allowlist`
+    /// (a `403` only: the destination is on none of the run's allowlists).
+    Refused {
+        req: u64,
+        status: u16,
+        message: String,
+        off_allowlist: bool,
+    },
 }
+
+/// The longest proxy credential `run` gives a front.
+pub const MAX_AUTHORIZATION: usize = 1024;
+/// The longest destination name a front may ask for: a DNS name's limit.
+pub const MAX_HOST: usize = 253;
+/// The connections a front may have asked for and not yet seen end: its open tunnels and
+/// plain HTTP requests (256 each per run, as in-process), with room for those `run` decides.
+pub const MAX_FRONT_REQUESTS: usize = 512;
 
 impl ToFront {
     /// Whether this message comes with a descriptor.
     pub fn carries_descriptor(&self) -> bool {
-        matches!(self, ToFront::Check { .. })
+        matches!(
+            self,
+            ToFront::Check { .. } | ToFront::ListenEgress { .. } | ToFront::Connected { .. }
+        )
     }
 
-    /// Nothing to check beyond the types yet: every field is an id or a uuid.
+    /// The bounds of `run`'s messages, which a front checks too.
     pub fn check(&self) -> Result<(), String> {
-        Ok(())
+        match self {
+            ToFront::ListenEgress { authorization } if authorization.len() > MAX_AUTHORIZATION => {
+                Err(format!("a proxy credential over {MAX_AUTHORIZATION} bytes"))
+            }
+            ToFront::Refused {
+                status,
+                message,
+                off_allowlist,
+                ..
+            } => {
+                if !(400..=599).contains(status) {
+                    return Err(format!("a refusal with the status {status}"));
+                }
+                if *off_allowlist && *status != 403 {
+                    return Err(format!(
+                        "a refusal for the allowlist with the status {status}"
+                    ));
+                }
+                if message.len() > MAX_TEXT {
+                    return Err(format!("a refusal's message over {MAX_TEXT} bytes"));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -73,6 +125,18 @@ pub enum ToMain {
     Checked {
         id: u64,
     },
+    /// A client of the egress proxy wants `host:port` (a `CONNECT`, or a plain `http://`
+    /// request): `run` decides, and answers [`ToFront::Connected`] or [`ToFront::Refused`].
+    /// `req` grows with every request of the front.
+    Connect {
+        req: u64,
+        host: String,
+        port: u16,
+    },
+    /// The connection `run` gave for `req` has ended.
+    Closed {
+        req: u64,
+    },
 }
 
 impl ToMain {
@@ -87,7 +151,19 @@ impl ToMain {
                 }
                 Ok(())
             }
-            ToMain::Pong { .. } | ToMain::Checked { .. } => Ok(()),
+            ToMain::Connect { host, port, .. } => {
+                if host.is_empty() || host.len() > MAX_HOST {
+                    return Err(format!("a destination of {} bytes", host.len()));
+                }
+                if !host.bytes().all(|b| b.is_ascii_graphic()) {
+                    return Err("a destination with a byte that no host name has".into());
+                }
+                if *port == 0 {
+                    return Err("a destination with the port 0".into());
+                }
+                Ok(())
+            }
+            ToMain::Pong { .. } | ToMain::Checked { .. } | ToMain::Closed { .. } => Ok(()),
         }
     }
 }
@@ -239,6 +315,50 @@ mod tests {
             status: Status::none("y".repeat(MAX_TO_MAIN)),
         };
         assert!(encode(&big, MAX_TO_MAIN).is_err());
+    }
+
+    #[test]
+    fn a_connect_names_a_host_of_1_to_253_printable_bytes_and_a_port_other_than_0() {
+        let connect = |host: &str, port: u16| {
+            serde_json::to_vec(&ToMain::Connect {
+                req: 1,
+                host: host.into(),
+                port,
+            })
+            .unwrap()
+        };
+        assert!(decode_to_main(&connect(&"a".repeat(MAX_HOST), 443)).is_ok());
+        assert!(decode_to_main(&connect("[::1]", 1)).is_ok());
+        for (host, port) in [
+            ("", 443),
+            (&*"a".repeat(MAX_HOST + 1), 443),
+            ("example.com", 0),
+            ("exa mple.com", 443),
+            ("example.com\r\nx", 443),
+            ("ex\u{e9}mple.com", 443),
+            ("example.com\0", 443),
+        ] {
+            assert!(
+                matches!(
+                    decode_to_main(&connect(host, port)),
+                    Err(WireError::OutOfBounds(_))
+                ),
+                "{host:?}:{port}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_403_says_that_a_destination_is_off_the_allowlist() {
+        let refused = |status: u16| ToFront::Refused {
+            req: 1,
+            status,
+            message: "no".into(),
+            off_allowlist: true,
+        };
+        assert!(refused(403).check().is_ok());
+        assert!(refused(400).check().is_err());
+        assert!(refused(502).check().is_err());
     }
 
     #[test]

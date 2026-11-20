@@ -19,6 +19,14 @@
 //! - Nothing is inspected or decrypted: a tunnel is bytes. The allowlist limits where data
 //!   can go, not what it is (exfiltration to an allowed host stays possible).
 //!
+//! The proxy is in two halves. The front half serves the client's HTTP: the credential, the
+//! `CONNECT` or the absolute `http://` request, the tunnel's bytes ([`FrontHalf`], [`serve`]).
+//! The broker decides and connects ([`Connector`]): the destination's name, the allowlists,
+//! the tunnel bound, the resolved addresses. On a host whose sandboxes use the bridge, the
+//! front half runs in a confined front process (ADR-0112, path C, part 2) on the listener this
+//! host bound, and asks for each destination over its wire; this process keeps the broker,
+//! makes the connection and hands its descriptor over. Elsewhere both halves run here.
+//!
 //! Every run gets a listener of its own, on a port of the network's gateway address, which
 //! stands for the run: its rules, its list of denied destinations (shown in the run's log,
 //! so an operator sees what to allow) and its end, when the guard is dropped. The listener
@@ -492,6 +500,9 @@ pub struct EgressProxy {
     bind_ip: IpAddr,
     sandbox_host: String,
     extra_hosts: Vec<String>,
+    /// The front process that serves each listener's HTTP (ADR-0112, path C, part 2), on a
+    /// host whose sandboxes use the bridge; `None`: this process serves it.
+    front: Option<crate::front::handle::FrontCommand>,
 }
 
 impl EgressProxy {
@@ -503,7 +514,22 @@ impl EgressProxy {
             bind_ip: endpoint.bind.ip(),
             sandbox_host: endpoint.sandbox_host.clone(),
             extra_hosts: endpoint.extra_hosts.clone(),
+            front: None,
         }
+    }
+
+    /// Whether a front process serves each listener's HTTP.
+    pub fn has_front(&self) -> bool {
+        self.front.is_some()
+    }
+
+    /// Each listener's HTTP is served by a front process started with `front`: this process
+    /// only decides and connects ([`ToFront::ListenEgress`]).
+    ///
+    /// [`ToFront::ListenEgress`]: crate::front::wire::ToFront::ListenEgress
+    pub fn with_front(mut self, front: Option<crate::front::handle::FrontCommand>) -> EgressProxy {
+        self.front = front;
+        self
     }
 
     /// Starts a run's listener: the host-wide rules and `run_rules` apply until the guard is
@@ -548,7 +574,21 @@ impl EgressProxy {
             denied_count: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
         });
-        tokio::spawn(accept_loop(listener, state.clone()));
+        let (front, broker) = match &self.front {
+            None => {
+                let half = FrontHalf::new(
+                    state.expected_auth.clone(),
+                    Arc::new(Direct(state.clone())),
+                    state.shutdown.clone(),
+                );
+                tokio::spawn(serve(listener, half));
+                (None, None)
+            }
+            Some(command) => {
+                let (front, broker) = start_front(command, listener, state.clone()).await?;
+                (Some(front), Some(broker))
+            }
+        };
         let sandbox_host = sandbox_host.unwrap_or(&self.sandbox_host).to_string();
         let host = match sandbox_host.parse::<IpAddr>() {
             Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
@@ -562,8 +602,93 @@ impl EgressProxy {
             sandbox_host,
             port,
             extra_hosts: self.extra_hosts.clone(),
+            front,
+            broker,
         })
     }
+}
+
+/// Starts a front for `listener` and the broker that answers its requests: a destination it
+/// asks for is decided and connected here ([`RunState::grant`]), and the connection's
+/// descriptor goes to the front, which holds it until it says that it ended.
+async fn start_front(
+    command: &crate::front::handle::FrontCommand,
+    listener: TcpListener,
+    state: Arc<RunState>,
+) -> Result<(
+    Arc<crate::front::handle::FrontHandle>,
+    tokio::task::JoinHandle<()>,
+)> {
+    use crate::front::handle::{FrontHandle, FrontRequest};
+    let front = FrontHandle::spawn(command, Uuid::nil())
+        .await
+        .context("cannot start the egress proxy's front process")?;
+    if !front.status().seccomp {
+        tracing::warn!(
+            problem = front.status().problem.as_deref().unwrap_or("-"),
+            "the egress proxy's front process is not confined"
+        );
+    }
+    let listener = std::os::fd::OwnedFd::from(listener.into_std()?);
+    front
+        .send(
+            &crate::front::wire::ToFront::ListenEgress {
+                authorization: state.expected_auth.clone(),
+            },
+            Some(listener),
+        )
+        .await?;
+    let mut requests = front
+        .take_requests()
+        .context("the front's requests are served already")?;
+    let front = Arc::new(front);
+    let weak = Arc::downgrade(&front);
+    let broker = tokio::spawn(async move {
+        // Each connection's place, until the front says it ended (or the front ends).
+        let held: Arc<Mutex<std::collections::HashMap<u64, tokio::sync::OwnedSemaphorePermit>>> =
+            Arc::default();
+        while let Some(request) = requests.recv().await {
+            match request {
+                FrontRequest::Connect { req, host, port } => {
+                    let (state, weak, held) = (state.clone(), weak.clone(), held.clone());
+                    tokio::spawn(async move {
+                        let granted = state.grant(&host, port).await;
+                        let Some(front) = weak.upgrade() else {
+                            return;
+                        };
+                        let answered = match granted {
+                            Ok((stream, permit)) => match stream.into_std() {
+                                Ok(stream) => {
+                                    lock(&held).insert(req, permit);
+                                    front.grant(req, std::os::fd::OwnedFd::from(stream)).await
+                                }
+                                Err(e) => {
+                                    front
+                                        .refuse(
+                                            req,
+                                            &Refusal::new(
+                                                StatusCode::BAD_GATEWAY,
+                                                format!("tinfirm egress proxy: {e}\n"),
+                                            ),
+                                        )
+                                        .await
+                                }
+                            },
+                            Err(refusal) => front.refuse(req, &refusal).await,
+                        };
+                        if let Err(e) = answered {
+                            lock(&held).remove(&req);
+                            tracing::debug!(error = %format!("{e:#}"), "egress proxy: cannot answer the front");
+                        }
+                    });
+                }
+                FrontRequest::Closed { req } => {
+                    lock(&held).remove(&req);
+                }
+            }
+        }
+    });
+    Ok((front, broker))
 }
 
 /// A run's listener. Dropping it stops the listener and ends the run's open tunnels.
@@ -574,6 +699,9 @@ pub struct EgressGuard {
     sandbox_host: String,
     port: u16,
     extra_hosts: Vec<String>,
+    /// The front that serves the listener's HTTP, when one does; dropped with the guard.
+    front: Option<Arc<crate::front::handle::FrontHandle>>,
+    broker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl EgressGuard {
@@ -660,6 +788,16 @@ impl EgressGuard {
         lock(&self.state.denied).iter().cloned().collect()
     }
 
+    /// The front process that serves this listener, when one does.
+    pub fn front(&self) -> Option<&crate::front::handle::FrontHandle> {
+        self.front.as_deref()
+    }
+
+    /// The run's places in use, of its 256 open connections.
+    pub fn open_connections(&self) -> usize {
+        MAX_TUNNELS - self.state.tunnels.available_permits()
+    }
+
     /// Connections let through and refused so far.
     pub fn counts(&self) -> (u64, u64) {
         (
@@ -672,6 +810,11 @@ impl EgressGuard {
 impl Drop for EgressGuard {
     fn drop(&mut self) {
         self.state.shutdown.cancel();
+        if let Some(broker) = self.broker.take() {
+            broker.abort();
+        }
+        // The front goes with its last handle: its group is killed and it is reaped.
+        self.front.take();
         tracing::info!(run_id = %self.state.run_label(), "egress proxy stopped for a run");
     }
 }
@@ -743,120 +886,99 @@ impl RunState {
     }
 }
 
-async fn accept_loop(listener: TcpListener, state: Arc<RunState>) {
-    let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    loop {
-        let permit = tokio::select! {
-            _ = state.shutdown.cancelled() => break,
-            permit = limit.clone().acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => break,
-            },
-        };
-        let stream = tokio::select! {
-            _ = state.shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(e) => {
-                    tracing::warn!(error = %e, "egress proxy: accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            },
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let shutdown = state.shutdown.clone();
-            let service = hyper::service::service_fn(move |req| {
-                let state = state.clone();
-                async move { Ok::<_, Infallible>(handle(state, req).await) }
+// ----- the broker: `run`'s side of a destination ------------------------------------------
+
+/// Why a destination is not given: the status and text its client gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    pub message: String,
+    /// The destination is on none of the run's allowlists: its client gets the header
+    /// `x-tinfirm-egress: denied`, which says what to allow. Only that refusal sets it.
+    pub off_allowlist: bool,
+}
+
+impl Refusal {
+    fn new(status: StatusCode, message: impl Into<String>) -> Refusal {
+        Refusal {
+            status: status.as_u16(),
+            message: message.into(),
+            off_allowlist: false,
+        }
+    }
+}
+
+impl RunState {
+    /// The broker's decision for `host:port`, which the front half asks for (in this process,
+    /// or a front's over its wire): the destination's name or address is checked, then the
+    /// allowlists, the tunnel bound and the addresses it resolves to, and only then is a
+    /// connection made. A refusal is counted and remembered, as before.
+    async fn grant(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<(TcpStream, tokio::sync::OwnedSemaphorePermit), Refusal> {
+        if port == 0 || host.is_empty() || host.len() > crate::front::wire::MAX_HOST {
+            self.denied_count.fetch_add(1, Ordering::Relaxed);
+            return Err(Refusal::new(
+                StatusCode::BAD_REQUEST,
+                "tinfirm egress proxy: CONNECT needs host:port\n",
+            ));
+        }
+        let target = Target::new(host, port);
+        if target.ip.is_none()
+            && let Err(why) = check_hostname(&target.host)
+        {
+            self.denied_count.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(run_id = %self.run_label(), why = %why, "egress refused: not a host name");
+            return Err(Refusal::new(
+                StatusCode::BAD_REQUEST,
+                "tinfirm egress proxy: not a host name\n",
+            ));
+        }
+        if !self.allows(&target) {
+            self.deny(&target);
+            return Err(Refusal {
+                off_allowlist: true,
+                ..Refusal::new(
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "tinfirm egress proxy: {} is not on this sandbox's allowlist\n",
+                        target.label()
+                    ),
+                )
             });
-            let mut builder = hyper::server::conn::http1::Builder::new();
-            builder
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT);
-            let connection = builder
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
-            tokio::select! {
-                result = connection => {
-                    if let Err(e) = result {
-                        tracing::debug!(error = %e, "egress proxy: connection ended with an error");
-                    }
-                }
-                _ = shutdown.cancelled() => {}
+        }
+        let Ok(permit) = self.tunnels.clone().try_acquire_owned() else {
+            return Err(Refusal::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tinfirm egress proxy: too many open tunnels\n",
+            ));
+        };
+        match connect_vetted(self, &target).await {
+            Ok(stream) => {
+                self.allowed_count.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(run_id = %self.run_label(), destination = %target.label(), "egress connection");
+                Ok((stream, permit))
             }
-        });
+            Err(refusal) => {
+                self.deny(&target);
+                Err(refusal)
+            }
+        }
     }
-}
-
-fn basic_auth(secret: &str) -> String {
-    format!(
-        "Basic {}",
-        STANDARD.encode(format!("{PROXY_USER}:{secret}"))
-    )
-}
-
-fn text(status: StatusCode, message: impl Into<String>) -> Response<ProxyBody> {
-    let body = Full::new(Bytes::from(message.into()))
-        .map_err(|never| match never {})
-        .boxed_unsync();
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn denied_response(target: &Target) -> Response<ProxyBody> {
-    let mut response = text(
-        StatusCode::FORBIDDEN,
-        format!(
-            "tinfirm egress proxy: {} is not on this sandbox's allowlist\n",
-            target.label()
-        ),
-    );
-    response
-        .headers_mut()
-        .insert("x-tinfirm-egress", HeaderValue::from_static("denied"));
-    response
-}
-
-async fn handle(state: Arc<RunState>, req: Request<Incoming>) -> Response<ProxyBody> {
-    let authorized = req
-        .headers()
-        .get(header::PROXY_AUTHORIZATION)
-        .is_some_and(|v| secret_eq(v.as_bytes(), state.expected_auth.as_bytes()));
-    if !authorized {
-        let mut response = text(
-            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-            "tinfirm egress proxy: this sandbox's proxy credential is missing or wrong\n",
-        );
-        response.headers_mut().insert(
-            header::PROXY_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"tinfirm egress\""),
-        );
-        return response;
-    }
-    if req.method() == Method::CONNECT {
-        return connect(state, req).await;
-    }
-    forward(state, req).await
 }
 
 /// Resolves the target and connects to an address that is allowed to be reached.
 async fn connect_vetted(
     state: &RunState,
     target: &Target,
-) -> std::result::Result<TcpStream, Box<Response<ProxyBody>>> {
+) -> std::result::Result<TcpStream, Refusal> {
     let bad_gateway = |why: String| {
-        Box::new(text(
+        Refusal::new(
             StatusCode::BAD_GATEWAY,
             format!("tinfirm egress proxy: {why}\n"),
-        ))
+        )
     };
     let addrs: Vec<SocketAddr> = match target.ip {
         Some(ip) => vec![SocketAddr::new(ip, target.port)],
@@ -906,20 +1028,197 @@ async fn connect_vetted(
             "cannot connect to {}: {error}",
             target.label()
         ))),
-        (None, why) => {
-            let why = why.unwrap_or("refused");
-            Err(Box::new(text(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "tinfirm egress proxy: {} resolves to a {why} address, which no allowlist entry opens\n",
-                    target.label()
-                ),
-            )))
-        }
+        (None, why) => Err(Refusal::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "tinfirm egress proxy: {} resolves to a {} address, which no allowlist entry opens\n",
+                target.label(),
+                why.unwrap_or("refused")
+            ),
+        )),
     }
 }
 
-async fn connect(state: Arc<RunState>, req: Request<Incoming>) -> Response<ProxyBody> {
+/// A connection given for a destination; `held` (its tunnel's place, or the front's notice
+/// that it ended) goes when the connection is done.
+pub struct Granted {
+    pub stream: TcpStream,
+    pub held: Box<dyn Send + Sync>,
+}
+
+/// Where the front half gets its connections: the broker in this process, or `run` over a
+/// front's wire.
+pub trait Connector: Send + Sync + 'static {
+    fn connect(
+        &self,
+        host: String,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<Granted, Refusal>> + Send>,
+    >;
+}
+
+/// The broker in this process (a host whose sandboxes do not use the bridge).
+struct Direct(Arc<RunState>);
+
+impl Connector for Direct {
+    fn connect(
+        &self,
+        host: String,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::result::Result<Granted, Refusal>> + Send>,
+    > {
+        let state = self.0.clone();
+        Box::pin(async move {
+            let (stream, permit) = state.grant(&host, port).await?;
+            Ok(Granted {
+                stream,
+                held: Box::new(permit),
+            })
+        })
+    }
+}
+
+// ----- the front half: the proxy's HTTP --------------------------------------------------
+
+/// The proxy's HTTP side for one listener: the credential it wants and where it gets its
+/// connections. It parses the client's requests; it decides nothing about destinations.
+pub struct FrontHalf {
+    expected_auth: String,
+    connector: Arc<dyn Connector>,
+    shutdown: CancellationToken,
+}
+
+impl FrontHalf {
+    pub fn new(
+        expected_auth: String,
+        connector: Arc<dyn Connector>,
+        shutdown: CancellationToken,
+    ) -> Arc<FrontHalf> {
+        Arc::new(FrontHalf {
+            expected_auth,
+            connector,
+            shutdown,
+        })
+    }
+}
+
+/// Serves the proxy's HTTP on `listener` until the half's shutdown.
+pub async fn serve(listener: TcpListener, half: Arc<FrontHalf>) {
+    let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    loop {
+        let permit = tokio::select! {
+            _ = half.shutdown.cancelled() => break,
+            permit = limit.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let stream = tokio::select! {
+            _ = half.shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    tracing::warn!(error = %e, "egress proxy: accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let half = half.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let shutdown = half.shutdown.clone();
+            let service = hyper::service::service_fn(move |req| {
+                let half = half.clone();
+                async move { Ok::<_, Infallible>(handle(half, req).await) }
+            });
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT);
+            let connection = builder
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades();
+            tokio::select! {
+                result = connection => {
+                    if let Err(e) = result {
+                        tracing::debug!(error = %e, "egress proxy: connection ended with an error");
+                    }
+                }
+                _ = shutdown.cancelled() => {}
+            }
+        });
+    }
+}
+
+fn basic_auth(secret: &str) -> String {
+    format!(
+        "Basic {}",
+        STANDARD.encode(format!("{PROXY_USER}:{secret}"))
+    )
+}
+
+fn text(status: StatusCode, message: impl Into<String>) -> Response<ProxyBody> {
+    let body = Full::new(Bytes::from(message.into()))
+        .map_err(|never| match never {})
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+/// The answer to a refused destination; a refusal of the allowlist says so in a header.
+fn refused(refusal: Refusal) -> Response<ProxyBody> {
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = text(status, refusal.message);
+    if refusal.off_allowlist {
+        response
+            .headers_mut()
+            .insert("x-tinfirm-egress", HeaderValue::from_static("denied"));
+    }
+    response
+}
+
+async fn handle(half: Arc<FrontHalf>, req: Request<Incoming>) -> Response<ProxyBody> {
+    let authorized = req
+        .headers()
+        .get(header::PROXY_AUTHORIZATION)
+        .is_some_and(|v| secret_eq(v.as_bytes(), half.expected_auth.as_bytes()));
+    if !authorized {
+        let mut response = text(
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "tinfirm egress proxy: this sandbox's proxy credential is missing or wrong\n",
+        );
+        response.headers_mut().insert(
+            header::PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"tinfirm egress\""),
+        );
+        return response;
+    }
+    // A destination names a host and a port, nothing more: no user name in it.
+    if req
+        .uri()
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "tinfirm egress proxy: a destination with a user name\n",
+        );
+    }
+    if req.method() == Method::CONNECT {
+        return connect(half, req).await;
+    }
+    forward(half, req).await
+}
+
+async fn connect(half: Arc<FrontHalf>, req: Request<Incoming>) -> Response<ProxyBody> {
     let Some(target) = req
         .uri()
         .authority()
@@ -930,28 +1229,18 @@ async fn connect(state: Arc<RunState>, req: Request<Incoming>) -> Response<Proxy
             "tinfirm egress proxy: CONNECT needs host:port\n",
         );
     };
-    if !state.allows(&target) {
-        state.deny(&target);
-        return denied_response(&target);
-    }
-    let Ok(permit) = state.tunnels.clone().try_acquire_owned() else {
-        return text(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "tinfirm egress proxy: too many open tunnels\n",
-        );
+    let granted = match half
+        .connector
+        .connect(target.host.clone(), target.port)
+        .await
+    {
+        Ok(granted) => granted,
+        Err(refusal) => return refused(refusal),
     };
-    let upstream = match connect_vetted(&state, &target).await {
-        Ok(stream) => stream,
-        Err(response) => {
-            state.deny(&target);
-            return *response;
-        }
-    };
-    state.allowed_count.fetch_add(1, Ordering::Relaxed);
-    tracing::debug!(run_id = %state.run_label(), destination = %target.label(), "egress tunnel");
-    let shutdown = state.shutdown.clone();
+    let shutdown = half.shutdown.clone();
     tokio::spawn(async move {
-        let _permit = permit;
+        let Granted { stream, held } = granted;
+        let _held = held;
         let upgraded = match hyper::upgrade::on(req).await {
             Ok(upgraded) => upgraded,
             Err(e) => {
@@ -960,7 +1249,7 @@ async fn connect(state: Arc<RunState>, req: Request<Incoming>) -> Response<Proxy
             }
         };
         let mut client = TokioIo::new(upgraded);
-        let mut upstream = upstream;
+        let mut upstream = stream;
         tokio::select! {
             result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
                 if let Err(e) = result {
@@ -1006,7 +1295,7 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 /// A plain `http://` request in absolute form, sent on in origin form.
-async fn forward(state: Arc<RunState>, req: Request<Incoming>) -> Response<ProxyBody> {
+async fn forward(half: Arc<FrontHalf>, req: Request<Incoming>) -> Response<ProxyBody> {
     let uri = req.uri().clone();
     let (Some("http"), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
         return text(
@@ -1017,18 +1306,6 @@ async fn forward(state: Arc<RunState>, req: Request<Incoming>) -> Response<Proxy
     let Some(target) = Target::from_authority(authority, Some(80)) else {
         return text(StatusCode::BAD_REQUEST, "tinfirm egress proxy: no host\n");
     };
-    if !state.allows(&target) {
-        state.deny(&target);
-        return denied_response(&target);
-    }
-    let stream = match connect_vetted(&state, &target).await {
-        Ok(stream) => stream,
-        Err(response) => {
-            state.deny(&target);
-            return *response;
-        }
-    };
-    state.allowed_count.fetch_add(1, Ordering::Relaxed);
     let (mut parts, body) = req.into_parts();
     let origin_form = uri
         .path_and_query()
@@ -1036,6 +1313,14 @@ async fn forward(state: Arc<RunState>, req: Request<Incoming>) -> Response<Proxy
     parts.uri = match origin_form.parse() {
         Ok(uri) => uri,
         Err(_) => return text(StatusCode::BAD_REQUEST, "tinfirm egress proxy: bad path\n"),
+    };
+    let granted = match half
+        .connector
+        .connect(target.host.clone(), target.port)
+        .await
+    {
+        Ok(granted) => granted,
+        Err(refusal) => return refused(refusal),
     };
     strip_hop_by_hop(&mut parts.headers);
     // The destination that was checked is the one the request names, not the one the client's
@@ -1049,13 +1334,16 @@ async fn forward(state: Arc<RunState>, req: Request<Incoming>) -> Response<Proxy
             format!("tinfirm egress proxy: {why}\n"),
         )
     };
+    let Granted { stream, held } = granted;
     let (mut sender, connection) =
         match hyper::client::conn::http1::handshake(TokioIo::new(stream)).await {
             Ok(pair) => pair,
             Err(e) => return bad_gateway(format!("{}: {e}", target.label())),
         };
-    let shutdown = state.shutdown.clone();
+    let shutdown = half.shutdown.clone();
     tokio::spawn(async move {
+        // The connection's place is held until the upstream connection ends.
+        let _held = held;
         tokio::select! {
             _ = connection => {}
             _ = shutdown.cancelled() => {}
@@ -1392,6 +1680,115 @@ mod tests {
         let mut answer = String::new();
         stream.read_to_string(&mut answer).await.unwrap();
         answer
+    }
+
+    /// A connector that records what the front half asks for and refuses all of it.
+    struct Recording(Mutex<Vec<(String, u16)>>);
+
+    impl Connector for Recording {
+        fn connect(
+            &self,
+            host: String,
+            port: u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::result::Result<Granted, Refusal>> + Send>,
+        > {
+            lock(&self.0).push((host, port));
+            Box::pin(async { Err(Refusal::new(StatusCode::FORBIDDEN, "no\n")) })
+        }
+    }
+
+    /// Sends `bytes` to `addr` and reads what comes back within a second.
+    async fn exchange(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let _ = stream.write_all(bytes).await;
+        let _ = stream.shutdown().await;
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut answer)).await;
+        answer
+    }
+
+    #[tokio::test]
+    async fn hostile_clients_of_the_front_half_reach_the_broker_only_with_a_well_formed_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recording = Arc::new(Recording(Mutex::new(Vec::new())));
+        let auth = basic_auth("the-secret");
+        let half = FrontHalf::new(auth.clone(), recording.clone(), CancellationToken::new());
+        tokio::spawn(serve(listener, half));
+        let a = format!("Proxy-Authorization: {auth}\r\n");
+        // Malformed requests, smuggling, oversized heads, wrong credentials: none reaches it.
+        let hostile = [
+            format!("CONNECT example.com HTTP/1.1\r\n{a}\r\n"),
+            format!("CONNECT user@example.com:443 HTTP/1.1\r\n{a}\r\n"),
+            format!("GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n{a}\r\n"),
+            format!("GET /relative HTTP/1.1\r\nHost: example.com\r\n{a}\r\n"),
+            format!(
+                "GET http://example.com/ HTTP/1.1\r\nX: {}\r\n{a}\r\n",
+                "y".repeat(512 * 1024)
+            ),
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic eDp5\r\n\r\n"
+                .to_string(),
+            "CONNECT example.com:443 HTTP/1.1\r\n\r\n".to_string(),
+            format!("CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: {auth}x\r\n\r\n"),
+            "\x16\x03\x01\x02\x00\x01\x00\x01\x7f\x03\x03".to_string(),
+            format!("connect example.com:443 HTTP/1.1\r\n{a}\r\n"),
+            format!("GET http://exa mple.com/ HTTP/1.1\r\n{a}\r\n"),
+        ];
+        for request in &hostile {
+            let before = lock(&recording.0).len();
+            let answer = exchange(addr, request.as_bytes()).await;
+            assert_eq!(lock(&recording.0).len(), before, "{request:.100}");
+            let answer = String::from_utf8_lossy(&answer);
+            assert!(
+                answer.is_empty()
+                    || answer.starts_with("HTTP/1.1 4")
+                    || answer.starts_with("HTTP/1.1 5"),
+                "{request:.80}: {answer:.120}"
+            );
+        }
+        // Seeded random bytes, as a client that sends anything.
+        let mut state: u64 = 0x5eed_0123_4567_89ab;
+        for _ in 0..100 {
+            let mut bytes = Vec::new();
+            for _ in 0..(state % 300 + 1) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push(
+                    b"CONECT GHTP/1.: \r\nexample.com443Proxy-Authorization"[state as usize % 50],
+                );
+            }
+            let answer = exchange(addr, &bytes).await;
+            let answer = String::from_utf8_lossy(&answer);
+            assert!(
+                answer.is_empty()
+                    || answer.starts_with("HTTP/1.1 4")
+                    || answer.starts_with("HTTP/1.1 5"),
+                "{answer:.120}"
+            );
+        }
+        assert!(lock(&recording.0).is_empty(), "{:?}", lock(&recording.0));
+        // A message with both Content-Length and Transfer-Encoding: hyper reads it as chunked
+        // and drops Content-Length (RFC 9112, 6.3), so it goes on with one framing, which the
+        // client of the upstream connection sets again; the broker sees only its destination.
+        let before = lock(&recording.0).len();
+        let answer = exchange(
+            addr,
+            format!("POST http://example.com/ HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n{a}\r\n0\r\n\r\n").as_bytes(),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 403"));
+        assert_eq!(lock(&recording.0).len(), before + 1);
+        lock(&recording.0).clear();
+        // A well-formed request does reach it, with the name and port it names.
+        let answer = exchange(
+            addr,
+            format!("CONNECT Example.COM.:8443 HTTP/1.1\r\nHost: x\r\n{a}\r\n").as_bytes(),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 403"));
+        assert_eq!(*lock(&recording.0), vec![("example.com".to_string(), 8443)]);
     }
 
     #[tokio::test]

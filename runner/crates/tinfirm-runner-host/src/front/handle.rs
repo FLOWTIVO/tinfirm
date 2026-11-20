@@ -116,7 +116,25 @@ impl std::fmt::Display for Ended {
 struct Pending {
     pongs: HashMap<u64, oneshot::Sender<()>>,
     checks: HashMap<u64, oneshot::Sender<()>>,
+    /// The front's own requests (`connect`) that are open: `true` once `run` gave the
+    /// connection, until the front says it ended.
+    connects: HashMap<u64, bool>,
+    /// The last request id the front used: ids only grow.
+    last_req: u64,
 }
+
+/// What a front asks `run` for ([`FrontHandle::take_requests`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontRequest {
+    /// A connection to `host:port`, for the egress proxy: answer with
+    /// [`FrontHandle::grant`] or [`FrontHandle::refuse`].
+    Connect { req: u64, host: String, port: u16 },
+    /// The connection given for `req` has ended.
+    Closed { req: u64 },
+}
+
+/// The front's requests that wait for their consumer.
+const REQUEST_QUEUE: usize = 64;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -156,6 +174,7 @@ pub struct FrontHandle {
     life: Arc<Life>,
     answer_timeout: Duration,
     send_timeout: Duration,
+    requests: Mutex<Option<tokio::sync::mpsc::Receiver<FrontRequest>>>,
 }
 
 impl std::fmt::Debug for FrontHandle {
@@ -240,14 +259,15 @@ impl FrontHandle {
         };
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (ended_tx, ended) = watch::channel(None);
+        let (requests_tx, requests) = tokio::sync::mpsc::channel(REQUEST_QUEUE);
         tokio::spawn(read_loop(
             reader,
             child,
-            pgid,
             pending.clone(),
             ended_tx,
             stderr,
             life.clone(),
+            requests_tx,
         ));
         let handle = FrontHandle {
             pgid,
@@ -259,6 +279,7 @@ impl FrontHandle {
             life,
             answer_timeout: ANSWER_TIMEOUT,
             send_timeout: SEND_TIMEOUT,
+            requests: Mutex::new(Some(requests)),
         };
         handle.send(&ToFront::Init { run: run_id }, None).await?;
         Ok(handle)
@@ -352,6 +373,47 @@ impl FrontHandle {
         // The descriptor is the front's now; `run`'s copy goes.
         drop(descriptor);
         Ok(())
+    }
+
+    /// The front's requests, in order: taken once, by whoever serves them. They wait (and hold
+    /// the front back) while no one takes them.
+    pub fn take_requests(&self) -> Option<tokio::sync::mpsc::Receiver<FrontRequest>> {
+        lock(&self.requests).take()
+    }
+
+    /// Gives the front the connection for its request `req`.
+    pub async fn grant(&self, req: u64, connection: OwnedFd) -> Result<()> {
+        match lock(&self.pending).connects.get_mut(&req) {
+            Some(granted @ false) => *granted = true,
+            _ => bail!("no open request {req} of the front waits for a connection"),
+        }
+        self.send(&ToFront::Connected { req }, Some(connection))
+            .await
+    }
+
+    /// Refuses the front's request `req`, with what its client is to get.
+    pub async fn refuse(&self, req: u64, refusal: &crate::egress_proxy::Refusal) -> Result<()> {
+        match lock(&self.pending).connects.remove(&req) {
+            Some(false) => {}
+            _ => bail!("no open request {req} of the front waits for an answer"),
+        }
+        let mut message: String = refusal.message.chars().take(wire::MAX_TEXT / 4).collect();
+        message.truncate(wire::MAX_TEXT);
+        self.send(
+            &ToFront::Refused {
+                req,
+                status: refusal.status,
+                message,
+                off_allowlist: refusal.off_allowlist,
+            },
+            None,
+        )
+        .await
+    }
+
+    /// The front's requests that are open: asked, or given and not yet ended.
+    pub fn open_requests(&self) -> usize {
+        lock(&self.pending).connects.len()
     }
 
     /// One round trip.
@@ -467,6 +529,8 @@ fn kind(message: &ToMain) -> &'static str {
         ToMain::Ready { .. } => "ready",
         ToMain::Pong { .. } => "pong",
         ToMain::Checked { .. } => "checked",
+        ToMain::Connect { .. } => "connect",
+        ToMain::Closed { .. } => "closed",
     }
 }
 
@@ -494,11 +558,11 @@ async fn read_message(reader: &mut OwnedReadHalf) -> Result<Option<ToMain>> {
 async fn read_loop(
     mut reader: OwnedReadHalf,
     mut child: tokio::process::Child,
-    pgid: u32,
     pending: Arc<Mutex<Pending>>,
     ended: watch::Sender<Option<Ended>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     life: Arc<Life>,
+    requests: tokio::sync::mpsc::Sender<FrontRequest>,
 ) {
     let broken = loop {
         let message = match read_message(&mut reader).await {
@@ -506,10 +570,48 @@ async fn read_loop(
             Ok(None) => break None,
             Err(e) => break Some(format!("{e:#}")),
         };
+        // The front's own requests: in order, bounded, and each closed only once given.
+        let request = {
+            let mut pending = lock(&pending);
+            match &message {
+                ToMain::Connect { req, host, port } => {
+                    if *req <= pending.last_req {
+                        break Some(format!("a request {req} after {}", pending.last_req));
+                    }
+                    if pending.connects.len() >= wire::MAX_FRONT_REQUESTS {
+                        break Some(format!(
+                            "more than {} open requests",
+                            wire::MAX_FRONT_REQUESTS
+                        ));
+                    }
+                    pending.last_req = *req;
+                    pending.connects.insert(*req, false);
+                    Some(FrontRequest::Connect {
+                        req: *req,
+                        host: host.clone(),
+                        port: *port,
+                    })
+                }
+                ToMain::Closed { req } => match pending.connects.remove(req) {
+                    Some(true) => Some(FrontRequest::Closed { req: *req }),
+                    Some(false) => {
+                        break Some(format!("request {req} closed before it was given"));
+                    }
+                    None => break Some(format!("an unknown request {req} closed")),
+                },
+                _ => None,
+            }
+        };
+        if let Some(request) = request {
+            if requests.send(request).await.is_err() {
+                break Some("no one serves the front's requests".to_string());
+            }
+            continue;
+        }
         let answered = {
             let mut pending = lock(&pending);
             match message {
-                ToMain::Ready { .. } => None,
+                ToMain::Ready { .. } | ToMain::Connect { .. } | ToMain::Closed { .. } => None,
                 ToMain::Pong { id } => pending.pongs.remove(&id),
                 ToMain::Checked { id } => pending.checks.remove(&id),
             }
@@ -522,7 +624,7 @@ async fn read_loop(
         }
     };
     if let Some(why) = &broken {
-        tracing::warn!(pgid, why = %why, "a front broke its wire; it is ended");
+        tracing::warn!(pid = ?child.id(), why = %why, "a front broke its wire; it is ended");
     }
     // A front whose wire broke is killed before it is reaped; one that closed its channel is
     // waited for, and killed if it stays (it may not keep anything running).
@@ -554,6 +656,7 @@ async fn read_loop(
     let mut pending = lock(&pending);
     pending.pongs.clear();
     pending.checks.clear();
+    pending.connects.clear();
     drop(pending);
     let _ = ended.send(Some(how));
 }

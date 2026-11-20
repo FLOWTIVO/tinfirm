@@ -31,12 +31,20 @@ pub struct BridgeOptions {
     /// host's own executable, which `run` sets; by default `binary`, which is the same file
     /// unless `TINFIRM_RUNNER_BRIDGE_BINARY` names another.
     pub reader: crate::reader::Reader,
+    /// The front processes of the sandboxes (ADR-0112, path C, part 2): this host's own
+    /// executable's `front`, which `run` sets; by default `binary`'s.
+    pub front: crate::front::handle::FrontCommand,
 }
 
 impl BridgeOptions {
     pub fn new(binary: PathBuf) -> BridgeOptions {
         BridgeOptions {
             reader: crate::reader::Reader::new(binary.clone()),
+            front: crate::front::handle::FrontCommand {
+                program: binary.clone(),
+                args: vec![crate::front::SUBCOMMAND.to_string()],
+                env: Vec::new(),
+            },
             binary,
             connect_timeout: Duration::from_secs(180),
             timing: HostTiming::default(),

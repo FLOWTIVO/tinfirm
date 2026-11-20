@@ -245,6 +245,20 @@ variables, and an upstream corporate proxy is not supported yet. A run's log lis
 (`403`, header `x-tinfirm-egress: denied`), so you can see what to allow. The proxy does not read
 traffic: it limits where data can go, not what it is.
 
+**Its two halves.** A sandbox speaks HTTP to the proxy: `CONNECT host:port` for a tunnel, or a
+request with an absolute `http://` URL. The part that parses this (the request, the
+`Proxy-Authorization` check and the copying of a tunnel's bytes) is one half; the decision is
+the other: whether the destination is on the run's allowlist, where its name resolves, whether that
+address is refused, the limit of 256 open connections per run (plain requests count too), and
+the connection itself. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), each listener's
+parsing half runs in a [front process](#sandbox-bridge) of its own, confined, which cannot make a
+connection: it asks `run` for each one by name and port, and `run` decides, connects and hands
+it the connected socket, or answers with the refusal (`400`, `403`, `502` or `503`) that the
+front gives the sandbox. `run` logs each refusal, and a front that asks for more than the wire allows
+(more than 512 open connections, a name over 253 bytes or not printable, port 0, an answer it
+did not wait for) is ended with its listener. Without the bridge both halves run in `run`. A
+destination with a user name (`user@host`) is refused with `400` either way.
+
 **Requirements.** Docker Engine on Linux. With Docker Desktop (or any engine in a VM) `run`
 refuses `--egress-proxy`: the sandboxes would reach this machine as `host.docker.internal`, which an
 internal network cannot route to.
@@ -789,13 +803,15 @@ not run by hand; `reader.rs`, `confine.rs`).
 - **The front process (being built).** Path C's second part moves the rest of what `run` parses
   from a sandbox (the bridge's TLS, frames and tunnels, and the HTTP of the proxies and the
   platform tools) into a confined process per sandbox, the front, which holds that sandbox's own
-  powers and no credential. `run` does not start it yet. What exists is its confinement, which it
-  applies to itself before it builds its runtime: limits of 512 MiB of data, 1024 descriptors and
+  powers and no credential. So far `run` starts one for each listener of the
+  [egress proxy](#egress-proxy) and the front serves that listener's HTTP; the other listeners
+  and the bridge follow. A front that cannot be confined serves all the same, with a warning in
+  `run`'s log. Its confinement, which it applies to itself before it builds its runtime: limits of 512 MiB of data, 1024 descriptors and
   no core file; not dumpable; Landlock with no directory at all (only `/dev/null` and
   `/dev/urandom`); and the reader's seccomp filter, with on top of it no `execve`, no new process
   (threads only), no `connect`, `bind` or `listen`, and no signal outside its own process group,
   the signal 0 included. A pair of Unix sockets stays allowed, which reaches no other process.
-  `doctor` starts one and says `front: confined: …`, or why not, as a note.
+  `doctor` starts one and says `front: confined: …`, or why not.
   - **Its wire to `run`.** A front's stdin is one end of a pair of Unix sockets, its control
     channel; `run` holds the other. Each message is its length in 4 bytes, then JSON of one of a
     closed set of messages with no unknown field: at most 64 KiB from a front, 1 MiB from `run`.
@@ -815,8 +831,17 @@ not run by hand; `reader.rs`, `confine.rs`).
     with the reaping, so a group id given to another process since is never signalled; the host
     reaps every front, also after its handle is dropped.
     `doctor` also tries the wire, on a line of its own: `[ ok ] front wire: ready, a round
-    trip, a descriptor passed`, or a warning with the reason (a failure once `run` starts
-    fronts).
+    trip, a descriptor passed`, or a failure with the reason when `run` would start fronts
+    (`--sandbox-bridge` or `--executor vm`), since no run starts there without one. The
+    `front` line is a warning there when the front cannot be confined.
+  - **The egress messages.** `run` passes the front the listener's socket with the credential
+    it must ask for; the front sends `connect` with a request number that only grows, a host
+    name or address and a port, and `closed` once that connection ends; `run` answers with
+    `connected` and the socket, or `refused` with a status, a message and whether the
+    destination is off the allowlist (only then does the client get `x-tinfirm-egress:
+    denied`). `run` holds a connection's place in the 256 until its `closed` comes, or the
+    front ends; a connection whose client left while `run` connected is closed by the front at
+    once, with its `closed`.
 
 ## A VM per run
 

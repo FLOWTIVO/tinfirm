@@ -316,6 +316,81 @@ fn hostile_front_child() {
             let _ = next_message_init(&socket);
             std::process::exit(0);
         }
+        "connect-hostile" | "connect-abuse" | "closed-unknown" | "connect-flood"
+        | "connect-long" => {
+            use std::io::Read;
+            let _ = out.write_all(&frame(&ready()));
+            // `init`, then the listener `run` passes (which this fake front never serves).
+            let mut channel = std::fs::File::from(socket.try_clone().unwrap());
+            let mut read_frame = || -> Option<ToFront> {
+                let mut header = [0u8; 4];
+                channel.read_exact(&mut header).ok()?;
+                let mut payload = vec![0u8; u32::from_be_bytes(header) as usize];
+                channel.read_exact(&mut payload).ok()?;
+                wire::decode_to_front(&payload).ok()
+            };
+            if mode != "connect-flood" {
+                let _ = read_frame();
+                let _ = read_frame();
+            }
+            let connect = |req: u64, host: &str, port: u16| {
+                frame(&ToMain::Connect {
+                    req,
+                    host: host.into(),
+                    port,
+                })
+            };
+            match mode.as_str() {
+                "connect-hostile" => {
+                    // Destinations that `run` must refuse, each answered with its status.
+                    let cases: &[(&str, u16, u16)] = &[
+                        ("a..b", 443, 400),
+                        ("-bad.example", 443, 400),
+                        ("bad_name!.example", 443, 400),
+                        ("example.com", 443, 403),
+                        ("127.0.0.1", 443, 403),
+                        ("169.254.169.254", 80, 403),
+                        ("::1", 443, 403),
+                        ("[::1]", 443, 403),
+                        ("localhost", 443, 403),
+                        ("allowed.invalid", 443, 502),
+                    ];
+                    let mut failed = Vec::new();
+                    for (i, (host, port, status)) in cases.iter().enumerate() {
+                        let _ = out.write_all(&connect(i as u64 + 1, host, *port));
+                        match read_frame() {
+                            Some(ToFront::Refused {
+                                req, status: got, ..
+                            }) if req == i as u64 + 1 && got == *status => {}
+                            other => failed.push(format!("{host}:{port}: {other:?}")),
+                        }
+                    }
+                    if failed.is_empty() {
+                        std::process::exit(0);
+                    }
+                    eprintln!("not refused as expected: {failed:?}");
+                    std::process::exit(1);
+                }
+                "connect-abuse" => {
+                    let _ = out.write_all(&connect(5, "example.com", 443));
+                    let _ = out.write_all(&connect(3, "example.com", 443));
+                }
+                "closed-unknown" => {
+                    let _ = out.write_all(&frame(&ToMain::Closed { req: 9 }));
+                }
+                "connect-long" => {
+                    let _ = out.write_all(&connect(1, &"a".repeat(254), 443));
+                }
+                _ => {
+                    // `run`'s consumer takes the requests and answers none of them.
+                    for req in 1..=600u64 {
+                        if out.write_all(&connect(req, "example.com", 443)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         "deaf" => {
             // Ready, and then it never reads its channel.
             let _ = out.write_all(&frame(&ready()));
@@ -763,6 +838,351 @@ async fn fronts_started_and_dropped_by_the_hundred_leave_no_zombie() {
     );
 }
 
+// ----- the egress proxy through a front (slice 3) -------------------------------------------
+
+use tinfirm_runner_host::egress_proxy::{EgressGuard, EgressProxy, EgressSettings, Rule};
+use tinfirm_runner_host::git_proxy::Endpoint;
+
+/// An egress proxy whose listeners a front serves, with `allow` and loopback as `loopback`.
+async fn egress_through(front: FrontCommand, allow: &[String], loopback: bool) -> EgressGuard {
+    egress_with(Some(front), allow, loopback).await
+}
+
+/// An egress proxy whose front half runs in a front, or in this process without one.
+async fn egress_with(front: Option<FrontCommand>, allow: &[String], loopback: bool) -> EgressGuard {
+    let settings = EgressSettings {
+        allow: allow.iter().map(|r| Rule::parse(r).unwrap()).collect(),
+        allow_private: false,
+        allow_loopback: loopback,
+    };
+    let endpoint = Endpoint {
+        bind: "127.0.0.2:0".parse().unwrap(),
+        sandbox_host: "127.0.0.2".into(),
+        extra_hosts: Vec::new(),
+    };
+    EgressProxy::new(settings, &endpoint)
+        .with_front(front)
+        .start_run(uuid::Uuid::new_v4(), Vec::new())
+        .await
+        .unwrap()
+}
+
+/// A server that echoes each connection's bytes, and answers `GET` with "hello".
+async fn echo_and_http() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut first = true;
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if first && buf.starts_with(b"GET ") {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
+                            .await;
+                        break;
+                    }
+                    first = false;
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+async fn proxy_request(guard: &EgressGuard, request: &str) -> (tokio::net::TcpStream, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(guard.local_addr())
+        .await
+        .unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read_exact(&mut byte).await.is_err() {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    (stream, String::from_utf8_lossy(&head).into_owned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_egress_proxy_in_a_front_tunnels_forwards_and_refuses_as_run_decides() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = echo_and_http().await;
+    let guard = egress_through(the_front(), &[format!("127.0.0.1:{}", server.port())], true).await;
+    let front = guard.front().expect("a front serves the listener");
+    assert!(front.status().seccomp);
+    let auth = guard.proxy_authorization().to_string();
+    // A tunnel to an allowed destination: the front copies its bytes.
+    let (mut tunnel, head) = proxy_request(
+        &guard,
+        &format!(
+            "CONNECT {server} HTTP/1.1\r\nHost: {server}\r\nProxy-Authorization: {auth}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    tunnel.write_all(b"through the front").await.unwrap();
+    let mut echoed = [0u8; 17];
+    tunnel.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"through the front");
+    assert_eq!(front.open_requests(), 1);
+    // A plain request, forwarded by the front on the connection `run` made.
+    let (mut plain, head) = proxy_request(
+        &guard,
+        &format!("GET http://{server}/x HTTP/1.1\r\nHost: {server}\r\nProxy-Authorization: {auth}\r\nConnection: close\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut body = String::new();
+    plain.read_to_string(&mut body).await.unwrap();
+    assert_eq!(body, "hello");
+    // A destination off the list: `run` refuses it and remembers it.
+    let (_s, head) = proxy_request(
+        &guard,
+        &format!("CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: {auth}\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(head.contains("x-tinfirm-egress: denied"), "{head}");
+    assert_eq!(guard.denied(), vec!["127.0.0.1:9".to_string()]);
+    // The front checks the credential: nothing reaches `run` without it.
+    let (_s, head) = proxy_request(
+        &guard,
+        &format!("CONNECT {server} HTTP/1.1\r\nHost: {server}\r\n\r\n"),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 407"), "{head}");
+    assert_eq!(guard.counts(), (2, 1));
+    // A closed tunnel gives its place back.
+    drop(tunnel);
+    for _ in 0..100 {
+        if front.open_requests() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(front.open_requests(), 0);
+    let pid = front.pgid();
+    drop(guard);
+    assert!(gone(pid).await, "the front outlived its listener's guard");
+}
+
+/// A listener whose queue is full: a connection to it waits until the test takes the queued
+/// ones, which `release` does.
+async fn a_stalled_destination() -> (
+    std::net::SocketAddr,
+    tokio::net::TcpListener,
+    Vec<tokio::net::TcpStream>,
+) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(0).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut queued = Vec::new();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(300),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => queued.push(stream),
+            Ok(Err(e)) => panic!("{e}"),
+            Err(_) => break,
+        }
+        assert!(queued.len() < 64, "the listener's queue never fills");
+    }
+    (addr, listener, queued)
+}
+
+async fn a_client_that_leaves_while_run_connects_costs_no_place(front: Option<FrontCommand>) {
+    use tokio::io::AsyncWriteExt;
+    let (addr, listener, _queued) = a_stalled_destination().await;
+    let guard = egress_with(front, &[addr.to_string()], true).await;
+    let auth = guard.proxy_authorization().to_string();
+    let mut client = tokio::net::TcpStream::connect(guard.local_addr())
+        .await
+        .unwrap();
+    client
+        .write_all(
+            format!(
+                "CONNECT {addr} HTTP/1.1\r\nHost: {addr}\r\nProxy-Authorization: {auth}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    // `run` holds a place while it connects.
+    for _ in 0..200 {
+        if guard.open_connections() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(guard.open_connections(), 1);
+    // The client gives up, and only then does the connection succeed.
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::spawn(async move {
+        let mut taken = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            taken.push(stream);
+        }
+    });
+    // In a front, `run` makes the connection and hands it to a client that is gone; in `run`,
+    // the client's handler is dropped with the connect it waits for. Either way the place
+    // comes back.
+    let made = u64::from(guard.front().is_some());
+    for _ in 0..1000 {
+        if guard.counts().0 == made
+            && guard.open_connections() == 0
+            && guard.front().is_none_or(|f| f.open_requests() == 0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(guard.counts(), (made, 0));
+    assert_eq!(guard.open_connections(), 0, "the place was not given back");
+    if let Some(front) = guard.front() {
+        assert_eq!(front.open_requests(), 0);
+        assert!(front.ended().is_none(), "{:?}", front.ended());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_leaves_while_run_connects_costs_no_place_in_a_front() {
+    a_client_that_leaves_while_run_connects_costs_no_place(Some(the_front())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_leaves_while_run_connects_costs_no_place_in_run() {
+    a_client_that_leaves_while_run_connects_costs_no_place(None).await;
+}
+
+async fn only_the_allowlists_refusal_says_denied(front: Option<FrontCommand>) {
+    use tokio::io::AsyncReadExt;
+    // `localhost` is on the list but resolves to loopback, which this proxy refuses.
+    let guard = egress_with(front, &["localhost".to_string()], false).await;
+    let auth = guard.proxy_authorization().to_string();
+    let refusal = |host: &'static str| {
+        let (guard, auth) = (&guard, auth.clone());
+        async move {
+            let (mut stream, head) = proxy_request(
+                guard,
+                &format!(
+                    "CONNECT {host}:443 HTTP/1.1\r\nHost: x\r\nProxy-Authorization: {auth}\r\n\r\n"
+                ),
+            )
+            .await;
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0u8; length];
+            stream.read_exact(&mut body).await.unwrap();
+            (head, String::from_utf8(body).unwrap())
+        }
+    };
+    let (head, body) = refusal("example.com").await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(body.contains("not on this sandbox's allowlist"), "{body}");
+    assert!(head.contains("x-tinfirm-egress: denied"), "{head}");
+    let (head, body) = refusal("localhost").await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(body.contains("which no allowlist entry opens"), "{body}");
+    assert!(!head.contains("x-tinfirm-egress"), "{head}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_allowlists_refusal_says_denied_in_a_front() {
+    only_the_allowlists_refusal_says_denied(Some(the_front())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_allowlists_refusal_says_denied_in_run() {
+    only_the_allowlists_refusal_says_denied(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_front_gets_from_run_only_what_runs_rules_allow() {
+    // `allowed.invalid` is on the list but resolves to nothing; `127.0.0.1:443` and
+    // `localhost` are on it but loopback; nothing else is.
+    let allow = [
+        "allowed.invalid".to_string(),
+        "127.0.0.1:443".to_string(),
+        "localhost".to_string(),
+    ];
+    let guard = egress_through(hostile_front("connect-hostile", &[]), &allow, false).await;
+    let ended = tokio::time::timeout(Duration::from_secs(60), guard.front().unwrap().wait_ended())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&ended, Ended::Exited { code: Some(0), .. }),
+        "{ended:?}"
+    );
+    // What it asked for is in the run's log of refused destinations.
+    let denied = guard.denied();
+    for expected in [
+        "example.com:443",
+        "127.0.0.1:443",
+        "[::1]:443",
+        "localhost:443",
+    ] {
+        assert!(
+            denied.contains(&expected.to_string()),
+            "{expected}: {denied:?}"
+        );
+    }
+    // Requests that break the wire end the front.
+    for (mode, why) in [
+        ("connect-abuse", "a request 3 after 5"),
+        ("closed-unknown", "an unknown request 9 closed"),
+        ("connect-long", "a destination of 254 bytes"),
+    ] {
+        let guard = egress_through(hostile_front(mode, &[]), &[], false).await;
+        let ended =
+            tokio::time::timeout(Duration::from_secs(10), guard.front().unwrap().wait_ended())
+                .await
+                .unwrap();
+        assert!(
+            matches!(&ended, Ended::Broken(text) if text.contains(why)),
+            "{mode}: {ended:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_front_with_too_many_open_requests_is_ended() {
+    let handle = FrontHandle::spawn(&hostile_front("connect-flood", &[]), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    // Taken and never answered.
+    let mut requests = handle.take_requests().unwrap();
+    tokio::spawn(async move { while requests.recv().await.is_some() {} });
+    let ended = tokio::time::timeout(Duration::from_secs(10), handle.wait_ended())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&ended, Ended::Broken(text) if text.contains("more than 512 open requests")),
+        "{ended:?}"
+    );
+}
+
 /// The plan's 2.8, as far as this slice makes it measurable: a front's start (to `ready`), its
 /// memory while idle, a round trip and a descriptor passed.
 /// `cargo test --release -p tinfirm-runner-host --test front measure -- --ignored --nocapture`
@@ -803,4 +1223,81 @@ async fn measure_the_wire() {
         starts[starts.len() / 2],
         starts[starts.len() - 1]
     );
+}
+
+/// The plan's 2.8 for the egress proxy: a tunnel's throughput and a `CONNECT`'s latency, with
+/// the front half in this process and in a front.
+/// `cargo test --release -p tinfirm-runner-host --test front measure -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, run by hand in release"]
+async fn measure_the_egress_proxy() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A sink that reads everything and answers its byte count when the client half-closes.
+    let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = sink.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut total: u64 = 0;
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    total += n as u64;
+                }
+                let _ = stream.write_all(&total.to_be_bytes()).await;
+            });
+        }
+    });
+    let allow = [format!("127.0.0.1:{}", sink_addr.port())];
+    for (name, front) in [("in run", None), ("in a front", Some(the_front()))] {
+        let settings = EgressSettings {
+            allow: allow.iter().map(|r| Rule::parse(r).unwrap()).collect(),
+            allow_private: false,
+            allow_loopback: true,
+        };
+        let endpoint = Endpoint {
+            bind: "127.0.0.2:0".parse().unwrap(),
+            sandbox_host: "127.0.0.2".into(),
+            extra_hosts: Vec::new(),
+        };
+        let guard = EgressProxy::new(settings, &endpoint)
+            .with_front(front)
+            .start_run(uuid::Uuid::new_v4(), Vec::new())
+            .await
+            .unwrap();
+        let auth = guard.proxy_authorization().to_string();
+        let connect = format!(
+            "CONNECT {sink_addr} HTTP/1.1\r\nHost: {sink_addr}\r\nProxy-Authorization: {auth}\r\n\r\n"
+        );
+        let mut latencies = Vec::new();
+        for _ in 0..200 {
+            let started = std::time::Instant::now();
+            let (stream, head) = proxy_request(&guard, &connect).await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            latencies.push(started.elapsed());
+            drop(stream);
+        }
+        latencies.sort();
+        let (mut tunnel, head) = proxy_request(&guard, &connect).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let chunk = vec![7u8; 1 << 20];
+        let started = std::time::Instant::now();
+        for _ in 0..1024 {
+            tunnel.write_all(&chunk).await.unwrap();
+        }
+        tunnel.shutdown().await.unwrap();
+        let mut count = [0u8; 8];
+        tunnel.read_exact(&mut count).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(u64::from_be_bytes(count), 1 << 30);
+        println!(
+            "{name}: CONNECT to 200: median {:?}, p99 {:?}; 1 GiB through a tunnel in {:.2} s ({:.0} MiB/s)",
+            latencies[latencies.len() / 2],
+            latencies[latencies.len() * 99 / 100],
+            took.as_secs_f64(),
+            1024.0 / took.as_secs_f64()
+        );
+    }
 }

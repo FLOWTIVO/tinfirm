@@ -4,12 +4,13 @@
 //! tools) out of `run`, which holds the credentials. `run` is to start one per sandbox and to
 //! talk with it over typed, bounded messages; it attaches every credential itself.
 //!
-//! This version builds the front's confinement, its probe and the wire to `run`; `run` starts
-//! no front for a sandbox yet. `front --probe JOB` confines itself as a front does
+//! So far `run` starts a front for each listener of the egress proxy when the sandboxes run
+//! over the bridge (`--sandbox-bridge` or a VM per run): the front parses that listener's HTTP
+//! and copies its tunnels, and `run` decides and makes each connection
+//! ([`crate::egress_proxy`]). The other listeners and the bridge follow. `front --probe JOB` confines itself as a front does
 //! ([`crate::confine::Profile::Front`]) and then tries what a front must be refused, and answers
 //! one line of JSON on stdout ([`Probe`]). `doctor` runs it ([`probe`]). `front` alone serves
-//! the control channel on its stdin ([`wire`]): it says it is ready, answers a round trip and
-//! takes a descriptor; `run`'s side of it is [`handle::FrontHandle`].
+//! the control channel on its stdin ([`wire`]); `run`'s side of it is [`handle::FrontHandle`].
 //!
 //! What a front applies to itself, before it builds any runtime or reads a byte:
 //! - resource limits: 512 MiB of data, 1024 descriptors, no core file;

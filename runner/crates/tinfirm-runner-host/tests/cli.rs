@@ -1575,6 +1575,12 @@ fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
                 && report.contains("refuses to start without --allow-unconfined-reader, which gives up the reader's confinement"),
             "{env:?}: {report}"
         );
+        // A front that cannot be confined still serves the sandbox's egress: a warning.
+        assert!(
+            report.contains("[warn] front: cannot be confined here")
+                && report.contains("each one parses a sandbox's HTTP with no confinement"),
+            "{env:?}: {report}"
+        );
         let mut allowed = env.to_vec();
         allowed.push(("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER", "1"));
         let report = doctor(&allowed);
@@ -1585,10 +1591,10 @@ fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
         );
     }
     let report = doctor(&[]);
-    // The front, which `run` does not start yet, is a note either way.
+    // Without the bridge, `run` starts no front: a note.
     assert!(
         report.contains("[info] front: cannot be confined here")
-            && report.contains("`run` does not start it yet"),
+            && report.contains("`run` starts one per egress listener"),
         "{report}"
     );
     assert!(

@@ -1537,7 +1537,7 @@ async fn doctor(
         sandbox_args.allow_unconfined_reader,
     )
     .await;
-    doctor_front(&mut checks, paths).await;
+    doctor_front(&mut checks, paths, bridged).await;
     // git.
     match git::git_version().await {
         Some(v) => checks.ok("git", v),
@@ -2309,6 +2309,7 @@ async fn run(
     let (mut opts, endpoint) = started;
     if let Some(bridge) = opts.bridge.as_mut() {
         bridge.reader = reader.context("a host with the bridge has a reader")?;
+        bridge.front = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
     }
     opts.egress = egress;
     // The model proxy is always on: a setup where its listeners could never serve a sandbox is
@@ -2402,9 +2403,10 @@ async fn probe_reader(
 }
 
 /// What `doctor` says of the front process of a sandbox (ADR-0112, path C, part 2), which
-/// `run` does not start yet: a front confines itself and tries to open this host's
-/// directories and memory, to make a socket, to reach this process and to start a program.
-async fn doctor_front(checks: &mut Checks, paths: &Paths) {
+/// `run` starts for each egress listener with --sandbox-bridge or --executor vm: a front
+/// confines itself and tries to open this host's directories and memory, to make a socket,
+/// to reach this process and to start a program.
+async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool) {
     let job = tinfirm_runner_host::front::ProbeJob {
         deny_read: vec![
             paths.config_dir.clone(),
@@ -2423,7 +2425,8 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths) {
         .and_then(|probe| probe),
         Err(e) => Err(anyhow::Error::from(e)),
     };
-    const UNUSED: &str = "the front process of a sandbox; `run` does not start it yet";
+    const USED: &str =
+        "`run` starts one per egress listener with --sandbox-bridge or --executor vm";
     // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed.
     let wire = async {
         let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
@@ -2435,25 +2438,40 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths) {
         anyhow::Ok(())
     }
     .await;
-    // A warning while `run` starts no front; a failure once the slice that has `run` start
-    // fronts for its sandboxes lands (path C part 2, slice 6), as the reader's probe is.
+    // With the bridge, a front that cannot start is a run that cannot start: its egress
+    // listener needs one. Without it, `run` starts no front.
     match wire {
         Ok(()) => checks.ok("front wire", "ready, a round trip, a descriptor passed"),
-        Err(e) => checks.warn(
+        Err(e) if bridged => checks.fail(
             "front wire",
-            format!("{e:#} (`run` does not start fronts yet)"),
+            format!("{e:#} (no run can start: each sandbox's egress proxy needs a front)"),
+        ),
+        Err(e) => checks.info(
+            "front wire",
+            format!("{e:#} (only used with --sandbox-bridge or --executor vm)"),
         ),
     }
+    // A front that cannot be confined still serves, with a warning in `run`'s log, until `run`
+    // refuses to start without a confined front (path C part 2, slice 6), as it does for the
+    // reader.
     match probe {
         Ok(probe) if probe.confined() => checks.ok(
             "front",
-            format!("confined: {} ({UNUSED})", probe.describe()),
+            format!("confined: {} ({USED})", probe.describe()),
+        ),
+        Ok(probe) if bridged => checks.warn(
+            "front",
+            format!(
+                "cannot be confined here: {}. `run` starts its fronts all the same, and each one parses a sandbox's HTTP with no confinement",
+                probe.describe()
+            ),
         ),
         Ok(probe) => checks.info(
             "front",
-            format!("cannot be confined here: {} ({UNUSED})", probe.describe()),
+            format!("cannot be confined here: {} ({USED})", probe.describe()),
         ),
-        Err(e) => checks.info("front", format!("{e:#} ({UNUSED})")),
+        Err(e) if bridged => checks.warn("front", format!("{e:#} ({USED})")),
+        Err(e) => checks.info("front", format!("{e:#} ({USED})")),
     }
 }
 

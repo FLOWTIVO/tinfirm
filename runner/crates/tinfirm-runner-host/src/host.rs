@@ -882,7 +882,10 @@ impl Shared {
         let Some(git_proxy) = self.git_proxy().await? else {
             return Ok(None);
         };
-        let proxy = Arc::new(EgressProxy::new(settings.clone(), git_proxy.endpoint()));
+        // With the bridge, a front process serves each sandbox's proxy HTTP (path C, part 2).
+        let front = self.opts.bridge.as_ref().map(|bridge| bridge.front.clone());
+        let proxy =
+            Arc::new(EgressProxy::new(settings.clone(), git_proxy.endpoint()).with_front(front));
         *slot = Some(proxy.clone());
         Ok(Some(proxy))
     }
