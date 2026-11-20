@@ -308,6 +308,8 @@ def bridge_ports(out):
     nobridge = unit_lines((out / "tinfirm-runner-host.docker-nobridge.service").read_text())
     exec_ports = next(line for line in ports.splitlines() if line.startswith("ExecStart="))
     check("--sandbox-bridge-ports" not in default, "docker unit: no --sandbox-bridge-ports by default (the system picks)")
+    blank = unit_lines((out / "tinfirm-runner-host.docker-blank-ports.service").read_text())
+    check("--sandbox-bridge-ports" not in blank, "docker unit: no --sandbox-bridge-ports for a range of blanks alone")
     check("--sandbox-bridge --sandbox-bridge-ports \"41000-41063\"" in exec_ports,
           "docker unit: --sandbox-bridge-ports with the range, after --sandbox-bridge")
     check("--sandbox-bridge" not in nobridge, "docker unit without the bridge: neither --sandbox-bridge nor its ports")

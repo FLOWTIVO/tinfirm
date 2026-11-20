@@ -44,8 +44,8 @@ ExecStart={{ tinfirm_runner_host_binary_path }} run \
     --sandbox-docker{% endif %}{% if tinfirm_runner_host_egress_proxy | bool %} \
     --egress-proxy{% for host in _tinfirm_runner_host_egress_allow %} \
     --egress-allow {{ arg(host) }}{% endfor %}{% endif %}{% if tinfirm_runner_host_sandbox_bridge | bool %} \
-    --sandbox-bridge{% if tinfirm_runner_host_sandbox_bridge_ports | string | length > 0 %} \
-    --sandbox-bridge-ports {{ arg(tinfirm_runner_host_sandbox_bridge_ports) }}{% endif %}{% endif %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
+    --sandbox-bridge{% if tinfirm_runner_host_sandbox_bridge_ports | string | trim | length > 0 %} \
+    --sandbox-bridge-ports {{ arg(tinfirm_runner_host_sandbox_bridge_ports | string | trim) }}{% endif %}{% endif %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
     --sandbox-env {{ arg(key ~ '=' ~ value) }}{% endfor %}
 
 {% endif %}

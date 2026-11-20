@@ -171,7 +171,17 @@
         mode: "0644"
       vars:
         tinfirm_runner_host_executor: docker
-        tinfirm_runner_host_sandbox_bridge_ports: 41000-41063
+        # With blanks around it: the unit gets the range without them.
+        tinfirm_runner_host_sandbox_bridge_ports: " 41000-41063 "
+
+    - name: Render the runner host's unit with a blank range
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker-blank-ports.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+        tinfirm_runner_host_sandbox_bridge_ports: "  "
 
     - name: Render the runner host's unit with ports but without the sandbox bridge
       ansible.builtin.template:
