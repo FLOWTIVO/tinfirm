@@ -98,7 +98,7 @@ sha256sum tinfirm-vm.img.zst
     ansible-playbook -i inventory.yml deploy/ansible/sandbox-node.yml
     ```
 
-5. **Run the control host's play again** with each node's fingerprint as its `nodeSha256`. It asks every node through the driver, as `run` does at its start, checks that the host's user reaches no Docker socket, and only then starts the host. The host shows **Online** on its page.
+5. **Run the control host's play again** with each node's fingerprint as its `nodeSha256`. It asks every node through the driver, as `run` does at its start, checks that the host's user reaches no Docker socket, and only then starts the host. The host shows **Online** on its page. To check a control host by hand later, run `tinfirm-runner-host doctor --executor vm --vm-driver node --vm-template <template> --max-concurrent-runs <N>` as the service's user, with the service's environment: it checks the driver's configuration and keys, asks every node as `run` does at its start, and does not look for Docker.
 
 6. **Run both plays again.** A second run changes nothing.
 
