@@ -1115,6 +1115,7 @@ impl RunState {
             idle: Box::pin(tokio::time::sleep(IDLE_TIMEOUT)),
             scan: KeyScan::new(gateway),
             run_id: state.run_id,
+            cut: false,
             ended: false,
         };
         Response::from_parts(head, body.boxed_unsync())
@@ -1347,6 +1348,8 @@ struct GatewayBody {
     idle: Pin<Box<tokio::time::Sleep>>,
     scan: KeyScan,
     run_id: Uuid,
+    /// The key was found: the next poll ends the answer with an error.
+    cut: bool,
     ended: bool,
 }
 
@@ -1362,6 +1365,12 @@ impl Body for GatewayBody {
         if this.ended {
             return Poll::Ready(None);
         }
+        if this.cut {
+            this.ended = true;
+            return Poll::Ready(Some(Err(
+                "the model gateway's answer contained the key".into()
+            )));
+        }
         loop {
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
@@ -1374,11 +1383,14 @@ impl Body for GatewayBody {
                     };
                     match this.scan.feed(data) {
                         None => {
-                            this.ended = true;
+                            // The error comes at the next poll, not now: the server writes what
+                            // it holds (the head, the parts before) while the body waits, and an
+                            // error before that would end the connection with nothing written,
+                            // when the key is in the answer's first part. As a front does it.
+                            this.cut = true;
                             tracing::warn!(run_id = %this.run_id, "model proxy: the gateway's answer contained the key; cut it off");
-                            return Poll::Ready(Some(Err(
-                                "the model gateway's answer contained the key".into(),
-                            )));
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                         Some(data) if data.is_empty() => continue,
                         Some(data) => return Poll::Ready(Some(Ok(Frame::data(data)))),
@@ -2923,6 +2935,97 @@ mod tests {
         assert_eq!(seen[0].headers["x-client-note"].as_bytes(), NOTE.as_bytes());
     }
 
+    /// What the sandbox's client got of an answer, read part by part: the status, the bytes of
+    /// the body, and the error that ended it, if one did. `after_head` runs once the head is in.
+    async fn request_in_steps(
+        guard: &ModelProxyGuard,
+        path: &str,
+        after_head: impl FnOnce(),
+    ) -> (StatusCode, Vec<u8>, Option<String>) {
+        let stream = TcpStream::connect(listener_addr(guard)).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        let mut req = Request::new(Full::new(Bytes::from_static(b"{}")));
+        *req.method_mut() = Method::POST;
+        *req.uri_mut() = path.parse().unwrap();
+        req.headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("proxy"));
+        let response = tokio::time::timeout(Duration::from_secs(10), sender.send_request(req))
+            .await
+            .expect("the head within 10 s")
+            .expect("the answer's head reaches the client");
+        let status = response.status();
+        after_head();
+        let mut body = response.into_body();
+        let mut got = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), body.frame())
+                .await
+                .expect("the body within 10 s")
+            {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        got.extend_from_slice(&data);
+                    }
+                }
+                Some(Err(e)) => return (status, got, Some(e.to_string())),
+                None => return (status, got, None),
+            }
+        }
+    }
+
+    /// An answer cut for the key keeps its head, whatever the order in which the key's bytes
+    /// arrive: the client gets the gateway's status, the bytes before the key's start, and an
+    /// abrupt end; never a byte of the key.
+    async fn a_cut_answer_keeps_its_head_in_every_order(mode: Mode) {
+        let (start, rest) = REAL_KEY.split_at(10);
+        let before = r#"{"error":"bad key "#;
+        // (the gateway's parts, `None` waiting for the test's go; what the client gets first)
+        let cases: Vec<(Vec<Option<String>>, &str)> = vec![
+            // The whole key in one part: the cut comes at the answer's first poll.
+            (vec![Some(format!(r#"{before}{REAL_KEY}"}}"#))], ""),
+            // The key across two reads: its start is held back, the rest cuts.
+            (
+                vec![
+                    Some(format!("{before}{start}")),
+                    None,
+                    Some(format!(r#"{rest}"}}"#)),
+                ],
+                before,
+            ),
+            // The first part of the answer is the key's start and nothing else.
+            (
+                vec![Some(start.to_string()), None, Some(format!(r#"{rest}"}}"#))],
+                "",
+            ),
+        ];
+        for (parts, first) in cases {
+            let waits = parts.iter().any(Option::is_none);
+            let echo = FakeGateway::start(Arc::new(move |_: &Seen| Reply {
+                status: StatusCode::UNAUTHORIZED,
+                headers: vec![("content-type", "application/json".into())],
+                parts: parts.clone(),
+            }))
+            .await;
+            let guard = start_in(mode, ModelFormat::Openai, &echo.url("/v1")).await;
+            let (status, got, error) =
+                request_in_steps(&guard, &format!("{}/responses", base_path(&guard)), || {
+                    if waits {
+                        echo.go();
+                    }
+                })
+                .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let got = String::from_utf8_lossy(&got).into_owned();
+            assert_eq!(got, first, "only what came before the key's start");
+            assert!(error.is_some(), "an abrupt end, not a whole answer: {got}");
+            assert!(!got.contains(start), "{got}");
+        }
+    }
+
     /// The tests of the proxy's traffic, with the front half in this process and in a front.
     macro_rules! in_both {
         ($($name:ident),* $(,)?) => {
@@ -2963,5 +3066,6 @@ mod tests {
         header_values_pass_byte_for_byte,
         the_host_token_goes_to_its_server_only_and_never_from_the_sandbox,
         the_host_token_in_the_answer_never_reaches_the_sandbox,
+        a_cut_answer_keeps_its_head_in_every_order,
     );
 }
