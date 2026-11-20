@@ -487,6 +487,8 @@ const RESTART_V2: &str = "TINFIRM_TEST_RESTART_V2";
 /// Set, in the test and in host A: host A registers its runs' bridges with its shared
 /// listener, and writes their records as hosts did before each sandbox's bridge was its front's.
 const RESTART_LEGACY: &str = "TINFIRM_TEST_RESTART_LEGACY";
+/// Set, in host A: the program its readers run ([`held_reader`]).
+const RESTART_READER: &str = "TINFIRM_TEST_RESTART_READER";
 
 /// The setup of both hosts of a restart test.
 fn restart_setup(v2: bool) -> HostSetup {
@@ -511,14 +513,16 @@ fn restart_test_host_a() {
         .block_on(async {
             let v2 = std::env::var_os(RESTART_V2).is_some();
             let mut setup = restart_setup(v2);
-            if std::env::var_os(RESTART_LEGACY).is_some() {
-                setup.options = Some(Box::new(|opts| {
-                    opts.bridge
-                        .as_mut()
-                        .expect("a bridged host")
-                        .shared_listener_for_new_runs = true;
-                }));
-            }
+            let legacy = std::env::var_os(RESTART_LEGACY).is_some();
+            let reader = std::env::var_os(RESTART_READER).map(PathBuf::from);
+            setup.options = Some(Box::new(move |opts| {
+                let bridge = opts.bridge.as_mut().expect("a bridged host");
+                bridge.shared_listener_for_new_runs = legacy;
+                if let Some(reader) = reader {
+                    bridge.reader = tinfirm_runner_host::reader::Reader::new(reader)
+                        .allowing_unconfined(bridge.reader.allows_unconfined());
+                }
+            }));
             let _host = start_host_at(std::path::Path::new(&dir), &url, setup).await;
             std::future::pending::<()>().await;
         });
@@ -538,6 +542,17 @@ fn host_process_with(
     v2: bool,
     legacy: bool,
 ) -> std::process::Child {
+    host_process_reading(dir, url, v2, legacy, None)
+}
+
+/// [`host_process_with`]; with `reader`, the program that host A's readers run.
+fn host_process_reading(
+    dir: &std::path::Path,
+    url: &str,
+    v2: bool,
+    legacy: bool,
+    reader: Option<&std::path::Path>,
+) -> std::process::Child {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["restart_test_host_a", "--exact", "--ignored", "--nocapture"])
@@ -549,6 +564,9 @@ fn host_process_with(
     }
     if legacy {
         command.env(RESTART_LEGACY, "1");
+    }
+    if let Some(reader) = reader {
+        command.env(RESTART_READER, reader);
     }
     command.spawn().unwrap()
 }
@@ -1609,13 +1627,40 @@ async fn a_front_killed_mid_run(
     u32,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let host_a = host_process(dir.path(), &server.url, false);
+    a_front_killed_mid_run_in(dir, server, Some(repo), false).await
+}
+
+/// [`a_front_killed_mid_run`] in `dir`, with `repo` if any; with `held`, host A's readers are
+/// [`held_reader`]'s.
+async fn a_front_killed_mid_run_in(
+    dir: tempfile::TempDir,
+    server: &mut FakeServer,
+    repo: Option<&TestRepo>,
+    held: bool,
+) -> (
+    tempfile::TempDir,
+    std::process::Child,
+    Conn,
+    AssignSpec<'static>,
+    u32,
+) {
+    let reader = held.then(|| held_reader(dir.path()));
+    let host_a = host_process_reading(dir.path(), &server.url, false, false, reader.as_deref());
     let mut conn = server.accept().await;
     conn.handshake(1).await;
-    let spec = AssignSpec::new("slow", Some(&repo.url));
+    let spec = AssignSpec::new("slow", repo.map(|repo| repo.url.as_str()));
     conn.send(spec.to_json());
     conn.wait_running(spec.run_id).await;
     conn.until_seq(spec.run_id, 3).await;
+    if held {
+        // A session home larger than a pipe holds: its archive is still on its way when the
+        // test ends the new front.
+        let home = sandbox_home(dir.path()).expect("the sandbox's home");
+        let noise: Vec<u8> = (0..(1u32 << 20))
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        std::fs::write(home.join("noise.bin"), noise).unwrap();
+    }
     let fronts = fronts_of(host_a.id());
     assert_eq!(
         fronts.len(),
@@ -1690,6 +1735,122 @@ async fn a_second_front_that_ends_too_is_not_replaced_and_the_run_says_its_work_
         // No third front was started for the run.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(fronts_of(host_a.id()).is_empty());
+        host_a.kill().unwrap();
+        host_a.wait().unwrap();
+    })
+    .await;
+}
+
+/// A reader program for host A that holds the first archive it unpacks, the session home's at
+/// the run's end (the repositories come back before it, as bundles), until the test says so:
+/// it makes `home-reached` in `dir`, and goes on once `go` is there.
+fn held_reader(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = dir.join("held-reader.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$2\" in\n*'\"kind\":\"unpack\"'*)\n  if mkdir '{reached}' 2>/dev/null; then\n    while [ ! -e '{go}' ]; do sleep 0.05; done\n  fi;;\nesac\nexec '{real}' \"$@\"\n",
+            reached = dir.join("home-reached").display(),
+            go = dir.join("go").display(),
+            real = env!("CARGO_BIN_EXE_tinfirm-runner-host"),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// The session home of the local sandbox of host A's run under `dir`.
+fn sandbox_home(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        for entry in std::fs::read_dir(&next).ok()?.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "sandbox") && path.join("home").is_dir() {
+                return Some(path.join("home"));
+            }
+            stack.push(path);
+        }
+    }
+    None
+}
+
+/// Waits until host A's run has its session home to collect, after the new front took the
+/// sandbox back; then ends that front, and lets the home's reader go on.
+async fn end_the_new_front_before_the_home(dir: &std::path::Path, host_a: u32, first: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while !dir.join("home-reached").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session home was not collected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let second = fronts_of(host_a)
+        .into_iter()
+        .find(|&pid| pid != first)
+        .expect("the new front");
+    kill_front(second);
+    std::fs::write(dir.join("go"), b"").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_front_that_ends_after_the_repositories_came_back_says_what_was_saved() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (dir, mut host_a, mut conn, spec, first) =
+            a_front_killed_mid_run_in(dir, &mut server, Some(&repo), true).await;
+        end_the_new_front_before_the_home(dir.path(), host_a.id(), first).await;
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message.contains("the new front that took the sandbox back ended too")
+                && message.contains("saved: the repository")
+                && message.contains("not saved: the session home")
+                && !message.contains("its work so far was saved"),
+            "{message}"
+        );
+        // The repository came back, and is pushed.
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        host_a.kill().unwrap();
+        host_a.wait().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_without_a_repository_whose_new_front_ends_too_says_its_work_is_lost() {
+    with_timeout(180, async {
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (dir, mut host_a, mut conn, spec, first) =
+            a_front_killed_mid_run_in(dir, &mut server, None, true).await;
+        end_the_new_front_before_the_home(dir.path(), host_a.id(), first).await;
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message.contains("ended too")
+                && message.contains("the work of the run is lost")
+                && message.contains("the session home")
+                && !message.contains("its work so far was saved"),
+            "{message}"
+        );
         host_a.kill().unwrap();
         host_a.wait().unwrap();
     })

@@ -896,6 +896,7 @@ pub async fn execute(
                 // host that restarted does, the agent stops and its work comes back. A second
                 // front that ends too is not replaced.
                 let front_ended = sandbox.front_ended_after(Duration::from_secs(2)).await;
+                let mut taken_back = false;
                 if front_ended {
                     let bridge = shared
                         .opts
@@ -907,6 +908,7 @@ pub async fn execute(
                         .await
                     {
                         Ok(()) => {
+                            taken_back = true;
                             tracing::warn!(run_id = %assign.run_id, "the sandbox's front ended during the run; a new one took the sandbox back");
                             if let Err(e) = sandbox.reclaim(RECLAIM_TIMEOUT).await {
                                 sink.log(
@@ -936,33 +938,33 @@ pub async fn execute(
                 }
                 sandbox.stop_agent(Duration::from_secs(5)).await;
                 // With the bridge, the agent's work comes back before the sandbox goes.
+                let mut collection = None;
                 if let Some(files) = sandbox.files()
                     && !matches!(agent.stop, Some(StopCause::Abort))
                 {
-                    collect_from_sandbox(
-                        &mut sink,
-                        assign,
-                        &files,
-                        &reader_of(shared),
-                        &layout,
-                        &mut repos,
-                        &home_dir,
-                        home_exclude,
-                        output_dir.as_deref(),
-                    )
-                    .await;
-                }
-                if front_ended
-                    && sandbox.front_ended()
-                    && repos
-                        .iter()
-                        .any(|repo| !matches!(repo.collected, Some(Ok(_))))
-                {
-                    // The new front ended too, before the work came back: no third one.
-                    failure.force(
-                        FailureClass::Infra,
-                        "The sandbox's front process ended during the run, and the new front that took the sandbox back ended too; the work of the run is lost.",
+                    collection = Some(
+                        collect_from_sandbox(
+                            &mut sink,
+                            assign,
+                            &files,
+                            &reader_of(shared),
+                            &layout,
+                            &mut repos,
+                            &home_dir,
+                            home_exclude,
+                            output_dir.as_deref(),
+                        )
+                        .await,
                     );
+                }
+                // The run said that the new front saved the work: so it must have, all of it.
+                // A part that did not come back (the new front ended too, and is not replaced,
+                // or the part failed) says what was saved and what was not.
+                if taken_back
+                    && let Some(collection) = &collection
+                    && let Some(message) = collection.after_a_new_front(sandbox.front_ended())
+                {
+                    failure.force(FailureClass::Infra, message);
                 }
                 sandbox.stop(Duration::from_secs(5)).await;
                 tokens.drop_record();
@@ -2768,10 +2770,53 @@ fn reader_of(shared: &Shared) -> crate::reader::Reader {
     }
 }
 
+/// What came back from the sandbox at the run's end, part by part.
+#[derive(Debug, Default)]
+struct Collection {
+    saved: Vec<String>,
+    missed: Vec<String>,
+}
+
+impl Collection {
+    fn part(&mut self, name: String, saved: bool) {
+        if saved {
+            self.saved.push(name);
+        } else {
+            self.missed.push(name);
+        }
+    }
+
+    /// The run's message when a new front took the sandbox back after its first one ended
+    /// during the run and not all of the work came back; `None` when it all did. With
+    /// `ended`, the new front ended too.
+    fn after_a_new_front(&self, ended: bool) -> Option<String> {
+        if self.missed.is_empty() {
+            return None;
+        }
+        let first = if ended {
+            "The sandbox's front process ended during the run, and the new front that took the sandbox back ended too"
+        } else {
+            "The sandbox's front process ended during the run; a new front took the sandbox back and the agent was stopped, but not all of its work came back"
+        };
+        Some(if self.saved.is_empty() {
+            format!(
+                "{first}; the work of the run is lost (not saved: {}).",
+                self.missed.join(", ")
+            )
+        } else {
+            format!(
+                "{first}; saved: {}; not saved: {}.",
+                self.saved.join(", "),
+                self.missed.join(", ")
+            )
+        })
+    }
+}
+
 /// With the bridge (ADR-0095), after the agent and before the sandbox goes: each repository's
 /// commits, the session home and `/output` come back (crate::sandbox_files), each read by a
 /// reader that holds no credential (crate::reader). A repository that does not come back fails
-/// in the finalize; a home or an `/output` that does not is logged.
+/// in the finalize; a home or an `/output` that does not is logged. Says which parts came back.
 #[allow(clippy::too_many_arguments)]
 async fn collect_from_sandbox(
     sink: &mut EventSink,
@@ -2783,7 +2828,8 @@ async fn collect_from_sandbox(
     home_dir: &Path,
     home_exclude: Vec<String>,
     output_dir: Option<&Path>,
-) {
+) -> Collection {
+    let mut collection = Collection::default();
     let tag = format!("{}.{}", assign.run_id, assign.epoch);
     if !repos.is_empty() {
         let temp = home_dir
@@ -2823,11 +2869,15 @@ async fn collect_from_sandbox(
             if let Err(e) = &collected {
                 tracing::warn!(run_id = %assign.run_id, dir = %repo.ws.dir, error = %sink.redact(&format!("{e:#}")), "a repository did not come back from the sandbox");
             }
+            collection.part(format!("the repository {}", repo.ws.dir), collected.is_ok());
             repo.collected = Some(collected.map_err(|e| sink.redact(&format!("{e:#}"))));
         }
         let _ = std::fs::remove_dir_all(&temp);
     }
-    match sandbox_files::collect_home(files, reader, layout, home_exclude, home_dir, &tag).await {
+    let home =
+        sandbox_files::collect_home(files, reader, layout, home_exclude, home_dir, &tag).await;
+    collection.part("the session home".to_string(), home.is_ok());
+    match home {
         Ok(home) if !home.left_out.is_empty() => sink.log(
             LogLevel::Debug,
             format!(
@@ -2845,7 +2895,12 @@ async fn collect_from_sandbox(
         ),
     }
     if let Some(output_dir) = output_dir {
-        match sandbox_files::collect_output(files, reader, layout, output_dir).await {
+        let output = sandbox_files::collect_output(files, reader, layout, output_dir).await;
+        collection.part(
+            format!("the files of {}", crate::sandbox::OUTPUT),
+            output.is_ok(),
+        );
+        match output {
             Ok(output) if !output.left_out.is_empty() => sink.log(
                 LogLevel::Warn,
                 format!(
@@ -2866,6 +2921,7 @@ async fn collect_from_sandbox(
             ),
         }
     }
+    collection
 }
 
 /// The agent's model, when it has one.
@@ -4120,6 +4176,38 @@ pub fn recover_workspaces(shared: &Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn after_a_new_front_the_run_says_what_came_back_and_claims_no_more() {
+        let mut all = Collection::default();
+        all.part("the repository app".into(), true);
+        all.part("the session home".into(), true);
+        assert_eq!(all.after_a_new_front(true), None);
+        let mut some = Collection::default();
+        some.part("the repository app".into(), true);
+        some.part("the session home".into(), false);
+        some.part("the files of /output".into(), false);
+        let message = some.after_a_new_front(true).unwrap();
+        assert!(message.contains("ended too"), "{message}");
+        assert!(
+            message.ends_with(
+                "saved: the repository app; not saved: the session home, the files of /output."
+            ),
+            "{message}"
+        );
+        let message = some.after_a_new_front(false).unwrap();
+        assert!(
+            message.contains("not all of its work came back"),
+            "{message}"
+        );
+        let mut none = Collection::default();
+        none.part("the session home".into(), false);
+        let message = none.after_a_new_front(false).unwrap();
+        assert!(
+            message.ends_with("the work of the run is lost (not saved: the session home)."),
+            "{message}"
+        );
+    }
 
     type Split = (
         mpsc::Sender<SandboxOutput>,
