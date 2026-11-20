@@ -876,6 +876,95 @@ fn labels_param(params: &Value) -> Result<BTreeMap<String, String>> {
     }
 }
 
+/// Why a node that offers the template gets no new VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Skipped {
+    /// It answered `verify` with problems, as it words them.
+    Problems(Vec<String>),
+    /// It gave no answer to `verify`: why.
+    NoAnswer(String),
+    /// It answered with no problem and no free slot.
+    Full,
+}
+
+/// The most of one node's cause that the message of a create without a node carries: a node's
+/// problems can be long, and the message goes to the server and into the run's page.
+const CAUSE_MAX: usize = 400;
+/// The most of that whole message, with up to [`MAX_NODES`] nodes in it.
+const NO_PLACE_MAX: usize = 2000;
+
+/// Where a new VM goes, from the `verify` answers of the nodes that offer its template, in the
+/// configuration's order: the index of the node with the most free slots among those that
+/// answer with no problem, the first on a tie; else why each node was skipped.
+fn choose(answers: &[(&str, Result<Value>)]) -> std::result::Result<usize, Vec<(String, Skipped)>> {
+    let mut best: Option<(usize, u64)> = None;
+    let mut skipped = Vec::new();
+    for (i, (node, answer)) in answers.iter().enumerate() {
+        let verified = match answer {
+            Ok(verified) => verified,
+            Err(e) => {
+                // Node::call names the node first; the message names it once.
+                let why = format!("{e:#}");
+                let why = why
+                    .strip_prefix(&format!("node {node}: "))
+                    .unwrap_or(&why)
+                    .to_string();
+                skipped.push((node.to_string(), Skipped::NoAnswer(why)));
+                continue;
+            }
+        };
+        let problems: Vec<String> = verified["problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| p.as_str().map_or_else(|| p.to_string(), str::to_string))
+            .collect();
+        if !problems.is_empty() {
+            skipped.push((node.to_string(), Skipped::Problems(problems)));
+            continue;
+        }
+        let free = verified["maxVms"].as_u64().unwrap_or(0);
+        if free == 0 {
+            skipped.push((node.to_string(), Skipped::Full));
+        } else if best.is_none_or(|(_, most)| free > most) {
+            best = Some((i, free));
+        }
+    }
+    best.map(|(i, _)| i).ok_or(skipped)
+}
+
+/// The error of a create that no node can take: why, for each node that offers the template.
+/// Only when each of them is healthy and full is it about free slots; a node that reports a
+/// problem or does not answer is named with its cause, each cut to [`CAUSE_MAX`], the whole to
+/// [`NO_PLACE_MAX`]. The causes are what the nodes and the connections report: no credential
+/// is in them.
+fn no_place(template: &str, skipped: &[(String, Skipped)]) -> String {
+    if skipped.iter().all(|(_, why)| *why == Skipped::Full) {
+        return format!("no node of the driver has a free slot for the template `{template}`");
+    }
+    let causes: Vec<String> = skipped
+        .iter()
+        .map(|(node, why)| match why {
+            Skipped::Problems(problems) => format!(
+                "node {node} reports a problem: {}",
+                crate::util::one_line(&problems.join("; "), CAUSE_MAX)
+            ),
+            Skipped::NoAnswer(error) => format!(
+                "node {node} did not answer: {}",
+                crate::util::one_line(error, CAUSE_MAX)
+            ),
+            Skipped::Full => format!("node {node} has no free slot"),
+        })
+        .collect();
+    crate::util::one_line(
+        &format!(
+            "no node of the driver can take a VM of the template `{template}`: {}",
+            causes.join("; ")
+        ),
+        NO_PLACE_MAX,
+    )
+}
+
 impl NodeDriver {
     pub fn new(config: NodeConfig) -> Result<NodeDriver> {
         let policy = config.peer_build;
@@ -996,24 +1085,22 @@ impl NodeDriver {
     }
 
     /// The node a new VM of `template` goes to: the most free slots among the nodes that offer
-    /// it, answer and report no problem; the first on a tie.
+    /// it, answer and report no problem; the first on a tie. When there is none, the error says
+    /// why for each node ([`no_place`]).
     async fn place(&self, template: &str) -> Result<&Arc<Node>> {
         let nodes = self.offering(template);
         if nodes.is_empty() {
             bail!("no node of the driver offers the template `{template}`");
         }
-        let mut best: Option<(&Arc<Node>, u64)> = None;
-        for (node, answer) in nodes.iter().zip(self.verify_each(&nodes, template).await) {
-            let Ok(verified) = answer else { continue };
-            let clean = verified["problems"].as_array().is_none_or(|p| p.is_empty());
-            let free = verified["maxVms"].as_u64().unwrap_or(0);
-            if clean && free > 0 && best.is_none_or(|(_, most)| free > most) {
-                best = Some((node, free));
-            }
+        let answers: Vec<(&str, Result<Value>)> = nodes
+            .iter()
+            .map(|node| node.name())
+            .zip(self.verify_each(&nodes, template).await)
+            .collect();
+        match choose(&answers) {
+            Ok(i) => Ok(nodes[i]),
+            Err(skipped) => bail!("{}", no_place(template, &skipped)),
         }
-        best.map(|(node, _)| node).with_context(|| {
-            format!("no node of the driver has a free slot for the template `{template}`")
-        })
     }
 
     pub async fn create(
@@ -1344,6 +1431,108 @@ mod tests {
         assert!(read_key(&key).unwrap_err().to_string().contains("0600"));
     }
 
+    fn healthy(free: u64) -> Result<Value> {
+        Ok(json!({ "problems": [], "maxVms": free, "checked": [] }))
+    }
+
+    fn broken(problems: &[&str]) -> Result<Value> {
+        Ok(json!({ "problems": problems, "maxVms": 0, "checked": [] }))
+    }
+
+    fn silent(node: &str) -> Result<Value> {
+        Err(anyhow::anyhow!(
+            "node {node}: cannot reach the node: connection refused"
+        ))
+    }
+
+    const TABLE: &str = "the node's own firewall table (inet tinfirm_node) is not loaded, and this node's configuration requires it";
+
+    fn message(template: &str, answers: &[(&str, Result<Value>)]) -> String {
+        no_place(template, &choose(answers).unwrap_err())
+    }
+
+    #[test]
+    fn a_vm_goes_to_the_healthy_node_with_the_most_free_slots() {
+        assert_eq!(choose(&[("a", healthy(1)), ("b", healthy(2))]), Ok(1));
+        assert_eq!(choose(&[("a", healthy(2)), ("b", healthy(2))]), Ok(0));
+        // A node with a problem or without an answer is skipped; the healthy one works on.
+        assert_eq!(choose(&[("a", broken(&[TABLE])), ("b", healthy(1))]), Ok(1));
+        assert_eq!(choose(&[("a", silent("a")), ("b", healthy(1))]), Ok(1));
+        // A node with problems is skipped even when it names free slots.
+        let odd = Ok(json!({ "problems": ["x"], "maxVms": 3 }));
+        assert_eq!(choose(&[("a", odd), ("b", healthy(1))]), Ok(1));
+    }
+
+    #[test]
+    fn a_create_without_a_node_names_the_cause_of_each() {
+        // One node, with its problem: the message says so, not "no free slot".
+        let one = message("sandbox-2c4g", &[("node-1", broken(&[TABLE]))]);
+        assert!(
+            one.starts_with(
+                "no node of the driver can take a VM of the template `sandbox-2c4g`: node node-1 reports a problem: the node's own firewall table"
+            ),
+            "{one}"
+        );
+        assert!(!one.contains("free slot"), "{one}");
+        // One node that does not answer: the error, the node named once.
+        let one = message("sandbox-2c4g", &[("node-1", silent("node-1"))]);
+        assert_eq!(
+            one,
+            "no node of the driver can take a VM of the template `sandbox-2c4g`: node node-1 did not answer: cannot reach the node: connection refused"
+        );
+        // Healthy and full, one node or two: the free slots.
+        let full = "no node of the driver has a free slot for the template `sandbox-2c4g`";
+        assert_eq!(message("sandbox-2c4g", &[("node-1", healthy(0))]), full);
+        assert_eq!(
+            message(
+                "sandbox-2c4g",
+                &[("node-1", healthy(0)), ("node-2", healthy(0))]
+            ),
+            full
+        );
+        // Two nodes, each with its own cause, in the configuration's order.
+        let two = message(
+            "sandbox-2c4g",
+            &[
+                ("node-1", healthy(0)),
+                ("node-2", broken(&[TABLE, "a second one"])),
+            ],
+        );
+        assert_eq!(
+            two,
+            format!(
+                "no node of the driver can take a VM of the template `sandbox-2c4g`: node node-1 has no free slot; node node-2 reports a problem: {TABLE}; a second one"
+            )
+        );
+        let two = message(
+            "sandbox-2c4g",
+            &[("node-1", silent("node-1")), ("node-2", broken(&[TABLE]))],
+        );
+        assert!(
+            two.contains("node node-1 did not answer: cannot reach the node")
+                && two.contains("; node node-2 reports a problem: the node's own"),
+            "{two}"
+        );
+    }
+
+    #[test]
+    fn the_message_of_a_create_without_a_node_is_bounded_and_on_one_line() {
+        let long = format!("{}\nsecond line", "x".repeat(5000));
+        let one = message("t", &[("node-1", broken(&[&long]))]);
+        assert!(!one.contains('\n'), "{one}");
+        assert!(one.len() < CAUSE_MAX + 200, "{}", one.len());
+        assert!(one.ends_with('…'), "{one}");
+        // Many nodes: the whole is bounded too.
+        let names: Vec<String> = (0..MAX_NODES).map(|i| format!("node-{i}")).collect();
+        let answers: Vec<(&str, Result<Value>)> = names
+            .iter()
+            .map(|name| (name.as_str(), broken(&[&long])))
+            .collect();
+        let all = message("t", &answers);
+        assert!(all.len() <= NO_PLACE_MAX, "{}", all.len());
+        assert!(all.ends_with('…'), "{all}");
+    }
+
     #[tokio::test]
     async fn a_line_that_is_no_request_gets_an_error_and_a_request_its_answer() {
         let driver = Arc::new(
@@ -1392,6 +1581,7 @@ mod tests {
             assert!(served.is_ok() && answers.is_empty());
         }
     }
+
     #[test]
     fn ids_name_their_node_and_builds_compare_by_release() {
         assert_eq!(driver_id("node-1", "vm-0a"), "node-1:vm-0a");

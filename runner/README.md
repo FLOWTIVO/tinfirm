@@ -905,6 +905,18 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   (this host's id) and `tinfirm-vm` (the VM's own id); the run that takes it is in this host's log.
 - **A VM that does not come up** (connected) within `--vm-start-timeout`, or that the provider fails,
   fails its run with `INFRA` and is deleted.
+- **A driver that can make no VM.** After a `create` that fails, this host asks the driver's
+  `verify`. Only an answer with problems and no room (`maxVms` 0), such as a node whose firewall
+  table is missing, stops it from taking runs: it rejects each new run with `NO_FREE_SLOT` and a
+  reason that names the cause ("the VM driver can make no VM now (…)"), so the run waits in the
+  server's queue with that reason, and the server dispatches it again later. This host asks `verify`
+  again before a rejection (at most every 5 s) and on its own every 30 s, and takes runs again once
+  the answer is clean or a create succeeds. A clean answer after a failed create leaves the host as
+  it was: the failure was the VM's own. A `verify` that fails or does not answer changes nothing.
+  A run's admission, and the report of the run whose create failed, wait at most 5 s for `verify`;
+  a slower answer is used when it comes. Its log has one warning when it stops taking runs and one
+  line when it takes them again. The host's page still shows its slots free meanwhile: the runner
+  protocol has no frame for such a state.
 - **The VM image's build.** The VM image holds its own copy of this binary, which runs the bridge and
   built the runner images there. When a VM's bridge connects, it names that build (the version and a
   digest of the images' definitions, such as `1.0.0+images.1a2b3c4d5e6f`), and this host compares it
@@ -1066,6 +1078,9 @@ driver is tested against node agents with their fake backend.
   agent's binary for its own.
 - **Placement.** A new VM goes to the node with the most free slots, by each node's `verify`, among the
   nodes that offer the template, answer and report no problem; the first in the file's order on a tie.
+  When no node can take it, the `create`'s error names each node's cause: its problems (cut to 400
+  bytes), that it did not answer, or that it has no free slot. Only when every such node is healthy
+  and full is it "no node of the driver has a free slot".
 - **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer with no
   problem. A node that does not answer is not counted and is named in the start's log; a node that
   reports a problem, or a template that no node offers, refuses the start. The start check adds

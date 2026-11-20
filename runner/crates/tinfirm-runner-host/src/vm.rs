@@ -65,6 +65,20 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(120);
 const DELETE_ATTEMPTS: u32 = 3;
 /// The longest line the driver may answer with.
 const MAX_LINE: u64 = 4 * 1024 * 1024;
+/// While the driver can make no VM, how often the host asks its `verify` again on its own
+/// ([`VmOptions::recheck`]).
+const RECHECK: Duration = Duration::from_secs(30);
+/// A run that comes while the driver can make no VM asks `verify` again first, unless the last
+/// answer is this recent: the server dispatches a rejected run again after 10 s, and several
+/// runs at once ask once.
+const RECHECK_FRESH: Duration = Duration::from_secs(5);
+/// The longest a run's admission, or the report of a failed create, waits for a health
+/// check ([`VmOptions::check_wait`]); the check goes on by itself, bounded by the driver's own
+/// [`VERIFY_TIMEOUT`], and its answer is recorded when it comes.
+const CHECK_WAIT: Duration = Duration::from_secs(5);
+/// The most of the driver's problems that the host passes on in a rejection: it goes to the
+/// server, and is shown as the run's queue reason.
+const CAUSE_MAX: usize = 1000;
 
 /// The program that is the driver, with its arguments and the environment it gets in addition
 /// to the host's.
@@ -159,6 +173,12 @@ pub struct VmOptions {
     /// What the host does with a VM whose image another build of the runner host made
     /// (`--vm-image-version`, ADR-0101).
     pub image_version: ImageVersion,
+    /// While the driver can make no VM ([`Vms::refusal`]): how often the host asks its `verify`
+    /// again on its own. No flag sets it.
+    pub recheck: Duration,
+    /// The longest a run's admission, or the report of a failed create, waits for the driver's
+    /// `verify` in a health check; then it goes on with what is known. No flag sets it.
+    pub check_wait: Duration,
     /// Test-only: the driver's "VMs" are processes on this machine, so the sandbox shares this
     /// machine's network and file system as the local test executor's does.
     #[doc(hidden)]
@@ -175,6 +195,8 @@ impl VmOptions {
             poll: Duration::from_secs(3),
             probe: default_probe(),
             image_version: ImageVersion::Warn,
+            recheck: RECHECK,
+            check_wait: CHECK_WAIT,
             on_this_machine: false,
         }
     }
@@ -809,6 +831,42 @@ pub struct Vms {
     live: Mutex<HashSet<String>>,
     /// The builds of VM images that the host has warned of ([`ImageVersion::Warn`]).
     warned: Mutex<HashSet<Option<String>>>,
+    /// Set while the driver can make no VM ([`Vms::refusal`]).
+    no_vms: Mutex<Option<NoVms>>,
+    /// Counts the times the driver started to make no VM: a recheck task ends when its own
+    /// time is over.
+    no_vms_since: AtomicU64,
+    /// A health check is under way: the runs that come together ask the driver once.
+    checking: std::sync::atomic::AtomicBool,
+    /// Counts the health checks that ended, for those that wait for one.
+    checks: tokio::sync::watch::Sender<u64>,
+}
+
+/// What a health check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Health {
+    /// `verify` answered: the driver can make VMs, or is full.
+    Clean,
+    /// `verify` answered with problems and no room: the cause.
+    NoVms(String),
+    /// `verify` failed or did not answer in the driver's own time: this tells nothing.
+    Unknown(String),
+}
+
+/// Why the driver can make no VM, as its last `verify` found it, and when that was.
+struct NoVms {
+    cause: String,
+    checked: tokio::time::Instant,
+}
+
+/// Whether a driver's `verify` says that it can make no VM now: it reports problems and has no
+/// room (`maxVms` 0, or none named). A driver with problems and room still makes VMs (one node
+/// broken beside a healthy one with free slots), and one with no problem and no room is full,
+/// which the host's own slots already bound. The cause is the problems, on one line and cut to
+/// [`CAUSE_MAX`].
+pub fn no_vms_cause(verified: &Verified) -> Option<String> {
+    (!verified.problems.is_empty() && verified.max_vms.unwrap_or(0) == 0)
+        .then(|| crate::util::one_line(&verified.problems.join("; "), CAUSE_MAX))
 }
 
 impl std::fmt::Debug for Vms {
@@ -825,6 +883,130 @@ impl Vms {
             driver,
             live: Mutex::new(HashSet::new()),
             warned: Mutex::new(HashSet::new()),
+            no_vms: Mutex::new(None),
+            no_vms_since: AtomicU64::new(0),
+            checking: std::sync::atomic::AtomicBool::new(false),
+            checks: tokio::sync::watch::Sender::new(0),
+        })
+    }
+
+    // ----- whether the driver can make a VM ----------------------------------------------
+    //
+    // A create that fails may be the run's own (its user data) or the driver's: a node that
+    // reports a problem, such as a node whose firewall table is missing, makes no VM for any
+    // run. The driver protocol does not say which, so after a failed create the host asks the
+    // driver's `verify`. Only an answer with problems and no room puts the host into the state
+    // where it takes no new run: it rejects each with the cause (`run.rejected`, which the
+    // server shows as the run's queue reason and dispatches again later) instead of failing it.
+    // It asks again before a rejection and on its own every `recheck`, and takes runs again
+    // once the answer is clean or a create succeeds. A `verify` that fails or does not answer
+    // changes nothing either way. No admission and no failed run's report waits longer than
+    // `check_wait` for the driver: the check goes on by itself. Each change is logged once.
+
+    /// Asks the driver's `verify`, within the driver's own [`VERIFY_TIMEOUT`].
+    async fn health(&self) -> Health {
+        match self.driver.verify(&self.options.template).await {
+            Ok(verified) => no_vms_cause(&verified).map_or(Health::Clean, Health::NoVms),
+            Err(e) => Health::Unknown(format!("{e:#}")),
+        }
+    }
+
+    /// Notes what a health check found, and logs a change of the state.
+    fn record(self: &Arc<Vms>, health: Health) {
+        let mut no_vms = lock(&self.no_vms);
+        let template = &self.options.template;
+        match (no_vms.as_mut(), health) {
+            (None, Health::NoVms(cause)) => {
+                tracing::warn!(
+                    %template,
+                    %cause,
+                    "the VM driver can make no VM: this host rejects new runs until the driver's verify is clean again"
+                );
+                *no_vms = Some(NoVms {
+                    cause,
+                    checked: tokio::time::Instant::now(),
+                });
+                drop(no_vms);
+                let since = self.no_vms_since.fetch_add(1, Ordering::Relaxed) + 1;
+                self.spawn_recheck(since);
+            }
+            (Some(known), Health::NoVms(cause)) => {
+                known.cause = cause;
+                known.checked = tokio::time::Instant::now();
+            }
+            (Some(_), Health::Clean) => {
+                *no_vms = None;
+                tracing::info!(%template, "the VM driver can make VMs again: this host takes new runs");
+            }
+            (known, Health::Unknown(why)) => {
+                // Not an answer: the state stays as it was, and the next check tries again.
+                if let Some(known) = known {
+                    known.checked = tokio::time::Instant::now();
+                }
+                tracing::debug!(%template, error = %why, "the VM driver's verify gave no answer; whether it can make VMs is unchanged");
+            }
+            (None, Health::Clean) => {}
+        }
+    }
+
+    /// Starts a health check unless one is under way, and waits for a check to end, at most
+    /// `wait`. The check goes on after the wait, and records its answer when it comes.
+    async fn check_within(self: &Arc<Vms>, wait: Duration) {
+        let mut ended = self.checks.subscribe();
+        let seen = *ended.borrow_and_update();
+        if !self.checking.swap(true, Ordering::SeqCst) {
+            let vms = self.clone();
+            tokio::spawn(async move {
+                let health = vms.health().await;
+                vms.record(health);
+                vms.checking.store(false, Ordering::SeqCst);
+                vms.checks.send_modify(|n| *n += 1);
+            });
+        }
+        let _ = tokio::time::timeout(wait, ended.wait_for(|n| *n > seen)).await;
+    }
+
+    /// While the driver can make no VM, asks it again every `recheck`, so that the host takes
+    /// runs again soon after it is fixed even when no run comes.
+    fn spawn_recheck(self: &Arc<Vms>, since: u64) {
+        let (vms, every) = (Arc::downgrade(self), self.options.recheck);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(vms) = vms.upgrade() else { return };
+                let current = || {
+                    lock(&vms.no_vms).is_some() && vms.no_vms_since.load(Ordering::Relaxed) == since
+                };
+                if !current() {
+                    return;
+                }
+                // Bounded by the driver's own time for `verify`.
+                vms.check_within(VERIFY_TIMEOUT + Duration::from_secs(5))
+                    .await;
+                if !current() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Why the host takes no new run now: its driver can make no VM (a create failed, and the
+    /// driver's `verify` then answered with problems and no room). Unless the driver was asked
+    /// a moment ago, it is asked again first, for at most `check_wait`; then the answer is what
+    /// is known. `None`: the host takes runs, and asks nothing.
+    pub async fn refusal(self: &Arc<Vms>) -> Option<String> {
+        let fresh = RECHECK_FRESH.min(self.options.recheck);
+        let stale = lock(&self.no_vms)
+            .as_ref()
+            .map(|known| known.checked.elapsed() >= fresh)?;
+        if stale {
+            self.check_within(self.options.check_wait).await;
+        }
+        lock(&self.no_vms).as_ref().map(|known| {
+            format!(
+                "the VM driver can make no VM now ({}); this runner host takes runs again once the driver's verify is clean",
+                known.cause
+            )
         })
     }
 
@@ -989,9 +1171,16 @@ impl Vms {
                 if let Some(label) = &label {
                     lock(&self.live).remove(label);
                 }
+                // Before the run fails, for at most `check_wait`: the next run then finds the
+                // host's state. A slower check records its answer when it comes.
+                self.check_within(self.options.check_wait).await;
                 return Err(e);
             }
         };
+        // The driver made a VM: it can.
+        if lock(&self.no_vms).is_some() {
+            self.record(Health::Clean);
+        }
         tracing::info!(vm = %id, name, template = %self.options.template, "sandbox VM created");
         Ok(VmGuard {
             vms: self.clone(),
@@ -1433,6 +1622,58 @@ mod tests {
         );
         let json = serde_json::to_string(&data).unwrap();
         assert_eq!(serde_json::from_str::<UserData>(&json).unwrap(), data);
+    }
+
+    #[test]
+    fn a_driver_makes_no_vm_when_it_reports_problems_and_no_room() {
+        let verified = |problems: &[&str], max_vms: Option<u32>| Verified {
+            problems: problems.iter().map(|p| p.to_string()).collect(),
+            max_vms,
+            checked: Vec::new(),
+        };
+        let table = "node node-1: the node's own firewall table is not loaded";
+        assert_eq!(
+            no_vms_cause(&verified(&[table], Some(0))).as_deref(),
+            Some(table)
+        );
+        assert!(no_vms_cause(&verified(&[table, "x"], None)).is_some());
+        // One node broken beside one with room: VMs are still made.
+        assert_eq!(no_vms_cause(&verified(&[table], Some(1))), None);
+        // Healthy and full: the host's slots bound that, not this.
+        assert_eq!(no_vms_cause(&verified(&[], Some(0))), None);
+        assert_eq!(no_vms_cause(&verified(&[], None)), None);
+        let long = "y".repeat(10 * CAUSE_MAX);
+        let cause = no_vms_cause(&verified(&[&long], Some(0))).unwrap();
+        assert!(cause.len() <= CAUSE_MAX, "{}", cause.len());
+    }
+
+    #[tokio::test]
+    async fn only_an_answer_of_verify_changes_whether_the_host_takes_runs() {
+        let mut options = VmOptions::new(
+            DriverCommand {
+                program: PathBuf::from("sh"),
+                args: vec!["-c".into(), "cat > /dev/null".into()],
+                env: Vec::new(),
+                builtin: None,
+            },
+            "sandbox".into(),
+        );
+        options.recheck = Duration::from_secs(3600);
+        let vms = Vms::new(options);
+        let cause = || lock(&vms.no_vms).as_ref().map(|known| known.cause.clone());
+        // No answer: nothing changes, either way.
+        vms.record(Health::Unknown("no answer".into()));
+        assert_eq!(cause(), None);
+        assert!(vms.refusal().await.is_none());
+        vms.record(Health::NoVms("the table is missing".into()));
+        assert_eq!(cause().as_deref(), Some("the table is missing"));
+        vms.record(Health::Unknown("no answer".into()));
+        assert_eq!(cause().as_deref(), Some("the table is missing"));
+        // A refusal right after a check answers with what is known, without asking.
+        let reason = vms.refusal().await.unwrap();
+        assert!(reason.contains("the table is missing"), "{reason}");
+        vms.record(Health::Clean);
+        assert_eq!(cause(), None);
     }
 
     /// A driver in `sh`: answers each request after `delay` with its method's line of

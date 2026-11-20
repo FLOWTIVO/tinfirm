@@ -13,6 +13,13 @@
 //                      not gone leave free, every host's VMs counted, as the node driver's
 //                      sum of the nodes' free slots is (wins over FAKE_VM_LIMIT)
 //   FAKE_VM_PROBLEMS   verify's problems, a JSON array (default: none)
+//   FAKE_VM_BROKEN     a file: while it is there, the "nodes" are broken, as a node whose
+//                      firewall table is gone: verify answers its content (a JSON array) as
+//                      the problems and maxVms 0, and a create fails
+//   FAKE_VM_CREATE_FAILS  when set, every create fails with this message, and verify stays
+//                      clean: a failure of the VM alone, such as its user data
+//   FAKE_VM_VERIFY     a file: while it is there, `verify` fails when it holds `fail`, and
+//                      answers after N ms when it holds `slow N`
 //   FAKE_VM_LEFTOVERS  VMs that are there from the start, a JSON array of {id, labels}
 //   FAKE_VM_BOOT_MS    how long a VM takes to come up (default 100)
 //   FAKE_VM_STATE      a file that keeps the VMs: a driver started again (by a host that
@@ -60,6 +67,12 @@ function log(method, params) {
   appendFileSync(env.FAKE_VM_LOG, JSON.stringify({ method, params }) + "\n");
 }
 
+// The problems of FAKE_VM_BROKEN while its file is there, else null.
+function brokenProblems() {
+  if (!env.FAKE_VM_BROKEN || !existsSync(env.FAKE_VM_BROKEN)) return null;
+  return JSON.parse(readFileSync(env.FAKE_VM_BROKEN, "utf8"));
+}
+
 function random(n) {
   return Math.floor(Math.random() * n);
 }
@@ -80,7 +93,12 @@ const methods = {
   hello() {
     return { protocol: 1, driver: "fake", version: "test" };
   },
-  verify({ template }) {
+  async verify({ template }) {
+    const mode = env.FAKE_VM_VERIFY && existsSync(env.FAKE_VM_VERIFY) ? readFileSync(env.FAKE_VM_VERIFY, "utf8").trim() : "";
+    if (mode === "fail") throw new Error("the provider's API is not reachable");
+    if (mode.startsWith("slow ")) await new Promise((resolve) => setTimeout(resolve, Number(mode.slice(5))));
+    const broken = brokenProblems();
+    if (broken) return { problems: broken, maxVms: 0, checked: [`template ${template}`] };
     return {
       problems: JSON.parse(env.FAKE_VM_PROBLEMS || "[]"),
       maxVms: env.FAKE_VM_SLOTS
@@ -92,6 +110,9 @@ const methods = {
     };
   },
   create({ template, name, userData, labels }) {
+    const broken = brokenProblems();
+    if (broken) throw new Error(`no node can take a VM: ${broken.join("; ")}`);
+    if (env.FAKE_VM_CREATE_FAILS) throw new Error(env.FAKE_VM_CREATE_FAILS);
     const data = JSON.parse(userData);
     if (data.tinfirm !== 1) throw new Error(`user data of format ${data.tinfirm}`);
     // Unique across the drivers of one state file.

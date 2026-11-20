@@ -1780,6 +1780,16 @@ impl Shared {
                 )),
             };
         }
+        // A VM driver that can make no VM (crate::vm, `Vms::refusal`): the run waits in the
+        // server's queue with the cause, instead of failing at its create. The protocol has
+        // no code of its own for it; the host has no slot to give, and the reason says why.
+        // A refusal found before keeps its own reason.
+        if refusal.is_none()
+            && let Executor::Vm(vms) = &self.opts.executor
+            && let Some(reason) = vms.refusal().await
+        {
+            refusal = Some((reject_code::NO_FREE_SLOT, reason));
+        }
         let mut runs = lock(&self.runs);
         let Some(entry) = runs
             .get_mut(&assign.run_id)

@@ -889,3 +889,254 @@ async fn without_ready_vms_each_run_creates_its_vm_and_none_is_kept() {
     })
     .await;
 }
+
+/// A driver that can make no VM (a node whose firewall table is missing) fails the run whose
+/// create it refuses, with its cause. The host then
+/// asks the driver's `verify`, finds problems and no room, and rejects every new run with the
+/// cause instead of failing it, so that the runs wait in the server's queue; no VM is asked for
+/// meanwhile. Once the driver is fixed, the host's own recheck finds it, and a run runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_driver_that_can_make_no_vm_fails_one_run_and_the_host_takes_none_until_it_can() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let broken = dir.path().join("broken");
+        let broken_path = broken.to_string_lossy().into_owned();
+        let mut options = vm_options(&log, &[("FAKE_VM_BROKEN", &broken_path)]);
+        options.recheck = Duration::from_millis(200);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::vm_with(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        std::fs::write(
+            &broken,
+            r#"["node node-1: the node's own firewall table (inet tinfirm_node) is not loaded"]"#,
+        )
+        .unwrap();
+
+        // The run whose create fails: it fails, and says why.
+        let first = AssignSpec::new("bridge-env", None);
+        conn.send(first.to_json());
+        let t = conn.until_finished(first.run_id).await;
+        assert_eq!(t.finished()["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(t.finished()["failureClass"], "INFRA");
+        assert!(
+            t.text().contains("firewall table (inet tinfirm_node)"),
+            "{}",
+            t.text()
+        );
+
+        // The next runs are rejected with the cause, and no VM is asked for.
+        for _ in 0..2 {
+            let spec = AssignSpec::new("bridge-env", None);
+            conn.send(spec.to_json());
+            let rejected = conn.take_run("run.rejected", spec.run_id).await;
+            assert_eq!(rejected["code"], "NO_FREE_SLOT", "{rejected}");
+            let reason = rejected["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("the VM driver can make no VM now"),
+                "{reason}"
+            );
+            assert!(
+                reason.contains("firewall table (inet tinfirm_node)"),
+                "{reason}"
+            );
+        }
+        let calls = vm_driver_calls(&log);
+        assert_eq!(calls_of(&calls, "create").len(), 1, "{calls:#?}");
+
+        // Fixed: the host's own recheck finds it without a run, and the next run runs.
+        std::fs::remove_file(&broken).unwrap();
+        let fixed = vm_driver_calls(&log).len();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while calls_of(&vm_driver_calls(&log)[fixed..], "verify").is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host did not ask the driver again"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Its answer is in.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let spec = AssignSpec::new("bridge-env", None);
+        conn.send(spec.to_json());
+        let id = spec.run_id.to_string();
+        let answer = conn
+            .take_where("the run's accept or rejection", |f| {
+                f["runId"] == id && (f["type"] == "run.accepted" || f["type"] == "run.rejected")
+            })
+            .await;
+        assert_eq!(answer["type"], "run.accepted", "{answer}");
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// A driver whose `verify` is clean after a failed create: the failure was the run's own, and
+/// the host goes on taking runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_that_fails_for_the_run_alone_keeps_the_host_taking_runs() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let options = vm_options(
+            &log,
+            &[(
+                "FAKE_VM_CREATE_FAILS",
+                "the user data is over the provider's limit",
+            )],
+        );
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::vm_with(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        for _ in 0..2 {
+            let spec = AssignSpec::new("bridge-env", None);
+            conn.send(spec.to_json());
+            conn.take_run("run.accepted", spec.run_id).await;
+            let t = conn.until_finished(spec.run_id).await;
+            assert_eq!(t.finished()["outcome"], "FAILED", "{}", t.text());
+            assert!(
+                t.text().contains("over the provider's limit"),
+                "{}",
+                t.text()
+            );
+        }
+        // Each failed create was followed by a verify, which was clean.
+        let calls = vm_driver_calls(&log);
+        assert_eq!(calls_of(&calls, "create").len(), 2, "{calls:#?}");
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// A `verify` that fails, or that has not answered yet, after a failed create tells nothing:
+/// the host goes on taking runs, each failing at its create as before, and the failed run's
+/// report waits at most `check_wait` for the driver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_verify_that_fails_or_is_slow_after_a_failed_create_keeps_the_host_taking_runs() {
+    with_timeout(120, async {
+        for mode in ["fail", "slow 5000"] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("driver.log");
+            let verify = dir.path().join("verify");
+            let verify_path = verify.to_string_lossy().into_owned();
+            let mut options = vm_options(
+                &log,
+                &[
+                    ("FAKE_VM_CREATE_FAILS", "the provider refused the VM"),
+                    ("FAKE_VM_VERIFY", &verify_path),
+                ],
+            );
+            options.check_wait = Duration::from_millis(200);
+            let mut server = FakeServer::start().await;
+            let host = start_host(&server.url, HostSetup::vm_with(options)).await;
+            let mut conn = server.accept().await;
+            conn.handshake(1).await;
+            std::fs::write(&verify, mode).unwrap();
+            for _ in 0..2 {
+                let spec = AssignSpec::new("bridge-env", None);
+                let sent = std::time::Instant::now();
+                conn.send(spec.to_json());
+                conn.take_run("run.accepted", spec.run_id).await;
+                let t = conn.until_finished(spec.run_id).await;
+                assert_eq!(t.finished()["outcome"], "FAILED", "{mode}: {}", t.text());
+                assert!(
+                    t.text().contains("the provider refused the VM"),
+                    "{mode}: {}",
+                    t.text()
+                );
+                // Not the 5 s of the slow verify.
+                assert!(
+                    sent.elapsed() < Duration::from_secs(4),
+                    "{mode}: {:?}",
+                    sent.elapsed()
+                );
+            }
+            host.shutdown.cancel();
+            host.handle.await.unwrap().unwrap();
+        }
+    })
+    .await;
+}
+
+/// While the driver can make no VM and its `verify` is slow, a new run is rejected within
+/// `check_wait` with the cause that is known; the state ends when `verify` answers clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_a_slow_verify_a_run_is_rejected_at_once_with_the_known_cause() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let broken = dir.path().join("broken");
+        let verify = dir.path().join("verify");
+        let (broken_path, verify_path) = (
+            broken.to_string_lossy().into_owned(),
+            verify.to_string_lossy().into_owned(),
+        );
+        let mut options = vm_options(
+            &log,
+            &[
+                ("FAKE_VM_BROKEN", &broken_path),
+                ("FAKE_VM_VERIFY", &verify_path),
+            ],
+        );
+        options.recheck = Duration::from_millis(200);
+        options.check_wait = Duration::from_millis(300);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::vm_with(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        std::fs::write(&broken, r#"["node node-1: the firewall table is missing"]"#).unwrap();
+        let first = AssignSpec::new("bridge-env", None);
+        conn.send(first.to_json());
+        let t = conn.until_finished(first.run_id).await;
+        assert_eq!(t.finished()["outcome"], "FAILED", "{}", t.text());
+
+        // The driver's verify now takes 3 s: the run is rejected within the bound.
+        std::fs::write(&verify, "slow 3000").unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let spec = AssignSpec::new("bridge-env", None);
+        let sent = std::time::Instant::now();
+        conn.send(spec.to_json());
+        let rejected = conn.take_run("run.rejected", spec.run_id).await;
+        assert!(
+            sent.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            sent.elapsed()
+        );
+        let reason = rejected["reason"].as_str().unwrap();
+        assert!(reason.contains("the firewall table is missing"), "{reason}");
+
+        // Fixed: once a verify answers clean, a run is taken again.
+        std::fs::remove_file(&broken).unwrap();
+        std::fs::remove_file(&verify).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let spec = AssignSpec::new("bridge-env", None);
+            conn.send(spec.to_json());
+            let id = spec.run_id.to_string();
+            let answer = conn
+                .take_where("the run's accept or rejection", |f| {
+                    f["runId"] == id && (f["type"] == "run.accepted" || f["type"] == "run.rejected")
+                })
+                .await;
+            if answer["type"] == "run.accepted" {
+                let t = conn.until_finished(spec.run_id).await;
+                assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host did not take runs again: {answer}"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
