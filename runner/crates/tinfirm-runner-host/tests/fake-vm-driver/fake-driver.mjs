@@ -19,7 +19,8 @@
 //   FAKE_VM_CREATE_FAILS  when set, every create fails with this message, and verify stays
 //                      clean: a failure of the VM alone, such as its user data
 //   FAKE_VM_VERIFY     a file: while it is there, `verify` fails when it holds `fail`, and
-//                      answers after N ms when it holds `slow N`
+//                      answers after N ms when it holds `slow N`, with what FAKE_VM_BROKEN
+//                      said when the call came
 //   FAKE_VM_LEFTOVERS  VMs that are there from the start, a JSON array of {id, labels}
 //   FAKE_VM_BOOT_MS    how long a VM takes to come up (default 100)
 //   FAKE_VM_STATE      a file that keeps the VMs: a driver started again (by a host that
@@ -96,8 +97,8 @@ const methods = {
   async verify({ template }) {
     const mode = env.FAKE_VM_VERIFY && existsSync(env.FAKE_VM_VERIFY) ? readFileSync(env.FAKE_VM_VERIFY, "utf8").trim() : "";
     if (mode === "fail") throw new Error("the provider's API is not reachable");
-    if (mode.startsWith("slow ")) await new Promise((resolve) => setTimeout(resolve, Number(mode.slice(5))));
     const broken = brokenProblems();
+    if (mode.startsWith("slow ")) await new Promise((resolve) => setTimeout(resolve, Number(mode.slice(5))));
     if (broken) return { problems: broken, maxVms: 0, checked: [`template ${template}`] };
     return {
       problems: JSON.parse(env.FAKE_VM_PROBLEMS || "[]"),

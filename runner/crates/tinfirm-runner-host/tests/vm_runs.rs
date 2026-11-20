@@ -1140,3 +1140,71 @@ async fn with_a_slow_verify_a_run_is_rejected_at_once_with_the_known_cause() {
     })
     .await;
 }
+
+/// A health check is older evidence than a VM made while its `verify` ran: a failed create
+/// starts a slow `verify` while the driver can make no VM; the driver is fixed and the next
+/// run's VM is made; then the slow answer "no VM" comes. The host still takes runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_no_vm_answer_older_than_a_vm_that_was_made_does_not_stop_the_host() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let broken = dir.path().join("broken");
+        let verify = dir.path().join("verify");
+        let (broken_path, verify_path) = (
+            broken.to_string_lossy().into_owned(),
+            verify.to_string_lossy().into_owned(),
+        );
+        let mut options = vm_options(
+            &log,
+            &[
+                ("FAKE_VM_BROKEN", &broken_path),
+                ("FAKE_VM_VERIFY", &verify_path),
+            ],
+        );
+        options.check_wait = Duration::from_millis(200);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::vm_with(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        std::fs::write(&verify, "slow 3000").unwrap();
+        std::fs::write(&broken, r#"["node node-1: the firewall table is missing"]"#).unwrap();
+
+        // The create fails; its check's verify takes 3 s, and will answer "no VM".
+        let first = AssignSpec::new("bridge-env", None);
+        let sent = std::time::Instant::now();
+        conn.send(first.to_json());
+        let t = conn.until_finished(first.run_id).await;
+        assert_eq!(t.finished()["outcome"], "FAILED", "{}", t.text());
+        assert!(
+            sent.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            sent.elapsed()
+        );
+
+        // Fixed while that verify runs: the next run's VM is made.
+        std::fs::remove_file(&broken).unwrap();
+        let second = AssignSpec::new("bridge-env", None);
+        conn.send(second.to_json());
+        let t = conn.until_finished(second.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+
+        // The slow answer has come by now; it is older than the VM, and changes nothing.
+        let wait = Duration::from_millis(3500).saturating_sub(sent.elapsed());
+        tokio::time::sleep(wait).await;
+        let third = AssignSpec::new("bridge-env", None);
+        conn.send(third.to_json());
+        let id = third.run_id.to_string();
+        let answer = conn
+            .take_where("the run's accept or rejection", |f| {
+                f["runId"] == id && (f["type"] == "run.accepted" || f["type"] == "run.rejected")
+            })
+            .await;
+        assert_eq!(answer["type"], "run.accepted", "{answer}");
+        let t = conn.until_finished(third.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}

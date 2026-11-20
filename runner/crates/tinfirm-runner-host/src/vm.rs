@@ -847,6 +847,9 @@ pub struct Vms {
     no_vms_since: AtomicU64,
     /// A health check is under way: the runs that come together ask the driver once.
     checking: std::sync::atomic::AtomicBool,
+    /// Counts the VMs the driver made: a check whose `verify` began before one of them was
+    /// made has older evidence than that VM, and its "no VM" answer is dropped.
+    made: AtomicU64,
     /// Counts the health checks that ended, for those that wait for one.
     checks: tokio::sync::watch::Sender<u64>,
 }
@@ -894,6 +897,7 @@ impl Vms {
             warned: Mutex::new(HashSet::new()),
             no_vms: Mutex::new(None),
             no_vms_since: AtomicU64::new(0),
+            made: AtomicU64::new(0),
             checking: std::sync::atomic::AtomicBool::new(false),
             checks: tokio::sync::watch::Sender::new(0),
         })
@@ -966,7 +970,14 @@ impl Vms {
         if !self.checking.swap(true, Ordering::SeqCst) {
             let vms = self.clone();
             tokio::spawn(async move {
-                let health = vms.health().await;
+                let made = vms.made.load(Ordering::SeqCst);
+                let health = match vms.health().await {
+                    // A VM was made while `verify` ran: the driver can make VMs.
+                    Health::NoVms(_) if vms.made.load(Ordering::SeqCst) != made => {
+                        Health::Unknown("the driver made a VM while its verify ran".into())
+                    }
+                    health => health,
+                };
                 vms.record(health);
                 vms.checking.store(false, Ordering::SeqCst);
                 vms.checks.send_modify(|n| *n += 1);
@@ -1186,7 +1197,9 @@ impl Vms {
                 return Err(e);
             }
         };
-        // The driver made a VM: it can.
+        // The driver made a VM: it can. Counted first, so that a check under way that answers
+        // "no VM" after this drops its answer.
+        self.made.fetch_add(1, Ordering::SeqCst);
         if lock(&self.no_vms).is_some() {
             self.record(Health::Clean);
         }
