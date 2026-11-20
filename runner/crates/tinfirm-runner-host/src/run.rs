@@ -1602,7 +1602,7 @@ async fn store_session_bundle(
         return Outcome::Refused;
     }
     let (home, runtime) = (home_dir.to_path_buf(), assign.agent.runtime);
-    let redactor = shared.run_redactor(assign.run_id);
+    let redactor = shared.run_redactor(assign.run_id, assign.epoch);
     let packed = tokio::task::spawn_blocking(move || {
         let packed = session_bundles::pack(&home, runtime)?;
         // The run's own credentials, which the server's scan does not know. Its URL secrets
@@ -3319,7 +3319,17 @@ async fn finalize_git(
             commits: None,
         };
         let scan = !leak && !repo.ws.read_only;
-        match prepare_repository(shared, sink, repo, run_id, scan, &mut result).await {
+        match prepare_repository(
+            shared,
+            sink,
+            repo,
+            run_id,
+            tokens.epoch(),
+            scan,
+            &mut result,
+        )
+        .await
+        {
             Ok(outgoing_leak) => {
                 if outgoing_leak {
                     leaking.push(repo.label());
@@ -3413,6 +3423,7 @@ async fn prepare_repository(
     sink: &mut EventSink,
     repo: &Repo<'_>,
     run_id: Uuid,
+    epoch: i64,
     scan: bool,
     result: &mut GitResult,
 ) -> anyhow::Result<bool> {
@@ -3486,7 +3497,7 @@ async fn prepare_repository(
     if !scan {
         return Ok(false);
     }
-    git.outgoing_contains_secret(&shared.run_redactor(run_id), &exclude)
+    git.outgoing_contains_secret(&shared.run_redactor(run_id, epoch), &exclude)
         .await
 }
 
@@ -3517,7 +3528,7 @@ async fn collect_output(
     assign: &RunAssign,
     output_root: &OutputRoot,
 ) -> Vec<ArtifactResult> {
-    let redactor = shared.run_redactor(assign.run_id);
+    let redactor = shared.run_redactor(assign.run_id, assign.epoch);
     let server_url = shared.config.server_url.clone();
     let token = shared.config.token.expose().to_string();
     let (run_id, epoch) = (assign.run_id, assign.epoch);

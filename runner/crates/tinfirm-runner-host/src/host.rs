@@ -547,14 +547,13 @@ impl Shared {
 
     /// The redactor of a run's bulk scans (its outgoing commits, its session bundle, its
     /// `/output`): every credential by value, as [`Shared::redactor`] has them, and of the
-    /// hashed ones only `run_id`'s. The hashes stand for that run's earlier tokens, which no
-    /// other run's sandbox ever had; and each run's hashes cost a pass of their own, so a scan
-    /// with every run's would cost as many passes as there are runs taken back.
-    pub fn run_redactor(&self, run_id: Uuid) -> Arc<Redactor> {
-        let own = lock(&self.run_hashed)
-            .iter()
-            .find(|((run, _), _)| *run == run_id)
-            .map(|(_, matcher)| matcher.clone());
+    /// hashed ones only those of `run_id`'s execution `epoch`. The hashes stand for that
+    /// execution's earlier tokens, which no other run's sandbox ever had; and each run's hashes
+    /// cost a pass of their own, so a scan with every run's would cost as many passes as there
+    /// are runs taken back. The execution is named exactly: a newer epoch of a run may replace
+    /// a copy this host still ends, and each scans with its own hashes.
+    pub fn run_redactor(&self, run_id: Uuid, epoch: i64) -> Arc<Redactor> {
+        let own = lock(&self.run_hashed).get(&(run_id, epoch)).cloned();
         Arc::new(self.redactor().with_only_hashed(own))
     }
 
@@ -3088,6 +3087,62 @@ mod tests {
         assert!(tool_took >= Duration::from_millis(2800), "{tool_took:?}");
         assert!(tool_took < Duration::from_millis(4300), "{tool_took:?}");
         assert_eq!(host.waiting_platform_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn each_epoch_of_a_run_scans_with_its_own_hashes() {
+        use crate::config::HostConfig;
+        use crate::secret_hashes::{HashedMatcher, SecretHashes};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let local = Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        let config = HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TEST_ONLY_host_token_of_the_epoch_test_0123"),
+        );
+        let host = Shared::new(HostOptions::new(paths, local), config);
+        let run = Uuid::new_v4();
+        // Epoch 1, a copy this host still ends, and epoch 2, which replaced it: each held an
+        // earlier token of its own.
+        let (first, second) = (
+            "ghs_TEST_ONLY_earlier_of_epoch_1_0123",
+            "ghs_TEST_ONLY_earlier_of_epoch_2_4567",
+        );
+        for (epoch, token) in [(1, first), (2, second)] {
+            let mut hashes = SecretHashes::new();
+            hashes.add(token);
+            host.add_run_hashed(run, epoch, Arc::new(HashedMatcher::new(&hashes).unwrap()));
+        }
+        let one = host.run_redactor(run, 1);
+        let two = host.run_redactor(run, 2);
+        assert!(one.contains_credential(first.as_bytes()));
+        assert!(!one.contains_credential(second.as_bytes()));
+        assert!(two.contains_credential(second.as_bytes()));
+        assert!(!two.contains_credential(first.as_bytes()));
+        // An execution with no hashes, or another run, gets none of these.
+        assert!(
+            !host
+                .run_redactor(run, 3)
+                .contains_credential(first.as_bytes())
+        );
+        assert!(
+            !host
+                .run_redactor(Uuid::new_v4(), 1)
+                .contains_credential(first.as_bytes())
+        );
+        // The host-wide redactor of events and log lines has both.
+        assert!(host.redactor().contains_credential(first.as_bytes()));
+        assert!(host.redactor().contains_credential(second.as_bytes()));
+        // Once epoch 1 ends, its hashes go, and epoch 2 keeps its own.
+        host.remove_run_secrets(run, 1);
+        assert!(!host.redactor().contains_credential(first.as_bytes()));
+        assert!(
+            host.run_redactor(run, 2)
+                .contains_credential(second.as_bytes())
+        );
     }
 
     #[tokio::test]
