@@ -660,6 +660,25 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     holds its base64, which these forms match, so the headers are not kept. A record without
     `redaction` (an earlier version's) is read as before, and the previous version reads one
     with it, ignoring the field.
+  - **A record whose hashes cannot be used** fails closed. Its hashes are read as untrusted
+    and bounded before any work: a salt of 32 bytes in hex, at most 16,384 forms, each of 8 to
+    49,152 bytes (the percent-encoding of the longest git token the host takes, 16,384 bytes,
+    the longest the server keeps; an assignment with a longer one is refused and a renewal
+    with one is ignored), a 12-bit tag and a SHA-256 in
+    lowercase hex. A record that has `redaction` and breaks any of these pushes nothing of the
+    run, stores no session bundle and saves no file of `/output`: the run ends failed with
+    `INFRA`, "its record of the run is damaged", and its work stays on the host as a failed
+    run's does (`keep_failed_workspaces`).
+  - **What a scan costs.** The run's events and the host's log lines are redacted with every
+    run's hashes, since they are small. The bulk scans of a run (its outgoing commits, its
+    session bundle, its `/output`) use every credential by value and that run's own hashes
+    alone, so ten runs taken back do not make each scan ten times as long. With ten runs'
+    hashes loaded, a scan of 200 MiB took 17.6 to 18.3 s with every run's hashes and 1.75 to
+    1.82 s with one run's (release build, 4 CPUs). What bounds a scan when an agent makes its
+    commits large on purpose is the size of what comes back from the sandbox: at most 8 GiB of
+    bundle per repository (the sandbox bridge's `BUNDLE_LIMITS`) and 20 repositories; at about
+    110 MiB/s by hashes and 160 MiB/s by value, 8 GiB takes about 2 minutes to scan. The
+    session bundle is 64 MiB unpacked at most, and an `/output` file 25 MiB by default.
   - **What the hashes give away.** Someone who reads the record learns, of a token that is no
     longer in it, its length and at most 12 bits per stored form from the rolling hashes: at
     most 60 to 96 bits for 5 to 8 forms, if all of them could be used together, which no method

@@ -284,6 +284,17 @@ impl Redactor {
         self
     }
 
+    /// This redactor's credentials by value, and of the hashed ones `hashed` alone: for a run's
+    /// bulk scans, which need not pay for every other run's hashes.
+    pub fn with_only_hashed(
+        &self,
+        hashed: Option<std::sync::Arc<crate::secret_hashes::HashedMatcher>>,
+    ) -> Redactor {
+        let mut redactor = self.clone();
+        redactor.hashed = hashed.into_iter().collect();
+        redactor
+    }
+
     fn hashed_contains(&self, bytes: &[u8]) -> bool {
         self.hashed.iter().any(|m| m.contains(bytes))
     }
@@ -449,7 +460,7 @@ mod tests {
 
     #[test]
     fn a_credential_known_by_its_hashes_alone_is_redacted_and_counts_as_a_credential() {
-        let token = "github_pat_TESTONLYrevoked0123456789abcdef";
+        let token = "github_pat_TEST_ONLY_revoked_0123_abcdef";
         let mut hashes = crate::secret_hashes::SecretHashes::new();
         hashes.add(token);
         let matcher =

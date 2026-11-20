@@ -21,13 +21,23 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ring::digest::{SHA256, digest};
 use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
 
 /// The bits of the rolling hash a form keeps: the pre-filter, and all that the tag gives away.
 pub const TAG_BITS: u32 = 12;
+/// The longest form of a token: its percent-encoding, at most three bytes per byte of the
+/// longest git token the host takes ([`crate::host::MAX_GIT_TOKEN_BYTES`]); its base64 is
+/// shorter.
+pub const MAX_FORM_LEN: usize = 3 * crate::host::MAX_GIT_TOKEN_BYTES;
+/// The most forms a record keeps: far above a run of the most repositories
+/// ([`tinfirm_protocol::MAX_WORKSPACES`], 20) whose tokens are renewed every 50 minutes for the
+/// longest run of a day (30 tokens each), at 9 forms a token: 20 × 31 × 9 = 5580.
+pub const MAX_FORMS: usize = 16 * 1024;
+/// The bytes of the salt.
+pub const SALT_BYTES: usize = 32;
 
 /// The hashes of every token a run has held, as its take-back record keeps them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +121,7 @@ impl SecretHashes {
     }
 
     fn salt_bytes(&self) -> Option<Vec<u8>> {
-        unhex(&self.salt).filter(|salt| salt.len() == 32)
+        unhex(&self.salt).filter(|salt| salt.len() == SALT_BYTES)
     }
 
     /// Adds every form of `secret` that the redactor would match and that is not here yet.
@@ -120,12 +130,20 @@ impl SecretHashes {
             return;
         };
         let base = base_of(&salt);
-        if secret.len() < crate::redact::MIN_SECRET_LEN {
+        if secret.len() < crate::redact::MIN_SECRET_LEN
+            || secret.len() > crate::host::MAX_GIT_TOKEN_BYTES
+        {
             return;
         }
         for form in crate::redact::variants(secret) {
-            if form.len() < crate::redact::MIN_SECRET_LEN {
+            if form.len() < crate::redact::MIN_SECRET_LEN || form.len() > MAX_FORM_LEN {
                 continue;
+            }
+            if self.forms.len() >= MAX_FORMS {
+                tracing::warn!(
+                    "a run has held more git tokens than its record keeps hashes of; the latest are not kept"
+                );
+                return;
             }
             let sha256 = hex(&salted(&salt, form.as_bytes()));
             if self.forms.iter().any(|f| f.sha256 == sha256) {
@@ -175,26 +193,54 @@ pub struct HashedMatcher {
 }
 
 impl HashedMatcher {
+    /// The scanner of `hashes`, which a record held, so read as untrusted: a salt of
+    /// [`SALT_BYTES`] in hex, at most [`MAX_FORMS`] forms, each of
+    /// [`crate::redact::MIN_SECRET_LEN`] to [`MAX_FORM_LEN`] bytes with a tag of [`TAG_BITS`]
+    /// bits and a SHA-256 in 64 lowercase hex digits. Anything else is an error, and nothing
+    /// is computed before the bounds are checked.
     pub fn new(hashes: &SecretHashes) -> Result<HashedMatcher> {
         let salt = hashes
             .salt_bytes()
-            .context("the record's redaction salt is not 32 bytes in hex")?;
+            .with_context(|| format!("the salt is not {SALT_BYTES} bytes in hex"))?;
+        if hashes.forms.len() > MAX_FORMS {
+            bail!(
+                "{} forms, more than the {MAX_FORMS} a record keeps",
+                hashes.forms.len()
+            );
+        }
+        for form in &hashes.forms {
+            let len = form.len as usize;
+            if !(crate::redact::MIN_SECRET_LEN..=MAX_FORM_LEN).contains(&len) {
+                bail!(
+                    "a form of {len} bytes, outside {} to {MAX_FORM_LEN}",
+                    crate::redact::MIN_SECRET_LEN
+                );
+            }
+            if u32::from(form.tag) >= 1 << TAG_BITS {
+                bail!("a tag of more than {TAG_BITS} bits");
+            }
+            if form.sha256.len() != 64
+                || !form
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                bail!("a hash is not SHA-256 in 64 lowercase hex digits");
+            }
+        }
         let base = base_of(&salt);
         let mut by_len: BTreeMap<usize, OfLength> = BTreeMap::new();
         for form in &hashes.forms {
             let len = form.len as usize;
-            if len == 0 {
-                continue;
-            }
             let proof: [u8; 32] = unhex(&form.sha256)
                 .and_then(|bytes| bytes.try_into().ok())
-                .context("a hash of the record's redaction is not SHA-256 in hex")?;
+                .context("a hash is not SHA-256 in hex")?;
             let entry = by_len.entry(len).or_insert_with(|| OfLength {
                 top: (1..len).fold(1u64, |p, _| p.wrapping_mul(base)),
                 tags: Box::new([0; (1 << TAG_BITS) / 64]),
                 proofs: HashMap::new(),
             });
-            let tag = form.tag & ((1 << TAG_BITS) - 1);
+            let tag = form.tag;
             entry.tags[usize::from(tag) / 64] |= 1 << (tag % 64);
             entry.proofs.entry(tag).or_default().push(proof);
         }
@@ -396,5 +442,100 @@ mod tests {
         // With a token in it: found by both.
         pack[100 << 20..(100 << 20) + tokens[3].len()].copy_from_slice(tokens[3].as_bytes());
         assert!(plain.contains_any(&pack) && hashed.contains_any(&pack));
+    }
+
+    /// Bytes like a pack's: incompressible, from a seeded xorshift.
+    fn pack_like(bytes: usize) -> Vec<u8> {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut pack = vec![0u8; bytes];
+        for chunk in pack.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+        }
+        pack
+    }
+
+    /// The cost of ten runs taken back (B3.1): one 200 MiB scan with every run's hashes, as the
+    /// host-wide redactor holds them, and with one run's alone, as a run's bulk scans now use.
+    /// `cargo test --release -p tinfirm-runner-host --lib secret_hashes -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement, run by hand in release"]
+    fn measure_a_scan_with_ten_runs_taken_back() {
+        let pack = pack_like(200 << 20);
+        let matchers: Vec<std::sync::Arc<HashedMatcher>> = (0..10)
+            .map(|run| {
+                // Each run: a revoked token and a GitHub App's earlier one.
+                let mut hashes = SecretHashes::new();
+                for which in ["revoked", "earlier"] {
+                    hashes.add(&format!(
+                        "{}_TEST_ONLY_{which}_{run:02}_abcdefghijklmn",
+                        "ghs"
+                    ));
+                }
+                std::sync::Arc::new(HashedMatcher::new(&hashes).unwrap())
+            })
+            .collect();
+        let host_wide =
+            crate::redact::Redactor::new(std::iter::empty::<&str>()).with_hashed(matchers.clone());
+        let one_run = host_wide.with_only_hashed(Some(matchers[0].clone()));
+        for (name, redactor) in [
+            ("ten runs' hashes", &host_wide),
+            ("one run's hashes", &one_run),
+        ] {
+            let started = std::time::Instant::now();
+            assert!(!redactor.contains_any(&pack));
+            let took = started.elapsed();
+            println!(
+                "{name}: {:.2} s for 200 MiB ({:.0} MiB/s)",
+                took.as_secs_f64(),
+                200.0 / took.as_secs_f64()
+            );
+        }
+    }
+
+    #[test]
+    fn a_records_hashes_out_of_bounds_are_refused_before_any_work() {
+        let mut good = SecretHashes::new();
+        good.add("ghs_TEST_ONLY_bounded_token_0123");
+        assert!(HashedMatcher::new(&good).is_ok());
+        let refused = |change: &dyn Fn(&mut SecretHashes)| {
+            let mut hashes = good.clone();
+            change(&mut hashes);
+            let started = std::time::Instant::now();
+            let error = HashedMatcher::new(&hashes).unwrap_err().to_string();
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{error}"
+            );
+            error
+        };
+        // The salt: 32 bytes in hex, no more, no less, no other characters.
+        assert!(refused(&|h| h.salt = "ab".repeat(31)).contains("salt"));
+        assert!(refused(&|h| h.salt = "ab".repeat(33)).contains("salt"));
+        assert!(refused(&|h| h.salt = "zz".repeat(32)).contains("salt"));
+        // A form's length: from the shortest secret to the longest form of the longest token.
+        for len in [0, 7, MAX_FORM_LEN as u32 + 1, u32::MAX] {
+            let error = refused(&|h| h.forms[0].len = len);
+            assert!(error.contains("a form of"), "{len}: {error}");
+        }
+        // The tag: 12 bits.
+        assert!(refused(&|h| h.forms[0].tag = 1 << TAG_BITS).contains("tag"));
+        // The hash: 64 lowercase hex digits.
+        assert!(
+            refused(&|h| h.forms[0].sha256 = h.forms[0].sha256.to_uppercase()).contains("SHA-256")
+        );
+        assert!(refused(&|h| h.forms[0].sha256.truncate(62)).contains("SHA-256"));
+        // The count of forms.
+        let error = refused(&|h| {
+            let form = h.forms[0].clone();
+            h.forms = vec![form; MAX_FORMS + 1];
+        });
+        assert!(error.contains("forms"), "{error}");
+        // A record keeps no form of a token longer than the host takes.
+        let mut long = SecretHashes::new();
+        long.add(&"x".repeat(crate::host::MAX_GIT_TOKEN_BYTES + 1));
+        assert!(long.is_empty());
     }
 }

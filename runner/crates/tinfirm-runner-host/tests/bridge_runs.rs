@@ -1199,6 +1199,74 @@ async fn an_apps_earlier_token_in_a_commit_is_caught_after_a_restart() {
     .await;
 }
 
+/// Host A killed mid-run; its record's `redaction` changed by `change` before host B takes the
+/// run back. The transcript of host B.
+async fn a_run_taken_back_from_a_record_whose_hashes_are(
+    change: impl FnOnce(&mut serde_json::Value),
+) -> (Transcript, TestRepo) {
+    let repo = TestRepo::new();
+    let mut server = FakeServer::start().await;
+    let (dir, spec, record, _) = a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+    let mut kept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    assert!(kept["redaction"]["salt"].is_string(), "{kept:#}");
+    change(&mut kept);
+    std::fs::write(&record, serde_json::to_vec(&kept).unwrap()).unwrap();
+    let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+    let mut conn = server.accept().await;
+    conn.handshake_listing(1, SERVER_FEATURES).await;
+    conn.send(json!({"type": "welcome.done"}));
+    let t = conn.until_finished(spec.run_id).await;
+    t.assert_no_secrets();
+    host.shutdown.cancel();
+    host.handle.await.unwrap().unwrap();
+    (t, repo)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_whose_hashes_cannot_be_used_pushes_nothing_of_the_run() {
+    with_timeout(180, async {
+        let (t, repo) = a_run_taken_back_from_a_record_whose_hashes_are(|kept| {
+            kept["redaction"]["forms"][0]["len"] = json!(u32::MAX);
+        })
+        .await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message.contains("its record of the run is damaged"),
+            "{message}"
+        );
+        assert!(message.contains("the work was not pushed"), "{message}");
+        assert_eq!(finished["git"][0]["pushed"], false, "{}", t.text());
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        assert!(
+            t.text()
+                .contains("nothing of the run's work leaves the host"),
+            "{}",
+            t.text()
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_without_hashes_is_taken_back_as_before() {
+    with_timeout(180, async {
+        let (t, repo) = a_run_taken_back_from_a_record_whose_hashes_are(|kept| {
+            kept.as_object_mut().unwrap().remove("redaction");
+        })
+        .await;
+        assert_eq!(t.finished()["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_applied_before_a_restart_is_confirmed_again_after_it() {
     with_timeout(180, async {

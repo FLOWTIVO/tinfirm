@@ -545,6 +545,19 @@ impl Shared {
         self.refresh_redactor();
     }
 
+    /// The redactor of a run's bulk scans (its outgoing commits, its session bundle, its
+    /// `/output`): every credential by value, as [`Shared::redactor`] has them, and of the
+    /// hashed ones only `run_id`'s. The hashes stand for that run's earlier tokens, which no
+    /// other run's sandbox ever had; and each run's hashes cost a pass of their own, so a scan
+    /// with every run's would cost as many passes as there are runs taken back.
+    pub fn run_redactor(&self, run_id: Uuid) -> Arc<Redactor> {
+        let own = lock(&self.run_hashed)
+            .iter()
+            .find(|((run, _), _)| *run == run_id)
+            .map(|(_, matcher)| matcher.clone());
+        Arc::new(self.redactor().with_only_hashed(own))
+    }
+
     /// The tokens a run taken back held before its restart, known by their salted hashes alone
     /// (crate::secret_hashes): from now on until the run ends they are redacted and scanned for
     /// as its other credentials are.
@@ -2393,6 +2406,12 @@ pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     features
 }
 
+/// The longest git token the host takes, in an assignment or a renewal: the longest token the
+/// server keeps (16 KiB, its bound for an OAuth access token; a token a person enters is at
+/// most 4000 characters, and a fine-grained GitHub token has 93). It is also the bound of what
+/// a take-back record's hashes of a token may be ([`crate::secret_hashes::MAX_FORM_LEN`]).
+pub const MAX_GIT_TOKEN_BYTES: usize = 16384;
+
 /// `run.assign.workspaces` (docs/archive/v1/CONVENTIONS.md §15.4 step 1): at most 20, each `dir` a valid and
 /// unique directory name, and each repository valid ([`validate_workspace`]).
 pub fn validate_workspaces(
@@ -2441,6 +2460,11 @@ pub fn validate_workspace(ws: &WorkspaceSpec, allow_insecure: bool) -> Result<()
     }
     if !safe_ref(&ws.default_branch) {
         return Err(format!("invalid defaultBranch `{}`", ws.default_branch));
+    }
+    if let Some(git) = &ws.git
+        && git.token.expose().len() > MAX_GIT_TOKEN_BYTES
+    {
+        return Err(format!("git.token is over {MAX_GIT_TOKEN_BYTES} bytes"));
     }
     // ADR-0116: a token that expires names its credential's mirror, and only together.
     if let Some(git) = &ws.git {
@@ -3425,6 +3449,14 @@ mod tests {
         assert!(with(false, Some(&key)).is_err());
         assert!(with(true, Some(&"3F".repeat(32))).is_err());
         assert!(with(true, Some("../x")).is_err());
+        // A token longer than the host takes is refused.
+        let mut spec = ws(url, "agent/X-1", "main");
+        spec.git = Some(tinfirm_protocol::GitCredentials::new(
+            "x-access-token",
+            tinfirm_protocol::Secret::new("t".repeat(MAX_GIT_TOKEN_BYTES + 1)),
+        ));
+        let error = validate_workspace(&spec, false).unwrap_err();
+        assert!(error.contains("git.token is over 16384 bytes"), "{error}");
     }
 
     #[test]

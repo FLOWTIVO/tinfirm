@@ -688,7 +688,7 @@ mod tests {
         // With hashes: written and read back as they are, beside the fields of before.
         let mut second = record();
         let mut hashes = crate::secret_hashes::SecretHashes::new();
-        hashes.add("ghs_TESTONLYanearliertoken0123456789abc");
+        hashes.add("ghs_TEST_ONLY_an_earlier_token_0123");
         second.redaction = Some(hashes.clone());
         records.save(&second).unwrap();
         let loaded = records.load_all();

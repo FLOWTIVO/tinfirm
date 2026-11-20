@@ -1128,14 +1128,18 @@ pub async fn take_back(
     // a GitHub App's earlier ones), by the salted hashes the record keeps: the events, the
     // host's log lines of the run, and the scans before the push, of the session bundle and
     // of `/output` find them as they find the live ones.
-    let hashes = tokens.hashes();
-    if !hashes.is_empty() {
-        match crate::secret_hashes::HashedMatcher::new(&hashes) {
+    // A record without hashes (an earlier version's) reads as before. A record whose hashes
+    // are there but cannot be used is unsafe: an earlier token could then leave in a commit,
+    // the session bundle or `/output`, so nothing of the run's work leaves the host.
+    let mut unsafe_record = None;
+    if record.redaction.is_some() {
+        match crate::secret_hashes::HashedMatcher::new(&tokens.hashes()) {
             Ok(matcher) => {
                 shared.add_run_hashed(assign.run_id, assign.epoch, Arc::new(matcher));
             }
             Err(e) => {
-                tracing::warn!(run_id = %assign.run_id, error = %format!("{e:#}"), "the record's hashes of the run's earlier git tokens cannot be read; only its live tokens are redacted")
+                tracing::error!(run_id = %assign.run_id, error = %format!("{e:#}"), "the take-back record's hashes of the run's earlier git tokens cannot be used; the run's work is not pushed");
+                unsafe_record = Some(format!("{e:#}"));
             }
         }
     }
@@ -1327,12 +1331,22 @@ pub async fn take_back(
     };
 
     // --- what the run leaves ---------------------------------------------------------------
+    if unsafe_record.is_some() {
+        sink.log(
+            LogLevel::Error,
+            "the runner host's record of the run cannot say which earlier git tokens to look for, so nothing of the run's work leaves the host: no push, no session bundle, no files of /output",
+        );
+    }
     let mut artifacts = Vec::new();
-    if came_back && let Some(output_root) = &output_root {
+    if came_back
+        && unsafe_record.is_none()
+        && let Some(output_root) = &output_root
+    {
         artifacts = collect_output(shared, &mut sink, assign, output_root).await;
     }
-    let mut leak = false;
-    let results = if came_back && !repos.is_empty() {
+    // A damaged record refuses the session bundle as a leak does.
+    let mut leak = unsafe_record.is_some();
+    let results = if came_back && !repos.is_empty() && unsafe_record.is_none() {
         sink.status(Phase::Finalizing, None);
         let finalized = finalize_git(shared, &mut sink, &repos, tokens, assign.run_id, false).await;
         if finalized.outgoing_leak {
@@ -1390,6 +1404,17 @@ pub async fn take_back(
             format!(
                 "The runner host restarted during the run and took the run back: {}.",
                 saved.join(", ")
+            ),
+        );
+    }
+    // A damaged record fails the run, cancelled or not: its work stays on the host.
+    let cancelled = cancelled && unsafe_record.is_none();
+    if let Some(why) = &unsafe_record {
+        failure.force(
+            FailureClass::Infra,
+            format!(
+                "The runner host restarted during the run, and its record of the run is damaged ({}); the work was not pushed and stays on the runner host.",
+                sink.redact(why)
             ),
         );
     }
@@ -1577,7 +1602,7 @@ async fn store_session_bundle(
         return Outcome::Refused;
     }
     let (home, runtime) = (home_dir.to_path_buf(), assign.agent.runtime);
-    let redactor = shared.redactor();
+    let redactor = shared.run_redactor(assign.run_id);
     let packed = tokio::task::spawn_blocking(move || {
         let packed = session_bundles::pack(&home, runtime)?;
         // The run's own credentials, which the server's scan does not know. Its URL secrets
@@ -3461,7 +3486,7 @@ async fn prepare_repository(
     if !scan {
         return Ok(false);
     }
-    git.outgoing_contains_secret(&shared.redactor(), &exclude)
+    git.outgoing_contains_secret(&shared.run_redactor(run_id), &exclude)
         .await
 }
 
@@ -3492,7 +3517,7 @@ async fn collect_output(
     assign: &RunAssign,
     output_root: &OutputRoot,
 ) -> Vec<ArtifactResult> {
-    let redactor = shared.redactor();
+    let redactor = shared.run_redactor(assign.run_id);
     let server_url = shared.config.server_url.clone();
     let token = shared.config.token.expose().to_string();
     let (run_id, epoch) = (assign.run_id, assign.epoch);

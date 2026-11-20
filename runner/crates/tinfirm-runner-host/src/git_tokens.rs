@@ -370,6 +370,10 @@ impl RunGitTokens {
                 let Slot::Held(held) = &mut entry.slot else {
                     continue;
                 };
+                if token.token.expose().len() > crate::host::MAX_GIT_TOKEN_BYTES {
+                    tracing::warn!(run_id = %self.run_id, "a renewed git token is longer than the host takes; the old one is kept");
+                    continue;
+                }
                 *held = Held::of(&GitCredentials {
                     username: token.username.clone(),
                     token: token.token.clone(),
