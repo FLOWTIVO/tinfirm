@@ -1817,7 +1817,8 @@ paths:
         of kind `APP` remains on the system (409 GITHUB_APP_IN_USE, with `details.credentials`): such a credential is an
         installation of the App it was added for. The same `appId` with a new key is the key's rotation, always
         allowed. Problems: 400 VALIDATION_FAILED; 400 SYSTEM_KIND_INVALID (not a company `GITHUB` system); 400
-        GITHUB_APP_REFUSED; 409 GITHUB_APP_IN_USE; 409 SYSTEM_PAUSED.
+        GITHUB_APP_REFUSED; 409 GITHUB_APP_IN_USE; 409 SYSTEM_PAUSED; 502 GITHUB_UNREACHABLE (GitHub could not be
+        reached, or limited the rate; nothing is stored).
       requestBody:
         required: true
         content:
@@ -1834,6 +1835,7 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
     delete:
       tags: [Systems]
       operationId: removeSystemGitHubApp
@@ -11443,8 +11445,9 @@ components:
           type: string
           description: >-
             A code: the binding's reason (`RECONNECT_YOURS`, `RECONNECT_COMPANY`, `SUSPENDED`, `NOT_ENTITLED`,
-            `GRANT_REMOVED`, `LEFT_GROUP`, `IDENTITY_CHANGED`, `HOLDER_LEFT`, `SYSTEM_REMOVED`, …), or `SYSTEM_PAUSED`,
-            `CREDENTIAL_REPLACED` or `REFRESH_REFUSED`
+            `GRANT_REMOVED`, `LEFT_GROUP`, `IDENTITY_CHANGED`, `HOLDER_LEFT`, `SYSTEM_REMOVED`, `ACCOUNT_REMOVED`, …), or
+            `SYSTEM_PAUSED`, `CREDENTIAL_REPLACED`, `REFRESH_REFUSED` or `BINDING_CHANGED` (found when a host reports a
+            run the server no longer tracks: the binding holds, but changed since the run cloned the repository)
           example: RECONNECT_COMPANY
         message: { type: string, description: "The text the run's host got, for its log and the agent" }
         revokedAt: { type: string, format: date-time }

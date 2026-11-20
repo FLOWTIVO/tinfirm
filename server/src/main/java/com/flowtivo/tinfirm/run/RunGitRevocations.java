@@ -55,6 +55,12 @@ public interface RunGitRevocations {
      */
     Set<UUID> conversationsOfSystem(UUID companyId, UUID systemId);
 
+    /**
+     * The conversations of the runs {@link #ofBinding} would concern now, for a caller that locks other conversations
+     * in the same transaction (CONVENTIONS §10). Reads only.
+     */
+    Set<UUID> conversationsOfBinding(UUID companyId, UUID bindingId);
+
     /** The runs with repositories of the paused system, reason {@link #SYSTEM_PAUSED}. */
     List<Revoked> ofSystem(UUID companyId, UUID systemId, String why);
 

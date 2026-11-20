@@ -114,6 +114,15 @@ class GitRevocationService implements RunGitRevocations {
 
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
+    public Set<UUID> conversationsOfBinding(UUID companyId, UUID bindingId) {
+        Set<UUID> conversations = new HashSet<>();
+        repositories.targetsOfBinding(bindingId, lostSince())
+            .forEach(target -> conversations.add(target.conversationId()));
+        return conversations;
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
     public List<Revoked> ofSystem(UUID companyId, UUID systemId, String why) {
         return revoke(repositories.targetsOfSystem(systemId, lostSince()), null, SYSTEM_PAUSED, why,
                 Map.of("systemId", systemId.toString()));

@@ -160,6 +160,8 @@ class ConversationService {
 
     private final ConversationHolds holds;
 
+    private final GitRevocations gitRevocations;
+
     ConversationService(ConversationStore store, BindingStore bindingStore, ConversationsImpl conversations,
             BindingService bindings, TurnService turnService, ConversationViews views,
             ConversationMessagesImpl messages, DecisionReads decisions, CompanyAccessGuard companyAccess,
@@ -167,7 +169,9 @@ class ConversationService {
             RunnerDirectory runners, Turns turns, ObjectProvider<OpenDecisions> openDecisions,
             ObjectProvider<QuestionAnswers> questionAnswers, AuditLog auditLog, ApplicationEventPublisher events,
             TimeSource time, AttachmentService attachments, OwnerReads ownerReads, PlaceStore places,
-            CompanySwitches companySwitches, SubmissionKeys keys, ConversationHolds holds) {
+            CompanySwitches companySwitches, SubmissionKeys keys, ConversationHolds holds,
+            GitRevocations gitRevocations) {
+        this.gitRevocations = gitRevocations;
         this.holds = holds;
         this.companySwitches = companySwitches;
         this.store = store;
@@ -866,6 +870,8 @@ class ConversationService {
         for (ConversationStore.ConversationRow row : inLockOrder(store.openOfPerson(event.companyId(),
                 event.principalId()))) {
             store.lock(event.companyId(), row.id());
+            // ADR-0116: a cancelled run pushes its work; the git tokens of the person's accounts and grants go first.
+            gitRevocations.personLeaving(event.companyId(), event.principalId(), row.id());
             turns.cancelActive(event.companyId(), row.id());
             end(store.lock(event.companyId(), row.id()).orElseThrow().info(), ConversationInfo.EndedReason.PERSON_LEFT,
                     null);

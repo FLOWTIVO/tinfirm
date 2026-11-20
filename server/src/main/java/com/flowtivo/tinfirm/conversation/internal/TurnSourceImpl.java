@@ -110,6 +110,8 @@ class TurnSourceImpl implements TurnSource {
 
     private final Accounts accounts;
 
+    private final BindingStore bindingStore;
+
     TurnSourceImpl(ConversationStore store, WorkspaceService workspace, ConversationBindings bindings,
             BindingTexts texts, Principals principals, Systems systems, RunReads runs,
             SystemTransactions transactions, ObjectProvider<TurnTools> tools,
@@ -117,7 +119,8 @@ class TurnSourceImpl implements TurnSource {
             ObjectProvider<PromptSection.Files> files, ObjectProvider<PromptSection.Outputs> outputs,
             DecisionStore decisions, TriggerPorts triggers,
             ObjectProvider<com.flowtivo.tinfirm.conversation.PlacePrompts> places, MemoryPrompt memory,
-            ConversationHolds holds, Accounts accounts) {
+            ConversationHolds holds, Accounts accounts, BindingStore bindingStore) {
+        this.bindingStore = bindingStore;
         this.accounts = accounts;
         this.holds = holds;
         this.memory = memory;
@@ -282,6 +285,17 @@ class TurnSourceImpl implements TurnSource {
             }
         }
         return java.util.Optional.empty();
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public List<UUID> bindingsHeldBy(UUID companyId, UUID principalId) {
+        return bindingStore.concerned(companyId, Set.of(), Set.of(), Set.of(), Set.of(principalId), Set.of())
+            .stream()
+            .map(BindingStore.BindingRow::info)
+            .filter(binding -> binding.bound() && principalId.equals(binding.holderPrincipalId()))
+            .map(BindingInfo::id)
+            .toList();
     }
 
     /**

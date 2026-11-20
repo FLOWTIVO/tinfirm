@@ -150,6 +150,12 @@ public class TestTurns implements TurnSource, TurnEnded, RunRequests {
     }
 
     @Override
+    public List<UUID> bindingsHeldBy(UUID companyId, UUID principalId) {
+        TurnSource real = real(TurnSource.class);
+        return real != null ? real.bindingsHeldBy(companyId, principalId) : List.of();
+    }
+
+    @Override
     public List<GitAccessGone> gitAccessGone(UUID companyId, List<ClonedRepository> repositories) {
         TurnSource real = real(TurnSource.class);
         return real != null ? real.gitAccessGone(companyId, repositories) : List.of();

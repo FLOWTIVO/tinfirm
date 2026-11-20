@@ -85,6 +85,15 @@ public interface TurnSource {
     }
 
     /**
+     * The {@code BOUND} bindings of open conversations that act through the principal's accounts (it is their
+     * holder): those that its suspension makes wait ({@code SUSPENDED}), for the revocation that goes before the
+     * cancel of its runs (ADR-0116). In the caller's transaction; reads only.
+     */
+    default List<UUID> bindingsHeldBy(UUID companyId, UUID principalId) {
+        return List.of();
+    }
+
+    /**
      * A repository a run's assignment cloned with a binding's token, as its {@code run_repository} row says.
      *
      * @param systemId       null once the system was removed

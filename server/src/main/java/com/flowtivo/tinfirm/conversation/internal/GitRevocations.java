@@ -70,6 +70,25 @@ class GitRevocations {
         told(companyId, revocations.ofBinding(companyId, bindingId, reason.name(), texts.revoked(binding)));
     }
 
+    /**
+     * A member leaves (in the leaving transaction, which holds the conversation's lock), before the conversation's
+     * running turn is cancelled: a cancelled run pushes its work, and the conversation ends, so no later check of its
+     * bindings would revoke anything. Every binding of the conversation that holds goes: through the person's own
+     * account ({@code HOLDER_LEFT}) or a credential lent to their group ({@code LEFT_GROUP}).
+     */
+    void personLeaving(UUID companyId, UUID principalId, UUID conversationId) {
+        for (BindingStore.BindingRow row : bindings.ofConversation(companyId, conversationId)) {
+            BindingInfo binding = row.info();
+            if (!binding.bound() || binding.open()) {
+                continue;
+            }
+            boolean held = principalId.equals(binding.holderPrincipalId());
+            revocations.ofBinding(companyId, binding.id(), held ? BindingInfo.Reason.HOLDER_LEFT.name()
+                    : BindingInfo.Reason.LEFT_GROUP.name(), held ? "the account's holder left the company"
+                            : "the person left the company");
+        }
+    }
+
     /** The runs of a paused system, in the pause's transaction, before any of them is cancelled. */
     List<RunGitRevocations.Revoked> systemPaused(UUID companyId, UUID systemId) {
         List<RunGitRevocations.Revoked> revoked = revocations.ofSystem(companyId, systemId,

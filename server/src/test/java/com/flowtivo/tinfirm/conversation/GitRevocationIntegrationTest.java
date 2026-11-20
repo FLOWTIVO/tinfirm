@@ -640,6 +640,56 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
         assertThat(deliveryOf(bench, runId)).isEqualTo("UNSUPPORTED");
     }
 
+    // ---- One cause that revokes and cancels: the revocation first ----------------------------------------------------
+
+    @Test
+    void aSuspendedMembersRunHearsTheRevocationOfTheirAccountBeforeItsCancel() {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        connectOwn(bench.member(), bench, git[0], "test-own-token");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        try (FakeRunner runner = host(hostRef(bench), List.of(REVOKE), List.of())) {
+            JsonNode assign = running(bench, runner, agentId);
+            String runId = assign.get("runId").asString();
+            assertThat(assign.get("workspaces").get(0).get("git").get("token").asString())
+                .isEqualTo("test-own-token");
+            ApiResponse suspended = bench.owner().post(bench.path("/members/" + bench.company().userId("MEMBER")
+                    + "/suspend"), Map.of("reason", "Left the project"));
+            assertThat(suspended.status()).as("%s", suspended).isEqualTo(200);
+            JsonNode revoke = runner.expect(REVOKE);
+            assertThat(revoke.get("runId").asString()).isEqualTo(runId);
+            assertThat(revoke.get("reason").asString()).isEqualTo("SUSPENDED");
+            runner.expect("run.cancel");
+            // The cancel's run pushes its work: the token of the suspended member's account went first.
+            assertThat(answerOrder(runner)).containsExactly(DONE, REVOKE, "run.cancel");
+            // The binding's own change after the commit finds the repository revoked already.
+            runner.expectNone(REVOKE, Duration.ofSeconds(1));
+            assertThat(revocations(bench, runId)).hasSize(1);
+            runner.assertFramesValid();
+        }
+    }
+
+    @Test
+    void aMemberWhoLeavesHasTheirRunsGitAccessRevokedBeforeItsCancel() {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        lent(bench, git[0], "WRITE");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        try (FakeRunner runner = host(hostRef(bench), List.of(REVOKE), List.of())) {
+            JsonNode assign = running(bench, runner, agentId);
+            String runId = assign.get("runId").asString();
+            assertThat(bench.owner().delete(bench.path("/members/" + bench.company().userId("MEMBER"))).status())
+                .isEqualTo(204);
+            JsonNode revoke = runner.expect(REVOKE);
+            assertThat(revoke.get("runId").asString()).isEqualTo(runId);
+            assertThat(revoke.get("reason").asString()).isEqualTo("LEFT_GROUP");
+            assertThat(revoke.get("message").asString()).contains("the person left the company");
+            runner.expect("run.cancel");
+            assertThat(answerOrder(runner)).containsExactly(DONE, REVOKE, "run.cancel");
+            runner.assertFramesValid();
+        }
+    }
+
     // ---- A lost run whose host is connected, resumed by a heartbeat ---------------------------------------------------
 
     @Test
