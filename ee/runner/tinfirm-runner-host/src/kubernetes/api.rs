@@ -12,14 +12,14 @@
 //!   It never appears in an error, a log line or a `Debug` output.
 //! - Every call names its namespace, and has a timeout ([`DEFAULT_TIMEOUT`]) over connecting,
 //!   the TLS handshake and the whole answer.
-//! - The calls: create, get, list by labels and delete for pods; get for network policies and
-//!   resource quotas; create and delete for Secrets. A create can be a dry run
-//!   ([`DryRun::All`]). No call reads a Secret, by name or in a list: an answer would carry the
+//! - The calls: create, get, list by labels and delete for pods; the list of a namespace's
+//!   network policies; get for resource quotas; create and delete for Secrets. A create can be
+//!   a dry run ([`DryRun::All`]). No call reads a Secret, by name or in a list: an answer would carry the
 //!   Secret's data, and the driver must never be able to read a run's ticket or any other
 //!   Secret. For the same reason, [`Api::create_secret`] and [`Api::delete_secret`] drop the
 //!   server's answer, which carries the Secret's data, without parsing it. No call creates,
-//!   lists or deletes a network policy: the chart installs the runs' policies, and the driver
-//!   only reads them to check them.
+//!   changes or deletes a network policy: the chart installs the runs' policies, and the driver
+//!   only lists them to check them.
 //! - Objects are [`serde_json::Value`]: the driver builds its pods and Secrets as JSON, and
 //!   reads a few fields of the answers.
 //! - Answers are bounded: [`MAX_OBJECT_BODY`] for one object, [`MAX_LIST_BODY`] for a list. A
@@ -302,10 +302,6 @@ impl Api {
     /// without being parsed.
     pub async fn delete_secret(&self, namespace: &str, name: &str) -> Result<(), ApiError> {
         self.delete(Kind::Secrets, namespace, name, None).await
-    }
-
-    pub async fn get_network_policy(&self, namespace: &str, name: &str) -> Result<Value, ApiError> {
-        self.get(Kind::NetworkPolicies, namespace, name).await
     }
 
     /// Every network policy of the namespace. This one list takes no label selector: the runs'
@@ -1093,7 +1089,6 @@ pub(super) mod tests {
         api.create_secret(NS, &secret, DryRun::No).await.unwrap();
         api.create_secret(NS, &secret, DryRun::All).await.unwrap();
         api.delete_secret(NS, "tinfirm-ticket-1").await.unwrap();
-        api.get_network_policy(NS, "p").await.unwrap();
         assert_eq!(api.list_network_policies(NS).await.unwrap().len(), 1);
         api.get_resource_quota(NS, "tinfirm-runs").await.unwrap();
 
@@ -1114,7 +1109,6 @@ pub(super) mod tests {
             ("POST", secrets.to_string()),
             ("POST", format!("{secrets}?dryRun=All")),
             ("DELETE", format!("{secrets}/tinfirm-ticket-1")),
-            ("GET", format!("{policies}/p")),
             ("GET", policies.to_string()),
             (
                 "GET",

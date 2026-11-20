@@ -176,10 +176,19 @@ impl PodDriver {
             return Ok(());
         }
         // A read that fails is a problem too: nothing is cached as passed then.
-        let (mut problems, _) = self.policy_problems().await;
-        if problems.is_empty() {
-            problems = self.admission_problems(template).await?;
+        let (problems, _) = self.policy_problems().await;
+        if !problems.is_empty() {
+            // The policies hold for every template.
+            lock(&self.admission_checked).clear();
+            bail!("refusing to create a run pod: {}", problems.join("; "));
         }
+        let problems = match self.admission_problems(template).await {
+            Ok(problems) => problems,
+            Err(e) => {
+                lock(&self.admission_checked).remove(template);
+                return Err(e);
+            }
+        };
         if !problems.is_empty() {
             lock(&self.admission_checked).remove(template);
             bail!("refusing to create a run pod: {}", problems.join("; "));
@@ -196,8 +205,19 @@ impl PodDriver {
         let ns = self.namespace();
         let mut problems = Vec::new();
         let mut checked = Vec::new();
+        // One list, so that the decision rests on one state of the namespace.
+        let policies = match self.api.list_network_policies(ns).await {
+            Ok(policies) => policies,
+            Err(e) => return (vec![api_problem("the network policies", &e)], checked),
+        };
+        let name_of = |policy: &Value| {
+            policy["metadata"]["name"]
+                .as_str()
+                .unwrap_or("?")
+                .to_string()
+        };
         // The two network policies the chart installs.
-        for (name, expected) in [
+        let expected = [
             (
                 &self.config.policies.default_deny,
                 spec::default_deny_spec(),
@@ -206,10 +226,11 @@ impl PodDriver {
                 &self.config.policies.allow_runner,
                 spec::allow_runner_spec(&self.config),
             ),
-        ] {
-            match self.api.get_network_policy(ns, name).await {
-                Ok(policy) => {
-                    let differences = spec::policy_differences(&expected, &policy);
+        ];
+        for (name, spec) in &expected {
+            match policies.iter().find(|p| &&name_of(p) == name) {
+                Some(policy) => {
+                    let differences = spec::policy_differences(spec, policy);
                     if differences.is_empty() {
                         checked.push(format!("NetworkPolicy {name}"));
                     } else {
@@ -219,30 +240,20 @@ impl PodDriver {
                         ));
                     }
                 }
-                Err(e) if e.is_not_found() => problems.push(format!(
+                None => problems.push(format!(
                     "there is no NetworkPolicy {name} in the runs' namespace {ns}"
                 )),
-                Err(e) => problems.push(api_problem(&format!("the NetworkPolicy {name}"), &e)),
             }
         }
         // And no other: network policies add up, so a third one may open the run pods.
-        match self.api.list_network_policies(ns).await {
-            Ok(policies) => {
-                let expected = [
-                    self.config.policies.default_deny.as_str(),
-                    self.config.policies.allow_runner.as_str(),
-                ];
-                for policy in &policies {
-                    let name = policy["metadata"]["name"].as_str().unwrap_or("?");
-                    if !expected.contains(&name) {
-                        problems.push(format!(
-                                "the runs' namespace {ns} holds the NetworkPolicy {}, which is not the chart's: network policies add up, so it may open the run pods; delete it",
-                                one_line(name)
-                            ));
-                    }
-                }
+        for policy in &policies {
+            let name = name_of(policy);
+            if !expected.iter().any(|(expected, _)| **expected == name) {
+                problems.push(format!(
+                    "the runs' namespace {ns} holds the NetworkPolicy {}, which is not the chart's: network policies add up, so it may open the run pods; delete it",
+                    one_line(&name)
+                ));
             }
-            Err(e) => problems.push(api_problem("the network policies", &e)),
         }
         (problems, checked)
     }
@@ -471,6 +482,11 @@ impl PodDriver {
         // The network policies: the chart's two, and no other.
         let (found, seen) = self.policy_problems().await;
         let policies_sound = found.is_empty();
+        if !policies_sound {
+            // No create passes on an earlier check while they are not sound, whatever its
+            // template.
+            lock(&self.admission_checked).clear();
+        }
         problems.extend(found);
         checked.extend(seen);
 
@@ -1287,23 +1303,17 @@ mod tests {
         let calls = t.calls();
         let n = battery_calls();
         let policies = format!("/apis/networking.k8s.io/v1/namespaces/{NS}/networkpolicies");
-        assert_eq!(calls.len(), 3 + n + 2, "{calls:#?}");
-        assert_eq!(
-            calls[..3],
-            [
-                format!("GET {policies}/tinfirm-runs-default-deny"),
-                format!("GET {policies}/tinfirm-runs-allow-runner"),
-                format!("GET {policies}"),
-            ]
-        );
+        // The policies: one request, one list.
+        assert_eq!(calls.len(), 1 + n + 2, "{calls:#?}");
+        assert_eq!(calls[0], format!("GET {policies}"));
         assert!(
-            calls[3..3 + n]
+            calls[1..1 + n]
                 .iter()
                 .all(|c| c == &format!("POST /api/v1/namespaces/{NS}/pods (dry run)"))
         );
-        assert_eq!(calls[3 + n], format!("POST /api/v1/namespaces/{NS}/pods"));
+        assert_eq!(calls[1 + n], format!("POST /api/v1/namespaces/{NS}/pods"));
         assert_eq!(
-            calls[3 + n + 1],
+            calls[1 + n + 1],
             format!("POST /api/v1/namespaces/{NS}/secrets")
         );
         {
@@ -1328,7 +1338,40 @@ mod tests {
         );
         t.forget_calls();
         t.create().await;
-        assert_eq!(t.calls().len(), 3 + n + 2);
+        assert_eq!(t.calls().len(), 1 + n + 2);
+    }
+
+    #[tokio::test]
+    async fn a_verify_that_finds_a_third_policy_takes_back_an_earlier_pass() {
+        let t = start(cluster()).await;
+        t.create().await;
+        assert!(lock(&t.driver.admission_checked).contains_key("sandbox-4c8g"));
+        t.cluster().policies.insert(
+            "allow-all".into(),
+            json!({"metadata": {"name": "allow-all"}, "spec": {"podSelector": {}, "ingress": [{}]}}),
+        );
+        let verified = t.ok("verify", json!({"template": "sandbox-4c8g"})).await;
+        assert!(
+            verified["problems"].to_string().contains("allow-all"),
+            "{verified}"
+        );
+        assert!(
+            lock(&t.driver.admission_checked).is_empty(),
+            "the pass is taken back"
+        );
+        // Within the minute, the next create checks again, and is refused.
+        let error = t
+            .error(
+                "create",
+                json!({"template": "sandbox-4c8g", "userData": USER_DATA,
+                                   "labels": {"tinfirm-host": HOST}}),
+            )
+            .await;
+        assert!(
+            error.contains("holds the NetworkPolicy allow-all"),
+            "{error}"
+        );
+        assert_eq!(t.cluster().pods.len(), 1, "only the first create's pod");
     }
 
     #[tokio::test]
@@ -1364,7 +1407,7 @@ mod tests {
                 }),
             ),
             (
-                "the driver may not read the NetworkPolicy",
+                "the driver may not read the network policies",
                 Box::new(|c| c.fail_policy_reads = true),
             ),
         ];
