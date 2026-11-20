@@ -334,11 +334,23 @@ impl Listener {
     async fn verify(&self, params: wire::VerifyParams) -> Result<Value, RpcError> {
         let template = parse_template(&params.template)?;
         let checked = self.helper.check(&template).await.map_err(from_helper)?;
-        Ok(json!({
+        let mut result = json!({
             "problems": checked.problems,
             "maxVms": checked.free,
             "checked": checked.checked,
-        }))
+        });
+        // The hardening mark, as the helper found it. A helper of an earlier build sends
+        // none: the result then has no `hardening`, which the driver counts as `no`.
+        match checked.hardening {
+            Some(hardening) => {
+                result["hardening"] = serde_json::to_value(hardening)
+                    .map_err(|_| RpcError::new(code::FAILED, "the answer cannot be written"))?;
+            }
+            None => tracing::warn!(
+                "the helper sent no hardening: verify answers without it, and the node counts as not hardened"
+            ),
+        }
+        Ok(result)
     }
 
     async fn create(&self, mut params: wire::CreateParams) -> Result<Value, RpcError> {

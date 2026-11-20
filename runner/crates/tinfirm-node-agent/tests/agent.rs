@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tinfirm_node_agent::backend::{FakeBackend, NodeTable};
+use tinfirm_node_agent::hardening::{self, Hardening, Line};
 use tinfirm_node_agent::helper::{self, Helper, HelperClient};
 use tinfirm_node_agent::id::{TemplateName, VmId};
 use tinfirm_node_agent::listener::{self, Listener, ListenerConfig};
@@ -325,6 +326,12 @@ async fn the_driver_protocol<S: AsyncRead + AsyncWrite>(node: &Node, driver: &mu
     assert!(
         verified["checked"].as_array().unwrap().len() >= 2,
         "{verified}"
+    );
+    // The fake node reads no machine: every line of its mark fails, and that is no problem.
+    assert_eq!(verified["hardening"]["hardened"], "no", "{verified}");
+    assert_eq!(
+        verified["hardening"]["lines"].as_array().unwrap().len(),
+        hardening::LINES.len()
     );
 
     let user_data = json!({"tinfirm": 1, "image": "tinfirm-runner-claude:local", "env": {"TINFIRM_BRIDGE_TICKET": "ab".repeat(32)}}).to_string();
@@ -795,6 +802,123 @@ async fn a_node_without_its_own_firewall_table_verifies_with_a_problem_and_makes
         .await
         .unwrap();
     assert_eq!(verified["problems"], json!([]), "{verified}");
+}
+
+#[tokio::test]
+async fn check_and_verify_carry_the_hardening_and_a_line_that_fails_stops_nothing() {
+    let node = node(None).await;
+    let yes = Hardening::of(
+        hardening::LINES
+            .iter()
+            .map(|id| Line::new(id, true, "as required"))
+            .collect(),
+    );
+    node.backend.set_hardening(yes.clone());
+    // The helper's wire.
+    let check = HelperClient::new(node.helper_socket.clone())
+        .check(&TemplateName::parse(TEMPLATE.as_bytes()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(check.hardening, Some(yes.clone()));
+    // The agent's wire: the same object, as it is.
+    let mut driver = unix_driver(&node).await;
+    driver.hello().await;
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["hardening"], serde_json::to_value(&yes).unwrap());
+    assert_eq!(verified["hardening"]["hardened"], "yes");
+    assert_eq!(verified["hardening"]["lines"][2]["line"], "io-uring");
+
+    // One line stops holding: the mark is `no` and names it, and the node keeps its slots and
+    // makes VMs.
+    let mut lines = yes.lines.clone();
+    lines[2] = Line::new("io-uring", false, "kernel.io_uring_disabled is 0, not 2");
+    node.backend.set_hardening(Hardening::of(lines));
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["hardening"]["hardened"], "no");
+    let failing: Vec<&Value> = verified["hardening"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["holds"] == false)
+        .collect();
+    assert_eq!(
+        failing,
+        [
+            &json!({"line": "io-uring", "holds": false, "found": "kernel.io_uring_disabled is 0, not 2"})
+        ]
+    );
+    assert_eq!(verified["problems"], json!([]));
+    assert_eq!(verified["maxVms"], 4);
+    driver
+        .call("create", json!({"template": TEMPLATE, "name": "n", "userData": "{}", "labels": labels(HOST, "v")}))
+        .await
+        .unwrap();
+}
+
+/// A helper of an earlier build, whose `check` has no `hardening`: one binary holds both
+/// processes, so it exists only when one of them was not restarted. The listener's `verify`
+/// answers without the field, which the driver counts as `no`, and does not fail.
+#[tokio::test]
+async fn a_helper_answer_without_the_hardening_gives_a_verify_without_it() {
+    use tokio::io::AsyncBufReadExt;
+    let HelperHalf {
+        tmp,
+        root,
+        backend,
+        config,
+        task: helper,
+    } = helper_half().await;
+    helper.abort();
+    let _ = helper.await;
+    std::fs::remove_file(&config.socket).unwrap();
+    let stub = tokio::net::UnixListener::bind(&config.socket).unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = stub.accept().await else {
+                return;
+            };
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            let _ = BufReader::new(read).read_line(&mut line).await;
+            let request: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+            let answer = match request["op"].as_str() {
+                Some("check") => {
+                    json!({"ok": {"problems": [], "checked": ["an older helper"], "free": 2}})
+                }
+                Some("list") => json!({"ok": {"vms": [], "free": 2}}),
+                _ => json!({"error": {"code": "failed", "message": "not in this stub"}}),
+            };
+            let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+            let _ = write.shutdown().await;
+        }
+    });
+    let node = node_from(
+        HelperHalf {
+            tmp,
+            root,
+            backend,
+            config,
+            task,
+        },
+        None,
+    )
+    .await;
+    let mut driver = unix_driver(&node).await;
+    driver.hello().await;
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(
+        verified,
+        json!({"problems": [], "maxVms": 2, "checked": ["an older helper"]})
+    );
 }
 
 /// The helper refuses a real process of another uid, where this test can run one: as root,

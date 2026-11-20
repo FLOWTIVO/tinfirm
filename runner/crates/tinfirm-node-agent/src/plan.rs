@@ -128,6 +128,24 @@ pub enum NodeFirewall {
     NotRequired,
 }
 
+/// What the hardening mark's lines need of the configuration (`crate::hardening`), which the
+/// role writes. Optional as a whole, so that a configuration written before it still loads:
+/// without it, the lines `listening-sockets` and `max-uptime` fail and say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HardeningConfig {
+    /// The listener's TCP port (`tls.listen` of `listener.json`): it may listen beyond
+    /// loopback.
+    pub agent_port: u16,
+    /// The SSH server's port: it may listen beyond loopback.
+    pub ssh_port: u16,
+    /// The longest the machine may run since its boot, in days, before the mark is `no`.
+    pub max_uptime_days: u32,
+}
+
+/// The longest `hardening.maxUptimeDays`.
+pub const MAX_UPTIME_DAYS: u32 = 3650;
+
 /// The helper's configuration file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -151,6 +169,9 @@ pub struct HelperConfig {
     pub network: Network,
     pub firecracker: Firecracker,
     pub templates: BTreeMap<TemplateName, Template>,
+    /// What the hardening mark needs; absent in a configuration written before it.
+    #[serde(default)]
+    pub hardening: Option<HardeningConfig>,
     /// Test-only: the listener may be root, as the tests run.
     #[serde(skip)]
     #[doc(hidden)]
@@ -279,6 +300,15 @@ impl HelperConfig {
             if a >= u64::from(base) && a < u64::from(base) + size {
                 bail!("network.{name} is inside network.vmRange");
             }
+        }
+        if let Some(h) = &self.hardening
+            && (h.agent_port == 0
+                || h.ssh_port == 0
+                || !(1..=MAX_UPTIME_DAYS).contains(&h.max_uptime_days))
+        {
+            bail!(
+                "hardening.agentPort and hardening.sshPort must not be 0, and hardening.maxUptimeDays must be 1 to {MAX_UPTIME_DAYS}"
+            );
         }
         // The templates.
         if self.templates.is_empty() {
@@ -603,6 +633,45 @@ pub(crate) mod tests {
         assert_eq!(t.bridge_port, DEFAULT_BRIDGE_PORT);
         assert_eq!(t.pids_max, 64);
         assert_eq!(config.node_firewall, NodeFirewall::Required);
+    }
+
+    #[test]
+    fn the_hardening_is_optional_and_checked_when_it_is_there() {
+        let parse = |value: Option<serde_json::Value>| {
+            let mut json = config_json();
+            if let Some(value) = value {
+                json["hardening"] = value;
+            }
+            serde_json::from_value::<HelperConfig>(json)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map(|()| c).map_err(|e| e.to_string()))
+                .map(|c| c.hardening)
+        };
+        // A configuration written before it loads.
+        assert_eq!(parse(None).unwrap(), None);
+        assert_eq!(
+            parse(Some(
+                serde_json::json!({"agentPort": 7400, "sshPort": 22, "maxUptimeDays": 30})
+            ))
+            .unwrap(),
+            Some(HardeningConfig {
+                agent_port: 7400,
+                ssh_port: 22,
+                max_uptime_days: 30
+            })
+        );
+        for wrong in [
+            serde_json::json!({"agentPort": 7400, "sshPort": 22}),
+            serde_json::json!({"agentPort": 7400, "sshPort": 22, "maxUptimeDays": 30, "udp": true}),
+            serde_json::json!({"agentPort": 0, "sshPort": 22, "maxUptimeDays": 30}),
+            serde_json::json!({"agentPort": 7400, "sshPort": 0, "maxUptimeDays": 30}),
+            serde_json::json!({"agentPort": 7400, "sshPort": 22, "maxUptimeDays": 0}),
+            serde_json::json!({"agentPort": 7400, "sshPort": 22, "maxUptimeDays": 3651}),
+            serde_json::json!({"agentPort": 70000, "sshPort": 22, "maxUptimeDays": 30}),
+            serde_json::json!(true),
+        ] {
+            assert!(parse(Some(wrong.clone())).is_err(), "{wrong} was taken");
+        }
     }
 
     #[test]

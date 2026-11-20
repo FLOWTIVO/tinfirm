@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 
 use crate::backend::{Backend, BackendError, Checked, NodeTable, Present};
 use crate::bounding;
+use crate::hardening::{self, Hardening};
 use crate::plan::{Firecracker, HelperConfig, Names, Template, VmPlan};
 use crate::spool::MAX_USER_DATA;
 
@@ -1070,6 +1071,8 @@ pub struct LinuxBackend {
     leave_failed: bool,
     /// The VMs, by serial, whose last delete failed: the next one does not wait again.
     failed_deletes: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// The hardening mark's checker, of the machine's own root, with its cached setuid scan.
+    hardening: hardening::Checker,
 }
 
 impl LinuxBackend {
@@ -1081,6 +1084,7 @@ impl LinuxBackend {
             fail_after: None,
             leave_failed: false,
             failed_deletes: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            hardening: hardening::Checker::new("/"),
         }
     }
 
@@ -1098,6 +1102,30 @@ impl LinuxBackend {
         self.fail_after = Some(step);
         self.leave_failed = leave;
         self
+    }
+
+    /// The pids of the VMMs that run: the process named `firecracker` in each jail's cgroup.
+    /// A jail of a form the helper does not know has a cgroup that cannot be known, so the
+    /// VMMs cannot all be listed while one is there.
+    fn vmm_pids(&self) -> Result<Vec<u32>, String> {
+        let dir = self.config.firecracker.chroot_base.join("firecracker");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("cannot read {}: {}", dir.display(), e.kind())),
+        };
+        let mut pids = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| format!("cannot read an entry of {}: {}", dir.display(), e.kind()))?;
+            let Some(names) = entry.file_name().to_str().and_then(Names::from_jail) else {
+                return Err("a jail of a form the helper does not know is on the node".into());
+            };
+            if let Some(pid) = vmm_pid(&places(&self.config.firecracker, &names).cgroup)? {
+                pids.push(pid);
+            }
+        }
+        Ok(pids)
     }
 
     /// Whether the work directory's file system has room for one more snapshot of `wanted`
@@ -1552,6 +1580,8 @@ impl Backend for LinuxBackend {
                 None => problems.push(format!("the tool `{name}` is not in {TOOL_PATH}")),
             }
         }
+        // Not a check: what runs, for the operator, who answers for a patched kernel.
+        checked.push(hardening::kernel_line(Path::new("/")));
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
         let built_in = built_in_modules(&[
             PathBuf::from(format!("/lib/modules/{}/modules.builtin", release.trim())),
@@ -1908,6 +1938,14 @@ impl Backend for LinuxBackend {
                 left.join(", ")
             )))
         }
+    }
+
+    /// Each line of the mark, read under the machine's own root. The VMMs' AppArmor labels are
+    /// read through the pids of their jails' cgroups ([`LinuxBackend::vmm_pids`]).
+    fn hardening(&self) -> Hardening {
+        let vmms = self.vmm_pids();
+        self.hardening
+            .check(self.config.hardening.as_ref(), &vmms, Instant::now())
     }
 
     /// Every entry under the chroot base's `firecracker/`, with its names where its name is of

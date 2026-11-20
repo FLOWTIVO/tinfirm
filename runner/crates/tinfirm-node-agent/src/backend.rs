@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::hardening::{self, Hardening, Line};
 use crate::plan::{Names, Template, VmPlan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +71,10 @@ pub trait Backend: Send + Sync + 'static {
     fn delete(&self, names: &Names) -> Result<(), BackendError>;
     /// The VMs on the node, the helper's and any an earlier helper left.
     fn list(&self) -> Result<Vec<Present>, BackendError>;
+    /// The hardening mark (ADR-0113, decision 5): each line, as the machine shows it now. It
+    /// only reads, and is no problem of [`Backend::check`]: a line that does not hold lowers
+    /// the mark and stops nothing.
+    fn hardening(&self) -> Hardening;
 }
 
 /// One VM of the fake backend.
@@ -87,6 +92,9 @@ struct FakeState {
     unknown: Vec<String>,
     problems: Vec<String>,
     node_table: NodeTable,
+    /// What the fake node answers of its hardening; `None` for the default (every line
+    /// failing).
+    hardening: Option<Hardening>,
     fail_next_make: bool,
     fail_next_delete: bool,
     fail_deletes: bool,
@@ -139,6 +147,11 @@ impl FakeBackend {
     /// What the fake node's own firewall table is: there, until a test says otherwise.
     pub fn set_node_table(&self, table: NodeTable) {
         self.state().node_table = table;
+    }
+
+    /// What the fake node answers of its hardening, until a test says otherwise.
+    pub fn set_hardening(&self, hardening: Hardening) {
+        self.state().hardening = Some(hardening);
     }
 
     /// The next make fails half-way: it leaves a VM whose VMM does not run.
@@ -229,5 +242,17 @@ impl Backend for FakeBackend {
             alive: false,
         });
         Ok(known.chain(unknown).collect())
+    }
+
+    /// Every line, failing, unless a test set another answer: the fake node reads no machine.
+    fn hardening(&self) -> Hardening {
+        self.state().hardening.clone().unwrap_or_else(|| {
+            Hardening::of(
+                hardening::LINES
+                    .iter()
+                    .map(|id| Line::new(id, false, "the fake backend reads no machine"))
+                    .collect(),
+            )
+        })
     }
 }

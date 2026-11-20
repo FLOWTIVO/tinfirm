@@ -8,6 +8,8 @@
 //!   a template's name, derives everything else ([`plan`]), and reads the user data from one
 //!   file of the listener's ([`spool`]). Its backend ([`backend`], [`linux`]) is the jail, the
 //!   network, the disks and the VMM; [`bounding`] cuts the VMM's capability bounding set.
+//!   In `check` it also reads the machine's hardening mark ([`hardening`]), and writes no
+//!   setting.
 //!
 //! Both wires read each line as strict JSON ([`strict`]): no object names a key twice.
 //!
@@ -15,6 +17,7 @@
 
 pub mod backend;
 pub mod bounding;
+pub mod hardening;
 pub mod helper;
 pub mod id;
 pub mod linux;

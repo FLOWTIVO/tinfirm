@@ -17,6 +17,7 @@ It is a binary of its own, licensed under MIT like the rest of `runner/` outside
 | The VMM's capability bounding set, cut to the six capabilities the jailer needs (ADR-0112 decision 4) | Built (`src/bounding.rs`), without unsafe code: the jailer has no argument for the bounding set and leaves it full, so the helper starts its own binary again as the hidden subcommand `start-jailer`, which drops the others from its own bounding set (`prctl(PR_CAPBSET_DROP)` through rustix) and then becomes the jailer. The helper refuses a VMM whose `/proc/<pid>/status` shows more. Below, "The bounding set" |
 | The VM image for a local disk | Built: `runner/images/vm/local-disk.sh` runs `setup.sh` without a provider and writes one ext4 file. Run in real guests |
 | A single machine: the runner host and the node agent on one machine (ADR-0112 decision 5) | Planned. The local-socket transport is built. The single machine's own firewall table is not (refuse every packet from a VMM's user, and from the listener's user but for its port; check it before each VM). Until it is, the helper refuses a configuration whose control host is the node itself (its address or loopback): the prerouting DNAT never sees a connection that the node's own stack makes, and an output-hook DNAT matched on the source address alone would admit every local user |
+| The hardening mark (ADR-0113, decision 5): the helper reads each line in `check`, and `verify` passes it on (`src/hardening.rs`). Below, "The hardening mark" | Built, tested on a fake root and with the fake backend. Not yet run on a node. The mark is `no` on every node until the role sets the lines up (planned, slice S4), and nothing reports it to the server yet: the runner host's `node` driver ignores the field (planned, slice S3a) |
 | `verify` trying the node's own egress (the server, the model gateway, the code hosts, a metadata service) | Planned: the listener has no network but its sockets, so this needs a design of its own |
 | The runner host's `node` driver (`--vm-driver node`), which relays the driver protocol to this listener | Built, in the runner host (`runner/crates/tinfirm-runner-host/src/node.rs`), tested against this agent with its fake backend over TLS and the local socket. VMs were made, described, listed and deleted through it between two machines, driven by a script in the runner host's place (the evidence); runs of the runner host tests' stand-in agent went through it on 2026-11-20, and so did conversations with real runtimes (Claude Code and PI, with a real model), with the sandbox's front confined |
 | `vm-boot` reading the user data from the user-data disk | Built, in the runner host (`vm_boot.rs`), tested on files standing in for the device, and run in real guests: it starts the run's container from the disk's user data |
@@ -96,6 +97,11 @@ Both files are JSON. An unknown field anywhere is refused. Paths are absolute.
     "work": "/var/lib/tinfirm-node-agent/work",
     "guestConsole": false
   },
+  "hardening": {
+    "agentPort": 7400,
+    "sshPort": 22,
+    "maxUptimeDays": 30
+  },
   "templates": {
     "sandbox-4c8g": {
       "vcpus": 4,
@@ -116,6 +122,7 @@ Both files are JSON. An unknown field anywhere is refused. Paths are absolute.
 | `maxVms` | 1 to 1024 |
 | `vmUidBase` | At least 100000; `vmUidBase + maxVms` below 2^31 |
 | `nodeFirewall` | `"required"` (default) or `"not-required"`, nothing else. `"required"`: the node's own firewall table (`inet tinfirm_node`, below) must be loaded. While it is missing, `check` names it as a problem, so a control host places no VM on the node, and the helper refuses every make, whoever asks. The VMs that run are left as they are. `"not-required"`: for a node that is meant to run without the table, such as a test machine; `check` then says in a line of what was checked whether the table is there, and that this node's configuration does not require it. Tables that cannot be listed are a problem either way |
+| `hardening` | Optional, for the hardening mark (below): `agentPort` (the listener's TCP port, `tls.listen`) and `sshPort`, the two ports that may listen beyond loopback, neither 0; `maxUptimeDays`, 1 to 3650. All three or none. Without it, a configuration written before the mark still loads, and the lines `listening-sockets` and `max-uptime` fail and say that `helper.json` does not name them: no default stands in for a bound the operator did not set |
 | `network.vmRange` | `A.B.C.D/P`, P from 8 to 29, no bit set below the prefix; room for `maxVms` slots of 8 addresses; holds neither `nodeAddress` nor `controlHost` |
 | `network.controlHost`, `network.nodeAddress` | Two different addresses; neither loopback nor `0.0.0.0`. A control host on the node itself is the single machine, which is planned (above). The helper compares the two addresses of its own file and nothing else: a control host at another address of the node itself passes, since the helper cannot know the node's addresses without the network it does not have. Whoever installs the node checks that (the role compares the control host with every IPv4 address of the node) |
 | `network.firstPort` | At least 1024; `firstPort + maxVms - 1` at most 65535. The published ports must not hold the listener's own port (`tls.listen`): the helper does not know the listener's configuration, so this is the installation's to keep |
@@ -202,7 +209,7 @@ A request has exactly `jsonrpc` (`"2.0"`), `method`, `params` and `id` (a number
 | Method | Parameters | Result |
 |---|---|---|
 | `hello` | `wire` (1), `build` | `wire` (1), `agent` (`tinfirm-node-agent`), `build` |
-| `verify` | `template` | `problems` (what the helper and its backend found; any problem means the node must not be used), `maxVms` (how many more VMs the node may make now), `checked` (for the log) |
+| `verify` | `template` | `problems` (what the helper and its backend found; any problem means the node must not be used), `maxVms` (how many more VMs the node may make now), `checked` (for the log), `hardening` (the hardening mark: `{"hardened": "yes" \| "no", "lines": [{"line", "holds", "found"}]}`, below; absent when the helper sent none) |
 | `create` | `template`, `name`, `userData`, `labels` | `id` |
 | `describe` | `id` | `id`, `name`, `state` (`running`, `failed` or `gone`), `address` (the node's), `port` (the node's port on which this VM's bridge is published), `labels`. For a VM the node does not have: `id` and `state: gone` |
 | `delete` | `id`, `labels` | `{}`. A VM that is gone is no error. `labels` must name `tinfirm-host`, not empty, and the VM must carry each of the labels; otherwise `-32002` |
@@ -264,7 +271,7 @@ From then on `describe` and `list` report that VM as `failed`, until it is delet
 
 | `op` | Fields | Answer (`ok`) |
 |---|---|---|
-| `check` | `template` | `problems`, `checked`, `free` (how many more VMs the node may make now) |
+| `check` | `template` | `problems`, `checked`, `free` (how many more VMs the node may make now), `hardening` (the mark, as on the agent's wire). The listener reads an answer without `hardening`, and its `verify` then has none |
 | `make` | `id`, `template` | `port`: the node's port of this VM's bridge |
 | `delete` | `id` | `{}`; a VM the helper does not hold is no error |
 | `list` | none | `vms`: each `{id, template, state, port}`, `state` being `running` or `failed`; `free` |
@@ -340,6 +347,8 @@ Only then does it read the bytes, at most 65537, and refuse them if their count 
 | The jails' directory (root's, not writable by others) and the work directory (root's, 0700) | Where the VMs' files are |
 
 Not checked, and the node's to make sure of: **no other firewall that drops forwarded packets** (Docker's `FORWARD` policy does, and so do ufw's and firewalld's defaults; a node keeps none of them, and no Docker after its image is built), and **a guest kernel with `CONFIG_IP_PNP`**, nf_tables, virtio-mmio and no need of an initrd. The kernel that ran is Kata Containers 4.3.1's `vmlinux-6.18.56-208` (`https://github.com/kata-containers/kata-containers/releases/download/4.3.1/kata-static-4.3.1-amd64.tar.zst`, SHA-256 `1463a2b86845f4d3d8e87f2f764ec59856fc0fee3520967a79ade32762be2e97`; the member `opt/kata/share/kata-containers/vmlinux-6.18.56-208`, SHA-256 `f87d8359035cb7557b16a319e6431ea09b183e62268aef436bf8dc6530d786b6`), with Firecracker and its jailer 1.14.2. That kernel is x86-64's; no kernel is pinned for aarch64 yet, though the agent is released for it: nothing ran on an aarch64 node.
+
+`check` also puts the kernel's release and the machine's boot time into `checked` (from `/proc/sys/kernel/osrelease` and the `btime` of `/proc/stat`): whether the kernel is patched stays the operator's duty, and these show what runs.
 
 **The shared image's loop device.** The image is attached once, read-only, and every VM's snapshot is over that device. A new image must be a new file moved over the old name (`mv`), never written in place: the running VMs keep the old file through the loop device until the last of them is deleted, and the kernel then frees it, while the next make attaches the new file under the same name. An image changed in place changes the disk under every running guest.
 
@@ -430,6 +439,40 @@ It is one table (`inet tinfirm_node`), and loading it again replaces that table 
 
 **Root on the node can delete this table.** It is the node's guard against a VMM or a listener that got out. Against root on a node the guard is the operator's network outside the node, as ADR-0112 says. When the table is deleted, or the ruleset flushed, the node takes no new VM: its `check` names the missing table, and the helper refuses a make. The VMs that run are not stopped: their runs go on until they end, without the node's table around them, while each VM's own tables still hold (a flush removes those too, and such a VM is then reported as `failed`). `systemctl reload tinfirm-node-agent-firewall.service` loads the table again, and the next `check` is clean. The check and the make are not one step: a table deleted in between is found at the next `check` or make.
 
+## The hardening mark
+
+ADR-0113, decision 5: a second mark beside the level, `yes` or `no`, for how little of the kernel a process finds behind the jail. `src/hardening.rs` reads each line in `check`, and `verify` passes the answer on as it is:
+
+```json
+"hardening": {"hardened": "no",
+  "lines": [{"line": "io-uring", "holds": false, "found": "kernel.io_uring_disabled is 0, not 2"}]}
+```
+
+- `hardened` is `yes` when every line holds, and `no` otherwise. A reader decides by it, not by the line ids, so a later build can add a line.
+- `found` is one sentence of what was read and its value, at most 200 characters. What the machine gave (a value, a path) is escaped and cut.
+- A fact that cannot be read (a missing file, one that is not text or too long, a value that is not a number, a listing not of the kernel's form) fails its line and says so.
+- **The helper only reads.** It writes no setting; the role sets the lines up (planned, slice S4). Until it does, the mark is `no` on every node.
+- **A line that does not hold lowers the mark and stops nothing** (the owner, 2026-11-20). It is not among `check`'s problems: the node keeps its slots and makes VMs.
+- **Nothing reports the mark to the server yet.** The runner host's `node` driver ignores the field; reading it, and the host's `hardened` in its `hello`, are planned (slices S3a and S3b).
+
+| Line | What the helper reads | It holds when |
+|---|---|---|
+| `user-namespaces` | `/proc/sys/user/max_user_namespaces` | 0 |
+| `unprivileged-bpf` | `/proc/sys/kernel/unprivileged_bpf_disabled` | 1 or 2 |
+| `io-uring` | `/proc/sys/kernel/io_uring_disabled` | 2. A kernel without the file (older than 6.6, such as Debian 12's 6.1) fails the line, which names the kernel's release |
+| `vmm-mac` | `/sys/module/apparmor/parameters/enabled`; `/sys/kernel/security/apparmor/profiles`; for each VMM that runs, `/proc/<pid>/attr/apparmor/current`, or `/proc/<pid>/attr/current` on a kernel without the first | AppArmor is on (`Y`), the profile `tinfirm-vmm` is loaded in enforce mode, and every running VMM's label is `tinfirm-vmm (enforce)`. The VMMs are the processes named `firecracker` in the cgroups of the helper's jails; a jail of a form the helper does not know, or a label that cannot be read, fails the line. A machine without AppArmor fails it: the check of SELinux labels is planned (slice S5) |
+| `panic-on-oops` | `/proc/sys/kernel/panic_on_oops` | 1 |
+| `modules-disabled` | `/proc/sys/kernel/modules_disabled` | 1 |
+| `kexec-disabled` | `/proc/sys/kernel/kexec_load_disabled` | 1. A kernel without the file fails the line |
+| `lockdown` | `/sys/kernel/security/lockdown` | The level in brackets is `integrity` or `confidentiality`. A kernel without the file has no lockdown, and fails the line |
+| `distribution-hardening` | `kernel.kptr_restrict`, `kernel.dmesg_restrict`, `kernel.perf_event_paranoid`, `kernel.randomize_va_space`, `fs.protected_symlinks`, `fs.protected_hardlinks` under `/proc/sys` | At least 1, 1, at least 2, 2, 1 and 1. These narrower facts stand for "the distribution's hardening on" (the owner, 2026-11-20) |
+| `no-docker` | `/run/docker.sock`, `/var/run/docker.sock`, `/run/containerd/containerd.sock`, `/run/podman/podman.sock` | None of them is there, of any file type |
+| `no-setuid` | Every entry under `/usr` and `/opt`, and under `/bin` and `/sbin` where they are directories and not links into `/usr`; links are not followed, and no other file system is entered (as `find -xdev`) | No regular file has the setuid or setgid bit with the others' execute bit. A VMM's user is in no supplementary group (the helper checks each VMM's `Groups`), so it runs only what others may. The scan is cached for 10 minutes, so a file made setuid shows at most 10 minutes later. More than 2,000,000 entries fail the line |
+| `listening-sockets` | `/proc/net/tcp` and `/proc/net/tcp6`, of the helper's own network namespace, which is the machine's | No TCP socket in the LISTEN state on an address other than loopback (`127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/104`), but on `hardening.agentPort` and `hardening.sshPort`. A kernel without IPv6 has no `tcp6`, which counts as no IPv6 socket. UDP is not part of the line: a DHCP client's socket would fail every cloud machine |
+| `max-uptime` | `/proc/uptime` | At most `hardening.maxUptimeDays` days since the boot (the role's default is 30). It stands for "the kernel patched": a node that was neither re-imaged nor rebooted reports `no` |
+
+Not a line: "the kernel patched" itself (the release and the boot time are in `checked`, above), "no SSH but the operator's path" (the node's firewall admits SSH from the management address only, and `check` requires that table), and "the helper the only root process of Tinfirm's" (it holds by the units and the jail).
+
 ## Decisions where the ADR left the wire open
 
 | Decision | Reason |
@@ -466,6 +509,10 @@ It is one table (`inet tinfirm_node`), and loading it again replaces that table 
 | A peer that is not the listener's uid gets nothing from the helper | `helper.rs` (the helper expects another uid than the test's, where the test is root); `tests/agent.rs` runs a real process as uid 65534 with `setpriv` against a helper that expects 4242 and one that expects 65534, where the test runs as root and has `setpriv` and `python3`, and skips otherwise |
 | The helper serves at most 32 connections, and refuses one that sends no request within 5 s | `helper.rs` |
 | `nodeFirewall`: `"required"` by default, `"not-required"`, any other value refused; the node's own table there, missing or not listed, with either value, as a line of what was checked or a problem; with the table missing and required, `check` and `verify` name it, the helper refuses a make with no slot or serial used, and the VM that runs stays; with `"not-required"` a make goes on | `plan.rs`, `helper.rs` (the fake backend), `tests/agent.rs` |
+| The hardening mark on a fake root: every line holding gives `yes`; each line off in turn gives `no` and names that line alone; a kernel without `io_uring_disabled` is named; no AppArmor, with and without SELinux; a VMM unconfined, a label that cannot be read, the older `attr/current`, VMMs that cannot be listed; files missing, not text, too long, a directory, malformed; random content in every file (no panic, every `found` within its bound and on one line); listeners on loopback, IPv4-mapped loopback, the agent's port and SSH are fine, one on another port over IPv4 and IPv6 is not; no `tcp6` is no IPv6; a setuid file that others cannot run is fine, links are not followed, a path is escaped; uptime just under, at and just over the limit; a configuration without `hardening` fails the two lines that need it; the setuid scan walks again only once 10 minutes have passed, on an injected clock | `hardening.rs` |
+| `hardening` in `helper.json`: optional, all three fields or none, none of them 0, `maxUptimeDays` 1 to 3650 | `plan.rs` |
+| `check` carries the backend's mark, and a line that fails is no problem and stops no make; a check answer is read with or without `hardening`, and with nothing else | `helper.rs` |
+| The helper's `check` and the agent's `verify` carry the mark as it is, a line that fails leaves `problems` empty and the node making VMs; a helper answer without it gives a `verify` without it, not an error | `tests/agent.rs` |
 | A failed make whose cleanup fails keeps its slot until a delete succeeds; a leftover that cannot be removed keeps its slot; a jail of unknown form blocks every slot and `check` names it, escaped | `helper.rs` |
 | A local peer that is not the runner host's uid gets nothing from the listener | `tests/agent.rs` (the listener expects another uid than the test's) |
 | A TLS client with another certificate, or none, gets nothing; the driver refuses a node of another certificate | `tls.rs`, `tests/agent.rs` |
@@ -492,4 +539,4 @@ It is one table (`inet tinfirm_node`), and loading it again replaces that table 
 | Without `guestConsole` a guest writes nothing to the node | `tests/linux_kvm.rs` |
 | ADR-0112 decision 8 on a node: a shell as a VM's VMM user, inside its jail and outside it (`vmm-user.sh`); a shell as the listener's user, and misuse of the helper's socket (`listener-user.sh`, `helper-misuse.py`); a root shell on the node with a canary ticket (`node-root.sh`) | `tests/attack/`, run by hand on a node; their outputs are in the evidence |
 
-**Not tested here.** The tests of `tests/linux_kvm.rs` and the scripts of `tests/attack/` need a KVM node and root, so CI does not run them: their last results are in [the evidence](../../../docs/reviews/2026-11-19-node-agent-execution/README.md), which also lists what was not tested at all (a conversation through the agent, the node's hardening, ARM, a guest that floods its console).
+**Not tested here.** The tests of `tests/linux_kvm.rs` and the scripts of `tests/attack/` need a KVM node and root, so CI does not run them: their last results are in [the evidence](../../../docs/reviews/2026-11-19-node-agent-execution/README.md), which also lists what was not tested at all (a conversation through the agent, the node's hardening, ARM, a guest that floods its console). The hardening mark's checker has not read a real node yet.

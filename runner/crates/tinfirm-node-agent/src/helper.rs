@@ -22,6 +22,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::backend::{Backend, BackendError, NodeTable, Present};
+use crate::hardening::Hardening;
 use crate::id::{TemplateName, VmId};
 use crate::linux::NODE_TABLE;
 use crate::local::{self, LineError};
@@ -110,6 +111,11 @@ pub struct CheckAnswer {
     pub checked: Vec<String>,
     /// How many more VMs the node may make now.
     pub free: u32,
+    /// The hardening mark (ADR-0113, decision 5). This helper always sends it. A helper of
+    /// an earlier build sends none, and the listener then leaves it out of `verify`, which the
+    /// driver counts as `no`: its absence is no reason to fail the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardening: Option<Hardening>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +464,8 @@ impl<B: Backend> Helper<B> {
     pub fn check(&self, template: &TemplateName) -> Result<CheckAnswer, HelperError> {
         let t = self.template(template)?;
         let mut checked = self.backend.check(t);
+        // Before the record's lock: the setuid scan may walk a tree, and a make need not wait.
+        let hardening = self.backend.hardening();
         match node_table_line(&self.backend.node_table(), self.config.node_firewall) {
             Ok(line) => checked.checked.push(line),
             Err(problem) => checked.problems.push(problem),
@@ -483,6 +491,7 @@ impl<B: Backend> Helper<B> {
             problems: checked.problems,
             checked: checked.checked,
             free: self.free(&state, &found),
+            hardening: Some(hardening),
         })
     }
 
@@ -1006,6 +1015,55 @@ mod tests {
         f.backend
             .set_node_table(NodeTable::Unknown("`nft` did not start".into()));
         assert!(!helper.check(&template()).unwrap().problems.is_empty());
+    }
+
+    #[test]
+    fn check_carries_the_backends_hardening_and_no_line_of_it_is_a_problem() {
+        use crate::hardening::{Hardened, Hardening, LINES, Line};
+        let f = fixture();
+        let helper = Helper::start(f.config.clone(), f.backend.clone()).unwrap();
+        // The fake's default: every line fails, and the check has no problem for it.
+        let check = helper.check(&template()).unwrap();
+        assert_eq!(check.problems, Vec::<String>::new());
+        let hardening = check.hardening.unwrap();
+        assert_eq!(hardening.hardened, Hardened::No);
+        assert_eq!(hardening.lines.len(), LINES.len());
+        let yes = Hardening::of(vec![Line::new(
+            "io-uring",
+            true,
+            "kernel.io_uring_disabled is 2",
+        )]);
+        f.backend.set_hardening(yes.clone());
+        assert_eq!(helper.check(&template()).unwrap().hardening, Some(yes));
+        // A make goes on whatever the mark says.
+        let a = VmId::generate().unwrap();
+        write_user_data(&f, &a, b"{}");
+        helper.make(&a, &template()).unwrap();
+    }
+
+    #[test]
+    fn a_check_answer_is_read_with_or_without_the_hardening_and_with_nothing_else() {
+        let without: CheckAnswer =
+            typed(json!({"problems": [], "checked": ["x"], "free": 2})).unwrap();
+        assert_eq!(without.hardening, None);
+        // Written back, it has no `hardening` key at all.
+        assert_eq!(
+            serde_json::to_value(&without).unwrap(),
+            json!({"problems": [], "checked": ["x"], "free": 2})
+        );
+        let with: CheckAnswer = typed(json!({
+            "problems": [], "checked": [], "free": 2,
+            "hardening": {"hardened": "no", "lines": [{"line": "io-uring", "holds": false, "found": "kernel.io_uring_disabled is 0, not 2"}]}
+        }))
+        .unwrap();
+        assert_eq!(with.hardening.unwrap().lines[0].line, "io-uring");
+        for wrong in [
+            json!({"problems": [], "checked": [], "free": 2, "other": 1}),
+            json!({"problems": [], "checked": [], "free": 2, "hardening": {"hardened": "yes"}}),
+            json!({"problems": [], "checked": [], "free": 2, "hardening": {"hardened": "yes", "lines": [], "x": 1}}),
+        ] {
+            assert!(typed::<CheckAnswer>(wrong.clone()).is_err(), "{wrong}");
+        }
     }
 
     #[test]
