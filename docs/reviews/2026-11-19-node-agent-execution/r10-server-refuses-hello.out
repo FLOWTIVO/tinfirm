@@ -6,7 +6,7 @@
 2026-11-20T06:05:19.210940Z INFO model proxy always on: a gateway's key stays on this host, the sandboxes get a dummy key listen=<loopback> sandbox_host=<loopback> allow_private=False local_gateway=-
 2026-11-20T06:05:19.210949Z INFO An agent that escapes its VM reaches its sandbox node, which holds no credential, and the other runs on that node. isolation=machine, hardened no
 2026-11-20T06:05:19.411539Z WARN Invalid hello message: isolationTiers[0].<list element> must match "container|gvisor|microvm" code=BAD_MESSAGE
-2026-11-20T06:05:19.411565Z DEBUG Received close frame: Some(CloseFrame { code: Policy, reason: Utf8Bytes(b"Expected a valid hello") }) log.target=tungstenite::protocol log.module_path=tungstenite::protocol log.file=/home/azureuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tungstenite-0.30.0/src/protocol/mod.rs log.line=719
+2026-11-20T06:05:19.411565Z DEBUG Received close frame: Some(CloseFrame { code: Policy, reason: Utf8Bytes(b"Expected a valid hello") }) log.target=tungstenite::protocol log.module_path=tungstenite::protocol log.file=/home/<the administrator>/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tungstenite-0.30.0/src/protocol/mod.rs log.line=719
 2026-11-20T06:05:19.411804Z ERROR fatal connection error error=the server refused this runner host's hello (close 1008: Expected a valid hello)
 2026-11-20T06:05:19.411896Z INFO waiting for the mirror maintenance to finish its current step
 error: the server refused this runner host's hello (close 1008: Expected a valid hello)

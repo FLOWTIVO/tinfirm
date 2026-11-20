@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 10, from vm-mgmt: io.max from the template, on a real VM.
+# Round 10, from the management machine: io.max from the template, on a real VM.
 DRV='cd ~/tinfirm-host && python3 control-host.py ./tinfirm-runner-host node-driver.json sandbox-2c2g tinfirm-runner-pi:local'
 drv() { ssh host "$DRV $* 2>&1"; }
 setio() { ssh ctl "sudo python3 - '$1' <<'P'

@@ -54,8 +54,10 @@ PY
 echo "another user (nobody) at the helper's socket: $(r setpriv --reuid 65534 --regid 65534 --clear-groups python3 -c "import socket;s=socket.socket(socket.AF_UNIX);s.connect('$HELPER_SOCKET')") ; a user of the listener's group that is not the listener (uid 65534, gid $G): $(groupmate)"
 echo
 echo "== B. inside the listener service's namespaces (its unit's view)"
+# The home of whoever runs this script with sudo: the listener may not read it.
+ADMIN_HOME=$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)
 inl() { nsenter -t $L -m -n -i -- setpriv --reuid $U --regid $G --clear-groups --inh-caps=-all --bounding-set=-all --no-new-privs "$@" </dev/null 2>&1; }
-echo "/home: $(r inl ls /home/azureuser) ; write /etc: $(r inl touch /etc/x) ; write /usr: $(r inl touch /usr/local/bin/x) ; /dev/kvm: $(r inl head -c0 /dev/kvm) ; /dev/mapper/control: $(r inl head -c0 /dev/mapper/control) ; block devices it sees: $(inl sh -c 'ls /dev | grep -c -E "^(sd|nvme|dm-|loop)"') ; the jails: $(r inl ls $JAILS/$VM) ; the work directory: $(r inl ls $WORK) ; /proc of others: $(inl sh -c 'ls /proc | grep -c "^[0-9]"') process(es) visible"
+echo "/home: $(r inl ls "$ADMIN_HOME") ; write /etc: $(r inl touch /etc/x) ; write /usr: $(r inl touch /usr/local/bin/x) ; /dev/kvm: $(r inl head -c0 /dev/kvm) ; /dev/mapper/control: $(r inl head -c0 /dev/mapper/control) ; block devices it sees: $(inl sh -c 'ls /dev | grep -c -E "^(sd|nvme|dm-|loop)"') ; the jails: $(r inl ls $JAILS/$VM) ; the work directory: $(r inl ls $WORK) ; /proc of others: $(inl sh -c 'ls /proc | grep -c "^[0-9]"') process(es) visible"
 echo "its own: the spool, written: $(r inl sh -c ": > $STATE/spool/x && rm $STATE/spool/x") ; the helper's socket: $(r inl python3 -c "import socket;s=socket.socket(socket.AF_UNIX);s.connect('$HELPER_SOCKET')")"
 echo
 echo "== C. misuse of the helper's socket, as the listener's user"

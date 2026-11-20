@@ -1,15 +1,15 @@
 == 1. the node's own journal of a boot with the four units enabled and cloud-init as the image has it (read from its disk afterwards: the node took no SSH for 21 minutes and was then deleted and made again)
-[    3.145789] vm-sbx-ctl systemd[1]: Starting tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall...
-[    3.295953] vm-sbx-ctl systemd[1]: Finished tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall.
-[    3.783379] vm-sbx-ctl cloud-init[534]: Cloud-init v. 26.2-0ubuntu1~24.04.2 running 'init-local' at Fri, 20 Nov 2026 07:02:43 +0000. Up 3.76 seconds.
-[    4.012947] vm-sbx-ctl dhcpcd[554]: eth0: offered 10.0.0.6 from <the platform address> GVX111084007012SOC
-[   34.056064] vm-sbx-ctl cloud-init[534]: 2026-11-20 07:03:13,899 - azure.py[WARNING]: Polling IMDS failed attempt 1 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Max
-[   65.087776] vm-sbx-ctl cloud-init[534]: 2026-11-20 07:03:44,930 - azure.py[WARNING]: Polling IMDS failed attempt 2 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Max
-[  313.274693] vm-sbx-ctl cloud-init[534]: 2026-11-20 07:07:53,117 - azure.py[WARNING]: Polling IMDS failed attempt 10 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Ma
-[  313.283326] vm-sbx-ctl cloud-init[534]: 2026-11-20 07:07:53,118 - azure.py[WARNING]: Failed to fetch metadata from IMDS: HTTPConnectionPool(host='<the metadata service>', port=80): Max retries exceeded wi
-[  313.283326] vm-sbx-ctl cloud-init[534]: 2026-11-20 07:07:53,118 - azure.py[ERROR]: Azure datasource failure occurred: result=error|reason=connection timeout querying IMDS|agent=Cloud-Init/26.2-0ubu
-[ 1206.704456] vm-sbx-ctl systemd[1]: tinfirm-node-agent-firewall.service: Deactivated successfully.
-[ 1206.704573] vm-sbx-ctl systemd[1]: Stopped tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall.
+[    3.145789] node systemd[1]: Starting tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall...
+[    3.295953] node systemd[1]: Finished tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall.
+[    3.783379] node cloud-init[534]: Cloud-init v. 26.2-0ubuntu1~24.04.2 running 'init-local' at Fri, 20 Nov 2026 07:02:43 +0000. Up 3.76 seconds.
+[    4.012947] node dhcpcd[554]: eth0: offered 10.0.0.6 from <the platform address>
+[   34.056064] node cloud-init[534]: 2026-11-20 07:03:13,899 - azure.py[WARNING]: Polling IMDS failed attempt 1 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Max
+[   65.087776] node cloud-init[534]: 2026-11-20 07:03:44,930 - azure.py[WARNING]: Polling IMDS failed attempt 2 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Max
+[  313.274693] node cloud-init[534]: 2026-11-20 07:07:53,117 - azure.py[WARNING]: Polling IMDS failed attempt 10 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Ma
+[  313.283326] node cloud-init[534]: 2026-11-20 07:07:53,118 - azure.py[WARNING]: Failed to fetch metadata from IMDS: HTTPConnectionPool(host='<the metadata service>', port=80): Max retries exceeded wi
+[  313.283326] node cloud-init[534]: 2026-11-20 07:07:53,118 - azure.py[ERROR]: Azure datasource failure occurred: result=error|reason=connection timeout querying IMDS|agent=Cloud-Init/26.2-0ubu
+[ 1206.704456] node systemd[1]: tinfirm-node-agent-firewall.service: Deactivated successfully.
+[ 1206.704573] node systemd[1]: Stopped tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall.
 (nothing more is logged between 313 s and the shutdown at 1206 s; port 22 refused connections all that time, so the boot had not reached its sockets)
 
 == a reboot with the four units enabled and cloud-init switched off (/etc/cloud/cloud-init.disabled); up 21.57 s

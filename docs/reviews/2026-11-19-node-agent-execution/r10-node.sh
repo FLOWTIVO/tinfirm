@@ -1,5 +1,5 @@
 #!/bin/bash
-# Round 10, from vm-mgmt: the jail's own file system, R1, the helper started again, the
+# Round 10, from the management machine: the jail's own file system, R1, the helper started again, the
 # firewall's line in `check`, io.max. The control host is `host` (10.0.0.5), the node `ctl`.
 DRV='cd ~/tinfirm-host && python3 control-host.py ./tinfirm-runner-host node-driver.json sandbox-2c2g tinfirm-runner-pi:local'
 drv() { ssh host "$DRV $* 2>&1"; }

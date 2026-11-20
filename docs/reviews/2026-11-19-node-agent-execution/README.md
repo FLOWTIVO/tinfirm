@@ -6,9 +6,9 @@ Evidence for the execution half of the node agent's Linux backend ([ADR-0112](..
 
 | | |
 |---|---|
-| The node | `vm-sbx-ctl`, Azure Standard_D4s_v6 (4 vCPUs, 16 GiB, nested virtualization, Xeon Platinum 8573C), 10.0.0.6, no public address. Ubuntu 24.04.5, kernel 7.0.0-1017-azure, systemd 255, nftables 1.0.9, iproute2 6.1.0, device-mapper tools 1.02.185 |
-| The control host | `vm-mgmt`, 10.0.0.4, in the same subnet |
-| A third machine | `vm-sbx-third`, 10.0.0.5, made for one check and deleted |
+| The node | Azure Standard_D4s_v6 (4 vCPUs, 16 GiB, nested virtualization, Xeon Platinum 8573C), 10.0.0.6, no public address. Ubuntu 24.04.5, kernel 7.0.0-1017-azure, systemd 255, nftables 1.0.9, iproute2 6.1.0, device-mapper tools 1.02.185 |
+| The control host | 10.0.0.4, in the same subnet |
+| A third machine | 10.0.0.5, made for one check and deleted |
 | The code | The branch `claude/zen-faraday-irqn49` at `7c3cf12`, with this change. The branch has moved since: from `41567f5` on, the listener's configuration needs `tls.controlHost`, which the listener of these runs did not have yet. Built on the node with rustc 1.100.0: the tests as a debug build, the installed agent as a release build for `x86_64-unknown-linux-musl` |
 | Firecracker and the jailer | 1.14.2, the release's binaries, as `/usr/local/bin/firecracker` and `/usr/local/bin/jailer` |
 | The guest kernel | Kata Containers 4.3.1's `vmlinux-6.18.56-208`, from `https://github.com/kata-containers/kata-containers/releases/download/4.3.1/kata-static-4.3.1-amd64.tar.zst` (SHA-256 `1463a2b86845f4d3d8e87f2f764ec59856fc0fee3520967a79ade32762be2e97`); the member's SHA-256 is `f87d8359035cb7557b16a319e6431ea09b183e62268aef436bf8dc6530d786b6`. The archive was downloaded on the node and the member compared with the installed file: the same |
@@ -446,7 +446,7 @@ Kata's guest kernel is built without `ioperm` and `iopl`, has no `/dev/port` and
 
 ## Third round, 2026-11-20 (05:56 to 08:15 UTC)
 
-On the branch at `54663cd`. The node as before (`vm-sbx-ctl`, 10.0.0.6); the control host was a machine of its own this time (10.0.0.5, a D2s_v6 VM), which drove the node through the runner host's node driver over TLS (`control-host.py`). The agent ran under its units with the node's firewall table, the sysctl file and `tls.controlHost` for 10.0.0.5. The VM image was built again with the branch's runner host (`local-disk.sh`, 313 s).
+On the branch at `54663cd`. The node as before (10.0.0.6); the control host was a machine of its own this time (10.0.0.5, a D2s_v6 VM), which drove the node through the runner host's node driver over TLS (`control-host.py`). The agent ran under its units with the node's firewall table, the sysctl file and `tls.controlHost` for 10.0.0.5. The VM image was built again with the branch's runner host (`local-disk.sh`, 313 s).
 
 | Command | Result |
 |---|---|
@@ -459,7 +459,7 @@ On the branch at `54663cd`. The node as before (`vm-sbx-ctl`, 10.0.0.6); the con
 
 ### No conversation ran: the server refused the host's hello (`r10-server-refuses-hello.out`)
 
-The round was to run real conversations from the owner's server through the node agent. The runner host of the branch, started with `run --executor vm --vm-driver node` and a valid login (`doctor` reports that the server accepted the token), verified the node (`node node-1: 2 free` and every check) and was then refused before `welcome`:
+The round was to run real conversations from a server of an earlier release through the node agent. The runner host of the branch, started with `run --executor vm --vm-driver node` and a valid login (`doctor` reports that the server accepted the token), verified the node (`node node-1: 2 free` and every check) and was then refused before `welcome`:
 
 ```
 WARN  Invalid hello message: isolationTiers[0].<list element> must match "container|gvisor|microvm"  code=BAD_MESSAGE
