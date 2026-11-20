@@ -221,7 +221,7 @@ Two forms have names in this ADR: **separated** (a control host and sandbox node
   - R22 and 6.9 (Kata, and root in its VM) are rewritten: an escape through the VMM reaches a jailed user; a flaw of KVM reaches root on a node without credentials, or on a single machine with them.
   - R27, R44, §6.6: on a separated host the git tokens and the host's token are on the control host only. Their lifetimes do not change: TIN-42 and Q41 stay worth doing, for the control host.
   - R28: closed for every host that runs VMs, where the bridge is the only way.
-  - R34: the control host is the tier-0 asset. A node sees the content of its runs and holds no credential: a lower tier, to be named.
+  - R34: the control host is the tier-0 asset. A node sees the content of its runs and holds no credential: a tier-1 asset, a lower tier with the same administrators (the owner, 2026-11-20).
   - R36: a restarted control host takes its runs back from its nodes as from a provider's VMs (ADR-0101); a node that restarts loses its runs.
   - 6.17, R58: a session home that a compromised node handed back steers later turns.
   - R12, R26, R55: unchanged in kind; R55's reason is rewritten, since the host now carries the login file (decision 6).
@@ -246,7 +246,7 @@ Two forms have names in this ADR: **separated** (a control host and sandbox node
 
 ## The owner's decisions so far
 
-Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 where the date says so. The revision of 2026-11-17 changed none of them; where the review found one in conflict with something else, it was an open question below.
+Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 or 2026-11-20 where the date says so. The revision of 2026-11-17 changed none of them; where the review found one in conflict with something else, it was an open question below.
 
 - Kata is dropped; one kind of VM of Tinfirm's own (decision 2).
 - The control host runs apart from the server by default (decision 3).
@@ -261,6 +261,7 @@ Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 where the date
 - A node reaches its VMs for the control host by a port per VM or by an address per VM; both stay (decision 4).
 - A compromised node must not be able to tamper with its other runs after one exploit, without one run per node, without pools and without special hardware. This holds for path A. It does not hold for path B (decision 1), which the owner accepted as a risk for sandbox nodes on 2026-11-19.
 - 2026-11-19: the control host reads a sandbox's input in a process per run that holds no credential, to be built in this scope: the bundle import and the unpacking of archives first, the proxies' request parsing as far as it can be split (decision 1). The bundle import and the archives are built (`4c1378c`, a confined process per reading); the proxies' request parsing and the bridge's frames are planned.
+- 2026-11-20: a sandbox node is a tier-1 asset, a named lower tier than the control host. It holds no credential, so its compromise reaches runs and not accounts. Only the people who administer the control host administer its nodes, and nodes are re-imaged on a schedule. The role and the guides follow this.
 
 ## To specify and verify during the build
 

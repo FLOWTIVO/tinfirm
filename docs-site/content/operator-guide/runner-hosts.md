@@ -128,6 +128,8 @@ Settings that are not options of the unit's command go in its environment (`Envi
 
 The role's variables turn each of them off (`tinfirm_runner_host_egress_proxy`, `tinfirm_runner_host_sandbox_bridge`, `tinfirm_runner_host_uid`); `deploy/ansible/README.md` lists them.
 
+**A sandbox node is a tier-1 asset.** A node runs the VMs of a control host and holds no credential: no git token, no host token and no model token. Whoever takes a node over reads the files and prompts of the runs on it and can change the work they hand back, which the control host then pushes to each run's own branch. So a node is a lower tier than the control host, with the same administrators: give its administration only to the people who administer the control host, admit nothing to it but the control host and your one management address, and replace its image on a schedule. Sandbox nodes are not ready for production yet ([With sandbox nodes](helm.md#with-sandbox-nodes)).
+
 ## What a run does
 
 1. **Accepts or refuses it.** The host refuses a run while it drains, when it or the credential's pool has no free slot, when an image is missing, or when the same conversation still has a run on it; the server then tries again.
