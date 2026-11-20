@@ -155,6 +155,7 @@ Nothing in the audit log holds a token.
 | `tool.called` | Each call that reached a system, with the account, its holder and the grant it went through |
 | `secret.accessed` | Each reveal of a credential, with its purpose; for a run's GitHub App token both the credential's secret and the App's key, with `run:{runId}` |
 | `run.git_revoked` | A run's git token of some repositories revoked on its host (a binding that failed, a paused system, a followed credential, a renewal refused for good), with whether the host was told |
+| `run.git_revoke_confirmed` | The run's host confirmed that it dropped those tokens and rewrote its take-back record: the run, the repositories, the host |
 | `system.github_app_set`, `system.github_app_removed` | A GitHub system's App set, its key replaced, or removed |
 
 ## 11. Troubleshooting

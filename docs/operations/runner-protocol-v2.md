@@ -172,9 +172,13 @@ ships it.
     sends the frame right after the change's commit (also to the connected host of a run lost
     within the resume window, which may still run it), and again at every `hello` that lists the
     run until the run ends, when the host accepts the run (a frame sent while `run.assign` was on
-    its way may have come first), and when a heartbeat resumes a lost run. There is no ack. A
-    host sends nothing back for a `run.git.revoke` of an unknown run or another epoch, no `error`
-    frame: it ignores it. A host of protocol 1 never gets one, and would answer it `error`
+    its way may have come first), and when a heartbeat resumes a lost run.
+  - **The host confirms it.** Once it has dropped the tokens and written its take-back record
+    again, the host answers `run.git.revoked {runId, epoch, componentIds}`, naming the
+    repositories of that frame that its run has, also when the frame comes twice. The server
+    takes it only from the run's host for the run's epoch, ignores any other without an `error`,
+    and marks the revocation confirmed. A host sends nothing back for a `run.git.revoke` of an
+    unknown run or another epoch, no `error` frame: it ignores it. A host of protocol 1 never gets one, and would answer it `error`
     `UNKNOWN_TYPE`.
   - **Before every `run.cancel`** of a run that a host reports (in its `hello`, a heartbeat or a
     `run.accepted`), the host first gets `run.git.revoke` for that assignment: every revocation
@@ -182,31 +186,41 @@ ships it.
     system is paused or removed, or whose binding changed since the run cloned it (reason
     `BINDING_CHANGED`). The second part covers a run the server stopped tracking (it ended, or was
     lost longer ago than the resume window, `TINFIRM_RUNNER_LOST_RESUME_WINDOW`), whose cause came
-    later; it is recorded and audited then. A cancelled run pushes its work, so it never pushes
-    with a token the server would refuse it now. A heartbeat of an earlier epoch gets the recorded
-    revocations only.
+    later, and an earlier execution of a run that was assigned again: the server keeps what each
+    assignment cloned, by epoch, for as long as it keeps the run. It is recorded and audited then.
+    A heartbeat of an earlier epoch gets the same. So does a member's machine that reports a run
+    of a company its owner left, when that run's assignment went to this machine; a machine that
+    did not hold it gets the cancel alone. A cancelled run pushes its work, so it never pushes with
+    a token the server would refuse it now.
   - `welcome.done` (no other field) ends the server's answer to a `hello` that lists
     `run.git.revoke`: once per connection, after every frame it sends again for the runs the
     `hello` listed (the revocations, then the cancels), also when there is nothing to send again.
-    Every revocation of those runs that the server held when it reconciled the `hello` went
-    before it. A host that took a run back after a restart pushes the run's work only after
-    `welcome.done`, so that it never pushes with a token the server revoked while it was away;
-    without one within 2 minutes it pushes with what its take-back record holds and logs a
-    warning, as it does without a connection.
-  - **A limit of `welcome.done`.** A revocation that commits while the server answers the `hello`
-    (after the reconciliation read the runs' revocations, under their locks) goes by the normal
-    path, right after its commit, and may arrive after `welcome.done`. The host applies it when it
-    arrives; a push it already started finishes.
+    Every revocation of those runs that committed before `welcome.done` was written went before
+    it: while the answer ends, the server holds back the commit of any revocation of the host's
+    runs, and sends those that committed meanwhile first. One that commits later goes right after
+    its commit; the host applies it when it arrives, and a push it already started finishes. A
+    frame may come twice; the host applies it once.
+  - A host that took a run back after a restart pushes it, and uses its git tokens, only once
+    the current process has had the server's `welcome` and, from a server that lists
+    `run.git.revoke` in `welcome.features`, `welcome.done`: there is no time limit, so it never
+    pushes with a token the server revoked while it was away. The take-back record stays, marked
+    collected, until the run ends. An older server sends no `welcome.done`, and the host goes on
+    at `welcome`. When the server cannot complete its answer after `welcome` (a database error,
+    for example), it sends `error` `INTERNAL_ERROR` and closes the connection with 1011; the host
+    reconnects, and its next `hello` is answered whole.
   - Each revocation is audited `run.git_revoked` (the run, the binding or the paused system,
-    the repositories, the reason, and how the host is told), and the run's page shows it on the
-    repository: told (`SENT`, the frame was written to the host's connection), pending (`PENDING`,
-    the host was not connected: it is told when it reconnects, before it can push), or the host
-    cannot drop a token (`UNSUPPORTED`).
+    the repositories, the reason, and how the host was to be told), and its first confirmation
+    `run.git_revoke_confirmed` (the run, the repositories, the host). The run's page shows it on
+    the repository: confirmed (`CONFIRMED`, "The runner host dropped the token."), sent and not
+    confirmed yet (`SENT`, the frame was written to the host's connection; it goes again when the
+    host reconnects), pending (`PENDING`, the host was not connected: it is told when it
+    reconnects, before it can push), or the host cannot drop a token (`UNSUPPORTED`).
   - A host that does not list the feature gets nothing: its run keeps its tokens until it ends,
     as before, the audit says `sent: false`, and the conversation says so. Upgrade the hosts to
     revoke at once; nothing needs configuring.
   - A paused agent or trigger, and the company's stop, revoke nothing: those runs finish, or are
-    cancelled, by their own rules.
+    cancelled, by their own rules, and a cancelled run pushes its work (the owner's decision of
+    2026-11-20 for the company's stop).
   - A revocation stops only what has not started: a fetch or a push already under way finishes,
     what the sandbox holds stays there, and the token itself stays valid at the code host. Rotate
     a member's personal access token at the code host when it may have been copied. A GitHub

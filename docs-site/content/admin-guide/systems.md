@@ -296,7 +296,7 @@ When the account a running turn cloned a repository with can no longer be used, 
 - the system is paused or removed;
 - a trigger's service account borrows another credential on the system.
 
-The agent's next fetch from that repository fails, and Tinfirm does not push it when the turn ends. A turn with unpushed commits there ends failed; its run page shows **Git access revoked** on the repository with the reason, and the commits stay only on the runner host, if its operator keeps failed workspaces. The turn's other repositories go on as usual. The audit log records each revocation as `run.git_revoked`.
+The agent's next fetch from that repository fails, and Tinfirm does not push it when the turn ends. A turn with unpushed commits there ends failed; its run page shows **Git access revoked** on the repository with the reason, and the commits stay only on the runner host, if its operator keeps failed workspaces. The turn's other repositories go on as usual. Under the reason, the run page says whether the runner host has heard: "The runner host dropped the token." once the host confirms it, that it was sent and not confirmed yet, that the host is told when it reconnects, or that the host is too old to drop a token. The audit log records each revocation as `run.git_revoked`, and the host's confirmation as `run.git_revoke_confirmed`.
 
 What a revocation does not stop:
 
