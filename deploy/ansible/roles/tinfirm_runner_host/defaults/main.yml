@@ -196,10 +196,12 @@ tinfirm_runner_host_images_build_timeout: 3600
 #     nodeSha256: 0123…             # the node's certificate's SHA-256, 64 hex digits
 #     templates: [sandbox-2c4g]     # the templates of the node's helper.json it offers
 #     publishedPorts: {first: 20000, last: 20001}   # optional: listed for your firewall
-# A node without nodeSha256 is not written yet: the role makes and shows the client
-# certificate and stops before it starts the host (the first set-up, deploy/ansible/README.md).
+# The driver's configuration names only the nodes with a nodeSha256; the others are named as
+# waiting. Emptying a node's nodeSha256 takes it out at the next run (the host reloads, which
+# drains). With no node pinned, the role stops a host that runs and starts none: the first
+# set-up (deploy/ansible/README.md).
 tinfirm_runner_host_nodes: []
-# The template every VM is made from (`--vm-template`); at least one node must offer it.
+# The template every VM is made from (`--vm-template`); at least one pinned node must offer it.
 tinfirm_runner_host_vm_template: ""
 # Where the bridge listens in the VM (`--vm-port`): the nodes' templates' bridgePort.
 tinfirm_runner_host_vm_port: 7443

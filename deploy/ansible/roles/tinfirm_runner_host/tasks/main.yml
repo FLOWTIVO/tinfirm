@@ -39,3 +39,7 @@
 
 - name: Run the runner host as a systemd service
   ansible.builtin.import_tasks: service.yml
+
+- name: Check that the control host's user reaches no Docker
+  ansible.builtin.import_tasks: proof.yml
+  when: _tinfirm_runner_host_vm | bool

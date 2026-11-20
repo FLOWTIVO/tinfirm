@@ -1,8 +1,8 @@
-{#- The node driver's configuration (runner/README.md, "Sandbox nodes"): every node over TLS,
-    with its pinned certificate and this host's client certificate and key. The driver
-    refuses an unknown field. -#}
+{#- The node driver's configuration (runner/README.md, "Sandbox nodes"): every node that has a
+    pin now, over TLS, with its pinned certificate and this host's client certificate and key.
+    A node without a pin is left out. The driver refuses an unknown field. -#}
 {%- set nodes = [] -%}
-{%- for node in tinfirm_runner_host_nodes -%}
+{%- for node in _tinfirm_runner_host_nodes_pinned -%}
 {%-   set _ = nodes.append({
         'name': node.name,
         'address': node.address,

@@ -129,13 +129,16 @@
           - tinfirm_runner_host_nodes | length <= 64
           - tinfirm_runner_host_nodes | map(attribute='name') | unique | length == tinfirm_runner_host_nodes | length
           - tinfirm_runner_host_vm_template is match('^[a-z0-9][a-z0-9-]{0,62}$')
-          - tinfirm_runner_host_nodes | selectattr('templates', 'contains', tinfirm_runner_host_vm_template) | list | length >= 1
+          # The nodes that have a pin are the driver's; with none yet, there is nothing to offer.
+          - >-
+            _tinfirm_runner_host_nodes_pinned | length == 0
+            or _tinfirm_runner_host_nodes_pinned | selectattr('templates', 'contains', tinfirm_runner_host_vm_template) | list | length >= 1
           - tinfirm_runner_host_node_peer_build in ['warn', 'refuse']
           - tinfirm_runner_host_vm_port | int >= 1
           - tinfirm_runner_host_vm_port | int <= 65535
         fail_msg: >-
           A control host needs tinfirm_runner_host_nodes (1 to 64 nodes, each name once),
-          tinfirm_runner_host_vm_template (a template that at least one node offers), and
+          tinfirm_runner_host_vm_template (a template that at least one node with a nodeSha256 offers), and
           tinfirm_runner_host_node_peer_build warn or refuse.
         quiet: true
 
@@ -160,3 +163,59 @@
       loop: "{{ tinfirm_runner_host_nodes }}"
       loop_control:
         label: "{{ item.name | default('?') }}"
+
+# A control host runs no Docker socket and no hypervisor (ADR-0112 decision 3). A Kata host is
+# not converted into one in place: ADR-0112 decision 7 makes the old machine a node and puts
+# the control host elsewhere. So the `vm` form refuses a machine with Docker, containerd or
+# Kata, or whose runner host user is in the docker group, before it changes anything: a
+# runner host of the Docker form that runs there keeps running, with its runs, untouched.
+- name: Refuse a machine with Docker for a control host
+  when: _tinfirm_runner_host_vm | bool
+  block:
+    - name: Read the machine's services
+      ansible.builtin.service_facts:
+
+    - name: Read the docker group
+      ansible.builtin.getent:
+        database: group
+        key: docker
+        fail_key: false
+
+    - name: Look for Docker's socket and Kata
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      loop: [/var/run/docker.sock, /run/containerd/containerd.sock, /opt/kata, /usr/bin/dockerd, /usr/bin/containerd]
+      register: _tinfirm_runner_host_docker_paths
+
+    - name: Look for a runner host of the Docker form
+      ansible.builtin.slurp:
+        src: /etc/systemd/system/tinfirm-runner-host.service
+      register: _tinfirm_runner_host_old_unit
+      failed_when: false
+
+    - name: Refuse Docker, containerd, Kata or the docker group on a control host
+      ansible.builtin.assert:
+        that:
+          - _found | length == 0
+        fail_msg: >-
+          This machine has {{ _found | join(', ') }}. A control host runs no Docker socket and no
+          hypervisor (ADR-0112 decision 3), and its user reaches no Docker: use a fresh machine for
+          it, or remove Docker, containerd and Kata first and take {{ tinfirm_runner_host_user }}
+          out of the docker group. A Kata host becomes a sandbox node instead, with a new image
+          (ADR-0112 decision 7). {{ _old_form }}
+        quiet: true
+      vars:
+        _services: "{{ ansible_facts['services'] | default({}) }}"
+        _docker_members: "{{ ((ansible_facts['getent_group'] | default({}))['docker'] | default(['', '', '', '']))[2] | default('') | split(',') }}"
+        _found: >-
+          {{ (['docker.service'] if 'docker.service' in _services else [])
+             + (['containerd.service'] if 'containerd.service' in _services else [])
+             + (_tinfirm_runner_host_docker_paths.results | selectattr('stat.exists') | map(attribute='item') | list)
+             + ([tinfirm_runner_host_user ~ ' in the docker group'] if tinfirm_runner_host_user in _docker_members else []) }}
+        _old_form: >-
+          {{ 'The runner host of the Docker form here was left alone and still runs with its runs: drain it
+              (systemctl reload tinfirm-runner-host, until it runs again with none) and stop it before you
+              re-image the machine.'
+             if (_tinfirm_runner_host_old_unit.content | default('') | b64decode) is search('--sandbox-runtime')
+             else '' }}

@@ -241,7 +241,9 @@ the runs on it, their files, prompts and tunnels, and what they hand back, but n
 
 The role `tinfirm_runner_host` with `tinfirm_runner_host_executor: vm`, which the play sets:
 
-1. checks the target and the nodes' variables. A control host needs no KVM;
+1. checks the target and the nodes' variables. A control host needs no KVM. It refuses a
+   machine with Docker, containerd or Kata (installed, not only running), or whose runner host
+   user is in the `docker` group, before it changes anything ([A machine with Docker](#a-machine-with-docker));
 2. installs `git`, `openssl`, `acl`, `ca-certificates` and `tar`. **No Docker, no Kata and no
    runner image**: with `--executor vm` the host uses no Docker, and the VM image holds the runner
    images (runner/README.md, "A VM per run": "No images on this host", "`--sandbox-runtime` is
@@ -251,14 +253,18 @@ The role `tinfirm_runner_host` with `tinfirm_runner_host_executor: vm`, which th
 4. makes the client certificate on the host with `tinfirm-runner-host node identity`:
    `/etc/tinfirm/node-driver/client.crt` (root's, 0644) and `client.key` (the user's, 0600, which
    the driver requires), and shows its fingerprint, which each node pins;
-5. while a node has no `nodeSha256`, stops here: the host is installed and logged in, not started;
-6. writes `/etc/tinfirm/node-driver.json` from `tinfirm_runner_host_nodes`;
-7. asks every node through the driver, as the runner host's user: `tinfirm-runner-host vm-driver
+5. writes `/etc/tinfirm/node-driver.json` with the nodes that have a `nodeSha256` now, and names
+   the others as waiting. A change of the file reloads the host, which drains. With no node
+   pinned at all, it stops a host that runs, removes the file, and starts none: the host is
+   installed and logged in, and does not run ([Take a node out](#take-a-node-out));
+6. asks every node of that file through the driver, as the runner host's user: `tinfirm-runner-host vm-driver
    node` with a `verify` of `tinfirm_runner_host_vm_template`, which is what `run` asks at its
    start. A node that names a problem fails the play;
-8. installs the unit with `run --executor vm --vm-driver node --vm-template … --vm-port …`, the
+7. installs the unit with `run --executor vm --vm-driver node --vm-template … --vm-port …`, the
    `--vm-probe`, `--egress-allow` and `--sandbox-env` settings and `--sandbox-docker`, sandboxed as
-   above, and starts it. The bridge and the egress proxy are always on with `--executor vm`.
+   above, and starts it. The bridge and the egress proxy are always on with `--executor vm`;
+8. ends with the check that the runner host's user is in no `docker` group and that no Docker or
+   containerd socket answers it, the rootless one included. Either fails the play.
 
 The control host still runs the reader of what a sandbox sends back in a confined process, which
 needs Linux 5.19 or later with Landlock enabled at boot (runner/README.md, "The reader"); `run`
@@ -374,8 +380,8 @@ The two machines need each other's fingerprint. In this order:
 
 1. **The control host, first time:** `ansible-playbook -i inventory.yml
    deploy/ansible/control-host.yml --ask-vault-pass`. It installs the host, logs it in, makes the
-   client certificate and shows **"The control host's client fingerprint"**. With nodes that have no
-   `nodeSha256` it stops there: the host is not started.
+   client certificate and shows **"The control host's client fingerprint"**. With no node pinned
+   yet it stops there: the host does not run.
 2. **The nodes:** set that fingerprint as `tinfirm_sandbox_node_client_sha256`, and run
    `ansible-playbook -i inventory.yml deploy/ansible/sandbox-node.yml`. Each node ends with the
    helper's check of its templates and shows **"The node's fingerprint, which the control host
@@ -400,17 +406,31 @@ The two machines need each other's fingerprint. In this order:
 `tinfirm_runner_host_max_concurrent_runs` at most the sum of the nodes' `tinfirm_sandbox_node_max_vms`.
 The play warns when it is above what the nodes have free.
 
+### Take a node out
+
+The driver's configuration names exactly the nodes that have a `nodeSha256` at the last run of
+`control-host.yml`. Emptying a node's `nodeSha256`, or taking the node out of
+`tinfirm_runner_host_nodes`, takes it out at the next run: the play rewrites the file without it
+and reloads the host, which drains. The runs in progress finish, the node's own runs included,
+and the host starts again without the node. A node without a pin is named in the play's output as
+waiting, and a new node without one waits the same way while the host serves the others. With no
+node pinned at all, the play stops the host (SIGTERM, which cancels its runs and pushes their work
+in progress) and removes the file.
+
+When the node may have been taken over, do not let its runs finish: after the play, run
+`systemctl restart tinfirm-runner-host` on the control host, which cancels them at once.
+
 ### Replace a node
 
 A node is re-imaged on a schedule, and replaced at once when it may have been taken over:
 
-1. Take the node out of `tinfirm_runner_host_nodes` and run `control-host.yml`: the host drains
-   (`systemctl reload`), so that the runs on that node finish, and starts again without it.
+1. Empty the node's `nodeSha256` and run `control-host.yml`: the host drains, so that the runs on
+   that node finish, and starts again without it ([Take a node out](#take-a-node-out)).
 2. Replace the node's image, and run `sandbox-node.yml` on it with the same variables. It makes a
    new TLS identity and shows its new fingerprint: the old key went with the old image.
-3. Put the node back with its **new** `nodeSha256`, and run `control-host.yml`. Until you do, the
-   driver refuses the node, whose certificate is not the pinned one: such a node is not counted,
-   and the host runs on the others.
+3. Set the node's **new** fingerprint as its `nodeSha256`, and run `control-host.yml`, which puts
+   it back. Had you kept the old pin, the driver would refuse the node, whose certificate is not
+   the pinned one: such a node is not counted, and the host runs on the others.
 
 A node that was taken over has handed back work that outlasts it (ADR-0112, Consequences): review
 the branches and artifacts of the runs it served, and discard their sessions.
@@ -423,6 +443,22 @@ since no node accepts it yet. Set the fingerprint as every node's
 `tinfirm_sandbox_node_client_sha256`, run `sandbox-node.yml`, which restarts each listener, then
 `control-host.yml`. A listener accepts one client certificate, so no run starts on a node in
 between. Do it at once if the key may have leaked.
+
+### A machine with Docker
+
+A control host runs no Docker socket and no hypervisor (ADR-0112 decision 3): its user would
+otherwise be root on the machine that holds every run's credentials. `control-host.yml` therefore
+refuses, in its first checks and before it changes anything, a machine where Docker, containerd
+or Kata is installed, Docker's socket exists, or the runner host's user is in the `docker` group.
+It does not remove them itself: a Kata host is not converted into a control host in place.
+ADR-0112 decision 7 makes such a machine a sandbox node, with a new image, and puts the control
+host on another machine. Use a fresh machine, or remove Docker, containerd and Kata and take the
+user out of the `docker` group first.
+
+A runner host of the Docker form on such a machine is left as it is, with its runs: the play
+fails before it touches the binary, the unit or the service, and says so when it finds that
+host's unit. Drain it (`systemctl reload tinfirm-runner-host`, until it runs again with no run),
+stop it, and then re-image the machine.
 
 ### Firewalls
 
@@ -498,8 +534,8 @@ variables above have no effect. The binary, login, user, `run` and sandbox setti
 | Variable | Default | Meaning |
 |---|---|---|
 | `tinfirm_runner_host_executor` | `docker` | `vm`: a control host |
-| `tinfirm_runner_host_nodes` | `[]` | Each node: `name`, `address` (`HOST:PORT` of its agent), `nodeSha256` (empty until its play shows it), `templates`, and optionally `publishedPorts` `{first, last}`, which the play lists for your firewall |
-| `tinfirm_runner_host_vm_template` | none | `--vm-template`; at least one node must offer it |
+| `tinfirm_runner_host_nodes` | `[]` | Each node: `name`, `address` (`HOST:PORT` of its agent), `nodeSha256` (empty until its play shows it; emptied, the node is taken out at the next run), `templates`, and optionally `publishedPorts` `{first, last}`, which the play lists for your firewall. The driver's file names only the nodes with a pin |
+| `tinfirm_runner_host_vm_template` | none | `--vm-template`; at least one node with a pin must offer it |
 | `tinfirm_runner_host_vm_port` | `7443` | `--vm-port`: the templates' `bridgePort` |
 | `tinfirm_runner_host_vm_probe` | `[]` | `--vm-probe`, one per entry |
 | `tinfirm_runner_host_node_peer_build` | `warn` | The driver's `peerBuild` |
@@ -546,3 +582,8 @@ Not run yet. On two fresh Ubuntu 24.04 VMs with KVM in one subnet, `ctl` (the co
 6. Run a conversation on the host, and see a VM made and deleted on the node.
 7. Run both plays again: `changed=0` on both.
 8. Replace the node's image and follow [Replace a node](#replace-a-node).
+9. Empty the node's `nodeSha256` and run `control-host.yml`: the play names the node as waiting,
+   the host drains and runs again, and with the only node out it is stopped and
+   `/etc/tinfirm/node-driver.json` is gone. Pin it again: the host starts.
+10. Run `control-host.yml` against a machine with Docker installed: it fails in its checks, and
+    changes nothing there.

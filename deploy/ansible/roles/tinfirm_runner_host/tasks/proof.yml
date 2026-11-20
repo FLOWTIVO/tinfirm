@@ -1,0 +1,48 @@
+---
+# The end of a control host's play: its user reaches no Docker (ADR-0112 decision 3). Asked as
+# that user: it is in no docker group, and no Docker or containerd socket answers it, the
+# rootless one included.
+- name: Read the runner host user's groups
+  ansible.builtin.command:
+    argv: [id, -nG, "{{ tinfirm_runner_host_user }}"]
+  register: _tinfirm_runner_host_groups
+  changed_when: false
+
+- name: Try the Docker sockets as the runner host's user
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -I
+      - -c
+      - |
+        import socket, sys
+        for path in sys.argv[1:]:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(3)
+            try:
+                s.connect(path)
+                print("REACHED " + path)
+            except OSError:
+                pass
+            finally:
+                s.close()
+      - /var/run/docker.sock
+      - /run/docker.sock
+      - /run/containerd/containerd.sock
+      - "/run/user/{{ tinfirm_runner_host_uid }}/docker.sock"
+  become: true
+  become_user: "{{ tinfirm_runner_host_user }}"
+  register: _tinfirm_runner_host_sockets
+  changed_when: false
+
+- name: Fail when the runner host's user reaches Docker
+  ansible.builtin.assert:
+    that:
+      - "'docker' not in (_tinfirm_runner_host_groups.stdout | split)"
+      - _tinfirm_runner_host_sockets.stdout | trim | length == 0
+    fail_msg: >-
+      {{ tinfirm_runner_host_user }} reaches Docker on this control host (groups:
+      {{ _tinfirm_runner_host_groups.stdout | trim }}; {{ _tinfirm_runner_host_sockets.stdout_lines | join(', ') }}).
+      A control host holds every run's credentials and must run no Docker socket (ADR-0112 decision 3).
+    success_msg: "{{ tinfirm_runner_host_user }} reaches no Docker socket."
+    quiet: false

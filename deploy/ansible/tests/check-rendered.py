@@ -115,6 +115,7 @@ def driver(d):
     check(1 <= len(d["nodes"]) <= 64, "node-driver.json: 1 to 64 nodes")
     names = [node["name"] for node in d["nodes"]]
     check(len(names) == len(set(names)), "node-driver.json: each name once")
+    check(names == ["node-1", "node-2"], "node-driver.json: the pinned nodes alone, node-3 (no pin) left out")
     for node in d["nodes"]:
         check(keys(node, ["name", "address", "nodeSha256", "certificate", "key", "templates"]),
               f"node-driver.json: {node['name']}: a TLS node's fields")
@@ -180,6 +181,9 @@ def main():
     helper(h)
     listener(json.loads((out / "listener.json").read_text()), h)
     driver(json.loads((out / "node-driver.json").read_text()))
+    derived = json.loads((out / "derived.json").read_text())
+    check(derived["nodes_unpinned"] == ["node-3"] and derived["nodes_pinned"] == ["node-1", "node-2"],
+          "the play names node-3 as waiting, and pins node-1 and node-2")
     firewall((out / "firewall.nft").read_text())
     one = (out / "firewall-one-vm-static.nft").read_text()
     check("define published_ports = 20000\n" in one and "udp sport 67" not in one,

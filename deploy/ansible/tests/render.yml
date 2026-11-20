@@ -89,4 +89,5 @@
           published_ports: "{{ _tinfirm_sandbox_node_published_ports }}"
           node_name: "{{ tinfirm_sandbox_node_name }}"
           nodes_unpinned: "{{ _tinfirm_runner_host_nodes_unpinned }}"
+          nodes_pinned: "{{ _tinfirm_runner_host_nodes_pinned | map(attribute='name') | list }}"
           packages: "{{ _tinfirm_sandbox_node_packages }}"

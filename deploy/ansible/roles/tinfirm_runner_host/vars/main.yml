@@ -9,12 +9,11 @@ _tinfirm_runner_host_node_config: /etc/tinfirm/node-driver.json
 _tinfirm_runner_host_node_dir: /etc/tinfirm/node-driver
 _tinfirm_runner_host_node_cert: /etc/tinfirm/node-driver/client.crt
 _tinfirm_runner_host_node_key: /etc/tinfirm/node-driver/client.key
-# The nodes whose pin is not set yet: while there is one, the role writes no driver
-# configuration and does not start the host.
+# The nodes with a pin, which the driver's configuration names, and the names of those without
+# one, which it leaves out: emptying a node's nodeSha256 takes the node out at the next run.
+_tinfirm_runner_host_nodes_pinned: "{{ tinfirm_runner_host_nodes | selectattr('nodeSha256', 'defined') | selectattr('nodeSha256', 'truthy') | list }}"
 _tinfirm_runner_host_nodes_unpinned: >-
-  {{ tinfirm_runner_host_nodes | rejectattr('nodeSha256', 'defined') | map(attribute='name') | list
-     + tinfirm_runner_host_nodes | selectattr('nodeSha256', 'defined') | rejectattr('nodeSha256', 'truthy')
-       | map(attribute='name') | list }}
+  {{ tinfirm_runner_host_nodes | map(attribute='name') | difference(_tinfirm_runner_host_nodes_pinned | map(attribute='name')) }}
 
 _tinfirm_runner_host_kata_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
 # The Go runtime's shim from the static release, and the configuration the role writes.

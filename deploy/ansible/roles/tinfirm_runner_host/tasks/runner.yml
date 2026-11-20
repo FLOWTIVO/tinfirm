@@ -5,7 +5,8 @@
     uid: "{{ tinfirm_runner_host_uid }}"
     home: "{{ tinfirm_runner_host_home }}"
     shell: /usr/sbin/nologin
-    # A control host has no Docker, and its user is in no group of Docker's.
+    # A control host has no Docker, and its user is in no group of Docker's: checks.yml refuses
+    # a machine where it is, and proof.yml checks it again at the end.
     groups: "{{ omit if _tinfirm_runner_host_vm | bool else ['docker'] }}"
     append: true
   when: tinfirm_runner_host_create_user | bool

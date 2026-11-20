@@ -89,17 +89,48 @@
   loop_control:
     label: "{{ item.name }}"
 
-# The first set-up: the nodes need the fingerprint above before they can show theirs.
-- name: Stop before the driver while a node has no fingerprint
+# The driver's configuration names exactly the nodes that have a pin now. A node without one
+# (not pinned yet, or whose pin the operator emptied to stop trusting it) is left out; a change
+# of the file reloads the host, which drains: the runs in progress finish, on the node left out
+# too, and the host starts again without it.
+- name: Name the nodes left out
+  ansible.builtin.debug:
+    msg: >-
+      Waiting, left out of the driver's configuration until they have a nodeSha256:
+      {{ _tinfirm_runner_host_nodes_unpinned | join(', ') }}. Run sandbox-node.yml on them with the
+      fingerprint above as tinfirm_sandbox_node_client_sha256, set the fingerprint each shows as
+      its nodeSha256, and run this play again.
   when: _tinfirm_runner_host_nodes_unpinned | length > 0
+
+# With no node to trust, nothing runs: a host that runs is stopped (SIGTERM: its runs are
+# cancelled and their work in progress pushed), its driver's file removed, and a new host is
+# not started. The first set-up ends here.
+- name: Stop with no pinned node
+  when: _tinfirm_runner_host_nodes_pinned | length == 0
   block:
-    - name: Say what is missing
+    - name: Look for the runner host's unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/tinfirm-runner-host.service
+        get_checksum: false
+      register: _tinfirm_runner_host_unit_file
+
+    - name: Stop the runner host
+      ansible.builtin.systemd_service:
+        name: tinfirm-runner-host
+        state: stopped
+        enabled: false
+      when: _tinfirm_runner_host_unit_file.stat.exists
+
+    - name: Remove the driver's configuration
+      ansible.builtin.file:
+        path: "{{ _tinfirm_runner_host_node_config }}"
+        state: absent
+
+    - name: Say why the host does not run
       ansible.builtin.debug:
         msg: >-
-          No nodeSha256 yet for {{ _tinfirm_runner_host_nodes_unpinned | join(', ') }}: run
-          sandbox-node.yml with the fingerprint above as tinfirm_sandbox_node_client_sha256, set the
-          fingerprint each node's play shows as its nodeSha256, and run this play again. The runner
-          host is installed and logged in, and not started.
+          No node has a nodeSha256: the runner host is installed and logged in, and does not run
+          (stopped, if it ran). It starts at the first run of this play with a pinned node.
 
     - name: End this host's play
       ansible.builtin.meta: end_host
@@ -114,8 +145,8 @@
   notify: Reload the runner host
 
 # The role's proof: what `run` asks at its start, through the driver itself, as the runner
-# host's user (whose key it is): every node offering the template answers over TLS with the
-# pinned certificates, and names no problem.
+# host's user (whose key it is): every node of the file that offers the template answers over
+# TLS with the pinned certificates, and names no problem.
 - name: Ask every node through the driver
   ansible.builtin.command:
     argv:

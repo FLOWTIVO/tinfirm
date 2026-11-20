@@ -86,7 +86,7 @@ sha256sum tinfirm-vm.img.zst
 
     `tinfirm_sandbox_node_control_host` is the control host's address as the nodes see its connections. Keep `tinfirm_runner_host_max_concurrent_runs` at most the sum of the nodes' `tinfirm_sandbox_node_max_vms`: `run` refuses to start while the nodes have fewer free VMs.
 
-3. **Run the control host's play.** It installs the host without Docker, logs it in, makes its client certificate on the host, and shows its fingerprint. With no node fingerprint yet, it stops before it starts the host:
+3. **Run the control host's play.** It installs the host without Docker, logs it in, makes its client certificate on the host, and shows its fingerprint. With no node fingerprint yet, it stops before it starts the host. It refuses a machine with Docker, containerd or Kata, or whose service user is in the `docker` group ([A machine with Docker](#a-machine-with-docker)):
 
     ```sh
     ansible-playbook -i inventory.yml deploy/ansible/control-host.yml --ask-vault-pass
@@ -98,19 +98,29 @@ sha256sum tinfirm-vm.img.zst
     ansible-playbook -i inventory.yml deploy/ansible/sandbox-node.yml
     ```
 
-5. **Run the control host's play again** with each node's fingerprint as its `nodeSha256`. It asks every node through the driver, as `run` does at its start, and starts the host. The host shows **Online** on its page.
+5. **Run the control host's play again** with each node's fingerprint as its `nodeSha256`. It asks every node through the driver, as `run` does at its start, starts the host, and checks that the host's user reaches no Docker socket. The host shows **Online** on its page.
 
 6. **Run both plays again.** A second run changes nothing.
 
+## Take a node out
+
+The host's driver uses exactly the nodes that had a `nodeSha256` at the last run of the control host's play. To stop trusting a node, empty its `nodeSha256` (or remove the node) and run the play: it rewrites the driver's file without the node and reloads the host, which drains. The runs in progress finish, those on that node too, and the host starts again without it. A node without a fingerprint is named in the play's output as waiting, and a new node waits the same way while the host serves the others. With no node pinned at all, the play stops the host, which cancels its runs.
+
+When the node may have been taken over, do not let its runs finish: after the play, run `sudo systemctl restart tinfirm-runner-host` on the control host, which cancels them at once.
+
 ## Replace a node
 
-1. Take the node out of `tinfirm_runner_host_nodes` and run the control host's play: the host drains, the runs on that node finish, and it starts again without the node.
+1. Empty the node's `nodeSha256` and run the control host's play: the host drains, the runs on that node finish, and it starts again without the node.
 2. Replace the node's image and run the nodes' play on it. It makes a new TLS identity and shows a new fingerprint.
-3. Put the node back with its new `nodeSha256` and run the control host's play. Until then, the driver refuses the node, whose certificate is no longer the pinned one, and the host runs on its other nodes.
+3. Set its new fingerprint as its `nodeSha256` and run the control host's play, which puts the node back. With the old fingerprint, the driver would refuse the node, whose certificate is no longer the pinned one, and the host would run on its other nodes.
 
 If a node may have been taken over, review the branches and artifacts of the runs it served and discard their sessions: what it handed back outlasts it.
 
 To replace the control host's certificate, remove `/etc/tinfirm/node-driver/client.crt` and `client.key` on it, run its play, which shows a new fingerprint and then fails because no node accepts it yet, set that fingerprint on every node, run the nodes' play, and run the control host's play again. No run starts on a node in between.
+
+## A machine with Docker
+
+A control host runs no Docker socket and no hypervisor: its user would otherwise be root on the machine that holds every run's credentials. The control host's play refuses a machine where Docker, containerd or Kata is installed, or where the service user is in the `docker` group, before it changes anything, and does not remove them itself. A Kata runner host is not converted into a control host in place: it becomes a sandbox node with a new image, and the control host runs on another machine ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 7). The runner host that runs on such a machine keeps running with its runs, since the play stops before it touches it: drain it with `sudo systemctl reload tinfirm-runner-host`, wait until it runs again with no run, stop it, and then replace the machine's image.
 
 ## Firewalls
 

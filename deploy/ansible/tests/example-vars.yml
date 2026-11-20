@@ -33,3 +33,8 @@ tinfirm_runner_host_nodes:
     address: 10.0.0.21:7700
     nodeSha256: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
     templates: [sandbox-4c8g]
+  # Not pinned yet, or its pin emptied: the driver's configuration leaves it out.
+  - name: node-3
+    address: 10.0.0.22:7700
+    nodeSha256: ""
+    templates: [sandbox-4c8g]
