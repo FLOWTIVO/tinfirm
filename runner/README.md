@@ -901,10 +901,11 @@ this host's own machine (a single machine, planned).
 **Not ready for use yet.** The node agent's execution (its jail, network, disks and VMM) is built.
 VMs were made, described, listed and deleted on one KVM node through this driver over TLS, driven by
 a script in this host's place ([the evidence](../docs/reviews/2026-11-19-node-agent-execution/README.md);
-[the agent's state](crates/tinfirm-node-agent/README.md#what-is-built-and-what-is-planned)). Still
-planned: the role that sets up a node, the node's own firewall and its hardening, the single machine
-(until its firewall is built, the node agent refuses a control host on its own machine), and the
-published VM image. No conversation has run through a node, and the Helm chart's runner pod has not
+[the agent's state](crates/tinfirm-node-agent/README.md#what-is-built-and-what-is-planned)). The
+Ansible plays that set up a node and a control host are written and have not run on a machine yet
+(`deploy/ansible/README.md`). Still planned: the node's hardening, the single machine (until its
+firewall is built, the node agent refuses a control host on its own machine), and the published VM
+image. No conversation has run through a node, and the Helm chart's runner pod has not
 run against one. Here, the driver is tested against node agents with their fake backend.
 
 - **Editions.** In the core, in every edition: the driver lists no paid feature
