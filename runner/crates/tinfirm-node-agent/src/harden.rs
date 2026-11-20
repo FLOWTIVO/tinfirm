@@ -322,6 +322,22 @@ pub fn perform(root: &Path, steps: &[Step]) -> (Vec<String>, bool) {
     (lines, ok)
 }
 
+/// What was written must read back as set. `again` is the plan made after the writes of
+/// `planned`: for each step that wrote, the same step must now have nothing to do. One line
+/// for each that would write again, and for each whose setting cannot be read back.
+pub fn not_taken(planned: &[Step], again: &[Step]) -> Vec<String> {
+    planned
+        .iter()
+        .zip(again)
+        .filter(|(first, _)| matches!(first, Step::Write { .. }))
+        .filter_map(|(_, second)| match second {
+            Step::Leave(_) => None,
+            Step::Write { says, .. } => Some(format!("did not take: {says}")),
+            Step::Refuse(why) => Some(format!("written, but it cannot be read back: {why}")),
+        })
+        .collect()
+}
+
 /// `tinfirm-node-agent harden`: reads the configuration, plans, writes, and checks that each
 /// write took by planning again. Each line goes to standard output, the unit's journal.
 pub fn harden(root: &Path, config: &HardenConfig) -> Result<()> {
@@ -332,12 +348,9 @@ pub fn harden(root: &Path, config: &HardenConfig) -> Result<()> {
     }
     let wrote = planned.iter().any(|s| matches!(s, Step::Write { .. }));
     if wrote {
-        // What was written must now read back as set: a second plan writes nothing.
-        for step in steps(config, &read_current(root)) {
-            if let Step::Write { says, .. } = step {
-                ok = false;
-                println!("did not take: {says}");
-            }
+        for line in not_taken(&planned, &steps(config, &read_current(root))) {
+            ok = false;
+            println!("{line}");
         }
     }
     if !ok {
@@ -594,6 +607,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_current(root).missing_modules, Ok(vec![]));
+    }
+
+    #[test]
+    fn a_write_that_does_not_read_back_as_set_is_a_failure() {
+        let write = |says: &str| Step::Write {
+            path: KEXEC,
+            value: "1",
+            says: says.into(),
+        };
+        let planned = [
+            write("kexec"),
+            Step::Leave("lockdown".into()),
+            write("modules"),
+        ];
+        // Every write took.
+        let taken = [
+            Step::Leave("a".into()),
+            Step::Leave("b".into()),
+            Step::Leave("c".into()),
+        ];
+        assert_eq!(not_taken(&planned, &taken), Vec::<String>::new());
+        // One would be written again, and one cannot be read any more.
+        let again = [
+            write("kexec is 0: set to 1"),
+            Step::Leave("b".into()),
+            Step::Refuse("kernel.modules_disabled not set: not a number".into()),
+        ];
+        assert_eq!(
+            not_taken(&planned, &again),
+            [
+                "did not take: kexec is 0: set to 1",
+                "written, but it cannot be read back: kernel.modules_disabled not set: not a number",
+            ]
+        );
+        // A step that wrote nothing is not judged here: its own line said what it found.
+        let refused = [
+            Step::Leave("a".into()),
+            Step::Refuse("lockdown not set".into()),
+            Step::Leave("c".into()),
+        ];
+        assert_eq!(not_taken(&planned, &refused), Vec::<String>::new());
     }
 
     #[test]
