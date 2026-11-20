@@ -4,12 +4,7 @@
 
 Tinfirm runs a company's AI agents on the company's own servers. People talk to an agent in Tinfirm, from their own AI client, or in Slack and Microsoft Teams. Triggers start an agent from Jira, GitHub, GitLab, a chat channel, a schedule or a webhook. Each run does a bounded job in a sandbox, and every decision that needs a person comes to one inbox and to the issue where the company already looks.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-inbox-dark.png">
-  <img src="docs/images/readme-inbox.png" alt="The inbox of a member, with three items under Needs you: a review of the Analyst's result before anything is written to the issue SHOP-238, a question of the Tester with two answers to choose from, and an approval of the Developer's comment on SHOP-241, with Approve and Deny" width="1240">
-</picture>
-
-The inbox: what waits for a person, and nothing else. The screenshots show the demo company that the end-to-end tests seed.
+<img src="docs/images/readme-film.gif" alt="A cut from the film about the platform. The line: agents do the work, you make the decisions. Then the inbox under the heading Only what needs a human: a person approves the Developer's pull request on acme/shop and answers the Business analyst's question, and both rows fold into what was decided. Last, three places to decide: in the inbox, on the issue, in Slack or Teams" width="800">
 
 - **No credential in the sandbox.** An agent holds no credentials. A conversation acts with the accounts of the person who started it, and a trigger with the accounts its author chose. The server makes the calls to a tracker, a code host or an MCP server, and proxies on the runner host serve git and the model: no system credential, git token or model key enters the sandbox.
 - **A person decides what matters.** Each tool of an agent is allowed or needs an approval, and a tool that writes needs one until someone allows it. Questions and approvals wait in one inbox, and the hash-chained audit log records what happened.
@@ -25,7 +20,7 @@ The inbox: what waits for a person, and nothing else. The screenshots show the d
 3. **When the agent needs a person, it asks.** Questions and approvals wait in one inbox; a person can also answer on the issue or in the chat thread. The agent then continues with the same context.
 4. **The result goes back where the work started:** a comment, a reply in the thread, a document, a pull request or a transition.
 
-A conversation with an agent is one thread: the person's message, the turn's work, the agent's answer, and the card of what it may not do without a person.
+A conversation with an agent is one thread: the person's message, the turn's work, the agent's answer, and the card of what it may not do without a person. The screenshot shows the demo company that the end-to-end tests seed.
 
 <img src="docs/images/readme-conversation.png" alt="A conversation with the agent Developer about the issue SHOP-241. Under the title, who acts and who pays: GitHub and Jira with the person's own accounts, paid from their budget, run on the host build-01. In the thread, the person's message, a turn that worked for a minute with 8 tool calls, the agent's finding, and an approval card for its comment on the Jira issue, which shows what would run, on which system and as whose account, with Approve and Deny" width="1240">
 
