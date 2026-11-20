@@ -731,14 +731,10 @@ fn label_selector(labels: &BTreeMap<String, String>) -> Result<String, String> {
     }
     let mut parts = Vec::new();
     for (key, value) in labels {
-        let (prefix, name) = match key.split_once('/') {
-            Some((prefix, name)) => (Some(prefix), name),
-            None => (None, key.as_str()),
-        };
-        if prefix.is_some_and(|p| !dns_subdomain(p)) || !label_name(name) {
+        if !label_key(key) {
             return Err(format!("`{key}` is not a label key"));
         }
-        if !value.is_empty() && !label_name(value) {
+        if !label_value(value) {
             return Err(format!("the value of label `{key}` is not a label value"));
         }
         parts.push(format!("{key}={value}"));
@@ -746,9 +742,22 @@ fn label_selector(labels: &BTreeMap<String, String>) -> Result<String, String> {
     Ok(parts.join(","))
 }
 
+/// A label's key: a name, after an optional prefix that is a DNS subdomain and a `/`.
+pub(super) fn label_key(key: &str) -> bool {
+    match key.split_once('/') {
+        Some((prefix, name)) => dns_subdomain(prefix) && label_name(name),
+        None => label_name(key),
+    }
+}
+
+/// A label's value: empty, or as a name.
+pub(super) fn label_value(value: &str) -> bool {
+    value.is_empty() || label_name(value)
+}
+
 /// A label's name or value: at most 63 characters of letters, digits, `-`, `_` and `.`,
 /// starting and ending with a letter or a digit.
-fn label_name(text: &str) -> bool {
+pub(super) fn label_name(text: &str) -> bool {
     let bytes = text.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 63
@@ -761,7 +770,7 @@ fn label_name(text: &str) -> bool {
 
 /// An RFC 1123 label: at most 63 characters of lower-case letters, digits and `-`, starting
 /// and ending with a letter or a digit. A namespace's name.
-fn dns_label(text: &str) -> bool {
+pub(super) fn dns_label(text: &str) -> bool {
     let bytes = text.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 63
@@ -773,7 +782,7 @@ fn dns_label(text: &str) -> bool {
 }
 
 /// An RFC 1123 subdomain: labels joined by `.`, at most 253 characters. An object's name.
-fn dns_subdomain(text: &str) -> bool {
+pub(super) fn dns_subdomain(text: &str) -> bool {
     !text.is_empty() && text.len() <= 253 && text.split('.').all(dns_label)
 }
 
