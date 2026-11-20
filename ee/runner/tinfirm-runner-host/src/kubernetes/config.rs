@@ -403,7 +403,9 @@ impl PodConfig {
     }
 }
 
-/// `repository@sha256:<64 lower-case hex digits>`, with no tag.
+/// `repository@sha256:<64 lower-case hex digits>`, with no tag. The repository is path
+/// components of lower-case letters and digits, with `.`, `_` and `-` between them; where it
+/// has more than one, the first may be a registry's host with a port.
 fn image_by_digest(image: &str) -> bool {
     let Some((repository, digest)) = image.split_once('@') else {
         return false;
@@ -414,17 +416,29 @@ fn image_by_digest(image: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     });
-    let last = repository.rsplit('/').next().unwrap_or_default();
-    hex_ok
-        && !repository.is_empty()
-        && repository.len() <= 255
-        && !last.contains(':')
-        && repository.split('/').all(|part| !part.is_empty())
-        && repository.bytes().all(|b| {
-            b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'.' | b'_' | b'-' | b'/' | b':')
-        })
+    let inner = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let component = |part: &str| {
+        let bytes = part.as_bytes();
+        bytes.first().is_some_and(inner)
+            && bytes.last().is_some_and(inner)
+            && bytes
+                .iter()
+                .all(|b| inner(b) || matches!(b, b'.' | b'_' | b'-'))
+    };
+    let parts: Vec<&str> = repository.split('/').collect();
+    let (first, rest) = parts.split_first().unwrap_or((&"", &[]));
+    // A colon is a registry's port, and a registry is never the whole repository: in the
+    // last component it would be a tag.
+    let first_ok = match first.rsplit_once(':') {
+        Some((host, port)) => {
+            !rest.is_empty()
+                && component(host)
+                && (1..=5).contains(&port.len())
+                && port.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => component(first),
+    };
+    hex_ok && repository.len() <= 255 && first_ok && rest.iter().all(|part| component(part))
 }
 
 fn network_attachment_ok(attachment: &str) -> bool {
@@ -524,6 +538,18 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn an_image_is_a_repository_and_a_digest() {
+        for image in [
+            format!("vm-pod@{DIGEST}"),
+            format!("registry.example.com/vm-pod@{DIGEST}"),
+            format!("registry.example.com:5000/team/sub/vm_pod.x@{DIGEST}"),
+            format!("localhost:5000/vm-pod@{DIGEST}"),
+        ] {
+            assert!(image_by_digest(&image), "{image}");
+        }
+    }
+
+    #[test]
     fn a_good_configuration_loads_with_its_defaults() {
         let config = config(&good());
         assert_eq!(config.run_service_account, "tinfirm-run");
@@ -585,6 +611,37 @@ pub(super) mod tests {
             (
                 "/image",
                 json!("registry.example.com/vm-pod@sha256:abc"),
+                "image",
+            ),
+            (
+                "/image",
+                json!(format!("registry.example.com/-invalid/vm-pod@{DIGEST}")),
+                "image",
+            ),
+            (
+                "/image",
+                json!(format!("registry.example.com/vm-pod-@{DIGEST}")),
+                "image",
+            ),
+            (
+                "/image",
+                json!(format!("registry.example.com//vm-pod@{DIGEST}")),
+                "image",
+            ),
+            (
+                "/image",
+                json!(format!("registry.example.com:port/vm-pod@{DIGEST}")),
+                "image",
+            ),
+            (
+                "/image",
+                json!(format!("registry.example.com/team:5000/vm-pod@{DIGEST}")),
+                "image",
+            ),
+            ("/image", json!(format!("registry:5000@{DIGEST}")), "image"),
+            (
+                "/image",
+                json!(format!("registry.example.com/VM-pod@{DIGEST}")),
                 "image",
             ),
             ("/templates", json!({}), "templates"),
