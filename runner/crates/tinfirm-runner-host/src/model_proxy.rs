@@ -237,6 +237,62 @@ impl ModelEndpoint {
     }
 }
 
+/// A header value as its bytes: HTTP allows any byte but the control bytes (UTF-8 text among
+/// them, as obs-text), so a value is not always text. On a front's wire it is a string whose
+/// characters are the bytes, U+0000 to U+00FF one for one; any other character is not a
+/// header value. Its length is the value's, in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderBytes(pub Vec<u8>);
+
+impl HeaderBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for HeaderBytes {
+    fn from(value: String) -> HeaderBytes {
+        HeaderBytes(value.into_bytes())
+    }
+}
+
+impl From<&str> for HeaderBytes {
+    fn from(value: &str) -> HeaderBytes {
+        HeaderBytes(value.as_bytes().to_vec())
+    }
+}
+
+impl Serialize for HeaderBytes {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let text: String = self.0.iter().map(|&byte| char::from(byte)).collect();
+        serializer.serialize_str(&text)
+    }
+}
+
+impl<'de> Deserialize<'de> for HeaderBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<HeaderBytes, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.chars()
+            .map(|c| u8::try_from(u32::from(c)).ok())
+            .collect::<Option<Vec<u8>>>()
+            .map(HeaderBytes)
+            .ok_or_else(|| serde::de::Error::custom("a header value's character above U+00FF"))
+    }
+}
+
 /// How long a request's body is, as the front half read it from the client's head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,7 +313,7 @@ pub struct RequestHead {
     pub endpoint: ModelEndpoint,
     pub method: String,
     pub query: Option<String>,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, HeaderBytes)>,
     pub length: BodyLength,
 }
 
@@ -306,7 +362,7 @@ impl RequestHead {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResponseHead {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, HeaderBytes)>,
 }
 
 /// Why the front half answered a request itself, for the run's log and counts.
@@ -1024,16 +1080,10 @@ fn request_head(
         if total > MAX_HEADER_BYTES {
             return Err(too_large());
         }
-        let Ok(value) = value.to_str() else {
-            return Err(Box::new((
-                Declined::Head,
-                error(
-                    StatusCode::BAD_REQUEST,
-                    "a request header's value is not text",
-                ),
-            )));
-        };
-        headers.push((name.as_str().to_string(), value.to_string()));
+        headers.push((
+            name.as_str().to_string(),
+            HeaderBytes(value.as_bytes().to_vec()),
+        ));
     }
     let length = match exact {
         Some(0) => BodyLength::Empty,
@@ -1091,7 +1141,7 @@ pub(crate) fn response_from(head: ResponseHead, body: ProxyBody) -> Response<Pro
     for (name, value) in head.headers {
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
+            HeaderValue::from_bytes(value.as_bytes()),
         ) {
             response.headers_mut().append(name, value);
         }
@@ -1099,22 +1149,24 @@ pub(crate) fn response_from(head: ResponseHead, body: ProxyBody) -> Response<Pro
     response
 }
 
-/// The run half's answer as its head and body. A header whose value is not text is dropped,
-/// and so is any after the first [`MAX_RESPONSE_HEADERS`]: a front's wire carries text.
+/// The run half's answer as its head and body: its first [`MAX_RESPONSE_HEADERS`] headers,
+/// byte for byte; the rest are dropped.
 fn response_head(response: Response<ProxyBody>, run_id: Uuid) -> (ResponseHead, ProxyBody) {
     let (parts, body) = response.into_parts();
     let mut headers = Vec::new();
     let mut dropped = 0;
     for (name, value) in &parts.headers {
-        match value.to_str() {
-            Ok(value) if headers.len() < MAX_RESPONSE_HEADERS => {
-                headers.push((name.as_str().to_string(), value.to_string()));
-            }
-            _ => dropped += 1,
+        if headers.len() < MAX_RESPONSE_HEADERS {
+            headers.push((
+                name.as_str().to_string(),
+                HeaderBytes(value.as_bytes().to_vec()),
+            ));
+        } else {
+            dropped += 1;
         }
     }
     if dropped > 0 {
-        tracing::debug!(%run_id, dropped, "model proxy: answer headers that are not text, or too many, are dropped");
+        tracing::debug!(%run_id, dropped, "model proxy: answer headers beyond the bound are dropped");
     }
     (
         ResponseHead {
@@ -1756,9 +1808,10 @@ mod tests {
                                 let mut response = Response::new(body);
                                 *response.status_mut() = reply.status;
                                 for (name, value) in reply.headers {
-                                    response
-                                        .headers_mut()
-                                        .append(name, HeaderValue::from_str(&value).unwrap());
+                                    response.headers_mut().append(
+                                        name,
+                                        HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+                                    );
                                 }
                                 Ok::<_, Infallible>(response)
                             }
@@ -1888,7 +1941,7 @@ mod tests {
         for (name, value) in headers {
             req.headers_mut().append(
                 HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                HeaderValue::from_str(value).unwrap(),
+                HeaderValue::from_bytes(value.as_bytes()).unwrap(),
             );
         }
         let response = sender.send_request(req).await.unwrap();
@@ -3119,6 +3172,32 @@ mod tests {
         nothing_stays(&guard).await;
     }
 
+    async fn header_values_pass_byte_for_byte(mode: Mode) {
+        // UTF-8 text in a value is obs-text to HTTP: allowed, and passed on as it is.
+        const NOTE: &str = "caf\u{e9} \u{fc}ber \u{2603}";
+        let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply {
+            headers: vec![
+                ("content-type", "application/json".into()),
+                ("x-gateway-note", NOTE.into()),
+            ],
+            ..Reply::ok("{}")
+        }))
+        .await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
+        let (status, headers, body) = request(
+            &guard,
+            Method::POST,
+            &format!("{}/v1/messages", base_path(&guard)),
+            &[("x-client-note", NOTE)],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(headers["x-gateway-note"].as_bytes(), NOTE.as_bytes());
+        let seen = gateway.seen();
+        assert_eq!(seen[0].headers["x-client-note"].as_bytes(), NOTE.as_bytes());
+    }
+
     /// The tests of the proxy's traffic, with the front half in this process and in a front.
     macro_rules! in_both {
         ($($name:ident),* $(,)?) => {
@@ -3156,6 +3235,7 @@ mod tests {
         the_gateways_address_is_checked,
         only_the_named_local_gateway_may_be_on_this_machine,
         a_client_that_leaves_costs_nothing_that_stays,
+        header_values_pass_byte_for_byte,
         the_host_token_goes_to_its_server_only_and_never_from_the_sandbox,
         the_host_token_in_the_answer_never_reaches_the_sandbox,
     );

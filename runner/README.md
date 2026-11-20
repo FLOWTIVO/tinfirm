@@ -346,7 +346,7 @@ nothing answers on its port. For a request to `/<run secret>/<path>` it:
 - drops every credential header of the sandbox (`Authorization`, `x-api-key`, `api-key`, `Proxy-Authorization`, `x-litellm-api-key`, `x-goog-api-key`, cookies, `x-tinfirm-runner-token`), the hop-by-hop and forwarding headers, sets `Authorization: Bearer <key>` and, for this host's server only, `x-tinfirm-runner-token: <host token>`, and keeps the rest (`anthropic-version`, `anthropic-beta`, the query);
 - connects to the base URL's origin itself, over https with the system's root certificates, to an address it resolved and checked as the [egress proxy](#egress-proxy) does: loopback, link-local (cloud metadata), reserved and this machine's own addresses are refused, private ones unless `--egress-allow-private`, and loopback and this machine's addresses only for the gateway of `--model-proxy-local-gateway` ([below](#a-gateway-on-this-machine)). It follows no redirect (`502`);
 - streams the answer back as it arrives (SSE), with no total timeout, only an idle one of 10 minutes between two parts; refuses a WebSocket upgrade (`501`); takes request bodies up to 64 MiB and 64 connections per run at once (more wait);
-- takes a request head of at most 64 headers, each name at most 64 bytes and each value at most 8 KiB, 24 KiB in all (`431` above), a query of at most 4 KiB (`414`), and header values that are text (`400` otherwise); passes back at most 100 of the answer's headers, and only those whose values are text;
+- takes a request head of at most 64 headers, each name at most 64 bytes and each value at most 8 KiB, 24 KiB in all (`431` above), and a query of at most 4 KiB (`414`); header values pass byte for byte, UTF-8 text included, and only the bytes HTTP forbids (CR, LF, NUL and the other control bytes) are refused; passes back the first 100 of the answer's headers, byte for byte, and drops the rest;
 - never logs the key or the host's token, and never passes them back: a gateway answer that contains either is cut off (`502` when it is in a header).
 
 **Its two halves.** The part that reads the sandbox's request (the run secret, the path rule,
@@ -859,7 +859,8 @@ not run by hand; `reader.rs`, `confine.rs`).
   - **The model messages.** `run` passes the front the listener's socket with the run secret,
     the format and the base path. For each request the front sends `request` with a request
     number that only grows (shared with `connect`), the endpoint, method, query, headers and
-    length, within the bounds above; `run` answers with `body` and one end of a new pair of
+    length, within the bounds above (a header value travels as a string whose characters are
+    its bytes, U+0000 to U+00FF, and its bounds count those bytes); `run` answers with `body` and one end of a new pair of
     Unix sockets, on which the front writes the request's body and then says `bodyEnd`; then
     `response` with the answer's status and headers, the answer's body on the same socket, and
     `end`, which says whether that body is whole. The front finishes its client's answer only on

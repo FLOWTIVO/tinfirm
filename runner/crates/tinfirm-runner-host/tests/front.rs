@@ -582,6 +582,11 @@ fn hostile_model_front(socket: &std::os::fd::OwnedFd, mode: &str) {
                 .push(("x-injected".into(), "a\r\nhost: elsewhere".into()));
             send(&ToMain::Request { req: 1, head: bad });
         }
+        "model-nul" => {
+            let mut bad = messages.clone();
+            bad.headers.push(("x-injected".into(), "a\0b".into()));
+            send(&ToMain::Request { req: 1, head: bad });
+        }
         "model-headers" => {
             let mut many = messages.clone();
             many.headers = (0..65).map(|i| (format!("x-h{i}"), "v".into())).collect();
@@ -1614,6 +1619,7 @@ async fn a_hostile_front_gets_from_runs_model_proxy_only_what_its_rules_allow() 
     // Requests that break the wire end the front.
     for (mode, why) in [
         ("model-crlf", "a header that HTTP does not allow"),
+        ("model-nul", "a header that HTTP does not allow"),
         ("model-headers", "more than 64 headers"),
         ("model-query", "a query with a byte that no query has"),
         ("model-order", "a request 3 after 5"),

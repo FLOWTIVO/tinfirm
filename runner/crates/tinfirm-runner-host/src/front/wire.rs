@@ -474,7 +474,7 @@ mod tests {
         many.headers = (0..65).map(|i| (format!("x-h{i}"), "v".into())).collect();
         bad.push(many);
         let mut long = head.clone();
-        long.headers = vec![("x-a".into(), "v".repeat(8 * 1024 + 1))];
+        long.headers = vec![("x-a".into(), "v".repeat(8 * 1024 + 1).into())];
         bad.push(long);
         let mut name = head.clone();
         name.headers = vec![("x a".into(), "v".into())];
