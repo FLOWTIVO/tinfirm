@@ -33,6 +33,8 @@ libc.workspace = true
 # free space, and a signal to a tool's process group (`src/linux.rs`). Already in the
 # workspace, for the runner host.
 rustix = { workspace = true, features = ["thread", "fs", "process", "mount"] }
+# The binary's allocator, which overwrites what is freed (`src/main.rs`).
+zeroizing-alloc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

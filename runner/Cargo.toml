@@ -64,6 +64,12 @@ libc = "0.2"
 landlock = "0.4.7"
 seccompiler = "0.5.0"
 rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "net"] }
+# The node agent's allocator (ADR-0112; threat model, 19.7): it overwrites every block with
+# zeros when the block is freed, so that a VM's one-time ticket that passed through a buffer of
+# the TLS library or of the JSON parser does not stay in freed memory. 1Password's wrapper of
+# the system allocator: about 100 lines, no dependency. The workspace's `unsafe_code` rule keeps
+# such code out of our own.
+zeroizing-alloc = "0.1.1"
 
 jsonschema = { version = "0.61", default-features = false }
 tempfile = "3.27"
