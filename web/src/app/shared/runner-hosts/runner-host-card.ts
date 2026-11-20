@@ -25,6 +25,7 @@ import {
   poolZone,
 } from './pool-view';
 import { isolationLines } from './isolation-view';
+import { HOST_PROBLEM_LABELS } from './runner-host-view';
 
 /**
  * One runner host as a sheet (package 2): online or offline and since when, draining, its version
@@ -33,7 +34,8 @@ import { isolationLines } from './isolation-view';
  * and whether the host confirmed it), for a company host that keeps ready sandboxes its pool
  * (ADR-0099: the count now and next, the week, the host's last report), and for a personal host
  * the subscriptions it reported. Its page saves a capacity, edits the pool's schedule and confirms
- * a removal; the card only asks.
+ * a removal; the card only asks. A host that reports that it takes no run (ADR-0117) says so
+ * beside "Online", with its problems in its own words and since when.
  */
 @Component({
   selector: 'app-runner-host-card',
@@ -81,6 +83,13 @@ import { isolationLines } from './isolation-view';
               >Draining</span
             >
           }
+          @if (h.problems?.length) {
+            <span
+              class="border-warning/40 bg-warning/10 text-warning inline-flex h-6 items-center rounded-full border px-2.5 text-xs font-semibold"
+              data-testid="host-unhealthy"
+              >Takes no runs</span
+            >
+          }
         </div>
         @if (meta(); as m) {
           <p class="text-muted-foreground font-mono text-xs break-all">{{ m }}</p>
@@ -102,6 +111,30 @@ import { isolationLines } from './isolation-view';
         </button>
       }
     </div>
+
+    @if (h.problems?.length) {
+      <section
+        class="flex flex-col gap-1 border-t px-4 py-3"
+        data-testid="host-problems"
+        [attr.aria-labelledby]="'host-problems-' + h.id"
+      >
+        <h4 class="text-sm font-semibold" [id]="'host-problems-' + h.id">Why it takes no runs</h4>
+        <ul class="flex flex-col gap-1">
+          @for (p of h.problems; track $index) {
+            <li class="flex flex-col text-sm" data-testid="host-problem">
+              <span>{{ problemLabels[p.code] ?? p.code }}</span>
+              <span class="text-muted-foreground font-mono text-xs break-all">{{ p.message }}</span>
+            </li>
+          }
+        </ul>
+        <p class="text-muted-foreground text-xs text-pretty" data-testid="host-problems-since">
+          @if (h.problemsSince) {
+            Since <app-time [value]="h.problemsSince" />, as the host reports.
+          }
+          Turns that only this host may run wait until it reports that it takes runs again.
+        </p>
+      </section>
+    }
 
     @if (isolation(); as iso) {
       <section
@@ -358,6 +391,8 @@ export class RunnerHostCard {
   /** What the host reports about its isolation (ADR-0113), as reported; null before its first report. */
   protected readonly isolation = computed(() => isolationLines(this.host().isolation));
 
+  /** What a problem a host reports means (ADR-0117); its own words follow, as text. */
+  protected readonly problemLabels = HOST_PROBLEM_LABELS;
   protected readonly kindLabels = SUBSCRIPTION_KIND_LABELS;
   protected readonly statusLabels = SUBSCRIPTION_STATUS_LABELS;
   protected readonly statusTones = SUBSCRIPTION_STATUS_TONES;

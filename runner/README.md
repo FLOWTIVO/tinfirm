@@ -951,15 +951,21 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 - **A driver that can make no VM.** After a `create` that fails, this host asks the driver's
   `verify`. Only an answer with problems and no room (`maxVms` 0), such as a node whose firewall
   table is missing, stops it from taking runs: it rejects each new run with `NO_FREE_SLOT` and a
-  reason that names the cause ("the VM driver can make no VM now (…)"), so the run waits in the
-  server's queue with that reason, and the server dispatches it again later. This host asks `verify`
+  reason that names the cause ("the VM driver can make no VM now (…)"). This host asks `verify`
   again before a rejection (at most every 5 s) and on its own every 30 s, and takes runs again once
   the answer is clean or a create succeeds. A clean answer after a failed create leaves the host as
   it was: the failure was the VM's own. A `verify` that fails or does not answer changes nothing.
   A run's admission, and the report of the run whose create failed, wait at most 5 s for `verify`;
   a slower answer is used when it comes. Its log has one warning when it stops taking runs and one
-  line when it takes them again. The host's page still shows its slots free meanwhile: the runner
-  protocol has no frame for such a state.
+  line when it takes them again. With a server that lists the feature `host.health`
+  ([ADR-0117](../docs/adr/0117-a-host-reports-that-it-can-take-no-run.md)) the host also tells
+  the server: `host.health` with the problem `VM_DRIVER_NO_VM` and the cause when the state
+  begins, again when the cause changes and after each reconnect while it holds, and once without
+  a problem when it ends; at most one frame every 5 s. The server then sends it no run, the host's
+  card says **Takes no runs** and why, and the waiting runs start as soon as the host takes runs
+  again. With an older server the host sends nothing: the runs wait in the server's queue with
+  the rejection's reason, and the server tries each again later, waiting longer after each
+  rejection by the same host (up to 5 minutes by default).
 - **The VM image's build.** The VM image holds its own copy of this binary, which runs the bridge and
   built the runner images there. When a VM's bridge connects, it names that build (the version and a
   digest of the images' definitions, such as `1.0.0+images.1a2b3c4d5e6f`), and this host compares it
@@ -1317,8 +1323,11 @@ The host speaks one runner protocol version per connection and names it in
   ([Steering](#steering-protocol-v2)), `session.bundle`
   ([Session bundles](#session-bundles-protocol-v2)), `run.git.revoke`
   ([Revoked git tokens](#revoked-git-tokens-protocol-v2)), `run.git.refresh`
-  ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)) and, with Docker or a VM per run,
-  `run.skills` ([Skills](#skills-protocol-v2)); a v1 host lists nothing.
+  ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)), with Docker or a VM per run,
+  `run.skills` ([Skills](#skills-protocol-v2)), and with a VM per run `host.health`
+  ([A driver that can make no VM](#a-vm-per-run)); a v1 host lists nothing. A feature that the host
+  sends frames for, as `host.health`, is used only with a server that lists it in
+  `welcome.features`.
 - **Per-kind waits.** A `run.request` of kind `ASK`, `ACCESS`, `NETWORK`, `ARTIFACT` or `GIT_TOKEN` waits 30 s for
   its ack (as the v1 pairs do); a `TOOL` request waits 65 s, the server's tool timeout
   (60 s by default) plus 5 s. A request that still waits when the connection is lost is sent
@@ -1340,7 +1349,7 @@ Three numbers, each moved by something else
 
 **This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
 It uses the features `run.steer`, `run.skills`, `session.bundle`, `run.git.revoke`, `run.git.refresh`,
-`sandbox.bridge`, `sandbox.pool` and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
+`host.health`, `sandbox.bridge`, `sandbox.pool` and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
 [ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). A host that lists none of them
 still takes turns; it only misses what they add.
 

@@ -7,6 +7,13 @@ describe('a runner host’s turns', () => {
     ['online', {}, true],
     ['offline', { online: false }, false],
     ['draining', { draining: true }, false],
+    // ADR-0117: a host that reports a problem takes none.
+    [
+      'reporting a problem',
+      { problems: [{ code: 'VM_DRIVER_NO_VM', message: 'the table is missing' }] },
+      false,
+    ],
+    ['reporting no problem', { problems: [] }, true],
     // Its version decides nothing, low or high (ADR-0109).
     ['online with runner 0.0.1', { version: '0.0.1' }, true],
     ['online with runner 9.9.9', { version: '9.9.9' }, true],

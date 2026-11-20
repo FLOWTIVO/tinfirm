@@ -136,6 +136,21 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
         return of(QueueReasonCode.RUNNER_HOST_DRAINING).withHost(host.id(), host.name());
     }
 
+    /**
+     * ADR-0117: the one host that may take the run reports that it takes no run: its first problem's code in
+     * {@code reason}, the host's words in {@code message}.
+     */
+    static QueueReason hostUnhealthy(RunnerHostInfo host, RunnerMessages.HostProblem problem) {
+        return of(QueueReasonCode.RUNNER_HOST_UNHEALTHY).withHost(host.id(), host.name()).withReason(problem.code())
+            .withMessage(problem.message());
+    }
+
+    /** ADR-0117: each of the {@code hosts} hosts that may take the run reports that it takes no run. */
+    static QueueReason hostsUnhealthy(int hosts) {
+        return of(QueueReasonCode.RUNNER_HOST_UNHEALTHY).withMessage("None of the " + hosts + " runner hosts that "
+                + "may run this conversation can take a run now: each reports a problem.");
+    }
+
     static QueueReason poolFull(RunnerHostInfo host, String label, int used, int limit) {
         return of(QueueReasonCode.CREDENTIAL_POOL_FULL).withHost(host.id(), host.name()).withLabel(label)
             .withUsage(used, limit);
@@ -279,6 +294,12 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
                     + (runtime != null ? runtime.name() : "of the agent") + ".";
             case RUNNER_HOST_OFFLINE -> "Runner host " + runnerHostName + " is offline.";
             case RUNNER_HOST_DRAINING -> "Runner host " + runnerHostName + " is finishing its runs before it restarts.";
+            // The host's own words, cut and on one line: shown as text, never interpreted.
+            case RUNNER_HOST_UNHEALTHY -> runnerHostName == null
+                    ? message != null ? message : "No runner host that may run this conversation can take a run now."
+                    : message == null ? "Runner host " + runnerHostName + " can take no run."
+                    : "Runner host " + runnerHostName + " can take no run: " + message
+                            + (message.endsWith(".") ? "" : ".");
             case CREDENTIAL_POOL_FULL -> "Waiting for a free slot of the subscription " + credentialLabel + " (" + used
                     + " of " + limit + " in use).";
             case RUNNER_HOST_FULL -> "Waiting for a free slot on "

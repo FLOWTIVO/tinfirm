@@ -256,6 +256,14 @@ Two limits must each have a free slot before a run starts: the host's slots and,
 
 The host uses the lower of **Runs at a time** and its ceiling, or the ceiling when nothing is set: Tinfirm can lower use, never raise it. A change in Tinfirm applies at once, without a restart, and fewer slots never stop a running turn: the host takes no new one until fewer run. A new ceiling needs a new start of `run`. Start hosts with generous ceilings, such as `--max-concurrent-runs 8`, and lower the number in Tinfirm. Size the machine for its ceiling: each run may use 4 GiB of memory and 2 CPUs.
 
+## A host that takes no runs
+
+A host with a VM per run whose driver can make no VM (its `verify` reports problems and no free room, for example a sandbox node whose firewall table is missing) takes no runs until the driver can again. It says so to the server, and its card shows **Takes no runs** beside **Online**, with a section **Why it takes no runs**: what the problem means ("Its VM driver can make no VM"), the host's own words, and since when. Turns that only this host may run wait, and their reason names the host and its problem. Tinfirm sends the host no run, and spends no audit event, token or new epoch on them, until it reports that it takes runs again; then they start at once. The company's audit has one `runner_host.health_failed` event when the host stops taking runs and one `runner_host.health_restored` when it starts again.
+
+Fix the cause on the host's side (the driver's log, `tinfirm-runner-host doctor`, the node). The host checks its driver again every 30 seconds by itself. A disconnect, or a restart of the server, clears the card: the host says it again after it reconnects, as long as the problem holds.
+
+A host of an older release does not report this: it rejects each run instead, and the run waits **Tries again** in its reason. Each further rejection of a run by the same host doubles the wait, up to five minutes (`TINFIRM_RUN_REJECT_BACKOFF_MAX`), so such a host costs one attempt per run every five minutes.
+
 ## Drain and upgrade
 
 A **drain** lets the active runs finish instead of cancelling them:

@@ -443,6 +443,7 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                 .credentialStatus(host, (Set<String>) session.getAttributes().getOrDefault(LABELS, Set.of()), status)
                 .ifPresent(error -> registry.sendTo(out, error));
             case RunnerMessages.HostConfigApplied applied -> applied(out, host, applied);
+            case RunnerMessages.HostHealth health -> health(session, out, host, health);
             case RunnerMessages.HostPoolStatus status -> {
                 // Only a company host keeps ready sandboxes (ADR-0099), and only one whose hello listed the feature.
                 if (!host.personal() && registry.supports(host.runnerHostId(), RunnerMessages.FEATURE_SANDBOX_POOL)) {
@@ -496,6 +497,55 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
             }
             case RunnerMessages.ProtocolError error -> log.warn("Runner host {} reported error {}: {}",
                     host.machineId(), abbreviate(error.code()), abbreviate(error.message()));
+        }
+    }
+
+    /**
+     * ADR-0117: a host's report of its health, kept with its connection. A host whose hello did not list the feature is
+     * answered {@code BAD_MESSAGE}, one over the flood bound {@code TOO_MANY_REQUESTS}; neither is applied. A change
+     * from no problem to a problem, and back, is audited and tells each company the host is in, whose runs that waited
+     * for it are placed again.
+     */
+    private void health(WebSocketSession session, WebSocketSession out, ConnectedHost host,
+            RunnerMessages.HostHealth health) {
+        if (!registry.supports(host.runnerHostId(), RunnerMessages.FEATURE_HOST_HEALTH)) {
+            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.BAD_MESSAGE,
+                    "host.health needs a host that lists the feature host.health in hello"));
+            return;
+        }
+        RunnerConnectionRegistry.HealthReport report = registry.reportHealth(host.machineId(), session.getId(),
+                health);
+        switch (report.outcome()) {
+            case TOO_MANY -> registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.TOO_MANY_REQUESTS,
+                    "This runner host sends host.health more often than the server takes (12 a minute); the server "
+                            + "keeps the state it took last."));
+            case SAME -> {
+            }
+            case CHANGED -> {
+                boolean wasUnhealthy = report.before().unhealthy();
+                boolean unhealthy = report.after().unhealthy();
+                log.info("Runner host {} reports {}", host.machineId(), unhealthy
+                        ? "that it takes no run: " + report.after().problems().stream()
+                            .map(problem -> problem.code() + " " + abbreviate(problem.message()))
+                            .toList()
+                        : "that it takes runs again");
+                if (wasUnhealthy == unhealthy) {
+                    // Other problems than before: the page shows them; nothing else changes.
+                    return;
+                }
+                sessions.auditHealth(host, report.after());
+                for (ConnectedHost placed : host.placements()) {
+                    try {
+                        SystemContext.runInCompany(placed.company(),
+                                () -> listener().hostHealthChanged(placed, !unhealthy));
+                    }
+                    catch (RuntimeException ex) {
+                        // The dispatcher's next pass places the runs anyway; the health is kept.
+                        log.warn("Placing the runs of runner host {} again in company {} failed", host.machineId(),
+                                placed.company(), ex);
+                    }
+                }
+            }
         }
     }
 

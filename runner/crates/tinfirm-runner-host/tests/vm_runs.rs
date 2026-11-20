@@ -1208,3 +1208,173 @@ async fn a_no_vm_answer_older_than_a_vm_that_was_made_does_not_stop_the_host() {
     })
     .await;
 }
+
+/// A run of protocol 2, as a host that lists `host.health` speaks it.
+fn v2_spec() -> AssignSpec<'static> {
+    let mut spec = AssignSpec::new("bridge-env", None);
+    spec.protocol_version = 2;
+    spec
+}
+
+/// A host of protocol 2 with a VM per run.
+fn v2_vm(options: tinfirm_runner_host::vm::VmOptions) -> HostSetup {
+    let mut setup = HostSetup::vm_with(options);
+    setup.protocol_version = 2;
+    setup
+}
+
+/// Breaks the fake driver with `cause` and runs one assignment, whose create fails: the host
+/// then knows that its driver can make no VM.
+async fn break_the_driver(conn: &mut Conn, broken: &std::path::Path, cause: &str) {
+    std::fs::write(broken, json!([cause]).to_string()).unwrap();
+    let first = v2_spec();
+    conn.send(first.to_json());
+    // Taken alone: the run's other frames stay, and so does a `host.health` among them.
+    let finished = conn.take_run("run.finished", first.run_id).await;
+    assert_eq!(finished["outcome"], "FAILED", "{finished}");
+}
+
+/// The next `host.health`, checked against the schema.
+async fn next_health(conn: &mut Conn) -> Value {
+    let frame = conn.take("host.health").await;
+    assert_schema_valid_version(&frame, 2);
+    frame
+}
+
+/// No `host.health` within `wait`.
+async fn no_health(conn: &mut Conn, wait: Duration) {
+    if let Ok(frame) = tokio::time::timeout(wait, conn.take("host.health")).await {
+        panic!("unexpected {frame}");
+    }
+}
+
+/// ADR-0117: a host with a VM per run lists `host.health`, and tells a server that lists it
+/// when its driver can make no VM, when the cause changes, after a reconnect while the state
+/// holds (once the server's answer to the hello is complete), and once when it takes runs
+/// again; nothing more while it is healthy. It still rejects a run that comes meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_whose_driver_can_make_no_vm_says_so_to_a_server_that_takes_host_health() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let broken = dir.path().join("broken");
+        let broken_path = broken.to_string_lossy().into_owned();
+        let mut options = vm_options(&log, &[("FAKE_VM_BROKEN", &broken_path)]);
+        options.recheck = Duration::from_millis(200);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, v2_vm(options)).await;
+        let mut conn = server.accept().await;
+        let hello = conn.handshake_listing(1, &["host.health"]).await;
+        assert!(
+            hello["features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("host.health")),
+            "{hello}"
+        );
+        // Healthy, and never otherwise on this connection: nothing.
+        no_health(&mut conn, Duration::from_millis(500)).await;
+
+        break_the_driver(
+            &mut conn,
+            &broken,
+            "node node-1: the firewall table is missing",
+        )
+        .await;
+        let unhealthy = next_health(&mut conn).await;
+        assert_eq!(
+            unhealthy["problems"][0]["code"], "VM_DRIVER_NO_VM",
+            "{unhealthy}"
+        );
+        let message = unhealthy["problems"][0]["message"].as_str().unwrap();
+        assert!(
+            message.contains("the firewall table is missing"),
+            "{message}"
+        );
+        assert!(unhealthy["since"].is_string(), "{unhealthy}");
+        let since = unhealthy["since"].clone();
+        // A run that still comes is rejected, as before.
+        let spec = v2_spec();
+        conn.send(spec.to_json());
+        let rejected = conn.take_run("run.rejected", spec.run_id).await;
+        assert_eq!(rejected["code"], "NO_FREE_SLOT", "{rejected}");
+
+        // Another cause: one frame with it, at least 5 s after the last, with the same start.
+        let changed_at = std::time::Instant::now();
+        std::fs::write(
+            &broken,
+            json!(["node node-1: the disk is full"]).to_string(),
+        )
+        .unwrap();
+        let changed = next_health(&mut conn).await;
+        let message = changed["problems"][0]["message"].as_str().unwrap();
+        assert!(message.contains("the disk is full"), "{message}");
+        assert_eq!(changed["since"], since);
+        assert!(changed_at.elapsed() < Duration::from_secs(10));
+
+        // A new connection starts healthy on the server's side: the host says it again, once
+        // the server's answer to the hello is complete (`welcome.done` from a server that
+        // lists `run.git.revoke`).
+        conn.kill();
+        while conn.next().await.is_some() {}
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, &["run.git.revoke", "host.health"])
+            .await;
+        no_health(&mut conn, Duration::from_millis(500)).await;
+        conn.send(json!({"type": "welcome.done"}));
+        let again = next_health(&mut conn).await;
+        assert_eq!(again["problems"][0]["code"], "VM_DRIVER_NO_VM", "{again}");
+        assert!(
+            again["problems"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("the disk is full"),
+            "{again}"
+        );
+
+        // Fixed: one frame without problems, then nothing more.
+        std::fs::remove_file(&broken).unwrap();
+        let healthy = next_health(&mut conn).await;
+        assert_eq!(healthy["problems"], json!([]), "{healthy}");
+        assert!(healthy.get("since").is_none(), "{healthy}");
+        no_health(&mut conn, Duration::from_secs(6)).await;
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// ADR-0117: a server that does not list `host.health` in `welcome.features` (an older one)
+/// gets no `host.health`: the host rejects the runs, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_without_host_health_gets_no_health_frame() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let broken = dir.path().join("broken");
+        let broken_path = broken.to_string_lossy().into_owned();
+        let mut options = vm_options(&log, &[("FAKE_VM_BROKEN", &broken_path)]);
+        options.recheck = Duration::from_millis(200);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, v2_vm(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, &["run.git.revoke", "run.git.refresh"])
+            .await;
+        conn.send(json!({"type": "welcome.done"}));
+        break_the_driver(
+            &mut conn,
+            &broken,
+            "node node-1: the firewall table is missing",
+        )
+        .await;
+        let spec = v2_spec();
+        conn.send(spec.to_json());
+        let rejected = conn.take_run("run.rejected", spec.run_id).await;
+        assert_eq!(rejected["code"], "NO_FREE_SLOT", "{rejected}");
+        std::fs::remove_file(&broken).unwrap();
+        no_health(&mut conn, Duration::from_secs(2)).await;
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}

@@ -201,6 +201,7 @@ export const WAITING_TEXTS: Record<QueueReasonCode, string> = {
   NO_HOST_OF_LEVEL: 'No runner host reports the level of isolation chosen for its agent.',
   RUNNER_HOST_OFFLINE: 'Its runner host is offline.',
   RUNNER_HOST_DRAINING: 'Its runner host is restarting.',
+  RUNNER_HOST_UNHEALTHY: 'Its runner host reports that it can take no run now.',
   CREDENTIAL_POOL_FULL: 'Its subscription is busy with other turns.',
   RUNNER_HOST_FULL: 'Every slot of the runner host is in use.',
   PREVIOUS_RUN_ACTIVE: 'The host still finishes an earlier turn of it.',

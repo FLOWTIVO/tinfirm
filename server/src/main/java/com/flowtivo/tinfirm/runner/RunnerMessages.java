@@ -205,6 +205,27 @@ public final class RunnerMessages {
      */
     public static final String FEATURE_RUN_GIT_REFRESH = "run.git.refresh";
 
+    /**
+     * The optional feature of protocol 2 whose host reports with {@link HostHealth} that it can take no run, and when it
+     * can again (ADR-0117). The server lists it in {@code welcome.features}; a host sends the frame only then.
+     */
+    public static final String FEATURE_HOST_HEALTH = "host.health";
+
+    /** The most problems one {@link HostHealth} names ({@code $defs/HostHealth.problems}). */
+    public static final int MAX_HOST_PROBLEMS = 8;
+
+    /** The longest {@code host.health.problems[].message}, in characters. */
+    public static final int MAX_HOST_PROBLEM_MESSAGE = 1000;
+
+    /**
+     * The codes of {@code host.health.problems[]}, a closed list (ADR-0117, decision 2): {@code VM_DRIVER_NO_VM}, the
+     * host's VM driver can make no VM.
+     */
+    public static final String HOST_PROBLEM_CODES = "^(VM_DRIVER_NO_VM)$";
+
+    /** One line of text: no control character of ASCII ({@code $defs/HostProblem.message}). */
+    private static final String ONE_LINE = "^[^\\x00-\\x1F\\x7F]*$";
+
     /** The most repositories one {@link RunGitRevoke} names ({@code $defs/RunGitRevoke.componentIds}). */
     public static final int MAX_GIT_REVOKE_COMPONENTS = 20;
 
@@ -267,6 +288,7 @@ public final class RunnerMessages {
             @JsonSubTypes.Type(value = HostConfig.class, name = "host.config"),
             @JsonSubTypes.Type(value = HostConfigApplied.class, name = "host.config.applied"),
             @JsonSubTypes.Type(value = HostPoolStatus.class, name = "host.pool.status"),
+            @JsonSubTypes.Type(value = HostHealth.class, name = "host.health"),
             @JsonSubTypes.Type(value = PslUpdate.class, name = "psl.update"),
             @JsonSubTypes.Type(value = ProtocolError.class, name = "error") })
     public sealed interface Message {
@@ -431,7 +453,7 @@ public final class RunnerMessages {
     /** Every optional feature of protocol 2 this server implements, as {@code welcome.features} names them. */
     public static final List<String> SERVER_FEATURES = List.of(FEATURE_RUN_STEER, FEATURE_RUN_SKILLS,
             FEATURE_SESSION_BUNDLE, FEATURE_SANDBOX_POOL, FEATURE_SANDBOX_BRIDGE, FEATURE_SANDBOX_ELASTIC,
-            FEATURE_RUN_GIT_REVOKE, FEATURE_RUN_GIT_REFRESH);
+            FEATURE_RUN_GIT_REVOKE, FEATURE_RUN_GIT_REFRESH, FEATURE_HOST_HEALTH);
 
     // ---- run.assign --------------------------------------------------------------------------------------------
 
@@ -1341,6 +1363,41 @@ public final class RunnerMessages {
     public record HostPoolStatus(@NotNull @Min(0) @Max(1024) Integer ready, @NotNull @Min(0) @Max(1024) Integer starting,
             @NotNull @Min(0) @Max(1024) Integer busy, @Nullable @Min(0) Long coldStartP90Seconds,
             @NotNull @Min(0) Integer servedReady, @NotNull @Min(0) Integer servedCold) implements Inbound {
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_HOST_HEALTH} (ADR-0117), host to server: why the host takes no run now; an empty
+     * list, that it takes runs again. The server keeps it with the connection; it answers nothing.
+     *
+     * @param since when the host's current problems began, by its clock (RFC 3339); null with none
+     */
+    public record HostHealth(@NotNull @Size(max = MAX_HOST_PROBLEMS) List<@NotNull @Valid HostProblem> problems,
+            @Nullable String since) implements Inbound {
+
+        public HostHealth {
+            problems = problems != null ? List.copyOf(problems) : null;
+        }
+
+        /** {@code since} as an instant; null when absent or unreadable, which costs only the page's "since". */
+        public @Nullable Instant sinceInstant() {
+            if (since == null) {
+                return null;
+            }
+            try {
+                return OffsetDateTime.parse(since).toInstant();
+            }
+            catch (DateTimeParseException ex) {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * One reason why a host takes no run: a code of {@link #HOST_PROBLEM_CODES}, and the host's own words on one line,
+     * shown to people as text and never interpreted.
+     */
+    public record HostProblem(@NotNull @Pattern(regexp = HOST_PROBLEM_CODES) String code,
+            @NotNull @Size(min = 1, max = MAX_HOST_PROBLEM_MESSAGE) @Pattern(regexp = ONE_LINE) String message) {
     }
 
     /** The effective pool of one credential of {@code hello}, with its ceiling. */

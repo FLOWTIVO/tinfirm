@@ -24,6 +24,7 @@ import com.flowtivo.tinfirm.principal.Principals;
 import com.flowtivo.tinfirm.runner.Hardening;
 import com.flowtivo.tinfirm.runner.HostCredentialInfo;
 import com.flowtivo.tinfirm.runner.HostScope;
+import com.flowtivo.tinfirm.runner.RunnerConnections;
 import com.flowtivo.tinfirm.runner.Isolation;
 import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerActivity;
@@ -447,6 +448,7 @@ class RunnerHostService {
                 : Map.of();
         return hosts.stream().map(host -> {
             boolean online = connections.isConnected(host.id());
+            RunnerConnections.Health health = online ? connections.health(host.id()) : RunnerConnections.Health.NONE;
             UUID owner = host.ownerPrincipalId();
             List<RunnerViews.CredentialDetails> hostCredentials = credentials.getOrDefault(host.id(), List.of())
                 .stream()
@@ -462,7 +464,11 @@ class RunnerHostService {
                     host.maxConcurrentRuns(), host.maxConcurrentRunsCeiling(), host.desiredMaxConcurrentRuns(),
                     host.configPending(), activeRuns.getOrDefault(host.id(), 0), hostCredentials, host.createdAt(),
                     host.scope() == HostScope.COMPANY ? poolDetails.get(host.id()) : null,
-                    isolationView(host.isolation()));
+                    isolationView(host.isolation()),
+                    health.unhealthy() ? health.problems().stream()
+                        .map(problem -> new RunnerViews.ProblemView(problem.code(), problem.message()))
+                        .toList() : null,
+                    health.since());
         }).toList();
     }
 

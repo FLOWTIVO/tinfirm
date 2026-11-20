@@ -11105,7 +11105,31 @@ components:
             What the host reported about its isolation at its latest hello (ADR-0113), stored and shown as reported:
             the server checks none of it. Absent before the host's first hello to a server of this release; such a
             host is placed as `CONTAINER`.
+        problems:
+          type: array
+          maxItems: 8
+          items: { $ref: '#/components/schemas/RunnerHostProblem' }
+          description: |
+            ADR-0117: why the connected host takes no run, as its `host.health` said; it gets no run while any is
+            listed. Absent while the host takes runs, or is offline: the server keeps them with the host's connection,
+            so a disconnect or a restart of the server forgets them.
+        problemsSince:
+          type: string
+          format: date-time
+          description: With `problems`, when the host says they began (never later than the server heard of them)
         createdAt: { type: string, format: date-time }
+    RunnerHostProblem:
+      type: object
+      description: |
+        One reason why a runner host takes no run (ADR-0117). `message` is the host's own text, one line of at most
+        1000 characters: shown as text, never interpreted.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [VM_DRIVER_NO_VM]
+          description: "VM_DRIVER_NO_VM: the host's VM driver can make no VM (its verify reports problems and no room)"
+        message: { type: string, maxLength: 1000 }
     RunnerHostIsolation:
       type: object
       description: |
@@ -11344,7 +11368,9 @@ components:
         access module's refusal, such as PRINCIPAL_INACTIVE or SUBSCRIPTION_GONE); NO_HOST_FOR_CREDENTIALS (the
         company has hosts for the runtime, but none may carry the run's credentials), NO_RUNNER_HOST, NO_HOST_OF_LEVEL
         (ADR-0113: no host that may run the conversation reports the level of isolation chosen for its agent,
-        `isolationLevel`), RUNNER_HOST_OFFLINE and RUNNER_HOST_DRAINING; CREDENTIAL_POOL_FULL (a subscription's pool) and
+        `isolationLevel`), RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING and RUNNER_HOST_UNHEALTHY (ADR-0117: the hosts
+        that may run it report that they take no run; of one host, its name, its first problem's code in `reason`
+        and the host's words in `message`); CREDENTIAL_POOL_FULL (a subscription's pool) and
         RUNNER_HOST_FULL. ASSIGNED: sent to the host, waiting for it to accept. PREVIOUS_RUN_ACTIVE and
         RUNNER_HOST_REJECTED: the host rejected the run, which waits until `retryAt`. TRIGGER_PAUSED (package 4): the
         conversation's trigger is paused, and its turns wait until it is resumed. NO_HOST_FOR_SKILLS (ADR-0064): the
@@ -11355,7 +11381,7 @@ components:
         RETRY_SCHEDULED (ADR-0073), before every check: an automatic retry of a turn that failed for a reason that may
         pass waits until `retryAt`, the `used`th of at most `limit` in a row (`AgentSettings.autoRetry`).
         OTHER: anything else, in `message`.
-      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, NO_HOST_FOR_APP_TOKENS, RETRY_SCHEDULED, OTHER]
+      enum: [COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE, MODEL_ACCESS_UNAVAILABLE, NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, RUNNER_HOST_UNHEALTHY, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL, PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, NO_HOST_FOR_APP_TOKENS, RETRY_SCHEDULED, OTHER]
     QueueReason:
       type: object
       description: |
@@ -11381,7 +11407,7 @@ components:
         limit: { type: integer, format: int32, nullable: true, description: "CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL: the limit applied; RETRY_SCHEDULED: how many automatic retries there are at most in a row" }
         lastSeenAt: { type: string, format: date-time, nullable: true, description: When an offline host was last connected }
         retryAt: { type: string, format: date-time, nullable: true, description: "BUDGET_SPENT (when the budget resets), RUNNER_HOST_REJECTED, PREVIOUS_RUN_ACTIVE, RETRY_SCHEDULED: the earliest time it goes on" }
-        reason: { type: string, nullable: true, description: "MODEL_ACCESS_UNAVAILABLE: the model access module's reason" }
+        reason: { type: string, nullable: true, description: "MODEL_ACCESS_UNAVAILABLE: the model access module's reason; RUNNER_HOST_UNHEALTHY: the host's problem code" }
         rejectCode: { type: string, nullable: true, description: "RUNNER_HOST_REJECTED: the host's code" }
         message: { type: string, nullable: true, description: Text from the runner host or the server; never a secret }
         runtime: { type: string, nullable: true, enum: [CLAUDE_CODE, CODEX, PI, OPENCODE] }

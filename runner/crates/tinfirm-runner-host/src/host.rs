@@ -410,6 +410,8 @@ pub struct Shared {
     /// Where the current connection's answer to the hello is (ADR-0116): set at each
     /// `welcome` and by `welcome.done`, cleared at a disconnect.
     welcome_done: watch::Sender<HelloAnswer>,
+    /// Whether the current connection's server takes `host.health` (ADR-0117).
+    pub server_takes_health: crate::health::ServerTakesHealth,
     heartbeat_secs: AtomicU64,
     lease_ttl_secs: AtomicU64,
     runner_host_id: Mutex<Option<Uuid>>,
@@ -474,6 +476,7 @@ impl Shared {
             public_suffix: Arc::new(PublicSuffixStore::load(&opts.paths)),
             connected: AtomicBool::new(false),
             welcome_done: watch::Sender::new(HelloAnswer::NotConnected),
+            server_takes_health: Default::default(),
             opts,
             config,
             outbox,
@@ -966,6 +969,7 @@ impl Shared {
     }
 
     pub fn on_welcome(&self, welcome: &tinfirm_protocol::Welcome) {
+        self.server_takes_health.on_welcome(welcome);
         self.welcome_done.send_replace(HelloAnswer::Welcomed {
             revokes: welcome.lists(feature::RUN_GIT_REVOKE),
         });
@@ -973,8 +977,9 @@ impl Shared {
         // A new connection: forget the host.config version, and drop answers that the old
         // connection did not write. The server sends host.config after welcome.
         lock(&self.capacity).new_connection();
-        self.outbox
-            .retain_control(|m| !matches!(m, Message::HostConfigApplied(_)));
+        self.outbox.retain_control(|m| {
+            !matches!(m, Message::HostConfigApplied(_)) && !crate::health::of_ended_connection(m)
+        });
         // Platform requests that still wait may have been lost with the old connection; the
         // server answers a repeated requestId again without storing it twice.
         for pending in lock(&self.platform_requests).values() {
@@ -2402,8 +2407,9 @@ pub(crate) fn validate_model_access(access: &ModelAccess, runtime: Runtime) -> R
 /// (`hello.features`): `run.steer`, `run.skills` when the skills reach the sandbox (Docker
 /// mounts them, a VM gets them over the bridge; the local test executor has no mounts,
 /// ADR-0064), `session.bundle` (ADR-0097), which the server uses for company hosts only,
-/// `run.git.revoke` and `run.git.refresh` (ADR-0116), `sandbox.bridge` with the sandbox bridge (ADR-0095), and `sandbox.elastic` when the VM
-/// driver is one of this binary's paid ones (ADR-0114). A v1 host lists none.
+/// `run.git.revoke` and `run.git.refresh` (ADR-0116), `sandbox.bridge` with the sandbox bridge (ADR-0095), `sandbox.elastic` when the VM
+/// driver is one of this binary's paid ones (ADR-0114), and `host.health` with a VM per run,
+/// whose driver's state the host reports (ADR-0117). A v1 host lists none.
 pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     if !v2 {
         return Vec::new();
@@ -2423,6 +2429,9 @@ pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
         && vms.options.driver.elastic()
     {
         features.push(feature::SANDBOX_ELASTIC.to_string());
+    }
+    if crate::health::lists_feature(executor) {
+        features.push(feature::HOST_HEALTH.to_string());
     }
     features
 }
@@ -2571,6 +2580,9 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     let ready_vms = host
         .ready_vms()
         .map(|ready_vms| tokio::spawn(ready_vms.clone().run(host.clone(), pool_stop.clone())));
+    // The host's report that it can take no run (ADR-0117); nothing on a host without a state
+    // of its own.
+    let health = tokio::spawn(crate::health::run(host.clone(), finish.clone()));
     let ticker = {
         let host = host.clone();
         let stop = finish.clone();
@@ -2611,6 +2623,7 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     }
     finish.cancel();
     ticker.abort();
+    health.abort();
     // A pass stops between two steps, but a gc that has started runs to its end: killing
     // `git gc` would leave its `git prune` running without the mirror's lock.
     maintenance_stop.cancel();
@@ -3438,9 +3451,11 @@ mod tests {
                 "run.git.revoke",
                 "run.git.refresh",
                 "sandbox.bridge",
-                "sandbox.elastic"
+                "sandbox.elastic",
+                "host.health"
             ]
         );
+        // A VM per run reports its driver's state (ADR-0117); Docker reports none.
         assert_eq!(
             features(true, &vm("/usr/local/bin/my-driver --region x"), true),
             [
@@ -3449,7 +3464,8 @@ mod tests {
                 "session.bundle",
                 "run.git.revoke",
                 "run.git.refresh",
-                "sandbox.bridge"
+                "sandbox.bridge",
+                "host.health"
             ]
         );
 

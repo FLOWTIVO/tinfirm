@@ -9,11 +9,13 @@ import org.jspecify.annotations.Nullable;
 import com.flowtivo.tinfirm.runner.Isolation;
 import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
+import com.flowtivo.tinfirm.runner.RunnerMessages;
 
 /**
  * Picks the runner host of a run among those package 2's rule leaves it ({@code Hosts.eligible}): the dispatcher's
  * own choice (the package 3 contract, §5.7 step 4 and 5; open point 13). A host takes the run when it is connected and
- * has confirmed its capacity on that connection, speaks runner protocol v2, does not drain and has a free slot under
+ * has confirmed its capacity on that connection, speaks runner protocol v2, does not drain, reports no problem with
+ * {@code host.health} (ADR-0117) and has a free slot under
  * its dispatch limit. Of those, for a session that moves with its bundle, a host of its level that restores it wins;
  * then the conversation's previous host, so that the turn resumes its session there; then the stronger host by its
  * level and hardening ({@link Isolation#rank}, ADR-0113: the dispatcher hands it the hosts that take one level, the
@@ -35,9 +37,20 @@ final class HostSelection {
      * @param restores   whether it restores session bundles: a company host whose connection lists
      *                   {@code session.bundle} (ADR-0097)
      * @param appTokens  whether its connection lists {@code run.git.refresh} and {@code run.git.revoke} (ADR-0116)
+     * @param problems   what its connection reports with {@code host.health} (ADR-0117); empty: it takes runs
      */
     record Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills, boolean restores,
-            boolean appTokens) {
+            boolean appTokens, List<RunnerMessages.HostProblem> problems) {
+
+        Host {
+            problems = List.copyOf(problems);
+        }
+
+        /** A host that reports no problem. */
+        Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills, boolean restores,
+                boolean appTokens) {
+            this(info, configured, protocol, used, skills, restores, appTokens, List.of());
+        }
 
         /** A host that renews no App installation's token. */
         Host(RunnerHostInfo info, boolean configured, int protocol, int used, boolean skills, boolean restores) {
@@ -162,11 +175,19 @@ final class HostSelection {
                     : QueueReason.noRunnerHost(null, "Every runner host that may run this conversation is finishing "
                             + "its runs before it restarts."));
         }
-        List<Host> free = open.stream().filter(host -> host.free() > 0).toList();
+        // ADR-0117: a host that says it takes no run gets none, so no run.assign, token or epoch is spent on it.
+        List<Host> healthy = open.stream().filter(host -> host.problems().isEmpty()).toList();
+        if (healthy.isEmpty()) {
+            return new Waits(open.size() == 1
+                    ? QueueReason.hostUnhealthy(open.getFirst().info(), open.getFirst().problems().getFirst())
+                    : QueueReason.hostsUnhealthy(open.size()));
+        }
+        List<Host> free = healthy.stream().filter(host -> host.free() > 0).toList();
         if (free.isEmpty()) {
-            int used = open.stream().mapToInt(Host::used).sum();
-            int limit = open.stream().mapToInt(Host::limit).sum();
-            return new Waits(QueueReason.hostsFull(open.size() == 1 ? open.getFirst().info() : null, used, limit));
+            int used = healthy.stream().mapToInt(Host::used).sum();
+            int limit = healthy.stream().mapToInt(Host::limit).sum();
+            return new Waits(QueueReason.hostsFull(healthy.size() == 1 ? healthy.getFirst().info() : null, used,
+                    limit));
         }
         // A free host of the level that restores a moving session first; then the session's (or previous) host; then
         // the stronger by level and hardening, the one with more room, the name.

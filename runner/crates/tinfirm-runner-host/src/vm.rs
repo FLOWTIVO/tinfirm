@@ -845,6 +845,9 @@ pub struct Vms {
     /// Counts the times the driver started to make no VM: a recheck task ends when its own
     /// time is over.
     no_vms_since: AtomicU64,
+    /// The cause while the driver can make no VM, `None` while it can: what the host reports
+    /// to the server (`host.health`, ADR-0117, [`crate::health`]).
+    no_vms_report: tokio::sync::watch::Sender<Option<String>>,
     /// A health check is under way: the runs that come together ask the driver once.
     checking: std::sync::atomic::AtomicBool,
     /// Counts the VMs the driver made: a check whose `verify` began before one of them was
@@ -897,6 +900,7 @@ impl Vms {
             warned: Mutex::new(HashSet::new()),
             no_vms: Mutex::new(None),
             no_vms_since: AtomicU64::new(0),
+            no_vms_report: tokio::sync::watch::Sender::new(None),
             made: AtomicU64::new(0),
             checking: std::sync::atomic::AtomicBool::new(false),
             checks: tokio::sync::watch::Sender::new(0),
@@ -924,8 +928,27 @@ impl Vms {
         }
     }
 
-    /// Notes what a health check found, and logs a change of the state.
+    /// The driver's state as it changes: the cause while it can make no VM, `None` while it can.
+    pub fn no_vms_watch(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.no_vms_report.subscribe()
+    }
+
+    /// Notes what a health check found, logs a change of the state, and passes the state on to
+    /// the host's report: when it is set, when its cause changes, and when it clears.
     fn record(self: &Arc<Vms>, health: Health) {
+        self.record_state(health);
+        // Under the state's lock, so that two checks that end together publish in order.
+        let no_vms = lock(&self.no_vms);
+        let now = no_vms.as_ref().map(|known| known.cause.clone());
+        self.no_vms_report.send_if_modified(|reported| {
+            let changed = *reported != now;
+            *reported = now;
+            changed
+        });
+        drop(no_vms);
+    }
+
+    fn record_state(self: &Arc<Vms>, health: Health) {
         let mut no_vms = lock(&self.no_vms);
         let template = &self.options.template;
         match (no_vms.as_mut(), health) {

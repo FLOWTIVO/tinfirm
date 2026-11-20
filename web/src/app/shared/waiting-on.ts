@@ -45,6 +45,7 @@ const RUNNER_REASONS: Record<string, string> = {
   NO_HOST_OF_LEVEL: 'No host of its level',
   RUNNER_HOST_OFFLINE: 'Host offline',
   RUNNER_HOST_DRAINING: 'Host restarting',
+  RUNNER_HOST_UNHEALTHY: 'Host takes no runs',
   CREDENTIAL_POOL_FULL: 'Subscription busy',
   RUNNER_HOST_FULL: 'Host busy',
   NO_HOST_FOR_SKILLS: 'No host for its skills',

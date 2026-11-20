@@ -111,11 +111,52 @@ describe('RunnerHosts', () => {
   it.each<[string, Partial<RunnerHost>]>([
     ['offline', { online: false, lastSeenAt: AT.earlier }],
     ['draining', { draining: true }],
+    [
+      'reporting a problem',
+      {
+        problems: [{ code: 'VM_DRIVER_NO_VM', message: 'node node-1: the table is missing' }],
+        problemsSince: AT.earlier,
+      },
+    ],
   ])('warns when no host takes turns: the only one is %s', async (_, overrides) => {
     await open([aRunnerHost(overrides)]);
     expect(words(q('none-takes-turns'))).toBe(
-      'No company host takes turns now Turns paid by a budget wait until a company host is online and not draining.',
+      'No company host takes turns now Turns paid by a budget wait until a company host is online, not draining and reports no problem.',
     );
+  });
+
+  it('says why a host that reports a problem takes no runs, in its own words as text (ADR-0117)', async () => {
+    await open([
+      aRunnerHost({
+        problems: [
+          {
+            code: 'VM_DRIVER_NO_VM',
+            message: 'node node-1: the firewall table <b>inet tinfirm_node</b> is not loaded',
+          },
+        ],
+        problemsSince: AT.earlier,
+      }),
+    ]);
+    const card = host('office');
+    expect(words(q('host-state', card))).toBe('Online');
+    expect(words(q('host-unhealthy', card))).toBe('Takes no runs');
+    const problems = q('host-problems', card)!;
+    expect(words(problems)).toContain('Why it takes no runs');
+    const item = q('host-problem', problems)!;
+    expect(words(item)).toContain('Its VM driver can make no VM');
+    // The host's text is shown as text, never as markup.
+    expect(item.textContent).toContain('<b>inet tinfirm_node</b>');
+    expect(item.querySelector('b')).toBeNull();
+    expect(words(q('host-problems-since', problems))).toContain('as the host reports');
+    expect(words(q('host-problems-since', problems))).toContain(
+      'Turns that only this host may run wait until it reports that it takes runs again.',
+    );
+  });
+
+  it('shows no problem for a host that takes runs', async () => {
+    await open([aRunnerHost()]);
+    expect(q('host-unhealthy', host('office'))).toBeNull();
+    expect(q('host-problems', host('office'))).toBeNull();
   });
 
   it('says what a company host is for when there is none', async () => {

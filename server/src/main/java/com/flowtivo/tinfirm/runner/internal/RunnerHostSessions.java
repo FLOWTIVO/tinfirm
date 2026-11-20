@@ -14,6 +14,8 @@ import java.util.Set;
 import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
@@ -21,6 +23,7 @@ import com.flowtivo.tinfirm.audit.AuditAction;
 import com.flowtivo.tinfirm.audit.AuditLog;
 import com.flowtivo.tinfirm.audit.AuditRecord;
 import com.flowtivo.tinfirm.runner.ConnectedHost;
+import com.flowtivo.tinfirm.runner.RunnerConnections;
 import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
@@ -43,6 +46,8 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  */
 @Component
 class RunnerHostSessions {
+
+    private static final Logger log = LoggerFactory.getLogger(RunnerHostSessions.class);
 
     private final RunnerHostStore store;
 
@@ -262,6 +267,35 @@ class RunnerHostSessions {
                 .details(details)
                 .build());
         });
+    }
+
+    /**
+     * ADR-0117, decision 8: {@code runner_host.health_failed} when the host's connection went from no problem to a
+     * problem ({@code codes}, the first {@code message}), {@code runner_host.health_restored} when it went back. In the
+     * chain of each company the host is in, by SYSTEM, each in its own transaction: a failure in one company loses
+     * no other's.
+     */
+    void auditHealth(ConnectedHost host, RunnerConnections.Health now) {
+        AuditAction action = now.unhealthy() ? AuditAction.RUNNER_HOST_HEALTH_FAILED
+                : AuditAction.RUNNER_HOST_HEALTH_RESTORED;
+        Map<String, @Nullable Object> details = new LinkedHashMap<>();
+        if (now.unhealthy()) {
+            details.put("codes", now.problems().stream().map(RunnerMessages.HostProblem::code).distinct().toList());
+            details.put("message", now.problems().getFirst().message());
+        }
+        for (ConnectedHost placed : host.placements()) {
+            try {
+                transactions.runInCompany(placed.company(), () -> auditLog.record(AuditRecord.company(placed.company(),
+                        action, Actor.SYSTEM)
+                    .target(RunnerHostService.TARGET, placed.runnerHostId())
+                    .details(details)
+                    .build()));
+            }
+            catch (RuntimeException ex) {
+                log.warn("Auditing the health of runner host {} in company {} failed", host.machineId(),
+                        placed.company(), ex);
+            }
+        }
     }
 
     /** The labels a {@code credential.status} may name: a machine's, none of a company host's. */

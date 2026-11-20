@@ -156,6 +156,22 @@ class RunnerSessionHandler implements RunnerSessionListener {
         dispatcher.nudge();
     }
 
+    /**
+     * ADR-0117, decision 6: the host's problems came or went. The runs that wait in a back-off after its rejections are
+     * placed again at once, with their count of rejections: once it is healthy they go to it, while it has a problem
+     * they go to another host or wait with its problem as their reason. Then the dispatcher runs.
+     */
+    @Override
+    public void hostHealthChanged(ConnectedHost host, boolean healthy) {
+        int released = transactions.inCompany(host.companyId(),
+                () -> runs.releaseRejectedBy(host.runnerHostId(), time.now()));
+        if (released > 0) {
+            log.info("Runner host {} reports that it takes {}: {} runs it rejected are placed again now",
+                    host.runnerHostId(), healthy ? "runs again" : "no run", released);
+        }
+        dispatcher.nudge();
+    }
+
     /** The host talks, so it is alive: all its running runs get a lease of at least now + TTL. */
     @Override
     public void hostActive(ConnectedHost host) {

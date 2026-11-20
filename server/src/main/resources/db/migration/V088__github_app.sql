@@ -12,7 +12,9 @@
 --                          system has at most one credential per installation (account_app_installation_uq), and
 --                          external_login is the login of the account the App is installed on.
 --   run.queue_reason       gains NO_HOST_FOR_APP_TOKENS: a run with a binding on an APP credential waits for a host that
---                          lists run.git.refresh and run.git.revoke.
+--                          lists run.git.refresh and run.git.revoke. It also gains RUNNER_HOST_UNHEALTHY (ADR-0117,
+--                          added here while this migration is unreleased): the hosts that may take a run report with
+--                          host.health that they take no run.
 --
 -- The conventions of V001 apply: company_id, ENABLE plus FORCE ROW LEVEL SECURITY, a policy on app_company_id(),
 -- composite foreign keys, and grants to the runtime role ${app_role}, which owns nothing. The schema owner runs this
@@ -70,5 +72,6 @@ ALTER TABLE run ADD CONSTRAINT run_queue_reason_ck CHECK (queue_reason IS NULL O
     'COMPANY_STOPPED', 'SYSTEM_PAUSED',
     'AGENT_PAUSED', 'ACCOUNT_REQUIRED', 'BUDGET_SPENT', 'KEY_ERROR', 'NO_MODEL_KEY', 'HOST_OFFLINE',
     'MODEL_ACCESS_UNAVAILABLE', 'NO_HOST_FOR_CREDENTIALS', 'NO_RUNNER_HOST', 'NO_HOST_OF_LEVEL', 'RUNNER_HOST_OFFLINE',
-    'RUNNER_HOST_DRAINING', 'CREDENTIAL_POOL_FULL', 'RUNNER_HOST_FULL', 'PREVIOUS_RUN_ACTIVE', 'RUNNER_HOST_REJECTED',
-    'ASSIGNED', 'TRIGGER_PAUSED', 'NO_HOST_FOR_SKILLS', 'NO_HOST_FOR_APP_TOKENS', 'RETRY_SCHEDULED', 'OTHER'));
+    'RUNNER_HOST_DRAINING', 'RUNNER_HOST_UNHEALTHY', 'CREDENTIAL_POOL_FULL', 'RUNNER_HOST_FULL', 'PREVIOUS_RUN_ACTIVE',
+    'RUNNER_HOST_REJECTED', 'ASSIGNED', 'TRIGGER_PAUSED', 'NO_HOST_FOR_SKILLS', 'NO_HOST_FOR_APP_TOKENS', 'RETRY_SCHEDULED',
+    'OTHER'));

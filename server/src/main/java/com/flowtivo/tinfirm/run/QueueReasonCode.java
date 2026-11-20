@@ -14,7 +14,9 @@ package com.flowtivo.tinfirm.run;
  * gateway, an inactive payer, a subscription gone: package 2's refusals);</li>
  * <li>the hosts: {@code NO_HOST_FOR_CREDENTIALS} (the company has hosts for the runtime, but none may carry the run's
  * credentials), {@code NO_RUNNER_HOST} (none can run it, or none of those may and is connected),
- * {@code RUNNER_HOST_OFFLINE} and {@code RUNNER_HOST_DRAINING} (of the one host that may take it);</li>
+ * {@code RUNNER_HOST_OFFLINE} and {@code RUNNER_HOST_DRAINING} (of the one host that may take it),
+ * {@code RUNNER_HOST_UNHEALTHY} (ADR-0117: the hosts that may take it report with {@code host.health} that they take
+ * no run; of one host, its name and its first problem);</li>
  * <li>the slots: {@code CREDENTIAL_POOL_FULL} (a subscription's pool), {@code RUNNER_HOST_FULL};</li>
  * <li>{@code ASSIGNED}: sent to its host, waiting for {@code run.accepted}. {@code PREVIOUS_RUN_ACTIVE} (the host
  * answered {@code TASK_RUN_ACTIVE}: it still ends the conversation's previous turn) and {@code RUNNER_HOST_REJECTED}:
@@ -33,7 +35,8 @@ package com.flowtivo.tinfirm.run;
 public enum QueueReasonCode {
     COMPANY_STOPPED, SYSTEM_PAUSED, AGENT_PAUSED, ACCOUNT_REQUIRED, BUDGET_SPENT, KEY_ERROR, NO_MODEL_KEY, HOST_OFFLINE,
     MODEL_ACCESS_UNAVAILABLE,
-    NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL,
+    NO_HOST_FOR_CREDENTIALS, NO_RUNNER_HOST, NO_HOST_OF_LEVEL, RUNNER_HOST_OFFLINE, RUNNER_HOST_DRAINING,
+    RUNNER_HOST_UNHEALTHY, CREDENTIAL_POOL_FULL, RUNNER_HOST_FULL,
     PREVIOUS_RUN_ACTIVE, RUNNER_HOST_REJECTED, ASSIGNED, TRIGGER_PAUSED, NO_HOST_FOR_SKILLS, NO_HOST_FOR_APP_TOKENS, RETRY_SCHEDULED,
     OTHER
 }

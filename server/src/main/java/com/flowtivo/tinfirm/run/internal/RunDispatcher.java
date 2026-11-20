@@ -494,7 +494,8 @@ class RunDispatcher {
                     connections.supports(host.id(), RunnerMessages.FEATURE_RUN_SKILLS),
                     host.company() && connections.supports(host.id(), RunnerMessages.FEATURE_SESSION_BUNDLE),
                     connections.supports(host.id(), RunnerMessages.FEATURE_RUN_GIT_REFRESH)
-                            && connections.supports(host.id(), RunnerMessages.FEATURE_RUN_GIT_REVOKE)))
+                            && connections.supports(host.id(), RunnerMessages.FEATURE_RUN_GIT_REVOKE),
+                    connections.health(host.id()).problems()))
             .toList();
         UUID previousHost = placement.preferred() != null ? placement.preferred()
                 : runs.previousHost(run.conversationId(), run.id()).orElse(null);

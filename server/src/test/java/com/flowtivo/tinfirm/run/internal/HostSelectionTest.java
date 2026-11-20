@@ -13,6 +13,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import com.flowtivo.tinfirm.run.QueueReasonCode;
 import com.flowtivo.tinfirm.runner.HostScope;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
+import com.flowtivo.tinfirm.runner.RunnerMessages;
 
 /**
  * The host of a run among the eligible ones (the package 3 contract, §5.7 steps 4 and 5; open point 13), as a table:
@@ -190,5 +191,52 @@ class HostSelectionTest {
         assertThat(HostSelection.select(List.of(other, busy), other.info().id(), false, machine))
             .isInstanceOfSatisfying(HostSelection.Chosen.class,
                     chosen -> assertThat(chosen.host().info().name()).isEqualTo("other"));
+    }
+
+    /**
+     * ADR-0117: a host that reports a problem with {@code host.health} gets no run. A run goes to a healthy host; when
+     * only the one host may take it, it waits with that host's name and first problem; of several, with none.
+     */
+    @org.junit.jupiter.api.Test
+    void aHostThatReportsAProblemTakesNoRun() {
+        RunnerHostInfo alpha = host(A, "alpha", true, 2, false, 4, 0).info();
+        RunnerHostInfo beta = host(B, "beta", true, 2, false, 4, 3).info();
+        List<RunnerMessages.HostProblem> problems = List.of(
+                new RunnerMessages.HostProblem("VM_DRIVER_NO_VM", "node node-1: the firewall table is missing"));
+        HostSelection.Host broken = new HostSelection.Host(alpha, true, 2, 0, false, false, false, problems);
+        HostSelection.Host working = new HostSelection.Host(beta, true, 2, 3, false, false, false, List.of());
+
+        // The broken host has more room and is the previous host: the healthy one takes the run all the same.
+        assertThat(HostSelection.select(List.of(broken, working), A))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("beta"));
+        assertThat(HostSelection.select(List.of(broken), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_UNHEALTHY);
+                assertThat(waits.reason().runnerHostId()).isEqualTo(A);
+                assertThat(waits.reason().reason()).isEqualTo("VM_DRIVER_NO_VM");
+                assertThat(waits.reason().text())
+                    .isEqualTo("Runner host alpha can take no run: node node-1: the firewall table is missing.");
+            });
+        HostSelection.Host brokenToo = new HostSelection.Host(beta, true, 2, 3, false, false, false, problems);
+        assertThat(HostSelection.select(List.of(broken, brokenToo), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_UNHEALTHY);
+                assertThat(waits.reason().runnerHostId()).isNull();
+                assertThat(waits.reason().text()).isEqualTo("None of the 2 runner hosts that may run this "
+                        + "conversation can take a run now: each reports a problem.");
+            });
+        // A draining host says so first; a full healthy host beside a broken one is full.
+        RunnerHostInfo draining = host(A, "alpha", true, 2, true, 4, 0).info();
+        assertThat(HostSelection.select(List.of(new HostSelection.Host(draining, true, 2, 0, false, false, false,
+                problems)), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class,
+                    waits -> assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_DRAINING));
+        HostSelection.Host full = new HostSelection.Host(beta, true, 2, 4, false, false, false, List.of());
+        assertThat(HostSelection.select(List.of(broken, full), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_FULL);
+                assertThat(waits.reason().runnerHostName()).isEqualTo("beta");
+            });
     }
 }

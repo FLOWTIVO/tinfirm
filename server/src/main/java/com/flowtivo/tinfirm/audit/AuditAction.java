@@ -138,6 +138,14 @@ public enum AuditAction {
      */
     RUNNER_HOST_ISOLATION_CHANGED("runner_host.isolation_changed"),
     /**
+     * A runner host reported with {@code host.health} that it takes no run, where it reported no problem before on its
+     * connection (ADR-0117): {@code codes} and the first {@code message}, the host's own words. By SYSTEM, in the
+     * chain of each company the host is in. A change among problems, and a frame sent again, are not audited.
+     */
+    RUNNER_HOST_HEALTH_FAILED("runner_host.health_failed"),
+    /** A runner host that reported a problem on its connection reported none (ADR-0117). By SYSTEM, as above. */
+    RUNNER_HOST_HEALTH_RESTORED("runner_host.health_restored"),
+    /**
      * A turn's run was created QUEUED (the package 3 contract, §8): {@code conversationId}, {@code agentId},
      * {@code turn}, {@code turnReason}, {@code payerPrincipalId}, {@code modelAccess} ({@code BUDGET} or
      * {@code SUBSCRIPTION}).

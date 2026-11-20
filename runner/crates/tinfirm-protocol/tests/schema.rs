@@ -1633,6 +1633,17 @@ fn constructed_messages_v2() -> Vec<Message> {
             served_ready: 31,
             served_cold: 4,
         }),
+        Message::HostHealth(HostHealth {
+            problems: vec![HostProblem {
+                code: HostProblemCode::VmDriverNoVm,
+                message: "the table is missing".into(),
+            }],
+            since: Some(Utc.with_ymd_and_hms(2026, 11, 20, 9, 15, 0).unwrap()),
+        }),
+        Message::HostHealth(HostHealth {
+            problems: vec![],
+            since: None,
+        }),
         Message::HostPoolStatus(HostPoolStatus {
             ready: 0,
             starting: 0,
@@ -2955,4 +2966,52 @@ fn hello_reports_its_level_of_isolation_in_its_tiers() {
     let mut frame = hello.clone();
     frame["isolationStated"] = json!("yes");
     assert!(!v2.is_valid(&frame), "isolationStated yes");
+}
+
+/// `host.health` (ADR-0117): at most 8 problems, a code of the closed list, a message of one
+/// line of at most 1000 characters; an empty list is a healthy host.
+#[test]
+fn host_health_is_bounded() {
+    let v2 = validator_v2();
+    let unhealthy = sample_v2("host.health.json");
+    assert_valid(&v2, &unhealthy, "host.health");
+    let healthy = sample_v2("host.health-healthy.json");
+    assert_valid(&v2, &healthy, "host.health without problems");
+    let Message::HostHealth(parsed) = Message::from_value(unhealthy.clone()).unwrap() else {
+        panic!("not host.health");
+    };
+    assert_eq!(parsed.problems[0].code, HostProblemCode::VmDriverNoVm);
+    assert!(parsed.since.is_some());
+
+    let problem = unhealthy["problems"][0].clone();
+    let mut eight = unhealthy.clone();
+    eight["problems"] = json!(vec![problem.clone(); HOST_PROBLEMS_MAX]);
+    assert_valid(&v2, &eight, "eight problems");
+    let mut nine = unhealthy.clone();
+    nine["problems"] = json!(vec![problem; HOST_PROBLEMS_MAX + 1]);
+    assert!(!v2.is_valid(&nine), "nine problems");
+
+    let mut longest = unhealthy.clone();
+    longest["problems"][0]["message"] = json!("x".repeat(HOST_PROBLEM_MESSAGE_MAX));
+    assert_valid(&v2, &longest, "the longest message");
+    let mut too_long = unhealthy.clone();
+    too_long["problems"][0]["message"] = json!("x".repeat(HOST_PROBLEM_MESSAGE_MAX + 1));
+    assert!(!v2.is_valid(&too_long), "a message too long");
+    for text in ["two\nlines", "a\ttab", "", "bell\u{7}"] {
+        let mut frame = unhealthy.clone();
+        frame["problems"][0]["message"] = json!(text);
+        assert!(!v2.is_valid(&frame), "message {text:?}");
+    }
+    for code in ["SOMETHING_ELSE", "vm_driver_no_vm", ""] {
+        let mut frame = unhealthy.clone();
+        frame["problems"][0]["code"] = json!(code);
+        assert!(!v2.is_valid(&frame), "code {code}");
+        assert!(Message::from_value(frame).is_err(), "code {code}");
+    }
+    let mut no_problems = healthy;
+    no_problems.as_object_mut().unwrap().remove("problems");
+    assert!(!v2.is_valid(&no_problems));
+    assert!(Message::from_value(no_problems).is_err());
+    // Not a frame of protocol 1.
+    assert!(Message::parse_version(&unhealthy.to_string(), PROTOCOL_VERSION).is_err());
 }

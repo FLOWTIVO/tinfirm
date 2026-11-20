@@ -559,6 +559,23 @@ class RunStore {
             .update();
     }
 
+    /**
+     * ADR-0117, decision 6: the QUEUED runs that wait until a later {@code dispatch_after} because this host rejected
+     * them ({@code RUNNER_HOST_REJECTED} naming it) are placed at the next dispatch: their {@code dispatch_after} and
+     * their reason's {@code retryAt} go, their count of rejections stays (decision 1).
+     *
+     * @return how many runs
+     */
+    int releaseRejectedBy(UUID hostId, Instant now) {
+        return jdbc.sql("""
+                UPDATE run SET dispatch_after = NULL, queue_reason_details = queue_reason_details - 'retryAt'
+                 WHERE status = 'QUEUED' AND dispatched_at IS NULL AND dispatch_after > ?
+                   AND queue_reason = 'RUNNER_HOST_REJECTED'
+                   AND queue_reason_details ->> 'runnerHostId' = ?""")
+            .params(ts(now), hostId.toString())
+            .update();
+    }
+
     /** Records why a QUEUED run waits; {@code since} is when its code last changed. */
     void setQueueReason(UUID runId, QueueReason reason, Instant since) {
         jdbc.sql("""

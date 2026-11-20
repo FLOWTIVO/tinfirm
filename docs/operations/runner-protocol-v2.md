@@ -14,7 +14,7 @@ and [`protocol/runner-v2.schema.json`](../../protocol/runner-v2.schema.json), an
 | Tools the agent sees | `ask_human`, `finish_run`, `request_repository`, `create_task`, `upload_attachment`, `list_repositories` | The platform tools `ask`, `finish`, `request_access`, `request_network_access` (only on a host with the egress proxy), `save_artifact` and `list_repositories`, as far as `run.assign.platformTools` names them; plus the server-executed tools of `run.assign.tools`: the systems' tools (`jira_get`, `jira_search`, …) and, while the agent's memory is on, `remember`, `forget` and `recall` |
 | Documents | `upload_attachment` only | `/output` in the sandbox, saved as outputs of the conversation when the run ends (`run.finished.artifacts`), and `save_artifact` for files elsewhere and for links. The host refuses a file above `run --upload-max-bytes` (default 25 MiB, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE`) before it reads it; set the two alike |
 | `run.assign` | `task {id, key, title}` | `workItem {id, key, title}` and `job {id}`, which carry the conversation (PLATFORM.md §11.1); `tools[]`; `platformTools[]`, the platform tools the agent may use (`finish` and `list_repositories` always); `allowedHosts[]`, the network hosts approved for the conversation or the agent; `skills[]` (feature `run.skills`, below); and `agent.effort` unless it is the runtime's default |
-| `hello.features` | none | The optional features the host implements: `run.steer`, `run.skills`, `run.git.revoke` and others (below) |
+| `hello.features` | none | The optional features the host implements: `run.steer`, `run.skills`, `run.git.revoke`, `host.health` and others (below) |
 | `hello.isolationTiers` | `container`, `gvisor` (and `microvm`, which no v1 host sends); all placed as `container` | The host's level of isolation: `machine`, `vm-jail`, `container`, or `gvisor` (placed as `container`); `microvm` is refused. Beside it `hardened` and `isolationStated` (below) |
 | `welcome` | no version | `protocolVersion`: the version the server speaks |
 | Usage (USAGE events, `run.finished.usage`) | cache writes counted in `inputTokens` | `cacheWriteTokens` apart from `inputTokens` |
@@ -245,6 +245,47 @@ ships it.
   it implements. A host that took a run back after a restart waits for `welcome.done` before it
   pushes the run's work only when `welcome.features` lists `run.git.revoke`; with an older server
   it pushes as before, without waiting.
+- **A host that can take no run** ([ADR-0117](../adr/0117-a-host-reports-that-it-can-take-no-run.md)).
+  A host that lists the feature `host.health`, today a host with a VM per run, tells the server
+  when it can take no run, and when it can again:
+
+  | Field | Meaning |
+  |---|---|
+  | `type` | `host.health` |
+  | `problems` | At most 8 `{code, message}`; empty: the host takes runs |
+  | `problems[].code` | A closed list, today `VM_DRIVER_NO_VM`: the VM driver's `verify` reports problems and no room |
+  | `problems[].message` | The host's own words, one line of at most 1000 characters |
+  | `since` | When the current problems began, by the host's clock; absent without problems |
+
+  - **The host** sends the frame only on a connection whose `welcome.features` lists
+    `host.health`, after `welcome` and, from a server that lists `run.git.revoke`, after
+    `welcome.done`: when it has a problem, at each change of its problems, and once with an empty
+    list when it is healthy again. It sends nothing while it is healthy and was healthy on that
+    connection. A connection starts healthy on both sides, so after a reconnect a host that still
+    has a problem says it again. It sends at most one frame every 5 seconds, the latest state, and
+    keeps rejecting a run that arrives while it has a problem (a frame on its way, or an older
+    server).
+  - **The server** keeps the problems with the host's connection, in memory: a disconnect, a new
+    connection and a restart of the server forget them. It assigns no run to such a host. A run that
+    only such hosts may take waits with `RUNNER_HOST_UNHEALTHY`, which names the host and its first
+    problem ("Runner host … can take no run: …."); no `run.assign`, no audit of an assignment, no
+    token and no new epoch happen while it waits. When the host's problems go or come, the runs
+    that wait in a back-off after its rejections are placed again at once, and the dispatcher runs:
+    once the host takes runs again, they start within seconds. The host's card shows the problems,
+    the host's text as text, while it is connected. The audit has `runner_host.health_failed` when
+    the host's connection goes from no problem to a problem and `runner_host.health_restored` when
+    it goes back; a change among problems is not audited.
+  - **Its limits.** A frame from a host that did not list the feature, or outside the schema (an
+    unknown code, more than 8 problems, a message of several lines or too long), is answered
+    `error BAD_MESSAGE` and not applied. More than 12 frames a minute from one connection (12 at
+    once, one more every 5 seconds) are answered `error TOO_MANY_REQUESTS` and not applied: the
+    server keeps the state it took last.
+  - **Compatibility.** A host of an older release does not list the feature and rejects each run as
+    before; the server waits longer after each further rejection of a run by the same host
+    (`TINFIRM_RUN_REJECT_BACKOFF`, doubled each time up to `TINFIRM_RUN_REJECT_BACKOFF_MAX`, 5
+    minutes by default). A server of an older release does not list the feature in
+    `welcome.features`, and the host sends nothing. Nothing needs configuring, and the server and
+    the hosts can be upgraded in either order.
 - **Skills** ([ADR-0064](../adr/0064-skills-library.md)). A v2 host that lists `run.skills` gets
   the agent's skills in `run.assign.skills` and downloads each from the server before the
   sandbox starts ([runner/README.md](../../runner/README.md#skills-protocol-v2)). A run whose
@@ -338,5 +379,8 @@ ships it.
 - `tinfirm_runner_refused_frames_total{frame, reason}` counts the requests and events the
   limits refused (`rate`, `size`, `budget`, `in_flight`). A steady count of `rate` for one
   company's hosts, or any `size`, points to a host that floods or does not cut its events.
+- A host with a VM per run lists `host.health` in its `hello`. While its driver can make no VM,
+  its card says **Takes no runs** and why, and its waiting turns show `RUNNER_HOST_UNHEALTHY`;
+  the company's audit has one `runner_host.health_failed` per episode and connection.
 - A run's page shows its tokens as `in · cache read · cache write · out`
   ([prompt-cache.md](prompt-cache.md)).

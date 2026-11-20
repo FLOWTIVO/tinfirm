@@ -94,6 +94,11 @@ public class TestRunnerSessions implements RunnerSessionListener {
     }
 
     @Override
+    public void hostHealthChanged(ConnectedHost host, boolean healthy) {
+        real().hostHealthChanged(host, healthy);
+    }
+
+    @Override
     public void hostActive(ConnectedHost host) {
         real().hostActive(host);
     }

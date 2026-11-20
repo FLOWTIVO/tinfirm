@@ -86,6 +86,8 @@ function sentence(text: string): string {
 const RUNNER_HOST_CODES: ReadonlySet<QueueReasonCode> = new Set<QueueReasonCode>([
   'RUNNER_HOST_OFFLINE',
   'RUNNER_HOST_DRAINING',
+  // ADR-0117: the host says it takes no run; its card says why.
+  'RUNNER_HOST_UNHEALTHY',
   'RUNNER_HOST_FULL',
   'RUNNER_HOST_REJECTED',
   'PREVIOUS_RUN_ACTIVE',

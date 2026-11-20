@@ -83,6 +83,13 @@ public interface RunnerSessionListener {
     void hostConfigured(ConnectedHost host);
 
     /**
+     * ADR-0117: the host's problems changed from none to some ({@code healthy} false), or from some to none
+     * ({@code healthy} true), in this company's context. The runs that wait in a back-off after this host's
+     * rejections are placed again now, and the dispatcher runs without waiting for its next tick.
+     */
+    void hostHealthChanged(ConnectedHost host, boolean healthy);
+
+    /**
      * The connected host sent a frame, and its runs' leases were last renewed this way at least
      * {@link RunnerProperties#leaseRenewalInterval()} ago: a host that talks is alive, so all its running runs get a
      * fresh lease (docs/archive/v1/CONVENTIONS.md §15.1).

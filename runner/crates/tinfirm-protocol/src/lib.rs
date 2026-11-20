@@ -100,7 +100,7 @@ pub const MESSAGE_TYPES: [&str; 19] = [
 /// Every `type` value defined by the v2 schema, in schema order: v1 without the three
 /// bespoke request pairs, plus `run.request` and `run.request.ack`, and the frames of the
 /// optional features ([`feature`]).
-pub const MESSAGE_TYPES_V2: [&str; 22] = [
+pub const MESSAGE_TYPES_V2: [&str; 23] = [
     "hello",
     "welcome",
     "run.assign",
@@ -121,12 +121,13 @@ pub const MESSAGE_TYPES_V2: [&str; 22] = [
     "host.config",
     "host.config.applied",
     "host.pool.status",
+    "host.health",
     "psl.update",
     "error",
 ];
 
 /// Every `type` value of any version: what [`Message::parse`] accepts.
-const KNOWN_MESSAGE_TYPES: [&str; 28] = [
+const KNOWN_MESSAGE_TYPES: [&str; 29] = [
     "hello",
     "welcome",
     "run.assign",
@@ -153,6 +154,7 @@ const KNOWN_MESSAGE_TYPES: [&str; 28] = [
     "host.config",
     "host.config.applied",
     "host.pool.status",
+    "host.health",
     "psl.update",
     "error",
 ];
@@ -570,6 +572,9 @@ pub enum Message {
     /// v2 feature [`feature::SANDBOX_POOL`], host -> server: the host's sandboxes now.
     #[serde(rename = "host.pool.status")]
     HostPoolStatus(HostPoolStatus),
+    /// v2 feature [`feature::HOST_HEALTH`], host -> server: whether the host can take runs.
+    #[serde(rename = "host.health")]
+    HostHealth(HostHealth),
     /// v2 only, server -> host: the Public Suffix List.
     #[serde(rename = "psl.update")]
     PslUpdate(PslUpdate),
@@ -678,6 +683,7 @@ impl Message {
             Message::HostConfig(_) => "host.config",
             Message::HostConfigApplied(_) => "host.config.applied",
             Message::HostPoolStatus(_) => "host.pool.status",
+            Message::HostHealth(_) => "host.health",
             Message::PslUpdate(_) => "psl.update",
             Message::Error(_) => "error",
         }
@@ -789,6 +795,9 @@ pub mod feature {
     /// expires with a [`super::RunRequest`] of kind [`super::RequestKind::GitToken`] (ADR-0116).
     /// A host that lists it lists [`RUN_GIT_REVOKE`] too.
     pub const RUN_GIT_REFRESH: &str = "run.git.refresh";
+    /// The host reports with [`super::HostHealth`] that it can take no run, and when it can
+    /// again (ADR-0117); sent only to a server whose `welcome.features` lists it.
+    pub const HOST_HEALTH: &str = "host.health";
 }
 
 /// `error.code` before `welcome`: the server's licence does not hold a feature the hello
@@ -2523,6 +2532,43 @@ pub struct HostPoolStatus {
     /// Runs of the last 24 hours that took a ready sandbox, and that waited for one.
     pub served_ready: u32,
     pub served_cold: u32,
+}
+
+/// Most problems in one [`HostHealth`].
+pub const HOST_PROBLEMS_MAX: usize = 8;
+/// Longest [`HostProblem::message`], in characters.
+pub const HOST_PROBLEM_MESSAGE_MAX: usize = 1000;
+
+/// Runner host -> server (v2, the feature [`feature::HOST_HEALTH`], ADR-0117): why the host
+/// takes no run now, or, with no problem, that it takes runs again. Sent after the welcome
+/// (and `welcome.done` where the server sends it) of a server that lists the feature: with a
+/// problem, at each change, and once when healthy again. The server answers nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostHealth {
+    /// At most [`HOST_PROBLEMS_MAX`]; empty: the host takes runs.
+    pub problems: Vec<HostProblem>,
+    /// When the current problems began; `None` with none.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_instant")]
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// One reason why the host takes no run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostProblem {
+    pub code: HostProblemCode,
+    /// One line, at most [`HOST_PROBLEM_MESSAGE_MAX`] characters, without control characters.
+    pub message: String,
+}
+
+/// The closed list of [`HostProblem::code`]: only states the host detects. A new code needs a
+/// feature name of its own, since a server refuses a code it does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostProblemCode {
+    /// The VM driver can make no VM: its `verify` reports problems and no room (ADR-0096).
+    VmDriverNoVm,
 }
 
 /// One credential in [`HostConfigApplied`].

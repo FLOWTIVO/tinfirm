@@ -2,6 +2,7 @@ package com.flowtivo.tinfirm.runner;
 
 import java.time.Instant;
 import java.util.Collection;
+import java.util.List;
 import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
@@ -37,6 +38,32 @@ public interface RunnerConnections {
      * lists ({@link RunnerMessages#FEATURE_RUN_STEER}); false when the host is not connected.
      */
     boolean supports(UUID runnerHostId, String feature);
+
+    /**
+     * What the host reports about its health on its current connection (ADR-0117): its problems, none while it takes
+     * runs, has not said otherwise on this connection, or is not connected. Kept with the connection, so that a
+     * disconnect and a restart of the server forget it.
+     */
+    Health health(UUID runnerHostId);
+
+    /**
+     * A host's problems as its {@code host.health} named them, and since when (the host's {@code since}, never later
+     * than the server received it); {@link #NONE} for a host that takes runs.
+     */
+    record Health(List<RunnerMessages.HostProblem> problems, @Nullable Instant since) {
+
+        public static final Health NONE = new Health(List.of(), null);
+
+        public Health {
+            problems = List.copyOf(problems);
+            since = problems.isEmpty() ? null : since;
+        }
+
+        /** Whether the host reports a problem, and so takes no run. */
+        public boolean unhealthy() {
+            return !problems.isEmpty();
+        }
+    }
 
     /**
      * Sends one frame if the host is connected. Returns false when it is not, or the send failed; callers rely on
