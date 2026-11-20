@@ -1,0 +1,14 @@
+chunk 8 sectors (4 KiB), in a row: 786432 chunks copied in 2797 ms; the snapshot file's use 6291456/16777216 sectors; kernel slab 163800 -> 239588 KiB (+74 MiB), 98 bytes a chunk; a 20 GiB snapshot written this way to its end: about 490 MiB
+chunk 8 sectors (4 KiB), scattered: 500000 chunks copied in 29691 ms; the snapshot file's use 4000000/16777216 sectors; kernel slab 163948 -> 236256 KiB (+70 MiB), 148 bytes a chunk; a 20 GiB snapshot written this way to its end: about 740 MiB
+chunk 16 sectors (8 KiB), in a row: 393216 chunks copied in 6316 ms; the snapshot file's use 6291456/16777216 sectors; kernel slab 163120 -> 236724 KiB (+71 MiB), 191 bytes a chunk; a 20 GiB snapshot written this way to its end: about 477 MiB
+chunk 16 sectors (8 KiB), scattered: 500000 chunks copied in 58769 ms; the snapshot file's use 8000000/16777216 sectors; kernel slab 161976 -> 273272 KiB (+108 MiB), 227 bytes a chunk; a 20 GiB snapshot written this way to its end: about 567 MiB
+chunk 64 sectors (32 KiB), in a row: 98304 chunks copied in 6672 ms; the snapshot file's use 6291456/16777216 sectors; kernel slab 155760 -> 231048 KiB (+73 MiB), 784 bytes a chunk; a 20 GiB snapshot written this way to its end: about 490 MiB
+Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+OSError: [Errno 5] Input/output error
+chunk 64 sectors (32 KiB), scattered: 500000 chunks copied in 89516 ms; the snapshot file's use Invalid sectors; kernel slab 155624 -> 394280 KiB (+233 MiB), 488 bytes a chunk; a 20 GiB snapshot written this way to its end: about 305 MiB
+chunk 128 sectors (64 KiB), in a row: 49152 chunks copied in 8895 ms; the snapshot file's use 6291456/16777216 sectors; kernel slab 163184 -> 241540 KiB (+76 MiB), 1632 bytes a chunk; a 20 GiB snapshot written this way to its end: about 510 MiB
+Traceback (most recent call last):
+  File "<stdin>", line 4, in <module>
+OSError: [Errno 28] No space left on device
+chunk 128 sectors (64 KiB), scattered: 500000 chunks copied in 71647 ms; the snapshot file's use Invalid sectors; kernel slab 162984 -> 320124 KiB (+153 MiB), 321 bytes a chunk; a 20 GiB snapshot written this way to its end: about 100 MiB

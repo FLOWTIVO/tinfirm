@@ -1,0 +1,49 @@
+#### before the fixes (the build of this round's first patch)
+== finding 1: a tool that hangs (systemd-udevd stopped with SIGSTOP, so that a dmsetup that waits for udev never returns)
+systemd-udevd: Ts 
+a list, 4 s into that create:
+    (30003 ms)
+the create: create ended: status 0 
+on the node meanwhile: 26158 dmsetup create tinfirm-tfvm-000000000055-0000 --table 0 67108864 snapshot /dev/loop0 /dev/loop1 N 8
+left afterwards: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0
+
+== finding 3: KillMode, and the helper started again in the middle of a make
+KillMode of the unit: process
+    after 0.03s: created node-1:vm-0b62f776b50337a7dc9d04fb099e0db6 (mid-make) from the template sandbox-2c2g
+    after 0.03s: create: 139 ms, id node-1:vm-0b62f776b50337a7dc9d04fb099e0db6; describe: 2 ms, running at 10.0.0.6:20000
+    on the node after the new helper and listener started: jails 1, VMMs 1, device-mapper 1, loop devices of snapshots 1, veths 1, VM tables 1, cgroups 0, named namespaces 1, work files 2, stray tools 0
+    after 0.06s: created node-1:vm-a0fbc3b61663c01d30608dd1092d0f09 (mid-make) from the template sandbox-2c2g
+    after 0.06s: create: 141 ms, id node-1:vm-a0fbc3b61663c01d30608dd1092d0f09; describe: 1 ms, running at 10.0.0.6:20000
+    on the node after the new helper and listener started: jails 1, VMMs 1, device-mapper 1, loop devices of snapshots 1, veths 1, VM tables 1, cgroups 0, named namespaces 1, work files 2, stray tools 0
+    after 0.09s: created node-1:vm-febbca3ebfea4cba28bb372d10ab5860 (mid-make) from the template sandbox-2c2g
+    after 0.09s: create: 144 ms, id node-1:vm-febbca3ebfea4cba28bb372d10ab5860; describe: 2 ms, running at 10.0.0.6:20000
+    on the node after the new helper and listener started: jails 1, VMMs 1, device-mapper 1, loop devices of snapshots 1, veths 1, VM tables 1, cgroups 0, named namespaces 1, work files 2, stray tools 0
+    after 0.12s: created node-1:vm-bed13b6bb4d8490a843af65dca2fe504 (mid-make) from the template sandbox-2c2g
+    after 0.12s: create: 143 ms, id node-1:vm-bed13b6bb4d8490a843af65dca2fe504; describe: 1 ms, running at 10.0.0.6:20000
+    on the node after the new helper and listener started: jails 1, VMMs 1, device-mapper 1, loop devices of snapshots 1, veths 1, VM tables 1, cgroups 0, named namespaces 1, work files 2, stray tools 0
+left afterwards: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0
+
+== finding 5: `nft flush ruleset` under a running VM
+before: the port answers ` tls alert`; "state": "running"
+setting the network namespace "tfvm-00000000005a-0000" failed: Invalid argument
+after the flush, tables on the node:  ; in the VM namespace: 
+after: the port answers ` refused`; "state": "running"
+the delete: deleted node-1:vm-17f1504bf272097f7c192e6cf845c316
+delete: ({}, 65)
+table inet tinfirm_node;
+left afterwards: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0
+
+== finding 6: a tree 5000 directories deep, made by the VM's user in its chroot, then the delete
+sh: cd: line 0: can't cd to d: File name too long
+mkdir: can't create directory 'd': File exists
+made 2046 levels as uid 1100000
+the delete:
+delete failed: node node-1: of the VM tfvm-00000000005b-0000 this is left: the jail /srv/tinfirm-jails/firecracker/tfvm-00000000005b-0000 (too many open files)
+delete: ERROR after 103 ms: {'code': -32000, 'message': 'node node-1: of the VM tfvm-00000000005b-0000 this is left: the jail /srv/tinfirm-jails/firecracker/tfvm-00000000005b-0000 (too many open files)'}
+delete: (None, 103)
+    (147 ms)
+the helper: active, restarts 0
+a list after it:
+list: {"vms": [{"address": "10.0.0.6", "id": "node-1:vm-efb1bb83a91ac5fdf2407bc0cb5bd0ea", "labels": {"tinfirm-host": "two-machine-run"}, "name": "deep-tree", "port": 20000, "state": "failed"}]}
+    (47 ms)
+left: jails 1, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0

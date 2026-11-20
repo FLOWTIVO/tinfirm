@@ -389,3 +389,57 @@ One thing about the machine, not the script: the first try ended at once with `u
 ### Still not tested after this round
 
 A conversation; path B with canary credentials, and path C; `kernel.modules_disabled`, lockdown and the AppArmor profile; a guest that floods its serial port; a flush of the node's whole ruleset under running VMs; a node at its disk's or memory's end; another kernel, distribution or architecture; a kernel that really has one of the eight modules built in (the check is tested on files standing in for one); the single machine.
+
+## The independent review's findings, 2026-11-19 to 20 (23:15 to 00:25 UTC)
+
+A review of the first round's commits (it read the code and ran nothing) found no way to root, to another VM or to a credential, and thirteen points about availability, cleanup and claims. Each was tried on the node first, with the build of this round's first part, and then again with the fix. `r9-review-before.out` and `r9-review-after.out` hold both runs; the other outputs are named below.
+
+| # | Finding | On the node, before | Now | After |
+|---|---|---|---|---|
+| 1 | A tool that hangs stops the whole helper | Confirmed. With `systemd-udevd` stopped (SIGSTOP), `dmsetup create` waited for udev and never ended: a `list` 4 s later got no answer in 30 s | Every tool has 10 s, then it is killed with its process group. `dmsetup` runs with `--noudevsync`: the helper makes the device's node itself | The same create took 128 ms, the `list` 53 ms |
+| 2 | A VM that cannot be removed holds the helper 10 to 20 s at every retry | Confirmed by the code: three waits of 5 s each, at every delete and every sweep | A VM whose last delete failed is not waited for again; the loop device is not waited for while the snapshot's device is there | The real tests' leftover case: the whole file runs in 38 s where it took 77 s |
+| 3 | `KillMode=process` keeps a make's tools alive beside the next helper | The reading holds: with a VM running, the helper is the only process of its unit's cgroup (`r9-bounding-set.out`), so the VMMs never needed it | The unit's kill mode is the default again | Four kills of the unit with two VMs running: both VMs run on and are listed. See below for what was not hit |
+| 4 | Disk and memory are overcommitted | Confirmed by the code: nothing checked either | `check` asks for room for `maxVms` snapshots and memory for `maxVms` VMMs; `make` asks for room for one more snapshot beside what the others may still grow by | `verify` lists both as checked (`r9-two-machines-final.out`). The measurement, and what is not done, below |
+| 5 | `nft flush ruleset` removes a running VM's node table, and `list` still says `running` | Confirmed: the port answers `refused`, the state stays `running` | A VM whose node table is gone is listed as not alive | The state is `failed`; the delete cleans up |
+| 6 | A tree that the VM's user builds in its chroot keeps the jail from being removed | Confirmed, sooner than expected: 2046 levels (as deep as a shell's `cd` gets) and the delete ends with "too many open files", every time | A removal that never goes deeper than one level (`src/tree.rs`) | The jail that the old build could not remove went in 68 ms; a new one in 141 ms. A unit test builds 5000 levels |
+| 7 | The `kill` fallback can never work without `CAP_KILL` | True by the unit | The fallback and the tool are gone; `check` asks for `cgroup.kill` | `verify` lists it as checked |
+| 8 | A failure of `nft` read as "the table is gone" | Above, "A delete that cannot ask" | | |
+| 9 | With `guestConsole` off a guest may still write to the emulated COM1 | Not from a process: see below | The README says what holds | |
+| 10 | `vmm_runs` connects as root to a path in the VM user's directory | True | The connect has a deadline (a thread of its own, 3 s); a comment says why the path is still the VMM's at that moment | The real tests pass |
+| 11 | The VMM's `Groups:` line is not read | True; the line was empty under the unit and through sudo (`r9-bounding-set.out`, `linux-kvm.out`) | A VMM with a supplementary group fails the make | A unit test |
+| 12 | Copies of the user data freed without being overwritten on three refusals | True | The bytes are a type that overwrites itself when dropped (`spool::Wiped`), in a buffer that never moves | The crate's tests |
+| 13 | Small ones | | A lock on the helper's state directory (a second helper does not start); the README's sentence about `check` and `make`; a note in the listener's unit about its runtime directory; a line in the README that the published ports must avoid the listener's port, which the helper cannot check; the node's firewall forwards nothing but the published ports | A unit test for the lock |
+
+After all of it: the crate's tests under umask 022 and 002 (76 + 16 + 2, the 6 real ones skipping), clippy and fmt clean, the 6 real tests in 38.3 s (`r9-linux-kvm-final.out`: make 127 ms, guest ready 2784 ms, delete 70 ms), and six cycles through the driver (`r9-two-machines-final.out`): create 141 to 149 ms, delete 70 to 110 ms. `describe` and `list` take 5 to 6 ms where they took 1 to 2: a list with a running VM now asks `nft` for the node's tables once.
+
+### Finding 3: what was not hit
+
+The reviewer's worry is a helper stopped in the middle of a make, whose tools then run on beside the next helper. A make takes about 130 ms. The unit was killed four times while VMs were being made, twice over (`r9-review-after.out`); none of the eight kills fell inside a make. The node was clean after each run, and the VMs that ran were listed again. So the change rests on the reading of the cgroups, which holds, and not on a caught race.
+
+### Finding 4: what was measured, and what is left (`r9-snapshot-memory.out`)
+
+A snapshot as the agent makes it, written to in two ways, with the kernel's slab memory before and after (not the VMM's cgroup: the snapshot's bookkeeping is the kernel's own, and whether any of it is charged to a cgroup was not looked at):
+
+| Chunk | Written in order, 3 GiB | Scattered, one 4 KiB write into every second chunk, 500,000 chunks |
+|---|---|---|
+| 4 KiB (today's) | +74 MiB | +70 MiB, 148 bytes a chunk; a 20 GiB snapshot written to its end this way: about 740 MiB |
+| 8 KiB | +71 MiB | +108 MiB, 227 bytes a chunk; about 570 MiB |
+| 32 KiB | +73 MiB | the 8 GiB snapshot file was full before the end |
+| 64 KiB | +76 MiB | the same |
+
+Written in order, the cost is about 25 MiB for each GiB whatever the chunk: that is the bookkeeping of the snapshot's file, not the table of chunks. Scattered writes add the table: with 4 KiB chunks a guest that touches its whole 20 GiB snapshot in the worst order holds about three quarters of a GiB of kernel memory outside its VMM's limit. A larger chunk lowers the count of chunks a snapshot can hold, and so the bound, and makes each scattered write cost a whole chunk of the snapshot. The chunk is left at 4 KiB in this change: choosing another needs a guest's own writes (a real run with Docker) measured for time and space, which this round has not. Proposed: measure 32 KiB under a real run; until then, a node's `check` could count about 40 MiB of kernel memory for each GiB of `snapshotMib` beside the VMMs' own. Not done either: `io.max` or `io.weight` for a VMM (the template has no field for it), and reserving the snapshot's space instead of checking it.
+
+### Finding 6: what bounds a jail's size
+
+Nothing yet. `fsize` bounds one file of the VMM, not the count of its files, so a process of the VM's user can fill the jails' file system with small files or directories, which stops the next VM's jail from being made (its kernel is copied there). The removal now copes with whatever it finds. Proposed, not built: each jail's root as a small file system of its own (a tmpfs with `size=` and `nr_inodes=`, charged to the VMM's cgroup), or a project quota on the jails' directory.
+
+### Finding 9: the serial port with the console off (`r9-com1.out`)
+
+A VM by hand in the agent's layout, with a program in its disk that writes a marker to port 0x3f8, run as the guest's init:
+
+```
+== control, with console=ttyS0
+... ioperm: Function not implemented  SCRIPT-ENDED status 1
+```
+
+Kata's guest kernel is built without `ioperm` and `iopl`, has no `/dev/port` and loads no module, so a process in the guest, root included, has no way to the port. Code in the guest's kernel has: the VMM emulates the port whatever the kernel's command line says, and copies what is written to its standard output, the console file, up to the 64 MiB bound. The same file holds Firecracker's own log, which goes to standard output too (its standard error stayed empty), and a guest's kernel can make Firecracker write lines there (`vcpu: IO write @ 0x71 failed`). So "nothing of a guest's log is on the node" was too strong; the README now says what holds. Not changed: the VMM's standard output. Sending it to `/dev/null` would lose Firecracker's own messages, which is where a make's failure is explained; giving Firecracker a log file of its own (`--log-path`) and its standard output to `/dev/null` would keep both apart, and is proposed.
