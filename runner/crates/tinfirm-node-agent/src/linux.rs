@@ -178,6 +178,54 @@ pub fn snapshot_table(sectors: u64, origin: &str, cow: &str) -> String {
     format!("0 {sectors} snapshot {origin} {cow} N 8")
 }
 
+/// `dmsetup create` for a VM's snapshot. `--noudevsync`: the helper takes the device's numbers
+/// from `dmsetup info` and makes its node in the jail itself, so it needs none of udev's
+/// links under `/dev/mapper`, and does not wait for a udev that is stopped or slow.
+pub fn snapshot_create_argv(device: &str, table: &str) -> Vec<String> {
+    [
+        "dmsetup",
+        "create",
+        "--noudevsync",
+        device,
+        "--table",
+        table,
+    ]
+    .iter()
+    .map(|w| w.to_string())
+    .collect()
+}
+
+/// What a file system must have free for one more snapshot of `wanted` bytes: the snapshot,
+/// and what the snapshots that are there (each `(size, allocated)`) may still grow by. A
+/// snapshot file is sparse, so nothing else keeps one guest that fills its disk from taking
+/// the room that another VM's writes need. `None` when there is room; the problem otherwise.
+pub fn disk_room_problem(free: u64, others: &[(u64, u64)], wanted: u64) -> Option<String> {
+    let promised: u64 = others
+        .iter()
+        .map(|(size, allocated)| size.saturating_sub(*allocated))
+        .sum();
+    let needed = wanted.saturating_add(promised);
+    (free < needed).then(|| {
+        format!(
+            "the work directory's file system has {} MiB free, and {} MiB are needed: {} MiB for this snapshot and {} MiB that the snapshots of {} other VM(s) may still grow by",
+            free >> 20,
+            needed >> 20,
+            wanted >> 20,
+            promised >> 20,
+            others.len()
+        )
+    })
+}
+
+/// The tables of `nft list tables`, by family and name (`inet tinfirm_00000000002a`).
+pub fn tables_of(listing: &str) -> std::collections::BTreeSet<String> {
+    listing
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("table "))
+        .map(|table| table.trim().to_string())
+        .collect()
+}
+
 /// The snapshot file's size in bytes.
 pub fn snapshot_bytes(template: &Template) -> u64 {
     u64::from(template.snapshot_mib) * 1024 * 1024
@@ -442,8 +490,8 @@ pub fn device_numbers(text: &str) -> Option<(u32, u32)> {
 }
 
 /// What a VMM's `/proc/<pid>/status` must say, as problems: the VM's own user and group in
-/// all four places, no effective, permitted, inheritable or ambient capability, a bounding set
-/// within the jailer's six, `NoNewPrivs`, and a seccomp filter.
+/// all four places, no supplementary group, no effective, permitted, inheritable or ambient
+/// capability, a bounding set within the jailer's six, `NoNewPrivs`, and a seccomp filter.
 pub fn vmm_status_problems(status: &str, uid: u32, gid: u32) -> Vec<String> {
     let field = |name: &str| {
         status
@@ -463,6 +511,11 @@ pub fn vmm_status_problems(status: &str, uid: u32, gid: u32) -> Vec<String> {
             Some(words) if words.len() == 4 && words.iter().all(|w| *w == wanted) => {}
             _ => problems.push(format!("its {name} is not {wanted} in all four places")),
         }
+    }
+    // No supplementary group: the jailer drops them, whatever its starter had.
+    match field("Groups") {
+        Some(groups) if groups.is_empty() => {}
+        _ => problems.push("it has supplementary groups".to_string()),
     }
     for name in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
         if hex(name) != Some(0) {
@@ -487,8 +540,8 @@ pub fn vmm_status_problems(status: &str, uid: u32, gid: u32) -> Vec<String> {
 /// Where the node's tools are looked for: the system's directories, never the caller's `PATH`.
 pub const TOOL_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// The tools the execution runs.
-pub const TOOLS: [&str; 8] = [
-    "ip", "nft", "sysctl", "losetup", "dmsetup", "blockdev", "mknod", "kill",
+pub const TOOLS: [&str; 7] = [
+    "ip", "nft", "sysctl", "losetup", "dmsetup", "blockdev", "mknod",
 ];
 /// The kernel modules a make needs, by their names under `/sys/module`. The helper loads
 /// none: the node loads them at boot (`units/tinfirm-node-agent-modules.service`). Each
@@ -545,10 +598,23 @@ fn plain(text: &[u8]) -> String {
         .collect()
 }
 
+/// How long one tool may run. The helper does one thing at a time, under its record's lock:
+/// a tool that never ends (a `dmsetup` that waits for a udev that is stopped, an `nft` that
+/// waits for a lock) would stop every later make, delete, list and check.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most of a tool's output that is kept.
+const TOOL_OUTPUT_MAX: u64 = 1024 * 1024;
+
 /// Runs one tool: an argument vector, no shell, an empty environment but for [`TOOL_PATH`],
 /// `stdin` on its standard input. Its standard output is returned, trimmed; a failure names
-/// the command and what it wrote.
+/// the command and what it wrote. A tool that has not ended after [`TOOL_TIMEOUT`] is killed
+/// with its whole process group (`ip netns exec` starts a second process), and that is a
+/// failure to run it, not an answer.
 fn tool(argv: &[String], stdin: Option<&str>) -> Result<String, ToolError> {
+    tool_within(argv, stdin, TOOL_TIMEOUT)
+}
+
+fn tool_within(argv: &[String], stdin: Option<&str>, limit: Duration) -> Result<String, ToolError> {
     let shown = argv.join(" ");
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
@@ -561,27 +627,79 @@ fn tool(argv: &[String], stdin: Option<&str>) -> Result<String, ToolError> {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| ToolError::Start(format!("cannot run `{shown}`: {}", e.kind())))?;
     if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // A tool that ends before it read everything fails by its exit status below.
         let _ = pipe.write_all(text.as_bytes());
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| ToolError::Start(format!("cannot wait for `{shown}`: {}", e.kind())))?;
-    if !output.status.success() {
-        let said = if output.stderr.is_empty() {
-            &output.stdout
+    // Both outputs are read beside the wait, so that a tool that writes much cannot block on
+    // a full pipe; each reader ends when the tool's last process has closed its end.
+    let reader = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(pipe) = pipe {
+                let _ = pipe.take(TOOL_OUTPUT_MAX).read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let out = reader(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = reader(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    // Most tools end within a millisecond or two: the wait starts short and grows, so that a
+    // make of two dozen tools does not spend its time asleep.
+    let end = Instant::now() + limit;
+    let mut pause = Duration::from_micros(100);
+    let status = loop {
+        let status = child.try_wait().ok().flatten();
+        if status.is_some() || Instant::now() >= end {
+            break status;
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(5));
+    };
+    if status.is_none() {
+        // The whole group: the tool, and what it started.
+        let _ = rustix::process::kill_process_group(
+            rustix::process::Pid::from_child(&child),
+            rustix::process::Signal::KILL,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let (said_out, said_err) = (
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    );
+    let Some(status) = status else {
+        return Err(ToolError::Start(format!(
+            "`{shown}` did not end within {} s and was killed",
+            limit.as_secs()
+        )));
+    };
+    if !status.success() {
+        let said = if said_err.is_empty() {
+            &said_out
         } else {
-            &output.stderr
+            &said_err
         };
         return Err(ToolError::Exit {
             shown: format!("`{shown}` failed: {}", plain(said)),
             said: String::from_utf8_lossy(said).into_owned(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&said_out).trim().to_string())
 }
 
 fn words(list: &[&str]) -> Vec<String> {
@@ -694,6 +812,10 @@ fn loops_of(file: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Waits until `gone` says so, at most `limit`.
 fn wait_until(limit: Duration, mut gone: impl FnMut() -> bool) -> bool {
     let end = Instant::now() + limit;
@@ -740,9 +862,23 @@ fn private_dir(path: &Path) -> Result<(), BackendError> {
 }
 
 /// The state the VMM's API reports (`GET /` on its socket): `Running` once the guest runs.
-/// The socket lies in a directory of the VM's user, so the answer is read with a bound and a
-/// timeout, and nothing of it is used but whether it says `Running`.
+///
+/// The socket lies in a directory of the VM's user. It is asked only during a make, before
+/// the make returns: until the guest runs, the one process of that user is the VMM that the
+/// helper has just started from root's own binary, so the path is still what the VMM made.
+/// Even so nothing is trusted of it: the answer is read with a bound and a timeout, nothing
+/// of it is used but whether it says `Running`, and the connection is made on a thread of its
+/// own with a deadline, since a connect to a local socket whose queue is full does not end.
 fn vmm_runs(socket: &Path) -> bool {
+    let (answer, asked) = std::sync::mpsc::channel();
+    let socket = socket.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = answer.send(ask_vmm(&socket));
+    });
+    asked.recv_timeout(Duration::from_secs(3)).unwrap_or(false)
+}
+
+fn ask_vmm(socket: &Path) -> bool {
     let Ok(mut stream) = UnixStream::connect(socket) else {
         return false;
     };
@@ -763,7 +899,7 @@ fn vmm_runs(socket: &Path) -> bool {
             Ok(0) | Err(_) => break,
             Ok(n) => answer.extend_from_slice(&buffer[..n]),
         }
-        if answer.windows(2).any(|w| w == b"}\n" || w == b"}\r") || answer.ends_with(b"}") {
+        if answer.ends_with(b"}") {
             break;
         }
     }
@@ -806,6 +942,8 @@ pub struct LinuxBackend {
     fail_after: Option<Step>,
     /// Test-only: a failed make leaves what it made, as a helper that was killed would.
     leave_failed: bool,
+    /// The VMs, by serial, whose last delete failed: the next one does not wait again.
+    failed_deletes: std::sync::Mutex<std::collections::BTreeSet<u64>>,
 }
 
 impl LinuxBackend {
@@ -816,6 +954,7 @@ impl LinuxBackend {
             starter: PathBuf::from("/proc/self/exe"),
             fail_after: None,
             leave_failed: false,
+            failed_deletes: std::sync::Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -833,6 +972,32 @@ impl LinuxBackend {
         self.fail_after = Some(step);
         self.leave_failed = leave;
         self
+    }
+
+    /// Whether the work directory's file system has room for one more snapshot of `wanted`
+    /// bytes beside what the snapshots that are there may still grow by ([`disk_room_problem`]).
+    fn room_problem(&self, wanted: u64) -> Option<String> {
+        let work = &self.config.firecracker.work;
+        let stat = match rustix::fs::statvfs(work) {
+            Ok(stat) => stat,
+            Err(e) => {
+                return Some(format!(
+                    "the free space of {} cannot be read: {}",
+                    work.display(),
+                    std::io::Error::from(e).kind()
+                ));
+            }
+        };
+        let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+        let mut others = Vec::new();
+        for entry in std::fs::read_dir(work).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".snapshot")
+                && let Ok(meta) = entry.metadata()
+            {
+                others.push((meta.len(), meta.blocks().saturating_mul(512)));
+            }
+        }
+        disk_room_problem(free, &others, wanted)
     }
 
     fn done(&self, step: Step) -> Result<(), BackendError> {
@@ -941,13 +1106,7 @@ impl LinuxBackend {
             .map_err(|_| failed("the shared image's size cannot be read"))?;
         let device = plan.names.snapshot();
         run(
-            &words(&[
-                "dmsetup",
-                "create",
-                &device,
-                "--table",
-                &snapshot_table(sectors, &origin, &cow),
-            ]),
+            &snapshot_create_argv(&device, &snapshot_table(sectors, &origin, &cow)),
             None,
         )?;
         let numbers = run(
@@ -1118,6 +1277,35 @@ fn root_dir(problems: &mut Vec<String>, checked: &mut Vec<String>, what: &str, p
 /// put it.
 pub const BUILT_IN_COPY: &str = "/run/tinfirm-node-agent-modules/modules.builtin";
 
+/// `MemTotal` of `/proc/meminfo`, in MiB.
+pub fn memory_total_mib(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib / 1024)
+}
+
+/// The kernel's cgroups have `cgroup.kill` (Linux 5.14): every cgroup but the root has the
+/// file, so the helper's own cgroup shows it; a helper in the root cgroup asks the release.
+fn cgroup_kill_there() -> bool {
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let path = own
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .unwrap_or("/")
+        .trim();
+    if path != "/" {
+        return Path::new("/sys/fs/cgroup")
+            .join(path.trim_start_matches('/'))
+            .join("cgroup.kill")
+            .exists();
+    }
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|n| n.parse::<u32>().ok());
+    matches!((numbers.next(), numbers.next()), (Some(major), Some(minor)) if (major, minor) >= (5, 14))
+}
+
 /// A kernel module is there: loaded (an entry under `sys_module`, the node's `/sys/module`),
 /// or built into the running kernel (a line of `built_in`, the text of the kernel's
 /// `modules.builtin`: one path per line, `kernel/drivers/net/veth.ko`). A built-in module has
@@ -1193,6 +1381,32 @@ impl Backend for LinuxBackend {
                 "{NODE_FORWARDING} is not 1: the node does not forward a published port to its VM"
             )),
         }
+        if cgroup_kill_there() {
+            checked.push("cgroup.kill".into());
+        } else {
+            problems.push(
+                "this kernel's cgroups have no `cgroup.kill` (Linux 5.14): the helper ends a VM's processes through it and in no other way".into(),
+            );
+        }
+        // Every slot at once: the snapshots' room, and the VMMs' memory.
+        let all = u64::from(self.config.max_vms);
+        if let Some(problem) = self.room_problem(all.saturating_mul(snapshot_bytes(template))) {
+            problems.push(format!(
+                "for {all} VM(s) of this template at once: {problem}"
+            ));
+        } else {
+            checked.push(format!("room for {all} snapshot(s) of this template"));
+        }
+        let wanted_mib = all * (u64::from(template.memory_mib) + VMM_OVERHEAD_MIB);
+        match memory_total_mib(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default()) {
+            Some(total) if total >= wanted_mib => {
+                checked.push(format!("memory for {all} VM(s) of this template"));
+            }
+            Some(total) => problems.push(format!(
+                "the node has {total} MiB of memory, and {all} VM(s) of this template may use {wanted_mib} MiB: lower maxVms or the template's memoryMib"
+            )),
+            None => problems.push("the node's memory cannot be read from /proc/meminfo".into()),
+        }
         match std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
             Ok(controllers) => {
                 for controller in ["cpu", "memory", "pids"] {
@@ -1254,11 +1468,16 @@ impl Backend for LinuxBackend {
             Presence::There => return Err(failed("the jail exists already")),
             Presence::Unknown(why) => return Err(failed(why)),
         }
-        let mut disk = user_data_disk(user_data)
-            .ok_or_else(|| failed("the user data is empty or over its size"))?;
+        if let Some(problem) = self.room_problem(snapshot_bytes(&plan.template)) {
+            return Err(failed(problem));
+        }
+        // Overwritten when it is dropped: the disk is in the jail by then, or never will be,
+        // and no copy of the user data stays here.
+        let disk = crate::spool::Wiped::new(
+            user_data_disk(user_data)
+                .ok_or_else(|| failed("the user data is empty or over its size"))?,
+        );
         let built = self.build(plan, &disk, &places);
-        // The disk is in the jail, or never will be: no copy of the user data stays here.
-        crate::spool::wipe(&mut disk);
         drop(disk);
         let Err(error) = built else {
             return Ok(());
@@ -1317,14 +1536,20 @@ impl Backend for LinuxBackend {
             Err(why) => Presence::Unknown(why),
         };
 
-        // The VMM and whatever else is in its cgroup.
+        // A VM whose last delete failed is not waited for again: the listener asks for a
+        // delete of a VM that cannot be removed about every second, and every make sweeps
+        // it, so each step is then tried once, and the answer comes at once.
+        let patience = if lock(&self.failed_deletes).contains(&names.serial) {
+            Duration::ZERO
+        } else {
+            KILL_TIMEOUT
+        };
+
+        // The VMM and whatever else is in its cgroup, through `cgroup.kill` (`check` asks for
+        // it). There is no other way: the helper may not signal another user's process.
         if presence(&places.cgroup) != Presence::Gone {
-            if std::fs::write(places.cgroup.join("cgroup.kill"), "1").is_err() {
-                for pid in cgroup_pids(&places.cgroup).unwrap_or_default() {
-                    let _ = tool(&words(&["kill", "-KILL", &pid.to_string()]), None);
-                }
-            }
-            wait_until(KILL_TIMEOUT, || pids(&places.cgroup) != Presence::There);
+            let _ = std::fs::write(places.cgroup.join("cgroup.kill"), "1");
+            wait_until(patience, || pids(&places.cgroup) != Presence::There);
             check("processes of its cgroup".into(), pids(&places.cgroup));
         }
 
@@ -1334,8 +1559,11 @@ impl Backend for LinuxBackend {
             // The VMM's descriptor of the device closes a moment after its process is gone:
             // the first tries may find the device busy. `dmsetup remove --retry` would sleep
             // 200 ms after each; this loop tries again every 10 ms.
-            wait_until(KILL_TIMEOUT, || {
-                let _ = tool(&words(&["dmsetup", "remove", &device]), None);
+            wait_until(patience, || {
+                let _ = tool(
+                    &words(&["dmsetup", "remove", "--noudevsync", &device]),
+                    None,
+                );
                 device_state(&device) != Presence::There
             });
         }
@@ -1347,9 +1575,12 @@ impl Backend for LinuxBackend {
             let _ = tool(&words(&["losetup", "--detach", &attached]), None);
         }
         // A loop device is detached once its last user closed it, which may be a moment later.
-        wait_until(KILL_TIMEOUT, || {
-            loop_state(&places.snapshot_file) != Presence::There
-        });
+        // While the snapshot's device is still there it is that user: no waiting for it then.
+        if device_state(&device) == Presence::Gone {
+            wait_until(patience, || {
+                loop_state(&places.snapshot_file) != Presence::There
+            });
+        }
         check(
             format!("the loop device of {}", places.snapshot_file.display()),
             loop_state(&places.snapshot_file),
@@ -1392,7 +1623,7 @@ impl Backend for LinuxBackend {
 
         // The cgroup: empty by now, but the kernel may need a moment to let it go.
         if presence(&places.cgroup) != Presence::Gone {
-            wait_until(KILL_TIMEOUT, || {
+            wait_until(patience, || {
                 let _ = std::fs::remove_dir(&places.cgroup);
                 presence(&places.cgroup) != Presence::There
             });
@@ -1404,9 +1635,10 @@ impl Backend for LinuxBackend {
 
         // The jail's directory: the last, since it is what `list` finds the VM by.
         if left.is_empty() {
-            match std::fs::remove_dir_all(&places.jail_dir) {
+            // Not `std::fs::remove_dir_all`: the chroot is the VM's user's, and a tree that
+            // user made thousands of levels deep must not end the removal (`crate::tree`).
+            match crate::tree::remove_tree(&places.jail_dir) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => left.push(format!(
                     "the jail {} ({})",
                     places.jail_dir.display(),
@@ -1425,8 +1657,10 @@ impl Backend for LinuxBackend {
             }
         }
         if left.is_empty() {
+            lock(&self.failed_deletes).remove(&names.serial);
             Ok(())
         } else {
+            lock(&self.failed_deletes).insert(names.serial);
             Err(failed(format!(
                 "of the VM {jail} this is left: {}",
                 left.join(", ")
@@ -1452,6 +1686,8 @@ impl Backend for LinuxBackend {
         // An entry that cannot be read fails the listing: a jail left out of it would give its
         // slot to another VM, and would hide a jail of a form the helper does not know.
         let mut present = Vec::new();
+        // Asked once for the whole listing, and only when a VMM runs.
+        let mut tables: Option<std::collections::BTreeSet<String>> = None;
         for entry in entries {
             let entry = entry.map_err(|e| {
                 BackendError::Failed(format!(
@@ -1463,12 +1699,25 @@ impl Backend for LinuxBackend {
             let name = entry.file_name();
             let names = name.to_str().and_then(Names::from_jail);
             // A cgroup that cannot be read fails the listing: "not alive" must be known.
-            let alive = match names {
+            let mut alive = match names {
                 Some(names) => vmm_pid(&places(&self.config.firecracker, &names).cgroup)
                     .map_err(BackendError::Failed)?
                     .is_some(),
                 None => false,
             };
+            // A VM whose node table is gone (a flush of the node's whole ruleset removes it)
+            // still runs, and nothing reaches it: it is reported as not alive, so that the
+            // control host ends its run and deletes it, instead of waiting on a dead port.
+            if let (true, Some(names)) = (alive, names) {
+                if tables.is_none() {
+                    let listing = tool(&words(&["nft", "list", "tables"]), None)
+                        .map_err(|e| BackendError::Failed(e.to_string()))?;
+                    tables = Some(tables_of(&listing));
+                }
+                alive = tables
+                    .as_ref()
+                    .is_some_and(|tables| tables.contains(&format!("inet {}", names.table())));
+            }
             present.push(Present {
                 jail: name.to_string_lossy().into_owned(),
                 names,
@@ -1789,6 +2038,9 @@ mod tests {
 
         std::fs::create_dir_all(&p.chroot).unwrap();
         std::fs::create_dir_all(dir.path().join("firecracker/other")).unwrap();
+        // A cgroup parent that no machine has: on a node, the agent's own cannot be read by
+        // an ordinary user, which the listing takes for "could not ask", and fails.
+        config.firecracker.cgroup_parent = "tinfirm-unit-test-no-such-parent".into();
         let backend = LinuxBackend::new(config.clone());
         let mut listed = backend.list().unwrap();
         listed.sort_by(|a, b| a.jail.cmp(&b.jail));
@@ -1905,7 +2157,7 @@ mod tests {
 
     /// The status of the VMM of the first real run (`/proc/<pid>/status`, the lines that matter).
     const VMM_STATUS: &str = "Name:\tfirecracker\nUid:\t1100000\t1100000\t1100000\t1100000\n\
-        Gid:\t1100000\t1100000\t1100000\t1100000\nNoNewPrivs:\t1\nSeccomp:\t2\n\
+        Gid:\t1100000\t1100000\t1100000\t1100000\nGroups:\t \nNoNewPrivs:\t1\nSeccomp:\t2\n\
         CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\n\
         CapBnd:\t00000000082000c3\nCapAmb:\t0000000000000000\n";
 
@@ -1941,13 +2193,18 @@ mod tests {
             wrong("Seccomp:\t2", "Seccomp:\t0"),
             ["it has no seccomp filter"]
         );
+        // What a jailer that kept its starter's groups would leave.
+        assert_eq!(
+            wrong("Groups:\t \n", "Groups:\t4 27 \n"),
+            ["it has supplementary groups"]
+        );
         // Another slot's user is not this VM's.
         assert_eq!(
             vmm_status_problems(VMM_STATUS, 1_100_001, 1_100_001).len(),
             2
         );
         // A status that cannot be read is no proof of anything.
-        assert_eq!(vmm_status_problems("", 1, 1).len(), 9);
+        assert_eq!(vmm_status_problems("", 1, 1).len(), 10);
     }
 
     /// The second and third lines are what a node showed after its helper was started again
@@ -2038,6 +2295,92 @@ mod tests {
             Some(built_in)
         );
         assert_eq!(built_in_modules(&[missing]), None);
+    }
+
+    #[test]
+    fn a_tool_that_does_not_end_is_killed_with_what_it_started_and_that_is_no_answer() {
+        let argv: Vec<String> = ["sh", "-c", "sleep 60 & sleep 60"]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+        let start = Instant::now();
+        let error = tool_within(&argv, None, Duration::from_millis(300)).unwrap_err();
+        // Not after 60 s: the second `sleep` held the pipes, and went with the group.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(
+            matches!(&error, ToolError::Start(why) if why.contains("did not end within")),
+            "{error}"
+        );
+        // One that ends in time is read as before, its standard input included.
+        let cat: Vec<String> = vec!["cat".into()];
+        assert_eq!(
+            tool_within(&cat, Some("rules\n"), Duration::from_secs(5)).unwrap(),
+            "rules"
+        );
+        let fails: Vec<String> = ["sh", "-c", "echo no >&2; exit 3"]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+        assert!(matches!(
+            tool_within(&fails, None, Duration::from_secs(5)),
+            Err(ToolError::Exit { said, .. }) if said == "no\n"
+        ));
+    }
+
+    #[test]
+    fn a_snapshot_needs_its_own_room_and_what_the_others_may_still_grow_by() {
+        const GIB: u64 = 1 << 30;
+        // An empty work directory: the snapshot's size.
+        assert_eq!(disk_room_problem(8 * GIB, &[], 8 * GIB), None);
+        assert!(disk_room_problem(8 * GIB - 1, &[], 8 * GIB).is_some());
+        // Two snapshots of 8 GiB there, one with 1 GiB written, one full: 7 GiB are promised.
+        let others = [(8 * GIB, GIB), (8 * GIB, 8 * GIB)];
+        assert_eq!(disk_room_problem(15 * GIB, &others, 8 * GIB), None);
+        let problem = disk_room_problem(15 * GIB - 1, &others, 8 * GIB).unwrap();
+        assert!(
+            problem.contains("15359 MiB free") && problem.contains("15360 MiB are needed"),
+            "{problem}"
+        );
+        assert!(problem.contains("2 other VM(s)"), "{problem}");
+        // The command for the snapshot does not wait for udev.
+        assert_eq!(
+            snapshot_create_argv(
+                "tinfirm-tfvm-000000000001-0000",
+                "0 8 snapshot /dev/loop0 /dev/loop1 N 8"
+            ),
+            [
+                "dmsetup",
+                "create",
+                "--noudevsync",
+                "tinfirm-tfvm-000000000001-0000",
+                "--table",
+                "0 8 snapshot /dev/loop0 /dev/loop1 N 8"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_nodes_tables_and_its_memory_are_read_from_what_the_node_prints() {
+        let tables = tables_of(
+            "table ip security\ntable inet tinfirm_node\ntable inet tinfirm_00000000002a\n",
+        );
+        assert!(tables.contains("inet tinfirm_00000000002a"));
+        assert!(tables.contains("inet tinfirm_node"));
+        assert!(!tables.contains("inet tinfirm_00000000002b"));
+        // Another family's table of the same name is not the VM's.
+        assert!(
+            !tables_of("table ip tinfirm_00000000002a\n").contains("inet tinfirm_00000000002a")
+        );
+        assert!(tables_of("").is_empty());
+        assert_eq!(
+            memory_total_mib("MemTotal:       16375032 kB\nMemFree:  1 kB\n"),
+            Some(15991)
+        );
+        assert_eq!(memory_total_mib("MemFree: 1 kB\n"), None);
     }
 
     #[test]

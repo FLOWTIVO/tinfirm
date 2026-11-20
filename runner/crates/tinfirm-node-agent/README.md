@@ -56,7 +56,7 @@ The paths are the defaults the role is to use (planned). Each is set in a config
 | `/var/lib/tinfirm-node-agent/` | root:root | 0755 | The spool's parent. The helper refuses, at its start and before each read, a parent that is not a directory of its own user (root) or that its group or others can write: then only root can rename the spool's entry, and the directory the helper opens a name in is the spool. Its own parents must be root's as well (`/var/lib`, `/var`), which the helper does not check |
 | `/var/lib/tinfirm-node-agent/spool/` | tinfirm-node-listener | 0700 | The listener's spool. The helper refuses, at its start and before each read, a spool that is a link or not the listener's 0700 directory. `<id>.userdata`, 0600, is written just before a make and removed just after it, whatever the answer; a listener that stopped between the two leaves it, and the next listener's start removes every entry of the spool |
 | `/var/lib/tinfirm-node-agent/listener/` | tinfirm-node-listener | 0700 | The listener's state: `vms/<id>.json`, a record per VM, 0600, written whole as `<id>.json.next` and renamed into place. At its start the listener removes `*.json.next` and moves a record it cannot read aside as `<id>.json.bad` |
-| `/var/lib/tinfirm-node-agent/helper/` | root | 0700 | The helper's state: `vms.json`, 0600, written whole and renamed into place. The helper refuses a directory that is not its own 0700 one |
+| `/var/lib/tinfirm-node-agent/helper/` | root | 0700 | The helper's state: `vms.json`, 0600, written whole and renamed into place. Beside it `lock`, on which one helper holds a lock while it lives: a second helper on the same state does not start, since each would remove the other's VMs as leftovers. The helper refuses a directory that is not its own 0700 one |
 | `/srv/tinfirm-jails/` | root:root | 0755 | The jailer's chroot base. `check` asks for a directory of root's that nobody else can write |
 | `/srv/tinfirm-jails/firecracker/<jail>/` | root | 0700 | A VM's jail directory: the mark that this VM is on the node. A make creates it first and a delete removes it last, so `list`, which reads this directory, shows a VM in every state in between. Root's alone: even the VM's own user has no path to its chroot from outside |
 | `/srv/tinfirm-jails/firecracker/<jail>/root/` | the VM's user | 0700 | The chroot, which the jailer hands to the VM's user. The helper puts `vmlinux`, `root.disk` (the snapshot's device node), `userdata.disk` and `vm.json` there, each the VM's user's, 0600; the jailer adds `firecracker`, `dev/` and `run/` |
@@ -114,10 +114,10 @@ Both files are JSON. An unknown field anywhere is refused. Paths are absolute.
 | `vmUidBase` | At least 100000; `vmUidBase + maxVms` below 2^31 |
 | `network.vmRange` | `A.B.C.D/P`, P from 8 to 29, no bit set below the prefix; room for `maxVms` slots of 8 addresses; holds neither `nodeAddress` nor `controlHost` |
 | `network.controlHost`, `network.nodeAddress` | Two different addresses; neither loopback nor `0.0.0.0`. A control host on the node itself is the single machine, which is planned (above) |
-| `network.firstPort` | At least 1024; `firstPort + maxVms - 1` at most 65535 |
+| `network.firstPort` | At least 1024; `firstPort + maxVms - 1` at most 65535. The published ports must not hold the listener's own port (`tls.listen`): the helper does not know the listener's configuration, so this is the installation's to keep |
 | `firecracker.firecracker` | A file named `firecracker`: the jailer names the chroot after it |
 | `firecracker.cgroupParent` | One name of letters, digits, `-` and `_` |
-| `firecracker.guestConsole` | `false` (default): the guest has no serial port to write to, and nothing of a guest's log is on the node. `true`: the guest's kernel and its journal write to the serial console, which the helper keeps in `<work>/<jail>.console` until the VM is deleted, for finding out why a guest does not come up. A guest's log may hold what a run printed: leave it off where runs are real |
+| `firecracker.guestConsole` | `false` (default): the guest's kernel has no serial driver (`8250.nr_uarts=0`) and no console, so nothing of a guest's log reaches the node. The VMM still emulates the port: code that runs in the guest's kernel can write to it, and that lands in the console file up to its bound; a process in the guest cannot with the kernel that ran (no `ioperm`, no `/dev/port`, no modules). `true`: the guest's kernel and its journal write to the serial console, which the helper keeps in `<work>/<jail>.console` until the VM is deleted, for finding out why a guest does not come up. A guest's log may hold what a run printed: leave it off where runs are real |
 | A template's `image`, `kernel`, and the two programs | Regular files of root's that only root can write, not links: `check` names each that is not |
 | Every path | Absolute, of letters, digits, `/`, `-`, `_` and `.`, without `.` or `..` parts |
 | A template's name | The form below |
@@ -313,19 +313,22 @@ Only then does it read the bytes, at most 65537, and refuse them if their count 
 
 ## The Linux backend
 
-`src/linux.rs`. The first half plans: pure functions from a `VmPlan` to the data the backend acts on. The second half runs them as root: each command is an argument vector, run without a shell and with no environment but `PATH=/usr/sbin:/usr/bin:/sbin:/bin`; each result is checked; and what a silent failure would hide is read back.
+`src/linux.rs`. The first half plans: pure functions from a `VmPlan` to the data the backend acts on. The second half runs them as root: each command is an argument vector, run without a shell and with no environment but `PATH=/usr/sbin:/usr/bin:/sbin:/bin`; each result is checked; and what a silent failure would hide is read back. No tool may run longer than 10 s: one that does is killed with its process group, and counts as not run. The helper does one thing at a time, so a tool that never ended would stop every operation after it.
 
 ### What a node needs
 
-`check` (the wire's `verify`) names each of these that is missing, and the node makes no VM while one is:
+`check` (the wire's `verify`) names each of these that is missing, and a control host does not use a node that has a problem. `make` does not run the whole check again: it reads back what a VM cannot do without (the forwarding, the settings of its namespace, its two tables, the room for its snapshot) and fails with the reason.
 
 | What | Why |
 |---|---|
 | `/dev/kvm`, `/dev/net/tun`, `/dev/mapper/control`, `/dev/loop-control` | KVM, the tap device, the snapshot, the loop devices |
-| The tools `ip`, `nft`, `sysctl`, `losetup`, `dmsetup`, `blockdev`, `mknod`, `kill` | What the execution runs |
+| The tools `ip`, `nft`, `sysctl`, `losetup`, `dmsetup`, `blockdev`, `mknod` | What the execution runs |
 | The modules `kvm`, `dm_snapshot`, `veth`, `nf_tables`, `nft_ct`, `nft_chain_nat`, `nft_nat`, `nf_nat` | The helper loads none (`units/tinfirm-node-agent-modules.service` does, at boot). A module counts when `/sys/module/<name>` is there, or when the kernel's list of built-in modules names it: a built-in module has an entry under `/sys/module` only when it has a parameter. The list is read from `/lib/modules/<release>/modules.builtin`, or, since the helper's unit hides `/lib/modules`, from the copy that the modules' unit makes at `/run/tinfirm-node-agent-modules/modules.builtin` |
 | `net.ipv4.ip_forward=1` | A published port is a DNAT into the VM's namespace. The helper reads it and never writes it (`units/tinfirm-node-agent.sysctl.conf`). Forwarding makes the node a router for whatever reaches it: the node's own firewall (below) forwards nothing but the control host's connections to the published ports |
 | A cgroup v2 hierarchy with the `cpu`, `memory` and `pids` controllers | The VMM's limits |
+| `cgroup.kill` (Linux 5.14) | The one way the helper ends a VM's processes: it may not signal another user's process |
+| Room in the work directory's file system for `maxVms` snapshots of the template | A snapshot file is sparse: without the room, one guest that fills its disk takes what another VM's writes need. `make` asks the same for one more snapshot beside what those that are there may still grow by |
+| Memory for `maxVms` VMs of the template (`memoryMib` + 128 MiB each) within the node's | The VMMs' limits must not add up to more than the node has |
 | The jailer, Firecracker, the image and the kernel: regular files of root's that only root can write | The helper runs the first two as root and hands the others to every VM |
 | The jails' directory (root's, not writable by others) and the work directory (root's, 0700) | Where the VMs' files are |
 
@@ -352,12 +355,12 @@ The helper overwrites the user data's bytes, and the disk it made of them, befor
 
 Every step is tried whatever the one before did, and each is checked on the node afterwards. The delete fails while anything of the VM is left, and names it, so the helper keeps its record and its slot:
 
-1. The VMM and whatever else is in its cgroup: `cgroup.kill`, then a wait of at most 5 s until the cgroup has no process.
+1. The VMM and whatever else is in its cgroup: `cgroup.kill`, then a wait of at most 5 s until the cgroup has no process. A VM whose last delete failed is not waited for again, here or in the steps below: each step is tried once and the answer comes at once, since the listener asks again about every second.
 2. The snapshot's device (`dmsetup remove`, tried every 10 ms while the VMM's descriptor of it closes), then the snapshot file's loop device, then the snapshot file and the console file. The loop device is found by its backing file's name, which holds the VM's serial: the kernel shows that file's path as the reader's mount namespace sees it, which differs under the helper's unit and after a helper was started again (`is_backing_file`).
 3. The node's end of the veth (its peer goes with it), then the namespace, with its tap device and its table.
 4. The node's table of the VM. It counts as gone only when `nft list table` fails with its own "No such file or directory" (`table_is_gone`): nft ends with the same status when it may not ask the kernel, and that is no answer.
 5. The cgroup.
-6. The jail's directory, and only when nothing above is left: a VM that could not be removed stays listed.
+6. The jail's directory, and only when nothing above is left: a VM that could not be removed stays listed. The chroot is the VM's user's, who may have left a tree thousands of directories deep in it: the removal never goes deeper than one level (`src/tree.rs`), where `std`'s ends at the limit of open files.
 
 A delete of a VM that is half made, or of one that is gone, succeeds.
 
@@ -365,7 +368,7 @@ A delete of a VM that is half made, or of one that is gone, succeeds.
 
 ### The list
 
-Every entry under `<chrootBase>/firecracker/`, with its names where its name is of the helper's form, and `alive` while a process named `firecracker` runs in the VM's cgroup. A helper that is started again finds its VMs still running: each VMM is in a cgroup of its own, outside the helper's.
+Every entry under `<chrootBase>/firecracker/`, with its names where its name is of the helper's form, and `alive` while a process named `firecracker` runs in the VM's cgroup and the node's table of the VM is loaded. A flush of the node's whole ruleset (`nft flush ruleset`, which a distribution's `nftables.service` does when it loads its own file) removes that table under a running VM: nothing reaches the VM any more, so it is reported as `failed`, the control host ends its run, and its delete cleans up. The table is not loaded again: the helper would hide that the node's rules were flushed, its own firewall with them. A helper that is started again finds its VMs still running: each VMM is in a cgroup of its own, outside the helper's.
 
 ### The units
 
@@ -377,7 +380,7 @@ Every entry under `<chrootBase>/firecracker/`, with its names where its name is 
 | `tinfirm-node-agent.sysctl.conf` | `net.ipv4.ip_forward = 1`, and `user.max_user_namespaces = 0`: nothing on a node needs a user namespace, and a process that got out of a VMM would use one |
 | `tinfirm-node-agent.nft`, `tinfirm-node-agent-firewall.service` | The node's own firewall, and the unit that loads it before the agent starts. Below, "The node's firewall" |
 | `tinfirm-node-agent.tmpfiles.conf` | The directories, with the owners and modes the two processes check; `/run/netns`, which the helper's unit must find |
-| `tinfirm-node-agent-helper.service` | The helper: eight capabilities (the jailer's six, `CAP_SETPCAP` to cut the bounding set, `CAP_NET_ADMIN`), no IP address family, a read-only file system but for its own places, a closed device list, a system call filter. `KillMode=process`: its VMs outlive it |
+| `tinfirm-node-agent-helper.service` | The helper: eight capabilities (the jailer's six, `CAP_SETPCAP` to cut the bounding set, `CAP_NET_ADMIN`), no IP address family, a read-only file system but for its own places, a closed device list, a system call filter. Its VMs outlive it without `KillMode=process`: each VMM is in a cgroup of its own, outside the unit's |
 | `tinfirm-node-agent-listener.service` | The listener: its own user, no capability, no device, its two directories. The role adds `IPAddressAllow=` with the control host's address in a drop-in |
 
 Each of the helper's eight capabilities was removed in turn on a node: every one is needed, and each failure left nothing of the VM. Four settings are left out of the helper's unit, each for a reason found on a node (`ProtectKernelTunables`, `ProtectControlGroups`, `PrivateNetwork`, `PrivateIPC`); the unit's own comments say why. The confinement narrows a flaw's path; it does not make a helper under an attacker's control harmless: `CAP_SYS_ADMIN` with the device-mapper is root in effect.

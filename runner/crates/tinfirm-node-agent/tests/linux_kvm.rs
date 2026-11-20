@@ -708,7 +708,13 @@ fn a_helper_started_over_what_a_crash_left_removes_it_or_keeps_its_slot() {
         .failing_after(Step::Disks, true)
         .make(&plan, &node.user_data("held"))
         .unwrap_err();
-    let holder = std::fs::File::open(Path::new("/dev/mapper").join(plan.names.snapshot())).unwrap();
+    // The helper does not wait for udev, which makes this node a moment after the device.
+    let node_of_device = Path::new("/dev/mapper").join(plan.names.snapshot());
+    let start = Instant::now();
+    while !node_of_device.exists() && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let holder = std::fs::File::open(&node_of_device).unwrap();
     let helper = Helper::start(node.config.clone(), node.backend()).unwrap();
     let left = left_of(&node, &plan.names);
     assert!(

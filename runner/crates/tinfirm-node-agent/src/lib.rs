@@ -24,4 +24,5 @@ pub mod plan;
 pub mod spool;
 pub mod strict;
 pub mod tls;
+pub mod tree;
 pub mod wire;

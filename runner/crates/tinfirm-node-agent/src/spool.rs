@@ -178,7 +178,7 @@ pub fn read(
     id: &VmId,
     listener_uid: u32,
     parent_owner: u32,
-) -> Result<Vec<u8>, Refused> {
+) -> Result<Wiped, Refused> {
     check_spool(spool, listener_uid, parent_owner)?;
     let path = user_data_path(spool, id);
     let file = File::options()
@@ -196,9 +196,11 @@ pub fn read(
             .map_err(|e| Refused::Io(e.kind().to_string()))?,
     );
     check(&facts, listener_uid)?;
-    let mut bytes = Vec::with_capacity(facts.len as usize);
+    // Room for the most that is read, so that a file that grows after its size was checked
+    // cannot make the buffer move; and overwritten on every way out of here.
+    let mut bytes = Wiped(Vec::with_capacity(MAX_USER_DATA as usize + 1));
     file.take(MAX_USER_DATA + 1)
-        .read_to_end(&mut bytes)
+        .read_to_end(&mut bytes.0)
         .map_err(|e| Refused::Io(e.kind().to_string()))?;
     if bytes.len() as u64 > MAX_USER_DATA {
         return Err(Refused::TooLarge);
@@ -207,6 +209,36 @@ pub fn read(
         return Err(Refused::Changed);
     }
     Ok(bytes)
+}
+
+/// Bytes that hold user data, or a disk made of it: overwritten when they are dropped
+/// ([`wipe`]), on every path, the refusals and the errors included. The buffer is as large as
+/// it will ever be from the first, so it never moves and leaves no copy behind.
+pub struct Wiped(Vec<u8>);
+
+impl Wiped {
+    pub fn new(bytes: Vec<u8>) -> Wiped {
+        Wiped(bytes)
+    }
+}
+
+impl std::ops::Deref for Wiped {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for Wiped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Wiped({} bytes)", self.0.len())
+    }
 }
 
 /// Overwrites bytes that held user data, before their memory is given back: a ticket should
@@ -353,7 +385,7 @@ mod tests {
 
     /// `read` with the helper's user this test's.
     fn read(spool: &Path, id: &VmId, listener_uid: u32) -> Result<Vec<u8>, Refused> {
-        super::read(spool, id, listener_uid, own_uid())
+        super::read(spool, id, listener_uid, own_uid()).map(|bytes| bytes.to_vec())
     }
 
     fn id() -> VmId {

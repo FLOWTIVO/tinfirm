@@ -54,5 +54,9 @@ SystemCallErrorNumber=EPERM
 MemoryMax=256M
 TasksMax=64
 
+# Not here: `RuntimeDirectory=tinfirm-node-agent-listener` for the local socket of the single
+# machine (planned). Under ProtectSystem=strict the listener cannot make that directory itself,
+# and its group must be the runner host's, which only that installation knows.
+
 [Install]
 WantedBy=multi-user.target

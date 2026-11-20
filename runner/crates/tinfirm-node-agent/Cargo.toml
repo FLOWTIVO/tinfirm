@@ -27,9 +27,12 @@ tracing-subscriber.workspace = true
 # Constants only (O_NOFOLLOW, O_NONBLOCK, O_NOCTTY), whose values differ by architecture; no
 # call into libc, so no unsafe code.
 libc.workspace = true
-# prctl(PR_CAPBSET_DROP) for the VMM's bounding set (`src/bounding.rs`), which the workspace's
-# `unsafe_code` rule keeps out of our own code. Already in the workspace, for the runner host.
-rustix = { workspace = true, features = ["thread"] }
+# What `std` has no safe call for, and the workspace's `unsafe_code` rule keeps out of our own
+# code: prctl(PR_CAPBSET_DROP) for the VMM's bounding set (`src/bounding.rs`), the calls
+# relative to an open directory that remove a jail's tree (`src/tree.rs`), a file system's
+# free space, and a signal to a tool's process group (`src/linux.rs`). Already in the
+# workspace, for the runner host.
+rustix = { workspace = true, features = ["thread", "fs", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true

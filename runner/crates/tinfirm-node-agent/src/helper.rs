@@ -39,6 +39,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_CONNECTIONS: usize = 32;
 /// The helper's record of its VMs, in its state directory.
 pub const STATE_FILE: &str = "vms.json";
+/// The lock that one helper holds on its state directory.
+pub const LOCK_FILE: &str = "lock";
 
 /// A request. Its fields are exactly these: any other is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +262,9 @@ pub struct Helper<B: Backend> {
     state: Mutex<State>,
     /// The helper's own uid (root): the owner the spool's parent must have.
     own_uid: u32,
+    /// The lock on the state directory, held while this helper lives: a second helper on the
+    /// same state would sweep this one's VMs as leftovers, and this one the other's.
+    _lock: std::fs::File,
 }
 
 /// What the backend finds on the node beyond the helper's record.
@@ -313,12 +318,27 @@ impl<B: Backend> Helper<B> {
         }
         spool::check_spool(&config.spool, config.listener_uid, own)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let lock = std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(config.state.join(LOCK_FILE))
+            .with_context(|| format!("cannot open the lock in {}", config.state.display()))?;
+        if lock.try_lock().is_err() {
+            bail!(
+                "another helper holds the state directory {}: two helpers on one state would remove each other's VMs",
+                config.state.display()
+            );
+        }
         let mut state = State::load(&config.state)?;
         let helper = Helper {
             config,
             backend,
             state: Mutex::new(State::default()),
             own_uid: own,
+            _lock: lock,
         };
         let found = helper
             .sweep(&state)
@@ -469,7 +489,7 @@ impl<B: Backend> Helper<B> {
                     format!("the node runs its {} VMs", self.config.max_vms),
                 )
             })?;
-        let mut user_data = spool::read(
+        let user_data = spool::read(
             &self.config.spool,
             id,
             self.config.listener_uid,
@@ -495,13 +515,12 @@ impl<B: Backend> Helper<B> {
         });
         if let Err(e) = state.save(&self.config.state) {
             *state = before;
-            spool::wipe(&mut user_data);
             return Err(HelperError::new(Code::Failed, format!("{e:#}")));
         }
         let plan = plan::plan(&self.config, &template, slot, serial);
         let made = self.backend.make(&plan, &user_data);
-        // The VM has the user data, or never will: the helper keeps no copy of it.
-        spool::wipe(&mut user_data);
+        // The VM has the user data, or never will: the helper keeps no copy of it. The bytes
+        // are overwritten when they are dropped, here and on every refusal above.
         drop(user_data);
         if let Err(e) = made {
             tracing::warn!(vm = %id, jail = %plan.names.jail(), error = %e, "cannot make the VM");
@@ -840,6 +859,20 @@ mod tests {
 
     fn template() -> TemplateName {
         TemplateName::parse(b"sandbox-4c8g").unwrap()
+    }
+
+    #[test]
+    fn a_second_helper_on_the_same_state_does_not_start() {
+        let f = fixture();
+        let first = Helper::start(f.config.clone(), f.backend.clone()).unwrap();
+        let second = Helper::start(f.config.clone(), f.backend.clone());
+        assert!(
+            second.is_err_and(|e| e.to_string().contains("another helper holds")),
+            "a second helper started"
+        );
+        // Once the first is gone, the next one starts.
+        drop(first);
+        Helper::start(f.config.clone(), f.backend.clone()).unwrap();
     }
 
     #[test]
