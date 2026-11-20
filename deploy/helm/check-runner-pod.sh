@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# The chart's part of the pod driver (ADR-0115, decision 2), beyond lint and template:
+# - the runs' two network policies and the driver's configuration, rendered with
+#   ci/runner-pod-values.yaml, are the files of ci/expected/, which the driver's own tests read
+#   (ee/runner/tinfirm-runner-host/src/kubernetes/spec.rs): a change on either side that the
+#   other lacks fails one of the two checks;
+# - the admission policies render where the cluster serves them, and not with `external`;
+# - the runner pod mounts no Secret of the runs' namespace, only the projected token;
+# - the chart refuses to render without the operator's statement, and with the runs' namespace
+#   equal to the release's.
+#
+# Run from the repository root: `deploy/helm/check-runner-pod.sh` (the helm job in ci.yml, and
+# `make helm-lint`). HELM names the command, `helm` by default, e.g.
+# HELM="docker run --rm -v $PWD:/w -w /w alpine/helm:4.3.0".
+set -euo pipefail
+
+read -r -a helm <<< "${HELM:-helm}"
+chart=deploy/helm/tinfirm
+values="$chart/ci/runner-pod-values.yaml"
+expected="$chart/ci/expected"
+vap=(--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy)
+render() { "${helm[@]}" template tinfirm "$chart" --namespace tinfirm "$@"; }
+fail() { echo "::error::$*"; exit 1; }
+
+# The JSON of an object's `spec` (indented by 2) or of a ConfigMap's key (by 4), as rendered.
+spec_of() { # <name>
+  awk -v name="$1" '/^---/ { n = "" } /^  name: / { n = $2 } n == name && /^spec:$/ { on = 1; next }
+    on && /^[^ ]/ { on = 0 } on && n == name && length($0) { sub(/^  /, ""); print }'
+}
+key_of() { # <key>
+  awk -v key="  $1: |" '$0 == key { on = 1; next } on && !/^    / { on = 0 } on { sub(/^    /, ""); print }'
+}
+
+out="$(render -f "$values" --show-only templates/runs-networkpolicy.yaml)"
+diff -u "$expected/runs-default-deny.json" <(spec_of tinfirm-runs-default-deny <<< "$out") \
+  || fail "The runs' default-deny policy differs from $expected/runs-default-deny.json: change both, and spec.rs's default_deny_spec with them"
+diff -u "$expected/runs-allow-runner.json" <(spec_of tinfirm-runs-allow-runner <<< "$out") \
+  || fail "The runs' allow rule differs from $expected/runs-allow-runner.json: change both, and spec.rs's allow_runner_spec with them"
+out="$(render -f "$values" --show-only templates/runner-configmap.yaml)"
+diff -u "$expected/pod-driver.json" <(key_of pod-driver.json <<< "$out") \
+  || fail "The pod driver's configuration differs from $expected/pod-driver.json: change both, and config.rs's PodConfig with them"
+
+# Exactly two policies in the runs' namespace: the driver reports any third one.
+for f in "$values" "$chart/ci/runner-pod-init-values.yaml"; do
+  count="$(render -f "$f" "${vap[@]}" | awk '/^kind: NetworkPolicy$/ { p = 1 } /^---/ { p = 0 }
+    p && /^  namespace: / { print $2 }' | grep -c -x -e tinfirm-runs -e sandboxes || true)"
+  [ "$count" = 2 ] || fail "$f: $count NetworkPolicies in the runs' namespace, not the chart's two"
+done
+
+# The admission policies: two policies and two bindings by capability, none without it or with
+# `external`.
+count() { grep -c -E '^kind: ValidatingAdmissionPolicy(Binding)?$' || true; }
+[ "$(render -f "$values" "${vap[@]}" | count)" = 4 ] || fail "No admission policies with the API served"
+[ "$(render -f "$values" | count)" = 0 ] || fail "Admission policies without the API served"
+[ "$(render -f "$chart/ci/runner-pod-init-values.yaml" "${vap[@]}" | count)" = 0 ] \
+  || fail "Admission policies with runner.vm.cluster.admission: external"
+
+# The runner pod: its own ServiceAccount, no automatic token, and of the runs' namespace
+# nothing but the projected token.
+out="$(render -f "$values" --show-only templates/runner-deployment.yaml)"
+grep -q -x '      serviceAccountName: tinfirm-runner' <<< "$out" || fail "The runner pod lacks its own ServiceAccount"
+grep -q -x '      automountServiceAccountToken: false' <<< "$out" || fail "The runner pod mounts its token automatically"
+grep -q -x '              - serviceAccountToken:' <<< "$out" || fail "The runner pod lacks its projected token"
+secrets="$(grep -A1 -x '          secret:' <<< "$out" | sed -n 's/^ *secretName: //p')"
+[ "$secrets" = tinfirm-runner ] || fail "The runner pod mounts Secrets other than its token's: $secrets"
+
+# The renders that must fail, each with its message.
+refused() { # <words of the message> <helm arguments...>
+  local words="$1" log
+  shift
+  if log="$(render -f "$values" "$@" 2>&1)"; then fail "Rendered, but must fail: $*"; fi
+  grep -q -F "$words" <<< "$log" || fail "Failed without \"$words\": $log"
+}
+refused 'runner.vm.cluster.isolationStatement: set it to "the workers for runs hold nothing else"' \
+  --set runner.vm.cluster.isolationStatement=
+refused 'runner.vm.cluster.isolationStatement' \
+  --set 'runner.vm.cluster.isolationStatement=The workers for runs hold nothing else'
+refused "runner.vm.cluster.namespace: \"tinfirm\" is the release's namespace" \
+  --set runner.vm.cluster.namespace=tinfirm
+refused 'networkPolicy.runner.egress.apiServer.to' --set-json 'networkPolicy.runner.egress.apiServer.to=[]'
+echo "The chart's pod driver objects are as the driver expects."

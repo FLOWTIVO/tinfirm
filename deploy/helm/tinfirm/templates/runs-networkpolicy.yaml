@@ -1,0 +1,27 @@
+{{- if and .Values.runner.enabled (eq .Values.runner.vm.driver "pod") }}
+{{- include "tinfirm.runner.validate" . }}
+# The runs' two network policies (ADR-0115, decision 2), whatever networkPolicy.enabled says:
+# the driver starts no VM without them. Each `spec` is JSON, exactly what the driver expects
+# (spec.rs, default_deny_spec and allow_runner_spec), which it compares field by field;
+# ci/expected/ holds both for ci/runner-pod-values.yaml. A run pod reaches nothing, and only
+# the runner pod reaches it, on the bridge's port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tinfirm.runs.defaultDenyName" . }}
+  namespace: {{ .Values.runner.vm.cluster.namespace }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  {{- include "tinfirm.runs.defaultDenySpec" . | nindent 2 }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tinfirm.runs.allowRunnerName" . }}
+  namespace: {{ .Values.runner.vm.cluster.namespace }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  {{- include "tinfirm.runs.allowRunnerSpec" . | nindent 2 }}
+{{- end }}

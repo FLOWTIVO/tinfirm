@@ -2,9 +2,10 @@
 {{- include "tinfirm.runner.validate" . }}
 {{- $r := .Values.runner }}
 # The runner pod (ADR-0101, decision 8): the declared company's runner host, whose sandboxes are
-# VMs: Droplets (driver digitalocean), or VMs on sandbox nodes outside the cluster (node). One
-# replica, recreated, never two: a second process with the same token would replace the first
-# one's connection, and both would use the same records.
+# VMs: Droplets (driver digitalocean), VMs on sandbox nodes outside the cluster (node), or a pod
+# per run in the runs' namespace (pod, ADR-0115 decision 2). One replica, recreated, never two:
+# a second process with the same token would replace the first one's connection, and both would
+# use the same records.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,8 +35,10 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      serviceAccountName: {{ include "tinfirm.serviceAccountName" . }}
-      # The runner host never calls the Kubernetes API.
+      serviceAccountName: {{ include "tinfirm.runner.serviceAccountName" . }}
+      # Never the automatic mount, which would add the namespace's file and the token under the
+      # well-known path. Only the pod driver calls the Kubernetes API, with the token of its
+      # projected volume (kubernetes-api).
       automountServiceAccountToken: false
       # No docker-link style variables, which would add TINFIRM_* names to the environment.
       enableServiceLinks: false
@@ -91,9 +94,26 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "tinfirm.runner.fullname" . }}
-          {{- with $r.extraEnv }}
+          {{- if or (eq $r.vm.driver "pod") $r.extraEnv }}
           env:
+            {{- if eq $r.vm.driver "pod" }}
+            # The pod driver keeps every run pod off this pod's node, and names this pod.
+            - name: TINFIRM_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TINFIRM_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TINFIRM_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
+            {{- with $r.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           lifecycle:
             # Drain: no new runs, the active ones finish, then `run` exits. When the grace
@@ -127,6 +147,13 @@ spec:
               readOnly: true
             - name: node-driver-key
               mountPath: {{ include "tinfirm.runner.nodeKeyDir" . }}
+              readOnly: true
+            {{- else if eq $r.vm.driver "pod" }}
+            - name: pod-driver-config
+              mountPath: {{ include "tinfirm.runner.podConfigDir" . }}
+              readOnly: true
+            - name: kubernetes-api
+              mountPath: {{ include "tinfirm.runner.kubernetesApiDir" . }}
               readOnly: true
             {{- end }}
       volumes:
@@ -184,6 +211,25 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 1Mi
+        {{- else if eq $r.vm.driver "pod" }}
+        - name: pod-driver-config
+          configMap:
+            name: {{ include "tinfirm.runner.fullname" . }}-pod-driver
+        # The pod driver's credential for the API server: a token of this pod's own
+        # ServiceAccount, valid for an hour and renewed by the kubelet, and the cluster's CA,
+        # readable by the pod's group (fsGroup). Nothing else: no namespace file, no Secret.
+        - name: kubernetes-api
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
         {{- end }}
       {{- with $r.nodeSelector }}
       nodeSelector:

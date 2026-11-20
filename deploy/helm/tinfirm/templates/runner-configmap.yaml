@@ -32,6 +32,8 @@ data:
   TINFIRM_DO_CONFIG: {{ printf "%s/digitalocean.json" (include "tinfirm.runner.digitaloceanConfigDir" .) | quote }}
   {{- else if eq $r.vm.driver "node" }}
   TINFIRM_NODE_DRIVER_CONFIG: {{ printf "%s/node-driver.json" (include "tinfirm.runner.nodeConfigDir" .) | quote }}
+  {{- else if eq $r.vm.driver "pod" }}
+  TINFIRM_POD_DRIVER_CONFIG: {{ printf "%s/pod-driver.json" (include "tinfirm.runner.podConfigDir" .) | quote }}
   {{- end }}
   {{- range $name, $value := $r.extraConfig }}
   {{ $name }}: {{ $value | toString | quote }}
@@ -63,5 +65,21 @@ metadata:
 data:
   node-driver.json: |
     {{- include "tinfirm.runner.nodeConfig" . | nindent 4 }}
+{{- else if eq $r.vm.driver "pod" }}
+---
+# The pod driver's configuration file (TINFIRM_POD_DRIVER_CONFIG, ADR-0115 decision 2), as
+# PodConfig reads it (ee/runner/tinfirm-runner-host/src/kubernetes/config.rs): the runs'
+# namespace and its objects' names, the run pod's image, sizes, tap, devices and workers, and
+# the runner pod's labels, which the run pods' anti-affinity and the allow rule name. No
+# secret. ci/expected/pod-driver.json is this file for ci/runner-pod-values.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tinfirm.runner.fullname" . }}-pod-driver
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+data:
+  pod-driver.json: |
+    {{- include "tinfirm.runner.podConfig" . | nindent 4 }}
 {{- end }}
 {{- end }}

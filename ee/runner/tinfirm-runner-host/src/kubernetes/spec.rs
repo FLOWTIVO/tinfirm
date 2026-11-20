@@ -1211,6 +1211,33 @@ mod tests {
         );
     }
 
+    /// The chart renders the driver's configuration and the runs' two network policies; its
+    /// CI step (deploy/helm/check-runner-pod.sh) compares them with these files for
+    /// ci/runner-pod-values.yaml. Here the driver reads the same files: it loads the
+    /// configuration, and expects the very policies the chart installs.
+    #[test]
+    fn the_charts_objects_are_what_the_driver_expects() {
+        const CONFIG: &str =
+            include_str!("../../../../../deploy/helm/tinfirm/ci/expected/pod-driver.json");
+        const DEFAULT_DENY: &str =
+            include_str!("../../../../../deploy/helm/tinfirm/ci/expected/runs-default-deny.json");
+        const ALLOW_RUNNER: &str =
+            include_str!("../../../../../deploy/helm/tinfirm/ci/expected/runs-allow-runner.json");
+        let config = PodConfig::from_json(CONFIG).unwrap();
+        let spec = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        assert_eq!(spec(DEFAULT_DENY), default_deny_spec());
+        assert_eq!(spec(ALLOW_RUNNER), allow_runner_spec(&config));
+        let read = |text: &str| json!({"metadata": {"name": "p"}, "spec": spec(text)});
+        assert!(policy_differences(&default_deny_spec(), &read(DEFAULT_DENY)).is_empty());
+        assert!(policy_differences(&allow_runner_spec(&config), &read(ALLOW_RUNNER)).is_empty());
+        // The chart names the objects as the driver's defaults do, and run pods fit its
+        // template.
+        assert_eq!(config.policies, super::super::config::Policies::default());
+        assert_eq!(config.resource_quota, "tinfirm-runs");
+        assert_eq!(config.run_service_account, "tinfirm-run");
+        pod(&config, "sandbox-4c8g", &id(), &labels(), NODE).unwrap();
+    }
+
     #[test]
     fn a_pods_state() {
         let pod = |phase: &str, ready: bool, ip: Option<&str>| {

@@ -436,6 +436,11 @@ jobs:
             helm template tinfirm "$chart" -f "$values" > /dev/null
             echo "::endgroup::"
           done
+      # The pod driver's objects (ADR-0115, decision 2): the runs' network policies and the
+      # driver's configuration are the files of ci/expected/, which the driver's tests read
+      # too; the admission policies by capability; the renders that must fail.
+      - name: Helm, the pod driver's objects
+        run: deploy/helm/check-runner-pod.sh
       - name: Compose config (with and without the oidc profile, SAML, the Entra ID and second-company examples, and the HTTPS overlay)
         run: |
           set -euo pipefail
@@ -505,7 +510,7 @@ jobs:
         timeout-minutes: 2
         run: |
           shellcheck deploy/compose/deploy-host.sh deploy/compose/smoke.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh \
-            .github/check-pins.sh .github/actions/set-version/*.sh
+            .github/check-pins.sh .github/actions/set-version/*.sh deploy/helm/check-runner-pod.sh
       - name: Workflow lint (actionlint)
         timeout-minutes: 2
         run: actionlint -color

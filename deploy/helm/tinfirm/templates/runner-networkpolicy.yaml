@@ -4,9 +4,9 @@
 # The runner pod (ADR-0101, decision 8). Ingress: nothing; the pod dials the server and the
 # VMs' bridges, and the sandboxes' traffic comes back through the bridges' tunnels. Egress (when
 # enabled): DNS, https (the server's public URL, the VM provider's API, git hosts, model
-# gateways, what the sandboxes may reach), the VMs' bridge port (driver digitalocean) or the
-# nodes' agent port and published bridge ports (driver node, ADR-0115's first form), plus
-# configured extras.
+# gateways, what the sandboxes may reach), the VMs' bridge port (driver digitalocean), the
+# nodes' agent port and published bridge ports (driver node, ADR-0115's first form), or the run
+# pods' bridge port and the API server (driver pod, ADR-0115 decision 2), plus configured extras.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -69,6 +69,26 @@ spec:
           endPort: {{ $node.publishedPorts.last }}
     {{- end }}
     {{- end }}
+    {{- else if eq $.Values.runner.vm.driver "pod" }}
+    # The run pods' bridge port, in the runs' namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Values.runner.vm.cluster.namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "tinfirm.runs.sandboxLabels" $ | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.runner.vm.port }}
+    # The API server, which the pod driver calls.
+    - to:
+        {{- toYaml $r.egress.apiServer.to | nindent 8 }}
+      ports:
+        {{- range $r.egress.apiServer.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
     {{- else }}
     {{- with $r.egress.vms.to }}
     # The VMs' bridges.

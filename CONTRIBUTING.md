@@ -95,7 +95,7 @@ Run the checks for every area you changed. Put the exact result in the pull requ
 | Runner licences | `make runner-licences-check` | The crates' licences and `runner/THIRD-PARTY-LICENSES.txt`, with cargo-about in Docker, as CI's `runner` job checks them. `make runner-licences` writes the file again after a change to `runner/Cargo.lock` ([Dependency licences](#dependency-licences)). |
 | Web | `make web-test` | `npm ci`, `npm run licences` (the production packages' licences), `npm run lint`, `npm test` (Vitest) and `npm run build` |
 | Web e2e | `cd web && npm run e2e` | Playwright tests in `web/e2e/`, against a stack the command starts and seeds itself ([web/e2e/README.md](web/e2e/README.md)). CI runs them in its `e2e` job. |
-| Helm | `make helm-lint` | The chart's `LICENSE` against the root one, `helm lint --strict` and `helm template`, with the default values and each file in `deploy/helm/tinfirm/ci/` |
+| Helm | `make helm-lint` | The chart's `LICENSE` against the root one, `helm lint --strict` and `helm template`, with the default values and each file in `deploy/helm/tinfirm/ci/`, and `deploy/helm/check-runner-pod.sh`: the pod driver's objects against `ci/expected/`, which the driver's tests read too |
 | Deploy files | `make deploy-lint` | Compose config with and without the `oidc` profile, with the Entra ID and second-company examples, and with the HTTPS overlay; hadolint on the four Dockerfiles (the server's, `deploy/release/runner-musl.Dockerfile`, `runner/ci.Dockerfile`, `docs-site/Dockerfile`); shellcheck on the deploy scripts; actionlint on the workflows |
 | Image | `make smoke-image` | Multi-stage build of web and server (`make build-image`, which it depends on), then the image started against PostgreSQL until `/api/system/info` answers (`deploy/compose/smoke.sh`), which catches what the unit tests cannot: a class missing from the jar, a bean that fails, a migration that fails |
 | Docs | Check that every relative link resolves | Follow the writing rules in section 7 |
@@ -111,7 +111,7 @@ CI (`.github/workflows/ci.yml`) runs on every pull request to `main` or `hotfix/
 | `web` | `npm ci`, `npm run licences`, `npm run lint`, `npm test`, `npm run build` |
 | `e2e` | The Playwright tests of `web/e2e/`, with PostgreSQL 18 and the server built from the commit, which serves the app's production build ([web/e2e/README.md](web/e2e/README.md#in-ci)) |
 | `docs` | The docs site's strict build (Zensical, in `docs-site/Dockerfile`) and its image's runtime contract |
-| `helm` | The chart's `LICENSE`, Helm lint and template, the Compose configs, the check that the chart and the Compose file pin the same LiteLLM image, hadolint, shellcheck, actionlint and the action pins (`.github/check-pins.sh`) |
+| `helm` | The chart's `LICENSE`, Helm lint and template, the pod driver's objects (`deploy/helm/check-runner-pod.sh`), the Compose configs, the check that the chart and the Compose file pin the same LiteLLM image, hadolint, shellcheck, actionlint and the action pins (`.github/check-pins.sh`) |
 | `image` | Builds the server image (no push), checks its runtime contract and its `/licenses/`, and starts it against PostgreSQL (`deploy/compose/smoke.sh`) |
 | `runner` | `cargo fmt`, clippy, the tests and the crates' licences (cargo-about), each a stage of `runner/ci.Dockerfile`; not the tests in real containers |
 | `security` | `reusable-security.yml`: SAST (semgrep), secrets (gitleaks) and dependency CVEs (trivy) |

@@ -30,7 +30,7 @@ ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
 DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile
 SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh runner/images/vm/local-disk.sh \
-                    .github/check-pins.sh .github/actions/set-version/*.sh
+                    .github/check-pins.sh .github/actions/set-version/*.sh deploy/helm/check-runner-pod.sh
 
 # `make release-assets`: the Linux release assets of HEAD (runner-artifacts.yml builds them
 # all), with this version in their names.
@@ -138,7 +138,7 @@ docs-build: $(DOCS_VENV)/.installed ## Docs site: strict build into docs-site/si
 docs-lock: ## Docs site: lock requirements.in into requirements.txt with hashes (needs uv)
 	cd $(DOCS_DIR) && uv pip compile --quiet --universal --python-version 3.11 --generate-hashes requirements.in -o requirements.txt
 
-helm-lint: ## Helm: the chart's LICENSE, lint --strict and template, with default values and each ci/*.yaml
+helm-lint: ## Helm: the chart's LICENSE, lint --strict and template, with default values and each ci/*.yaml, and the pod driver's objects
 	cmp LICENSE $(CHART)/LICENSE || { echo "$(CHART)/LICENSE must be a copy of the root LICENSE: cp LICENSE $(CHART)/LICENSE" >&2; exit 1; }
 	helm lint --strict $(CHART)
 	helm template tinfirm $(CHART) > /dev/null
@@ -147,6 +147,7 @@ helm-lint: ## Helm: the chart's LICENSE, lint --strict and template, with defaul
 	  helm lint --strict $(CHART) -f "$$values"; \
 	  helm template tinfirm $(CHART) -f "$$values" > /dev/null; \
 	done
+	deploy/helm/check-runner-pod.sh
 
 deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second-company examples, the HTTPS overlay), hadolint, shellcheck, actionlint, the action pins
 	$(COMPOSE) --env-file $(COMPOSE_DIR)/.env.example config --quiet

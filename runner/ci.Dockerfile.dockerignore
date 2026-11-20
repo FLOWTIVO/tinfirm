@@ -1,11 +1,12 @@
 # Build context of ci.Dockerfile (the repository root): the Rust workspace, its paid code under
-# ee/runner (ADR-0100, ADR-0114), the protocol schemas it includes and the public suffix list
-# its tests read, nothing else.
+# ee/runner (ADR-0100, ADR-0114), the protocol schemas it includes, and the public suffix list
+# and the chart's expected pod driver objects that its tests read, nothing else.
 *
 !runner
 !ee/runner
 !protocol
 !server/src/main/resources/psl/public_suffix_list.dat
+!deploy/helm/tinfirm/ci/expected
 
 runner/target
 runner/images/pi/node_modules
