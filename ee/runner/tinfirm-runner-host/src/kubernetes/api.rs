@@ -787,7 +787,7 @@ pub(super) fn dns_subdomain(text: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::convert::Infallible;
     use std::net::SocketAddr;
@@ -807,16 +807,16 @@ mod tests {
 
     /// A request the fake API got.
     #[derive(Debug, Clone)]
-    struct Seen {
-        method: String,
-        target: String,
-        authorization: String,
-        content_type: String,
-        body: Value,
+    pub(in crate::kubernetes) struct Seen {
+        pub(in crate::kubernetes) method: String,
+        pub(in crate::kubernetes) target: String,
+        pub(in crate::kubernetes) authorization: String,
+        pub(in crate::kubernetes) content_type: String,
+        pub(in crate::kubernetes) body: Value,
     }
 
     /// What the fake API answers.
-    enum Reply {
+    pub(in crate::kubernetes) enum Reply {
         Json(u16, Value),
         /// With a `Retry-After` of so many seconds.
         RetryAfter(u16, u64, Value),
@@ -829,15 +829,15 @@ mod tests {
         Late(Duration),
     }
 
-    type Handler = Arc<dyn Fn(&Seen, usize) -> Reply + Send + Sync>;
+    pub(in crate::kubernetes) type Handler = Arc<dyn Fn(&Seen, usize) -> Reply + Send + Sync>;
 
-    struct Fake {
+    pub(in crate::kubernetes) struct Fake {
         addr: SocketAddr,
-        seen: Arc<Mutex<Vec<Seen>>>,
+        pub(in crate::kubernetes) seen: Arc<Mutex<Vec<Seen>>>,
     }
 
     impl Fake {
-        fn seen(&self) -> Vec<Seen> {
+        pub(in crate::kubernetes) fn seen(&self) -> Vec<Seen> {
             self.seen.lock().unwrap().clone()
         }
 
@@ -999,14 +999,14 @@ mod tests {
     }
 
     /// A CA, a fake API with a certificate from it for 127.0.0.1, and a client of it.
-    struct Setup {
-        _dir: tempfile::TempDir,
-        token_file: PathBuf,
-        fake: Fake,
-        api: Api,
+    pub(in crate::kubernetes) struct Setup {
+        pub(in crate::kubernetes) _dir: tempfile::TempDir,
+        pub(in crate::kubernetes) token_file: PathBuf,
+        pub(in crate::kubernetes) fake: Fake,
+        pub(in crate::kubernetes) api: Api,
     }
 
-    async fn setup(handler: Handler) -> Setup {
+    pub(in crate::kubernetes) async fn setup(handler: Handler) -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let (ca_pem, issuer) = ca("test cluster CA");
         let ca_file = dir.path().join("ca.crt");
@@ -1026,7 +1026,7 @@ mod tests {
         }
     }
 
-    fn status(code: u16, reason: &str, message: &str) -> Value {
+    pub(in crate::kubernetes) fn status(code: u16, reason: &str, message: &str) -> Value {
         json!({"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Failure",
                "message": message, "reason": reason, "code": code})
     }
