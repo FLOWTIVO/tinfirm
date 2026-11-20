@@ -5,7 +5,7 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt};
 use tokio::net::UnixListener;
 
 /// This process's effective uid: the owner of `/proc/self`.
@@ -108,6 +108,83 @@ pub enum LineError {
     Io(io::Error),
 }
 
+/// How many bytes [`WipedLines`] takes from its stream at once.
+const WIPED_CHUNK: usize = 8192;
+
+/// Lines of a stream whose lines may hold a secret (the listener's requests: a `create`
+/// carries a run's ticket). It reads as [`read_line`] does, and keeps no byte of a line once
+/// the line is handed out: what it took from the stream is overwritten as soon as it is copied
+/// into the caller's line, where a buffered reader would keep it until later input happens to
+/// overwrite it. The caller's line is one buffer for the whole connection, as large as the
+/// longest line from the first, so it never moves in memory and leaves no copy behind; the
+/// caller overwrites it when it has read the line ([`crate::spool::wipe`]).
+pub struct WipedLines<R> {
+    inner: R,
+    chunk: Box<[u8]>,
+    start: usize,
+    end: usize,
+}
+
+impl<R: AsyncRead + Unpin> WipedLines<R> {
+    pub fn new(inner: R) -> WipedLines<R> {
+        WipedLines {
+            inner,
+            chunk: vec![0; WIPED_CHUNK].into_boxed_slice(),
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Reads one line of at most `max` bytes into `line`, the newline excluded, after
+    /// emptying it; `false` at the end of the input.
+    pub async fn read_line(&mut self, max: usize, line: &mut Vec<u8>) -> Result<bool, LineError> {
+        crate::spool::wipe(line);
+        line.clear();
+        // Once, for the connection's longest line: the buffer never grows after it.
+        line.reserve_exact(max);
+        loop {
+            if self.start == self.end {
+                let read = self
+                    .inner
+                    .read(&mut self.chunk)
+                    .await
+                    .map_err(LineError::Io)?;
+                if read == 0 {
+                    // The input ended: a last line without a newline, or nothing.
+                    return Ok(!line.is_empty());
+                }
+                (self.start, self.end) = (0, read);
+            }
+            let piece = &mut self.chunk[self.start..self.end];
+            let newline = piece.iter().position(|b| *b == b'\n');
+            let taken = newline.map_or(piece.len(), |at| at + 1);
+            let text = newline.unwrap_or(taken);
+            if line.len() + text > max {
+                crate::spool::wipe(&mut self.chunk);
+                crate::spool::wipe(line);
+                line.clear();
+                (self.start, self.end) = (0, 0);
+                return Err(LineError::TooLong);
+            }
+            line.extend_from_slice(&piece[..text]);
+            crate::spool::wipe(&mut piece[..taken]);
+            self.start += taken;
+            if newline.is_some() {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(true);
+            }
+        }
+    }
+
+    /// What the reader still holds of its stream: for the tests.
+    #[doc(hidden)]
+    pub fn held(&self) -> &[u8] {
+        &self.chunk
+    }
+}
+
 /// Reads one line of at most `max` bytes, the newline excluded; `None` at the end of the input.
 pub async fn read_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
@@ -174,6 +251,52 @@ mod tests {
         assert!(!peer_allowed(Some(0), 991));
         assert!(!peer_allowed(Some(992), 991));
         assert!(!peer_allowed(None, 991));
+    }
+
+    #[tokio::test]
+    async fn wiped_lines_are_bounded_and_leave_nothing_behind_in_the_reader() {
+        let input: &[u8] = b"short\nexactly10\r\n\na-ticket\n12345678901\nnever read";
+        let mut lines = WipedLines::new(input);
+        let mut line = Vec::new();
+        for wanted in [&b"short"[..], b"exactly10", b"", b"a-ticket"] {
+            assert!(lines.read_line(10, &mut line).await.unwrap());
+            assert_eq!(line, wanted);
+        }
+        // The line's buffer did not move, and the reader holds none of what it handed out:
+        // the bytes it still holds are those it has not handed out yet.
+        assert_eq!(line.capacity(), 10);
+        let held = lines.held();
+        assert!(!held.windows(8).any(|w| w == b"a-ticket"), "{held:?}");
+        assert!(held.windows(11).any(|w| w == b"12345678901"));
+        assert!(matches!(
+            lines.read_line(10, &mut line).await,
+            Err(LineError::TooLong)
+        ));
+        // After a line that is too long the reader holds nothing at all.
+        assert!(lines.held().iter().all(|b| *b == 0));
+        assert!(line.is_empty());
+
+        // A last line without a newline, then the end; a line across two reads of the stream.
+        let mut lines = WipedLines::new(&b"end"[..]);
+        assert!(lines.read_line(10, &mut line).await.unwrap());
+        assert_eq!(line, b"end");
+        assert!(!lines.read_line(10, &mut line).await.unwrap());
+        let (mut far, near) = tokio::io::duplex(64);
+        let mut lines = WipedLines::new(near);
+        tokio::io::AsyncWriteExt::write_all(&mut far, b"in two ")
+            .await
+            .unwrap();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::io::AsyncWriteExt::write_all(&mut far, b"parts\nnext\n")
+                .await
+                .unwrap();
+        });
+        assert!(lines.read_line(64, &mut line).await.unwrap());
+        assert_eq!(line, b"in two parts");
+        assert!(lines.read_line(64, &mut line).await.unwrap());
+        assert_eq!(line, b"next");
+        writer.await.unwrap();
     }
 
     #[tokio::test]

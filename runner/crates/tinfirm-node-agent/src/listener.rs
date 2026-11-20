@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 
@@ -341,7 +341,7 @@ impl Listener {
         }))
     }
 
-    async fn create(&self, params: wire::CreateParams) -> Result<Value, RpcError> {
+    async fn create(&self, mut params: wire::CreateParams) -> Result<Value, RpcError> {
         let template = parse_template(&params.template)?;
         wire::check_name(&params.name)?;
         wire::check_labels(&params.labels)?;
@@ -381,7 +381,10 @@ impl Listener {
             ));
         }
         let spooled = spool::user_data_path(&self.config.spool, &id);
-        let made = match write_spool(&spooled, user_data) {
+        let spooling = write_spool(&spooled, user_data);
+        // The user data is in the spool, or never will be: the listener keeps no copy of it.
+        params.user_data.wipe();
+        let made = match spooling {
             Ok(()) => self.helper.make(&id, &template).await.map_err(from_helper),
             Err(e) => Err(RpcError::new(
                 code::FAILED,
@@ -554,13 +557,16 @@ impl Listener {
             }
             let _ = write.shutdown().await;
         });
-        let mut reader = BufReader::new(read);
+        // A `create` carries a run's ticket: the reader and the line keep no byte of a request
+        // once it is parsed, and a request overwrites its parameters when it is dropped.
+        let mut lines = local::WipedLines::new(read);
+        let mut line = Vec::new();
         let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
         loop {
-            let line = match local::read_line(&mut reader, wire::MAX_LINE).await {
-                Ok(Some(line)) => line,
-                Ok(None) | Err(LineError::Io(_)) => break,
+            match lines.read_line(wire::MAX_LINE, &mut line).await {
+                Ok(true) => {}
+                Ok(false) | Err(LineError::Io(_)) => break,
                 Err(LineError::TooLong) => {
                     tracing::warn!(
                         peer,
@@ -576,7 +582,9 @@ impl Listener {
                     break;
                 }
             };
-            let request = match RpcRequest::parse(&line) {
+            let parsed = RpcRequest::parse(&line);
+            spool::wipe(&mut line);
+            let request = match parsed {
                 Ok(request) => request,
                 Err((id, e)) => {
                     tracing::info!(peer, code = e.code, "refused a request");

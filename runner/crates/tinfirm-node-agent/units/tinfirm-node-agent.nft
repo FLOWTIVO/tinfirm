@@ -1,0 +1,77 @@
+#!/usr/sbin/nft -f
+# /etc/tinfirm/node-agent/firewall.nft: the node's own firewall (ADR-0112 decision 4, "A node
+# reaches nothing of Tinfirm's"). The node agent does not load it and does not need it to
+# work; the node's role does, before the agent starts (tinfirm-node-agent-firewall.service).
+#
+# It lets in the control host, to the agent's port and to the VMs' published ports, and one
+# management address to SSH. It lets out nothing but answers: the node opens no connection
+# to anything, the control host included.
+#
+# It is one table of its own, and loading it again replaces that table alone. It does not
+# flush the ruleset: the helper keeps one table per VM (`inet tinfirm_<12 hex digits>`), which
+# a flush would remove under running VMs. A packet must pass every table's chain of a hook,
+# and a drop in one is final, so this table and a VM's table each admit a connection to the
+# VM's bridge on their own terms, and neither can widen the other.
+#
+# Root on the node can delete this table. It is the node's own guard against a VMM or a
+# listener that got out; against root on a node, the guard is the operator's network outside
+# the node (ADR-0112 decision 4).
+
+# The control host: the one source of connections to the agent and to the VMs' bridges.
+define control_host = 10.0.0.5
+# The node's address, as the control host dials it (`network.nodeAddress`).
+define node_address = 10.0.0.20
+# The listener's TLS port (`tls.listen`).
+define agent_port = 7700
+# The VMs' published ports: `network.firstPort` to `firstPort + maxVms - 1`.
+define published_ports = 20000-20007
+# The VMs' own range (`network.vmRange`).
+define vm_range = 10.231.0.0/16
+# Where the operator's SSH comes from: the node stays manageable from this one address. It
+# may be the control host; then a control host that is taken over reaches the node's SSH
+# port, though still not without a key.
+define management = 10.0.0.9
+# Addresses that are refused by name whatever else changes in this file: the providers'
+# metadata services.
+define metadata4 = { 169.254.169.254 }
+define metadata6 = { fd00:ec2::254 }
+
+table inet tinfirm_node
+delete table inet tinfirm_node
+table inet tinfirm_node {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iifname "lo" accept
+		ct state established,related accept
+		ip saddr $control_host ip daddr $node_address tcp dport $agent_port ct state new accept
+		ip saddr $management ip daddr $node_address tcp dport 22 ct state new accept
+		# A node whose address comes by DHCP: the lease's answers. Remove both DHCP rules on
+		# a node with a static address.
+		udp sport 67 udp dport 68 accept
+		counter comment "dropped: to the node"
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ip daddr $metadata4 counter drop comment "a metadata service"
+		ip6 daddr $metadata6 counter drop comment "a metadata service"
+		ct state established,related accept
+		# The control host's connection to a published port, which the VM's own table has
+		# turned towards the VM's namespace: nothing else is forwarded, in either direction.
+		ip saddr $control_host ip daddr $vm_range ct state new ct status dnat ct original ip daddr $node_address ct original proto-dst $published_ports accept
+		counter comment "dropped: through the node"
+	}
+
+	chain output {
+		type filter hook output priority filter; policy drop;
+		ip daddr $metadata4 counter drop comment "a metadata service"
+		ip6 daddr $metadata6 counter drop comment "a metadata service"
+		oifname "lo" accept
+		ct state established,related accept
+		# The DHCP lease's renewal (see the input chain).
+		udp sport 68 udp dport 67 accept
+		# Nothing else: the node opens no connection, to the control host, the server, the
+		# model gateway, the code hosts, a resolver, a time server or the internet.
+		counter comment "dropped: from the node"
+	}
+}

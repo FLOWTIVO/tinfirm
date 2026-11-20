@@ -47,10 +47,32 @@ enum Command {
         #[arg(long)]
         cert: PathBuf,
     },
+    /// Cuts this process's capability bounding set to the six capabilities the jailer needs
+    /// and replaces it with the jailer (ADR-0112 decision 4). The helper starts it for each
+    /// VM; it is not run by hand. It takes root's own file named `jailer` and arguments that
+    /// start with `--id` and a jail's name of the helper's, and nothing else.
+    #[command(hide = true, name = tinfirm_node_agent::bounding::START_JAILER)]
+    StartJailer {
+        jailer: PathBuf,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let command = Cli::parse().command;
+    // Before any other thread exists: a bounding set is a thread's own, and the exec must
+    // come from the thread that cut it.
+    if let Command::StartJailer { jailer, args } = &command {
+        return Err(tinfirm_node_agent::bounding::start_jailer(jailer, args));
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(command))
+}
+
+async fn run(command: Command) -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -58,7 +80,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    match Cli::parse().command {
+    match command {
         Command::Helper { config } => {
             let config = plan::HelperConfig::load(&config)?;
             let backend = linux::LinuxBackend::new(config.clone());
@@ -76,5 +98,6 @@ async fn main() -> Result<()> {
             println!("{}", tls::fingerprint(&cert)?);
             Ok(())
         }
+        Command::StartJailer { .. } => unreachable!("handled before the runtime starts"),
     }
 }

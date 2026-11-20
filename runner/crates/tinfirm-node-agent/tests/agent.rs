@@ -94,6 +94,9 @@ struct HelperHalf {
 async fn helper_half() -> HelperHalf {
     let own = local::own_uid().unwrap();
     let tmp = tempfile::tempdir().unwrap();
+    // The spool's parent must not be writable by its group or by others, whatever the umask
+    // the tests run under made of the new directory.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = tmp.path().to_path_buf();
     for name in [
         "helper-socket",
@@ -934,6 +937,7 @@ async fn hanging_helper(socket: PathBuf) -> tokio::task::JoinHandle<()> {
 #[tokio::test]
 async fn a_connection_has_at_most_its_requests_in_flight() {
     let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let root = tmp.path();
     for name in [
         "helper-socket",

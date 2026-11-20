@@ -491,9 +491,9 @@ pub const TOOLS: [&str; 8] = [
     "ip", "nft", "sysctl", "losetup", "dmsetup", "blockdev", "mknod", "kill",
 ];
 /// The kernel modules a make needs, by their names under `/sys/module`. The helper loads
-/// none: the node loads them at boot (`units/tinfirm-node-agent-modules.service`). The tun
-/// and loop drivers and the device-mapper's core are checked by their devices instead: they
-/// are built into many kernels, and a built-in driver has no entry under `/sys/module`.
+/// none: the node loads them at boot (`units/tinfirm-node-agent-modules.service`). Each
+/// counts when it is loaded or built into the kernel ([`module_present`]). The tun and loop
+/// drivers and the device-mapper's core are checked by their devices instead.
 pub const MODULES: [&str; 8] = [
     "kvm",
     "dm_snapshot",
@@ -514,13 +514,17 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 enum ToolError {
     Start(String),
-    Exit(String),
+    /// `shown` is for a message; `said` is what the tool wrote, for the callers that read it.
+    Exit {
+        shown: String,
+        said: String,
+    },
 }
 
 impl std::fmt::Display for ToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ToolError::Start(why) | ToolError::Exit(why) => f.write_str(why),
+            ToolError::Start(why) | ToolError::Exit { shown: why, .. } => f.write_str(why),
         }
     }
 }
@@ -572,10 +576,10 @@ fn tool(argv: &[String], stdin: Option<&str>) -> Result<String, ToolError> {
         } else {
             &output.stderr
         };
-        return Err(ToolError::Exit(format!(
-            "`{shown}` failed: {}",
-            plain(said)
-        )));
+        return Err(ToolError::Exit {
+            shown: format!("`{shown}` failed: {}", plain(said)),
+            said: String::from_utf8_lossy(said).into_owned(),
+        });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -588,31 +592,83 @@ fn failed(why: impl std::fmt::Display) -> BackendError {
     BackendError::Failed(why.to_string())
 }
 
-/// The processes of a cgroup; none for a cgroup that is not there.
-fn cgroup_pids(cgroup: &Path) -> Vec<u32> {
-    std::fs::read_to_string(cgroup.join("cgroup.procs"))
-        .map(|text| text.lines().filter_map(|l| l.trim().parse().ok()).collect())
-        .unwrap_or_default()
+/// Whether something of a VM is on the node. A delete may call a thing gone only when the
+/// node said so: a question that could not be asked (a directory that cannot be read, a tool
+/// that cannot run, a permission that is missing) is `Unknown`, and the VM stays listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    There,
+    Gone,
+    Unknown(String),
+}
+
+/// A path's presence: there when it can be seen, gone only on "no such file or directory".
+pub fn presence(path: &Path) -> Presence {
+    match path.symlink_metadata() {
+        Ok(_) => Presence::There,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Presence::Gone,
+        Err(e) => Presence::Unknown(format!("cannot look at {}: {}", path.display(), e.kind())),
+    }
+}
+
+/// What `nft list table inet <table>` wrote when it failed says that the table does not
+/// exist: its first line is `Error: No such file or directory` (nftables 1.0.9; the tools run
+/// with an empty environment, so in the C locale). nft ends with the same status 1 when it may
+/// not ask the kernel (`Operation not permitted (you must be root)`, then `netlink: Error:
+/// cache initialization failed: Operation not permitted`): that is no answer about the table.
+pub fn table_is_gone(said: &str) -> bool {
+    said.lines().next().map(str::trim) == Some("Error: No such file or directory")
+}
+
+/// The processes of a cgroup; none for a cgroup that is not there. A list that cannot be read
+/// is an error: it is no proof that nothing runs.
+fn cgroup_pids(cgroup: &Path) -> Result<Vec<u32>, String> {
+    let file = cgroup.join("cgroup.procs");
+    match std::fs::read_to_string(&file) {
+        Ok(text) => Ok(text.lines().filter_map(|l| l.trim().parse().ok()).collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("cannot read {}: {}", file.display(), e.kind())),
+    }
 }
 
 /// The VMM of a cgroup: its process named `firecracker`.
-fn vmm_pid(cgroup: &Path) -> Option<u32> {
-    cgroup_pids(cgroup).into_iter().find(|pid| {
+fn vmm_pid(cgroup: &Path) -> Result<Option<u32>, String> {
+    Ok(cgroup_pids(cgroup)?.into_iter().find(|pid| {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .is_ok_and(|comm| comm.trim() == "firecracker")
-    })
+    }))
+}
+
+/// For each block device of sysfs whose name starts with `prefix`, the text of its file
+/// `attribute`, where it has one. An unattached loop device has no backing file, and a device
+/// may go while the list is read: those are skipped. A list or a file that cannot be read for
+/// another reason is an error.
+fn block_devices(prefix: &str, attribute: &str) -> Result<Vec<(String, String)>, String> {
+    let cannot =
+        |what: &Path, e: std::io::Error| format!("cannot read {}: {}", what.display(), e.kind());
+    let dir = Path::new("/sys/block");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| cannot(dir, e))? {
+        let entry = entry.map_err(|e| cannot(dir, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let file = entry.path().join(attribute);
+        match std::fs::read_to_string(&file) {
+            Ok(text) => found.push((name, text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(cannot(&file, e)),
+        }
+    }
+    Ok(found)
 }
 
 /// A device-mapper device of this name exists (from sysfs, so without a tool).
-fn dm_exists(name: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir("/sys/block") else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry.file_name().to_string_lossy().starts_with("dm-")
-            && std::fs::read_to_string(entry.path().join("dm/name"))
-                .is_ok_and(|found| found.trim() == name)
-    })
+fn dm_exists(name: &str) -> Result<bool, String> {
+    Ok(block_devices("dm-", "dm/name")?
+        .iter()
+        .any(|(_, found)| found.trim() == name))
 }
 
 /// A loop device's backing file, as sysfs names it, is `file`. The kernel prints that path as
@@ -630,23 +686,12 @@ pub fn is_backing_file(backing: &str, file: &Path) -> bool {
 }
 
 /// The loop devices whose backing file is `file` (from sysfs), a deleted one included.
-fn loops_of(file: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir("/sys/block") else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let backing = std::fs::read_to_string(entry.path().join("loop/backing_file")).ok()?;
-            (name.starts_with("loop") && is_backing_file(&backing, file))
-                .then(|| format!("/dev/{name}"))
-        })
-        .collect()
-}
-
-fn exists(path: &Path) -> bool {
-    path.symlink_metadata().is_ok()
+fn loops_of(file: &Path) -> Result<Vec<String>, String> {
+    Ok(block_devices("loop", "loop/backing_file")?
+        .into_iter()
+        .filter(|(_, backing)| is_backing_file(backing, file))
+        .map(|(name, _)| format!("/dev/{name}"))
+        .collect())
 }
 
 /// Waits until `gone` says so, at most `limit`.
@@ -754,6 +799,9 @@ impl Step {
 /// The Linux backend.
 pub struct LinuxBackend {
     config: HelperConfig,
+    /// The agent's own binary, which the helper starts again as `start-jailer` to cut the
+    /// VMM's bounding set (`src/bounding.rs`).
+    starter: PathBuf,
     /// Test-only: a make fails right after this step, as if the step after it had.
     fail_after: Option<Step>,
     /// Test-only: a failed make leaves what it made, as a helper that was killed would.
@@ -764,9 +812,18 @@ impl LinuxBackend {
     pub fn new(config: HelperConfig) -> LinuxBackend {
         LinuxBackend {
             config,
+            // The running helper's own program, whatever has happened to its file since.
+            starter: PathBuf::from("/proc/self/exe"),
             fail_after: None,
             leave_failed: false,
         }
+    }
+
+    /// Test-only: the agent's binary, where the backend does not run inside it.
+    #[doc(hidden)]
+    pub fn with_starter(mut self, agent: impl Into<PathBuf>) -> LinuxBackend {
+        self.starter = agent.into();
+        self
     }
 
     /// Test-only: every make fails right after `step`; with `leave`, it also leaves what it
@@ -959,17 +1016,17 @@ impl LinuxBackend {
         let errors = console
             .try_clone()
             .map_err(|e| failed(format!("cannot open the console twice: {}", e.kind())))?;
-        let argv = jailer_argv(plan);
-        let mut jailer = Command::new(&argv[0]);
-        jailer
-            .args(&argv[1..])
+        // The helper's own binary again, as `start-jailer`: it cuts its bounding set to the
+        // jailer's six capabilities and becomes the jailer.
+        let mut child = Command::new(&self.starter)
+            .arg(bounding::START_JAILER)
+            .args(jailer_argv(plan))
             .env_clear()
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(console)
             .stderr(errors)
-            .process_group(0);
-        let mut child = bounding::cut_bounding_set(&mut jailer)
+            .process_group(0)
             .spawn()
             .map_err(|e| failed(format!("cannot start the jailer: {}", e.kind())))?;
         // With a new PID namespace the jailer's first process ends when the VMM is started.
@@ -1000,7 +1057,7 @@ impl LinuxBackend {
             if vmm_runs(&socket) {
                 return true;
             }
-            ended = cgroup_pids(&places.cgroup).is_empty();
+            ended = cgroup_pids(&places.cgroup).is_ok_and(|pids| pids.is_empty());
             ended
         });
         if ended || !runs {
@@ -1012,6 +1069,7 @@ impl LinuxBackend {
             }));
         }
         let pid = vmm_pid(&places.cgroup)
+            .map_err(failed)?
             .ok_or_else(|| failed("no VMM runs in the VM's cgroup after its start"))?;
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
             .map_err(|e| failed(format!("cannot read the VMM's status: {}", e.kind())))?;
@@ -1054,15 +1112,31 @@ fn root_dir(problems: &mut Vec<String>, checked: &mut Vec<String>, what: &str, p
     }
 }
 
-/// A kernel module is there: loaded, or built into the running kernel.
-fn module_present(name: &str, built_in: &str) -> bool {
-    Path::new("/sys/module").join(name).exists()
+/// Where the node's unit keeps a copy of the kernel's list of built-in modules
+/// (`units/tinfirm-node-agent-modules.service`): the helper's own unit hides `/lib/modules`
+/// (`ProtectKernelModules`), so the helper cannot read the list where the kernel's package
+/// put it.
+pub const BUILT_IN_COPY: &str = "/run/tinfirm-node-agent-modules/modules.builtin";
+
+/// A kernel module is there: loaded (an entry under `sys_module`, the node's `/sys/module`),
+/// or built into the running kernel (a line of `built_in`, the text of the kernel's
+/// `modules.builtin`: one path per line, `kernel/drivers/net/veth.ko`). A built-in module has
+/// an entry under `/sys/module` only when it has a parameter, so both are asked. The list
+/// spells a module's name with `-` or `_`, and may name a compressed file.
+pub fn module_present(name: &str, sys_module: &Path, built_in: &str) -> bool {
+    sys_module.join(name).exists()
         || built_in.lines().any(|line| {
-            line.rsplit('/')
-                .next()
-                .and_then(|file| file.strip_suffix(".ko"))
-                .is_some_and(|module| module.replace('-', "_") == name)
+            let file = line.trim().rsplit('/').next().unwrap_or("");
+            let module = file.split_once(".ko").map_or("", |(module, _)| module);
+            !module.is_empty() && module.replace('-', "_") == name
         })
+}
+
+/// The kernel's list of built-in modules: the first of `places` that can be read.
+fn built_in_modules(places: &[PathBuf]) -> Option<String> {
+    places
+        .iter()
+        .find_map(|place| std::fs::read_to_string(place).ok())
 }
 
 impl Backend for LinuxBackend {
@@ -1092,15 +1166,24 @@ impl Backend for LinuxBackend {
             }
         }
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        let built_in =
-            std::fs::read_to_string(format!("/lib/modules/{}/modules.builtin", release.trim()))
-                .unwrap_or_default();
+        let built_in = built_in_modules(&[
+            PathBuf::from(format!("/lib/modules/{}/modules.builtin", release.trim())),
+            PathBuf::from(BUILT_IN_COPY),
+        ]);
         for name in MODULES {
-            if module_present(name, &built_in) {
+            if module_present(
+                name,
+                Path::new("/sys/module"),
+                built_in.as_deref().unwrap_or(""),
+            ) {
                 checked.push(format!("the module {name}"));
+            } else if built_in.is_some() {
+                problems.push(format!(
+                    "the kernel module {name} is neither loaded (no /sys/module/{name}) nor built into this kernel: the helper loads none"
+                ));
             } else {
                 problems.push(format!(
-                    "the kernel module {name} is not loaded (no /sys/module/{name}, and the kernel's list of built-in modules does not name it or cannot be read): the helper loads none"
+                    "the kernel module {name} is not loaded (no /sys/module/{name}), and the kernel's list of built-in modules cannot be read, neither in /lib/modules nor at {BUILT_IN_COPY}: the helper loads none"
                 ));
             }
         }
@@ -1166,8 +1249,10 @@ impl Backend for LinuxBackend {
     /// listed, so the helper's own delete finds it again.
     fn make(&self, plan: &VmPlan, user_data: &[u8]) -> Result<(), BackendError> {
         let places = places(&plan.firecracker, &plan.names);
-        if exists(&places.jail_dir) {
-            return Err(failed("the jail exists already"));
+        match presence(&places.jail_dir) {
+            Presence::Gone => {}
+            Presence::There => return Err(failed("the jail exists already")),
+            Presence::Unknown(why) => return Err(failed(why)),
         }
         let mut disk = user_data_disk(user_data)
             .ok_or_else(|| failed("the user data is empty or over its size"))?;
@@ -1188,57 +1273,90 @@ impl Backend for LinuxBackend {
     }
 
     /// Removes everything of the VM named `names`. Every step is tried whatever the one before
-    /// did, and each is checked: the delete fails while anything of the VM is left, and names
-    /// it. The jail's directory goes last, and only when nothing else is left, so a VM that
-    /// could not be removed is still listed and keeps its slot.
+    /// did, and each is checked: the delete fails while anything of the VM is left, or while
+    /// the node could not be asked whether it is ([`Presence::Unknown`]), and names it. The
+    /// jail's directory goes last, and only when nothing else is left, so a VM that could not
+    /// be removed is still listed and keeps its slot.
+    ///
+    /// How each thing is known to be gone:
+    ///
+    /// | Thing | Gone when | Could not ask when |
+    /// |---|---|---|
+    /// | The VM's processes | its cgroup's `cgroup.procs` is read and empty, or the cgroup is not there | the file cannot be read |
+    /// | The snapshot's device | `/sys/block` is read and no `dm-*` has its name | `/sys/block` or a name in it cannot be read |
+    /// | Its loop device | `/sys/block` is read and no `loop*` has its backing file | the same |
+    /// | The files, the namespace, the veth, the cgroup, the jail | the path says "no such file or directory" | any other error on the path |
+    /// | The node's table | `nft list table` fails with its "No such file or directory" ([`table_is_gone`]) | nft cannot run, or fails with any other text |
+    ///
+    /// Every process of a VM is in its cgroup: the jailer enters it before it forks, and a
+    /// VMM cannot leave it (it may write no other cgroup's `cgroup.procs`). So the delete asks
+    /// the cgroup, not the user's process list; and the kernel refuses to remove a cgroup that
+    /// still holds a process, which is the second check.
     fn delete(&self, names: &Names) -> Result<(), BackendError> {
         let places = places(&self.config.firecracker, names);
         let mut left: Vec<String> = Vec::new();
+        // One thing's state after its step: nothing to say when it is gone.
+        let mut check = |what: String, state: Presence| match state {
+            Presence::Gone => {}
+            Presence::There => left.push(what),
+            Presence::Unknown(why) => left.push(format!("{what}, perhaps ({why})")),
+        };
+        let pids = |cgroup: &Path| match cgroup_pids(cgroup) {
+            Ok(pids) if pids.is_empty() => Presence::Gone,
+            Ok(_) => Presence::There,
+            Err(why) => Presence::Unknown(why),
+        };
+        let device_state = |device: &str| match dm_exists(device) {
+            Ok(false) => Presence::Gone,
+            Ok(true) => Presence::There,
+            Err(why) => Presence::Unknown(why),
+        };
+        let loop_state = |file: &Path| match loops_of(file) {
+            Ok(found) if found.is_empty() => Presence::Gone,
+            Ok(_) => Presence::There,
+            Err(why) => Presence::Unknown(why),
+        };
 
         // The VMM and whatever else is in its cgroup.
-        if exists(&places.cgroup) {
+        if presence(&places.cgroup) != Presence::Gone {
             if std::fs::write(places.cgroup.join("cgroup.kill"), "1").is_err() {
-                for pid in cgroup_pids(&places.cgroup) {
+                for pid in cgroup_pids(&places.cgroup).unwrap_or_default() {
                     let _ = tool(&words(&["kill", "-KILL", &pid.to_string()]), None);
                 }
             }
-            if !wait_until(KILL_TIMEOUT, || cgroup_pids(&places.cgroup).is_empty()) {
-                left.push(format!(
-                    "{} process(es) of its cgroup still run",
-                    cgroup_pids(&places.cgroup).len()
-                ));
-            }
+            wait_until(KILL_TIMEOUT, || pids(&places.cgroup) != Presence::There);
+            check("processes of its cgroup".into(), pids(&places.cgroup));
         }
 
         // The snapshot's device, then its loop device, then its file.
         let device = names.snapshot();
-        if dm_exists(&device) {
+        if device_state(&device) != Presence::Gone {
             // The VMM's descriptor of the device closes a moment after its process is gone:
             // the first tries may find the device busy. `dmsetup remove --retry` would sleep
             // 200 ms after each; this loop tries again every 10 ms.
-            let removed = wait_until(KILL_TIMEOUT, || {
+            wait_until(KILL_TIMEOUT, || {
                 let _ = tool(&words(&["dmsetup", "remove", &device]), None);
-                !dm_exists(&device)
+                device_state(&device) != Presence::There
             });
-            if !removed {
-                left.push(format!("the device-mapper device {device}"));
-            }
         }
-        for attached in loops_of(&places.snapshot_file) {
+        check(
+            format!("the device-mapper device {device}"),
+            device_state(&device),
+        );
+        for attached in loops_of(&places.snapshot_file).unwrap_or_default() {
             let _ = tool(&words(&["losetup", "--detach", &attached]), None);
         }
         // A loop device is detached once its last user closed it, which may be a moment later.
-        if !wait_until(KILL_TIMEOUT, || loops_of(&places.snapshot_file).is_empty()) {
-            left.push(format!(
-                "the loop device of {}",
-                places.snapshot_file.display()
-            ));
-        }
+        wait_until(KILL_TIMEOUT, || {
+            loop_state(&places.snapshot_file) != Presence::There
+        });
+        check(
+            format!("the loop device of {}", places.snapshot_file.display()),
+            loop_state(&places.snapshot_file),
+        );
         for file in [&places.snapshot_file, &places.console] {
             let _ = std::fs::remove_file(file);
-            if exists(file) {
-                left.push(format!("the file {}", file.display()));
-            }
+            check(format!("the file {}", file.display()), presence(file));
         }
 
         // The veth first: removing the node's end removes its peer in the namespace at once,
@@ -1247,43 +1365,42 @@ impl Backend for LinuxBackend {
         let jail = names.jail();
         let veth = names.veth();
         let veth_path = Path::new("/sys/class/net").join(&veth);
-        if exists(&veth_path) {
+        if presence(&veth_path) != Presence::Gone {
             let _ = tool(&words(&["ip", "link", "del", &veth]), None);
-            if exists(&veth_path) {
-                left.push(format!("the interface {veth}"));
-            }
         }
-        if exists(&places.netns) {
+        check(format!("the interface {veth}"), presence(&veth_path));
+        if presence(&places.netns) != Presence::Gone {
             let _ = tool(&words(&["ip", "netns", "del", &jail]), None);
-            if exists(&places.netns) {
-                left.push(format!("the network namespace {jail}"));
-            }
         }
+        check(
+            format!("the network namespace {jail}"),
+            presence(&places.netns),
+        );
+
+        // The node's table of the VM: gone only when nft itself says that it does not exist.
         let table = names.table();
         let listing = words(&["nft", "list", "table", "inet", &table]);
-        match tool(&listing, None) {
-            Ok(_) => {
-                let _ = tool(&words(&["nft", "delete", "table", "inet", &table]), None);
-                // Gone only when nft says so itself: a tool that cannot run proves nothing.
-                if !matches!(tool(&listing, None), Err(ToolError::Exit(_))) {
-                    left.push(format!("the firewall table {table}"));
-                }
-            }
-            Err(ToolError::Exit(_)) => {}
-            Err(ToolError::Start(why)) => {
-                left.push(format!("the firewall table {table}, perhaps ({why})"))
-            }
+        let table_state = || match tool(&listing, None) {
+            Ok(_) => Presence::There,
+            Err(ToolError::Exit { said, .. }) if table_is_gone(&said) => Presence::Gone,
+            Err(e) => Presence::Unknown(e.to_string()),
+        };
+        if table_state() == Presence::There {
+            let _ = tool(&words(&["nft", "delete", "table", "inet", &table]), None);
         }
+        check(format!("the firewall table {table}"), table_state());
 
         // The cgroup: empty by now, but the kernel may need a moment to let it go.
-        if exists(&places.cgroup)
-            && !wait_until(KILL_TIMEOUT, || {
+        if presence(&places.cgroup) != Presence::Gone {
+            wait_until(KILL_TIMEOUT, || {
                 let _ = std::fs::remove_dir(&places.cgroup);
-                !exists(&places.cgroup)
-            })
-        {
-            left.push(format!("the cgroup {}", places.cgroup.display()));
+                presence(&places.cgroup) != Presence::There
+            });
         }
+        check(
+            format!("the cgroup {}", places.cgroup.display()),
+            presence(&places.cgroup),
+        );
 
         // The jail's directory: the last, since it is what `list` finds the VM by.
         if left.is_empty() {
@@ -1296,8 +1413,15 @@ impl Backend for LinuxBackend {
                     e.kind()
                 )),
             }
-            if left.is_empty() && exists(&places.jail_dir) {
-                left.push(format!("the jail {}", places.jail_dir.display()));
+            if left.is_empty() {
+                match presence(&places.jail_dir) {
+                    Presence::Gone => {}
+                    Presence::There => left.push(format!("the jail {}", places.jail_dir.display())),
+                    Presence::Unknown(why) => left.push(format!(
+                        "the jail {}, perhaps ({why})",
+                        places.jail_dir.display()
+                    )),
+                }
             }
         }
         if left.is_empty() {
@@ -1338,9 +1462,13 @@ impl Backend for LinuxBackend {
             })?;
             let name = entry.file_name();
             let names = name.to_str().and_then(Names::from_jail);
-            let alive = names.is_some_and(|names| {
-                vmm_pid(&places(&self.config.firecracker, &names).cgroup).is_some()
-            });
+            // A cgroup that cannot be read fails the listing: "not alive" must be known.
+            let alive = match names {
+                Some(names) => vmm_pid(&places(&self.config.firecracker, &names).cgroup)
+                    .map_err(BackendError::Failed)?
+                    .is_some(),
+                None => false,
+            };
             present.push(Present {
                 jail: name.to_string_lossy().into_owned(),
                 names,
@@ -1842,6 +1970,74 @@ mod tests {
         ] {
             assert!(!is_backing_file(backing, file), "{backing}");
         }
+    }
+
+    /// The texts are nftables 1.0.9's, captured on a node: a table that is not there, an
+    /// ordinary user, root without `CAP_NET_ADMIN` (the same words), and a delete of a table
+    /// that is not there. All four end with status 1.
+    #[test]
+    fn a_table_is_gone_only_when_nft_says_that_it_does_not_exist() {
+        assert!(table_is_gone(
+            "Error: No such file or directory\nlist table inet tinfirm_000000000abc\n                ^^^^^^^^^^^^^^^^^^^^\n"
+        ));
+        for no_answer in [
+            "Operation not permitted (you must be root)\nnetlink: Error: cache initialization failed: Operation not permitted\n",
+            "Error: Could not process rule: No such file or directory\ndelete table inet tinfirm_000000000abc\n",
+            "netlink: Error: No such file or directory\n",
+            "Error: syntax error, unexpected newline\n",
+            "",
+            "\nError: No such file or directory\n",
+        ] {
+            assert!(!table_is_gone(no_answer), "{no_answer}");
+        }
+    }
+
+    #[test]
+    fn a_path_is_gone_only_when_the_node_says_no_such_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(presence(dir.path()), Presence::There);
+        assert_eq!(presence(&dir.path().join("nothing")), Presence::Gone);
+        // A dangling link is there: it is the link that a delete must remove.
+        std::os::unix::fs::symlink("/nowhere", dir.path().join("link")).unwrap();
+        assert_eq!(presence(&dir.path().join("link")), Presence::There);
+        // A path below a file cannot be asked for: that is no "gone".
+        std::fs::write(dir.path().join("file"), b"").unwrap();
+        assert!(matches!(
+            presence(&dir.path().join("file/below")),
+            Presence::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn a_module_counts_when_it_is_loaded_or_built_into_the_kernel() {
+        // Files standing in for /sys/module and for the kernel's modules.builtin.
+        let dir = tempfile::tempdir().unwrap();
+        let sys_module = dir.path().join("sys-module");
+        std::fs::create_dir_all(sys_module.join("nf_tables")).unwrap();
+        let built_in = "kernel/drivers/net/veth.ko\nkernel/drivers/md/dm-snapshot.ko\n\
+                        kernel/net/netfilter/nft_ct.ko.zst\nkernel/drivers/net/tun.ko\n";
+        std::fs::write(dir.path().join("modules.builtin"), built_in).unwrap();
+        // Loaded, with nothing in the list.
+        assert!(module_present("nf_tables", &sys_module, ""));
+        // Built in, with no entry under /sys/module: a `-` in the file's name, a compressed file.
+        assert!(module_present("veth", &sys_module, built_in));
+        assert!(module_present("dm_snapshot", &sys_module, built_in));
+        assert!(module_present("nft_ct", &sys_module, built_in));
+        // Neither.
+        assert!(!module_present("nf_nat", &sys_module, built_in));
+        assert!(!module_present("kvm", &sys_module, ""));
+        // A name that another module's name only holds.
+        assert!(!module_present("tu", &sys_module, built_in));
+        assert!(!module_present("snapshot", &sys_module, built_in));
+
+        // The list is read from the first place that has it.
+        let missing = dir.path().join("no-such/modules.builtin");
+        let copy = dir.path().join("modules.builtin");
+        assert_eq!(
+            built_in_modules(&[missing.clone(), copy]).as_deref(),
+            Some(built_in)
+        );
+        assert_eq!(built_in_modules(&[missing]), None);
     }
 
     #[test]

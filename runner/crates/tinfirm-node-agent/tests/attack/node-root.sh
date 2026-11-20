@@ -11,8 +11,9 @@
 #      a node reads its runs' tickets: ADR-0112, Consequences) and nowhere else;
 #   2. that the agent's port gives a root shell on the node nothing without the control
 #      host's key;
-#   3. which connections the node itself can open. The agent filters none of them: that is
-#      the node's and the control host's firewall, which the role is to set (planned).
+#   3. which connections the node itself can open. The agent filters none of them: the
+#      node's own firewall does (`units/tinfirm-node-agent.nft`), where the role has loaded
+#      it. The script says whether its table is loaded, and tries the connections either way.
 #
 #   node-root.sh < FILE     (the ticket's value in the user data of the VM that runs, on the
 #                            standard input: on a command line, sudo would write it to the journal)
@@ -84,8 +85,8 @@ try:
 except Exception as error:
     print("  nothing (%s)" % type(error).__name__)
 PY
-echo "== 3. connections the node itself can open, as root (the agent filters none of these)"
-for target in "$CONTROL 22 the-control-host's-SSH" "$CONTROL 443 the-control-host,-port-443" "169.254.169.254 80 the-metadata-service" "1.1.1.1 443 the-internet-by-address"; do
+echo "== 3. connections the node itself can open, as root (the node's firewall table: $(nft list table inet tinfirm_node >/dev/null 2>&1 && echo loaded || echo NOT LOADED))"
+for target in "$CONTROL 22 the-control-host's-SSH" "$CONTROL 443 the-control-host,-port-443" "$CONTROL $AGENT_PORT the-control-host,-the-agent's-own-port-number" "169.254.169.254 80 the-metadata-service" "168.63.129.16 80 Azure's-host-agent" "1.1.1.1 443 the-internet-by-address" "8.8.8.8 53 a-resolver"; do
     set -- $target; echo "  $3 ($1:$2): $(python3 -c "
 import socket,sys
 s=socket.socket(); s.settimeout(3)

@@ -808,6 +808,9 @@ mod tests {
     /// A helper's configuration in a directory of its own, with the listener's uid this test's.
     pub(crate) fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
+        // The spool's parent must not be writable by its group or by others, whatever the
+        // umask the tests run under made of the new directory.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config = config();
         let uid = local::own_uid().unwrap();
         config.listener_uid = uid;

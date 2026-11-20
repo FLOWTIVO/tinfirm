@@ -101,6 +101,16 @@ pub struct RpcRequest {
     pub params: Option<Value>,
 }
 
+/// A request's parameters may hold user data: they are overwritten when the request is dropped,
+/// whichever way it was answered.
+impl Drop for RpcRequest {
+    fn drop(&mut self) {
+        if let Some(params) = &mut self.params {
+            wipe_value(params);
+        }
+    }
+}
+
 /// The methods of the wire. A method's name goes into a log or a message only as one of these.
 pub const METHODS: [&str; 6] = ["hello", "verify", "create", "describe", "delete", "list"];
 
@@ -213,6 +223,34 @@ pub struct VerifyParams {
 #[derive(Clone, Deserialize)]
 #[serde(transparent)]
 pub struct UserData(pub String);
+
+impl UserData {
+    /// Overwrites the text and leaves it empty ([`crate::spool::wipe`]): the listener calls
+    /// it once the user data is in the spool, and it happens when the value is dropped.
+    pub fn wipe(&mut self) {
+        let mut bytes = std::mem::take(&mut self.0).into_bytes();
+        crate::spool::wipe(&mut bytes);
+    }
+}
+
+impl Drop for UserData {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+/// Overwrites every string of a JSON value, at any depth ([`crate::spool::wipe`]).
+pub fn wipe_value(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let mut bytes = std::mem::take(text).into_bytes();
+            crate::spool::wipe(&mut bytes);
+        }
+        Value::Array(items) => items.iter_mut().for_each(wipe_value),
+        Value::Object(fields) => fields.values_mut().for_each(wipe_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
 
 impl fmt::Debug for UserData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -218,7 +218,9 @@ impl Node {
     }
 
     fn backend(&self) -> LinuxBackend {
+        // The helper starts its own binary to cut the bounding set; here that is the agent's.
         LinuxBackend::new(self.config.clone())
+            .with_starter(env!("CARGO_BIN_EXE_tinfirm-node-agent"))
     }
 
     /// User data as the runner host writes it: the bridge listens for the host, with a

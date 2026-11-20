@@ -24,9 +24,12 @@ rcgen.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# Constants (O_NOFOLLOW, O_NONBLOCK, O_NOCTTY), whose values differ by architecture, and one
-# call: prctl(PR_CAPBSET_DROP) in `src/bounding.rs`, the crate's only unsafe code.
+# Constants only (O_NOFOLLOW, O_NONBLOCK, O_NOCTTY), whose values differ by architecture; no
+# call into libc, so no unsafe code.
 libc.workspace = true
+# prctl(PR_CAPBSET_DROP) for the VMM's bounding set (`src/bounding.rs`), which the workspace's
+# `unsafe_code` rule keeps out of our own code. Already in the workspace, for the runner host.
+rustix = { workspace = true, features = ["thread"] }
 
 [dev-dependencies]
 tempfile.workspace = true
