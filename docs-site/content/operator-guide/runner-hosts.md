@@ -36,7 +36,7 @@ Each Tinfirm release carries the binary for these platforms on its [GitHub Relea
 
 `<version>` is `x.y.z` for a release `vx.y.z`, such as `1.0.0`, and `rolling-<short sha>` for `rolling`. Only the runner host and the node agent are published: the runner host as these archives and as the image `ghcr.io/flowtivo/tinfirm-runner-host` (`:v1.0.0` for v1.0.0), the node agent as its archives alone. The runner images, which contain Claude Code, are built on your machine and never pushed to a registry.
 
-The node agent runs on the sandbox nodes of a control host whose VMs run on your own machines ([With sandbox nodes](helm.md#with-sandbox-nodes)), not on a runner host. Install it from the same release as the runner host, which checks the agent's release when it connects. Download and check its archive as the runner host's below, with `tinfirm-node-agent` in place of `tinfirm-runner-host` and a Linux target; its archive holds the binary, its licence and the licences of the crates it is built with. The node agent makes VMs, but the role that installs it with its service units, the node's own firewall and its hardening are planned: sandbox nodes are not ready for production.
+The node agent runs on the sandbox nodes of a control host whose VMs run on your own machines ([With sandbox nodes](helm.md#with-sandbox-nodes)), not on a runner host. Install it from the same release as the runner host, which checks the agent's release when it connects. Download and check its archive as the runner host's below, with `tinfirm-node-agent` in place of `tinfirm-runner-host` and a Linux target; its archive holds the binary, its licence and the licences of the crates it is built with. The Ansible role in `deploy/ansible` installs it with its service units, the node's own firewall and the guest's kernel and image, and a control host beside it ([Sandbox nodes on your own machines](sandbox-nodes.md)). The node's hardening is planned, and sandbox nodes are not ready for production: no conversation has run through a node, and the role has not run on a machine yet.
 
 On Kubernetes, the Helm chart can run a company host for you, as a pod whose sandboxes are VMs, with no machine of its own and no registration in the app: [The runner pod](helm.md#the-runner-pod).
 
@@ -117,7 +117,7 @@ TimeoutStopSec=180
 WantedBy=multi-user.target
 ```
 
-Settings that are not options of the unit's command go in its environment (`Environment=` or an `EnvironmentFile=`): the reference lists every `TINFIRM_RUNNER_*` variable. For Linux VMs with Kata Containers, the Ansible role in `deploy/ansible` of Tinfirm's source installs Docker, Kata, the binary and this unit, logs in and builds the images.
+Settings that are not options of the unit's command go in its environment (`Environment=` or an `EnvironmentFile=`): the reference lists every `TINFIRM_RUNNER_*` variable. For Linux VMs with Kata Containers, the Ansible role in `deploy/ansible` of Tinfirm's source installs Docker, Kata, the binary and this unit, logs in and builds the images. For a control host whose VMs run on sandbox nodes, its play `control-host.yml` installs the binary and this unit with `run --executor vm --vm-driver node`, and no Docker, Kata or image ([Sandbox nodes on your own machines](sandbox-nodes.md)).
 
 **A company host is a tier-0 asset.** It receives the git token and the prompt of every conversation it runs, so harden it like the server. The Ansible role does by default, and a unit you write yourself should too:
 
@@ -128,7 +128,7 @@ Settings that are not options of the unit's command go in its environment (`Envi
 
 The role's variables turn each of them off (`tinfirm_runner_host_egress_proxy`, `tinfirm_runner_host_sandbox_bridge`, `tinfirm_runner_host_uid`); `deploy/ansible/README.md` lists them.
 
-**A sandbox node is a tier-1 asset.** A node runs the VMs of a control host and holds no credential: no git token, no host token and no model token. Whoever takes a node over reads the files and prompts of the runs on it and can change the work they hand back, which the control host then pushes to each run's own branch. So a node is a lower tier than the control host, with the same administrators: give its administration only to the people who administer the control host, admit nothing to it but the control host and your one management address, and replace its image on a schedule. Sandbox nodes are not ready for production yet ([With sandbox nodes](helm.md#with-sandbox-nodes)).
+**A sandbox node is a tier-1 asset.** A node runs the VMs of a control host and holds no credential: no git token, no host token and no model token. Whoever takes a node over reads the files and prompts of the runs on it and can change the work they hand back, which the control host then pushes to each run's own branch. So a node is a lower tier than the control host, with the same administrators: give its administration only to the people who administer the control host, admit nothing to it but the control host and your one management address, and replace its image on a schedule. The node's role does the second and makes the third easy ([Sandbox nodes on your own machines](sandbox-nodes.md#who-administers-a-node)). Sandbox nodes are not ready for production yet ([With sandbox nodes](helm.md#with-sandbox-nodes)).
 
 ## What a run does
 

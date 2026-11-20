@@ -341,7 +341,7 @@ With `runner.enabled: true` the chart also runs a runner host, as a pod: the com
 
 | `runner.vm.driver` | Where the VMs run | Edition | State |
 |---|---|---|---|
-| `node` | On sandbox nodes outside the cluster: your machines with KVM, each running the node agent, which hold no credential | Every edition, Community included | Not ready for production: the node agent makes VMs, but a node's setup, firewall and hardening are planned (below) |
+| `node` | On sandbox nodes outside the cluster: your machines with KVM, each running the node agent, which hold no credential | Every edition, Community included | Not ready for production: the node agent makes VMs, and the role that sets up a node has not run on a machine yet; a node's hardening is planned (below) |
 | `digitalocean` (the default) | A DigitalOcean Droplet per run | Pro and Enterprise ([Licence](licence.md)). Without such a key the server refuses the host, and the pod stops. | Available |
 
 Ready VMs, which wait for runs so that a run starts in seconds, are Pro's and Enterprise's with either driver: `runner.pool.maxReady` stays `0`, its default, in Community.
@@ -357,13 +357,13 @@ kubectl -n tinfirm create secret generic tinfirm-runner --from-file=token=./runn
 
 !!! warning "Not ready for production"
 
-    The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host's `node` driver. What a node needs around it is planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)): the role that installs the agent and its service units, the node's own firewall, its hardening, and the published VM image. The chart's pod has not run against a node, and no conversation has run through one. The runner host refuses to start with the `node` driver while a node's check reports a problem. Use this form to prepare and to test, and DigitalOcean's driver for production until then.
+    The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host's `node` driver. The Ansible role that installs a node, with the agent's service units and the node's own firewall, is built and has not run on a machine yet ([Sandbox nodes on your own machines](sandbox-nodes.md)). The node's hardening and the published VM image are planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). The chart's pod has not run against a node, and no conversation has run through one. The runner host refuses to start with the `node` driver while a node's check reports a problem. Use this form to prepare and to test, and DigitalOcean's driver for production until then.
 
 The pod is then a control host: it holds the credentials and runs no agent code. The VMs run on sandbox nodes, machines outside the cluster that hold nothing, each with the node agent. The pod reaches each node's agent over TLS, with the node's certificate pinned by its SHA-256 and the pod's own client certificate, which each node pins in turn. A node's local socket, for a runner host on the node's own machine, is not for a pod. Such a host would report the isolation level `machine`.
 
 Prepare:
 
-- the sandbox nodes, each with the node agent, its templates and the VM image of the same release as the chart. The node agent is the archive `tinfirm-node-agent-<version>-<target>.tar.gz` of that release, checked against its signed `SHA256SUMS` as the runner host's ([Install and run runner hosts](runner-hosts.md#install));
+- the sandbox nodes, each with the node agent, its templates and the VM image of the same release as the chart. The node agent is the archive `tinfirm-node-agent-<version>-<target>.tar.gz` of that release, checked against its signed `SHA256SUMS` as the runner host's ([Install and run runner hosts](runner-hosts.md#install)). The play `sandbox-node.yml` installs a node ([Sandbox nodes on your own machines](sandbox-nodes.md)): give it the pod's client fingerprint as `tinfirm_sandbox_node_client_sha256` and the address the pod's connections come from as `tinfirm_sandbox_node_control_host`;
 - the pod's client certificate and key: `tinfirm-runner-host node identity --cert client.crt --key client.key` writes them (DER, the key with mode 0600; it refuses files that exist) and prints the certificate's SHA-256, which each node's listener names as `tls.clientSha256`. `tinfirm-node-agent identity` makes the same files, so either binary will do;
 - each node's certificate's SHA-256: `tinfirm-runner-host node fingerprint --cert node.crt`, or `tinfirm-node-agent fingerprint --cert node.crt` on the node;
 - the network: the pod reaches each node at its agent's TLS port (`tls.listen`) and at the ports where the node publishes the VMs' bridges (its `network.firstPort` to `firstPort + maxVms - 1`), and each node's `network.controlHost` is the address it sees the pod's connections come from. A node lets in the published ports from that one address alone, so the cluster's pods must leave through one address, such as a NAT gateway or an egress IP.
@@ -447,7 +447,7 @@ runner:
 | `runner.existingSecret`, `runner.secretKeys.token` | `tinfirm-runner`, `token` | The host's token, `tfr_` and 43 base64url characters. The server gets it at its start and keeps only its hash; the pod reads it from a file. |
 | `runner.serverUrl` | the public URL | The server's URL that the pod connects to, https only, as any runner host's |
 | `runner.maxConcurrentRuns` | `4` | The most runs at once, up to 1000; admins can lower it on **Runner hosts**, never raise it |
-| `runner.vm.driver` | `digitalocean` | `node` (sandbox nodes, every edition; planned, above) or `digitalocean` (Pro and Enterprise) |
+| `runner.vm.driver` | `digitalocean` | `node` (sandbox nodes, every edition; not ready for production, above) or `digitalocean` (Pro and Enterprise) |
 | `runner.vm.template` | `sandbox` | The template that every VM is created from: one that a node offers, or a key of `runner.vm.digitalocean.templates` |
 | `runner.vm.node.existingSecret`, `.secretKeys.certificate`, `.secretKeys.key` | `tinfirm-node-driver`, `client.crt`, `client.key` | With `node`: the pod's client certificate and key, DER |
 | `runner.vm.node.nodes` | none | With `node`, 1 to 64: each node's `name` (1 to 32 of `a-z`, `0-9` and `-`), `address` (`HOST:PORT` of its agent's TLS listener; an IPv6 address in brackets), `nodeSha256` (its certificate's SHA-256) and `templates` |
