@@ -41,7 +41,7 @@
         mode: "0644"
       loop: [helper.json, listener.json, firewall.nft, listener-control-host.conf]
 
-    - name: Render the node's firewall for one VM and a static address
+    - name: Render the node's firewall for one VM, a static address and SSH on another port
       ansible.builtin.template:
         src: "{{ _node }}/templates/firewall.nft.j2"
         dest: "{{ render_dir }}/firewall-one-vm-static.nft"
@@ -49,6 +49,7 @@
       vars:
         tinfirm_sandbox_node_max_vms: 1
         tinfirm_sandbox_node_dhcp: false
+        tinfirm_sandbox_node_ssh_port: 2222
 
     - name: Render the control host's driver configuration
       ansible.builtin.template:

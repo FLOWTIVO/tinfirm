@@ -174,6 +174,9 @@ impl Node {
             "state": root.join("state"),
             "maxVms": max_vms,
             "vmUidBase": 1_300_000,
+            // These tests load no node table of their own: they run on a machine with or
+            // without the role's.
+            "nodeFirewall": "not-required",
             "network": {
                 "vmRange": "10.251.0.0/24",
                 "nodeAddress": NODE,

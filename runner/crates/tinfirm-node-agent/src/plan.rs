@@ -114,6 +114,20 @@ fn default_jail_mib() -> u32 {
     64
 }
 
+/// Whether the helper makes VMs only while the node's own firewall table
+/// (`units/tinfirm-node-agent.nft`, `inet tinfirm_node`) is loaded. The table is required
+/// unless the configuration says otherwise, so the weaker choice is the one written down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeFirewall {
+    /// `check` names a missing table as a problem, and `make` refuses while it is missing.
+    #[default]
+    Required,
+    /// For a node that runs without the table (a test machine): `check` says that it is
+    /// missing, as a line of what was checked, and `make` does not ask.
+    NotRequired,
+}
+
 /// The helper's configuration file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -130,6 +144,10 @@ pub struct HelperConfig {
     pub max_vms: u32,
     /// The user and group of slot N's VMM are `vmUidBase + N`.
     pub vm_uid_base: u32,
+    /// `"required"` by default; `"not-required"` only where the node is meant to run without
+    /// its own firewall table.
+    #[serde(default)]
+    pub node_firewall: NodeFirewall,
     pub network: Network,
     pub firecracker: Firecracker,
     pub templates: BTreeMap<TemplateName, Template>,
@@ -525,6 +543,7 @@ pub(crate) mod tests {
             "state": "/var/lib/tinfirm-node-agent/helper",
             "maxVms": 64,
             "vmUidBase": 1_100_000,
+            "nodeFirewall": "required",
             "network": {
                 "vmRange": "10.231.0.0/16",
                 "nodeAddress": "10.0.0.20",
@@ -583,6 +602,42 @@ pub(crate) mod tests {
         let t = &config.templates[&TemplateName::parse(b"sandbox-4c8g").unwrap()];
         assert_eq!(t.bridge_port, DEFAULT_BRIDGE_PORT);
         assert_eq!(t.pids_max, 64);
+        assert_eq!(config.node_firewall, NodeFirewall::Required);
+    }
+
+    #[test]
+    fn the_node_firewall_is_required_unless_the_configuration_says_otherwise() {
+        let parse = |value: Option<serde_json::Value>| {
+            let mut json = config_json();
+            match value {
+                Some(value) => json["nodeFirewall"] = value,
+                None => {
+                    json.as_object_mut().unwrap().remove("nodeFirewall");
+                }
+            }
+            serde_json::from_value::<HelperConfig>(json).map(|c| c.node_firewall)
+        };
+        assert_eq!(parse(None).unwrap(), NodeFirewall::Required);
+        assert_eq!(
+            parse(Some("required".into())).unwrap(),
+            NodeFirewall::Required
+        );
+        assert_eq!(
+            parse(Some("not-required".into())).unwrap(),
+            NodeFirewall::NotRequired
+        );
+        for wrong in [
+            serde_json::json!("optional"),
+            serde_json::json!("Required"),
+            serde_json::json!("notRequired"),
+            serde_json::json!("not_required"),
+            serde_json::json!(""),
+            serde_json::json!(false),
+            serde_json::json!(null),
+            serde_json::json!({"required": false}),
+        ] {
+            assert!(parse(Some(wrong.clone())).is_err(), "{wrong} was taken");
+        }
     }
 
     #[test]

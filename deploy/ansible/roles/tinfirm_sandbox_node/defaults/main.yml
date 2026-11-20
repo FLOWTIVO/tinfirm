@@ -94,6 +94,9 @@ tinfirm_sandbox_node_control_host: ""
 # It may be the control host's; then a control host that is taken over reaches the node's SSH
 # port, though still not without a key.
 tinfirm_sandbox_node_management_address: ""
+# The port of the node's SSH server, which the node's firewall admits from the management
+# address alone (the firewall's `ssh_port`). The role does not change sshd's port.
+tinfirm_sandbox_node_ssh_port: 22
 # true: the role stops when this play's SSH connection comes from another address than
 # tinfirm_sandbox_node_management_address, since the node's firewall would then lock it out.
 tinfirm_sandbox_node_check_ssh_source: true

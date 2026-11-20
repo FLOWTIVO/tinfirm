@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::backend::{Backend, BackendError, Checked, Present};
+use crate::backend::{Backend, BackendError, Checked, NodeTable, Present};
 use crate::bounding;
 use crate::plan::{Firecracker, HelperConfig, Names, Template, VmPlan};
 use crate::spool::MAX_USER_DATA;
@@ -543,10 +543,10 @@ pub fn network_read_backs(plan: &VmPlan) -> Vec<(Vec<String>, &'static str)> {
     checks
 }
 
-/// The node's own setting that every VM needs, and that the node's role must set: the helper
-/// reads it and never writes it.
 /// The node's own firewall table, as `nft list tables` names it (`units/tinfirm-node-agent.nft`).
 pub const NODE_TABLE: &str = "inet tinfirm_node";
+/// The node's own setting that every VM needs, and that the node's role must set: the helper
+/// reads it and never writes it.
 pub const NODE_FORWARDING: &str = "net.ipv4.ip_forward";
 
 /// The loop device of `losetup --noheadings --output NAME,RO --associated <image>` that is
@@ -1671,19 +1671,19 @@ impl Backend for LinuxBackend {
                 e.kind()
             )),
         }
-        // The node's own firewall is the node's role's, and the helper works without it; what
-        // a control host is told is whether it is there, since a node without it forwards and
-        // answers with no guard of its own.
-        match tool(&words(&["nft", "list", "tables"]), None) {
-            Ok(listing) if tables_of(&listing).contains(NODE_TABLE) => {
-                checked.push(format!("the node's own firewall table ({NODE_TABLE})"));
-            }
-            Ok(_) => checked.push(format!(
-                "NOT THERE: the node's own firewall table ({NODE_TABLE}); the node lets out and in whatever its network allows"
-            )),
-            Err(e) => problems.push(format!("the node's firewall tables cannot be listed: {e}")),
-        }
+        // The node's own firewall table is asked by the helper itself (`node_table`), which
+        // decides with its configuration whether a missing one is a problem.
         Checked { problems, checked }
+    }
+
+    /// `nft list tables`, read for the node's own table. The role loads the table; the
+    /// helper never loads it again, which would hide that someone removed it.
+    fn node_table(&self) -> NodeTable {
+        match tool(&words(&["nft", "list", "tables"]), None) {
+            Ok(listing) if tables_of(&listing).contains(NODE_TABLE) => NodeTable::There,
+            Ok(_) => NodeTable::Missing,
+            Err(e) => NodeTable::Unknown(e.to_string()),
+        }
     }
 
     /// Builds the VM and starts its VMM. A make that fails at any step removes what it made

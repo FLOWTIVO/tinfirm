@@ -13,6 +13,7 @@ It is a binary of its own, licensed under MIT like the rest of `runner/` outside
 | The fake backend, for the tests | Built |
 | The Linux backend's planning half: the jailer's arguments, the VMM's configuration, the snapshot's table, the network's commands, the firewall's rules, the user-data disk, what is read back | Built, tested as pure functions |
 | The Linux backend's execution: running those as root, the VMM's start, the removal of a VM's jail, snapshot, namespace, cgroup and tables, the node's check | Built, tested on a KVM node (`tests/linux_kvm.rs`, and [the evidence](../../../docs/reviews/2026-11-19-node-agent-execution/README.md)) |
+| The node's own firewall table required (`nodeFirewall`): `check` names a missing table as a problem, and the helper refuses a make while it is missing | Built, tested with the fake backend (`helper.rs`, `tests/agent.rs`). Not yet run on a node: the evidence's round 10 shows the earlier behaviour, a line of what was checked |
 | The VMM's capability bounding set, cut to the six capabilities the jailer needs (ADR-0112 decision 4) | Built (`src/bounding.rs`), without unsafe code: the jailer has no argument for the bounding set and leaves it full, so the helper starts its own binary again as the hidden subcommand `start-jailer`, which drops the others from its own bounding set (`prctl(PR_CAPBSET_DROP)` through rustix) and then becomes the jailer. The helper refuses a VMM whose `/proc/<pid>/status` shows more. Below, "The bounding set" |
 | The VM image for a local disk | Built: `runner/images/vm/local-disk.sh` runs `setup.sh` without a provider and writes one ext4 file. Run in real guests |
 | A single machine: the runner host and the node agent on one machine (ADR-0112 decision 5) | Planned. The local-socket transport is built. The single machine's own firewall table is not (refuse every packet from a VMM's user, and from the listener's user but for its port; check it before each VM). Until it is, the helper refuses a configuration whose control host is the node itself (its address or loopback): the prerouting DNAT never sees a connection that the node's own stack makes, and an output-hook DNAT matched on the source address alone would admit every local user |
@@ -80,6 +81,7 @@ Both files are JSON. An unknown field anywhere is refused. Paths are absolute.
   "state": "/var/lib/tinfirm-node-agent/helper",
   "maxVms": 8,
   "vmUidBase": 1100000,
+  "nodeFirewall": "required",
   "network": {
     "vmRange": "10.231.0.0/16",
     "nodeAddress": "10.0.0.20",
@@ -113,6 +115,7 @@ Both files are JSON. An unknown field anywhere is refused. Paths are absolute.
 | `listenerUid` | Not 0, and not one of the VMs' users |
 | `maxVms` | 1 to 1024 |
 | `vmUidBase` | At least 100000; `vmUidBase + maxVms` below 2^31 |
+| `nodeFirewall` | `"required"` (default) or `"not-required"`, nothing else. `"required"`: the node's own firewall table (`inet tinfirm_node`, below) must be loaded. While it is missing, `check` names it as a problem, so a control host places no VM on the node, and the helper refuses every make, whoever asks. The VMs that run are left as they are. `"not-required"`: for a node that is meant to run without the table, such as a test machine; `check` then says in a line of what was checked whether the table is there, and that this node's configuration does not require it. Tables that cannot be listed are a problem either way |
 | `network.vmRange` | `A.B.C.D/P`, P from 8 to 29, no bit set below the prefix; room for `maxVms` slots of 8 addresses; holds neither `nodeAddress` nor `controlHost` |
 | `network.controlHost`, `network.nodeAddress` | Two different addresses; neither loopback nor `0.0.0.0`. A control host on the node itself is the single machine, which is planned (above). The helper compares the two addresses of its own file and nothing else: a control host at another address of the node itself passes, since the helper cannot know the node's addresses without the network it does not have. Whoever installs the node checks that (the role compares the control host with every IPv4 address of the node) |
 | `network.firstPort` | At least 1024; `firstPort + maxVms - 1` at most 65535. The published ports must not hold the listener's own port (`tls.listen`): the helper does not know the listener's configuration, so this is the installation's to keep |
@@ -320,13 +323,14 @@ Only then does it read the bytes, at most 65537, and refuse them if their count 
 
 ### What a node needs
 
-`check` (the wire's `verify`) names each of these that is missing, and a control host does not use a node that has a problem. `make` does not run the whole check again: it reads back what a VM cannot do without (the forwarding, the settings of its namespace, its two tables, the room for its snapshot) and fails with the reason.
+`check` (the wire's `verify`) names each of these that is missing, and a control host does not use a node that has a problem. `make` does not run the whole check again: it asks whether the node's own firewall table is there, reads back what a VM cannot do without (the forwarding, the settings of its namespace, its two tables, the room for its snapshot), and fails with the reason.
 
 | What | Why |
 |---|---|
 | `/dev/kvm`, `/dev/net/tun`, `/dev/mapper/control`, `/dev/loop-control` | KVM, the tap device, the snapshot, the loop devices |
 | The tools `ip`, `nft`, `sysctl`, `losetup`, `dmsetup`, `blockdev`, `mknod` | What the execution runs |
 | The modules `kvm`, `dm_snapshot`, `veth`, `nf_tables`, `nft_ct`, `nft_chain_nat`, `nft_nat`, `nf_nat` | The helper loads none (`units/tinfirm-node-agent-modules.service` does, at boot). A module counts when `/sys/module/<name>` is there, or when the kernel's list of built-in modules names it: a built-in module has an entry under `/sys/module` only when it has a parameter. The list is read from `/lib/modules/<release>/modules.builtin`, or, since the helper's unit hides `/lib/modules`, from the copy that the modules' unit makes at `/run/tinfirm-node-agent-modules/modules.builtin` |
+| The node's own firewall table, `inet tinfirm_node` in `nft list tables`, unless `nodeFirewall` is `"not-required"` | Without it the node lets out and in whatever its network allows: a process that got out of a VMM, or the listener's user, could open connections from the node. Below, "The node's firewall". With `"not-required"` its absence is a line of what was checked. `nft list tables` failing is a problem either way |
 | `net.ipv4.ip_forward=1` | A published port is a DNAT into the VM's namespace. The helper reads it and never writes it (`units/tinfirm-node-agent.sysctl.conf`). Forwarding makes the node a router for whatever reaches it: the node's own firewall (below) forwards nothing but the control host's connections to the published ports |
 | A cgroup v2 hierarchy with the `cpu`, `memory` and `pids` controllers | The VMM's limits |
 | `cgroup.kill` (Linux 5.14) | The one way the helper ends a VM's processes: it may not signal another user's process |
@@ -341,7 +345,7 @@ Not checked, and the node's to make sure of: **no other firewall that drops forw
 
 ### A make
 
-In this order; a make that fails at any step removes what it made, with the steps of a delete, and returns the first error.
+Before the backend's first step, the helper refuses the make, with nothing made and no slot or serial used, while the node's own firewall table is missing and `nodeFirewall` requires it, or while the node's tables cannot be listed. The backend's steps then come in this order; a make that fails at any step removes what it made, with the steps of a delete, and returns the first error.
 
 1. **The mark** (`places`): the jail's own directory, root's, 0700. A make over a jail that is there is refused.
 2. **The network** (`network_commands`): a namespace, with IPv6 off in it (`all` and `default`) before any interface is there, and forwarding on; a veth from the node into it, with IPv6 off on the node's end before it is up; a tap device that the VM's user may open. Then `network_read_backs`: each of those sysctls, and the node's own forwarding, must read `1`. A service manager that makes `/proc/sys` read-only lets `sysctl -w` end without an error in some setups; the make then fails with "the setting did not take" instead of leaving a VM that nothing reaches.
@@ -373,7 +377,7 @@ A delete of a VM that is half made, or of one that is gone, succeeds.
 
 ### The list
 
-Every entry under `<chrootBase>/firecracker/`, with its names where its name is of the helper's form, and `alive` while a process named `firecracker` runs in the VM's cgroup and the node's table of the VM is loaded. A flush of the node's whole ruleset (`nft flush ruleset`, which a distribution's `nftables.service` does when it loads its own file) removes that table under a running VM: nothing reaches the VM any more, so it is reported as `failed`, the control host ends its run, and its delete cleans up. The table is not loaded again: the helper would hide that the node's rules were flushed, its own firewall with them. A helper that is started again finds its VMs still running: each VMM is in a cgroup of its own, outside the helper's.
+Every entry under `<chrootBase>/firecracker/`, with its names where its name is of the helper's form, and `alive` while a process named `firecracker` runs in the VM's cgroup and the node's table of the VM is loaded. A flush of the node's whole ruleset (`nft flush ruleset`, which a distribution's `nftables.service` does when it loads its own file) removes that table under a running VM: nothing reaches the VM any more, so it is reported as `failed`, the control host ends its run, and its delete cleans up. The table is not loaded again: the helper would hide that the node's rules were flushed, its own firewall with them. Such a flush removes the node's own table too, so the helper makes no new VM until the table is loaded again, unless `nodeFirewall` is `"not-required"`. A helper that is started again finds its VMs still running: each VMM is in a cgroup of its own, outside the helper's.
 
 ### The units
 
@@ -405,7 +409,7 @@ It reads no configuration and no environment, and hands the jailer an empty envi
 
 ### The node's firewall
 
-`units/tinfirm-node-agent.nft` (ADR-0112 decision 4, "A node reaches nothing of Tinfirm's"). The agent does not load it and works without it; the role loads it (`tinfirm-node-agent-firewall.service`) before the agent starts, with the node's values in the `define` lines at its head.
+`units/tinfirm-node-agent.nft` (ADR-0112 decision 4, "A node reaches nothing of Tinfirm's"). The agent does not load it; the role loads it (`tinfirm-node-agent-firewall.service`) before the agent starts, with the node's values in the `define` lines at its head. The helper's unit requires that unit, which shows only that the table was loaded once. So the helper asks for the table itself, in `check` and before each make, and by default makes no VM without it (`nodeFirewall`, above). A node that is meant to run without the table says `"nodeFirewall": "not-required"` in `helper.json`; the tests of `tests/linux_kvm.rs` do.
 
 | It admits | |
 |---|---|
@@ -422,9 +426,9 @@ What the node needs to stay manageable, and why each is there:
 - **Nothing else.** No resolver, no time server, no package mirror: the node's clock comes from its hypervisor or the operator opens a time server in the file, and the node is updated by replacing its image. An update in place needs its mirror in the file for that time: a rule added to the loaded table by hand is gone when the unit loads the file again, since the file replaces the whole table.
 - **A node whose own start needs a network service** (a cloud image whose cloud-init asks a metadata service, an agent of the platform) does not finish its start with this table loaded at boot: on the Azure VM that ran, sshd waits for cloud-init, which waits for the metadata service the table drops. Such a node needs that start-up service switched off. The role `tinfirm_sandbox_node` refuses a node whose cloud-init would run at its next start and, when told (`tinfirm_sandbox_node_cloud_init: disable`), switches cloud-init off for good; another start-up service of a platform is the operator's to find.
 
-It is one table (`inet tinfirm_node`), and loading it again replaces that table alone. It never flushes the ruleset: the helper keeps a table per VM (`inet tinfirm_<12 hex digits>`), which a flush would remove under running VMs. A packet must pass the chains of every table on a hook, and a drop in one is final, so this table and a VM's table each admit a bridge's connection on their own terms and neither can widen the other. The helper's own checks read only its own tables.
+It is one table (`inet tinfirm_node`), and loading it again replaces that table alone. It never flushes the ruleset: the helper keeps a table per VM (`inet tinfirm_<12 hex digits>`), which a flush would remove under running VMs. A packet must pass the chains of every table on a hook, and a drop in one is final, so this table and a VM's table each admit a bridge's connection on their own terms and neither can widen the other. The helper's own checks read only its own tables, and whether this one is in the list of tables.
 
-**Root on the node can delete this table.** It is the node's guard against a VMM or a listener that got out. Against root on a node the guard is the operator's network outside the node, as ADR-0112 says.
+**Root on the node can delete this table.** It is the node's guard against a VMM or a listener that got out. Against root on a node the guard is the operator's network outside the node, as ADR-0112 says. When the table is deleted, or the ruleset flushed, the node takes no new VM: its `check` names the missing table, and the helper refuses a make. The VMs that run are not stopped: their runs go on until they end, without the node's table around them, while each VM's own tables still hold (a flush removes those too, and such a VM is then reported as `failed`). `systemctl reload tinfirm-node-agent-firewall.service` loads the table again, and the next `check` is clean. The check and the make are not one step: a table deleted in between is found at the next `check` or make.
 
 ## Decisions where the ADR left the wire open
 
@@ -461,6 +465,7 @@ It is one table (`inet tinfirm_node`), and loading it again replaces that table 
 | The helper's configuration file: another user's, one that its group or others can write, and what is not a regular file, on made-up facts and on a real file | `plan.rs` |
 | A peer that is not the listener's uid gets nothing from the helper | `helper.rs` (the helper expects another uid than the test's, where the test is root); `tests/agent.rs` runs a real process as uid 65534 with `setpriv` against a helper that expects 4242 and one that expects 65534, where the test runs as root and has `setpriv` and `python3`, and skips otherwise |
 | The helper serves at most 32 connections, and refuses one that sends no request within 5 s | `helper.rs` |
+| `nodeFirewall`: `"required"` by default, `"not-required"`, any other value refused; the node's own table there, missing or not listed, with either value, as a line of what was checked or a problem; with the table missing and required, `check` and `verify` name it, the helper refuses a make with no slot or serial used, and the VM that runs stays; with `"not-required"` a make goes on | `plan.rs`, `helper.rs` (the fake backend), `tests/agent.rs` |
 | A failed make whose cleanup fails keeps its slot until a delete succeeds; a leftover that cannot be removed keeps its slot; a jail of unknown form blocks every slot and `check` names it, escaped | `helper.rs` |
 | A local peer that is not the runner host's uid gets nothing from the listener | `tests/agent.rs` (the listener expects another uid than the test's) |
 | A TLS client with another certificate, or none, gets nothing; the driver refuses a node of another certificate | `tls.rs`, `tests/agent.rs` |

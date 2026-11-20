@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tinfirm_node_agent::backend::FakeBackend;
+use tinfirm_node_agent::backend::{FakeBackend, NodeTable};
 use tinfirm_node_agent::helper::{self, Helper, HelperClient};
 use tinfirm_node_agent::id::{TemplateName, VmId};
 use tinfirm_node_agent::listener::{self, Listener, ListenerConfig};
@@ -754,6 +754,47 @@ async fn the_node_makes_no_more_vms_than_its_slots_and_each_its_own_port() {
     let uids: std::collections::BTreeSet<u32> =
         node.backend.vms().values().map(|vm| vm.plan.uid).collect();
     assert_eq!(uids.len(), 4);
+}
+
+#[tokio::test]
+async fn a_node_without_its_own_firewall_table_verifies_with_a_problem_and_makes_no_vm() {
+    let node = node(None).await;
+    let mut driver = unix_driver(&node).await;
+    driver.hello().await;
+    let running = driver
+        .call("create", json!({"template": TEMPLATE, "name": "before", "userData": "{}", "labels": labels(HOST, "v0")}))
+        .await
+        .unwrap();
+    node.backend.set_node_table(NodeTable::Missing);
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    let problems = verified["problems"].as_array().unwrap();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("inet tinfirm_node")),
+        "{verified}"
+    );
+    let (code, message) = driver
+        .call("create", json!({"template": TEMPLATE, "name": "after", "userData": "{}", "labels": labels(HOST, "v1")}))
+        .await
+        .unwrap_err();
+    assert_eq!(code, wire::code::FAILED, "{message}");
+    // The VM that ran before goes on running.
+    assert_eq!(node.backend.vms().len(), 1);
+    let described = driver
+        .call("describe", json!({"id": running["id"]}))
+        .await
+        .unwrap();
+    assert_eq!(described["state"], "running", "{described}");
+    node.backend.set_node_table(NodeTable::There);
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["problems"], json!([]), "{verified}");
 }
 
 /// The helper refuses a real process of another uid, where this test can run one: as root,

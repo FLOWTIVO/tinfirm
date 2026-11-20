@@ -1,6 +1,8 @@
 {#- The helper's configuration (runner/crates/tinfirm-node-agent/README.md, "The helper's").
     JSON has no comments, and the helper refuses an unknown field: the file is the one value
-    below. Numbers are made numbers here, whatever the inventory's YAML gave. -#}
+    below. Numbers are made numbers here, whatever the inventory's YAML gave. The role
+    installs and loads the node's own firewall table, so the helper requires it
+    (`nodeFirewall`): a node whose table is gone takes no new VM. -#}
 {%- set templates = {} -%}
 {%- for name, t in tinfirm_sandbox_node_templates.items() -%}
 {%-   set _ = templates.update({name: {
@@ -20,6 +22,7 @@
   'state': '/var/lib/tinfirm-node-agent/helper',
   'maxVms': tinfirm_sandbox_node_max_vms | int,
   'vmUidBase': tinfirm_sandbox_node_vm_uid_base | int,
+  'nodeFirewall': 'required',
   'network': {
     'vmRange': tinfirm_sandbox_node_vm_range,
     'nodeAddress': tinfirm_sandbox_node_address,

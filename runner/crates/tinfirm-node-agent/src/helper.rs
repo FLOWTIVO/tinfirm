@@ -21,10 +21,11 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::backend::{Backend, BackendError, Present};
+use crate::backend::{Backend, BackendError, NodeTable, Present};
 use crate::id::{TemplateName, VmId};
+use crate::linux::NODE_TABLE;
 use crate::local::{self, LineError};
-use crate::plan::{self, HelperConfig, MAX_SERIAL, Names};
+use crate::plan::{self, HelperConfig, MAX_SERIAL, Names, NodeFirewall};
 use crate::spool;
 
 /// The version of the helper's wire (`v` in every request).
@@ -122,6 +123,30 @@ pub struct MakeAnswer {
 pub struct ListAnswer {
     pub vms: Vec<HelperVm>,
     pub free: u32,
+}
+
+/// What `check` says of the node's own firewall table, with the configuration's `nodeFirewall`:
+/// `Ok` with a line of what was checked, or `Err` with a problem. `make` refuses on the same
+/// `Err`, so a node takes no new VM while its `check` names the table as a problem. Tables that
+/// cannot be listed are a problem either way: a VM's own tables need the same `nft`.
+pub fn node_table_line(found: &NodeTable, wanted: NodeFirewall) -> Result<String, String> {
+    match (found, wanted) {
+        (NodeTable::There, NodeFirewall::Required) => Ok(format!(
+            "the node's own firewall table ({NODE_TABLE}), required by this node's configuration"
+        )),
+        (NodeTable::There, NodeFirewall::NotRequired) => Ok(format!(
+            "the node's own firewall table ({NODE_TABLE}); not required by this node's configuration"
+        )),
+        (NodeTable::Missing, NodeFirewall::Required) => Err(format!(
+            "the node's own firewall table ({NODE_TABLE}) is not loaded, and this node's configuration requires it: the node lets out and in whatever its network allows, so no VM is made until the table is back. Only root on the node removes it (`nft delete table`, `nft flush ruleset`): find out who, then load it again with `systemctl reload tinfirm-node-agent-firewall.service`. The VMs that run are left as they are"
+        )),
+        (NodeTable::Missing, NodeFirewall::NotRequired) => Ok(format!(
+            "NOT THERE: the node's own firewall table ({NODE_TABLE}), not required by this node's configuration (nodeFirewall \"not-required\"); the node lets out and in whatever its network allows"
+        )),
+        (NodeTable::Unknown(why), _) => Err(format!(
+            "the node's firewall tables cannot be listed ({why}), so whether its own table ({NODE_TABLE}) is loaded is not known"
+        )),
+    }
 }
 
 /// What went wrong, as the answer names it.
@@ -433,6 +458,10 @@ impl<B: Backend> Helper<B> {
     pub fn check(&self, template: &TemplateName) -> Result<CheckAnswer, HelperError> {
         let t = self.template(template)?;
         let mut checked = self.backend.check(t);
+        match node_table_line(&self.backend.node_table(), self.config.node_firewall) {
+            Ok(line) => checked.checked.push(line),
+            Err(problem) => checked.problems.push(problem),
+        }
         match spool::check_spool(&self.config.spool, self.config.listener_uid, self.own_uid) {
             Ok(()) => checked.checked.push("the listener's spool".into()),
             Err(e) => checked.problems.push(e.to_string()),
@@ -474,6 +503,14 @@ impl<B: Backend> Helper<B> {
                 Code::Exists,
                 format!("the VM {id} exists"),
             ));
+        }
+        // The helper itself refuses a VM on a node whose own firewall table its configuration
+        // requires and that is not there: a listener under an attacker's control does not ask
+        // `check` first. The VMs that run are not touched.
+        if let Err(problem) = node_table_line(&self.backend.node_table(), self.config.node_firewall)
+        {
+            tracing::error!(vm = %id, problem = %problem, "no VM is made");
+            return Err(HelperError::new(Code::Failed, problem));
         }
         let found = self.sweep(&state)?;
         if !found.unknown.is_empty() {
@@ -859,6 +896,116 @@ mod tests {
 
     fn template() -> TemplateName {
         TemplateName::parse(b"sandbox-4c8g").unwrap()
+    }
+
+    #[test]
+    fn a_missing_node_table_is_a_problem_unless_the_configuration_does_not_require_it() {
+        use NodeFirewall::{NotRequired, Required};
+        let unknown = NodeTable::Unknown("`nft` did not start".into());
+        let line = |found: &NodeTable, wanted| node_table_line(found, wanted);
+
+        let there = line(&NodeTable::There, Required).unwrap();
+        assert!(
+            there.contains(NODE_TABLE) && there.contains("required by"),
+            "{there}"
+        );
+        let there = line(&NodeTable::There, NotRequired).unwrap();
+        assert!(
+            there.contains("not required by this node's configuration"),
+            "{there}"
+        );
+
+        let missing = line(&NodeTable::Missing, Required).unwrap_err();
+        for words in [
+            NODE_TABLE,
+            "is not loaded",
+            "requires it",
+            "no VM is made",
+            "systemctl reload tinfirm-node-agent-firewall.service",
+        ] {
+            assert!(missing.contains(words), "{words}: {missing}");
+        }
+        let missing = line(&NodeTable::Missing, NotRequired).unwrap();
+        assert!(
+            missing.starts_with("NOT THERE")
+                && missing.contains("not required by this node's configuration"),
+            "{missing}"
+        );
+
+        for wanted in [Required, NotRequired] {
+            let problem = line(&unknown, wanted).unwrap_err();
+            assert!(
+                problem.contains("cannot be listed") && problem.contains("did not start"),
+                "{problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_and_make_follow_the_node_table_and_the_configuration() {
+        let f = fixture();
+        let helper = Helper::start(f.config.clone(), f.backend.clone()).unwrap();
+        assert_eq!(helper.config().node_firewall, NodeFirewall::Required);
+        let a = VmId::generate().unwrap();
+        write_user_data(&f, &a, b"{}");
+        helper.make(&a, &template()).unwrap();
+
+        // The table is removed under a running VM: check names it, make refuses, and the VM
+        // that runs is left as it is.
+        f.backend.set_node_table(NodeTable::Missing);
+        let check = helper.check(&template()).unwrap();
+        assert!(
+            check.problems.iter().any(|p| p.contains(NODE_TABLE)),
+            "{check:?}"
+        );
+        let b = VmId::generate().unwrap();
+        write_user_data(&f, &b, b"{}");
+        let refused = helper.make(&b, &template()).unwrap_err();
+        assert_eq!(refused.code, Code::Failed);
+        assert!(refused.message.contains(NODE_TABLE), "{refused}");
+        assert_eq!(f.backend.vms().keys().copied().collect::<Vec<_>>(), [0]);
+        assert!(f.backend.vms()[&0].alive);
+        let listed = helper.list().unwrap();
+        assert_eq!(listed.vms.len(), 1);
+        assert_eq!(listed.free, 2);
+
+        // Tables that cannot be listed: the same.
+        f.backend
+            .set_node_table(NodeTable::Unknown("`nft` did not start".into()));
+        assert!(!helper.check(&template()).unwrap().problems.is_empty());
+        assert_eq!(helper.make(&b, &template()).unwrap_err().code, Code::Failed);
+
+        // Back: the next make takes the next serial, the refusals having used none.
+        f.backend.set_node_table(NodeTable::There);
+        assert_eq!(
+            helper.check(&template()).unwrap().problems,
+            Vec::<String>::new()
+        );
+        helper.make(&b, &template()).unwrap();
+        assert_eq!(f.backend.vms().keys().copied().collect::<Vec<_>>(), [0, 1]);
+        drop(helper);
+
+        // A node that is meant to run without the table says so, and makes VMs.
+        let mut config = f.config.clone();
+        config.node_firewall = NodeFirewall::NotRequired;
+        let helper = Helper::start(config, f.backend.clone()).unwrap();
+        f.backend.set_node_table(NodeTable::Missing);
+        let check = helper.check(&template()).unwrap();
+        assert_eq!(check.problems, Vec::<String>::new());
+        assert!(
+            check
+                .checked
+                .iter()
+                .any(|c| c.contains("not required by this node's configuration")),
+            "{check:?}"
+        );
+        let c = VmId::generate().unwrap();
+        write_user_data(&f, &c, b"{}");
+        helper.make(&c, &template()).unwrap();
+        // Unlisted tables stay a problem: the VMs' own tables need the same nft.
+        f.backend
+            .set_node_table(NodeTable::Unknown("`nft` did not start".into()));
+        assert!(!helper.check(&template()).unwrap().problems.is_empty());
     }
 
     #[test]

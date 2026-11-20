@@ -36,6 +36,16 @@ pub struct Checked {
     pub checked: Vec<String>,
 }
 
+/// The node's own firewall table (`inet tinfirm_node`), as the backend finds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NodeTable {
+    #[default]
+    There,
+    Missing,
+    /// The node's tables cannot be listed: why.
+    Unknown(String),
+}
+
 /// A VM that the backend finds on the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Present {
@@ -51,6 +61,9 @@ pub struct Present {
 /// The four things the helper does, below its checks.
 pub trait Backend: Send + Sync + 'static {
     fn check(&self, template: &Template) -> Checked;
+    /// Whether the node's own firewall table is loaded. The helper asks it in `check` and
+    /// before each make, and decides with its configuration (`crate::helper::node_table_line`).
+    fn node_table(&self) -> NodeTable;
     /// Builds the VM's jail, network and disks, and starts its VMM.
     fn make(&self, plan: &VmPlan, user_data: &[u8]) -> Result<(), BackendError>;
     /// Removes everything of the VM named `names`; one that is not there is no error.
@@ -73,6 +86,7 @@ struct FakeState {
     /// Jails of a form the helper does not know.
     unknown: Vec<String>,
     problems: Vec<String>,
+    node_table: NodeTable,
     fail_next_make: bool,
     fail_next_delete: bool,
     fail_deletes: bool,
@@ -122,6 +136,11 @@ impl FakeBackend {
         self.state().problems = problems;
     }
 
+    /// What the fake node's own firewall table is: there, until a test says otherwise.
+    pub fn set_node_table(&self, table: NodeTable) {
+        self.state().node_table = table;
+    }
+
     /// The next make fails half-way: it leaves a VM whose VMM does not run.
     pub fn fail_next_make(&self) {
         self.state().fail_next_make = true;
@@ -153,6 +172,10 @@ impl Backend for FakeBackend {
             problems: self.state().problems.clone(),
             checked: vec!["the fake backend".into()],
         }
+    }
+
+    fn node_table(&self) -> NodeTable {
+        self.state().node_table.clone()
     }
 
     fn make(&self, plan: &VmPlan, user_data: &[u8]) -> Result<(), BackendError> {

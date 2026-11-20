@@ -1,8 +1,9 @@
 #!/usr/sbin/nft -f
 # {{ ansible_managed }}
 # /etc/tinfirm/node-agent/firewall.nft: the node's own firewall (ADR-0112 decision 4, "A node
-# reaches nothing of Tinfirm's"). The node agent does not load it and does not need it to
-# work; the node's role does, before the agent starts (tinfirm-node-agent-firewall.service).
+# reaches nothing of Tinfirm's"). The node agent does not load it. Its helper makes no VM
+# while the table is missing, unless helper.json says "nodeFirewall": "not-required". The
+# node's role loads it, before the agent starts (tinfirm-node-agent-firewall.service).
 #
 # It lets in the control host, to the agent's port and to the VMs' published ports, and one
 # management address to SSH. It lets out nothing but answers: the node opens no connection
@@ -33,7 +34,7 @@ define vm_range = {{ tinfirm_sandbox_node_vm_range }}
 # port, though still not without a key.
 define management = {{ tinfirm_sandbox_node_management_address }}
 # The port of the node's SSH server.
-define ssh_port = 22
+define ssh_port = {{ tinfirm_sandbox_node_ssh_port | int }}
 # Addresses that are refused by name whatever else changes in this file: the providers'
 # metadata services.
 define metadata4 = { 169.254.169.254 }

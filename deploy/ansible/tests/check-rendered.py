@@ -48,8 +48,10 @@ def keys(obj, required, optional=()):
 
 
 def helper(h):
-    check(keys(h, ["listenerUid", "socket", "spool", "state", "maxVms", "vmUidBase", "network",
-                   "firecracker", "templates"]), "helper.json: exactly the README's fields")
+    check(keys(h, ["listenerUid", "socket", "spool", "state", "maxVms", "vmUidBase", "nodeFirewall",
+                   "network", "firecracker", "templates"]), "helper.json: exactly the README's fields")
+    # The role loads the node's own firewall table, so the helper requires it.
+    check(h["nodeFirewall"] == "required", "helper.json: nodeFirewall required")
     check(is_int(h["listenerUid"]) and h["listenerUid"] != 0, "helper.json: listenerUid a number, not 0")
     check(is_int(h["maxVms"]) and 1 <= h["maxVms"] <= 1024, "helper.json: maxVms 1 to 1024")
     base, count = h["vmUidBase"], h["maxVms"]
@@ -188,6 +190,8 @@ def main():
     one = (out / "firewall-one-vm-static.nft").read_text()
     check("define published_ports = 20000\n" in one and "udp sport 67" not in one,
           "firewall for one VM and a static address: one port, no DHCP rules")
+    check("define ssh_port = 2222\n" in one and "define ssh_port = 22\n" in (out / "firewall.nft").read_text(),
+          "firewall: ssh_port from tinfirm_sandbox_node_ssh_port, 22 by default")
     dropin = (out / "listener-control-host.conf").read_text()
     check("\n[Service]\nIPAddressAllow=10.0.0.5\n" in dropin, "listener's drop-in: IPAddressAllow the control host")
     units((out / "tinfirm-runner-host.docker.service").read_text(), (out / "tinfirm-runner-host.vm.service").read_text())

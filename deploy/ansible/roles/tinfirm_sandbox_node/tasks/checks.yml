@@ -118,11 +118,18 @@
       - >-
         tinfirm_sandbox_node_agent_port | int < tinfirm_sandbox_node_first_port | int
         or tinfirm_sandbox_node_agent_port | int > _tinfirm_sandbox_node_last_port | int
-      - tinfirm_sandbox_node_agent_port | int != 22
+      - tinfirm_sandbox_node_ssh_port | int >= 1
+      - tinfirm_sandbox_node_ssh_port | int <= 65535
+      - >-
+        tinfirm_sandbox_node_ssh_port | int < tinfirm_sandbox_node_first_port | int
+        or tinfirm_sandbox_node_ssh_port | int > _tinfirm_sandbox_node_last_port | int
+      - tinfirm_sandbox_node_agent_port | int != tinfirm_sandbox_node_ssh_port | int
     fail_msg: >-
       tinfirm_sandbox_node_max_vms is 1 to 1024; the published ports
       {{ tinfirm_sandbox_node_first_port }} to {{ _tinfirm_sandbox_node_last_port }} lie from 1024
-      to 65535; the agent's port {{ tinfirm_sandbox_node_agent_port }} is neither one of them nor 22.
+      to 65535; the SSH port {{ tinfirm_sandbox_node_ssh_port }} is 1 to 65535 and not one of
+      them; the agent's port {{ tinfirm_sandbox_node_agent_port }} is neither one of them nor the
+      SSH port.
     quiet: true
 
 - name: Check the templates
@@ -161,10 +168,10 @@
       bytes of a-z, 0-9 and -.
     quiet: true
 
-# The node's firewall admits SSH from the management address alone. This play's own
-# connection stays up once the table is loaded (an established connection), but the next
-# one would not: stop before that.
-- name: Read the address this play's SSH connection comes from
+# The node's firewall admits SSH from the management address alone, to its SSH port. This
+# play's own connection stays up once the table is loaded (an established connection), but
+# the next one would not: stop before that.
+- name: Read the address and the port of this play's SSH connection
   ansible.builtin.command:
     argv: [printenv, SSH_CONNECTION]
   become: false
@@ -173,15 +180,18 @@
   failed_when: false
   when: tinfirm_sandbox_node_check_ssh_source | bool
 
-- name: Check that this play comes from the management address
+- name: Check that this play comes from the management address to the SSH port
   ansible.builtin.assert:
     that:
       - (_tinfirm_sandbox_node_ssh.stdout | split(' ') | first) == tinfirm_sandbox_node_management_address
+      - (_tinfirm_sandbox_node_ssh.stdout | split(' ') | last) == (tinfirm_sandbox_node_ssh_port | string)
     fail_msg: >-
-      This play's SSH connection comes from {{ _tinfirm_sandbox_node_ssh.stdout | split(' ') | first }},
-      but the node's firewall admits SSH from tinfirm_sandbox_node_management_address
-      ({{ tinfirm_sandbox_node_management_address }}) alone: the next connection of this play
-      would be dropped. Run the play from that address, or set the variable to this one.
+      This play's SSH connection comes from {{ _tinfirm_sandbox_node_ssh.stdout | split(' ') | first }}
+      to port {{ _tinfirm_sandbox_node_ssh.stdout | split(' ') | last }}, but the node's firewall
+      admits SSH from tinfirm_sandbox_node_management_address
+      ({{ tinfirm_sandbox_node_management_address }}) alone, to tinfirm_sandbox_node_ssh_port
+      ({{ tinfirm_sandbox_node_ssh_port }}): the next connection of this play would be dropped.
+      Run the play from that address, or set the variables to this connection's.
       tinfirm_sandbox_node_check_ssh_source: false skips this check.
     quiet: true
   when:

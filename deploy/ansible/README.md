@@ -231,8 +231,8 @@ the runs on it, their files, prompts and tunnels, and what they hand back, but n
 - Only the people who administer the control host administer its nodes. The role cannot enforce
   that: give SSH keys and sudo on a node to those people alone.
 - The node's firewall admits SSH from one management address alone
-  (`tinfirm_sandbox_node_management_address`), and the role stops when its own SSH connection
-  comes from another one.
+  (`tinfirm_sandbox_node_management_address`), to one port (`tinfirm_sandbox_node_ssh_port`), and
+  the role stops when its own SSH connection comes from another address or to another port.
 - Re-image the nodes on a schedule. The role installs everything from its variables and keeps
   nothing on the node that a new image would lose, but the node's TLS identity, which it makes
   again on a new image ([Replace a node](#replace-a-node)).
@@ -276,7 +276,8 @@ refuses to start without it.
 The role `tinfirm_sandbox_node`:
 
 1. checks the target: Ubuntu, Debian or the RHEL family with systemd, `/dev/kvm`, the addresses
-   and ports, the templates, that the play's SSH connection comes from the management address,
+   and ports, the templates, that the play's SSH connection comes from the management address
+   to the SSH port,
    and that neither Docker, firewalld, `nftables.service` nor ufw runs (each would drop or flush
    what the VMs need);
 2. installs the tools the helper runs (`ip`, `nft`, `losetup`, `dmsetup` and the rest of "What a
@@ -300,7 +301,9 @@ The role `tinfirm_sandbox_node`:
 9. makes the node's TLS identity on the node with `tinfirm-node-agent identity`: the key is the
    listener's (0600), the certificate root's (0644). It never leaves the node;
 10. writes `helper.json` (root's, 0644, which the helper requires) and `listener.json`
-    (`root:tinfirm-node-listener`, 0640) from the variables;
+    (`root:tinfirm-node-listener`, 0640) from the variables. `helper.json` says
+    `"nodeFirewall": "required"`: the helper makes no VM while the node's firewall table is
+    missing;
 11. starts the modules' unit, the firewall's, the helper and the listener, in that order;
 12. proves the node: every unit active, both sysctl settings read back, the firewall table
     loaded, and the helper's own `check` of every template, asked on its socket as the listener's
@@ -467,7 +470,10 @@ stop it, and then re-image the machine.
   `/etc/tinfirm/node-agent/firewall.nft`, loaded by `tinfirm-node-agent-firewall.service`. It admits
   the control host to the agent's port and to the published ports, SSH from the management address,
   the DHCP lease (`tinfirm_sandbox_node_dhcp: false` removes it), and drops everything else, every
-  connection the node opens included. Root on the node can delete it.
+  connection the node opens included. Root on the node can delete it. The helper then makes no new
+  VM, and its `check` names the table as a problem, so the control host places no VM on the node
+  until the table is loaded again (`systemctl reload tinfirm-node-agent-firewall.service`). The
+  VMs that run go on running.
 - **On the control host:** this role sets no firewall; it is yours. It lets the control host reach
   each node's agent port and published ports, and admits nothing from the nodes' network
   (ADR-0112 decision 3).
@@ -512,7 +518,8 @@ stop it, and then re-image the machine.
 | `tinfirm_sandbox_node_address` | the default route's address | The node's IPv4 address as the control host dials it |
 | `tinfirm_sandbox_node_control_host` | none | The control host's IPv4 address, as the node sees it. Required |
 | `tinfirm_sandbox_node_management_address` | none | The one address admitted to SSH. Required |
-| `tinfirm_sandbox_node_check_ssh_source` | `true` | Stop when the play's SSH comes from another address |
+| `tinfirm_sandbox_node_ssh_port` | `22` | The node's SSH port, which the firewall admits from the management address (its `ssh_port`). The role does not change sshd's port |
+| `tinfirm_sandbox_node_check_ssh_source` | `true` | Stop when the play's SSH comes from another address, or goes to another port than `tinfirm_sandbox_node_ssh_port` |
 | `tinfirm_sandbox_node_cloud_init` | `refuse` | `refuse` stops the play on a node whose cloud-init would run at the next start; `disable` writes `/etc/cloud/cloud-init.disabled`. With cloud-init active, a node does not finish its start once the firewall is loaded, since cloud-init waits for the metadata service that the firewall drops |
 | `tinfirm_sandbox_node_agent_port` | `7700` | The listener's TLS port |
 | `tinfirm_sandbox_node_first_port` | `20000` | The first VM's published port; the last is `first_port + max_vms - 1` |

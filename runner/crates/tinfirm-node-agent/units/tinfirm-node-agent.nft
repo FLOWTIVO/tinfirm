@@ -1,7 +1,8 @@
 #!/usr/sbin/nft -f
 # /etc/tinfirm/node-agent/firewall.nft: the node's own firewall (ADR-0112 decision 4, "A node
-# reaches nothing of Tinfirm's"). The node agent does not load it and does not need it to
-# work; the node's role does, before the agent starts (tinfirm-node-agent-firewall.service).
+# reaches nothing of Tinfirm's"). The node agent does not load it. Its helper makes no VM
+# while the table is missing, unless helper.json says "nodeFirewall": "not-required". The
+# node's role loads it, before the agent starts (tinfirm-node-agent-firewall.service).
 #
 # It lets in the control host, to the agent's port and to the VMs' published ports, and one
 # management address to SSH. It lets out nothing but answers: the node opens no connection
