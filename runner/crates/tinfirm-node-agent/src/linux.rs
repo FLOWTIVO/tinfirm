@@ -1077,6 +1077,10 @@ pub struct LinuxBackend {
 
 impl LinuxBackend {
     pub fn new(config: HelperConfig) -> LinuxBackend {
+        // The VMMs' users and groups: slot N's is `vmUidBase + N` (the configuration's check
+        // keeps the last below 2^31).
+        let last_vmm = config.vm_uid_base + config.max_vms.saturating_sub(1);
+        let hardening = hardening::Checker::new("/").with_vmm_ids(config.vm_uid_base, last_vmm);
         LinuxBackend {
             config,
             // The running helper's own program, whatever has happened to its file since.
@@ -1084,7 +1088,7 @@ impl LinuxBackend {
             fail_after: None,
             leave_failed: false,
             failed_deletes: std::sync::Mutex::new(std::collections::BTreeSet::new()),
-            hardening: hardening::Checker::new("/"),
+            hardening,
         }
     }
 

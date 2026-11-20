@@ -325,8 +325,27 @@ fn is_loopback(ip: &IpAddr) -> bool {
     }
 }
 
+/// Who of those that must not may run a file of this mode, owner and group: `Some(None)` for
+/// others, `Some(Some(id))` for the VMM's user `id`, `None` for nobody. A VMM's user and group
+/// are one number of `vmm_ids` (first and last; `plan::HelperConfig::vm_uid_base` and its
+/// slots), and it is in no other group. The kernel takes the first class that fits a process:
+/// the owner's bits, else the group's, else the others'.
+fn who_may_run(mode: u32, uid: u32, gid: u32, vmm_ids: Option<(u32, u32)>) -> Option<Option<u32>> {
+    let of_a_vmm = |id: u32| vmm_ids.is_some_and(|(first, last)| (first..=last).contains(&id));
+    if mode & 0o001 != 0 {
+        Some(None)
+    } else if of_a_vmm(uid) && mode & 0o100 != 0 {
+        Some(Some(uid))
+    } else if of_a_vmm(gid) && uid != gid && mode & 0o010 != 0 {
+        Some(Some(gid))
+    } else {
+        None
+    }
+}
+
 /// What one scan for setuid and setgid files found: the line, and how many entries it walked.
-fn scan_setuid(root: &Path) -> Line {
+/// `vmm_ids` are the VMMs' users and groups, first and last, where they are known.
+fn scan_setuid(root: &Path, vmm_ids: Option<(u32, u32)>) -> Line {
     let id = line::NO_SETUID;
     let mut stack: Vec<(PathBuf, u64)> = Vec::new();
     for dir in SCANNED {
@@ -350,7 +369,8 @@ fn scan_setuid(root: &Path) -> Line {
         shown(&format!("/{}", relative.to_string_lossy()))
     };
     let mut walked: u64 = 0;
-    let mut first: Option<PathBuf> = None;
+    // The first such file: its path, mode, owner and group, and who may run it.
+    let mut first: Option<(PathBuf, u32, u32, u32, Option<u32>)> = None;
     let mut more: u64 = 0;
     while let Some((dir, dev)) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -399,9 +419,12 @@ fn scan_setuid(root: &Path) -> Line {
                 if meta.dev() == dev {
                     stack.push((path, dev));
                 }
-            } else if kind.is_file() && meta.mode() & 0o6000 != 0 && meta.mode() & 0o001 != 0 {
+            } else if kind.is_file()
+                && meta.mode() & 0o6000 != 0
+                && let Some(who) = who_may_run(meta.mode(), meta.uid(), meta.gid(), vmm_ids)
+            {
                 if first.is_none() {
-                    first = Some(path);
+                    first = Some((path, meta.mode() & 0o7777, meta.uid(), meta.gid(), who));
                 } else {
                     more += 1;
                 }
@@ -413,27 +436,26 @@ fn scan_setuid(root: &Path) -> Line {
             id,
             true,
             format!(
-                "no setuid or setgid file that others may run, in {walked} entries under /usr, /opt, /bin and /sbin"
+                "no setuid or setgid file that others or a VMM's user may run, in {walked} entries under /usr, /opt, /bin and /sbin"
             ),
         ),
-        Some(path) => {
+        Some((path, mode, uid, gid, who)) => {
             let and = if more > 0 {
                 format!(" (and {more} more)")
             } else {
                 String::new()
             };
-            let mode = path
-                .symlink_metadata()
-                .map(|m| format!("{:o}", m.mode() & 0o7777))
-                .unwrap_or_else(|_| "?".into());
-            Line::new(
-                id,
-                false,
-                format!(
-                    "{} is setuid or setgid (mode {mode}) and others may run it{and}",
+            let found = match who {
+                None => format!(
+                    "{} is setuid or setgid (mode {mode:o}) and others may run it{and}",
                     shown_path(&path)
                 ),
-            )
+                Some(vmm) => format!(
+                    "{} is setuid or setgid (mode {mode:o}, owner {uid}, group {gid}) and the VMM's user {vmm} may run it{and}",
+                    shown_path(&path)
+                ),
+            };
+            Line::new(id, false, found)
         }
     }
 }
@@ -442,6 +464,9 @@ fn scan_setuid(root: &Path) -> Line {
 pub struct Checker {
     root: PathBuf,
     scan_every: Duration,
+    /// The VMMs' users and groups, first and last, for the setuid scan; `None` where no VMM
+    /// runs under this checker's root (a test's).
+    vmm_ids: Option<(u32, u32)>,
     /// The last scan's line and when it was made.
     scan: Mutex<Option<(Instant, Line)>>,
     /// How many scans walked the tree, for the tests.
@@ -454,9 +479,17 @@ impl Checker {
         Checker {
             root: root.into(),
             scan_every: SCAN_EVERY,
+            vmm_ids: None,
             scan: Mutex::new(None),
             walks: AtomicU64::new(0),
         }
+    }
+
+    /// The same checker, which also counts a setuid or setgid file that a VMM's user may run
+    /// as its owner or through its group: the VMMs' users and groups are `first` to `last`.
+    pub fn with_vmm_ids(mut self, first: u32, last: u32) -> Checker {
+        self.vmm_ids = Some((first, last));
+        self
     }
 
     /// How many times a check walked the tree for setuid files.
@@ -719,7 +752,7 @@ impl Checker {
             return line.clone();
         }
         self.walks.fetch_add(1, Ordering::Relaxed);
-        let line = scan_setuid(&self.root);
+        let line = scan_setuid(&self.root, self.vmm_ids);
         *last = Some((now, line.clone()));
         line
     }
@@ -1457,6 +1490,67 @@ mod tests {
             line_of(&h, line::MAX_UPTIME)
                 .found
                 .contains("hardening.maxUptimeDays")
+        );
+    }
+
+    #[test]
+    fn a_vmms_user_may_run_a_file_as_its_owner_or_through_its_group() {
+        let ids = Some((100_000, 100_063));
+        for (mode, uid, gid, who) in [
+            // Others may run it, whoever owns it.
+            (0o4755, 0, 0, Some(None)),
+            (0o2711, 0, 0, Some(None)),
+            // `sudo` as the role leaves it: root's group only.
+            (0o4750, 0, 27, None),
+            // The group is a VMM's.
+            (0o4750, 0, 100_003, Some(Some(100_003))),
+            (0o4750, 0, 100_064, None),
+            (0o4740, 0, 100_003, None),
+            // The owner is a VMM's.
+            (0o2700, 100_000, 0, Some(Some(100_000))),
+            (0o2600, 100_000, 0, None),
+            // Owner and group are the same VMM's: the owner's bits decide.
+            (0o4070, 100_003, 100_003, None),
+            (0o4170, 100_003, 100_003, Some(Some(100_003))),
+        ] {
+            assert_eq!(
+                who_may_run(mode, uid, gid, ids),
+                who,
+                "{mode:o} {uid} {gid}"
+            );
+        }
+        // Where the VMMs' range is not known, only the others' bit counts.
+        assert_eq!(who_may_run(0o4750, 0, 100_003, None), None);
+        assert_eq!(who_may_run(0o4751, 0, 100_003, None), Some(None));
+    }
+
+    #[test]
+    fn the_scan_finds_a_setuid_file_that_only_a_vmms_group_may_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        put(root, "usr/bin/helper", "");
+        let file = root.join("usr/bin/helper");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o4750)).unwrap();
+        let (uid, gid) = {
+            let meta = file.metadata().unwrap();
+            (meta.uid(), meta.gid())
+        };
+        // No VMM has this file's group or owner: nobody who must not may run it.
+        let far = gid.max(uid) + 1000;
+        assert!(scan_setuid(root, Some((far, far + 63))).holds);
+        assert!(scan_setuid(root, None).holds);
+        // The file's group is a VMM's. (Where the test's user and group are one number, the
+        // file's owner is that VMM too, and the owner's bit lets it run.)
+        let line = scan_setuid(root, Some((gid, gid)));
+        assert!(!line.holds, "{}", line.found);
+        assert!(
+            line.found
+                .contains("/usr/bin/helper is setuid or setgid (mode 4750, owner ")
+                && line
+                    .found
+                    .contains(&format!("the VMM's user {gid} may run it")),
+            "{}",
+            line.found
         );
     }
 
