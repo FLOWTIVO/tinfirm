@@ -798,40 +798,38 @@ pub async fn execute(
                 }
                 // While the sandbox lives, a host that restarts takes the run back (ADR-0101).
                 if let Some((kind, bridge_id, session_key)) = sandbox.take_back_record() {
-                    // The tokens as the run's holder has them now, none that was revoked.
-                    let mut kept = assign.clone();
-                    let revoked = tokens.write_to(&mut kept);
-                    let record = RunRecord {
-                        version: crate::takeback::RECORD_VERSION,
-                        assign: kept,
-                        sandbox: kind,
-                        bridge_id,
-                        session_key,
-                        repos: repos
-                            .iter()
-                            .map(|repo| {
-                                RepoRecord::new(
-                                    &repo.ws.dir,
-                                    &repo.cloned_head,
-                                    repo.cloned_commits,
-                                    repo.git.base_refs(),
-                                    repo.git.config_snapshot(),
-                                )
-                            })
-                            .collect(),
-                        home_exclude: home_exclude.clone(),
-                        session_id: None,
-                        seq_floor: sink.last_seq() + crate::takeback::SEQ_BLOCK,
-                        revoked,
-                        collected: false,
-                    };
-                    match RecordHandle::create(&shared.records, record) {
-                        Ok(record) => {
-                            let record = Arc::new(record);
-                            sink.keep_record(record.clone());
-                            // A revocation from now on writes the record again.
-                            tokens.keep_record(record);
-                        }
+                    let repos = repos
+                        .iter()
+                        .map(|repo| {
+                            RepoRecord::new(
+                                &repo.ws.dir,
+                                &repo.cloned_head,
+                                repo.cloned_commits,
+                                repo.git.base_refs(),
+                                repo.git.config_snapshot(),
+                            )
+                        })
+                        .collect();
+                    let seq_floor = sink.last_seq() + crate::takeback::SEQ_BLOCK;
+                    // The tokens as the run's holder has them, none that was revoked: the holder
+                    // writes the record and keeps it in step from then on, in one step that a
+                    // revocation waits for.
+                    let made =
+                        tokens.make_record(&shared.records, assign, |kept, revoked| RunRecord {
+                            version: crate::takeback::RECORD_VERSION,
+                            assign: kept,
+                            sandbox: kind,
+                            bridge_id,
+                            session_key,
+                            repos,
+                            home_exclude: home_exclude.clone(),
+                            session_id: None,
+                            seq_floor,
+                            revoked,
+                            collected: false,
+                        });
+                    match made {
+                        Ok(record) => sink.keep_record(record),
                         Err(e) => sink.log(
                             LogLevel::Warn,
                             format!(
@@ -1066,15 +1064,16 @@ const TAKE_BACK_WAIT: Duration = Duration::from_secs(120);
 const RECLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How a run taken back ends ([`take_back`]).
-#[derive(Debug)]
 pub enum TakenBackEnd {
     /// The run ends, and this is its report.
     Finished(Box<RunFinished>),
     /// Aborted (a stale epoch): it pushes and reports nothing, and its record and work go.
     Aborted,
     /// The host shuts down while the run waits for the server before its push: the record and
-    /// the work stay on this host, and the next start takes the run back from them.
-    Left,
+    /// the work stay on this host, and the next start takes the run back from them. A sandbox
+    /// that still holds the work (its record could not be marked collected) comes with it: the
+    /// host keeps it until the process ends, so that its session is not ended.
+    Left(Option<Box<crate::sandbox::Sandbox>>),
 }
 
 /// Takes back a run of the process this host restarted from (ADR-0101). `sandbox` is the
@@ -1088,6 +1087,7 @@ pub enum TakenBackEnd {
 pub async fn take_back(
     shared: &Arc<Shared>,
     record: RunRecord,
+    kept: Arc<RecordHandle>,
     tokens: &Arc<RunGitTokens>,
     sandbox: Option<(
         crate::sandbox::TakenBack,
@@ -1103,11 +1103,10 @@ pub async fn take_back(
         assign.epoch,
         record.seq_floor,
     );
-    let kept = Arc::new(RecordHandle::kept(&shared.records, record.clone()));
+    // The holder keeps `kept` in step since the run was registered: a revocation that the
+    // server sends again at the hello writes the record again.
     sink.keep_record(kept.clone());
     tokens.attach_log(sink.side());
-    // A revocation that the server sends again at the hello writes the record again.
-    tokens.keep_record(kept.clone());
     let mut secrets = Vec::new();
     if let Some(tinfirm_protocol::AssignedCredential::Model(access)) = assign.credential() {
         secrets.push(access.api_key.expose().to_string());
@@ -1183,6 +1182,9 @@ pub async fn take_back(
     // epoch) stops the wait.
     let mut failure = Failure::default();
     let mut came_back = record.collected;
+    // A sandbox whose work came back but that the record cannot yet call collected: it lives
+    // until the run ends.
+    let mut held: Option<crate::sandbox::Sandbox> = None;
     if let Some((sandbox, registration)) = sandbox {
         let connected = tokio::select! {
             session = registration.connected(TAKE_BACK_WAIT) => Some(session),
@@ -1225,10 +1227,12 @@ pub async fn take_back(
                     )
                     .await;
                 }
-                sandbox.stop(Duration::from_secs(5)).await;
-                if *stop_rx.borrow() != Some(StopRequest::Abort) {
-                    // From now on the run's work is on this host alone: a restart takes the
-                    // run back from here, without a sandbox.
+                if *stop_rx.borrow() == Some(StopRequest::Abort) {
+                    sandbox.stop(Duration::from_secs(5)).await;
+                } else {
+                    // The work is on this host now. The record says so before the sandbox
+                    // goes, so that a restart at any moment finds the work where the record
+                    // says it is: in the sandbox until the mark is on disk, here after it.
                     let collected: Vec<(String, CollectedRecord)> = repos
                         .iter()
                         .filter_map(|repo| {
@@ -1236,7 +1240,15 @@ pub async fn take_back(
                             Some((repo.ws.dir.clone(), CollectedRecord::of(collected)))
                         })
                         .collect();
-                    kept.collected(&collected);
+                    if kept.collected(&collected) {
+                        sandbox.stop(Duration::from_secs(5)).await;
+                    } else {
+                        sink.log(
+                            LogLevel::Warn,
+                            "the runner host cannot write in its record that the run's work came back from the sandbox, so it keeps the sandbox until the run ends: a restart meanwhile takes the work from the sandbox again",
+                        );
+                        held = Some(sandbox);
+                    }
                 }
             }
             Some(Err(e)) => {
@@ -1270,9 +1282,10 @@ pub async fn take_back(
             Waited::Answered | Waited::Aborted => {}
             Waited::Left => {
                 tracing::info!(run_id = %assign.run_id, epoch = assign.epoch, "the host stops while a run taken back waits for the server; the next start takes it back");
-                // The record stays, and so does the work: neither is removed here.
+                // The record stays, and so does the work: neither is removed here. A sandbox
+                // kept for want of the mark is left too: its bridge waits for the next start.
                 tokens.drop_record();
-                return TakenBackEnd::Left;
+                return TakenBackEnd::Left(held.map(Box::new));
             }
         }
         if *stop_rx.borrow() != Some(StopRequest::Abort) && shared.speaks_v2() {
@@ -1280,8 +1293,12 @@ pub async fn take_back(
         }
     }
 
-    let cancelled = match *stop_rx.borrow() {
+    let stop = *stop_rx.borrow();
+    let cancelled = match stop {
         Some(StopRequest::Abort) => {
+            if let Some(mut sandbox) = held.take() {
+                sandbox.stop(Duration::from_secs(5)).await;
+            }
             tokens.drop_record();
             sink.drop_record();
             let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
@@ -1367,7 +1384,10 @@ pub async fn take_back(
         ..Report::default()
     };
     let finished = finish(&mut sink, assign, failure, cancelled, report);
-    // The run has ended: nothing is left to take back.
+    // The run has ended: nothing is left to take back, and a sandbox kept so far goes.
+    if let Some(mut sandbox) = held.take() {
+        sandbox.stop(Duration::from_secs(5)).await;
+    }
     tokens.drop_record();
     sink.drop_record();
     let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));

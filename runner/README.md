@@ -656,7 +656,9 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     before the push.
   - While the run waits, its agent is stopped and its sandbox is gone: the work, the session
     home and `/output` are on this host, and the record stays, marked `collected`, with how each
-    repository came back. The run's wall-clock limit no longer matters then, since nothing of the
+    repository came back. The mark is written before the sandbox is stopped; a host that cannot
+    write it keeps the sandbox until the run ends, says so in the run's log, and a restart
+    meanwhile takes the work from the sandbox again. The run's wall-clock limit no longer matters then, since nothing of the
     run executes. The host logs one warning when the wait begins ("a run taken back waits for the
     server's answer to the hello before it pushes"), the run's events say it once, and `doctor`
     counts such runs under "runs to take back". A cancel from the server is applied after the wait,
@@ -2004,8 +2006,9 @@ repository it names:
 | The redaction | The token stays on the run's list until the run ends: what was revealed stays redacted, and the agent printing it is still `CREDENTIAL_LEAK` |
 | The run's events | A `LOG` event at `warn` with the message |
 
-Once the holder has dropped the tokens and the take-back record is written again, the host
-confirms the frame with `run.git.revoked` (`runId`, `epoch`, `componentIds`): it names every
+Once the holder has dropped the tokens and the take-back record is written again (a record that
+is being made when the frame comes is made first, then written again without the token), the
+host confirms the frame with `run.git.revoked` (`runId`, `epoch`, `componentIds`): it names every
 repository of the frame that the run has, those revoked already included, so a frame that comes
 twice is confirmed twice. It goes in the run's order with its events, so a confirmation written
 while the host is disconnected, or lost with the connection, goes again after the next

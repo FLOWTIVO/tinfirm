@@ -40,7 +40,7 @@ use tinfirm_protocol::{GitCredentials, GitToken, LogLevel, RunAssign, Secret, Wo
 use uuid::Uuid;
 
 use crate::run::EventSink;
-use crate::takeback::RecordHandle;
+use crate::takeback::{RecordHandle, Records, RunRecord};
 
 /// Why a repository's token is gone: the server's reason code and its message for the run's
 /// log and the agent. Its `Display` is the message.
@@ -429,8 +429,32 @@ impl RunGitTokens {
         }
     }
 
-    /// Keeps the run's take-back record in step with the holder from now on, and writes it at
-    /// once if the holder changed since the record was made.
+    /// Makes the run's take-back record and keeps it in step with the holder from now on. The
+    /// snapshot of the tokens, the record's first write and its attachment to the holder are
+    /// one step under the holder's record lock: a revocation that comes meanwhile waits for it,
+    /// and then writes the record again without the token. So a revocation that finds no record
+    /// attached is one whose record, if the run ever gets one, is made after it and never holds
+    /// the token; only then is "no record" an answer that a confirmation may rest on.
+    /// `build` makes the record from the assignment as the holder has it now and the
+    /// repositories it names as revoked.
+    pub fn make_record(
+        &self,
+        records: &Records,
+        assign: &RunAssign,
+        build: impl FnOnce(RunAssign, Vec<RevokedRepository>) -> RunRecord,
+    ) -> anyhow::Result<Arc<RecordHandle>> {
+        let mut slot = lock(&self.record);
+        let mut kept = assign.clone();
+        let revoked = self.write_to(&mut kept);
+        let record = Arc::new(RecordHandle::create(records, build(kept, revoked))?);
+        *slot = Some(record.clone());
+        Ok(record)
+    }
+
+    /// Keeps a record that is on disk already (a run taken back) in step with the holder from
+    /// now on, and writes it at once if the holder changed since it was written. Attached
+    /// before any revocation of the run can be handled ([`crate::host::Shared`] does so when it
+    /// registers the run).
     pub fn keep_record(&self, record: Arc<RecordHandle>) {
         *lock(&self.record) = Some(record);
         self.sync_record();
@@ -444,6 +468,7 @@ impl RunGitTokens {
     /// Writes the take-back record again if the holder changed since. `true` when the record
     /// on disk is in step with the holder, or the run has none.
     fn sync_record(&self) -> bool {
+        // Waits while the record is being made ([`RunGitTokens::make_record`]).
         let record = lock(&self.record).clone();
         match record {
             Some(record) => record.sync_git(self),
@@ -754,6 +779,56 @@ mod tests {
         );
         assert_eq!(tokens.authorization(ids[0]).unwrap_err().message, "gone");
         assert!(tokens.due(None).iter().all(|id| *id != ids[0]));
+    }
+
+    #[test]
+    fn a_revocation_while_the_record_is_made_waits_and_leaves_no_token_on_disk() {
+        let assign = assign(serde_json::json!([workspace(
+            "a",
+            Some("token-of-a-0123456789")
+        )]));
+        let component = assign.workspaces[0].component_id;
+        let tokens = RunGitTokens::new(&assign);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let path = dir.path().join(format!("data/runs/{}.json", assign.run_id));
+        std::thread::scope(|scope| {
+            let mut revoking = None;
+            tokens
+                .make_record(&records, &assign, |kept, revoked| {
+                    // The snapshot is taken and holds the token; the revocation comes now,
+                    // before the record's first write.
+                    assert!(kept.workspaces[0].git.is_some());
+                    let handle =
+                        scope.spawn(|| tokens.revoke(&[component], "SUSPENDED", "suspended"));
+                    std::thread::sleep(Duration::from_millis(300));
+                    // The token is gone from the holder, but the answer waits for the record.
+                    assert!(tokens.revocation(component).is_some());
+                    assert!(!handle.is_finished(), "answered before the record was made");
+                    revoking = Some(handle);
+                    crate::takeback::RunRecord {
+                        version: crate::takeback::RECORD_VERSION,
+                        assign: kept,
+                        sandbox: crate::takeback::SandboxRecord::Local,
+                        bridge_id: "run.1".into(),
+                        session_key: tinfirm_bridge::control::Hidden::new("k".repeat(64)),
+                        repos: Vec::new(),
+                        home_exclude: Vec::new(),
+                        session_id: None,
+                        seq_floor: 1000,
+                        revoked,
+                        collected: false,
+                    }
+                })
+                .unwrap();
+            let answered = revoking.unwrap().join().unwrap();
+            // When the host may confirm, the record on disk no longer holds the token.
+            assert!(answered.recorded && answered.named == vec![component]);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("token-of-a"), "{text}");
+            assert!(text.contains("\"revoked\""), "{text}");
+        });
     }
 
     #[test]

@@ -416,6 +416,10 @@ pub struct Shared {
     /// such an error names the stale epoch.
     stale_hints: Mutex<HashMap<Uuid, std::time::Instant>>,
     shutting_down: AtomicBool,
+    /// Sandboxes of runs taken back that hold work the take-back record cannot yet call
+    /// collected, left for the next start of the host: kept until this process ends, so that
+    /// their sessions are not ended and their bridges wait for the next process.
+    left_sandboxes: Mutex<Vec<crate::sandbox::Sandbox>>,
     /// Set by the connection after each welcome; tests read it.
     pub connections: AtomicU64,
 }
@@ -489,6 +493,7 @@ impl Shared {
             state_file,
             stale_hints: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            left_sandboxes: Mutex::new(Vec::new()),
             connections: AtomicU64::new(0),
         });
         shared.refresh_redactor();
@@ -771,6 +776,13 @@ impl Shared {
         let steering = Steering::new(run_id, epoch, self.outbox.clone());
         // No token that the server revoked comes back (ADR-0116).
         let git_tokens = RunGitTokens::restored(&record.assign, &record.revoked);
+        // The record on disk is the holder's before the run can get a revocation: one that
+        // comes from now on writes it again before the host confirms it.
+        let kept = Arc::new(crate::takeback::RecordHandle::kept(
+            &self.records,
+            record.clone(),
+        ));
+        git_tokens.keep_record(kept.clone());
         lock(&self.runs).insert(
             run_id,
             RunEntry {
@@ -787,7 +799,7 @@ impl Shared {
         self.outbox.resume_run(run_id, epoch, record.seq_floor);
         let shared = self.clone();
         let handle = tokio::spawn(async move {
-            let end = run::take_back(&shared, record, &git_tokens, sandbox, stop_rx).await;
+            let end = run::take_back(&shared, record, kept, &git_tokens, sandbox, stop_rx).await;
             git_tokens.close_log();
             steering.close("the run ended");
             match end {
@@ -799,8 +811,13 @@ impl Shared {
                     tracing::info!(%run_id, epoch, "run taken back and aborted (stale epoch)");
                     shared.outbox.drop_run(run_id, epoch);
                 }
-                run::TakenBackEnd::Left => {
+                run::TakenBackEnd::Left(sandbox) => {
                     tracing::info!(%run_id, epoch, "run taken back and left for the next start of the host");
+                    // A sandbox that still holds the work lives as long as this process: its
+                    // bridge then waits for the next one, which takes the session back.
+                    if let Some(sandbox) = sandbox {
+                        lock(&shared.left_sandboxes).push(*sandbox);
+                    }
                 }
             }
             {

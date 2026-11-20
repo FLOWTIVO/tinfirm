@@ -1005,6 +1005,64 @@ async fn a_host_that_shuts_down_while_a_run_taken_back_waits_leaves_the_run_for_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_taken_back_whose_record_cannot_be_marked_keeps_its_sandbox_for_the_next_start() {
+    with_timeout(240, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, record, _) =
+            a_host_killed_mid_run_after(&mut server, &repo, true, None).await;
+        // The record cannot be written: its temporary file's place is taken.
+        let blocker = record.with_extension("json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        // Host B, in a process of its own, takes the run back and collects the work.
+        let mut host_b = host_process(dir.path(), &server.url, true);
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
+        let id = spec.run_id.to_string();
+        conn.take_where("the warning that the sandbox is kept", |f| {
+            f["runId"] == id
+                && f["eventType"] == "LOG"
+                && f["payload"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("keeps the sandbox until the run ends"))
+        })
+        .await;
+        // The disk still says that the work is in the sandbox, and the sandbox is there. Host B
+        // dies before its push (no welcome.done).
+        let kept: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        assert!(kept.get("collected").is_none(), "{kept:#}");
+        host_b.kill().unwrap();
+        host_b.wait().unwrap();
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+
+        // The next start takes the work from the sandbox again, and pushes it.
+        std::fs::remove_dir(&blocker).unwrap();
+        let again = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
+        conn.send(json!({"type": "welcome.done"}));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        assert_eq!(t.finished()["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        assert!(
+            t.text()
+                .contains("restarted during the run and takes it back"),
+            "{}",
+            t.text()
+        );
+        assert!(!record.exists());
+        again.shutdown.cancel();
+        again.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revocation_applied_before_a_restart_is_confirmed_again_after_it() {
     with_timeout(180, async {
         let repo = TestRepo::new();

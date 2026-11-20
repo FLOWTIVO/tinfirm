@@ -72,9 +72,9 @@ pub struct RunRecord {
     /// null, and a host that takes the run back pushes none of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked: Vec<RevokedRepository>,
-    /// The work came back from the sandbox, and the sandbox has stopped: the run's
-    /// repositories, its session home and its `/output` are on this host, and only the push and
-    /// the report are left (ADR-0116, decision 10: they wait for the server). A host that takes
+    /// The work came back from the sandbox, which stops once this is on disk (or, when it
+    /// cannot be written, lives until the run ends): the run's repositories, its session home
+    /// and its `/output` are on this host, and only the push and the report are left (ADR-0116, decision 10: they wait for the server). A host that takes
     /// such a run back needs no sandbox and no bridge. An older host ignores the field: it
     /// finds no sandbox, and reports the run's work as lost.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -442,9 +442,9 @@ impl RecordHandle {
         })
     }
 
-    /// The work came back from the sandbox and the sandbox has stopped
-    /// ([`RunRecord::collected`]): `repos` is how each repository (by `dir`) came back. A host
-    /// that restarts from now on takes the run back from this host's own disk.
+    /// The work came back from the sandbox ([`RunRecord::collected`]): `repos` is how each
+    /// repository (by `dir`) came back. A host that restarts from now on takes the run back
+    /// from this host's own disk. `true` once that is on disk: only then may the sandbox go.
     pub fn collected(&self, repos: &[(String, CollectedRecord)]) -> bool {
         self.update(|record| {
             record.collected = true;
