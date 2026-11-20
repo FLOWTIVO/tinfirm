@@ -1,0 +1,43 @@
+# HTTPS for a Compose host that the internet reaches directly: Caddy on ports 80 and 443,
+# with a certificate from Let's Encrypt for TINFIRM_TLS_HOST. Use it when no reverse proxy
+# or tunnel of your own ends TLS in front of the server.
+#
+#   docker compose -f compose.yaml -f compose.tls.yaml up -d --no-build
+#
+# In .env: TINFIRM_TLS_HOST=tinfirm.example.com, TINFIRM_PUBLIC_URL=https://tinfirm.example.com
+# and TINFIRM_HTTP_BIND=127.0.0.1, so that only Caddy reaches the server's port.
+# Before the first start: the name must resolve to this host, and ports 80 and 443 must be
+# open from the internet. Let's Encrypt limits failed attempts for a name: check the name
+# with `dig +short` first.
+#
+# The server trusts X-Forwarded-For from Caddy because Caddy's address on the Compose
+# network is a private one (Tomcat's default; compose.yaml says why it is not set).
+
+services:
+  caddy:
+    # Digest-pinned like the other images; bump tag and digest together.
+    image: caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      TINFIRM_TLS_HOST: ${TINFIRM_TLS_HOST:?is not set in .env; the host name of TINFIRM_PUBLIC_URL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # The certificate and its account key. Keep the volume: a new one asks for a new certificate.
+      - caddy-data:/data
+      - caddy-config:/config
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  caddy-data:
+  caddy-config:

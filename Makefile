@@ -148,7 +148,7 @@ helm-lint: ## Helm: the chart's LICENSE, lint --strict and template, with defaul
 	  helm template tinfirm $(CHART) -f "$$values" > /dev/null; \
 	done
 
-deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second-company examples), hadolint, shellcheck, actionlint, the action pins
+deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second-company examples, the HTTPS overlay), hadolint, shellcheck, actionlint, the action pins
 	$(COMPOSE) --env-file $(COMPOSE_DIR)/.env.example config --quiet
 	$(COMPOSE) --env-file $(COMPOSE_DIR)/.env.example --profile oidc config --quiet
 	$(COMPOSE_OIDC) --env-file $(COMPOSE_DIR)/.env.example config --quiet
@@ -158,6 +158,8 @@ deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second
 	  $(COMPOSE) -f $(COMPOSE_DIR)/compose.entra.yaml --env-file $(COMPOSE_DIR)/.env.example config --quiet
 	TINFIRM_ACME_ISSUER_URI=https://sso.example.com TINFIRM_ACME_CLIENT_ID=lint TINFIRM_ACME_CLIENT_SECRET=lint \
 	  $(COMPOSE) -f $(COMPOSE_DIR)/compose.companies.example.yaml --env-file $(COMPOSE_DIR)/.env.example config --quiet
+	TINFIRM_TLS_HOST=lint.example.com \
+	  $(COMPOSE) -f $(COMPOSE_DIR)/compose.tls.yaml --env-file $(COMPOSE_DIR)/.env.example config --quiet
 	for file in $(DOCKERFILES); do echo "--- $$file"; docker run --rm -i $(HADOLINT_IMAGE) < "$$file"; done
 	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) $(SHELL_SCRIPTS)
 	docker run --rm -v "$(CURDIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color

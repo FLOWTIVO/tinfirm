@@ -191,6 +191,25 @@ docker exec tinfirm-postgres-1 dropdb -U postgres restore_check
 
 The count and the highest version are those of the running database.
 
+### HTTPS on a Compose host
+
+The stack itself speaks plain HTTP on `127.0.0.1:8080`. Where your own reverse proxy or tunnel ends TLS, point it at that port and keep to the limits of [Requirements](requirements.md#network). Where the internet reaches the host directly, the overlay `compose.tls.yaml` adds Caddy on ports 80 and 443, which gets a certificate from Let's Encrypt for one host name and renews it:
+
+```sh title=".env"
+TINFIRM_TLS_HOST=tinfirm.example.com
+TINFIRM_PUBLIC_URL=https://tinfirm.example.com
+TINFIRM_HTTP_BIND=127.0.0.1
+```
+
+```sh
+dig +short tinfirm.example.com          # must be this host's public address
+docker compose -f compose.yaml -f compose.tls.yaml up -d --no-build
+```
+
+Before the first start, the name must resolve to the host and ports 80 and 443 must be open from the internet: Let's Encrypt limits failed attempts for a name. Open no other port: PostgreSQL, LiteLLM and the server's own port stay on `127.0.0.1`. Name `compose.tls.yaml` in every later `docker compose` command too, or Compose removes Caddy as an orphan with `--remove-orphans`. The certificate and its account key are in the volume `tinfirm_caddy-data`. `.env.example`'s values are public: generate every secret before a host is on the internet, as `deploy/compose/deploy-host.sh` does.
+
+The overlay was tried once: the certificate came at the first start, and a runner host's WebSocket and a conversation's event stream passed through Caddy. Not tried through it: a model request's long stream, an upload of 25 MB, and a renewal.
+
 ### Upgrade the stack
 
 From the Compose files of a release ([Try Tinfirm with Docker Compose](quick-start.md#1-start-the-stack)): download and check the new release's `tinfirm-compose-<version>.tar.gz` against its signed `SHA256SUMS` as there, and unpack it beside the old directory. Copy your `.env` into the new directory, and name the new release's image in it, by the digest you verified ([Verify your images](verify-images.md)):

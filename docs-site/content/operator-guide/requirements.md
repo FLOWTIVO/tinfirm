@@ -100,7 +100,7 @@ These assume Claude Code or a similar runtime and agents that sometimes build co
 
 | Need | Why |
 |---|---|
-| A host name with a TLS certificate, such as `tinfirm.example.com` | People, AI clients, add-ins, chats, webhook senders and runner hosts all reach the server there |
+| A host name with a TLS certificate, such as `tinfirm.example.com` | People, AI clients, add-ins, chats, webhook senders and runner hosts all reach the server there. A Compose host that the internet reaches directly can get both from the overlay `compose.tls.yaml`: [HTTPS on a Compose host](maintenance.md#https-on-a-compose-host) |
 | The ingress allows request bodies up to **64 MiB** and responses that pause up to **10 minutes**, and passes WebSockets | Runners' model requests go through the server and stream long answers; a conversation's uploads are up to 25 MB; runner hosts hold a WebSocket open. ingress-nginx allows 1 MiB and 60 seconds by default: [Install on Kubernetes with Helm](helm.md) gives the annotations. |
 | Runner hosts reach the server's host name on 443, and the code hosts | They open every connection themselves and need no inbound port |
 | The server reaches PostgreSQL, LiteLLM, the identity provider and the company's systems | Its outbound connections: [Architecture](architecture.md#connections) lists them |

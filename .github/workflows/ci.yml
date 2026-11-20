@@ -425,7 +425,7 @@ jobs:
             helm template tinfirm "$chart" -f "$values" > /dev/null
             echo "::endgroup::"
           done
-      - name: Compose config (with and without the oidc profile, SAML, and the Entra ID and second-company examples)
+      - name: Compose config (with and without the oidc profile, SAML, the Entra ID and second-company examples, and the HTTPS overlay)
         run: |
           set -euo pipefail
           compose=(docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env.example)
@@ -438,6 +438,8 @@ jobs:
             "${compose[@]}" -f deploy/compose/compose.entra.yaml config --quiet
           TINFIRM_ACME_ISSUER_URI=https://sso.example.com TINFIRM_ACME_CLIENT_ID=lint TINFIRM_ACME_CLIENT_SECRET=lint \
             "${compose[@]}" -f deploy/compose/compose.companies.example.yaml config --quiet
+          TINFIRM_TLS_HOST=lint.example.com \
+            "${compose[@]}" -f deploy/compose/compose.tls.yaml config --quiet
       # Dependabot bumps the Compose file's LiteLLM alone. The chart's goes with it, and the
       # filter of LiteLLM's fields with both (LiteLlmRequests, which the server's relay
       # applies): it removes the new version's all_litellm_params, which
