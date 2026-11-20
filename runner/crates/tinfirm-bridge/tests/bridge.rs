@@ -1617,3 +1617,149 @@ async fn hostile_first_frames_are_refused_and_the_listener_goes_on() {
     assert_eq!(drain(&mut io).await.0, "real\n");
     assert_eq!(finish(&session, bridge).await, 0);
 }
+
+/// A listener that reads each connection to its end, then writes how many bytes it read.
+async fn sink() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut total = 0usize;
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => total += n,
+                    }
+                }
+                let _ = socket
+                    .write_all(format!("total {total}\n").as_bytes())
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+fn median(mut times: Vec<Duration>) -> (Duration, Duration) {
+    times.sort();
+    let p99 = times[(times.len() * 99 / 100).min(times.len() - 1)];
+    (times[times.len() / 2], p99)
+}
+
+/// What the bridge costs with the host's side in this process: a handshake, a command's round
+/// trip, a put and a get of 1 GiB, and 1 GiB through a tunnel. Run by hand, in release:
+/// `cargo test --release -p tinfirm-bridge --test bridge measure -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, run by hand in release"]
+async fn measure_the_bridge() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const LONG: Duration = Duration::from_secs(600);
+    let server = server().await;
+    let mut times = Vec::new();
+    for i in 0..20 {
+        let started = std::time::Instant::now();
+        let (session, bridge) = connect(&server, &format!("run-measure-{i}")).await;
+        times.push(started.elapsed());
+        finish(&session, bridge).await;
+    }
+    let (p50, p99) = median(times);
+    println!("handshake (start of the bridge to the session): median {p50:?}, p99 {p99:?}");
+
+    let (mut session, bridge) = connect(&server, "run-measure").await;
+    let files = session.files();
+    let mut times = Vec::new();
+    for _ in 0..200 {
+        let started = std::time::Instant::now();
+        let out = files.exec(&["true"], &[], None, None, WAIT).await.unwrap();
+        assert!(out.success());
+        times.push(started.elapsed());
+    }
+    let (p50, p99) = median(times);
+    println!("exec round trip (`true`): median {p50:?}, p99 {p99:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    // Written whole: tar packs a sparse file as its holes, which would carry nothing.
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(source.join("big.bin")).unwrap();
+        let chunk = pattern(1024 * 1024, 3);
+        for _ in 0..1024 {
+            file.write_all(&chunk).unwrap();
+        }
+    }
+    let sandbox_dir = dir.path().join("sandbox");
+    let started = std::time::Instant::now();
+    files
+        .put_dir(&source, sandbox_dir.to_str().unwrap(), Vec::new(), LONG)
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    println!(
+        "put of 1 GiB: {took:?} ({:.0} MiB/s)",
+        1024.0 / took.as_secs_f64()
+    );
+    std::fs::remove_dir_all(&source).unwrap();
+    let started = std::time::Instant::now();
+    let read = files
+        .receive(
+            sandbox_dir.to_str().unwrap(),
+            Vec::new(),
+            Vec::new(),
+            LONG,
+            |input| Ok(std::io::copy(input, &mut std::io::sink())?),
+        )
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(read > GIB);
+    println!(
+        "get of 1 GiB: {took:?} ({:.0} MiB/s)",
+        1024.0 / took.as_secs_f64()
+    );
+    std::fs::remove_dir_all(&sandbox_dir).unwrap();
+
+    let listening = session
+        .open_tunnels(
+            &[TunnelTarget {
+                listen: any_port(),
+                target: sink().await,
+            }],
+            WAIT,
+        )
+        .await
+        .unwrap();
+    let mut io = session
+        .start(shell("echo ready; cat >/dev/null", &[]))
+        .await
+        .unwrap();
+    read_until(&mut io, "ready").await;
+    let socket = TcpStream::connect(listening[0]).await.unwrap();
+    let (mut reader, mut writer) = socket.into_split();
+    let started = std::time::Instant::now();
+    let writing = tokio::spawn(async move {
+        let chunk = vec![7u8; 1024 * 1024];
+        for _ in 0..1024 {
+            writer.write_all(&chunk).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+    });
+    let mut answer = String::new();
+    tokio::time::timeout(LONG, reader.read_to_string(&mut answer))
+        .await
+        .unwrap()
+        .unwrap();
+    let took = started.elapsed();
+    writing.await.unwrap();
+    assert_eq!(answer, format!("total {GIB}\n"));
+    println!(
+        "1 GiB through a tunnel: {took:?} ({:.0} MiB/s)",
+        1024.0 / took.as_secs_f64()
+    );
+    io.stdin.shutdown().await.unwrap();
+    drain(&mut io).await;
+    finish(&session, bridge).await;
+}

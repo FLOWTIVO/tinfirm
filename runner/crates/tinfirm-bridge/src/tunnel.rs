@@ -395,18 +395,80 @@ pub async fn listen(tunnels: &[Tunnel]) -> Result<Vec<(Tunnel, TcpListener)>, St
     Ok(out)
 }
 
-/// The host's side: the listener of each tunnel, and the streams the sandbox opens.
+/// A connection of the host's for one stream of a tunnel: what it reads goes to the sandbox,
+/// and what the sandbox sends is written into it.
+pub type TunnelConnection = (
+    Box<dyn AsyncRead + Unpin + Send>,
+    Box<dyn AsyncWrite + Unpin + Send>,
+);
+
+/// Where the host carries a tunnel's streams: a listener of the host's that it connects to
+/// ([`SocketAddr`]), or a service in the same process. Each stream gets a connection of its
+/// own; the sandbox never names where.
+pub trait TunnelEnd: Send + Sync + 'static {
+    /// A new connection for one stream.
+    fn connect(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<TunnelConnection>> + Send>,
+    >;
+
+    /// For the log.
+    fn describe(&self) -> String;
+}
+
+impl TunnelEnd for SocketAddr {
+    fn connect(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<TunnelConnection>> + Send>,
+    > {
+        let target = *self;
+        Box::pin(async move {
+            let socket = TcpStream::connect(target).await?;
+            let _ = socket.set_nodelay(true);
+            let (reader, writer) = socket.into_split();
+            Ok((
+                Box::new(reader) as Box<dyn AsyncRead + Unpin + Send>,
+                Box::new(writer) as Box<dyn AsyncWrite + Unpin + Send>,
+            ))
+        })
+    }
+
+    fn describe(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// The host's side: where each tunnel's streams go, and the streams the sandbox opens.
 pub struct HostTunnels {
-    targets: HashMap<u32, SocketAddr>,
+    targets: HashMap<u32, Arc<dyn TunnelEnd>>,
     streams: Arc<Streams>,
     last_open: u32,
     connect_timeout: Duration,
 }
 
 impl HostTunnels {
+    /// Tunnels to listeners of the host's, by address.
     pub fn new(
         streams: Arc<Streams>,
         targets: HashMap<u32, SocketAddr>,
+        connect_timeout: Duration,
+    ) -> HostTunnels {
+        HostTunnels::with_ends(
+            streams,
+            targets
+                .into_iter()
+                .map(|(id, addr)| (id, Arc::new(addr) as Arc<dyn TunnelEnd>))
+                .collect(),
+            connect_timeout,
+        )
+    }
+
+    /// Tunnels to any [`TunnelEnd`].
+    pub fn with_ends(
+        streams: Arc<Streams>,
+        targets: HashMap<u32, Arc<dyn TunnelEnd>>,
         connect_timeout: Duration,
     ) -> HostTunnels {
         HostTunnels {
@@ -443,7 +505,7 @@ impl HostTunnels {
             return;
         }
         self.last_open = stream;
-        let Some(&target) = self.targets.get(&tunnel) else {
+        let Some(target) = self.targets.get(&tunnel).cloned() else {
             tracing::warn!(
                 stream,
                 tunnel,
@@ -460,14 +522,14 @@ impl HostTunnels {
         let streams = self.streams.clone();
         let timeout = self.connect_timeout;
         tokio::spawn(async move {
-            match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
-                Ok(Ok(socket)) => streams.run(opened, socket),
+            match tokio::time::timeout(timeout, target.connect()).await {
+                Ok(Ok((reader, writer))) => streams.run_io(opened, reader, writer),
                 Ok(Err(e)) => {
-                    tracing::debug!(%target, error = %e, "a tunnel cannot reach its listener");
+                    tracing::debug!(target = %target.describe(), error = %e, "a tunnel cannot reach its listener");
                     streams.abort(stream);
                 }
                 Err(_) => {
-                    tracing::debug!(%target, "a tunnel's listener did not answer in time");
+                    tracing::debug!(target = %target.describe(), "a tunnel's listener did not answer in time");
                     streams.abort(stream);
                 }
             }

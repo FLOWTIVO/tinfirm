@@ -1,6 +1,12 @@
 //! The runner host's side of the bridge (ADR-0095): one listener for every run of the host,
 //! a one-time ticket per run, and the run's session once its bridge has connected: the
 //! adapter's stdio, the tunnels, and the sandbox's files ([`SandboxFiles`]).
+//!
+//! Its parts serve a caller that holds one sandbox's connections alone (the sandbox's front
+//! process in the runner host, ADR-0112): [`accept_hello`] (TLS and the first frame),
+//! [`judge`] (a `hello` against what the run waits for, which the caller may decide elsewhere),
+//! [`welcome`] and [`refuse`], and [`SessionCore`], the session over a link that a handshake
+//! attached, whose tunnels reach any [`TunnelEnd`].
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,7 +29,9 @@ use crate::files::{self, Limits, ReadOne, Unpacked};
 use crate::frame::{self, Frame, Kind};
 use crate::link::{self, Inbound, InboundReceiver, LinkHandle, Timing};
 use crate::tls::Identity;
-use crate::tunnel::{HOST_STREAMS, HostTunnels, MAX_TUNNELS, Opened, Streams, next_event};
+use crate::tunnel::{
+    HOST_STREAMS, HostTunnels, MAX_TUNNELS, Opened, Streams, TunnelEnd, next_event,
+};
 use crate::{PROTOCOL_VERSION, random_token, secret_eq};
 
 /// The bytes the host keeps for a sandbox until they are acknowledged (the adapter's stdin).
@@ -480,43 +488,21 @@ pub struct HostSession {
     key: Hidden,
     /// The version the bridge named in its first `hello` ([`crate::BUILD`]); none from an older one.
     build: Option<String>,
-    state: Arc<State>,
-    output: Option<mpsc::Receiver<Output>>,
-    exit: watch::Receiver<Option<Exit>>,
-    started: bool,
+    core: SessionCore,
 }
 
 impl HostSession {
     fn new(registration: Registration, established: Established) -> HostSession {
-        let key = established.session;
-        let build = established.build;
-        let link = established.link;
-        let state = Arc::new(State {
-            streams: Streams::new(link.clone()),
-            link,
-            waiters: Mutex::new(HashMap::new()),
-            next_request: AtomicU64::new(1),
-            next_stream: AtomicU32::new(HOST_STREAMS),
-            tunnels: Mutex::new(None),
-            ended: CancellationToken::new(),
-        });
-        let (out_tx, output) = mpsc::channel(OUTPUT_QUEUE);
-        let (exit_tx, exit) = watch::channel(None);
-        tokio::spawn(dispatch(
+        let core = SessionCore::new(
+            established.link,
             established.inbound,
-            state.clone(),
-            out_tx,
-            exit_tx,
-            registration.inner.timing.gone_after,
-        ));
+            &registration.inner.timing,
+        );
         HostSession {
             registration,
-            key,
-            build,
-            state,
-            output: Some(output),
-            exit,
-            started: false,
+            key: established.session,
+            build: established.build,
+            core,
         }
     }
 
@@ -539,17 +525,124 @@ impl HostSession {
     /// How the adapter ended, once it has: with [`HostSession::start`], or the one that
     /// [`HostSession::reclaim`] stopped.
     pub fn exit(&self) -> watch::Receiver<Option<Exit>> {
-        self.exit.clone()
+        self.core.exit()
     }
 
     /// Whether the session has ended: the bridge had no connection for longer than
     /// [`HostTiming::gone_after`], or its link closed. A session that waits for its `start`
     /// (a ready sandbox) ends the same way.
     pub fn has_ended(&self) -> bool {
-        self.state.ended.is_cancelled()
+        self.core.has_ended()
     }
 
     /// Resolves once the session has ended ([`HostSession::has_ended`]).
+    pub fn ended(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+        self.core.ended()
+    }
+
+    /// The sandbox's files and the host's commands there, for as long as the session lasts.
+    pub fn files(&self) -> SandboxFiles {
+        self.core.files()
+    }
+
+    /// Before [`HostSession::start`]: the sandbox listens on each tunnel's address and carries
+    /// its connections to the tunnel's target, and no other. Returns the addresses the sandbox
+    /// listens on, in order: the asked ones (or, for a port 0, the one the sandbox got).
+    pub async fn open_tunnels(
+        &mut self,
+        tunnels: &[TunnelTarget],
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>> {
+        let ends: Vec<(SocketAddr, Arc<dyn TunnelEnd>)> = tunnels
+            .iter()
+            .map(|t| (t.listen, Arc::new(t.target) as Arc<dyn TunnelEnd>))
+            .collect();
+        self.core.open_tunnels(&ends, timeout).await
+    }
+
+    /// Starts the adapter in the sandbox, with the run's environment.
+    pub async fn start(&mut self, start: Start) -> Result<HostIo> {
+        self.core.start(start).await
+    }
+
+    pub async fn signal(&self, signal: Signal) -> Result<()> {
+        self.core.signal(signal).await
+    }
+
+    /// SIGTERM to the adapter's process group, SIGKILL after `grace`.
+    pub async fn stop(&self, grace: Duration) -> Result<()> {
+        self.core.stop(grace).await
+    }
+
+    /// For a session taken back after a restart (ADR-0101): the agent that the host's
+    /// predecessor started stops, and its further output is dropped. Waits up to `timeout`
+    /// for the adapter to end, when it still ran, and returns whether it did.
+    pub async fn reclaim(&mut self, timeout: Duration) -> Result<bool> {
+        self.core.reclaim(timeout).await
+    }
+
+    /// After the adapter has ended: the host has what it needs, and the bridge ends. Waits up
+    /// to `timeout` for the bridge's answer.
+    pub async fn close(&self, timeout: Duration) {
+        self.core.close(timeout).await
+    }
+}
+
+/// A session over a link that a handshake attached, whoever holds the link: the adapter's
+/// stdio and exit, the host's requests, the tunnels and the files. [`HostSession`] is one for a
+/// run registered with a [`BridgeServer`]; the front process of a sandbox holds one of its own.
+/// Dropping it leaves the link as it is: its owner closes it.
+pub struct SessionCore {
+    state: Arc<State>,
+    output: Option<mpsc::Receiver<Output>>,
+    exit: watch::Receiver<Option<Exit>>,
+    started: bool,
+    tunnel_connect: Duration,
+}
+
+impl SessionCore {
+    /// The session of `link`, whose events come on `inbound`, with `timing`'s bounds: its
+    /// dispatcher runs from now on, until the link ends or the bridge is gone for
+    /// [`HostTiming::gone_after`].
+    pub fn new(link: LinkHandle, inbound: InboundReceiver, timing: &HostTiming) -> SessionCore {
+        let state = Arc::new(State {
+            streams: Streams::new(link.clone()),
+            link,
+            waiters: Mutex::new(HashMap::new()),
+            next_request: AtomicU64::new(1),
+            next_stream: AtomicU32::new(HOST_STREAMS),
+            tunnels: Mutex::new(None),
+            ended: CancellationToken::new(),
+        });
+        let (out_tx, output) = mpsc::channel(OUTPUT_QUEUE);
+        let (exit_tx, exit) = watch::channel(None);
+        tokio::spawn(dispatch(
+            inbound,
+            state.clone(),
+            out_tx,
+            exit_tx,
+            timing.gone_after,
+        ));
+        SessionCore {
+            state,
+            output: Some(output),
+            exit,
+            started: false,
+            tunnel_connect: timing.tunnel_connect,
+        }
+    }
+
+    /// How the adapter ended, once it has.
+    pub fn exit(&self) -> watch::Receiver<Option<Exit>> {
+        self.exit.clone()
+    }
+
+    /// Whether the session has ended ([`HostSession::has_ended`]).
+    pub fn has_ended(&self) -> bool {
+        self.state.ended.is_cancelled()
+    }
+
+    /// Resolves once the session has ended.
     pub fn ended(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
         self.state.ended.clone().cancelled_owned()
     }
@@ -561,12 +654,13 @@ impl HostSession {
         }
     }
 
-    /// Before [`HostSession::start`]: the sandbox listens on each tunnel's address and carries
-    /// its connections to the tunnel's target, and no other. Returns the addresses the sandbox
-    /// listens on, in order: the asked ones (or, for a port 0, the one the sandbox got).
+    /// Before [`SessionCore::start`]: the sandbox listens on each tunnel's address, and each
+    /// connection it gets there goes to that tunnel's end and to no other. Returns the
+    /// addresses the sandbox listens on, in order: the asked ones (or, for a port 0, the one
+    /// the sandbox got).
     pub async fn open_tunnels(
         &mut self,
-        tunnels: &[TunnelTarget],
+        tunnels: &[(SocketAddr, Arc<dyn TunnelEnd>)],
         timeout: Duration,
     ) -> Result<Vec<SocketAddr>> {
         anyhow::ensure!(!self.started, "the adapter was started already");
@@ -580,9 +674,9 @@ impl HostSession {
         );
         let asked: Vec<Tunnel> = (1u32..)
             .zip(tunnels)
-            .map(|(id, t)| Tunnel {
+            .map(|(id, (listen, _))| Tunnel {
                 id,
-                addr: t.listen.to_string(),
+                addr: listen.to_string(),
             })
             .collect();
         let reply = self
@@ -600,26 +694,26 @@ impl HostSession {
             bail!("the sandbox answered the tunnels with something else");
         };
         let mut bound = Vec::with_capacity(asked.len());
-        let mut targets = HashMap::new();
-        for (tunnel, wanted) in asked.iter().zip(tunnels) {
+        let mut targets: HashMap<u32, Arc<dyn TunnelEnd>> = HashMap::new();
+        for (tunnel, (listen, end)) in asked.iter().zip(tunnels) {
             let got = reply
                 .iter()
                 .find(|t| t.id == tunnel.id)
-                .with_context(|| format!("the sandbox did not listen on {}", wanted.listen))?;
+                .with_context(|| format!("the sandbox did not listen on {listen}"))?;
             let addr: SocketAddr = got
                 .addr
                 .parse()
                 .with_context(|| format!("the sandbox listens on `{}`", got.addr))?;
-            if wanted.listen.port() != 0 && addr != wanted.listen {
-                bail!("the sandbox listens on {addr} instead of {}", wanted.listen);
+            if listen.port() != 0 && addr != *listen {
+                bail!("the sandbox listens on {addr} instead of {listen}");
             }
             bound.push(addr);
-            targets.insert(tunnel.id, wanted.target);
+            targets.insert(tunnel.id, end.clone());
         }
-        *lock(&self.state.tunnels) = Some(HostTunnels::new(
+        *lock(&self.state.tunnels) = Some(HostTunnels::with_ends(
             self.state.streams.clone(),
             targets,
-            self.registration.inner.timing.tunnel_connect,
+            self.tunnel_connect,
         ));
         Ok(bound)
     }
@@ -665,9 +759,8 @@ impl HostSession {
             .map_err(|_| anyhow!("the sandbox bridge's link is closed"))
     }
 
-    /// For a session taken back after a restart (ADR-0101): the agent that the host's
-    /// predecessor started stops, and its further output is dropped. Waits up to `timeout`
-    /// for the adapter to end, when it still ran, and returns whether it did.
+    /// The agent that an earlier host started stops, and its further output is dropped
+    /// ([`HostSession::reclaim`]).
     pub async fn reclaim(&mut self, timeout: Duration) -> Result<bool> {
         anyhow::ensure!(!self.started, "the adapter was started by this host");
         // Nobody reads the old agent's output: the dispatcher drops it.
@@ -690,8 +783,7 @@ impl HostSession {
         Ok(running)
     }
 
-    /// After the adapter has ended: the host has what it needs, and the bridge ends. Waits up
-    /// to `timeout` for the bridge's answer.
+    /// After the adapter has ended: the bridge ends. Waits up to `timeout` for its answer.
     pub async fn close(&self, timeout: Duration) {
         if let Err(e) = self
             .state
@@ -1112,10 +1204,31 @@ enum Decision {
     Refuse(RefuseCode, &'static str),
 }
 
-async fn handshake(tcp: TcpStream, inner: &Arc<Inner>) -> Result<()> {
+/// What a bridge said in its `hello`, the first frame of each of its connections.
+#[derive(Debug, Clone)]
+pub struct Hello {
+    pub run_id: String,
+    /// The run's one-time ticket, on its first connection.
+    pub ticket: Option<Hidden>,
+    /// The session's key, on every later one.
+    pub session: Option<Hidden>,
+    /// The last frame number the bridge received.
+    pub rx_seq: u64,
+    /// The last frame number the bridge sent; none from an older bridge.
+    pub tx_seq: Option<u64>,
+    /// The version of the bridge's binary; none from an older bridge.
+    pub build: Option<String>,
+}
+
+/// The TLS handshake with `acceptor` on `tcp`, then the bridge's first frame, which must be a
+/// `hello` of this protocol's version. A connection that sends anything else is answered with
+/// a refusal and closed.
+pub async fn accept_hello(
+    acceptor: &TlsAcceptor,
+    tcp: TcpStream,
+) -> Result<(TlsStream<TcpStream>, Hello)> {
     let _ = tcp.set_nodelay(true);
-    let mut tls = inner
-        .acceptor
+    let mut tls = acceptor
         .accept(tcp)
         .await
         .context("the TLS handshake failed")?;
@@ -1152,7 +1265,104 @@ async fn handshake(tcp: TcpStream, inner: &Arc<Inner>) -> Result<()> {
         .await;
         bail!("the bridge speaks protocol {version}, this host {PROTOCOL_VERSION}");
     }
-    let decision = decide(inner, &run_id, ticket, session, rx_seq, tx_seq)?;
+    Ok((
+        tls,
+        Hello {
+            run_id,
+            ticket,
+            session,
+            rx_seq,
+            tx_seq,
+            build,
+        },
+    ))
+}
+
+/// What a run's entry waits for: its bridge's first connection with the ticket, a reconnect
+/// with the session's key, or the bridge of a session that an earlier host started.
+#[derive(Debug, Clone, Copy)]
+pub enum Expect<'a> {
+    Ticket(&'a Hidden),
+    Session(&'a Hidden),
+    Reclaim(&'a Hidden),
+}
+
+/// What becomes of a `hello` ([`judge`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The ticket is right: a new session, with a key of its own.
+    New,
+    /// The session's key is right: the bridge goes on with the session's link.
+    Resume,
+    /// The key of a session that an earlier host started is right: a new link starts where the
+    /// bridge's is, after `rx_after`.
+    Reclaim {
+        rx_after: u64,
+    },
+    Refuse(RefuseCode, &'static str),
+}
+
+/// Decides a `hello` against what the run's entry waits for (`None`: no such run), without
+/// waiting. The secrets are compared in a time that tells nothing of them ([`secret_eq`]).
+pub fn judge(expect: Option<Expect<'_>>, hello: &Hello) -> Verdict {
+    let same = |a: &Hidden, b: &Hidden| secret_eq(a.expose().as_bytes(), b.expose().as_bytes());
+    match (expect, &hello.ticket, &hello.session) {
+        (Some(Expect::Ticket(expected)), Some(ticket), None) if same(expected, ticket) => {
+            Verdict::New
+        }
+        (Some(Expect::Session(expected)), None, Some(session)) if same(expected, session) => {
+            Verdict::Resume
+        }
+        (Some(Expect::Reclaim(expected)), None, Some(session)) if same(expected, session) => {
+            let Some(rx_after) = hello.tx_seq else {
+                // A bridge that names no number cannot go on with a link of this process's.
+                return Verdict::Refuse(
+                    RefuseCode::UnsupportedVersion,
+                    "this bridge cannot be taken back by a runner host that restarted",
+                );
+            };
+            if hello.rx_seq > link::MAX_SEQ || rx_after > link::MAX_SEQ {
+                // The agent may drive its bridge (threat model 6.13): no link has such numbers.
+                return Verdict::Refuse(
+                    RefuseCode::BadRequest,
+                    "the hello names a frame number that no link reaches",
+                );
+            }
+            Verdict::Reclaim { rx_after }
+        }
+        (Some(expect), ticket, session) => match (expect, ticket, session) {
+            (Expect::Session(_), Some(_), _) => Verdict::Refuse(
+                RefuseCode::TicketUsed,
+                "the run's ticket was used; a reconnect presents the session key",
+            ),
+            (_, _, Some(_)) => Verdict::Refuse(RefuseCode::UnknownSession, "no such session"),
+            _ => Verdict::Refuse(RefuseCode::BadTicket, "no run waits for this ticket"),
+        },
+        (None, _, Some(_)) => Verdict::Refuse(RefuseCode::UnknownSession, "no such session"),
+        (None, _, None) => Verdict::Refuse(RefuseCode::BadTicket, "no run waits for this ticket"),
+    }
+}
+
+/// Answers an admitted bridge: its `welcome`, with the session's key on a new session, and
+/// the last frame number this side has of it.
+pub async fn welcome(
+    tls: &mut TlsStream<TcpStream>,
+    session: Option<Hidden>,
+    rx_seq: u64,
+) -> Result<()> {
+    let welcome = Control::Welcome {
+        version: PROTOCOL_VERSION,
+        session,
+        rx_seq,
+    };
+    write_control(tls, &welcome).await
+}
+
+async fn handshake(tcp: TcpStream, inner: &Arc<Inner>) -> Result<()> {
+    let (mut tls, hello) = accept_hello(&inner.acceptor, tcp).await?;
+    let run_id = hello.run_id.clone();
+    let (rx_seq, build) = (hello.rx_seq, hello.build.clone());
+    let decision = decide(inner, &hello)?;
     match decision {
         Decision::Refuse(code, message) => {
             refuse(&mut tls, code, message).await;
@@ -1165,12 +1375,7 @@ async fn handshake(tcp: TcpStream, inner: &Arc<Inner>) -> Result<()> {
             link,
             inbound,
         } => {
-            let welcome = Control::Welcome {
-                version: PROTOCOL_VERSION,
-                session: Some(session.clone()),
-                rx_seq: 0,
-            };
-            if let Err(e) = write_control(&mut tls, &welcome).await {
+            if let Err(e) = welcome(&mut tls, Some(session.clone()), 0).await {
                 // The bridge never learnt the session key: let it try its ticket again.
                 link.close();
                 lock(&inner.runs).insert(run_id.clone(), Entry::Waiting { ticket, ready });
@@ -1204,12 +1409,7 @@ async fn handshake(tcp: TcpStream, inner: &Arc<Inner>) -> Result<()> {
                 .rx_seq()
                 .await
                 .map_err(|_| anyhow!("the run's link is closed"))?;
-            let welcome = Control::Welcome {
-                version: PROTOCOL_VERSION,
-                session: None,
-                rx_seq: ours,
-            };
-            write_control(&mut tls, &welcome)
+            welcome(&mut tls, None, ours)
                 .await
                 .context("cannot answer the bridge")?;
             link.attach(Box::new(tls), rx_seq)
@@ -1224,12 +1424,7 @@ async fn handshake(tcp: TcpStream, inner: &Arc<Inner>) -> Result<()> {
             rx_after,
         } => {
             // What the bridge sent to the process before this one is that one's: had it.
-            let welcome = Control::Welcome {
-                version: PROTOCOL_VERSION,
-                session: None,
-                rx_seq: rx_after,
-            };
-            if let Err(e) = write_control(&mut tls, &welcome).await {
+            if let Err(e) = welcome(&mut tls, None, rx_after).await {
                 link.close();
                 lock(&inner.runs).insert(run_id.clone(), Entry::Reclaiming { session, ready });
                 return Err(e).context("cannot answer the bridge");
@@ -1253,27 +1448,22 @@ async fn handshake(tcp: TcpStream, inner: &Arc<Inner>) -> Result<()> {
     Ok(())
 }
 
-/// Checks a `hello` against the registered runs, under the lock and without waiting.
-fn decide(
-    inner: &Inner,
-    run_id: &str,
-    ticket: Option<Hidden>,
-    session: Option<Hidden>,
-    rx_seq: u64,
-    tx_seq: Option<u64>,
-) -> Result<Decision> {
+/// Checks a `hello` against the registered runs ([`judge`]), under the lock and without
+/// waiting, and makes what the verdict needs: the link of a new or reclaimed session.
+fn decide(inner: &Inner, hello: &Hello) -> Result<Decision> {
     let mut runs = lock(&inner.runs);
+    let run_id = hello.run_id.as_str();
     let entry = runs.remove(run_id);
-    let same = |a: &Hidden, b: &Hidden| secret_eq(a.expose().as_bytes(), b.expose().as_bytes());
-    let decision = match (entry, ticket, session) {
-        (
-            Some(Entry::Waiting {
-                ticket: expected,
-                ready,
-            }),
-            Some(ticket),
-            None,
-        ) if same(&expected, &ticket) => {
+    let verdict = judge(
+        entry.as_ref().map(|entry| match entry {
+            Entry::Waiting { ticket, .. } => Expect::Ticket(ticket),
+            Entry::Established { session, .. } => Expect::Session(session),
+            Entry::Reclaiming { session, .. } => Expect::Reclaim(session),
+        }),
+        hello,
+    );
+    let decision = match (verdict, entry) {
+        (Verdict::New, Some(Entry::Waiting { ticket, ready })) => {
             let (link, inbound) = link::spawn(REPLAY_BYTES, inner.timing.link);
             let session = Hidden::new(random_token()?);
             runs.insert(
@@ -1284,98 +1474,46 @@ fn decide(
                 },
             );
             Decision::New {
-                ticket: expected,
+                ticket,
                 session,
                 ready,
                 link,
                 inbound,
             }
         }
-        (
-            Some(Entry::Established {
-                session: expected,
-                link,
-            }),
-            None,
-            Some(session),
-        ) if same(&expected, &session) => {
+        (Verdict::Resume, Some(Entry::Established { session, link })) => {
             let resumed = link.clone();
-            runs.insert(
-                run_id.to_string(),
-                Entry::Established {
-                    session: expected,
-                    link,
-                },
-            );
+            runs.insert(run_id.to_string(), Entry::Established { session, link });
             Decision::Resume(resumed)
         }
-        (
-            Some(Entry::Reclaiming {
-                session: expected,
-                ready,
-            }),
-            None,
-            Some(session),
-        ) if same(&expected, &session) => {
-            let Some(rx_after) = tx_seq else {
-                // A bridge that names no number cannot go on with a link of this process's.
-                runs.insert(
-                    run_id.to_string(),
-                    Entry::Reclaiming {
-                        session: expected,
-                        ready,
-                    },
-                );
-                return Ok(Decision::Refuse(
-                    RefuseCode::UnsupportedVersion,
-                    "this bridge cannot be taken back by a runner host that restarted",
-                ));
-            };
-            if rx_seq > link::MAX_SEQ || rx_after > link::MAX_SEQ {
-                // The agent may drive its bridge (threat model 6.13): no link has such numbers.
-                runs.insert(
-                    run_id.to_string(),
-                    Entry::Reclaiming {
-                        session: expected,
-                        ready,
-                    },
-                );
-                return Ok(Decision::Refuse(
-                    RefuseCode::BadRequest,
-                    "the hello names a frame number that no link reaches",
-                ));
-            }
+        (Verdict::Reclaim { rx_after }, Some(Entry::Reclaiming { session, ready })) => {
             let (link, inbound) =
-                link::spawn_after(REPLAY_BYTES, inner.timing.link, rx_seq, rx_after);
+                link::spawn_after(REPLAY_BYTES, inner.timing.link, hello.rx_seq, rx_after);
             runs.insert(
                 run_id.to_string(),
                 Entry::Established {
-                    session: expected.clone(),
+                    session: session.clone(),
                     link: link.clone(),
                 },
             );
             Decision::Reclaim {
-                session: expected,
+                session,
                 ready,
                 link,
                 inbound,
                 rx_after,
             }
         }
-        (Some(entry), ticket, session) => {
-            let refusal = match (&entry, ticket, session) {
-                (Entry::Established { .. }, Some(_), _) => (
-                    RefuseCode::TicketUsed,
-                    "the run's ticket was used; a reconnect presents the session key",
-                ),
-                (_, _, Some(_)) => (RefuseCode::UnknownSession, "no such session"),
-                _ => (RefuseCode::BadTicket, "no run waits for this ticket"),
-            };
-            runs.insert(run_id.to_string(), entry);
-            Decision::Refuse(refusal.0, refusal.1)
+        (verdict, entry) => {
+            if let Some(entry) = entry {
+                runs.insert(run_id.to_string(), entry);
+            }
+            match verdict {
+                Verdict::Refuse(code, message) => Decision::Refuse(code, message),
+                // `judge` admits only what the entry waits for.
+                _ => Decision::Refuse(RefuseCode::BadRequest, "the bridge is not admitted"),
+            }
         }
-        (None, _, Some(_)) => Decision::Refuse(RefuseCode::UnknownSession, "no such session"),
-        (None, _, None) => Decision::Refuse(RefuseCode::BadTicket, "no run waits for this ticket"),
     };
     Ok(decision)
 }
@@ -1387,7 +1525,8 @@ async fn write_control(tls: &mut TlsStream<TcpStream>, control: &Control) -> Res
     Ok(())
 }
 
-async fn refuse(tls: &mut TlsStream<TcpStream>, code: RefuseCode, message: &str) {
+/// Refuses a bridge's connection with `code` and `message`, and closes it.
+pub async fn refuse(tls: &mut TlsStream<TcpStream>, code: RefuseCode, message: &str) {
     let refused = Control::Refused {
         code,
         message: message.to_string(),
@@ -1412,23 +1551,131 @@ mod tests {
         .await
         .unwrap();
         for (rx_seq, tx_seq) in [(u64::MAX, 0), (0, u64::MAX), (link::MAX_SEQ + 1, 7)] {
-            let decision = decide(
-                &server.inner,
-                "run-1",
-                None,
-                Some(key.clone()),
-                rx_seq,
-                Some(tx_seq),
-            )
-            .unwrap();
+            let decision = decide(&server.inner, &reclaim_hello(&key, rx_seq, tx_seq)).unwrap();
             assert!(
                 matches!(decision, Decision::Refuse(RefuseCode::BadRequest, _)),
                 "{rx_seq} {tx_seq}"
             );
         }
         // The run still waits for its bridge, which comes back with its own numbers.
-        let decision = decide(&server.inner, "run-1", None, Some(key), 3, Some(5)).unwrap();
+        let decision = decide(&server.inner, &reclaim_hello(&key, 3, 5)).unwrap();
         assert!(matches!(decision, Decision::Reclaim { rx_after: 5, .. }));
+    }
+
+    fn reclaim_hello(key: &Hidden, rx_seq: u64, tx_seq: u64) -> Hello {
+        Hello {
+            run_id: "run-1".into(),
+            ticket: None,
+            session: Some(key.clone()),
+            rx_seq,
+            tx_seq: Some(tx_seq),
+            build: None,
+        }
+    }
+
+    #[test]
+    fn a_hello_is_admitted_only_with_what_its_entry_waits_for() {
+        let (ticket, session, other) = (
+            Hidden::new("t".repeat(64)),
+            Hidden::new("s".repeat(64)),
+            Hidden::new("o".repeat(64)),
+        );
+        let hello =
+            |ticket: Option<&Hidden>, session: Option<&Hidden>, tx_seq: Option<u64>| Hello {
+                run_id: "run-1".into(),
+                ticket: ticket.cloned(),
+                session: session.cloned(),
+                rx_seq: 2,
+                tx_seq,
+                build: None,
+            };
+        let cases: Vec<(Option<Expect<'_>>, Hello, Verdict)> = vec![
+            (
+                Some(Expect::Ticket(&ticket)),
+                hello(Some(&ticket), None, None),
+                Verdict::New,
+            ),
+            (
+                Some(Expect::Ticket(&ticket)),
+                hello(Some(&other), None, None),
+                Verdict::Refuse(RefuseCode::BadTicket, ""),
+            ),
+            // A ticket with a session key as well is no first connection.
+            (
+                Some(Expect::Ticket(&ticket)),
+                hello(Some(&ticket), Some(&session), None),
+                Verdict::Refuse(RefuseCode::UnknownSession, ""),
+            ),
+            (
+                Some(Expect::Ticket(&ticket)),
+                hello(None, Some(&session), Some(1)),
+                Verdict::Refuse(RefuseCode::UnknownSession, ""),
+            ),
+            (
+                Some(Expect::Session(&session)),
+                hello(None, Some(&session), None),
+                Verdict::Resume,
+            ),
+            (
+                Some(Expect::Session(&session)),
+                hello(Some(&ticket), None, None),
+                Verdict::Refuse(RefuseCode::TicketUsed, ""),
+            ),
+            (
+                Some(Expect::Session(&session)),
+                hello(None, Some(&other), None),
+                Verdict::Refuse(RefuseCode::UnknownSession, ""),
+            ),
+            (
+                Some(Expect::Reclaim(&session)),
+                hello(None, Some(&session), Some(7)),
+                Verdict::Reclaim { rx_after: 7 },
+            ),
+            (
+                Some(Expect::Reclaim(&session)),
+                hello(None, Some(&session), None),
+                Verdict::Refuse(RefuseCode::UnsupportedVersion, ""),
+            ),
+            (
+                Some(Expect::Reclaim(&session)),
+                hello(None, Some(&session), Some(link::MAX_SEQ + 1)),
+                Verdict::Refuse(RefuseCode::BadRequest, ""),
+            ),
+            (
+                Some(Expect::Reclaim(&session)),
+                hello(None, Some(&other), Some(7)),
+                Verdict::Refuse(RefuseCode::UnknownSession, ""),
+            ),
+            (
+                Some(Expect::Reclaim(&session)),
+                hello(Some(&ticket), None, None),
+                Verdict::Refuse(RefuseCode::BadTicket, ""),
+            ),
+            (
+                None,
+                hello(Some(&ticket), None, None),
+                Verdict::Refuse(RefuseCode::BadTicket, ""),
+            ),
+            (
+                None,
+                hello(None, Some(&session), Some(1)),
+                Verdict::Refuse(RefuseCode::UnknownSession, ""),
+            ),
+            (
+                None,
+                hello(None, None, None),
+                Verdict::Refuse(RefuseCode::BadTicket, ""),
+            ),
+        ];
+        for (i, (expect, hello, want)) in cases.into_iter().enumerate() {
+            let verdict = judge(expect, &hello);
+            // A refusal is known by its code; its message is for the bridge's log.
+            let same = match (&verdict, &want) {
+                (Verdict::Refuse(got, _), Verdict::Refuse(code, _)) => got == code,
+                (got, want) => got == want,
+            };
+            assert!(same, "case {i}: {verdict:?}, not {want:?}");
+        }
     }
 
     /// A session over an in-memory pair of links, as after a handshake: the host's side, and
@@ -1467,6 +1714,107 @@ mod tests {
         (session, sandbox, sandbox_in)
     }
 
+    /// An end in this process: each connection is one side of an in-memory pipe whose other
+    /// side echoes what it reads.
+    struct Echo;
+
+    impl TunnelEnd for Echo {
+        fn connect(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = std::io::Result<crate::tunnel::TunnelConnection>>
+                    + Send,
+            >,
+        > {
+            Box::pin(async {
+                let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = theirs.read(&mut buf).await {
+                        if n == 0 || theirs.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let (reader, writer) = tokio::io::split(ours);
+                Ok((
+                    Box::new(reader) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(writer) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                ))
+            })
+        }
+
+        fn describe(&self) -> String {
+            "an echo in this process".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_reaches_an_end_in_this_process_and_no_address() {
+        let (mut session, sandbox, mut sandbox_in) = session().await;
+        let listen: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let asked = tokio::spawn(async move {
+            let ends: Vec<(SocketAddr, Arc<dyn TunnelEnd>)> = vec![(listen, Arc::new(Echo))];
+            let bound = session
+                .core
+                .open_tunnels(&ends, Duration::from_secs(5))
+                .await;
+            (session, bound)
+        });
+        let id = loop {
+            match tokio::time::timeout(Duration::from_secs(5), sandbox_in.recv()).await {
+                Ok(Some(Inbound::Control(Control::Tunnels { id, tunnels }))) => {
+                    assert_eq!(tunnels.len(), 1);
+                    assert_eq!(tunnels[0].addr, listen.to_string());
+                    break id;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("no tunnels request: {other:?}"),
+            }
+        };
+        sandbox
+            .send_control(&Control::Listening {
+                id,
+                tunnels: vec![Tunnel {
+                    id: 1,
+                    addr: listen.to_string(),
+                }],
+            })
+            .await
+            .unwrap();
+        let (_session, bound) = asked.await.unwrap();
+        assert_eq!(bound.unwrap(), [listen]);
+        let stream = crate::frame::STREAM_DYNAMIC;
+        sandbox
+            .send_control(&Control::Open { stream, tunnel: 1 })
+            .await
+            .unwrap();
+        sandbox
+            .send(Kind::Data, stream, b"hello".to_vec())
+            .await
+            .unwrap();
+        // A second stream on a tunnel that was not asked for is refused.
+        sandbox
+            .send_control(&Control::Open {
+                stream: stream + 1,
+                tunnel: 2,
+            })
+            .await
+            .unwrap();
+        let (mut echoed, mut refused) = (Vec::new(), false);
+        while echoed != b"hello" || !refused {
+            match tokio::time::timeout(Duration::from_secs(5), sandbox_in.recv()).await {
+                Ok(Some(Inbound::Data { stream: s, bytes })) if s == stream => echoed.extend(bytes),
+                Ok(Some(Inbound::Control(Control::Reset { stream: s }))) if s == stream + 1 => {
+                    refused = true
+                }
+                Ok(Some(_)) => {}
+                other => panic!("no echo: {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_host_that_does_not_read_the_output_holds_the_sandbox_back_and_nothing_else() {
         let (mut session, sandbox, mut sandbox_in) = session().await;
@@ -1493,7 +1841,7 @@ mod tests {
         }
         // A request of the host's, sent while the output is held; its answer waits behind
         // the output, as everything of the link does, and is not lost.
-        let state = session.state.clone();
+        let state = session.core.state.clone();
         let waiter = tokio::spawn(async move {
             state
                 .request(|id| Control::Close { id }, Duration::from_secs(20))
