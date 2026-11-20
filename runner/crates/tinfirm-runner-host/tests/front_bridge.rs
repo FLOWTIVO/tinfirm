@@ -357,6 +357,86 @@ async fn a_new_front_takes_the_session_of_one_that_ended_back_with_its_key() {
     drop(front);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bytes_written_right_before_runs_end_of_stdin_all_reach_the_agent_then_the_end() {
+    let _one = SERIAL.lock().await;
+    let (_front, mut session, bridge, _identity, _addr) = connected("run-front-stdin-1").await;
+    // `wc` counts until its stdin ends: its count is every byte, and it comes only after the
+    // end.
+    let mut io = session
+        .start(shell("echo ready; wc -c; echo ended >&2"))
+        .await
+        .unwrap();
+    read_until(&mut io, "ready").await;
+    let bytes = vec![b'x'; 1 << 20];
+    io.stdin.write_all(&bytes).await.unwrap();
+    io.stdin.write_all(b"last").await.unwrap();
+    io.stdin.shutdown().await.unwrap();
+    let (out, err) = drain(&mut io).await;
+    assert_eq!(out.trim(), ((1 << 20) + 4).to_string());
+    assert_eq!(err, "ended\n");
+    assert_eq!(finish(&session, bridge).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stdin_that_ends_without_runs_word_never_ends_the_agents_input() {
+    let _one = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("stdin-ended");
+    let (front, mut session, bridge, identity, addr) = connected("run-front-stdin-2").await;
+    let mut io = session
+        .start(shell(&format!(
+            "echo up; cat; touch '{}'; sleep 30",
+            marker.display()
+        )))
+        .await
+        .unwrap();
+    read_until(&mut io, "up").await;
+    io.stdin.write_all(b"through\n").await.unwrap();
+    read_until(&mut io, "through").await;
+    // `run`'s end of the stdin socket closes as a killed `run`'s does, with no word, and the
+    // front is held back: its control channel stays open, well past the moment it would have
+    // ended. The agent's stdin stays open all that time.
+    let FrontIo {
+        stdin,
+        output,
+        exit,
+    } = io;
+    drop(stdin);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!marker.exists(), "the agent's stdin ended");
+    assert!(
+        exit.borrow().is_none(),
+        "the agent ended: {:?}",
+        *exit.borrow()
+    );
+    assert!(front.handle().ended().is_none());
+    // Then the front ends, as with `run`'s end: the agent goes on, and a new front takes the
+    // session back and finds it running, its stdin never ended.
+    let key = session.session_key().clone();
+    let ended = front.handle().end_watch();
+    drop((output, exit, session, front));
+    assert!(!matches!(ended.wait().await, Ended::Broken(_)));
+    let (front, registration, _) = bridged_front(
+        "run-front-stdin-2",
+        Expected::Reclaim(key),
+        &identity,
+        addr.port(),
+    )
+    .await;
+    registration
+        .allow_peer(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .await
+        .unwrap();
+    let mut session = registration.connected(WAIT).await.unwrap();
+    assert!(!marker.exists(), "the agent's stdin ended");
+    assert!(session.reclaim(WAIT).await.unwrap(), "the agent still ran");
+    assert!(!marker.exists(), "the agent's stdin ended");
+    let code = finish(&session, bridge).await;
+    assert_ne!(code, sandbox::EXIT_HOST_GONE);
+    drop(front);
+}
+
 /// A connection that says `hello` as `hello` asks, through TLS with `pin`, and the first
 /// frame the front answers with.
 async fn hello_to(addr: SocketAddr, identity: &Identity, hello: Control) -> Option<Control> {
@@ -1658,4 +1738,83 @@ fn control(seq: &mut u64, control: &Control) -> Vec<u8> {
         frame::STREAM_CONTROL,
         serde_json::to_vec(control).unwrap(),
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_sandboxs_front_takes_only_its_own_bridge() {
+    let _one = SERIAL.lock().await;
+    let (identity_a, identity_b) = (Identity::generate().unwrap(), Identity::generate().unwrap());
+    let (ticket_a, ticket_b) = ("a".repeat(64), "b".repeat(64));
+    let (front_a, registration_a, addr_a) = bridged_front(
+        "run-a",
+        Expected::Ticket(Hidden::new(ticket_a.clone())),
+        &identity_a,
+        0,
+    )
+    .await;
+    let (front_b, registration_b, addr_b) = bridged_front(
+        "run-b",
+        Expected::Ticket(Hidden::new(ticket_b.clone())),
+        &identity_b,
+        0,
+    )
+    .await;
+    for registration in [&registration_a, &registration_b] {
+        registration
+            .allow_peer(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
+    }
+    // Sandbox A's bridge, at B's port: B's certificate is not the one it pins.
+    let answer = hello_to(
+        addr_b,
+        &identity_a,
+        hello("run-a", Some(&ticket_a), None, Some(0)),
+    )
+    .await;
+    assert!(answer.is_none(), "{answer:?}");
+    // With B's pin, A's run and ticket, or B's run with A's ticket, are no session of B's.
+    for (run_id, ticket) in [("run-a", &ticket_a), ("run-b", &ticket_a)] {
+        let answer = hello_to(
+            addr_b,
+            &identity_b,
+            hello(run_id, Some(ticket), None, Some(0)),
+        )
+        .await;
+        assert_eq!(refused(answer), Some(RefuseCode::BadTicket), "{run_id}");
+    }
+    // Each sandbox's own bridge gets its own session.
+    let bridge_a = spawn_bridge(addr_a, "run-a", &ticket_a, &identity_a);
+    let bridge_b = spawn_bridge(addr_b, "run-b", &ticket_b, &identity_b);
+    let session_a = registration_a.connected(WAIT).await.unwrap();
+    let session_b = registration_b.connected(WAIT).await.unwrap();
+    assert_ne!(session_a.session_key(), session_b.session_key());
+    assert_eq!(finish(&session_a, bridge_a).await, 0);
+    assert_eq!(finish(&session_b, bridge_b).await, 0);
+    drop((front_a, front_b));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_port_that_a_program_of_the_sandbox_holds_is_named_with_its_service() {
+    use tinfirm_runner_host::front::wire::Service;
+    let _one = SERIAL.lock().await;
+    let (front, mut session, bridge, _, _) = connected("run-front-taken").await;
+    front
+        .listen_egress(None, "Basic c2VjcmV0".into(), Arc::new(Refusing))
+        .await
+        .unwrap();
+    // A program of the sandbox's listens there first.
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = taken.local_addr().unwrap();
+    let error = session
+        .open_tunnels(&[(port, Service::Egress)], WAIT)
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(&format!("the egress proxy on {port}")),
+        "{error}"
+    );
+    assert!(front.handle().ended().is_none());
+    assert_eq!(finish(&session, bridge).await, 0);
 }

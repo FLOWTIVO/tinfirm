@@ -2,9 +2,14 @@
 //!
 //! While a run's sandbox lives on the sandbox bridge, the host keeps a record of it in its data
 //! directory (`runs/<runId>.json`, 0600): the assignment, the sandbox, the bridge session's key,
-//! the repositories as they were cloned, and the agent's session once it is open. The bridge
-//! listener's identity and port are kept beside them (`runs/bridge.json`), since every bridge
-//! pins the one and dials the other. A record goes once the sandbox has stopped.
+//! the repositories as they were cloned, and the agent's session once it is open. Where the
+//! sandbox's front holds its bridge (ADR-0112, path C, part 2), the record keeps that bridge's
+//! own TLS identity, its listener's address and port, and the address it connects from
+//! ([`RunRecord::bridge`]): the bridge pins the one and dials the other, and a host that
+//! restarts gives the run a new front with them. A record without them is of a host before
+//! that: its bridge pins the shared listener's identity, kept beside the records with its port
+//! (`runs/bridge.json`), which serves such runs for one release. A record goes once the
+//! sandbox has stopped.
 //!
 //! A host that starts and finds records takes each run back before it says hello: the run is
 //! listed in `hello.activeRuns`, so the server keeps it; its bridge comes back with the session
@@ -85,6 +90,50 @@ pub struct RunRecord {
     /// without it reads as before, and its run's earlier tokens are not known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redaction: Option<crate::secret_hashes::SecretHashes>,
+    /// The sandbox's bridge in its front: its own identity and listener. `None` in a record of
+    /// a host whose sandboxes' bridges used its shared listener (`runs/bridge.json`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<BridgeRecord>,
+}
+
+/// A sandbox's bridge that its front holds, as a record keeps it: the certificate and its
+/// PKCS #8 key (base64 of DER), which the record's mode protects as it does the run's tokens;
+/// the listener's address and port; and the address the bridge connects from (`0.0.0.0`: any).
+/// The key is [`Hidden`], as the session key is: a `Debug` of a record never shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeRecord {
+    pub cert: String,
+    pub key: Hidden,
+    pub ip: std::net::IpAddr,
+    pub port: u16,
+    pub peer: std::net::IpAddr,
+}
+
+impl BridgeRecord {
+    pub fn of(keep: &crate::sandbox::BridgeKeep) -> BridgeRecord {
+        BridgeRecord {
+            cert: B64.encode(&keep.cert),
+            key: Hidden::new(B64.encode(&keep.key)),
+            ip: keep.ip,
+            port: keep.port,
+            peer: keep.peer,
+        }
+    }
+
+    pub fn keep(&self) -> Result<crate::sandbox::BridgeKeep> {
+        Ok(crate::sandbox::BridgeKeep {
+            cert: B64
+                .decode(&self.cert)
+                .context("the record's bridge certificate")?,
+            key: B64
+                .decode(self.key.expose())
+                .context("the record's bridge key")?,
+            ip: self.ip,
+            port: self.port,
+            peer: self.peer,
+        })
+    }
 }
 
 impl RunRecord {
@@ -518,6 +567,7 @@ mod tests {
             revoked: Vec::new(),
             collected: false,
             redaction: None,
+            bridge: None,
         }
     }
 
@@ -697,6 +747,33 @@ mod tests {
             .find(|r| r.run_id() == second.run_id())
             .unwrap();
         assert_eq!(kept.redaction.as_ref(), Some(&hashes));
+    }
+
+    #[test]
+    fn a_records_debug_never_shows_its_bridges_key_and_its_file_keeps_it() {
+        let key: Vec<u8> = (0u8..=255).cycle().skip(7).take(120).collect();
+        let keep = crate::sandbox::BridgeKeep {
+            cert: b"certificate".to_vec(),
+            key: key.clone(),
+            ip: "10.1.2.3".parse().unwrap(),
+            port: 41234,
+            peer: "10.1.2.4".parse().unwrap(),
+        };
+        let mut with = record();
+        with.bridge = Some(BridgeRecord::of(&keep));
+        let encoded = B64.encode(&key);
+        let shown = format!("{with:?} {:?} {keep:?}", with.bridge);
+        assert!(shown.contains("41234"), "{shown}");
+        // No run of the key's text shows, however it is cut.
+        for part in encoded.as_bytes().chunks(8) {
+            let part = std::str::from_utf8(part).unwrap();
+            assert!(!shown.contains(part), "{part} in {shown}");
+        }
+        // The file holds the key as before, as the base64 of its DER, and gives it back.
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains(&format!("\"key\":\"{encoded}\"")), "{text}");
+        let read: RunRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(read.bridge.unwrap().keep().unwrap().key, key);
     }
 
     #[test]

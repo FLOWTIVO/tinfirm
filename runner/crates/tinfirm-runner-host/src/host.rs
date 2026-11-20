@@ -590,6 +590,33 @@ impl Shared {
         if let Some(proxy) = slot.as_ref() {
             return Ok(Some(proxy.clone()));
         }
+        let Some(endpoint) = self.proxies_endpoint().await? else {
+            return Ok(None);
+        };
+        let proxy = GitProxy::start(endpoint, self.opts.allow_insecure_repo_urls).await?;
+        tracing::info!(
+            addr = %proxy.local_addr(),
+            sandbox_host = %proxy.endpoint().sandbox_host,
+            "git proxy listening"
+        );
+        *slot = Some(proxy.clone());
+        Ok(Some(proxy))
+    }
+
+    /// The git proxy's shared listener, if it was started; never starts it.
+    pub async fn started_git_proxy(&self) -> Option<GitProxy> {
+        self.git_proxy.lock().await.clone()
+    }
+
+    /// The sandbox bridge's shared listener, if it was started; never starts it.
+    pub async fn started_bridge(&self) -> Option<BridgeListener> {
+        self.bridge.lock().await.clone()
+    }
+
+    /// Where the proxies' listeners bind and how a sandbox names them, without binding any:
+    /// with the bridge, this machine's loopback, which a sandbox reaches only through its
+    /// tunnels. `Ok(None)` when the sandboxes have no network.
+    pub async fn proxies_endpoint(&self) -> Result<Option<git_proxy::Endpoint>> {
         let Some(endpoint) = git_proxy::endpoint(
             &self.opts.executor,
             self.opts.sandbox_network.as_deref(),
@@ -600,19 +627,50 @@ impl Shared {
             return Ok(None);
         };
         // With the bridge, the sandboxes reach the listeners only through their tunnels.
-        let endpoint = if self.opts.bridge.is_some() {
+        Ok(Some(if self.opts.bridge.is_some() {
             crate::bridge::listeners_endpoint(self.sandbox_shares_host_network())
         } else {
             endpoint
-        };
-        let proxy = GitProxy::start(endpoint, self.opts.allow_insecure_repo_urls).await?;
-        tracing::info!(
-            addr = %proxy.local_addr(),
-            sandbox_host = %proxy.endpoint().sandbox_host,
-            "git proxy listening"
-        );
-        *slot = Some(proxy.clone());
-        Ok(Some(proxy))
+        }))
+    }
+
+    /// Where a sandbox's bridge listener binds, and how the sandbox names it: the sandbox
+    /// network's gateway (or what `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` say). `Ok(None)`
+    /// when the sandboxes have no network.
+    pub async fn bridge_endpoint(&self) -> Result<Option<git_proxy::Endpoint>> {
+        git_proxy::endpoint(
+            &self.opts.executor,
+            self.opts.sandbox_network.as_deref(),
+            &self.opts.git_proxy,
+        )
+        .await
+    }
+
+    /// The address a sandbox's bridge connects from, as this host sees it, where it can tell
+    /// one sandbox from another: the local executor's processes connect from loopback, and a
+    /// Docker container on the sandbox network from its own address on it (`network`), when
+    /// the bridge listens on that network's gateway. `None` where every sandbox comes from one
+    /// address (Docker Desktop, the host's network, a listener address of the operator's own):
+    /// there the front takes a connection from any address, and `run` decides by the run's
+    /// ticket alone.
+    pub fn bridge_peer(&self, endpoint: &git_proxy::Endpoint) -> crate::sandbox::BridgePeer {
+        use crate::sandbox::BridgePeer;
+        match &self.opts.executor {
+            Executor::Local { .. } => BridgePeer::Loopback,
+            Executor::Docker(_)
+                if !endpoint.bind.ip().is_loopback()
+                    && self.opts.git_proxy.bind.is_none()
+                    && self.opts.sandbox_network.as_deref() != Some("host") =>
+            {
+                BridgePeer::Container(
+                    self.opts
+                        .sandbox_network
+                        .clone()
+                        .unwrap_or_else(|| "bridge".to_string()),
+                )
+            }
+            _ => BridgePeer::Any,
+        }
     }
 
     /// Whether a sandbox shares this machine's network namespace: the local test executor (and
@@ -752,6 +810,25 @@ impl Shared {
                 }
             }
         }
+        // A run whose sandbox's front held its bridge comes back through a new front, with the
+        // identity, the port and the peer that its record keeps.
+        let (fronted, held): (Vec<_>, Vec<_>) = held
+            .into_iter()
+            .partition(|(record, _)| record.bridge.is_some());
+        for (record, sandbox) in fronted {
+            let run_id = record.run_id();
+            match self.register_front_again(&record).await {
+                Ok(registration) => {
+                    tracing::info!(%run_id, epoch = record.assign.epoch, "taking back a run of the process before this one, through a new front");
+                    self.spawn_taken_back(record, Some((sandbox, registration)));
+                }
+                Err(e) => {
+                    tracing::warn!(%run_id, error = %format!("{e:#}"), "a run of the process before this one cannot be taken back");
+                    self.records.remove(run_id);
+                    sandbox.discard(Duration::from_secs(5)).await;
+                }
+            }
+        }
         if held.is_empty() {
             return;
         }
@@ -796,6 +873,32 @@ impl Shared {
                 Some((sandbox, crate::sandbox::Registered::Shared(registration))),
             );
         }
+    }
+
+    /// A new front for the bridge of a run taken back whose record keeps its identity and
+    /// listener: on the kept port, or, when it is taken now, on another, which the bridge does
+    /// not find (as with the shared listener's port).
+    async fn register_front_again(
+        &self,
+        record: &crate::takeback::RunRecord,
+    ) -> Result<crate::sandbox::Registered> {
+        let options = self
+            .opts
+            .bridge
+            .as_ref()
+            .context("this host runs no agent over the sandbox bridge now")?;
+        let keep = record
+            .bridge
+            .as_ref()
+            .context("the record keeps no bridge of a front")?
+            .keep()?;
+        keep.register_again(
+            options,
+            &record.bridge_id,
+            record.session_key.clone(),
+            Duration::from_secs(2),
+        )
+        .await
     }
 
     /// Registers a run taken back as a run of this host's, listed in `hello.activeRuns`, and
@@ -882,10 +985,10 @@ impl Shared {
         if let Some(proxy) = slot.as_ref() {
             return Ok(Some(proxy.clone()));
         }
-        let Some(git_proxy) = self.git_proxy().await? else {
+        let Some(endpoint) = self.proxies_endpoint().await? else {
             return Ok(None);
         };
-        let proxy = Arc::new(EgressProxy::new(settings.clone(), git_proxy.endpoint()));
+        let proxy = Arc::new(EgressProxy::new(settings.clone(), &endpoint));
         *slot = Some(proxy.clone());
         Ok(Some(proxy))
     }
@@ -893,7 +996,11 @@ impl Shared {
     /// Whether a run's sandbox reaches its proxies through tunnels that end in its front, with no
     /// listener of this host's for them: on a host whose sandboxes' bridges are their fronts'.
     pub fn sandboxes_tunnel_to_their_front(&self) -> bool {
-        false
+        self.opts
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| !bridge.shared_listener_for_new_runs)
+            && !matches!(self.opts.executor, Executor::Vm(_))
     }
 
     /// A new sandbox's front process, which serves the HTTP of that sandbox's proxy listeners
@@ -919,14 +1026,13 @@ impl Shared {
         if let Some(proxy) = slot.as_ref() {
             return Ok(proxy.clone());
         }
-        let Some(git_proxy) = self.git_proxy().await? else {
+        let Some(endpoint) = self.proxies_endpoint().await? else {
             anyhow::bail!("the sandboxes have no network, so they cannot reach the model proxy");
         };
         let host_token = HostToken::new(&self.config.server_url, self.config.token.expose())
             .context("the model proxy cannot send this host's token to its server")?;
         let proxy = Arc::new(
-            ModelProxy::new(self.opts.model_proxy.clone(), git_proxy.endpoint())
-                .with_host_token(host_token),
+            ModelProxy::new(self.opts.model_proxy.clone(), &endpoint).with_host_token(host_token),
         );
         *slot = Some(proxy.clone());
         Ok(proxy)

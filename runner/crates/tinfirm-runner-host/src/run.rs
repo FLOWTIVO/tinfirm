@@ -817,7 +817,7 @@ pub async fn execute(
                     sandbox_reader.set(files, reader_of(shared));
                 }
                 // While the sandbox lives, a host that restarts takes the run back (ADR-0101).
-                if let Some((kind, bridge_id, session_key)) = sandbox.take_back_record() {
+                if let Some((kind, bridge_id, session_key, keep)) = sandbox.take_back_record() {
                     let repos = repos
                         .iter()
                         .map(|repo| {
@@ -849,6 +849,7 @@ pub async fn execute(
                             collected: false,
                             // The holder sets it ([`RunGitTokens::make_record`]).
                             redaction: None,
+                            bridge: keep.as_ref().map(crate::takeback::BridgeRecord::of),
                         });
                     match made {
                         Ok(record) => sink.keep_record(record),
@@ -890,6 +891,49 @@ pub async fn execute(
                     deadline,
                 )
                 .await;
+                // A sandbox's front that ended during the run (it crashed, or broke its wire)
+                // took the bridge's session with it: one new front takes the session back, as a
+                // host that restarted does, the agent stops and its work comes back. A second
+                // front that ends too is not replaced.
+                let front_ended = sandbox.front_ended_after(Duration::from_secs(2)).await;
+                if front_ended {
+                    let bridge = shared
+                        .opts
+                        .bridge
+                        .as_ref()
+                        .expect("a front holds the bridge");
+                    match sandbox
+                        .take_back_from_a_new_front(bridge, TAKE_BACK_WAIT)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::warn!(run_id = %assign.run_id, "the sandbox's front ended during the run; a new one took the sandbox back");
+                            if let Err(e) = sandbox.reclaim(RECLAIM_TIMEOUT).await {
+                                sink.log(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "the agent did not stop as asked: {}",
+                                        sink.redact(&format!("{e:#}"))
+                                    ),
+                                );
+                            }
+                            failure.set(
+                                FailureClass::Infra,
+                                "The sandbox's front process ended during the run; a new front took the sandbox back, the agent was stopped, and its work so far was saved.",
+                            );
+                        }
+                        Err(e) => {
+                            let error = sink.redact(&format!("{e:#}"));
+                            tracing::warn!(run_id = %assign.run_id, %error, "the sandbox's front ended during the run, and a new one could not take the sandbox back");
+                            failure.set(
+                                FailureClass::Infra,
+                                format!(
+                                    "The sandbox's front process ended during the run, and a new front could not take the sandbox back ({error}); the work of the run is lost."
+                                ),
+                            );
+                        }
+                    }
+                }
                 sandbox.stop_agent(Duration::from_secs(5)).await;
                 // With the bridge, the agent's work comes back before the sandbox goes.
                 if let Some(files) = sandbox.files()
@@ -907,6 +951,18 @@ pub async fn execute(
                         output_dir.as_deref(),
                     )
                     .await;
+                }
+                if front_ended
+                    && sandbox.front_ended()
+                    && repos
+                        .iter()
+                        .any(|repo| !matches!(repo.collected, Some(Ok(_))))
+                {
+                    // The new front ended too, before the work came back: no third one.
+                    failure.force(
+                        FailureClass::Infra,
+                        "The sandbox's front process ended during the run, and the new front that took the sandbox back ended too; the work of the run is lost.",
+                    );
                 }
                 sandbox.stop(Duration::from_secs(5)).await;
                 tokens.drop_record();
@@ -1231,7 +1287,8 @@ pub async fn take_back(
         match connected {
             Some(Ok(session)) => {
                 came_back = true;
-                let mut sandbox = sandbox.connected(session);
+                let keep = record.bridge.as_ref().and_then(|bridge| bridge.keep().ok());
+                let mut sandbox = sandbox.connected(session, keep);
                 match sandbox.reclaim(RECLAIM_TIMEOUT).await {
                     Ok(true) => sink.log(
                         LogLevel::Info,
@@ -2071,8 +2128,23 @@ async fn sandbox_access(
         sandbox_host,
         ..SandboxAccess::default()
     };
-    let proxy = match shared.git_proxy().await {
-        Ok(Some(proxy)) => proxy,
+    // Where the sandbox's front serves the run's git proxy for its tunnels alone, the host's
+    // shared listener is not started for it.
+    let shared_proxy = if shared.sandboxes_tunnel_to_their_front() {
+        shared
+            .proxies_endpoint()
+            .await
+            .map(|endpoint| endpoint.map(|endpoint| (None, endpoint)))
+    } else {
+        shared.git_proxy().await.map(|proxy| {
+            proxy.map(|proxy| {
+                let endpoint = proxy.endpoint().clone();
+                (Some(proxy), endpoint)
+            })
+        })
+    };
+    let (proxy, endpoint) = match shared_proxy {
+        Ok(Some(found)) => found,
         Ok(None) => {
             sink.log(
                 LogLevel::Warn,
@@ -2092,15 +2164,24 @@ async fn sandbox_access(
             return access;
         }
     };
-    access.extra_hosts = proxy.endpoint().extra_hosts.clone();
+    access.extra_hosts = endpoint.extra_hosts.clone();
     // On a host with the bridge the run gets a listener of its own, which its sandbox's front
     // serves: the front reads the sandbox's requests, and this process attaches the tokens.
-    let proxy = match run_listener(shared, &proxy, front).await {
+    let proxy = match run_listener(shared, &endpoint, front).await {
         Ok(Some((own, guard))) => {
             access.git_listener = Some(guard);
             own
         }
-        Ok(None) => proxy,
+        Ok(None) => match proxy {
+            Some(proxy) => proxy,
+            None => {
+                sink.log(
+                    LogLevel::Warn,
+                    "the Tinfirm platform tools and git fetch are not available in this run: the sandbox has no front",
+                );
+                return access;
+            }
+        },
         Err(e) => {
             let error = sink.redact(&format!("{e:#}"));
             tracing::warn!(run_id = %assign.run_id, %error, "the sandbox's front cannot serve its git proxy");
@@ -2178,7 +2259,7 @@ async fn sandbox_access(
 /// elsewhere, where the shared listener serves the run.
 async fn run_listener(
     shared: &Arc<Shared>,
-    shared_proxy: &GitProxy,
+    endpoint: &crate::git_proxy::Endpoint,
     front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
 ) -> anyhow::Result<Option<(GitProxy, crate::git_proxy::FrontListenerGuard)>> {
     if front.is_none() {
@@ -2188,7 +2269,7 @@ async fn run_listener(
         return Ok(None);
     };
     let (proxy, guard) = GitProxy::start_in_front(
-        shared_proxy.endpoint().clone(),
+        endpoint.clone(),
         shared.opts.allow_insecure_repo_urls,
         crate::git_proxy::ListenerLimits::default(),
         front,
@@ -2296,6 +2377,9 @@ async fn start_sandbox(
     let Some(options) = shared.opts.bridge.clone() else {
         return shared.opts.executor.start(spec).await;
     };
+    if claimed.is_none() && shared.sandboxes_tunnel_to_their_front() {
+        return start_in_front(shared, sink, assign, spec, access, puts, options).await;
+    }
     // The listeners the run uses, on this host's loopback: the sandbox reaches each through a
     // tunnel on its own loopback, at the same port.
     let mut listeners = Vec::new();
@@ -2365,6 +2449,116 @@ async fn start_sandbox(
         connect_timeout: options.connect_timeout,
         tunnels: crate::sandbox::Tunnels::Targets(tunnels),
         puts,
+        peer: crate::sandbox::BridgePeer::Any,
+        keep: None,
+    };
+    shared.opts.executor.start_bridged(spec, bridged).await
+}
+
+/// Starts the run's sandbox with its bridge in the sandbox's front (ADR-0112, path C, part 2):
+/// the bridge gets a TLS identity and a listener of its own, which only its front holds; the
+/// front takes a connection only from the sandbox's address where this host can tell it, and
+/// `run` decides the bridge's `hello` with the ticket it keeps. The sandbox reaches its git
+/// proxy, model proxy and egress proxy only through tunnels to its front, on fixed ports of its
+/// own loopback: this host binds no listener for them.
+async fn start_in_front(
+    shared: &Arc<Shared>,
+    sink: &mut EventSink,
+    assign: &RunAssign,
+    spec: &mut SandboxSpec,
+    access: &SandboxAccess,
+    puts: Vec<crate::sandbox::Put>,
+    options: crate::bridge::BridgeOptions,
+) -> anyhow::Result<(crate::sandbox::Sandbox, SandboxIo)> {
+    use anyhow::Context as _;
+    let endpoint = shared.bridge_endpoint().await?.context(
+        "the sandbox has no network, so its bridge cannot reach this host (--sandbox-bridge)",
+    )?;
+    let front = match &access.front {
+        Some(front) => front.clone(),
+        None => shared
+            .sandbox_front()
+            .await?
+            .context("the sandbox has no front")?,
+    };
+    let loopback = match access.sandbox_host.as_deref().map(str::parse) {
+        Some(Ok(ip)) => ip,
+        _ => std::net::IpAddr::V4(crate::bridge::SANDBOX_LOOPBACK),
+    };
+    let mut services = Vec::new();
+    if access.git_listener.is_some() && (access.mcp.is_some() || !access.routes.is_empty()) {
+        services.push(Service::Git);
+    }
+    if access.model_proxy.is_some() {
+        services.push(Service::Model);
+    }
+    if access.egress.is_some() {
+        services.push(Service::Egress);
+    }
+    let tunnels = services
+        .into_iter()
+        .map(|service| {
+            (
+                std::net::SocketAddr::new(loopback, crate::bridge::tunnel_port(service)),
+                service,
+            )
+        })
+        .collect();
+    if spec.extra_hosts.is_empty() {
+        spec.extra_hosts = endpoint.extra_hosts.clone();
+    }
+    let identity = tinfirm_bridge::tls::Identity::generate()?;
+    let listener =
+        crate::bridge::bind_sandbox_listener(endpoint.bind.ip(), None, options.ports).await?;
+    let port = listener.local_addr()?.port();
+    // A run assigned again with a newer epoch gets a new sandbox and a new bridge.
+    let bridge_id = format!("{}.{}", assign.run_id, assign.epoch);
+    let expected = crate::front::session::Expected::new_ticket()?;
+    let crate::front::session::Expected::Ticket(ticket) = &expected else {
+        unreachable!("a new ticket");
+    };
+    let ticket = ticket.expose().to_string();
+    // The ticket is in the sandbox's settings; it is no credential, but it never leaves the host.
+    shared.add_run_masked(assign.run_id, assign.epoch, vec![ticket.clone()]);
+    let registration = front
+        .bridge(
+            &identity,
+            &options.timing,
+            crate::front::session::Peer::Listen(listener),
+            &bridge_id,
+            expected,
+        )
+        .await
+        .context("the sandbox's front cannot take its bridge")?;
+    tracing::info!(run_id = %assign.run_id, ip = %endpoint.bind.ip(), port, "the sandbox's bridge listens in its front");
+    sink.log(
+        LogLevel::Debug,
+        "the agent runs over the sandbox bridge, in the sandbox's front; its credentials are not in the sandbox's settings",
+    );
+    let bootstrap = crate::bridge::bootstrap_env(
+        &bridge_id,
+        &ticket,
+        &identity.pin_hex(),
+        &crate::git_proxy::host_port(&endpoint.sandbox_host, port),
+    );
+    let (cert, key) = identity.to_der();
+    let keep = crate::sandbox::BridgeKeep {
+        cert: cert.to_vec(),
+        key: key.to_vec(),
+        ip: endpoint.bind.ip(),
+        port,
+        // Set once the sandbox's address is known.
+        peer: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    };
+    let bridged = crate::sandbox::Bridged {
+        registration: crate::sandbox::Registered::Front(registration),
+        bootstrap,
+        binary: options.binary,
+        connect_timeout: options.connect_timeout,
+        tunnels: crate::sandbox::Tunnels::Services(tunnels),
+        puts,
+        peer: shared.bridge_peer(&endpoint),
+        keep: Some(keep),
     };
     shared.opts.executor.start_bridged(spec, bridged).await
 }
@@ -2855,6 +3049,18 @@ fn spawn_output_splitter(
     });
 }
 
+/// The agent's phase is over: its stdin ends, on purpose. The bridge passes that end on
+/// only when it is said; a stdin that `run` just dropped (with the bridge in the sandbox's
+/// front) would stay open until the agent was stopped.
+async fn end_input(
+    stdin: &tokio::sync::Mutex<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>,
+) {
+    // The transport is gone: nothing else holds the lock.
+    if let Err(e) = stdin.lock().await.shutdown().await {
+        tracing::debug!(error = %e, "the agent's stdin did not end as asked");
+    }
+}
+
 async fn run_agent(
     shared: &Arc<Shared>,
     assign: &RunAssign,
@@ -2872,10 +3078,16 @@ async fn run_agent(
     let (log_tx, mut log_rx) = mpsc::channel::<String>(crate::sandbox::OUTPUT_QUEUE);
     let activity: Activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
     spawn_output_splitter(io.output, line_tx, budget.clone(), log_tx, activity.clone());
-    let outgoing = futures::sink::unfold(io.stdin, async |mut stdin, line: String| {
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
+    // The agent's stdin stays here as well as in the transport: the phase ends it on purpose
+    // ([`end_input`]), which a drop does not do with the bridge in the sandbox's front.
+    let stdin = Arc::new(tokio::sync::Mutex::new(io.stdin));
+    let outgoing = futures::sink::unfold(stdin.clone(), async |stdin, line: String| {
+        {
+            let mut stdin = stdin.lock().await;
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await?;
+        }
         Ok::<_, std::io::Error>(stdin)
     });
     let transport = AcpTransport {
@@ -2886,8 +3098,7 @@ async fn run_agent(
 
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let acp_future = acp::run_session(transport, params, inbound_tx, control_rx);
-    tokio::pin!(acp_future);
+    let mut acp_future = Box::pin(acp::run_session(transport, params, inbound_tx, control_rx));
 
     let mut mapper = EventMapper::new(
         assign.limits.max_turns,
@@ -3076,6 +3287,8 @@ async fn run_agent(
             }
         }
     };
+    drop(acp_future);
+    end_input(&stdin).await;
 
     // Drain what arrived before the prompt response.
     while let Ok(item) = inbound_rx.try_recv() {

@@ -839,6 +839,13 @@ pub fn serve(status: Status) -> ExitCode {
                     bridge.stop(grace_seconds);
                     continue;
                 }
+                ToFront::StdinEnd {} => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a stdin end for no bridge");
+                    };
+                    bridge.stdin_end();
+                    continue;
+                }
                 ToFront::Reclaim { id, timeout_ms } => {
                     let Some(bridge) = &bridge else {
                         return refuse("a reclaim for no bridge");

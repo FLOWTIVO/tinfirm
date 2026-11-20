@@ -327,6 +327,18 @@ struct SandboxArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     sandbox_bridge: bool,
+    /// With --sandbox-bridge, the ports from which each sandbox's bridge listener takes one,
+    /// as FROM-TO (both included), on the sandbox network's gateway: what a host firewall
+    /// between the sandboxes and this host must admit. Without it the system picks each port
+    /// from its range for local ports (net.ipv4.ip_local_port_range). A range with no free
+    /// port fails the run that needs one.
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_SANDBOX_BRIDGE_PORTS",
+        value_name = "FROM-TO",
+        value_parser = tinfirm_runner_host::bridge::parse_port_range
+    )]
+    sandbox_bridge_ports: Option<(u16, u16)>,
     /// Run sandboxes over the bridge although this system cannot confine the reader of what
     /// they send back (Landlock 2 and seccomp: Linux 5.19 or later). Without it, a host with
     /// --sandbox-bridge or --executor vm refuses to start on such a system. With it, the reader
@@ -2295,6 +2307,7 @@ async fn run(
                 max_concurrent_runs,
                 no_image_rebuild,
                 sandbox_args.sandbox_bridge,
+                sandbox_args.sandbox_bridge_ports,
                 &settings,
                 &egress,
                 &mut signals,
@@ -2555,6 +2568,7 @@ async fn docker_executor(
     max_concurrent_runs: u32,
     no_image_rebuild: bool,
     sandbox_bridge: bool,
+    sandbox_bridge_ports: Option<(u16, u16)>,
     settings: &SandboxSettings,
     egress: &Option<EgressSettings>,
     signals: &mut Signals,
@@ -2574,7 +2588,9 @@ async fn docker_executor(
         let arch = info.architecture.unwrap_or_default();
         tinfirm_runner_host::bridge::check_static_linux(&binary, &arch)
             .context("--sandbox-bridge needs a bridge binary that runs in the sandboxes")?;
-        Some(BridgeOptions::new(binary))
+        let mut bridge = BridgeOptions::new(binary);
+        bridge.ports = sandbox_bridge_ports;
+        Some(bridge)
     } else {
         None
     };

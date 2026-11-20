@@ -11,6 +11,7 @@
 //! isolation at all and exists only for the host's own tests; the CLI never selects it.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -428,6 +429,35 @@ pub struct SandboxIo {
     pub output: mpsc::Receiver<SandboxOutput>,
 }
 
+/// The attached stdin of a container without the bridge. Its shutdown only flushes: the end of
+/// the agent's phase leaves the container's stdin open until the container stops, as a drop of
+/// it always did.
+struct AttachedStdin(Pin<Box<dyn AsyncWrite + Send>>);
+
+impl AsyncWrite for AttachedStdin {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.as_mut().poll_flush(cx)
+    }
+}
+
 /// Chunks of a sandbox's output waiting for their reader ([`SandboxIo::output`]).
 pub const OUTPUT_QUEUE: usize = 1024;
 
@@ -455,6 +485,9 @@ enum SandboxKind {
         session: Session,
         exit: watch::Receiver<Option<Exit>>,
         inner: Box<SandboxKind>,
+        /// The bridge's identity, listener and peer, when the sandbox's front holds its bridge:
+        /// what a new front, or a host that restarted, takes the session back with.
+        keep: Option<BridgeKeep>,
     },
     /// The local test executor's bridge process of the process that this host restarted from
     /// (ADR-0101): this one has no handle of it, and the bridge ends it.
@@ -472,6 +505,83 @@ pub struct Bridged {
     pub connect_timeout: Duration,
     pub tunnels: Tunnels,
     pub puts: Vec<Put>,
+    /// The address the sandbox's bridge connects from, for its front's check.
+    pub peer: BridgePeer,
+    /// The bridge's identity and listener, when the sandbox's front holds its bridge.
+    pub keep: Option<BridgeKeep>,
+}
+
+/// Where a sandbox's bridge connects from, as this host sees it ([`crate::host::Shared::bridge_peer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgePeer {
+    /// From this machine's loopback: the local executor's process.
+    Loopback,
+    /// From the container's own address on this Docker network, known once it has started.
+    Container(String),
+    /// From any address: where every sandbox comes from one address.
+    Any,
+}
+
+/// What a host keeps of a sandbox's bridge that its front holds, to take the session back
+/// with a new front: the identity that the bridge pins, the listener's address and port that
+/// it dials, and the address it connects from (unspecified: any).
+#[derive(Clone)]
+pub struct BridgeKeep {
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+    pub ip: std::net::IpAddr,
+    pub port: u16,
+    pub peer: std::net::IpAddr,
+}
+
+impl std::fmt::Debug for BridgeKeep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeKeep")
+            .field("ip", &self.ip)
+            .field("port", &self.port)
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BridgeKeep {
+    pub fn identity(&self) -> Result<tinfirm_bridge::tls::Identity> {
+        tinfirm_bridge::tls::Identity::from_der(self.cert.clone(), self.key.clone())
+    }
+
+    /// A new front for the bridge of `run_id`, on the kept port, waiting for the bridge to
+    /// come back with the session's `key`.
+    pub async fn register_again(
+        &self,
+        options: &crate::bridge::BridgeOptions,
+        run_id: &str,
+        key: Hidden,
+        port_wait: Duration,
+    ) -> Result<Registered> {
+        let front = crate::front::sandbox::SandboxFront::start(&options.front).await?;
+        // The port of a front that just ended is free a moment later.
+        let deadline = tokio::time::Instant::now() + port_wait;
+        let listener = loop {
+            match crate::bridge::bind_sandbox_listener(self.ip, Some(self.port), None).await {
+                Ok(listener) => break listener,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let registration = front
+            .bridge(
+                &self.identity()?,
+                &options.timing,
+                crate::front::session::Peer::Listen(listener),
+                run_id,
+                crate::front::session::Expected::Reclaim(key),
+            )
+            .await?;
+        registration.allow_peer(self.peer).await?;
+        Ok(Registered::Front(registration))
+    }
 }
 
 /// A run's bridge, registered and not yet connected.
@@ -484,6 +594,14 @@ pub enum Registered {
 }
 
 impl Registered {
+    /// The address the sandbox's bridge connects from (unspecified: any), for a front.
+    pub async fn allow_peer(&self, ip: std::net::IpAddr) -> Result<()> {
+        match self {
+            Registered::Shared(_) => Ok(()),
+            Registered::Front(registration) => registration.allow_peer(ip).await,
+        }
+    }
+
     /// Waits for the bridge's first connection.
     pub async fn connected(self, timeout: Duration) -> Result<Session> {
         match self {
@@ -559,6 +677,15 @@ impl Session {
         match self {
             Session::Shared(session) => Files::Shared(session.files()),
             Session::Front(session) => Files::Front(session.files()),
+        }
+    }
+
+    /// Whether the sandbox's front ended by itself (it crashed, or broke the wire), with the
+    /// session in it.
+    pub fn front_ended(&self) -> bool {
+        match self {
+            Session::Shared(_) => false,
+            Session::Front(session) => session.front().handle().ended().is_some(),
         }
     }
 
@@ -755,7 +882,7 @@ impl Executor {
     pub async fn start_bridged(
         &self,
         spec: &SandboxSpec,
-        bridged: Bridged,
+        mut bridged: Bridged,
     ) -> Result<(Sandbox, SandboxIo)> {
         let (settings, run_env) = crate::bridge::split_env(&spec.env);
         let bootstrap = bridged.bootstrap.clone();
@@ -776,10 +903,28 @@ impl Executor {
                     let _ = remove_container(docker, &container.name).await;
                     return Err(e).context("cannot start the container");
                 }
-                let inner = SandboxKind::Docker {
+                let mut inner = SandboxKind::Docker {
                     docker: docker.clone(),
                     name: container.name.clone(),
                 };
+                // The sandbox's front takes its bridge's connection only from the container's
+                // address, now that the container has one.
+                let peer = match &bridged.peer {
+                    BridgePeer::Container(network) => {
+                        match container_address(docker, &container.name, network).await {
+                            Ok(ip) => ip,
+                            Err(e) => return Err(stopped(&mut inner, e).await),
+                        }
+                    }
+                    BridgePeer::Loopback => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    BridgePeer::Any => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                };
+                if let Err(e) = bridged.registration.allow_peer(peer).await {
+                    return Err(stopped(&mut inner, e).await);
+                }
+                if let Some(keep) = &mut bridged.keep {
+                    keep.peer = peer;
+                }
                 let start = Start {
                     argv,
                     env: hide(run_env),
@@ -791,6 +936,13 @@ impl Executor {
                 bail!("a VM sandbox comes from the VM pool: the run claims it first")
             }
             Executor::Local { program, args } => {
+                // The local executor's bridge is a process of this machine: it connects from
+                // loopback.
+                let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+                bridged.registration.allow_peer(peer).await?;
+                if let Some(keep) = &mut bridged.keep {
+                    keep.peer = peer;
+                }
                 let mut cmd = tokio::process::Command::new(&bridged.binary);
                 cmd.arg("bridge")
                     .env_clear()
@@ -818,6 +970,31 @@ impl Executor {
             }
         }
     }
+}
+
+/// The container's address on the Docker network `network`, which its bridge connects from.
+async fn container_address(docker: &Docker, name: &str, network: &str) -> Result<IpAddr> {
+    let inspected = docker
+        .inspect_container(
+            name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .context("cannot inspect the sandbox's container")?;
+    let address = inspected
+        .network_settings
+        .and_then(|settings| settings.networks)
+        .and_then(|mut networks| networks.remove(network))
+        .and_then(|endpoint| endpoint.ip_address)
+        .filter(|ip| !ip.is_empty())
+        .with_context(|| {
+            format!("the sandbox's container has no address on the Docker network `{network}`")
+        })?;
+    address.parse().with_context(|| {
+        format!(
+            "the sandbox's container has the address `{address}` on `{network}`, which is not one"
+        )
+    })
 }
 
 fn hide(env: Vec<(String, String)>) -> Vec<(String, Hidden)> {
@@ -904,6 +1081,7 @@ impl Executor {
             puts,
             start,
             &probe,
+            None,
         )
         .await
     }
@@ -941,7 +1119,16 @@ async fn finish_bridged(
     };
     match connected {
         Ok(session) => {
-            finish_session(inner, session, bridged.tunnels, bridged.puts, start, probe).await
+            finish_session(
+                inner,
+                session,
+                bridged.tunnels,
+                bridged.puts,
+                start,
+                probe,
+                bridged.keep,
+            )
+            .await
         }
         Err(e) => Err(stopped(&mut inner, e).await),
     }
@@ -967,6 +1154,7 @@ async fn finish_session(
     puts: Vec<Put>,
     start: Start,
     probe: &[ProbeCheck],
+    keep: Option<BridgeKeep>,
 ) -> Result<(Sandbox, SandboxIo)> {
     let started = async {
         self::probe(&session.files(), probe).await?;
@@ -1002,6 +1190,7 @@ async fn finish_session(
                 session,
                 exit,
                 inner: Box::new(inner),
+                keep,
             },
         },
         SandboxIo { stdin, output: rx },
@@ -1225,7 +1414,7 @@ async fn start_docker(docker: &Docker, spec: &SandboxSpec) -> Result<(Sandbox, S
             },
         },
         SandboxIo {
-            stdin: attach.input,
+            stdin: Box::pin(AttachedStdin(attach.input)),
             output: rx,
         },
     ))
@@ -1363,14 +1552,16 @@ impl TakenBack {
         Ok(TakenBack { inner })
     }
 
-    /// The sandbox, now that its bridge `session` has come back.
-    pub fn connected(self, session: Session) -> Sandbox {
+    /// The sandbox, now that its bridge `session` has come back; `keep` when its front holds
+    /// the bridge.
+    pub fn connected(self, session: Session, keep: Option<BridgeKeep>) -> Sandbox {
         let exit = session.exit();
         Sandbox {
             kind: SandboxKind::Bridged {
                 session,
                 exit,
                 inner: Box::new(self.inner),
+                keep,
             },
         }
     }
@@ -1383,11 +1574,26 @@ impl TakenBack {
 
 impl Sandbox {
     /// What a host that restarted needs to take the sandbox's run back (ADR-0101): the
-    /// sandbox, its bridge's name with the listener, and its session's key. `None` without
-    /// the bridge, and for a VM whose address is not known.
-    pub fn take_back_record(&self) -> Option<(crate::takeback::SandboxRecord, String, Hidden)> {
+    /// sandbox, its bridge's name with the listener, its session's key, and what its front
+    /// holds of the bridge, when a front holds it. `None` without the bridge, and for a VM
+    /// whose address is not known.
+    #[allow(clippy::type_complexity)]
+    pub fn take_back_record(
+        &self,
+    ) -> Option<(
+        crate::takeback::SandboxRecord,
+        String,
+        Hidden,
+        Option<BridgeKeep>,
+    )> {
         use crate::takeback::SandboxRecord;
-        let SandboxKind::Bridged { session, inner, .. } = &self.kind else {
+        let SandboxKind::Bridged {
+            session,
+            inner,
+            keep,
+            ..
+        } = &self.kind
+        else {
             return None;
         };
         let record = match inner.as_ref() {
@@ -1402,7 +1608,62 @@ impl Sandbox {
             record,
             session.run_id().to_string(),
             session.session_key().clone(),
+            keep.clone(),
         ))
+    }
+
+    /// Whether the sandbox's front ended by itself, with the bridge's session in it.
+    pub fn front_ended(&self) -> bool {
+        matches!(&self.kind, SandboxKind::Bridged { session, .. } if session.front_ended())
+    }
+
+    /// Once the agent's output has ended: whether the sandbox's front ended with it. A front's
+    /// end is known a moment after its sockets end, and the adapter's own end comes with its
+    /// exit, so this waits up to `wait` for the one or the other.
+    pub async fn front_ended_after(&self, wait: Duration) -> bool {
+        let SandboxKind::Bridged { session, exit, .. } = &self.kind else {
+            return false;
+        };
+        let Session::Front(front) = session else {
+            return false;
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            if front.front().handle().ended().is_some() {
+                return true;
+            }
+            if matches!(*exit.borrow(), Some(Exit::Exited { .. })) {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        front.front().handle().ended().is_some()
+    }
+
+    /// After its front ended: one new front takes the bridge's session back, as a host that
+    /// restarted does, within `timeout`.
+    pub async fn take_back_from_a_new_front(
+        &mut self,
+        options: &crate::bridge::BridgeOptions,
+        timeout: Duration,
+    ) -> Result<()> {
+        let SandboxKind::Bridged {
+            session,
+            exit,
+            keep: Some(keep),
+            ..
+        } = &mut self.kind
+        else {
+            bail!("the sandbox's bridge is not in a front");
+        };
+        let (run_id, key) = (session.run_id().to_string(), session.session_key().clone());
+        let registration = keep
+            .register_again(options, &run_id, key, Duration::from_secs(10))
+            .await?;
+        let taken = registration.connected(timeout).await?;
+        *exit = taken.exit();
+        *session = taken;
+        Ok(())
     }
 
     /// For a sandbox taken back: the agent that the earlier process started stops. Whether it

@@ -863,6 +863,7 @@ mod tests {
                         revoked,
                         collected: false,
                         redaction: None,
+                        bridge: None,
                     }
                 })
                 .unwrap();

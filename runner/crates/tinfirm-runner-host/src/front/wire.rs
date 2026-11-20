@@ -172,6 +172,10 @@ pub enum ToFront {
     Stop {
         grace_seconds: u64,
     },
+    /// `run` ended the adapter's stdin on purpose, after shutting its socket's write half: the
+    /// front passes the end on once it has read that socket to its end. A socket that ends
+    /// without it passes nothing on.
+    StdinEnd {},
     /// Stop the agent of an earlier host ([`Reply::Reclaimed`]).
     Reclaim {
         id: u64,

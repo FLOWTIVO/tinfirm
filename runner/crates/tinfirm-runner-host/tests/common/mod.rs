@@ -1387,6 +1387,13 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
         // with --allow-unconfined-reader does. The reader's own tests (reader.rs) take no
         // unconfined reader.
         bridge.reader = bridge.reader.clone().allowing_unconfined(true);
+        // The fronts are this host's own binary, as `run` sets them, whatever runs as the
+        // sandbox's bridge.
+        bridge.front = tinfirm_runner_host::front::handle::FrontCommand {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_tinfirm-runner-host")),
+            args: vec![tinfirm_runner_host::front::SUBCOMMAND.to_string()],
+            env: Vec::new(),
+        };
         opts.bridge = Some(bridge);
     }
     if let Some(timeout) = setup.inactivity_timeout {

@@ -10,7 +10,9 @@
 //! ticket and the session key it holds ([`tinfirm_bridge::host::judge`]): the front only
 //! applies the decision. The adapter's stdin, stdout and stderr are three sockets that `run`
 //! gave; its end, the session's end and the answers to `run`'s requests go on the control
-//! channel.
+//! channel. The adapter's stdin ends only when `run` says so ([`wire::ToFront::StdinEnd`]),
+//! after the last bytes of its socket: a socket that ends without it is `run` that ended, and
+//! the agent goes on until a host takes the session back.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -75,6 +77,8 @@ pub(super) struct FrontBridge {
     handshakes: Arc<Semaphore>,
     ops: mpsc::UnboundedSender<Op>,
     services: Services,
+    /// `run` ended the adapter's stdin on purpose.
+    stdin_end: watch::Sender<bool>,
 }
 
 impl FrontBridge {
@@ -107,6 +111,7 @@ impl FrontBridge {
             handshakes: Arc::new(Semaphore::new(wire::MAX_HELLOS)),
             ops: ops_tx,
             services,
+            stdin_end: watch::Sender::new(false),
         });
         tokio::spawn(run_ops(Arc::downgrade(&bridge), ops_rx));
         if let Some(fd) = listener {
@@ -173,8 +178,10 @@ impl FrontBridge {
                 Ok(Ok(allowed)) => *allowed,
                 _ => None,
             };
-            // Closed before a byte of it is read.
-            if allowed != Some(peer.to_canonical()) {
+            // Closed before a byte of it is read. An unspecified address takes any peer:
+            // where every sandbox comes from one address, `run` decides by the ticket alone.
+            let taken = allowed.is_some_and(|ip| ip.is_unspecified() || ip == peer.to_canonical());
+            if !taken {
                 return;
             }
         }
@@ -302,6 +309,12 @@ impl FrontBridge {
         let _ = self.ops.send(Op::Stop(grace_seconds));
     }
 
+    /// `run` ended the adapter's stdin on purpose: the end reaches the agent once the bytes
+    /// before it have.
+    pub(super) fn stdin_end(&self) {
+        self.stdin_end.send_replace(true);
+    }
+
     /// Starts the adapter, its stdio on `stdio` (stdin, stdout, stderr).
     pub(super) fn start_adapter(self: &Arc<Self>, id: u64, start: Start, stdio: [OwnedFd; 3]) {
         let bridge = self.clone();
@@ -313,7 +326,8 @@ impl FrontBridge {
                     None => Err(NOT_CONNECTED.to_string()),
                 }
             };
-            let reply = match started.and_then(|io| pump_stdio(io, stdio)) {
+            let stdin_end = bridge.stdin_end.subscribe();
+            let reply = match started.and_then(|io| pump_stdio(io, stdio, stdin_end)) {
                 Ok(()) => Reply::Done,
                 Err(message) => failed(&message),
             };
@@ -683,7 +697,11 @@ async fn report_ends(
 /// The adapter's stdio on `run`'s sockets: what comes on stdin goes to the adapter, and its
 /// output goes on stdout and stderr at `run`'s pace, so that a slow reader holds the sandbox
 /// back through the bridge's credit, as in `run`.
-fn pump_stdio(io: HostIo, stdio: [OwnedFd; 3]) -> Result<(), String> {
+fn pump_stdio(
+    io: HostIo,
+    stdio: [OwnedFd; 3],
+    mut stdin_end: watch::Receiver<bool>,
+) -> Result<(), String> {
     let [stdin, stdout, stderr] = stdio.map(|fd| {
         let socket = std::os::unix::net::UnixStream::from(fd);
         socket
@@ -712,8 +730,14 @@ fn pump_stdio(io: HostIo, stdio: [OwnedFd; 3]) -> Result<(), String> {
                 }
             }
         }
-        // The adapter's stdin ends with `run`'s.
-        let _ = to_adapter.shutdown().await;
+        // The socket is read to its end first, so the end never overtakes bytes that were
+        // still in it. Then the end reaches the agent only when `run` said so: a socket that
+        // ended without it is `run` that ended (a crash, `kill -9`), and this front ends with
+        // its control channel while it waits. The agent then goes on until a host takes the
+        // session back, as with the bridge in the main process.
+        if stdin_end.wait_for(|said| *said).await.is_ok() {
+            let _ = to_adapter.shutdown().await;
+        }
     });
     tokio::spawn(async move {
         let mut stdout = Some(stdout);

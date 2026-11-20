@@ -16,14 +16,16 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use tinfirm_bridge::control::{Exec, Hidden, ProbeCheck, Signal, Start};
 use tinfirm_bridge::host::{self, ExecOutput, Exit, Expect, HostTiming, Output, Verdict};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -307,7 +309,8 @@ impl BridgeRegistration {
     }
 
     /// The address the sandbox's bridge connects from: the front closes a connection from any
-    /// other before its TLS handshake.
+    /// other before its TLS handshake. An unspecified address (`0.0.0.0`) takes any peer, where
+    /// every sandbox comes from one address.
     pub async fn allow_peer(&self, ip: IpAddr) -> Result<()> {
         self.front
             .handle()
@@ -346,10 +349,71 @@ impl BridgeRegistration {
     }
 }
 
+/// The adapter's stdin, on a socket of its own. Its shutdown ends that stdin on purpose: the
+/// socket's write half ends, then `run` says so on the control channel
+/// ([`ToFront::StdinEnd`]), and the front passes the end on after the socket's last bytes.
+/// Dropped without a shutdown (a task cancelled, a panic), it says nothing, and neither does a
+/// `run` that ended: the agent's stdin stays open, and the agent goes on until a host takes
+/// the session back.
+pub struct FrontStdin {
+    socket: UnixStream,
+    front: Arc<SandboxFront>,
+    end: StdinEnd,
+}
+
+enum StdinEnd {
+    Open,
+    Saying(Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>),
+    Said,
+}
+
+impl AsyncWrite for FrontStdin {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.socket).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            match &mut self.end {
+                StdinEnd::Open => {
+                    // The socket's end first: the front reads it to that end before it acts on
+                    // the message, so no byte written before is lost.
+                    std::task::ready!(Pin::new(&mut self.socket).poll_shutdown(cx))?;
+                    let front = self.front.clone();
+                    self.end = StdinEnd::Saying(Box::pin(async move {
+                        front
+                            .handle()
+                            .send(&ToFront::StdinEnd {}, None)
+                            .await
+                            .map_err(std::io::Error::other)
+                    }));
+                }
+                StdinEnd::Saying(saying) => {
+                    let said = std::task::ready!(saying.as_mut().poll(cx));
+                    self.end = StdinEnd::Said;
+                    return Poll::Ready(said);
+                }
+                StdinEnd::Said => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
 /// The adapter's stdio once it is started, as [`tinfirm_bridge::host::HostIo`] has it.
 pub struct FrontIo {
-    /// Writes go to the adapter's stdin; dropping it ends that stdin.
-    pub stdin: UnixStream,
+    /// Writes go to the adapter's stdin; its shutdown ends that stdin, and nothing else does.
+    pub stdin: FrontStdin,
     /// Closes when the adapter has exited or is lost. Holds at most [`OUTPUT_QUEUE`] chunks:
     /// a reader that falls behind holds the sandbox back.
     pub output: mpsc::Receiver<Output>,
@@ -441,7 +505,11 @@ impl FrontSession {
         spawn_output(stdout, tx.clone(), Output::Stdout);
         spawn_output(stderr, tx, Output::Stderr);
         Ok(FrontIo {
-            stdin,
+            stdin: FrontStdin {
+                socket: stdin,
+                front: self.front.clone(),
+                end: StdinEnd::Open,
+            },
             output,
             exit: self.exit(),
         })
@@ -500,7 +568,25 @@ impl FrontSession {
                 Ok(addrs)
             }
             Reply::Failed { message } => {
-                Err(anyhow!("{message}")).context("the sandbox cannot listen for its tunnels")
+                // The ports are fixed: a program of the image that listens there first takes
+                // one from the bridge, and the error names each.
+                let named: Vec<String> = tunnels
+                    .iter()
+                    .map(|(addr, service)| {
+                        let name = match service {
+                            Service::Git => "the git proxy and the platform tools",
+                            Service::Model => "the model proxy",
+                            Service::Egress => "the egress proxy",
+                        };
+                        format!("{name} on {addr}")
+                    })
+                    .collect();
+                Err(anyhow!("{message}")).with_context(|| {
+                    format!(
+                        "the sandbox's bridge cannot listen for {}; a program of the image may listen there",
+                        named.join(", ")
+                    )
+                })
             }
             other => Err(self.broken("the tunnels", &other)),
         }

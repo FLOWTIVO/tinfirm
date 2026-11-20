@@ -34,6 +34,13 @@ pub struct BridgeOptions {
     /// The front processes of the sandboxes (ADR-0112, path C, part 2): this host's own
     /// executable's `front`, which `run` sets; by default `binary`'s.
     pub front: crate::front::handle::FrontCommand,
+    /// The ports from which each sandbox's bridge listener takes one (`run
+    /// --sandbox-bridge-ports`), both included; `None`: a port the system picks.
+    pub ports: Option<(u16, u16)>,
+    /// New runs register with this process's one shared listener, as hosts did before each
+    /// sandbox's bridge was its front's: only for the tests of the take-back of such a run.
+    /// `run` never sets it, and no flag or variable does.
+    pub shared_listener_for_new_runs: bool,
 }
 
 impl BridgeOptions {
@@ -48,6 +55,8 @@ impl BridgeOptions {
             binary,
             connect_timeout: Duration::from_secs(180),
             timing: HostTiming::default(),
+            ports: None,
+            shared_listener_for_new_runs: false,
         }
     }
 
@@ -58,6 +67,59 @@ impl BridgeOptions {
             None => std::env::current_exe().context("cannot find this executable"),
         }
     }
+}
+
+/// `FROM-TO` (or one port) of `--sandbox-bridge-ports`.
+pub fn parse_port_range(text: &str) -> Result<(u16, u16)> {
+    let text = text.trim();
+    let (from, to) = text.split_once('-').unwrap_or((text, text));
+    let parse = |p: &str| {
+        p.trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p != 0)
+            .with_context(|| format!("`{p}` is not a port from 1 to 65535"))
+    };
+    let (from, to) = (parse(from)?, parse(to)?);
+    anyhow::ensure!(from <= to, "the range {from}-{to} has no port");
+    Ok((from, to))
+}
+
+/// A sandbox's bridge listener on `ip`: on `port` when it is given (the port its record keeps),
+/// else on a free port of `ports`, or on one the system picks without them.
+pub async fn bind_sandbox_listener(
+    ip: IpAddr,
+    port: Option<u16>,
+    ports: Option<(u16, u16)>,
+) -> Result<tokio::net::TcpListener> {
+    if let Some(port) = port {
+        return tokio::net::TcpListener::bind(SocketAddr::new(ip, port))
+            .await
+            .with_context(|| format!("the sandbox's bridge cannot listen on {ip} port {port}"));
+    }
+    let Some((from, to)) = ports else {
+        return tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+            .await
+            .with_context(|| format!("the sandbox's bridge cannot listen on {ip}"));
+    };
+    // From a place in the range that changes, so that runs do not all try the same ports.
+    let span = u32::from(to - from) + 1;
+    let start = rand_below(span);
+    for i in 0..span {
+        let port = from + u16::try_from((start + i) % span).expect("within the range");
+        if let Ok(listener) = tokio::net::TcpListener::bind(SocketAddr::new(ip, port)).await {
+            return Ok(listener);
+        }
+    }
+    bail!(
+        "no port of {from}-{to} on {ip} is free for the sandbox's bridge (--sandbox-bridge-ports)"
+    )
+}
+
+fn rand_below(n: u32) -> u32 {
+    let mut bytes = [0u8; 4];
+    let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes);
+    u32::from_le_bytes(bytes) % n.max(1)
 }
 
 /// The host's bridge listener, and how a sandbox reaches it (the git proxy's endpoint).
@@ -134,9 +196,14 @@ pub fn tunnels(listeners: &[SocketAddr], loopback: IpAddr) -> Vec<TunnelTarget> 
 /// "sandbox" shares this machine's network, so that runs' tunnels, which take their listeners'
 /// ports, would take each other's on one address (Linux, where all of 127.0.0.0/8 is
 /// loopback).
+///
+/// The tunnels to a sandbox's front take fixed ports ([`tunnel_port`]), so two processes of
+/// this machine (a host and the next one after its restart, or tests' hosts) must not hand out
+/// the same address: each starts at a random place.
 pub fn local_sandbox_loopback() -> Ipv4Addr {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
+    let next = NEXT.get_or_init(|| std::sync::atomic::AtomicU32::new(rand_below(u32::MAX)));
+    let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let low = 1 + n % 250;
     let mid = 1 + (n / 250) % 250;
     let high = 10 + (n / 62_500) % 240;

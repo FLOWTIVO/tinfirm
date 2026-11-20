@@ -8,7 +8,6 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -57,13 +56,13 @@ async fn a_run_over_the_bridge_clones_runs_commits_and_pushes() {
             t.text().contains("the agent runs over the sandbox bridge"),
             "no bridge in the run's log"
         );
-        let listener = host.host.bridge().await.unwrap().expect("a listener");
-        assert_eq!(listener.server.run_count(), 0);
-        // The run's record went with its sandbox; the listener's identity stays for the next
-        // process of the host (ADR-0101).
+        // The sandbox's bridge was its front's: the host's shared listener never started, and
+        // no identity of it is kept.
+        assert!(host.host.started_bridge().await.is_none());
+        // The run's record went with its sandbox.
         let runs = host.paths.data_dir.join("runs");
         assert!(!runs.join(format!("{}.json", spec.run_id)).exists());
-        assert!(runs.join("bridge.json").exists());
+        assert!(!runs.join("bridge.json").exists());
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })
@@ -237,9 +236,8 @@ async fn a_sandbox_whose_bridge_never_connects_fails_the_run_with_infra() {
             "{}",
             t.text()
         );
-        // Its registration is gone with the run.
-        let listener = host.host.bridge().await.unwrap().expect("a listener");
-        assert_eq!(listener.server.run_count(), 0);
+        // Its bridge was its front's, gone with the run; the shared listener never started.
+        assert!(host.host.started_bridge().await.is_none());
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })
@@ -247,9 +245,6 @@ async fn a_sandbox_whose_bridge_never_connects_fails_the_run_with_infra() {
 }
 
 // ----- the host's listeners, through the bridge's tunnels --------------------------------
-
-/// The host's listeners bind 127.0.0.2 with the bridge and the local executor.
-const LISTENERS: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_agent_fetches_through_its_tunnel_to_the_git_proxy() {
@@ -285,10 +280,9 @@ async fn the_model_proxy_answers_through_the_tunnel_and_the_listeners_are_on_loo
         assert!(text.contains(&format!("model-key={DUMMY_KEY}")), "{text}");
         assert!(text.contains("messages=502"), "{text}");
         assert!(text.contains("keys=404"), "{text}");
-        // The listeners are on loopback, not where the sandboxes reach this host.
-        let proxy = host.host.git_proxy().await.unwrap().expect("started");
-        assert_eq!(proxy.local_addr().ip(), LISTENERS);
-        assert_eq!(proxy.endpoint().sandbox_host, "127.0.0.1");
+        // The host binds no listener of the proxies for the run, and the shared git listener
+        // never started: the sandbox reaches them through its tunnels to its front only.
+        assert!(host.host.started_git_proxy().await.is_none());
         // The run is over: its tunnel is gone with its bridge.
         let port = text
             .split("model-port=")
@@ -296,6 +290,12 @@ async fn the_model_proxy_answers_through_the_tunnel_and_the_listeners_are_on_loo
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|port| port.parse::<u16>().ok())
             .expect("a port");
+        assert_eq!(
+            port,
+            tinfirm_runner_host::bridge::tunnel_port(
+                tinfirm_runner_host::front::wire::Service::Model
+            )
+        );
         let tunnel = text
             .split("model-host=")
             .nth(1)
@@ -484,6 +484,9 @@ const RESTART_DIR: &str = "TINFIRM_TEST_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_RESTART_URL";
 /// Set: host A speaks protocol 2.
 const RESTART_V2: &str = "TINFIRM_TEST_RESTART_V2";
+/// Set, in the test and in host A: host A registers its runs' bridges with its shared
+/// listener, and writes their records as hosts did before each sandbox's bridge was its front's.
+const RESTART_LEGACY: &str = "TINFIRM_TEST_RESTART_LEGACY";
 
 /// The setup of both hosts of a restart test.
 fn restart_setup(v2: bool) -> HostSetup {
@@ -507,7 +510,16 @@ fn restart_test_host_a() {
         .unwrap()
         .block_on(async {
             let v2 = std::env::var_os(RESTART_V2).is_some();
-            let _host = start_host_at(std::path::Path::new(&dir), &url, restart_setup(v2)).await;
+            let mut setup = restart_setup(v2);
+            if std::env::var_os(RESTART_LEGACY).is_some() {
+                setup.options = Some(Box::new(|opts| {
+                    opts.bridge
+                        .as_mut()
+                        .expect("a bridged host")
+                        .shared_listener_for_new_runs = true;
+                }));
+            }
+            let _host = start_host_at(std::path::Path::new(&dir), &url, setup).await;
             std::future::pending::<()>().await;
         });
 }
@@ -515,6 +527,17 @@ fn restart_test_host_a() {
 /// A host on the directories under `dir`, in a process of its own ([`restart_test_host_a`]),
 /// which the test kills as a crash would.
 fn host_process(dir: &std::path::Path, url: &str, v2: bool) -> std::process::Child {
+    host_process_with(dir, url, v2, false)
+}
+
+/// [`host_process`]; with `legacy`, a host that registers its runs' bridges with its shared
+/// listener, as hosts did before each sandbox's bridge was its front's.
+fn host_process_with(
+    dir: &std::path::Path,
+    url: &str,
+    v2: bool,
+    legacy: bool,
+) -> std::process::Child {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["restart_test_host_a", "--exact", "--ignored", "--nocapture"])
@@ -523,6 +546,9 @@ fn host_process(dir: &std::path::Path, url: &str, v2: bool) -> std::process::Chi
         .stdout(std::process::Stdio::null());
     if v2 {
         command.env(RESTART_V2, "1");
+    }
+    if legacy {
+        command.env(RESTART_LEGACY, "1");
     }
     command.spawn().unwrap()
 }
@@ -587,6 +613,11 @@ async fn a_host_killed_when(
     }
     let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
     assert!(record.exists(), "no record of the run");
+    // The sandbox's bridge is its front's: its record keeps the bridge's own identity and
+    // port, and the shared listener's file is not written.
+    let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    assert!(kept["bridge"]["port"].as_u64().is_some(), "{kept}");
+    assert!(!dir.path().join("data/runs/bridge.json").exists());
     if let Some(message) = revoke {
         conn.send(git_revoke(
             spec.run_id,
@@ -666,10 +697,10 @@ async fn a_host_that_restarted_takes_its_run_back_and_saves_the_work() {
             "{}",
             t.text()
         );
-        // Nothing is left to take back.
+        // Nothing is left to take back, and the run came back through a new front: the shared
+        // listener never started.
         assert!(!record.exists());
-        let listener = host.host.bridge().await.unwrap().expect("a listener");
-        assert_eq!(listener.server.run_count(), 0);
+        assert!(host.host.started_bridge().await.is_none());
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })
@@ -1522,6 +1553,198 @@ async fn a_run_taken_back_with_a_revocation_and_a_cancel_in_the_hellos_answer_pu
             "{}",
             t.text()
         );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+// ----- the sandbox's bridge in its front: its end, and the records of earlier hosts ----------
+
+/// The fronts of host A (a process of the test's own, [`host_process`]): its children that
+/// run as `front`.
+fn fronts_of(host: u32) -> Vec<u32> {
+    let mut fronts = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().filter_map(|e| e.ok()) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let ppid = stat
+            .rfind(')')
+            .and_then(|at| stat[at + 1..].split_whitespace().nth(1))
+            .and_then(|ppid| ppid.parse::<u32>().ok());
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let front = cmdline
+            .split(|b| *b == 0)
+            .nth(1)
+            .is_some_and(|arg| arg == tinfirm_runner_host::front::SUBCOMMAND.as_bytes());
+        if ppid == Some(host) && front {
+            fronts.push(pid);
+        }
+    }
+    fronts
+}
+
+fn kill_front(pid: u32) {
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot kill the front {pid}");
+}
+
+/// Host A, in a process of its own, runs the `slow` scenario until the agent has written its
+/// work, and its sandbox's front is killed (SIGKILL). Host A, its connection and the run.
+async fn a_front_killed_mid_run(
+    server: &mut FakeServer,
+    repo: &TestRepo,
+) -> (
+    tempfile::TempDir,
+    std::process::Child,
+    Conn,
+    AssignSpec<'static>,
+    u32,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let host_a = host_process(dir.path(), &server.url, false);
+    let mut conn = server.accept().await;
+    conn.handshake(1).await;
+    let spec = AssignSpec::new("slow", Some(&repo.url));
+    conn.send(spec.to_json());
+    conn.wait_running(spec.run_id).await;
+    conn.until_seq(spec.run_id, 3).await;
+    let fronts = fronts_of(host_a.id());
+    assert_eq!(
+        fronts.len(),
+        1,
+        "one front for the run's sandbox: {fronts:?}"
+    );
+    kill_front(fronts[0]);
+    (dir, host_a, conn, spec, fronts[0])
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_front_that_ends_during_a_run_is_replaced_once_and_the_work_is_saved() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (_dir, mut host_a, mut conn, spec, _) =
+            a_front_killed_mid_run(&mut server, &repo).await;
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message.contains("front process ended during the run")
+                && message.contains("its work so far was saved"),
+            "{message}"
+        );
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        // The host goes on: its next run is fine.
+        let next = AssignSpec::new("turn-usage", None);
+        conn.send(next.to_json());
+        let t = conn.until_finished(next.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        host_a.kill().unwrap();
+        host_a.wait().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_front_that_ends_too_is_not_replaced_and_the_run_says_its_work_is_lost() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (_dir, mut host_a, mut conn, spec, first) =
+            a_front_killed_mid_run(&mut server, &repo).await;
+        // The new front, as soon as it is there.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(second) = fronts_of(host_a.id()).into_iter().find(|&pid| pid != first) {
+                kill_front(second);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no new front came");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message.contains("front process ended during the run")
+                && message.contains("the work of the run is lost"),
+            "{message}"
+        );
+        // No third front was started for the run.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(fronts_of(host_a.id()).is_empty());
+        host_a.kill().unwrap();
+        host_a.wait().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        // Host A writes its record as the code before each sandbox's bridge was its front's.
+        let mut host_a = host_process_with(dir.path(), &server.url, false, true);
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("slow", Some(&repo.url));
+        conn.send(spec.to_json());
+        conn.wait_running(spec.run_id).await;
+        conn.until_seq(spec.run_id, 3).await;
+        let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert!(kept.get("bridge").is_none(), "{kept}");
+        assert!(dir.path().join("data/runs/bridge.json").exists());
+        host_a.kill().unwrap();
+        host_a.wait().unwrap();
+
+        // Host B, of this version, takes the run back through its shared listener.
+        let host = start_host_at(dir.path(), &server.url, HostSetup::bridged()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        assert!(
+            finished["failureMessage"]
+                .as_str()
+                .unwrap()
+                .contains("its work so far was pushed"),
+            "{}",
+            t.text()
+        );
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
+        assert!(!record.exists());
+        let listener = host
+            .host
+            .started_bridge()
+            .await
+            .expect("the shared listener");
+        assert_eq!(listener.server.run_count(), 0);
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })
