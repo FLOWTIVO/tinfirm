@@ -1,17 +1,22 @@
-# Loads the node's own firewall before the agent starts. Loading it again replaces its one
-# table and leaves the VMs' tables as they are.
+# Loads the node's own firewall before the network is up and before the agent starts. The
+# file replaces its one table in one transaction and leaves the VMs' tables as they are, so
+# a start, a reload and a restart never leave a moment without the table. A stop leaves the
+# table loaded: taking a node's firewall away is `nft delete table inet tinfirm_node`, by hand.
 [Unit]
 Description=Tinfirm node agent: the node's own firewall
-Before=tinfirm-node-agent-helper.service tinfirm-node-agent-listener.service network-pre.target
+# As a distribution's own nftables unit: no default dependencies, so that it is ordered
+# before the network and not after the whole basic system.
+DefaultDependencies=no
 Wants=network-pre.target
-After=tinfirm-node-agent-modules.service
+Before=network-pre.target shutdown.target tinfirm-node-agent-helper.service tinfirm-node-agent-listener.service
+After=local-fs.target systemd-modules-load.service
+Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/tinfirm/node-agent/firewall.nft
 ExecReload=/usr/sbin/nft -f /etc/tinfirm/node-agent/firewall.nft
-ExecStop=-/usr/sbin/nft delete table inet tinfirm_node
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sysinit.target

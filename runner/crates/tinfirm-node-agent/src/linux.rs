@@ -36,6 +36,17 @@ pub const VM_CONFIG: &str = "/vm.json";
 pub const KERNEL: &str = "/vmlinux";
 pub const ROOT_DISK: &str = "/root.disk";
 pub const USER_DATA_DISK: &str = "/userdata.disk";
+/// Firecracker's own log (`--log-path`), in the jail: its messages, and nothing of the guest's.
+pub const VMM_LOG: &str = "/firecracker.log";
+/// The files and directories a jail's own file system may hold: the jailer's and the helper's
+/// are about twenty.
+pub const JAIL_INODES: u64 = 1024;
+/// The chunk of a VM's snapshot, in 512-byte sectors (4 KiB).
+pub const SNAPSHOT_CHUNK_SECTORS: u64 = 8;
+/// What the kernel keeps in memory for each chunk of a snapshot that was written, in bytes:
+/// measured on a node at about 150 (docs/reviews/2026-11-19-node-agent-execution), and no
+/// cgroup is charged for it.
+pub const SNAPSHOT_CHUNK_MEMORY: u64 = 160;
 /// The interfaces inside a VM's network namespace: each namespace has its own, so the names
 /// are fixed.
 pub const NS_VETH: &str = "veth0";
@@ -62,19 +73,66 @@ pub const USER_DATA_CMDLINE: &str = "tinfirm.user-data=disk:/dev/vdb";
 /// its own VMM (Firecracker exits on `SIGXFSZ`), and fills no disk of the node.
 pub const CONSOLE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The memory, in MiB, that the kernel may come to hold for one VM's snapshot once the guest
+/// has written all of it: [`SNAPSHOT_CHUNK_MEMORY`] for each chunk.
+pub fn snapshot_memory_mib(template: &Template) -> u64 {
+    let chunks = snapshot_bytes(template) / (SNAPSHOT_CHUNK_SECTORS * 512);
+    (chunks * SNAPSHOT_CHUNK_MEMORY).div_ceil(1024 * 1024)
+}
+
+/// The memory of the node, in MiB, that one VM of `template` may take: the guest's, the VMM's
+/// own, its jail's file system (memory, since it is a tmpfs) and its snapshot's bookkeeping.
+pub fn vm_memory_mib(template: &Template, firecracker: &Firecracker) -> u64 {
+    u64::from(template.memory_mib)
+        + VMM_OVERHEAD_MIB
+        + u64::from(firecracker.jail_mib)
+        + snapshot_memory_mib(template)
+}
+
+/// The options of a jail's own file system: a tmpfs of `jailMib` with [`JAIL_INODES`] inodes.
+pub fn jail_mount_options(firecracker: &Firecracker) -> String {
+    format!(
+        "size={}m,nr_inodes={JAIL_INODES},mode=0700,uid=0,gid=0",
+        firecracker.jail_mib
+    )
+}
+
+/// The value of the VM's `io.max` for its root disk (`major:minor`), from the template's
+/// `ioMax`; `None` when the template sets no limit. The helper writes it into the VM's cgroup
+/// itself, once the jailer has made the cgroup: the jailer takes no cgroup value with a `=`
+/// in it.
+pub fn io_max(template: &Template, disk: (u32, u32)) -> Option<String> {
+    let io = template.io_max.as_ref()?;
+    let mut words = vec![format!("{}:{}", disk.0, disk.1)];
+    for (key, value) in [
+        ("rbps", io.read_bytes_per_second),
+        ("wbps", io.write_bytes_per_second),
+        ("riops", io.reads_per_second),
+        ("wiops", io.writes_per_second),
+    ] {
+        if let Some(value) = value {
+            words.push(format!("{key}={value}"));
+        }
+    }
+    (words.len() > 1).then(|| words.join(" "))
+}
+
 /// The jailer's argument vector: the VMM as the slot's own user and group, in a chroot of its
 /// own, in the VM's network namespace and a new PID namespace, under a cgroup with the
 /// template's limits. The jailer makes no limit on its own; these are all it gets.
 ///
-/// Not `--daemonize`: the helper starts the jailer with its standard output on the VM's
-/// console file and in a process group of its own, and the jailer's first process ends once
-/// the VMM runs in its new PID namespace, which tells the helper how the jailer fared.
+/// Not `--daemonize`: the helper starts the jailer in a process group of its own, and the
+/// jailer's first process ends once the VMM runs in its new PID namespace, which tells the
+/// helper how the jailer fared.
+///
+/// Firecracker writes its own messages to [`VMM_LOG`] in the jail (`--log-path`), so its
+/// standard output carries the guest's serial console alone.
 pub fn jailer_argv(plan: &VmPlan) -> Vec<String> {
     let t = &plan.template;
     let fc = &plan.firecracker;
     let memory = (u64::from(t.memory_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
     let jail = plan.names.jail();
-    vec![
+    let mut argv = vec![
         fc.jailer.display().to_string(),
         "--id".into(),
         jail.clone(),
@@ -103,12 +161,23 @@ pub fn jailer_argv(plan: &VmPlan) -> Vec<String> {
         format!("pids.max={}", t.pids_max),
         "--resource-limit".into(),
         format!("fsize={CONSOLE_MAX_BYTES}"),
-        "--".into(),
-        "--api-sock".into(),
-        API_SOCKET.into(),
-        "--config-file".into(),
-        VM_CONFIG.into(),
-    ]
+    ];
+    argv.extend(
+        [
+            "--",
+            "--api-sock",
+            API_SOCKET,
+            "--config-file",
+            VM_CONFIG,
+            "--log-path",
+            VMM_LOG,
+            "--level",
+            "Info",
+            "--show-level",
+        ]
+        .map(String::from),
+    );
+    argv
 }
 
 /// The guest's MAC address: locally administered, from its IPv4 address.
@@ -173,9 +242,10 @@ pub fn boot_args(plan: &VmPlan) -> String {
 }
 
 /// The device-mapper table of a VM's root disk: a snapshot of its own (`cow`) over the shared,
-/// read-only image (`origin`, `sectors` long), not kept after the VM (`N`), in chunks of 4 KiB.
+/// read-only image (`origin`, `sectors` long), not kept after the VM (`N`), in chunks of
+/// [`SNAPSHOT_CHUNK_SECTORS`].
 pub fn snapshot_table(sectors: u64, origin: &str, cow: &str) -> String {
-    format!("0 {sectors} snapshot {origin} {cow} N 8")
+    format!("0 {sectors} snapshot {origin} {cow} N {SNAPSHOT_CHUNK_SECTORS}")
 }
 
 /// `dmsetup create` for a VM's snapshot. `--noudevsync`: the helper takes the device's numbers
@@ -422,8 +492,11 @@ pub struct Places {
     pub netns: PathBuf,
     /// The snapshot's own file.
     pub snapshot_file: PathBuf,
-    /// The VMM's standard output: the guest's serial console and Firecracker's messages.
+    /// The VMM's standard output with `guestConsole`: the guest's serial console. Without
+    /// it the VMM's standard output is `/dev/null`, and this file is not made.
     pub console: PathBuf,
+    /// The jailer's and the VMM's standard error: what they say when they cannot start.
+    pub errors: PathBuf,
 }
 
 pub fn places(firecracker: &Firecracker, names: &Names) -> Places {
@@ -438,6 +511,7 @@ pub fn places(firecracker: &Firecracker, names: &Names) -> Places {
         netns: Path::new("/var/run/netns").join(&jail),
         snapshot_file: firecracker.work.join(format!("{jail}.snapshot")),
         console: firecracker.work.join(format!("{jail}.console")),
+        errors: firecracker.work.join(format!("{jail}.errors")),
     }
 }
 
@@ -471,6 +545,8 @@ pub fn network_read_backs(plan: &VmPlan) -> Vec<(Vec<String>, &'static str)> {
 
 /// The node's own setting that every VM needs, and that the node's role must set: the helper
 /// reads it and never writes it.
+/// The node's own firewall table, as `nft list tables` names it (`units/tinfirm-node-agent.nft`).
+pub const NODE_TABLE: &str = "inet tinfirm_node";
 pub const NODE_FORWARDING: &str = "net.ipv4.ip_forward";
 
 /// The loop device of `losetup --noheadings --output NAME,RO --associated <image>` that is
@@ -854,6 +930,56 @@ fn own(path: &Path, uid: u32, gid: u32) -> Result<(), BackendError> {
     })
 }
 
+/// The first 64 KiB of a regular file, opened without following a link and without waiting:
+/// the VMM's log lies in a directory of the VM's user.
+fn first_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let mut bytes = Vec::new();
+    file.take(64 * 1024).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// What Firecracker writes to its log once the VM of its configuration file is started.
+pub const VMM_STARTED: &str = "Successfully started microvm";
+
+/// Why a jailer or a VMM did not start, from a file of their own words (never a guest's): as
+/// plain text, the first lines that Firecracker marks as errors, or else the file's end, at
+/// most 400 characters. The file is read with a bound and is no link.
+fn last_words(path: &Path) -> String {
+    let bytes = match first_bytes(path) {
+        Ok(bytes) if bytes.is_empty() => return "(nothing)".into(),
+        Ok(bytes) => bytes,
+        Err(e) => return format!("(cannot be read: {})", e.kind()),
+    };
+    let text: String = bytes
+        .iter()
+        .map(|b| match b {
+            b' '..=b'~' | b'\n' => *b as char,
+            _ => ' ',
+        })
+        .collect();
+    let line = |l: &str| l.split_whitespace().collect::<Vec<_>>().join(" ");
+    let errors: Vec<String> = text
+        .lines()
+        .filter(|l| l.contains(":ERROR]"))
+        .map(line)
+        .collect();
+    if errors.is_empty() {
+        let all = line(&text);
+        let skip = all.chars().count().saturating_sub(400);
+        all.chars().skip(skip).collect()
+    } else {
+        errors.join(" | ").chars().take(400).collect()
+    }
+}
+
 fn private_dir(path: &Path) -> Result<(), BackendError> {
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -989,12 +1115,34 @@ impl LinuxBackend {
             }
         };
         let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+        // A snapshot that cannot be read is not counted as absent: the answer is then that
+        // the room is not known, and no VM is made on a guess.
+        let unread = |what: String, e: std::io::Error| {
+            Some(format!(
+                "the snapshots in {} cannot be counted ({what}: {}), so the room for one more is not known",
+                work.display(),
+                e.kind()
+            ))
+        };
+        let entries = match std::fs::read_dir(work) {
+            Ok(entries) => entries,
+            Err(e) => return unread("the directory".into(), e),
+        };
         let mut others = Vec::new();
-        for entry in std::fs::read_dir(work).into_iter().flatten().flatten() {
-            if entry.file_name().to_string_lossy().ends_with(".snapshot")
-                && let Ok(meta) = entry.metadata()
-            {
-                others.push((meta.len(), meta.blocks().saturating_mul(512)));
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return unread("an entry".into(), e),
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".snapshot") {
+                continue;
+            }
+            match entry.metadata() {
+                Ok(meta) => others.push((meta.len(), meta.blocks().saturating_mul(512))),
+                // Deleted between the listing and now: that one is gone.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return unread(name, e),
             }
         }
         disk_room_problem(free, &others, wanted)
@@ -1125,9 +1273,27 @@ impl LinuxBackend {
             .ok_or_else(|| failed("the snapshot's device numbers cannot be read"))?;
         self.done(Step::Disks)?;
 
-        // The jail: the chroot is root's until the jailer hands it to the VM's user.
+        // The jail: the chroot is a file system of its own, with a size and a number of
+        // inodes, so what the VM's user writes there takes no room from the node or from
+        // another VM. It is root's until the jailer hands it to the VM's user.
         let chroot = &places.chroot;
         private_dir(chroot)?;
+        rustix::mount::mount(
+            "tinfirm-jail",
+            chroot,
+            "tmpfs",
+            rustix::mount::MountFlags::NOSUID,
+            std::ffi::CString::new(jail_mount_options(&plan.firecracker))
+                .expect("no NUL in it")
+                .as_c_str(),
+        )
+        .map_err(|e| {
+            failed(format!(
+                "cannot mount the jail's file system on {}: {}",
+                chroot.display(),
+                std::io::Error::from(e).kind()
+            ))
+        })?;
         let inside = |name: &str| chroot.join(name.trim_start_matches('/'));
         let kernel = std::fs::read(&plan.template.kernel).map_err(|e| {
             failed(format!(
@@ -1142,6 +1308,7 @@ impl LinuxBackend {
         let config = serde_json::to_vec(&firecracker_config(plan))
             .map_err(|_| failed("the VMM's configuration cannot be written"))?;
         put(&inside(VM_CONFIG), &config, plan.uid, plan.gid)?;
+        put(&inside(VMM_LOG), b"", plan.uid, plan.gid)?;
         let root_disk = inside(ROOT_DISK);
         run(
             &words(&[
@@ -1158,23 +1325,26 @@ impl LinuxBackend {
         own(&root_disk, plan.uid, plan.gid)?;
         self.done(Step::Jail)?;
 
-        // The VMM: the jailer, started with the cut bounding set.
-        let console = std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&places.console)
-            .map_err(|e| {
-                failed(format!(
-                    "cannot make {}: {}",
-                    places.console.display(),
-                    e.kind()
-                ))
-            })?;
-        let errors = console
-            .try_clone()
-            .map_err(|e| failed(format!("cannot open the console twice: {}", e.kind())))?;
+        // The VMM: the jailer, started with the cut bounding set. Its standard output is the
+        // guest's serial console: a file with `guestConsole`, nowhere without it, so that a
+        // guest's kernel, which can write to the serial port's address whatever its command
+        // line says, writes into nothing. Its standard error is a file of its own, which
+        // holds what the jailer or Firecracker say when they cannot start.
+        let new_file = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|e| failed(format!("cannot make {}: {}", path.display(), e.kind())))
+        };
+        let console = if plan.firecracker.guest_console {
+            Stdio::from(new_file(&places.console)?)
+        } else {
+            Stdio::null()
+        };
+        let errors = new_file(&places.errors)?;
         // The helper's own binary again, as `start-jailer`: it cuts its bounding set to the
         // jailer's six capabilities and becomes the jailer.
         let mut child = Command::new(&self.starter)
@@ -1200,32 +1370,61 @@ impl LinuxBackend {
             return Err(failed("the jailer did not finish starting the VMM in time"));
         };
         if !status.success() {
-            // Nothing of a guest is in the console yet: these are the jailer's own words.
-            let said = std::fs::read(&places.console).unwrap_or_default();
             return Err(failed(format!(
                 "the jailer failed ({status}): {}",
-                plain(&said[..said.len().min(2048)])
+                last_words(&places.errors)
             )));
+        }
+        // The template's limit of the VMM's reads and writes of the root disk. The VMM has
+        // run for a moment without it by now, and its guest has not.
+        if let Some(limit) = io_max(&plan.template, (major, minor)) {
+            let parent = places
+                .cgroup
+                .parent()
+                .unwrap_or(Path::new("/sys/fs/cgroup"));
+            // Not an error when it is on already; the write below fails when it is not.
+            let _ = std::fs::write(parent.join("cgroup.subtree_control"), "+io");
+            std::fs::write(places.cgroup.join("io.max"), &limit).map_err(|e| {
+                failed(format!(
+                    "cannot set the VM's io.max to `{limit}`: {} (the cgroup controller io must be handed down to {})",
+                    e.kind(),
+                    parent.display()
+                ))
+            })?;
         }
         // The jailer's second process execs the VMM in the cgroup; when that fails (a
         // capability the jailer lacks, a configuration Firecracker refuses), the cgroup is
         // empty at once, and waiting longer would only hold the helper.
         let socket = inside(API_SOCKET);
         let mut ended = false;
+        let log = inside(VMM_LOG);
+        let mut started = false;
         let runs = wait_until(START_TIMEOUT, || {
-            if vmm_runs(&socket) {
+            // The API is asked only once the log says that the VM is started: a request that
+            // arrives while Firecracker gives up on its configuration ends its API thread
+            // first, and then the log never says why it gave up.
+            started = started
+                || first_bytes(&log)
+                    .is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(VMM_STARTED));
+            if started && vmm_runs(&socket) {
                 return true;
             }
             ended = cgroup_pids(&places.cgroup).is_ok_and(|pids| pids.is_empty());
             ended
         });
         if ended || !runs {
-            // The console may hold a guest's bytes by now: only its kind goes into the error.
-            return Err(failed(if ended {
-                "the VMM ended before its guest ran (the VM's console file said why, and is removed with the VM)"
-            } else {
-                "the VMM did not report a running guest in time"
-            }));
+            // Firecracker's own log and its standard error hold no byte of a guest's serial
+            // console, and go into the error as plain text, since both are removed with the VM.
+            return Err(failed(format!(
+                "{}: Firecracker's log ends with: {}; its standard error: {}",
+                if ended {
+                    "the VMM ended before its guest ran"
+                } else {
+                    "the VMM did not report a running guest in time"
+                },
+                last_words(&log),
+                last_words(&places.errors)
+            )));
         }
         let pid = vmm_pid(&places.cgroup)
             .map_err(failed)?
@@ -1397,13 +1596,17 @@ impl Backend for LinuxBackend {
         } else {
             checked.push(format!("room for {all} snapshot(s) of this template"));
         }
-        let wanted_mib = all * (u64::from(template.memory_mib) + VMM_OVERHEAD_MIB);
+        // Each VM's guest and VMM, its jail's file system, and what the kernel holds for a
+        // snapshot that is written full, which no cgroup is charged for.
+        let wanted_mib = all * vm_memory_mib(template, &self.config.firecracker);
         match memory_total_mib(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default()) {
             Some(total) if total >= wanted_mib => {
                 checked.push(format!("memory for {all} VM(s) of this template"));
             }
             Some(total) => problems.push(format!(
-                "the node has {total} MiB of memory, and {all} VM(s) of this template may use {wanted_mib} MiB: lower maxVms or the template's memoryMib"
+                "the node has {total} MiB of memory, and {all} VM(s) of this template may use {wanted_mib} MiB (each its memoryMib, {VMM_OVERHEAD_MIB} MiB for its VMM, its jail's {} MiB and {} MiB for a snapshot written full): lower maxVms, the template's memoryMib or its snapshotMib",
+                self.config.firecracker.jail_mib,
+                snapshot_memory_mib(template)
             )),
             None => problems.push("the node's memory cannot be read from /proc/meminfo".into()),
         }
@@ -1422,6 +1625,19 @@ impl Backend for LinuxBackend {
             Err(_) => problems.push(
                 "/sys/fs/cgroup is not a cgroup v2 hierarchy: a VM would run without limits".into(),
             ),
+        }
+        // A template with `ioMax` needs the io controller handed down from the root cgroup,
+        // which a service manager does only when some unit asks for it.
+        if template.io_max.is_some() {
+            let handed = std::fs::read_to_string("/sys/fs/cgroup/cgroup.subtree_control")
+                .is_ok_and(|c| c.split_whitespace().any(|c| c == "io"));
+            if handed {
+                checked.push("the cgroup controller io, for the template's ioMax".into());
+            } else {
+                problems.push(
+                    "the template has an ioMax, and the root cgroup does not hand down the controller io (cgroup.subtree_control): the helper's unit asks for it with IOAccounting=yes".into(),
+                );
+            }
         }
         let fc = &self.config.firecracker;
         root_file(&mut problems, &mut checked, "the jailer", &fc.jailer);
@@ -1454,6 +1670,18 @@ impl Backend for LinuxBackend {
                 fc.work.display(),
                 e.kind()
             )),
+        }
+        // The node's own firewall is the node's role's, and the helper works without it; what
+        // a control host is told is whether it is there, since a node without it forwards and
+        // answers with no guard of its own.
+        match tool(&words(&["nft", "list", "tables"]), None) {
+            Ok(listing) if tables_of(&listing).contains(NODE_TABLE) => {
+                checked.push(format!("the node's own firewall table ({NODE_TABLE})"));
+            }
+            Ok(_) => checked.push(format!(
+                "NOT THERE: the node's own firewall table ({NODE_TABLE}); the node lets out and in whatever its network allows"
+            )),
+            Err(e) => problems.push(format!("the node's firewall tables cannot be listed: {e}")),
         }
         Checked { problems, checked }
     }
@@ -1585,7 +1813,7 @@ impl Backend for LinuxBackend {
             format!("the loop device of {}", places.snapshot_file.display()),
             loop_state(&places.snapshot_file),
         );
-        for file in [&places.snapshot_file, &places.console] {
+        for file in [&places.snapshot_file, &places.console, &places.errors] {
             let _ = std::fs::remove_file(file);
             check(format!("the file {}", file.display()), presence(file));
         }
@@ -1634,6 +1862,20 @@ impl Backend for LinuxBackend {
         );
 
         // The jail's directory: the last, since it is what `list` finds the VM by.
+        if left.is_empty() {
+            // The jail's own file system goes with everything in it, whatever its user made
+            // there. Where it is not mounted (a helper that was started again has a mount
+            // namespace of its own, in which the file system of an earlier helper's jail is
+            // not: it ended with its VMM), the chroot is an empty directory.
+            match rustix::mount::unmount(&places.chroot, rustix::mount::UnmountFlags::DETACH) {
+                Ok(()) | Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOENT) => {}
+                Err(e) => left.push(format!(
+                    "the jail's file system on {} ({})",
+                    places.chroot.display(),
+                    std::io::Error::from(e).kind()
+                )),
+            }
+        }
         if left.is_empty() {
             // Not `std::fs::remove_dir_all`: the chroot is the VM's user's, and a tree that
             // user made thousands of levels deep must not end the removal (`crate::tree`).
@@ -1783,12 +2025,82 @@ mod tests {
         assert!(!argv.contains(&"--daemonize".to_string()));
         // The VMM's own arguments: its API socket and its configuration in the chroot.
         let vmm = &argv[argv.iter().position(|a| a == "--").unwrap() + 1..];
-        assert_eq!(vmm, ["--api-sock", API_SOCKET, "--config-file", VM_CONFIG]);
+        // Its own messages go to its log in the jail, not to its standard output, which is the
+        // guest's serial console.
+        assert_eq!(
+            vmm,
+            [
+                "--api-sock",
+                API_SOCKET,
+                "--config-file",
+                VM_CONFIG,
+                "--log-path",
+                VMM_LOG,
+                "--level",
+                "Info",
+                "--show-level"
+            ]
+        );
         // The chroot is the one the plan names.
         assert_eq!(
             p.chroot,
             Path::new("/srv/tinfirm-jails/firecracker/tfvm-00000000002a-0003/root")
         );
+    }
+
+    #[test]
+    fn a_templates_io_limit_is_the_vms_io_max_of_its_root_disk() {
+        let mut p = sample(0, 1);
+        assert_eq!(io_max(&p.template, (253, 7)), None);
+        p.template.io_max = Some(crate::plan::IoMax {
+            read_bytes_per_second: Some(104_857_600),
+            write_bytes_per_second: None,
+            reads_per_second: None,
+            writes_per_second: Some(2000),
+        });
+        assert_eq!(
+            io_max(&p.template, (253, 7)).as_deref(),
+            Some("253:7 rbps=104857600 wiops=2000")
+        );
+        // Not through the jailer, which refuses a cgroup value with `=` in it.
+        assert!(!jailer_argv(&p).iter().any(|a| a.contains("io.max")));
+    }
+
+    #[test]
+    fn a_vms_memory_counts_its_jail_and_its_snapshot_written_full() {
+        let p = sample(0, 1);
+        // 20480 MiB in chunks of 4 KiB: 5 242 880 chunks of 160 bytes each.
+        assert_eq!(snapshot_memory_mib(&p.template), 800);
+        assert_eq!(
+            vm_memory_mib(&p.template, &p.firecracker),
+            8192 + 128 + 64 + 800
+        );
+        assert_eq!(
+            jail_mount_options(&p.firecracker),
+            "size=64m,nr_inodes=1024,mode=0700,uid=0,gid=0"
+        );
+        assert_eq!(
+            snapshot_table(16, "/dev/loop0", "/dev/loop1"),
+            "0 16 snapshot /dev/loop0 /dev/loop1 N 8"
+        );
+    }
+
+    #[test]
+    fn the_room_for_a_snapshot_is_not_known_when_the_work_directory_cannot_be_read() {
+        let mut config = config();
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the directory should be: its free space is read, its entries are not.
+        let file = dir.path().join("work");
+        std::fs::write(&file, b"").unwrap();
+        config.firecracker.work = file;
+        let problem = LinuxBackend::new(config.clone()).room_problem(1).unwrap();
+        assert!(problem.contains("cannot be counted"), "{problem}");
+        // A directory that is there, with a snapshot in it, is counted.
+        config.firecracker.work = dir.path().to_path_buf();
+        let sparse = std::fs::File::create(dir.path().join("x.snapshot")).unwrap();
+        sparse.set_len(1 << 42).unwrap();
+        let problem = LinuxBackend::new(config).room_problem(1).unwrap();
+        assert!(problem.contains("1 other VM(s)"), "{problem}");
     }
 
     #[test]

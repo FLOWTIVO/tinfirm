@@ -32,7 +32,7 @@ libc.workspace = true
 # relative to an open directory that remove a jail's tree (`src/tree.rs`), a file system's
 # free space, and a signal to a tool's process group (`src/linux.rs`). Already in the
 # workspace, for the runner host.
-rustix = { workspace = true, features = ["thread", "fs", "process"] }
+rustix = { workspace = true, features = ["thread", "fs", "process", "mount"] }
 
 [dev-dependencies]
 tempfile.workspace = true

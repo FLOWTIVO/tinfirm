@@ -45,6 +45,24 @@ pub struct Template {
     /// The VMM's process limit (cgroup `pids.max`).
     #[serde(default = "default_pids")]
     pub pids_max: u32,
+    /// Limits of the VMM's reads and writes of the VM's root disk (cgroup `io.max`). None by
+    /// default.
+    #[serde(default)]
+    pub io_max: Option<IoMax>,
+}
+
+/// A VM's `io.max`: each limit that is named, per second.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IoMax {
+    #[serde(default)]
+    pub read_bytes_per_second: Option<u64>,
+    #[serde(default)]
+    pub write_bytes_per_second: Option<u64>,
+    #[serde(default)]
+    pub reads_per_second: Option<u64>,
+    #[serde(default)]
+    pub writes_per_second: Option<u64>,
 }
 
 fn default_bridge_port() -> u16 {
@@ -85,6 +103,15 @@ pub struct Firecracker {
     /// up. Off by default: a guest's log is then nowhere on the node.
     #[serde(default)]
     pub guest_console: bool,
+    /// The size of each jail's own file system, in MiB: a tmpfs that holds the VMM's binary,
+    /// its configuration, its log and the VM's user data, and bounds what the VM's user can
+    /// write on the node. It is memory, and is counted as such.
+    #[serde(default = "default_jail_mib")]
+    pub jail_mib: u32,
+}
+
+fn default_jail_mib() -> u32 {
+    64
 }
 
 /// The helper's configuration file.
@@ -158,6 +185,26 @@ impl HelperConfig {
             ("firecracker.work", &self.firecracker.work),
         ] {
             plain_path(name, path)?;
+        }
+        // `start-jailer` starts only a file of this name (`crate::bounding`).
+        if self.firecracker.jailer.file_name() != Some(std::ffi::OsStr::new("jailer")) {
+            bail!("firecracker.jailer must be a file named `jailer`");
+        }
+        if !(8..=4096).contains(&self.firecracker.jail_mib) {
+            bail!("firecracker.jailMib must be 8 to 4096");
+        }
+        for (name, template) in &self.templates {
+            if let Some(io) = &template.io_max {
+                let limits = [
+                    io.read_bytes_per_second,
+                    io.write_bytes_per_second,
+                    io.reads_per_second,
+                    io.writes_per_second,
+                ];
+                if limits.iter().all(Option::is_none) || limits.contains(&Some(0)) {
+                    bail!("templates.{name}.ioMax must name at least one limit, and none of 0");
+                }
+            }
         }
         // The jailer names the chroot after the VMM's file: chroot_dir() relies on it.
         if self.firecracker.firecracker.file_name() != Some(std::ffi::OsStr::new("firecracker")) {
@@ -501,6 +548,32 @@ pub(crate) mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn the_jailer_must_be_named_jailer_and_the_jails_size_and_io_limits_are_checked() {
+        let with = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut json = config_json();
+            change(&mut json);
+            serde_json::from_value::<HelperConfig>(json)
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map_err(|e| e.to_string()))
+        };
+        // `start-jailer` would refuse it at every make: the configuration is refused instead.
+        let e = with(&|j| j["firecracker"]["jailer"] = "/usr/local/bin/jailer-1.14".into());
+        assert!(e.unwrap_err().contains("named `jailer`"));
+        assert_eq!(config().firecracker.jail_mib, 64);
+        assert!(with(&|j| j["firecracker"]["jailMib"] = 4.into()).is_err());
+        assert!(with(&|j| j["firecracker"]["jailMib"] = 128.into()).is_ok());
+        let template = |j: &mut serde_json::Value, io: serde_json::Value| {
+            j["templates"]["sandbox-4c8g"]["ioMax"] = io;
+        };
+        assert!(
+            with(&|j| template(j, serde_json::json!({"writeBytesPerSecond": 1048576}))).is_ok()
+        );
+        assert!(with(&|j| template(j, serde_json::json!({}))).is_err());
+        assert!(with(&|j| template(j, serde_json::json!({"readsPerSecond": 0}))).is_err());
+        assert!(with(&|j| template(j, serde_json::json!({"bytes": 5}))).is_err());
     }
 
     #[test]

@@ -183,6 +183,12 @@ impl RpcRequest {
         };
         match &self.params {
             Some(params @ Value::Object(_)) => {
+                // From a copy, whose strings move into the parameters without another copy.
+                // Parsing the value itself by reference was tried and left the user data
+                // once more in memory on every create (a canary found it on a node). What
+                // this leaves: a copy that fails to parse is dropped as it is, so a `create`
+                // that the listener refuses for its form keeps its user data in freed memory
+                // until that memory is used again.
                 serde_json::from_value(params.clone()).map_err(|_| refused())
             }
             _ => Err(refused()),

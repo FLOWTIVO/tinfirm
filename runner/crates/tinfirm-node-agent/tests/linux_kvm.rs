@@ -352,6 +352,7 @@ fn left_of(node: &Node, names: &Names) -> Vec<String> {
         ("network namespace", places.netns.clone()),
         ("snapshot file", places.snapshot_file.clone()),
         ("console file", places.console.clone()),
+        ("errors file", places.errors.clone()),
         ("jail", places.jail_dir.clone()),
         ("veth", Path::new("/sys/class/net").join(names.veth())),
         (
@@ -371,6 +372,12 @@ fn left_of(node: &Node, names: &Names) -> Vec<String> {
         .any(|backing| linux::is_backing_file(backing, &places.snapshot_file))
     {
         left.push("loop device of the snapshot file".to_string());
+    }
+    if std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .contains(&names.jail())
+    {
+        left.push("a mount of its jail".to_string());
     }
     if must(&["nft", "list", "tables"]).contains(&names.table()) {
         left.push(format!("firewall table {}", names.table()));
@@ -503,6 +510,7 @@ fn a_made_vm_runs_jailed_answers_only_its_control_host_and_a_delete_leaves_nothi
         [
             "dev",
             "firecracker",
+            "firecracker.log",
             "firecracker.pid",
             "root.disk",
             "run",
@@ -511,7 +519,29 @@ fn a_made_vm_runs_jailed_answers_only_its_control_host_and_a_delete_leaves_nothi
             "vmlinux"
         ]
     );
-    for name in ["root.disk", "userdata.disk", "vm.json", "vmlinux"] {
+    // The jail is a file system of its own, with a size and a number of inodes.
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let mount = mounts
+        .lines()
+        .find(|line| line.contains(&format!("{} ", places.chroot.display())))
+        .expect("the chroot is a mount point");
+    assert!(
+        mount.contains(" - tmpfs tinfirm-jail ")
+            && mount.contains("size=65536k")
+            && mount.contains("nr_inodes=1024")
+            && mount.contains("nosuid"),
+        "{mount}"
+    );
+    // Firecracker's own messages are in its log in the jail, and none in the console.
+    let log = std::fs::read_to_string(places.chroot.join("firecracker.log")).unwrap();
+    assert!(log.contains("Running Firecracker"), "{log}");
+    for name in [
+        "firecracker.log",
+        "root.disk",
+        "userdata.disk",
+        "vm.json",
+        "vmlinux",
+    ] {
         let meta = std::fs::symlink_metadata(places.chroot.join(name)).unwrap();
         assert_eq!(
             (meta.uid(), meta.mode() & 0o7777),
@@ -521,7 +551,7 @@ fn a_made_vm_runs_jailed_answers_only_its_control_host_and_a_delete_leaves_nothi
     }
     let jail = std::fs::symlink_metadata(&places.jail_dir).unwrap();
     assert_eq!((jail.uid(), jail.mode() & 0o7777), (0, 0o700));
-    for file in [&places.snapshot_file, &places.console] {
+    for file in [&places.snapshot_file, &places.console, &places.errors] {
         let meta = std::fs::symlink_metadata(file).unwrap();
         assert_eq!((meta.uid(), meta.mode() & 0o7777), (0, 0o600));
     }
@@ -883,12 +913,112 @@ fn a_guest_without_the_console_setting_writes_nothing_to_the_node() {
     let plan = node.plan(3, 0x60);
     backend.make(&plan, &node.user_data("quiet")).unwrap();
     guest_ready(plan.published_port);
-    let console = std::fs::read(node.places(&plan.names).console).unwrap();
-    let console = String::from_utf8_lossy(&console);
+    // No console file is made: the VMM's standard output is /dev/null, whatever a guest's
+    // kernel writes to the serial port's address. Firecracker's own words are in its log.
+    let places = node.places(&plan.names);
+    assert!(!places.console.exists());
+    let pid = cgroup_pids(&places)[0];
+    assert_eq!(
+        std::fs::read_link(format!("/proc/{pid}/fd/1")).unwrap(),
+        Path::new("/dev/null")
+    );
+    assert_eq!(std::fs::read(&places.errors).unwrap(), b"");
+    let log = std::fs::read_to_string(places.chroot.join("firecracker.log")).unwrap();
     assert!(
-        !console.contains("Linux version") && !console.contains("vm-boot"),
-        "{console}"
+        log.contains("Running Firecracker") && !log.contains("Linux version"),
+        "{log}"
     );
     backend.delete(&plan.names).unwrap();
     assert_eq!(left_of(&node, &plan.names), Vec::<String>::new());
+}
+
+/// As a VM's user, with nothing but that user's rights, in the directory `at`. Root enters
+/// the directory first: a jail's own directory is root's, so its user reaches the chroot from
+/// inside only.
+fn as_user(uid: u32, at: &Path, script: &str) -> Result<String, String> {
+    let id = uid.to_string();
+    let enter = format!(
+        "cd '{}' && exec setpriv --reuid {id} --regid {id} --clear-groups --inh-caps=-all --bounding-set=-all sh -c \"$0\"",
+        at.display()
+    );
+    sh(&["sh", "-c", &enter, script])
+}
+
+#[test]
+fn a_vms_user_that_fills_its_jail_takes_nothing_from_the_node_or_the_next_vm() {
+    let Some(node) = Node::start(4) else { return };
+    let backend = node.backend();
+    let plan_a = node.plan(0, 0x70);
+    backend.make(&plan_a, &node.user_data("fills")).unwrap();
+    guest_ready(plan_a.published_port);
+    let places = node.places(&plan_a.names);
+    let free = |path: &Path| {
+        let stat = rustix::fs::statvfs(path).unwrap();
+        stat.f_bavail * stat.f_frsize
+    };
+    let before = free(&node.config.firecracker.work);
+    // Bytes until the file system is full, then names until it has no inode left, then a
+    // sticky directory with a file in it, which root without CAP_FOWNER may not empty until
+    // it owns the directory.
+    let said = as_user(
+        plan_a.uid,
+        &places.chroot,
+        "dd if=/dev/zero of=fill bs=1M 2>&1 | tail -1; \
+         i=0; while true 2>/dev/null > n$i; do i=$((i+1)); done; echo \"names: $i\"; \
+         rm n0 n1 n2; mkdir sticky && true > sticky/file && chmod 1700 sticky . && echo sticky",
+    )
+    .unwrap();
+    eprintln!("the VM's user in its jail: {}", said.replace('\n', "; "));
+    assert!(said.contains("sticky"), "{said}");
+    let stat = rustix::fs::statvfs(&places.chroot).unwrap();
+    eprintln!(
+        "the jail's file system: {} of {} KiB free, {} of {} inodes free",
+        stat.f_bavail * stat.f_frsize / 1024,
+        stat.f_blocks * stat.f_frsize / 1024,
+        stat.f_ffree,
+        stat.f_files
+    );
+    assert!(stat.f_blocks * stat.f_frsize == 64 << 20 && stat.f_files == 1024);
+    assert!(stat.f_bavail * stat.f_frsize < 1 << 20);
+    // The node's own file system lost nothing to it.
+    let after = free(&node.config.firecracker.work);
+    assert!(before.abs_diff(after) < 64 << 20, "{before} {after}");
+    // The next VM is made and comes up, and both are deleted with nothing left.
+    let plan_b = node.plan(1, 0x71);
+    backend.make(&plan_b, &node.user_data("next")).unwrap();
+    guest_ready(plan_b.published_port);
+    backend.delete(&plan_a.names).unwrap();
+    backend.delete(&plan_b.names).unwrap();
+    assert_eq!(left_of(&node, &plan_a.names), Vec::<String>::new());
+    assert_eq!(left_of(&node, &plan_b.names), Vec::<String>::new());
+}
+
+#[test]
+fn a_vmm_that_cannot_start_says_why_in_the_makes_error() {
+    let Some(mut node) = Node::start(4) else {
+        return;
+    };
+    // A kernel that is none: Firecracker refuses it and ends, before any guest runs.
+    let bad = node.config.firecracker.work.join("not-a-kernel");
+    std::fs::write(&bad, b"this is no kernel\n").unwrap();
+    for console in [true, false] {
+        node.config.firecracker.guest_console = console;
+        let name = node.config.templates.keys().next().unwrap().clone();
+        node.config.templates.get_mut(&name).unwrap().kernel = bad.clone();
+        let plan = node.plan(2, 0x80 + u64::from(console));
+        let error = node
+            .backend()
+            .make(&plan, &node.user_data("bad"))
+            .unwrap_err();
+        eprintln!("guestConsole {console}: {error}");
+        let BackendError::Failed(why) = &error else {
+            panic!("{error}")
+        };
+        assert!(
+            why.contains("the VMM ended before its guest ran") && why.contains("kernel"),
+            "{why}"
+        );
+        assert_eq!(left_of(&node, &plan.names), Vec::<String>::new());
+    }
+    std::fs::remove_file(&bad).unwrap();
 }

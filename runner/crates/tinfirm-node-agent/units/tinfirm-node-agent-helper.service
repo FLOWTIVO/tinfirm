@@ -7,8 +7,11 @@
 # (docs/reviews/2026-11-19-node-agent-execution).
 [Unit]
 Description=Tinfirm node agent: the helper (root), which makes and deletes the VMs
-Requires=tinfirm-node-agent-modules.service
-After=tinfirm-node-agent-modules.service systemd-tmpfiles-setup.service systemd-sysctl.service
+# The node's firewall is required: a node whose firewall file does not load (a typing mistake
+# in its `define` lines) starts no helper, and so takes no VM, instead of forwarding with no
+# table of its own. `check` also says whether the table is there.
+Requires=tinfirm-node-agent-modules.service tinfirm-node-agent-firewall.service
+After=tinfirm-node-agent-modules.service tinfirm-node-agent-firewall.service systemd-tmpfiles-setup.service systemd-sysctl.service
 
 [Service]
 ExecStart=/usr/local/bin/tinfirm-node-agent helper --config /etc/tinfirm/node-agent/helper.json
@@ -20,6 +23,9 @@ RestartSec=1
 # the helper and the tools of a make it was in the middle of, which would otherwise go on
 # beside the next helper's cleanup.
 UMask=0077
+# Makes the service manager hand the cgroup controller `io` down from the root cgroup, which
+# a template's `ioMax` needs in the VMs' own cgroups (the helper sets no limit on itself).
+IOAccounting=yes
 
 # What is left of root. The jailer needs six of these itself (the VMM's bounding set is cut
 # to them): CHOWN, DAC_OVERRIDE, SETGID, SETUID, SYS_ADMIN, MKNOD. The helper needs SETPCAP

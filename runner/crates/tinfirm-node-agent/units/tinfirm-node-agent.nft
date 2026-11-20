@@ -31,6 +31,8 @@ define vm_range = 10.231.0.0/16
 # may be the control host; then a control host that is taken over reaches the node's SSH
 # port, though still not without a key.
 define management = 10.0.0.9
+# The port of the node's SSH server.
+define ssh_port = 22
 # Addresses that are refused by name whatever else changes in this file: the providers'
 # metadata services.
 define metadata4 = { 169.254.169.254 }
@@ -44,7 +46,7 @@ table inet tinfirm_node {
 		iifname "lo" accept
 		ct state established,related accept
 		ip saddr $control_host ip daddr $node_address tcp dport $agent_port ct state new accept
-		ip saddr $management ip daddr $node_address tcp dport 22 ct state new accept
+		ip saddr $management ip daddr $node_address tcp dport $ssh_port ct state new accept
 		# A node whose address comes by DHCP: the lease's answers. Remove both DHCP rules on
 		# a node with a static address.
 		udp sport 67 udp dport 68 accept
