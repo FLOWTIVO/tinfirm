@@ -2038,6 +2038,12 @@ mod tests {
                 "/v1/models?limit=1000"
             ]
         );
+        // A front answers the client first and tells `run` of the refusal after, so the last
+        // refusal may still be on its way.
+        let settled = tokio::time::Instant::now() + Duration::from_secs(5);
+        while guard.counts() != (4, 18) && tokio::time::Instant::now() < settled {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(guard.counts(), (4, 18));
 
         // An OpenAI gateway under `/v1`: its endpoints, under that path only.
