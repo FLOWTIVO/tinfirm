@@ -166,7 +166,8 @@ impl PodDriver {
         Ok(json!({ "id": name }))
     }
 
-    /// Checks the admission policy for `template` unless it passed within the last minute.
+    /// Checks the network policies and the admission policy for `template`, unless they passed
+    /// within the last minute.
     async fn check_admission(&self, template: &str) -> Result<()> {
         let fresh = lock(&self.admission_checked)
             .get(template)
@@ -174,13 +175,76 @@ impl PodDriver {
         if fresh {
             return Ok(());
         }
-        let problems = self.admission_problems(template).await?;
+        // A read that fails is a problem too: nothing is cached as passed then.
+        let (mut problems, _) = self.policy_problems().await;
+        if problems.is_empty() {
+            problems = self.admission_problems(template).await?;
+        }
         if !problems.is_empty() {
             lock(&self.admission_checked).remove(template);
             bail!("refusing to create a run pod: {}", problems.join("; "));
         }
         lock(&self.admission_checked).insert(template.to_string(), Instant::now());
         Ok(())
+    }
+
+    /// The network policies of the runs' namespace: the chart's two, each as expected, and no
+    /// other. `verify` reports these problems, and `create` refuses while there is one (ADR-0115
+    /// decision 2: no VM starts while a policy is missing or changed). The problems, and what
+    /// was checked.
+    async fn policy_problems(&self) -> (Vec<String>, Vec<String>) {
+        let ns = self.namespace();
+        let mut problems = Vec::new();
+        let mut checked = Vec::new();
+        // The two network policies the chart installs.
+        for (name, expected) in [
+            (
+                &self.config.policies.default_deny,
+                spec::default_deny_spec(),
+            ),
+            (
+                &self.config.policies.allow_runner,
+                spec::allow_runner_spec(&self.config),
+            ),
+        ] {
+            match self.api.get_network_policy(ns, name).await {
+                Ok(policy) => {
+                    let differences = spec::policy_differences(&expected, &policy);
+                    if differences.is_empty() {
+                        checked.push(format!("NetworkPolicy {name}"));
+                    } else {
+                        problems.push(format!(
+                            "the NetworkPolicy {name} is not the one expected: {}",
+                            one_line(&differences.join(", "))
+                        ));
+                    }
+                }
+                Err(e) if e.is_not_found() => problems.push(format!(
+                    "there is no NetworkPolicy {name} in the runs' namespace {ns}"
+                )),
+                Err(e) => problems.push(api_problem(&format!("the NetworkPolicy {name}"), &e)),
+            }
+        }
+        // And no other: network policies add up, so a third one may open the run pods.
+        match self.api.list_network_policies(ns).await {
+            Ok(policies) => {
+                let expected = [
+                    self.config.policies.default_deny.as_str(),
+                    self.config.policies.allow_runner.as_str(),
+                ];
+                for policy in &policies {
+                    let name = policy["metadata"]["name"].as_str().unwrap_or("?");
+                    if !expected.contains(&name) {
+                        problems.push(format!(
+                                "the runs' namespace {ns} holds the NetworkPolicy {}, which is not the chart's: network policies add up, so it may open the run pods; delete it",
+                                one_line(name)
+                            ));
+                    }
+                }
+            }
+            Err(e) => problems.push(api_problem("the network policies", &e)),
+        }
+        (problems, checked)
     }
 
     /// The admission check: dry runs of the correct pod, which the cluster must accept, and of
@@ -404,35 +468,11 @@ impl PodDriver {
             Err(e) => problems.push(api_problem("the ResourceQuota", &e)),
         }
 
-        // The two network policies the chart installs.
-        for (name, expected) in [
-            (
-                &self.config.policies.default_deny,
-                spec::default_deny_spec(),
-            ),
-            (
-                &self.config.policies.allow_runner,
-                spec::allow_runner_spec(&self.config),
-            ),
-        ] {
-            match self.api.get_network_policy(&ns, name).await {
-                Ok(policy) => {
-                    let differences = spec::policy_differences(&expected, &policy);
-                    if differences.is_empty() {
-                        checked.push(format!("NetworkPolicy {name}"));
-                    } else {
-                        problems.push(format!(
-                            "the NetworkPolicy {name} is not the one expected: {}",
-                            one_line(&differences.join(", "))
-                        ));
-                    }
-                }
-                Err(e) if e.is_not_found() => problems.push(format!(
-                    "there is no NetworkPolicy {name} in the runs' namespace {ns}"
-                )),
-                Err(e) => problems.push(api_problem(&format!("the NetworkPolicy {name}"), &e)),
-            }
-        }
+        // The network policies: the chart's two, and no other.
+        let (found, seen) = self.policy_problems().await;
+        let policies_sound = found.is_empty();
+        problems.extend(found);
+        checked.extend(seen);
 
         // Run pods that no node takes.
         let selector = BTreeMap::from([(
@@ -452,7 +492,10 @@ impl PodDriver {
         if self.runner_node.is_some() {
             match self.admission_problems(template).await {
                 Ok(found) if found.is_empty() => {
-                    lock(&self.admission_checked).insert(template.to_string(), Instant::now());
+                    // A create's check reads the policies too: it passed only if they are sound.
+                    if policies_sound {
+                        lock(&self.admission_checked).insert(template.to_string(), Instant::now());
+                    }
                     checked.push("the admission policy refuses every pod it must".into());
                 }
                 Ok(found) => {
@@ -789,12 +832,13 @@ fn milli(text: &str) -> Option<u128> {
         "Pi" => (1 << 50, 1),
         "Ei" => (1 << 60, 1),
         exponent => {
-            let power: u32 = exponent
+            let power: i32 = exponent
                 .strip_prefix('e')
                 .or_else(|| exponent.strip_prefix('E'))?
                 .parse()
                 .ok()?;
-            (10u128.checked_pow(power)?, 1)
+            let scale = 10u128.checked_pow(power.unsigned_abs())?;
+            if power >= 0 { (scale, 1) } else { (1, scale) }
         }
     };
     let top = mantissa.checked_mul(numerator)?.checked_mul(1000)?;
@@ -839,6 +883,8 @@ mod tests {
         /// How many more of the Secrets' deletes fail.
         fail_secret_deletes: u32,
         fail_pod_delete: bool,
+        /// Reads of the network policies are forbidden.
+        fail_policy_reads: bool,
         next_uid: u64,
     }
 
@@ -872,6 +918,7 @@ mod tests {
             fail_secret_create: false,
             fail_secret_deletes: 0,
             fail_pod_delete: false,
+            fail_policy_reads: false,
             next_uid: 1,
         }
     }
@@ -1080,6 +1127,22 @@ mod tests {
                     None => not_found("secrets", name),
                 }
             }
+            ("GET", p)
+                if p.starts_with(policies.trim_end_matches('/')) && cluster.fail_policy_reads =>
+            {
+                Reply::Json(
+                    403,
+                    status(
+                        403,
+                        "Forbidden",
+                        "networkpolicies.networking.k8s.io is forbidden",
+                    ),
+                )
+            }
+            ("GET", p) if p == policies.trim_end_matches('/') => Reply::Json(
+                200,
+                json!({"kind": "NetworkPolicyList", "items": cluster.policies.values().collect::<Vec<_>>()}),
+            ),
             ("GET", p) if p.starts_with(&policies) => {
                 let name = &p[policies.len()..];
                 match cluster.policies.get(name) {
@@ -1223,15 +1286,24 @@ mod tests {
         let vm = VmId::parse(&id).unwrap();
         let calls = t.calls();
         let n = battery_calls();
-        assert_eq!(calls.len(), n + 2, "{calls:#?}");
+        let policies = format!("/apis/networking.k8s.io/v1/namespaces/{NS}/networkpolicies");
+        assert_eq!(calls.len(), 3 + n + 2, "{calls:#?}");
+        assert_eq!(
+            calls[..3],
+            [
+                format!("GET {policies}/tinfirm-runs-default-deny"),
+                format!("GET {policies}/tinfirm-runs-allow-runner"),
+                format!("GET {policies}"),
+            ]
+        );
         assert!(
-            calls[..n]
+            calls[3..3 + n]
                 .iter()
                 .all(|c| c == &format!("POST /api/v1/namespaces/{NS}/pods (dry run)"))
         );
-        assert_eq!(calls[n], format!("POST /api/v1/namespaces/{NS}/pods"));
+        assert_eq!(calls[3 + n], format!("POST /api/v1/namespaces/{NS}/pods"));
         assert_eq!(
-            calls[n + 1],
+            calls[3 + n + 1],
             format!("POST /api/v1/namespaces/{NS}/secrets")
         );
         {
@@ -1256,7 +1328,64 @@ mod tests {
         );
         t.forget_calls();
         t.create().await;
-        assert_eq!(t.calls().len(), n + 2);
+        assert_eq!(t.calls().len(), 3 + n + 2);
+    }
+
+    #[tokio::test]
+    async fn create_is_refused_while_the_policies_are_not_the_charts() {
+        let t = start(cluster()).await;
+        let create = json!({"template": "sandbox-4c8g", "userData": USER_DATA,
+                            "labels": {"tinfirm-host": HOST}});
+        let sound = t.cluster().policies.clone();
+        let mut changed = sound["tinfirm-runs-allow-runner"].clone();
+        changed["spec"]["ingress"][0]["ports"][0]["port"] = json!(22);
+        type Change = Box<dyn Fn(&mut Cluster)>;
+        let cases: Vec<(&str, Change)> = vec![
+            (
+                "there is no NetworkPolicy tinfirm-runs-default-deny",
+                Box::new(|c| {
+                    c.policies.remove("tinfirm-runs-default-deny");
+                }),
+            ),
+            (
+                "the NetworkPolicy tinfirm-runs-allow-runner is not the one expected",
+                Box::new(move |c| {
+                    c.policies
+                        .insert("tinfirm-runs-allow-runner".into(), changed.clone());
+                }),
+            ),
+            (
+                "holds the NetworkPolicy allow-all, which is not the chart's: network policies add up",
+                Box::new(|c| {
+                    c.policies.insert(
+                        "allow-all".into(),
+                        json!({"metadata": {"name": "allow-all"}}),
+                    );
+                }),
+            ),
+            (
+                "the driver may not read the NetworkPolicy",
+                Box::new(|c| c.fail_policy_reads = true),
+            ),
+        ];
+        for (expected, change) in cases {
+            change(&mut t.cluster());
+            let error = t.error("create", create.clone()).await;
+            assert!(error.contains("refusing to create a run pod"), "{error}");
+            assert!(error.contains(expected), "{expected}: {error}");
+            assert!(lock(&t.driver.admission_checked).is_empty(), "not cached");
+            assert!(t.cluster().pods.is_empty());
+            // The namespace made clean again: the next create runs the check, and passes.
+            {
+                let mut cluster = t.cluster();
+                cluster.policies = sound.clone();
+                cluster.fail_policy_reads = false;
+            }
+            t.ok("create", create.clone()).await;
+            // Its check passed: let it be old, for the next case.
+            lock(&t.driver.admission_checked).clear();
+            t.cluster().pods.clear();
+        }
     }
 
     #[tokio::test]
@@ -1596,6 +1725,10 @@ mod tests {
         c.policies
             .insert("tinfirm-runs-allow-runner".into(), opened);
         c.admission = Admission::LetsHostPathIn;
+        c.policies.insert(
+            "allow-all".into(),
+            json!({"metadata": {"name": "allow-all"}, "spec": {"podSelector": {}, "ingress": [{}], "egress": [{}]}}),
+        );
         c.pods.insert("tinfirm-vm-00112233445566778899aabbccddeeff".into(), json!({
             "metadata": {"name": "tinfirm-vm-00112233445566778899aabbccddeeff",
                          "labels": {"tinfirm.flowtivo.com/sandbox": "vm"}},
@@ -1613,6 +1746,7 @@ mod tests {
             "has found no node for",
             "didn't match pod anti-affinity rules",
             "accepts a run pod with a hostPath volume",
+            "holds the NetworkPolicy allow-all, which is not the chart's: network policies add up, so it may open the run pods",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
@@ -1666,6 +1800,10 @@ mod tests {
         assert!(text.contains("cannot reach the API server"), "{text}");
         assert!(!text.contains("admission policy is missing"), "{text}");
         assert!(!text.contains("there is no"), "{text}");
+        assert!(
+            text.contains("cannot reach the API server to read the network policies"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1678,11 +1816,16 @@ mod tests {
             ("1.5Gi", 3 * 512 * 1024 * 1024 * 1000),
             ("2k", 2_000_000),
             ("1e3", 1_000_000),
+            ("1e+3", 1_000_000),
+            ("1E3", 1_000_000),
+            ("1e-3", 1),
+            ("15e-1", 1500),
+            ("1e-4", 1),
             ("250u", 1),
         ] {
             assert_eq!(milli(text), Some(expected), "{text}");
         }
-        for bad in ["", "x", "1Zi", "-1"] {
+        for bad in ["", "x", "1Zi", "-1", "1e39", "1e-39", "1e99999999999", "1e"] {
             assert_eq!(milli(bad), None, "{bad}");
         }
         let config = config(&good());

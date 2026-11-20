@@ -308,6 +308,14 @@ impl Api {
         self.get(Kind::NetworkPolicies, namespace, name).await
     }
 
+    /// Every network policy of the namespace. This one list takes no label selector: the runs'
+    /// namespace holds exactly two, and the driver must see any other, since network policies
+    /// add up and a third could open the run pods.
+    pub async fn list_network_policies(&self, namespace: &str) -> Result<Vec<Value>, ApiError> {
+        let collection = self.collection(Kind::NetworkPolicies, namespace)?;
+        self.list_at(&collection, &[]).await
+    }
+
     pub async fn get_resource_quota(&self, namespace: &str, name: &str) -> Result<Value, ApiError> {
         self.get(Kind::ResourceQuotas, namespace, name).await
     }
@@ -349,14 +357,18 @@ impl Api {
     ) -> Result<Vec<Value>, ApiError> {
         let collection = self.collection(kind, namespace)?;
         let selector = label_selector(labels).map_err(|e| not_sent(&collection, e))?;
+        self.list_at(&collection, &[("labelSelector", selector)])
+            .await
+    }
+
+    /// The items of the list at `collection`.
+    async fn list_at(
+        &self,
+        collection: &str,
+        query: &[(&str, String)],
+    ) -> Result<Vec<Value>, ApiError> {
         let (call, bytes) = self
-            .call(
-                Method::GET,
-                &collection,
-                &[("labelSelector", selector)],
-                None,
-                MAX_LIST_BODY,
-            )
+            .call(Method::GET, collection, query, None, MAX_LIST_BODY)
             .await?;
         match object_of(call.clone(), &bytes)?
             .get_mut("items")
@@ -1041,10 +1053,15 @@ pub(super) mod tests {
     /// Answers every call as the API would when it succeeds.
     fn ok_handler() -> Handler {
         Arc::new(|seen: &Seen, _: usize| match seen.method.as_str() {
-            "GET" if seen.target.contains("labelSelector") => Reply::Json(
-                200,
-                json!({"kind": "List", "items": [{"metadata": {"name": "a"}}]}),
-            ),
+            "GET"
+                if seen.target.contains("labelSelector")
+                    || seen.target.ends_with("networkpolicies") =>
+            {
+                Reply::Json(
+                    200,
+                    json!({"kind": "List", "items": [{"metadata": {"name": "a"}}]}),
+                )
+            }
             "POST" => {
                 let mut object = seen.body.clone();
                 object["metadata"]["uid"] = json!("0a0b0c0d-0000-4000-8000-000000000001");
@@ -1077,6 +1094,7 @@ pub(super) mod tests {
         api.create_secret(NS, &secret, DryRun::All).await.unwrap();
         api.delete_secret(NS, "tinfirm-ticket-1").await.unwrap();
         api.get_network_policy(NS, "p").await.unwrap();
+        assert_eq!(api.list_network_policies(NS).await.unwrap().len(), 1);
         api.get_resource_quota(NS, "tinfirm-runs").await.unwrap();
 
         let pods = "/api/v1/namespaces/tinfirm-runs/pods";
@@ -1097,6 +1115,7 @@ pub(super) mod tests {
             ("POST", format!("{secrets}?dryRun=All")),
             ("DELETE", format!("{secrets}/tinfirm-ticket-1")),
             ("GET", format!("{policies}/p")),
+            ("GET", policies.to_string()),
             (
                 "GET",
                 "/api/v1/namespaces/tinfirm-runs/resourcequotas/tinfirm-runs".to_string(),
