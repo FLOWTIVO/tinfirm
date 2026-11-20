@@ -32,14 +32,14 @@ use tokio::sync::oneshot;
 use crate::confine::Status;
 
 use super::head::{Backend, BoxError, Declined, ProxyBody, RequestHead, ResponseHead};
-use super::wire::{self, CHECK_REPLY, MAX_TO_FRONT, MAX_TO_MAIN, Service, ToFront, ToMain};
+use super::wire::{self, CHECK_REPLY, MAX_TO_FRONT, Service, ToFront, ToMain};
 use crate::egress_proxy::{Connector, FrontHalf, Granted, Refusal};
 use crate::model_proxy::proxy_error;
 
 /// How much a read takes at most.
 const READ: usize = 64 * 1024;
 /// The most descriptors one read may bring.
-const DESCRIPTORS_PER_READ: usize = 4;
+const DESCRIPTORS_PER_READ: usize = 8;
 
 /// The control channel, as the front reads it: bytes, and the descriptors that came with them,
 /// in order.
@@ -110,31 +110,32 @@ impl Channel {
 }
 
 /// The front's side of writing to `run`: whole frames, one at a time, from any thread.
-struct Writer {
+pub(super) struct Writer {
     socket: OwnedFd,
     /// Held while a frame is written; it holds the last request id the front used.
     lock: std::sync::Mutex<u64>,
 }
 
 impl Writer {
-    fn send(&self, message: &ToMain) -> Result<(), String> {
-        let frame = wire::encode(message, MAX_TO_MAIN).map_err(|e| e.to_string())?;
+    pub(super) fn send(&self, message: &ToMain) -> Result<(), String> {
+        let frame = wire::encode(message, message.max_frame()).map_err(|e| e.to_string())?;
         let _one = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        wire::send_frame(self.socket.as_fd(), &frame, None)
+        wire::send_frame(self.socket.as_fd(), &frame, &[])
             .map_err(|e| format!("cannot write the control channel: {e}"))
     }
 
     /// Sends a new request, `make` of the next id: the id is taken under the lock the frame
     /// is written under, so that ids reach `run` in the order they grow, whichever of the
     /// runtime's threads makes them. The id comes back with whether the frame went.
-    fn send_new(&self, make: impl FnOnce(u64) -> ToMain) -> (u64, Result<(), String>) {
+    pub(super) fn send_new(&self, make: impl FnOnce(u64) -> ToMain) -> (u64, Result<(), String>) {
         let mut last = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         *last += 1;
         let req = *last;
-        let sent = wire::encode(&make(req), MAX_TO_MAIN)
+        let message = make(req);
+        let sent = wire::encode(&message, message.max_frame())
             .map_err(|e| e.to_string())
             .and_then(|frame| {
-                wire::send_frame(self.socket.as_fd(), &frame, None)
+                wire::send_frame(self.socket.as_fd(), &frame, &[])
                     .map_err(|e| format!("cannot write the control channel: {e}"))
             });
         (req, sent)
@@ -567,7 +568,7 @@ pub fn serve(status: Status) -> ExitCode {
         Err(e) => return super::fail(&format!("cannot build its runtime: {e}")),
     };
     // `run`'s messages are read in a thread of their own, in order, descriptors with them.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(ToFront, Option<OwnedFd>), String>>(64);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(ToFront, Vec<OwnedFd>), String>>(64);
     std::thread::spawn(move || {
         let mut channel = Channel {
             socket,
@@ -577,20 +578,15 @@ pub fn serve(status: Status) -> ExitCode {
         loop {
             let item = match channel.next() {
                 Ok(Some(message)) => {
-                    let descriptor = if message.carries_descriptor() {
-                        match channel.descriptors.pop_front() {
-                            Some(fd) => Some(fd),
-                            None => {
-                                let _ = tx.blocking_send(Err(
-                                    "a message came without its descriptor".to_string(),
-                                ));
-                                return;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    Ok((message, descriptor))
+                    let wanted = message.descriptors();
+                    if channel.descriptors.len() < wanted {
+                        let _ = tx.blocking_send(Err(
+                            "a message came without its descriptor".to_string()
+                        ));
+                        return;
+                    }
+                    let descriptors: Vec<OwnedFd> = channel.descriptors.drain(..wanted).collect();
+                    Ok((message, descriptors))
                 }
                 Ok(None) => return,
                 Err(e) => Err(e),
@@ -609,12 +605,13 @@ pub fn serve(status: Status) -> ExitCode {
             waiting: std::sync::Mutex::new(HashMap::new()),
         }));
         let mut model = false;
+        let mut bridge: Option<Arc<super::bridge::FrontBridge>> = None;
         let mut git: Option<Arc<crate::git_proxy::FrontRoutes>> = None;
         let egress_shutdown = tokio_util::sync::CancellationToken::new();
         let model_shutdown = tokio_util::sync::CancellationToken::new();
         let git_shutdown = tokio_util::sync::CancellationToken::new();
         while let Some(item) = rx.recv().await {
-            let (message, descriptor) = match item {
+            let (message, mut descriptors) = match item {
                 Ok(item) => item,
                 Err(e) => return refuse(&e),
             };
@@ -627,7 +624,7 @@ pub fn serve(status: Status) -> ExitCode {
                 _ if !init => return refuse("a message before init"),
                 ToFront::Ping { id } => ToMain::Pong { id },
                 ToFront::Check { id } => {
-                    let fd = descriptor.expect("taken with the message");
+                    let fd = descriptors.pop().expect("taken with the message");
                     let mut file = std::fs::File::from(fd);
                     if std::io::Write::write_all(&mut file, CHECK_REPLY).is_err() {
                         return refuse("cannot write on the descriptor of a check");
@@ -639,7 +636,7 @@ pub fn serve(status: Status) -> ExitCode {
                     return refuse("a second egress listener");
                 }
                 ToFront::ListenEgress { authorization } => {
-                    let fd = descriptor.expect("taken with the message");
+                    let fd = descriptors.pop().expect("taken with the message");
                     let listener = std::net::TcpListener::from(fd);
                     let listener = match listener
                         .set_nonblocking(true)
@@ -661,7 +658,7 @@ pub fn serve(status: Status) -> ExitCode {
                     continue;
                 }
                 ToFront::Connected { req } => {
-                    let fd = descriptor.expect("taken with the message");
+                    let fd = descriptors.pop().expect("taken with the message");
                     if !egress.as_ref().is_some_and(|e| e.answer(req, Ok(fd))) {
                         return refuse("a connection for no request of this front");
                     }
@@ -691,7 +688,7 @@ pub fn serve(status: Status) -> ExitCode {
                     api,
                     base_path,
                 } => {
-                    let fd = descriptor.expect("taken with the message");
+                    let fd = descriptors.pop().expect("taken with the message");
                     let listener = std::net::TcpListener::from(fd);
                     let listener = match listener
                         .set_nonblocking(true)
@@ -718,7 +715,7 @@ pub fn serve(status: Status) -> ExitCode {
                     return refuse("a second git listener");
                 }
                 ToFront::ListenGit { limits } => {
-                    let fd = descriptor.expect("taken with the message");
+                    let fd = descriptors.pop().expect("taken with the message");
                     let listener = std::net::TcpListener::from(fd);
                     let listener = match listener
                         .set_nonblocking(true)
@@ -754,7 +751,7 @@ pub fn serve(status: Status) -> ExitCode {
                     continue;
                 }
                 ToFront::Body { req } => {
-                    let fd = descriptor.expect("taken with the message");
+                    let fd = descriptors.pop().expect("taken with the message");
                     if !requests.body(req, fd) {
                         return refuse("a socket for no request of this front");
                     }
@@ -764,6 +761,110 @@ pub fn serve(status: Status) -> ExitCode {
                     if !requests.response(req, head) {
                         return refuse("an answer to no request of this front");
                     }
+                    continue;
+                }
+                ToFront::BridgeInit { .. } if bridge.is_some() => {
+                    return refuse("a second bridge");
+                }
+                ToFront::BridgeInit {
+                    identity,
+                    timing,
+                    listen,
+                } => {
+                    let listener =
+                        listen.then(|| descriptors.pop().expect("taken with the message"));
+                    match super::bridge::FrontBridge::start(
+                        writer.clone(),
+                        &identity,
+                        &timing,
+                        listener,
+                    ) {
+                        Ok(started) => bridge = Some(started),
+                        Err(e) => return refuse(&e),
+                    }
+                    continue;
+                }
+                ToFront::AllowPeer { ip } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a peer for no bridge");
+                    };
+                    bridge.allow_peer(ip);
+                    continue;
+                }
+                ToFront::Dialed {} => {
+                    let fd = descriptors.pop().expect("taken with the message");
+                    let Some(bridge) = &bridge else {
+                        return refuse("a connection for no bridge");
+                    };
+                    if let Err(e) = bridge.dialed(fd) {
+                        return refuse(&e);
+                    }
+                    continue;
+                }
+                ToFront::Admit { req, admission } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("an admission for no bridge");
+                    };
+                    bridge.admit(req, admission);
+                    continue;
+                }
+                ToFront::Start { id, start } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a start for no bridge");
+                    };
+                    let mut stdio = descriptors.drain(..);
+                    let (Some(stdin), Some(stdout), Some(stderr)) =
+                        (stdio.next(), stdio.next(), stdio.next())
+                    else {
+                        return refuse("a start without its stdio");
+                    };
+                    bridge.start_adapter(id, start, [stdin, stdout, stderr]);
+                    continue;
+                }
+                ToFront::Signal { signal } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a signal for no bridge");
+                    };
+                    bridge.signal(signal);
+                    continue;
+                }
+                ToFront::Stop { grace_seconds } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a stop for no bridge");
+                    };
+                    bridge.stop(grace_seconds);
+                    continue;
+                }
+                ToFront::Reclaim { id, timeout_ms } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a reclaim for no bridge");
+                    };
+                    bridge.reclaim(id, std::time::Duration::from_millis(timeout_ms));
+                    continue;
+                }
+                ToFront::Close { id, timeout_ms } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a close for no bridge");
+                    };
+                    bridge.close(id, std::time::Duration::from_millis(timeout_ms));
+                    continue;
+                }
+                ToFront::Exec { exec } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a command for no bridge");
+                    };
+                    bridge.exec(exec);
+                    continue;
+                }
+                ToFront::Probe {
+                    id,
+                    checks,
+                    timeout_ms,
+                } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("a probe for no bridge");
+                    };
+                    bridge.probe(id, checks, std::time::Duration::from_millis(timeout_ms));
                     continue;
                 }
                 ToFront::End { req, ok } => {

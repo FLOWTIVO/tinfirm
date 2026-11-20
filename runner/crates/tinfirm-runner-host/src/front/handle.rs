@@ -1,10 +1,10 @@
 //! `run`'s side of a front process ([`super::wire`]): it starts the front, holds the control
 //! channel, sends descriptors, and ends the front when it is dropped.
 //!
-//! What a front sends is read as hostile. A frame over [`MAX_TO_MAIN`], a payload that is not
-//! one of the wire's messages, a message out of its bounds, a second `ready`, or an answer to
-//! nothing `run` asked ends that front at once: its process group is killed, and its handle
-//! says why ([`Ended::Broken`]). Nothing else is touched: every front has its own channel,
+//! What a front sends is read as hostile. A frame over [`wire::MAX_TO_MAIN`] (a command's end
+//! over [`wire::MAX_EXEC_FRAME`]), a payload that is not one of the wire's messages, a message
+//! out of its bounds, a second `ready`, or an answer to nothing `run` asked ends that front at
+//! once: its process group is killed, and its handle says why ([`Ended::Broken`]). Nothing else is touched: every front has its own channel,
 //! process group and handle. `run` reads the channel with plain reads, so a descriptor that a
 //! front sends along is closed by the kernel and never reaches `run`.
 //!
@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::confine::{self, Status};
 
-use super::wire::{self, MAX_TO_FRONT, MAX_TO_MAIN, ToFront, ToMain};
+use super::wire::{self, MAX_TO_FRONT, ToFront, ToMain};
 
 /// How long a front has to say that it is ready.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -122,6 +122,14 @@ struct Pending {
     requests: HashMap<super::wire::Service, usize>,
     /// The last request id the front used: ids only grow.
     last_req: u64,
+    /// `run`'s requests about the sandbox's bridge that wait for their answer, by id.
+    answers: HashMap<u64, oneshot::Sender<wire::Reply>>,
+    /// The bridge's connections whose `hello` `run` has not yet seen attached: `true` once
+    /// `run` admitted it.
+    hellos: HashMap<u64, bool>,
+    /// The adapter's end and the session's end were said: each once.
+    exited: bool,
+    session_ended: bool,
 }
 
 /// A request of the front's that is open.
@@ -164,6 +172,20 @@ pub enum FrontRequest {
         service: super::wire::Service,
         why: crate::model_proxy::Declined,
     },
+    /// A connection to the sandbox's bridge said `hello`: answer with [`FrontHandle::admit`].
+    Hello {
+        req: u64,
+        hello: super::wire::WireHello,
+    },
+    /// The connection of `req` was admitted, and its link took it or not.
+    Admitted { req: u64, attached: bool },
+    /// The adapter ended.
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// The bridge's session ended.
+    SessionEnded,
 }
 
 /// The front's requests that wait for their consumer.
@@ -205,7 +227,7 @@ pub struct FrontHandle {
     status: Status,
     writer: tokio::sync::Mutex<OwnedWriteHalf>,
     pending: Arc<Mutex<Pending>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     ended: watch::Receiver<Option<Ended>>,
     life: Arc<Life>,
     answer_timeout: Duration,
@@ -297,6 +319,7 @@ impl FrontHandle {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (ended_tx, ended) = watch::channel(None);
         let (requests_tx, requests) = tokio::sync::mpsc::channel(REQUEST_QUEUE);
+        let next_id = Arc::new(AtomicU64::new(1));
         tokio::spawn(read_loop(
             reader,
             child,
@@ -305,13 +328,14 @@ impl FrontHandle {
             stderr,
             life.clone(),
             requests_tx,
+            next_id.clone(),
         ));
         let handle = FrontHandle {
             pgid,
             status,
             writer: tokio::sync::Mutex::new(writer),
             pending,
-            next_id: AtomicU64::new(1),
+            next_id,
             ended,
             life,
             answer_timeout: ANSWER_TIMEOUT,
@@ -373,8 +397,14 @@ impl FrontHandle {
 
     /// Sends `message`, with `descriptor` when the message carries one.
     pub async fn send(&self, message: &ToFront, descriptor: Option<OwnedFd>) -> Result<()> {
-        if message.carries_descriptor() != descriptor.is_some() {
-            bail!("a message of the wire with a descriptor it does not carry, or without one");
+        self.send_all(message, descriptor.into_iter().collect())
+            .await
+    }
+
+    /// Sends `message` with the descriptors it carries, in order.
+    pub async fn send_all(&self, message: &ToFront, descriptors: Vec<OwnedFd>) -> Result<()> {
+        if message.descriptors() != descriptors.len() {
+            bail!("a message of the wire with descriptors it does not carry, or without them");
         }
         if let Some(ended) = self.ended() {
             bail!("{ended}");
@@ -385,7 +415,7 @@ impl FrontHandle {
             let stream: &UnixStream = (*writer).as_ref();
             let written = stream
                 .async_io(Interest::WRITABLE, || {
-                    wire::send_with(stream.as_fd(), &frame, descriptor.as_ref())
+                    wire::send_with(stream.as_fd(), &frame, &descriptors)
                 })
                 .await
                 .context("cannot write to the front")?;
@@ -407,8 +437,8 @@ impl FrontHandle {
                 bail!("{why}");
             }
         }
-        // The descriptor is the front's now; `run`'s copy goes.
-        drop(descriptor);
+        // The descriptors are the front's now; `run`'s copies go.
+        drop(descriptors);
         Ok(())
     }
 
@@ -500,6 +530,56 @@ impl FrontHandle {
             }
         }
         self.send(&ToFront::End { req, ok }, None).await
+    }
+
+    /// `run`'s decision on the `hello` of the front's request `req`.
+    pub async fn admit(&self, req: u64, admission: super::wire::Admission) -> Result<()> {
+        match lock(&self.pending).hellos.get_mut(&req) {
+            Some(admitted @ false) => *admitted = true,
+            _ => bail!("no hello {req} of the front waits for its admission"),
+        }
+        self.send(&ToFront::Admit { req, admission }, None).await
+    }
+
+    /// A request about the sandbox's bridge, `make` of its id, with its descriptors: the
+    /// front's answer within `timeout`. A request that is not answered in time fails, and the
+    /// front lives on: its sandbox may be slow, and an answer that comes later is dropped.
+    pub async fn ask(
+        &self,
+        make: impl FnOnce(u64) -> ToFront,
+        descriptors: Vec<OwnedFd>,
+        timeout: Duration,
+    ) -> Result<wire::Reply> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        lock(&self.pending).answers.insert(id, tx);
+        let answered = match self.send_all(&make(id), descriptors).await {
+            Ok(()) => {
+                tokio::select! {
+                    answered = tokio::time::timeout(timeout, rx) => match answered {
+                        Ok(Ok(reply)) => Ok(reply),
+                        Ok(Err(_)) => Err(anyhow::anyhow!("{}", self.ended().map_or_else(|| "the front ended".to_string(), |e| e.to_string()))),
+                        Err(_) => Err(anyhow::anyhow!("the sandbox's front did not answer within {} s", timeout.as_secs())),
+                    },
+                    ended = self.wait_ended() => Err(anyhow::anyhow!("{ended}")),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        lock(&self.pending).answers.remove(&id);
+        answered
+    }
+
+    /// Ends the front for `why`, a rule of `run`'s that it broke.
+    pub fn break_wire(&self, why: String) {
+        self.life.break_wire(why);
+    }
+
+    /// `run`'s requests about the bridge that wait for an answer, and the `hello`s that wait
+    /// for their end.
+    pub fn bridge_waiting(&self) -> (usize, usize) {
+        let pending = lock(&self.pending);
+        (pending.answers.len(), pending.hellos.len())
     }
 
     /// One round trip.
@@ -655,6 +735,11 @@ fn kind(message: &ToMain) -> &'static str {
         ToMain::BodyEnd { .. } => "bodyEnd",
         ToMain::Abort { .. } => "abort",
         ToMain::Declined { .. } => "declined",
+        ToMain::Hello { .. } => "hello",
+        ToMain::Admitted { .. } => "admitted",
+        ToMain::Exited { .. } => "exited",
+        ToMain::SessionEnded {} => "sessionEnded",
+        ToMain::Answer { .. } => "answer",
     }
 }
 
@@ -670,7 +755,7 @@ async fn read_message(reader: &mut OwnedReadHalf) -> Result<Option<ToMain>> {
             read => got += read,
         }
     }
-    let length = wire::frame_length(header, MAX_TO_MAIN)?;
+    let length = wire::frame_length(header, wire::MAX_EXEC_FRAME)?;
     let mut payload = vec![0u8; length];
     reader
         .read_exact(&mut payload)
@@ -797,10 +882,56 @@ fn own_request(pending: &mut Pending, message: &ToMain) -> std::result::Result<O
             service: *service,
             why: *why,
         })),
-        ToMain::Ready { .. } | ToMain::Pong { .. } | ToMain::Checked { .. } => Ok(Own::Not),
+        ToMain::Hello { req, hello } => {
+            new(pending, *req)?;
+            if pending.hellos.len() >= wire::MAX_HELLOS {
+                return Err(format!(
+                    "more than {} hellos of the bridge at once",
+                    wire::MAX_HELLOS
+                ));
+            }
+            pending.hellos.insert(*req, false);
+            Ok(Own::Request(FrontRequest::Hello {
+                req: *req,
+                hello: hello.clone(),
+            }))
+        }
+        ToMain::Admitted { req, attached } => match pending.hellos.get(req) {
+            Some(true) => {
+                pending.hellos.remove(req);
+                Ok(Own::Request(FrontRequest::Admitted {
+                    req: *req,
+                    attached: *attached,
+                }))
+            }
+            Some(false) => Err(format!("hello {req} attached before it was admitted")),
+            None => Err(format!("an unknown hello {req} attached")),
+        },
+        ToMain::Exited { code, signal } => {
+            if pending.exited {
+                return Err("the adapter ended twice".into());
+            }
+            pending.exited = true;
+            Ok(Own::Request(FrontRequest::Exited {
+                code: *code,
+                signal: *signal,
+            }))
+        }
+        ToMain::SessionEnded {} => {
+            if pending.session_ended {
+                return Err("the bridge's session ended twice".into());
+            }
+            pending.session_ended = true;
+            Ok(Own::Request(FrontRequest::SessionEnded))
+        }
+        ToMain::Ready { .. }
+        | ToMain::Pong { .. }
+        | ToMain::Checked { .. }
+        | ToMain::Answer { .. } => Ok(Own::Not),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_loop(
     mut reader: OwnedReadHalf,
     mut child: tokio::process::Child,
@@ -809,6 +940,7 @@ async fn read_loop(
     stderr: Arc<Mutex<Vec<u8>>>,
     life: Arc<Life>,
     requests: tokio::sync::mpsc::Sender<FrontRequest>,
+    next_id: Arc<AtomicU64>,
 ) {
     let broken = loop {
         let message = match read_message(&mut reader).await {
@@ -831,6 +963,20 @@ async fn read_loop(
                 continue;
             }
         }
+        // An answer about the bridge: to a request that waits, or to one `run` gave up
+        // waiting for (its sandbox was slow), which is dropped; to one never asked, it breaks
+        // the wire.
+        if let ToMain::Answer { id, reply } = &message {
+            let mut pending = lock(&pending);
+            match pending.answers.remove(id) {
+                Some(tx) => {
+                    let _ = tx.send(reply.clone());
+                    continue;
+                }
+                None if *id < next_id.load(Ordering::Relaxed) => continue,
+                None => break Some(format!("an answer to nothing asked ({id})")),
+            }
+        }
         let answered = {
             let mut pending = lock(&pending);
             match message {
@@ -840,7 +986,12 @@ async fn read_loop(
                 | ToMain::Request { .. }
                 | ToMain::BodyEnd { .. }
                 | ToMain::Abort { .. }
-                | ToMain::Declined { .. } => None,
+                | ToMain::Declined { .. }
+                | ToMain::Hello { .. }
+                | ToMain::Admitted { .. }
+                | ToMain::Exited { .. }
+                | ToMain::SessionEnded {}
+                | ToMain::Answer { .. } => None,
                 ToMain::Pong { id } => pending.pongs.remove(&id),
                 ToMain::Checked { id } => pending.checks.remove(&id),
             }
@@ -896,6 +1047,8 @@ async fn read_loop(
     pending.checks.clear();
     pending.open.clear();
     pending.requests.clear();
+    pending.answers.clear();
+    pending.hellos.clear();
     drop(pending);
     let _ = ended.send(Some(how));
 }

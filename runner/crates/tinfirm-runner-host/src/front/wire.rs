@@ -19,7 +19,13 @@
 //! go each on a socket of its own ([`ToFront::Body`]) while the control channel carries their
 //! heads and ends; a run's listener of the git proxy and the platform tools
 //! ([`ToFront::ListenGit`]) and its routes ([`ToFront::GitRoutes`]), whose requests go the same
-//! way. The next slices add the bridge's and the files' messages.
+//! way; and the sandbox's bridge ([`ToFront::BridgeInit`]): each connection's `hello`, which
+//! `run` decides ([`ToMain::Hello`], [`ToFront::Admit`]), the adapter's start with its stdio on
+//! three sockets, its signals and stop, the reclaim, the close, the host's commands and the
+//! network probe, and the ends of the adapter and of the session. The files' messages follow.
+//!
+//! Every message from a front is at most [`MAX_TO_MAIN`] bytes but a command's end, which
+//! holds its two outputs in base64 and may take [`MAX_EXEC_FRAME`].
 //!
 //! Every request of a front has an id that grows with each request ([`ToMain::Connect`] and
 //! [`ToMain::Request`] share them), so that `run` can tell an answer to a request it ended
@@ -36,8 +42,11 @@ use crate::model_proxy::{ModelApi, RequestHead, ResponseHead};
 
 /// The length prefix of a frame.
 pub const HEADER: usize = 4;
-/// The largest frame a front may send.
+/// The largest frame a front may send, but for a command's end ([`MAX_EXEC_FRAME`]).
 pub const MAX_TO_MAIN: usize = 64 * 1024;
+/// The largest frame of a command's end ([`Reply::ExecDone`]): its two outputs, in base64,
+/// and room for the rest. Every other message stays within [`MAX_TO_MAIN`].
+pub const MAX_EXEC_FRAME: usize = 192 * 1024;
 /// The largest frame `run` may send.
 pub const MAX_TO_FRONT: usize = 1024 * 1024;
 /// The longest text a front may put in a message (its confinement's problem).
@@ -50,18 +59,28 @@ pub const CHECK_REPLY: &[u8] = b"tinfirm-front-check\n";
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ToFront {
     /// The run the front serves; the first message, once.
-    Init { run: Uuid },
+    Init {
+        run: Uuid,
+    },
     /// Answer [`ToMain::Pong`] with the same id.
-    Ping { id: u64 },
+    Ping {
+        id: u64,
+    },
     /// With a descriptor: write [`CHECK_REPLY`] on it, close it, and answer
     /// [`ToMain::Checked`] with the same id.
-    Check { id: u64 },
+    Check {
+        id: u64,
+    },
     /// With a descriptor, a TCP listener that `run` bound: serve the egress proxy's HTTP on
     /// it, for clients that send `Proxy-Authorization: <authorization>` (crate::egress_proxy).
     /// Every destination is `run`'s to decide ([`ToMain::Connect`]).
-    ListenEgress { authorization: String },
+    ListenEgress {
+        authorization: String,
+    },
     /// With a descriptor, the TCP connection `run` made for [`ToMain::Connect`] `req`.
-    Connected { req: u64 },
+    Connected {
+        req: u64,
+    },
     /// `run` refused [`ToMain::Connect`] `req`: the front answers its client with `status`
     /// and `message`, and with the header `x-tinfirm-egress: denied` when `off_allowlist`
     /// (a `403` only: the destination is on none of the run's allowlists).
@@ -80,28 +99,284 @@ pub enum ToFront {
         base_path: String,
     },
     /// Stop serving `service`'s listener and end its connections.
-    Unlisten { service: Service },
+    Unlisten {
+        service: Service,
+    },
     /// With a descriptor, one end of a socket pair for [`ToMain::Request`] `req`: the front
     /// writes the request's body on it, then shuts its writing down; `run` writes the answer's
     /// body on it.
-    Body { req: u64 },
+    Body {
+        req: u64,
+    },
     /// The answer's status and headers for `req`; its body follows on the request's socket.
-    Response { req: u64, head: ResponseHead },
+    Response {
+        req: u64,
+        head: ResponseHead,
+    },
     /// `run` is done with `req`: the answer's body ended whole (`ok`), or was cut off. Nothing
     /// of `req` comes after this.
-    End { req: u64, ok: bool },
+    End {
+        req: u64,
+        ok: bool,
+    },
     /// With a descriptor, a TCP listener that `run` bound for one run: serve the git proxy's
     /// fetches and the platform tools' endpoint on it (crate::git_proxy), within `limits`, for
     /// the routes of [`ToFront::GitRoutes`]. Their requests go to `run` ([`ToMain::Request`]);
     /// no git token and no tool comes here.
-    ListenGit { limits: FrontLimits },
+    ListenGit {
+        limits: FrontLimits,
+    },
     /// The run's routes as they are now, which replace those the front had: each with its
     /// number, which is all that the front hands `run` of it.
     GitRoutes {
         routes: Vec<GitRouteSpec>,
         mcp: Vec<McpRouteSpec>,
     },
+    /// The sandbox's bridge (ADR-0095) is the front's: its TLS identity, which no other
+    /// sandbox's bridge pins, and its timing. With `listen`, a TCP listener that `run` bound
+    /// comes with it, on which the sandbox's bridge connects; without, `run` dials the bridge
+    /// and passes each connection ([`ToFront::Dialed`]).
+    BridgeInit {
+        identity: WireIdentity,
+        timing: WireTiming,
+        listen: bool,
+    },
+    /// The address that the sandbox's bridge connects from: a connection from any other is
+    /// closed before its TLS handshake.
+    AllowPeer {
+        ip: std::net::IpAddr,
+    },
+    /// With a descriptor: a TCP connection to the sandbox's bridge that `run` dialed.
+    Dialed {},
+    /// `run`'s decision on the `hello` of [`ToMain::Hello`] `req`.
+    Admit {
+        req: u64,
+        admission: Admission,
+    },
+    /// With three descriptors, the adapter's stdin, stdout and stderr: start the adapter
+    /// ([`Reply::Done`] once its `start` went to the sandbox).
+    Start {
+        id: u64,
+        start: tinfirm_bridge::control::Start,
+    },
+    Signal {
+        signal: tinfirm_bridge::control::Signal,
+    },
+    Stop {
+        grace_seconds: u64,
+    },
+    /// Stop the agent of an earlier host ([`Reply::Reclaimed`]).
+    Reclaim {
+        id: u64,
+        timeout_ms: u64,
+    },
+    /// The adapter has ended and `run` has what it needs: the bridge ends ([`Reply::Done`]).
+    Close {
+        id: u64,
+        timeout_ms: u64,
+    },
+    /// Run a command in the sandbox ([`Reply::ExecDone`]); its `id` is the request's.
+    Exec {
+        exec: tinfirm_bridge::control::Exec,
+    },
+    /// Probe the sandbox's network from inside ([`Reply::Probed`]).
+    Probe {
+        id: u64,
+        checks: Vec<tinfirm_bridge::control::ProbeCheck>,
+        timeout_ms: u64,
+    },
 }
+
+/// A bridge's TLS identity on the wire: its certificate and its PKCS #8 key, DER in base64.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WireIdentity {
+    pub cert: String,
+    pub key: String,
+}
+
+/// The longest certificate or key of a [`WireIdentity`], in base64.
+pub const MAX_IDENTITY_PART: usize = 16 * 1024;
+
+/// The bridge's timing ([`tinfirm_bridge::host::HostTiming`]) in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WireTiming {
+    pub tick_ms: u64,
+    pub ping_after_ms: u64,
+    pub dead_after_ms: u64,
+    pub write_timeout_ms: u64,
+    pub handshake_ms: u64,
+    pub gone_after_ms: u64,
+    pub tunnel_connect_ms: u64,
+}
+
+/// The longest time of a [`WireTiming`]: a day.
+const MAX_TIMING_MS: u64 = 24 * 60 * 60 * 1000;
+
+impl WireTiming {
+    pub fn of(timing: &tinfirm_bridge::host::HostTiming) -> WireTiming {
+        let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        WireTiming {
+            tick_ms: ms(timing.link.tick),
+            ping_after_ms: ms(timing.link.ping_after),
+            dead_after_ms: ms(timing.link.dead_after),
+            write_timeout_ms: ms(timing.link.write_timeout),
+            handshake_ms: ms(timing.handshake),
+            gone_after_ms: ms(timing.gone_after),
+            tunnel_connect_ms: ms(timing.tunnel_connect),
+        }
+    }
+
+    pub fn host_timing(&self) -> tinfirm_bridge::host::HostTiming {
+        let d = std::time::Duration::from_millis;
+        tinfirm_bridge::host::HostTiming {
+            link: tinfirm_bridge::link::Timing {
+                tick: d(self.tick_ms),
+                ping_after: d(self.ping_after_ms),
+                dead_after: d(self.dead_after_ms),
+                write_timeout: d(self.write_timeout_ms),
+            },
+            handshake: d(self.handshake_ms),
+            gone_after: d(self.gone_after_ms),
+            tunnel_connect: d(self.tunnel_connect_ms),
+            // `run` dials; the front never does.
+            dial_retry: d(1000),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        let all = [
+            self.tick_ms,
+            self.ping_after_ms,
+            self.dead_after_ms,
+            self.write_timeout_ms,
+            self.handshake_ms,
+            self.gone_after_ms,
+            self.tunnel_connect_ms,
+        ];
+        if all.iter().all(|&ms| (1..=MAX_TIMING_MS).contains(&ms)) {
+            Ok(())
+        } else {
+            Err("a bridge's time out of bounds".into())
+        }
+    }
+}
+
+/// `run`'s decision on a bridge's `hello` ([`tinfirm_bridge::host::judge`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum Admission {
+    /// A new session, with its key.
+    New {
+        session: tinfirm_bridge::control::Hidden,
+    },
+    /// The session goes on with the front's link.
+    Resume,
+    /// The session of an earlier host goes on with a new link, after `rx_after`.
+    Reclaim { rx_after: u64 },
+    Refuse {
+        code: tinfirm_bridge::control::RefuseCode,
+        message: String,
+    },
+}
+
+/// A bridge's `hello`, as a front hands it to `run` ([`tinfirm_bridge::host::Hello`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WireHello {
+    pub run_id: String,
+    pub ticket: Option<tinfirm_bridge::control::Hidden>,
+    pub session: Option<tinfirm_bridge::control::Hidden>,
+    pub rx_seq: u64,
+    pub tx_seq: Option<u64>,
+    pub build: Option<String>,
+}
+
+/// The longest run id, ticket or session key of a [`WireHello`], and its longest build.
+pub const MAX_HELLO_NAME: usize = 128;
+pub const MAX_HELLO_BUILD: usize = 64;
+
+impl WireHello {
+    pub fn of(hello: &tinfirm_bridge::host::Hello) -> WireHello {
+        WireHello {
+            run_id: hello.run_id.clone(),
+            ticket: hello.ticket.clone(),
+            session: hello.session.clone(),
+            rx_seq: hello.rx_seq,
+            tx_seq: hello.tx_seq,
+            build: hello.build.clone(),
+        }
+    }
+
+    pub fn hello(&self) -> tinfirm_bridge::host::Hello {
+        tinfirm_bridge::host::Hello {
+            run_id: self.run_id.clone(),
+            ticket: self.ticket.clone(),
+            session: self.session.clone(),
+            rx_seq: self.rx_seq,
+            tx_seq: self.tx_seq,
+            build: self.build.clone(),
+        }
+    }
+
+    /// Its bounds: `run` ends a front that sends a `hello` out of them, so a front refuses such
+    /// a connection itself.
+    pub fn check(&self) -> Result<(), String> {
+        let name =
+            |text: &str| text.len() <= MAX_HELLO_NAME && text.bytes().all(|b| b.is_ascii_graphic());
+        let secret = |secret: &Option<tinfirm_bridge::control::Hidden>| {
+            secret.as_ref().is_none_or(|s| name(s.expose()))
+        };
+        if !name(&self.run_id) || !secret(&self.ticket) || !secret(&self.session) {
+            return Err("a hello's name or secret out of bounds".into());
+        }
+        if self
+            .build
+            .as_ref()
+            .is_some_and(|b| b.len() > MAX_HELLO_BUILD || !b.bytes().all(|b| b.is_ascii_graphic()))
+        {
+            return Err("a hello's build out of bounds".into());
+        }
+        Ok(())
+    }
+}
+
+/// A front's answer to a request of `run`'s about the sandbox's bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum Reply {
+    /// The start or the close is done.
+    Done,
+    /// The agent of an earlier host stopped, if it still ran.
+    Reclaimed {
+        running: bool,
+    },
+    /// The command's end, and its output, each at most
+    /// [`tinfirm_bridge::control::Exec::MAX_OUTPUT`] bytes, in base64: the output is text
+    /// that JSON would escape up to six times its length, base64 four thirds of it.
+    ExecDone {
+        code: Option<i32>,
+        signal: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    /// The names of the checks that got through.
+    Probed {
+        open: Vec<String>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+/// The longest base64 of an exec's output.
+pub const MAX_EXEC_OUTPUT_B64: usize = tinfirm_bridge::control::Exec::MAX_OUTPUT.div_ceil(3) * 4;
+/// The most names in a [`Reply::Probed`], and the longest.
+pub const MAX_PROBED: usize = 64;
+pub const MAX_PROBE_NAME: usize = 256;
+/// The `hello`s a front may have handed `run` that are not yet admitted and attached.
+pub const MAX_HELLOS: usize = 8;
 
 /// The bounds of a listener that a front serves: its open connections, the time a request's
 /// headers have, and the time a connection may stay idle.
@@ -165,15 +440,23 @@ pub const MAX_MODEL_LISTENER: usize = 1024;
 impl ToFront {
     /// Whether this message comes with a descriptor.
     pub fn carries_descriptor(&self) -> bool {
-        matches!(
-            self,
+        self.descriptors() > 0
+    }
+
+    /// How many descriptors come with this message.
+    pub fn descriptors(&self) -> usize {
+        match self {
             ToFront::Check { .. }
-                | ToFront::ListenEgress { .. }
-                | ToFront::Connected { .. }
-                | ToFront::ListenModel { .. }
-                | ToFront::ListenGit { .. }
-                | ToFront::Body { .. }
-        )
+            | ToFront::ListenEgress { .. }
+            | ToFront::Connected { .. }
+            | ToFront::ListenModel { .. }
+            | ToFront::ListenGit { .. }
+            | ToFront::Body { .. }
+            | ToFront::Dialed {} => 1,
+            ToFront::BridgeInit { listen, .. } => usize::from(*listen),
+            ToFront::Start { .. } => 3,
+            _ => 0,
+        }
     }
 
     /// The bounds of `run`'s messages, which a front checks too.
@@ -221,6 +504,22 @@ impl ToFront {
                 }
                 Ok(())
             }
+            ToFront::BridgeInit {
+                identity, timing, ..
+            } => {
+                if identity.cert.len() > MAX_IDENTITY_PART || identity.key.len() > MAX_IDENTITY_PART
+                {
+                    return Err("a bridge identity out of bounds".into());
+                }
+                timing.check()
+            }
+            ToFront::Admit {
+                admission: Admission::Refuse { message, .. },
+                ..
+            } if message.len() > MAX_TEXT => {
+                Err(format!("a refusal's message over {MAX_TEXT} bytes"))
+            }
+            ToFront::Start { start, .. } => start.check(),
             ToFront::Response { head, .. } => {
                 if !(100..=599).contains(&head.status) {
                     return Err(format!("an answer with the status {}", head.status));
@@ -283,6 +582,29 @@ pub enum ToMain {
         service: Service,
         why: crate::model_proxy::Declined,
     },
+    /// A connection to the sandbox's bridge said `hello`: `run` decides ([`ToFront::Admit`]).
+    /// `req` grows with the front's other requests.
+    Hello {
+        req: u64,
+        hello: WireHello,
+    },
+    /// The connection of `req` was admitted and its link took it (`attached`), or not.
+    Admitted {
+        req: u64,
+        attached: bool,
+    },
+    /// The adapter ended.
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// The bridge's session has ended: its link closed, or it had no connection for too long.
+    SessionEnded {},
+    /// The answer to `run`'s request `id`.
+    Answer {
+        id: u64,
+        reply: Reply,
+    },
 }
 
 impl ToMain {
@@ -310,12 +632,44 @@ impl ToMain {
                 Ok(())
             }
             ToMain::Request { head, .. } => head.check(),
+            ToMain::Hello { hello, .. } => hello.check(),
+            ToMain::Answer { reply, .. } => match reply {
+                Reply::ExecDone { stdout, stderr, .. }
+                    if stdout.len() > MAX_EXEC_OUTPUT_B64 || stderr.len() > MAX_EXEC_OUTPUT_B64 =>
+                {
+                    Err("a command's output over its bound".into())
+                }
+                Reply::Probed { open }
+                    if open.len() > MAX_PROBED || open.iter().any(|n| n.len() > MAX_PROBE_NAME) =>
+                {
+                    Err("a probe's answer out of bounds".into())
+                }
+                Reply::Failed { message } if message.len() > MAX_TEXT => {
+                    Err(format!("a failure's message over {MAX_TEXT} bytes"))
+                }
+                _ => Ok(()),
+            },
             ToMain::Pong { .. }
             | ToMain::Checked { .. }
             | ToMain::Closed { .. }
             | ToMain::BodyEnd { .. }
             | ToMain::Abort { .. }
-            | ToMain::Declined { .. } => Ok(()),
+            | ToMain::Declined { .. }
+            | ToMain::Admitted { .. }
+            | ToMain::Exited { .. }
+            | ToMain::SessionEnded {} => Ok(()),
+        }
+    }
+
+    /// The largest frame this message may take: [`MAX_TO_MAIN`], or [`MAX_EXEC_FRAME`] for a
+    /// command's end, whose two outputs it holds.
+    pub fn max_frame(&self) -> usize {
+        match self {
+            ToMain::Answer {
+                reply: Reply::ExecDone { .. },
+                ..
+            } => MAX_EXEC_FRAME,
+            _ => MAX_TO_MAIN,
         }
     }
 }
@@ -345,12 +699,16 @@ pub fn frame_length(header: [u8; HEADER], max: usize) -> Result<usize, WireError
     Ok(length)
 }
 
-/// A front's message from a frame's payload, checked.
+/// A front's message from a frame's payload (of at most [`MAX_EXEC_FRAME`] bytes), checked:
+/// only a command's end may be larger than [`MAX_TO_MAIN`].
 pub fn decode_to_main(payload: &[u8]) -> Result<ToMain, WireError> {
     // serde_json names no value of the input in its errors' text, only where it stopped.
     let message: ToMain = serde_json::from_slice(payload).map_err(|e| {
         WireError::NotAMessage(format!("{:?} at column {}", e.classify(), e.column()))
     })?;
+    if payload.len() > message.max_frame() {
+        return Err(WireError::TooLong(payload.len(), message.max_frame()));
+    }
     message.check().map_err(WireError::OutOfBounds)?;
     Ok(message)
 }
@@ -376,30 +734,39 @@ pub fn encode(message: &impl Serialize, max: usize) -> Result<Vec<u8>, WireError
     Ok(frame)
 }
 
-/// Writes `frame` on the blocking socket `socket`, with `descriptor` on its first byte. A
+/// Writes `frame` on the blocking socket `socket`, with `descriptors` on its first byte. A
 /// write that takes part of the frame is followed by plain writes of the rest.
 pub fn send_frame(
     socket: BorrowedFd<'_>,
     frame: &[u8],
-    descriptor: Option<&OwnedFd>,
+    descriptors: &[OwnedFd],
 ) -> std::io::Result<()> {
-    let written = send_with(socket, frame, descriptor)?;
+    let written = send_with(socket, frame, descriptors)?;
     let mut rest = std::fs::File::from(socket.try_clone_to_owned()?);
     rest.write_all(&frame[written..])
 }
 
-/// One `sendmsg` of `frame`, with `descriptor` attached: how many bytes it took.
+/// The most descriptors one message carries.
+pub const MAX_DESCRIPTORS: usize = 3;
+
+/// One `sendmsg` of `frame`, with `descriptors` attached: how many bytes it took.
 pub fn send_with(
     socket: BorrowedFd<'_>,
     frame: &[u8],
-    descriptor: Option<&OwnedFd>,
+    descriptors: &[OwnedFd],
 ) -> std::io::Result<usize> {
     use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
-    let fds: Vec<BorrowedFd<'_>> = descriptor.iter().map(|fd| fd.as_fd()).collect();
-    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    if descriptors.len() > MAX_DESCRIPTORS {
+        return Err(std::io::Error::other(
+            "too many descriptors for one message",
+        ));
+    }
+    let fds: Vec<BorrowedFd<'_>> = descriptors.iter().map(|fd| fd.as_fd()).collect();
+    let mut space =
+        [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
     let mut control = SendAncillaryBuffer::new(&mut space);
     if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(&fds)) {
-        return Err(std::io::Error::other("no room for the descriptor"));
+        return Err(std::io::Error::other("no room for the descriptors"));
     }
     loop {
         match sendmsg(
@@ -576,6 +943,115 @@ mod tests {
         assert!(response(99, 0).check().is_err());
         assert!(response(600, 0).check().is_err());
         assert!(response(200, 101).check().is_err());
+    }
+
+    #[test]
+    fn the_bridges_messages_keep_their_bounds_and_only_a_commands_end_is_larger() {
+        use tinfirm_bridge::control::Hidden;
+        let hello = |run_id: &str, ticket: &str, build: Option<&str>| ToMain::Hello {
+            req: 1,
+            hello: WireHello {
+                run_id: run_id.into(),
+                ticket: Some(Hidden::new(ticket)),
+                session: None,
+                rx_seq: 0,
+                tx_seq: Some(0),
+                build: build.map(str::to_string),
+            },
+        };
+        let decode = |message: &ToMain| decode_to_main(&serde_json::to_vec(message).unwrap());
+        assert!(decode(&hello("run-1", &"t".repeat(64), Some("1.0.0"))).is_ok());
+        for bad in [
+            hello(&"r".repeat(MAX_HELLO_NAME + 1), "t", None),
+            hello("run 1", "t", None),
+            hello("run-1", &"t".repeat(MAX_HELLO_NAME + 1), None),
+            hello("run-1", "t\n", None),
+            hello("run-1", "t", Some(&"b".repeat(MAX_HELLO_BUILD + 1))),
+        ] {
+            assert!(
+                matches!(decode(&bad), Err(WireError::OutOfBounds(_))),
+                "{bad:?}"
+            );
+        }
+        let exec = |stdout: usize| ToMain::Answer {
+            id: 1,
+            reply: Reply::ExecDone {
+                code: Some(0),
+                signal: None,
+                stdout: "A".repeat(stdout),
+                stderr: "A".repeat(MAX_EXEC_OUTPUT_B64),
+            },
+        };
+        // Both outputs at their bound fit the larger frame, which no other message gets.
+        let full = exec(MAX_EXEC_OUTPUT_B64);
+        let frame = encode(&full, full.max_frame()).unwrap();
+        assert!(frame.len() > MAX_TO_MAIN && frame.len() <= MAX_EXEC_FRAME);
+        assert!(decode(&full).is_ok());
+        assert!(matches!(
+            decode(&exec(MAX_EXEC_OUTPUT_B64 + 1)),
+            Err(WireError::OutOfBounds(_))
+        ));
+        let mut padded = serde_json::to_vec(&hello("run-1", "t", None)).unwrap();
+        padded.pop();
+        padded.extend(vec![b' '; MAX_TO_MAIN]);
+        padded.push(b'}');
+        assert!(matches!(
+            decode_to_main(&padded),
+            Err(WireError::TooLong(_, MAX_TO_MAIN))
+        ));
+        for reply in [
+            Reply::Probed {
+                open: vec!["x".into(); MAX_PROBED + 1],
+            },
+            Reply::Probed {
+                open: vec!["x".repeat(MAX_PROBE_NAME + 1)],
+            },
+            Reply::Failed {
+                message: "m".repeat(MAX_TEXT + 1),
+            },
+        ] {
+            assert!(matches!(
+                decode(&ToMain::Answer { id: 1, reply }),
+                Err(WireError::OutOfBounds(_))
+            ));
+        }
+        // `run`'s side: an identity, a timing and a refusal within their bounds.
+        let timing = WireTiming::of(&tinfirm_bridge::host::HostTiming::default());
+        let init = |cert: usize, timing: WireTiming| ToFront::BridgeInit {
+            identity: WireIdentity {
+                cert: "c".repeat(cert),
+                key: "k".into(),
+            },
+            timing,
+            listen: true,
+        };
+        assert!(init(100, timing).check().is_ok());
+        assert_eq!(init(100, timing).descriptors(), 1);
+        assert!(init(MAX_IDENTITY_PART + 1, timing).check().is_err());
+        assert!(
+            init(
+                100,
+                WireTiming {
+                    handshake_ms: 0,
+                    ..timing
+                }
+            )
+            .check()
+            .is_err()
+        );
+        let refuse = |message: usize| ToFront::Admit {
+            req: 1,
+            admission: Admission::Refuse {
+                code: tinfirm_bridge::control::RefuseCode::BadTicket,
+                message: "m".repeat(message),
+            },
+        };
+        assert!(refuse(MAX_TEXT).check().is_ok());
+        assert!(refuse(MAX_TEXT + 1).check().is_err());
+        assert_eq!(
+            timing.host_timing().handshake,
+            std::time::Duration::from_secs(10)
+        );
     }
 
     #[test]

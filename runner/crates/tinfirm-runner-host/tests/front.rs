@@ -285,9 +285,14 @@ fn hostile_front_child() {
             // Every frame it sends carries a descriptor of a file `run` must never get.
             let file = std::fs::File::open(std::env::var(HOSTILE_FILE).unwrap()).unwrap();
             let fd = std::os::fd::OwnedFd::from(file);
-            wire::send_frame(socket.as_fd(), &frame(&ready()), Some(&fd)).unwrap();
+            wire::send_frame(socket.as_fd(), &frame(&ready()), std::slice::from_ref(&fd)).unwrap();
             while let Some(id) = next_ping() {
-                wire::send_frame(socket.as_fd(), &frame(&ToMain::Pong { id }), Some(&fd)).unwrap();
+                wire::send_frame(
+                    socket.as_fd(),
+                    &frame(&ToMain::Pong { id }),
+                    std::slice::from_ref(&fd),
+                )
+                .unwrap();
             }
         }
         "silent" => std::thread::sleep(Duration::from_secs(60)),

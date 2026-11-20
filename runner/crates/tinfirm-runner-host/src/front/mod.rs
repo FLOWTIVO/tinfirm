@@ -11,7 +11,9 @@
 //! it reads the sandbox's model requests, which `run` checks again and sends on with the
 //! key ([`crate::model_proxy`]); and it reads the fetches and tool calls of the run's own
 //! listener of the git proxy and the platform tools, which `run` checks again and answers with
-//! the run's tokens and tools ([`crate::git_proxy`]). The bridge follows.
+//! the run's tokens and tools ([`crate::git_proxy`]). The sandbox's bridge can run in its front
+//! too ([`session::FrontSession`]: the front does the TLS and the link, `run` decides each
+//! `hello`), but `run` does not use it for its sandboxes yet.
 //! `front --probe JOB` confines itself as a front does
 //! ([`crate::confine::Profile::Front`]) and then tries what a front must be refused, and answers
 //! one line of JSON on stdout ([`Probe`]). `doctor` runs it ([`probe`]). `front` alone serves
@@ -45,11 +47,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::confine::{self, Plan, Status};
 
+mod bridge;
 pub mod conn;
 pub mod handle;
 pub mod head;
 pub mod sandbox;
 mod serve;
+pub mod session;
 pub mod wire;
 
 /// The hidden subcommand that starts a front.

@@ -654,6 +654,14 @@ impl SessionCore {
         }
     }
 
+    /// A handle for what may be done at any time while the session lasts, apart from the
+    /// session's owner: signals, the stop, the close, and the files.
+    pub fn control(&self) -> SessionControl {
+        SessionControl {
+            state: self.state.clone(),
+        }
+    }
+
     /// Before [`SessionCore::start`]: the sandbox listens on each tunnel's address, and each
     /// connection it gets there goes to that tunnel's end and to no other. Returns the
     /// addresses the sandbox listens on, in order: the asked ones (or, for a port 0, the one
@@ -791,6 +799,48 @@ impl SessionCore {
             .await
         {
             tracing::debug!(error = %e, "the sandbox's bridge did not answer the close");
+        }
+    }
+}
+
+/// What may be done with a session at any time, from any task ([`SessionCore::control`]).
+/// Clones share the session; once it has ended, every call fails.
+#[derive(Clone)]
+pub struct SessionControl {
+    state: Arc<State>,
+}
+
+impl SessionControl {
+    pub async fn signal(&self, signal: Signal) -> Result<()> {
+        self.state
+            .link
+            .send_control(&Control::Signal { signal })
+            .await
+            .map_err(|_| anyhow!("the sandbox bridge's link is closed"))
+    }
+
+    /// SIGTERM to the adapter's process group, SIGKILL after `grace`.
+    pub async fn stop(&self, grace: Duration) -> Result<()> {
+        self.state
+            .link
+            .send_control(&Control::Stop {
+                grace_seconds: grace.as_secs().max(1),
+            })
+            .await
+            .map_err(|_| anyhow!("the sandbox bridge's link is closed"))
+    }
+
+    /// After the adapter has ended: the bridge ends. Its answer, within `timeout`.
+    pub async fn close(&self, timeout: Duration) -> Result<()> {
+        self.state
+            .request(|id| Control::Close { id }, timeout)
+            .await
+            .map(|_| ())
+    }
+
+    pub fn files(&self) -> SandboxFiles {
+        SandboxFiles {
+            state: self.state.clone(),
         }
     }
 }

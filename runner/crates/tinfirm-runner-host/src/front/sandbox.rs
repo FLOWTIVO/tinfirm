@@ -70,6 +70,8 @@ struct Router {
     tasks: Arc<AtomicUsize>,
     /// The services whose listener the front has served: each once in the sandbox's life.
     served: Mutex<std::collections::HashSet<Service>>,
+    /// The sandbox's bridge, once the front serves it (crate::front::session).
+    bridge: Mutex<Option<Arc<super::session::BridgeState>>>,
 }
 
 /// A request that `run` answers.
@@ -146,6 +148,17 @@ impl SandboxFront {
                 }
             );
         }
+        Ok(())
+    }
+
+    /// The bridge's state, which this front's dispatcher keeps from now on: one bridge in the
+    /// front's life.
+    pub(crate) fn serve_bridge(&self, state: Arc<super::session::BridgeState>) -> Result<()> {
+        let mut bridge = lock(&self.router.bridge);
+        if bridge.is_some() {
+            bail!("the sandbox's front serves its bridge already");
+        }
+        *bridge = Some(state);
         Ok(())
     }
 
@@ -266,6 +279,10 @@ impl Drop for SandboxFront {
             answering.stop.cancel();
         }
         lock(&self.router.held).clear();
+        // Its bridge's session ends with it.
+        if let Some(state) = lock(&self.router.bridge).clone() {
+            state.end();
+        }
         // The front goes with the handle's last owner: its group is killed and it is reaped.
     }
 }
@@ -356,6 +373,41 @@ async fn dispatch(
                     answering.stop.cancel();
                 }
             }
+            FrontRequest::Hello { req, hello } => {
+                let state = lock(&router.bridge).clone();
+                let decided = match &state {
+                    Some(state) => state.decide(req, &hello),
+                    None => Err(anyhow::anyhow!("a hello to a front that serves no bridge")),
+                };
+                let Some(handle) = front.upgrade() else {
+                    break;
+                };
+                match decided {
+                    Ok(admission) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = handle.admit(req, admission).await {
+                                tracing::debug!(error = %format!("{e:#}"), "cannot answer a hello of the sandbox's front");
+                            }
+                        });
+                    }
+                    Err(e) => handle.break_wire(format!("{e:#}")),
+                }
+            }
+            FrontRequest::Admitted { req, attached } => {
+                if let Some(state) = lock(&router.bridge).clone() {
+                    state.admitted(req, attached);
+                }
+            }
+            FrontRequest::Exited { code, signal } => {
+                if let Some(state) = lock(&router.bridge).clone() {
+                    state.exited(code, signal);
+                }
+            }
+            FrontRequest::SessionEnded => {
+                if let Some(state) = lock(&router.bridge).clone() {
+                    state.end();
+                }
+            }
             FrontRequest::Declined { service, why } => {
                 let backend = match service {
                     Service::Model => lock(&router.model).clone(),
@@ -369,11 +421,14 @@ async fn dispatch(
         }
     }
     // The front ended: its requests end with it, upstream requests included, and the places
-    // of its connections come back.
+    // of its connections come back; its bridge's session ends.
     for answering in lock(&router.requests).values() {
         answering.stop.cancel();
     }
     lock(&router.held).clear();
+    if let Some(state) = lock(&router.bridge).clone() {
+        state.end();
+    }
 }
 
 /// One task of [`Router::tasks`], counted while it lives.
