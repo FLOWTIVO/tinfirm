@@ -2711,6 +2711,24 @@ mod tests {
         assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
     }
 
+    /// An answer's head: what comes until its blank line, the connection's end or an error,
+    /// however many reads it takes.
+    async fn read_head(stream: &mut (impl AsyncRead + Unpin)) -> String {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0u8; 4096];
+            while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+        .await
+        .expect("the proxy answers");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// A tool call's body over the bound is refused with 413 whether its head declares it
     /// (the front half refuses it) or it streams (the run half stops reading at the bound).
     async fn a_tool_call_over_its_bound_is_too_large(mode: Mode) {
@@ -2745,15 +2763,11 @@ mod tests {
                     let _ = write.write_all(b"\r\n0\r\n\r\n").await;
                     write
                 });
-                let mut answer = vec![0u8; 1024];
-                let n = read.read(&mut answer).await.unwrap();
-                let answer = String::from_utf8_lossy(&answer[..n]);
+                let answer = read_head(&mut read).await;
                 assert!(answer.starts_with("HTTP/1.1 413"), "chunked: {answer}");
                 writer.abort();
             } else {
-                let mut answer = vec![0u8; 1024];
-                let n = stream.read(&mut answer).await.unwrap();
-                let answer = String::from_utf8_lossy(&answer[..n]);
+                let answer = read_head(&mut stream).await;
                 assert!(answer.starts_with("HTTP/1.1 413"), "declared: {answer}");
             }
         }
