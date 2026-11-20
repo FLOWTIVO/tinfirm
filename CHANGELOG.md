@@ -10,6 +10,8 @@ Between releases, `main` is a development channel, not a release: the images tag
 
 The first release candidate of 1.0.0, built from the same code as 1.0.0 to test the release itself before the final version: the gate, the signed images and chart, the runner host binaries and the Compose tarball, and their signed `SHA256SUMS`. It contains everything described under 1.0.0 below. Install 1.0.0, not this candidate.
 
+Fixed after this candidate: a run over the sandbox bridge could lose its work and fail with `GIT_ERROR`, "the sandbox's bridge is gone", after 30 s, when its agent ended at the moment the host stopped it. The sandbox's bridge now ignores a stop that comes after the agent has ended, and ends only when the host closes the session. A VM sandbox has the fix once its image holds a runner host of 1.0.0.
+
 ## [1.0.0] - unreleased
 
 The first release of Tinfirm.
