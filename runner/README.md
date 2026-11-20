@@ -987,8 +987,15 @@ deletes only VMs that carry this host's label. The protocol is version 1. `descr
 ([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)): with a `port`, this host dials the
 VM's bridge at `address:port`; without one, at `address:--vm-port`. The bridge in the VM listens on
 `--vm-port` either way. A run's take-back record keeps the port, so that a restarted host dials the
-same; a record without one, such as one written before the field existed, means `--vm-port`. You can write one for another provider or your own
-hypervisor, in any edition: such a host lists no paid feature. A driver must keep the contract C1 to
+same; a record without one, such as one written before the field existed, means `--vm-port`. A
+request is a JSON object with `jsonrpc` `"2.0"`, a `method` and an `id` (a number or a string); the
+protocol has no notifications and no batches. A method that fails is answered with an error of code
+-32000 and a message for this host's log, an unknown method too. A line that is not JSON is
+answered with -32700 and `id` `null`, JSON that is no request with -32600 (with its `id` when it has
+one), and an empty line with nothing. This binary's drivers (`vm-driver digitalocean` and `vm-driver
+node`) do so, and exit non-zero when their input ended after such lines and no request. This host
+reads only the answers to its own ids. You can write one for another provider or
+your own hypervisor, in any edition: such a host lists no paid feature. A driver must keep the contract C1 to
 C7 of the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#62-any-provider-one-contract-a-driver-per-provider).
 

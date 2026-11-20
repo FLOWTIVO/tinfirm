@@ -1102,46 +1102,18 @@ impl NodeDriver {
     }
 }
 
-/// Serves the driver protocol on `input` and `output` until `input` ends: each request in a
-/// task of its own, each answer on a line of its own.
-pub async fn serve<R, W>(driver: Arc<NodeDriver>, input: R, mut output: W) -> Result<()>
+/// Serves the driver protocol on `input` and `output` until `input` ends
+/// ([`crate::vm::serve_driver`]: a line that is not a request gets an error answer).
+pub async fn serve<R, W>(driver: Arc<NodeDriver>, input: R, output: W) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    let writer = tokio::spawn(async move {
-        while let Some(answer) = rx.recv().await {
-            let mut line = serde_json::to_vec(&answer).expect("answers serialize");
-            line.push(b'\n');
-            if output.write_all(&line).await.is_err() || output.flush().await.is_err() {
-                break;
-            }
-        }
-    });
-    let mut reader = BufReader::new(input);
-    while let Some(line) = read_line(&mut reader).await {
-        let Ok(request) = serde_json::from_slice::<Value>(&line) else {
-            continue;
-        };
-        let id = request["id"].clone();
-        let method = request["method"].as_str().unwrap_or_default().to_string();
-        let params = request["params"].clone();
-        let (driver, tx) = (driver.clone(), tx.clone());
-        tokio::spawn(async move {
-            let answer = match driver.handle(&method, params).await {
-                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                Err(e) => {
-                    eprintln!("{method} failed: {e:#}");
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": format!("{e:#}")}})
-                }
-            };
-            let _ = tx.send(answer);
-        });
-    }
-    drop(tx);
-    let _ = writer.await;
-    Ok(())
+    crate::vm::serve_driver(input, output, move |method, params| {
+        let driver = driver.clone();
+        async move { driver.handle(&method, params).await }
+    })
+    .await
 }
 
 /// `vm-driver node`: serves the driver protocol on stdin and stdout.
@@ -1372,6 +1344,54 @@ mod tests {
         assert!(read_key(&key).unwrap_err().to_string().contains("0600"));
     }
 
+    #[tokio::test]
+    async fn a_line_that_is_no_request_gets_an_error_and_a_request_its_answer() {
+        let driver = Arc::new(
+            NodeDriver::new(config(json!({ "nodes": [socket_node("a")] })).unwrap()).unwrap(),
+        );
+        let serve_lines = |input: &'static str| {
+            let driver = driver.clone();
+            async move {
+                let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
+                let served = serve(driver, input.as_bytes(), theirs).await;
+                let mut out = String::new();
+                ours.read_to_string(&mut out).await.unwrap();
+                let answers: Vec<Value> = out
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                (served, answers)
+            }
+        };
+        // Not JSON: a parse error with a null id, and a failure at the end.
+        let (served, answers) = serve_lines("{'jsonrpc': '2.0'}\n").await;
+        assert!(served.is_err());
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0]["error"]["code"], -32700);
+        assert_eq!(answers[0]["id"], Value::Null);
+        // JSON that is no request: invalid, with its id when it has one.
+        let (served, answers) = serve_lines(
+            "{\"jsonrpc\":\"2.0\"}\n[1]\n{\"jsonrpc\":\"1.0\",\"id\":4,\"method\":\"hello\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"hello\"}\n",
+        )
+        .await;
+        assert!(served.is_err());
+        let codes: Vec<&Value> = answers.iter().map(|a| &a["error"]["code"]).collect();
+        assert_eq!(codes, [&json!(-32600); 4]);
+        assert_eq!(answers[2]["id"], 4);
+        // A request among them: answered, and the end is no failure. An empty line gets
+        // nothing.
+        let (served, answers) =
+            serve_lines("\nnot json\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"hello\"}\n").await;
+        assert!(served.is_ok());
+        assert_eq!(answers.len(), 2, "{answers:?}");
+        let hello = answers.iter().find(|a| a["id"] == 7).unwrap();
+        assert_eq!(hello["result"]["driver"], "node");
+        // No input, or empty lines only: nothing, and no failure.
+        for input in ["", "\n\n"] {
+            let (served, answers) = serve_lines(input).await;
+            assert!(served.is_ok() && answers.is_empty());
+        }
+    }
     #[test]
     fn ids_name_their_node_and_builds_compare_by_release() {
         assert_eq!(driver_id("node-1", "vm-0a"), "node-1:vm-0a");

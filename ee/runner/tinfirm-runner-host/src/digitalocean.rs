@@ -45,8 +45,7 @@ use hyper::body::Bytes;
 use hyper::{Method, Request, StatusCode, header};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::vm::{DRIVER_PROTOCOL, HOST_LABEL};
 
@@ -883,46 +882,18 @@ fn labels_param(params: &Value) -> Result<BTreeMap<String, String>> {
     }
 }
 
-/// Serves the driver protocol on `input` and `output` until `input` ends: each request in a
-/// task of its own, each answer on a line of its own.
-pub async fn serve<R, W>(driver: Arc<DigitalOcean>, input: R, mut output: W) -> Result<()>
+/// Serves the driver protocol on `input` and `output` until `input` ends
+/// ([`crate::vm::serve_driver`]: a line that is not a request gets an error answer).
+pub async fn serve<R, W>(driver: Arc<DigitalOcean>, input: R, output: W) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-    let writer = tokio::spawn(async move {
-        while let Some(answer) = rx.recv().await {
-            let mut line = serde_json::to_vec(&answer).expect("answers serialize");
-            line.push(b'\n');
-            if output.write_all(&line).await.is_err() || output.flush().await.is_err() {
-                break;
-            }
-        }
-    });
-    let mut lines = BufReader::new(input).lines();
-    while let Some(line) = lines.next_line().await? {
-        let Ok(request) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let id = request["id"].clone();
-        let method = request["method"].as_str().unwrap_or_default().to_string();
-        let params = request["params"].clone();
-        let (driver, tx) = (driver.clone(), tx.clone());
-        tokio::spawn(async move {
-            let answer = match driver.handle(&method, params).await {
-                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                Err(e) => {
-                    eprintln!("{method} failed: {e:#}");
-                    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": format!("{e:#}")}})
-                }
-            };
-            let _ = tx.send(answer);
-        });
-    }
-    drop(tx);
-    let _ = writer.await;
-    Ok(())
+    crate::vm::serve_driver(input, output, move |method, params| {
+        let driver = driver.clone();
+        async move { driver.handle(&method, params).await }
+    })
+    .await
 }
 
 /// `vm-driver digitalocean`: serves the driver protocol on stdin and stdout.
@@ -981,6 +952,7 @@ mod tests {
     use http_body_util::BodyExt;
     use hyper::body::Incoming;
     use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     const TOKEN: &str = "dop_v1_TEST-ONLY-fake-token";
     const HOST: &str = "0192f1a4-0000-7000-8000-00000000aaaa";
@@ -1540,16 +1512,24 @@ mod tests {
         let (input, output) = tokio::io::split(server);
         let served = tokio::spawn(serve(Arc::new(driver), input, output));
         client
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"hello\",\"params\":{\"protocol\":1}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"describe\",\"params\":{\"id\":\"999\"}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"fly\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"hello\",\"params\":{\"protocol\":1}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"describe\",\"params\":{\"id\":\"999\"}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"fly\",\"params\":{}}\n{'jsonrpc': '2.0'}\n")
             .await
             .unwrap();
         let mut lines = BufReader::new(&mut client).lines();
         let mut answers = BTreeMap::new();
-        while answers.len() < 3 {
+        let mut refused = Vec::new();
+        while answers.len() + refused.len() < 4 {
             let line = lines.next_line().await.unwrap().unwrap();
             let answer: Value = serde_json::from_str(&line).unwrap();
-            answers.insert(answer["id"].as_u64().unwrap(), answer);
+            match answer["id"].as_u64() {
+                Some(id) => {
+                    answers.insert(id, answer);
+                }
+                None => refused.push(answer),
+            }
         }
+        // A line that is not JSON: a parse error, as the node driver answers it.
+        assert_eq!(refused[0]["error"]["code"], crate::vm::PARSE_ERROR);
         assert_eq!(answers[&1]["result"]["driver"], "digitalocean");
         assert_eq!(answers[&1]["result"]["protocol"], DRIVER_PROTOCOL);
         assert_eq!(answers[&2]["result"], json!({"id": "999", "state": "gone"}));

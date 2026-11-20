@@ -1660,3 +1660,65 @@ fn node_identity_writes_a_key_and_certificate_once_and_fingerprint_prints_its_pi
     );
     assert!(!out.status.success());
 }
+
+/// `vm-driver node` answers a line that is not JSON, and JSON that is no request, with a
+/// JSON-RPC error, and exits non-zero when its input held no request besides; a request is
+/// answered, and an input with no line, or empty lines only, ends with success.
+#[test]
+fn the_node_driver_answers_a_line_that_is_no_request_with_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("node-driver.json");
+    std::fs::write(
+        &config,
+        r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox-4c8g"]}]}"#,
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let driver = |input: &str| {
+        run(
+            dir,
+            &["vm-driver", "node", "--config", config],
+            Some(input),
+            None,
+        )
+    };
+    let answers = |out: &Output| -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+
+    // A line that is not JSON: a parse error with a null id, and a failure.
+    let out = driver("{'jsonrpc': '2.0'}\n");
+    assert!(!out.status.success(), "{}", text(&out));
+    let got = answers(&out);
+    assert_eq!(got.len(), 1, "{}", text(&out));
+    assert_eq!(got[0]["jsonrpc"], "2.0");
+    assert_eq!(got[0]["id"], serde_json::Value::Null);
+    assert_eq!(got[0]["error"]["code"], -32700);
+
+    // JSON that is no request: an invalid request.
+    let out = driver("{\"jsonrpc\": \"2.0\", \"id\": 3}\n");
+    assert!(!out.status.success(), "{}", text(&out));
+    let got = answers(&out);
+    assert_eq!(got[0]["error"]["code"], -32600, "{}", text(&out));
+    assert_eq!(got[0]["id"], 3);
+
+    // With a request besides: both answered, and success.
+    let out = driver("not json\n{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"hello\"}\n");
+    assert!(out.status.success(), "{}", text(&out));
+    let got = answers(&out);
+    assert_eq!(got.len(), 2, "{}", text(&out));
+    let hello = got.iter().find(|a| a["id"] == 1).unwrap();
+    assert_eq!(hello["result"]["driver"], "node");
+    assert_eq!(hello["result"]["protocol"], 1);
+
+    // No line, or an empty one: nothing, and success, as before.
+    for input in ["", "\n"] {
+        let out = driver(input);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(out.stdout.is_empty(), "{}", text(&out));
+    }
+}

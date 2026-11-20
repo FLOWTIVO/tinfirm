@@ -642,6 +642,162 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// ----- the driver's side of the protocol -------------------------------------------------
+
+/// A line that is not JSON (JSON-RPC 2.0's parse error).
+pub const PARSE_ERROR: i64 = -32700;
+/// JSON that is not a request of the driver protocol (JSON-RPC 2.0's invalid request).
+pub const INVALID_REQUEST: i64 = -32600;
+/// A method that failed, or that the driver does not have: the message says what.
+pub const DRIVER_ERROR: i64 = -32000;
+/// The longest request line a driver of this binary reads.
+const MAX_REQUEST_LINE: u64 = 1024 * 1024;
+
+/// One line of a driver's input.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestLine {
+    /// Empty, or white space only: skipped without an answer.
+    Empty,
+    /// A request: its `id`, `method` and `params` (`null` when absent).
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    /// Not a request: the error answer it gets.
+    Refused(Value),
+}
+
+fn error_answer(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// What a line of a driver's input is. A request is a JSON object with `jsonrpc` "2.0", a
+/// `method` and an `id` (a number or a string): the protocol has no notifications, so a
+/// request without an `id` is refused too, and so is a batch.
+pub fn read_request(line: &[u8]) -> RequestLine {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return RequestLine::Empty;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return RequestLine::Refused(error_answer(
+            Value::Null,
+            PARSE_ERROR,
+            "the line is not JSON: a request is one JSON-RPC 2.0 object on one line",
+        ));
+    };
+    // The id is answered when it is one; a malformed one is answered as null.
+    let id = match value.get("id") {
+        Some(id @ (Value::Number(_) | Value::String(_))) => id.clone(),
+        _ => Value::Null,
+    };
+    let refuse =
+        |message: &str| RequestLine::Refused(error_answer(id.clone(), INVALID_REQUEST, message));
+    let Value::Object(request) = &value else {
+        return refuse("not a request: a request is a JSON object, and batches are not taken");
+    };
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return refuse("not a request: `jsonrpc` must be \"2.0\"");
+    }
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return refuse("not a request: `method` is missing or not a string");
+    };
+    if id.is_null() {
+        return refuse(
+            "not a request: `id` is missing or not a number or a string (the driver protocol has no notifications)",
+        );
+    }
+    RequestLine::Request {
+        id,
+        method: method.to_string(),
+        params: request.get("params").cloned().unwrap_or(Value::Null),
+    }
+}
+
+/// Serves the driver protocol on `input` and `output` until `input` ends, for this binary's
+/// drivers: each request in a task of its own (`handle` with its method and params), each
+/// answer on a line of its own, in any order. A line that is not a request gets an error
+/// answer ([`PARSE_ERROR`], [`INVALID_REQUEST`]); an empty line none. Fails when the input
+/// held such lines and no request, so that a caller that sent only bad lines sees a failure.
+pub async fn serve_driver<R, W, F, Fut>(input: R, mut output: W, handle: F) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Fn(String, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        while let Some(answer) = rx.recv().await {
+            let mut line = serde_json::to_vec(&answer).expect("answers serialize");
+            line.push(b'\n');
+            if output.write_all(&line).await.is_err() || output.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let (mut requests, mut refused) = (0u64, 0u64);
+    let mut reader = BufReader::new(input);
+    loop {
+        let mut line = Vec::new();
+        match (&mut reader)
+            .take(MAX_REQUEST_LINE + 1)
+            .read_until(b'\n', &mut line)
+            .await
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.last() == Some(&b'\n') => {
+                line.pop();
+            }
+            Ok(_) if line.len() as u64 > MAX_REQUEST_LINE => {
+                // The rest of the line is still to come: nothing after it can be read as a
+                // request.
+                refused += 1;
+                let _ = tx.send(error_answer(
+                    Value::Null,
+                    PARSE_ERROR,
+                    &format!("a line over {MAX_REQUEST_LINE} bytes; no more input is read"),
+                ));
+                break;
+            }
+            Ok(_) => {}
+        }
+        match read_request(&line) {
+            RequestLine::Empty => {}
+            RequestLine::Refused(answer) => {
+                refused += 1;
+                eprintln!(
+                    "{}",
+                    answer["error"]["message"].as_str().unwrap_or_default()
+                );
+                let _ = tx.send(answer);
+            }
+            RequestLine::Request { id, method, params } => {
+                requests += 1;
+                let (work, tx) = (handle(method.clone(), params), tx.clone());
+                tokio::spawn(async move {
+                    let answer = match work.await {
+                        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                        Err(e) => {
+                            eprintln!("{method} failed: {e:#}");
+                            error_answer(id, DRIVER_ERROR, &format!("{e:#}"))
+                        }
+                    };
+                    let _ = tx.send(answer);
+                });
+            }
+        }
+    }
+    drop(tx);
+    let _ = writer.await;
+    if refused > 0 && requests == 0 {
+        bail!(
+            "the input held {refused} line(s) that are no request of the driver protocol, each answered with an error, and no request"
+        );
+    }
+    Ok(())
+}
+
 // ----- the executor --------------------------------------------------------------------
 
 /// The VM executor: its options and its driver.
