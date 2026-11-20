@@ -177,6 +177,9 @@ struct Life {
     group: Mutex<Option<u32>>,
     /// Set when `run` ends the front for a reason of its own (a request without an answer).
     broken: Mutex<Option<String>>,
+    /// Set when `run` itself ends the front because it no longer wants it (its last owner went):
+    /// what the front sends or how its channel ends after that is no fault of the front's.
+    ending: std::sync::atomic::AtomicBool,
 }
 
 impl Life {
@@ -243,6 +246,7 @@ impl FrontHandle {
         let life = Arc::new(Life {
             group: Mutex::new(Some(pgid)),
             broken: Mutex::new(None),
+            ending: std::sync::atomic::AtomicBool::new(false),
         });
         let stderr = Arc::new(Mutex::new(Vec::new()));
         if let Some(mut pipe) = child.stderr.take() {
@@ -557,10 +561,44 @@ impl FrontHandle {
     }
 }
 
+impl FrontHandle {
+    /// `run` no longer wants the front: from now on its end is an ordinary one, whatever the
+    /// front still sends (an end of a connection that its listener's close ended) and however
+    /// its channel ends (a reset, when the kill finds bytes of `run`'s unread).
+    pub fn ending(&self) {
+        self.life
+            .ending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A watch on the front's end that outlives the handle.
+    pub fn end_watch(&self) -> EndWatch {
+        EndWatch(self.ended.clone())
+    }
+}
+
+/// How a front ends, also once its handle is gone ([`FrontHandle::end_watch`]).
+pub struct EndWatch(watch::Receiver<Option<Ended>>);
+
+impl EndWatch {
+    pub async fn wait(mut self) -> Ended {
+        loop {
+            if let Some(how) = self.0.borrow_and_update().clone() {
+                return how;
+            }
+            if self.0.changed().await.is_err() {
+                return Ended::Broken("its handle's reader stopped".into());
+            }
+        }
+    }
+}
+
 impl Drop for FrontHandle {
     fn drop(&mut self) {
         // Its channel closes with the handle, and the front exits on that; its group goes too,
         // whatever it is doing, unless it is reaped already. The reader goes on and reaps it.
+        // An end that `run` causes is no broken wire.
+        self.ending();
         self.life.kill();
     }
 }
@@ -801,6 +839,15 @@ async fn read_loop(
             }
             None => break Some(format!("an unasked {}", kind(&message))),
         }
+    };
+    // Only a front that breaks the rules while `run` still wants it broke its wire; what the
+    // read sees once `run` ended the front itself follows from that end.
+    let broken = match broken {
+        Some(why) if life.ending.load(std::sync::atomic::Ordering::SeqCst) => {
+            tracing::debug!(pid = ?child.id(), why = %why, "a front that run ended stopped");
+            None
+        }
+        other => other,
     };
     if let Some(why) = &broken {
         tracing::warn!(pid = ?child.id(), why = %why, "a front broke its wire; it is ended");

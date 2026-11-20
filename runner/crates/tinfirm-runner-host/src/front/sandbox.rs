@@ -214,6 +214,9 @@ impl SandboxFront {
 
 impl Drop for SandboxFront {
     fn drop(&mut self) {
+        // `run` ends this front: nothing it still sends, and no reset of its channel, is a
+        // fault from now on (the dispatcher that took its requests goes first).
+        self.handle.ending();
         self.dispatcher.abort();
         for (_, answering) in lock(&self.router.requests).drain() {
             answering.stop.cancel();

@@ -2033,3 +2033,100 @@ async fn a_front_serves_one_listener_of_each_service_and_run_refuses_a_second() 
     .await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_front_that_ends_with_its_run_is_no_broken_wire() {
+    use tinfirm_runner_host::model_proxy::{ModelProxy, ModelProxySettings};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let endpoint = Endpoint {
+        bind: "127.0.0.2:0".parse().unwrap(),
+        sandbox_host: "127.0.0.2".into(),
+        extra_hosts: Vec::new(),
+    };
+    let server = echo_and_http().await;
+    let gateway = silent_gateway().await;
+    for traffic in [false, true] {
+        let front = SandboxFront::start(&the_front()).await.unwrap();
+        let end = front.handle().end_watch();
+        let egress = EgressProxy::new(
+            EgressSettings {
+                allow: vec![Rule::parse(&format!("127.0.0.1:{}", server.port())).unwrap()],
+                allow_private: false,
+                allow_loopback: true,
+            },
+            &endpoint,
+        )
+        .start_run_at(uuid::Uuid::new_v4(), Vec::new(), None, Some(front.clone()))
+        .await
+        .unwrap();
+        let access = tinfirm_protocol::ModelAccess {
+            format: tinfirm_protocol::ModelFormat::Anthropic,
+            base_url: Some(format!("http://{gateway}")),
+            region: None,
+            access_key_id: None,
+            api_key: tinfirm_protocol::Secret::new("sk-TEST-ONLY-ending-front-key"),
+        };
+        let model = ModelProxy::new(
+            ModelProxySettings {
+                allow_private: false,
+                local_gateway: None,
+                allow_loopback: true,
+                allow_http: true,
+            },
+            &endpoint,
+        )
+        .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front.clone()))
+        .await
+        .unwrap();
+        let mut open = Vec::new();
+        if traffic {
+            // A tunnel that is open, and a model request that waits for its gateway, when
+            // the run ends.
+            let auth = egress.proxy_authorization().to_string();
+            let (mut tunnel, head) = proxy_request(
+                &egress,
+                &format!("CONNECT {server} HTTP/1.1\r\nHost: {server}\r\nProxy-Authorization: {auth}\r\n\r\n"),
+            )
+            .await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            tunnel.write_all(b"ping").await.unwrap();
+            let mut echoed = [0u8; 4];
+            tunnel.read_exact(&mut echoed).await.unwrap();
+            open.push(tunnel);
+            let path = format!(
+                "{}/v1/messages",
+                url::Url::parse(model.base_url()).unwrap().path()
+            );
+            let mut request = tokio::net::TcpStream::connect(model.local_addr())
+                .await
+                .unwrap();
+            request
+                .write_all(
+                    format!("POST {path} HTTP/1.1\r\nhost: p\r\ncontent-length: 2\r\n\r\n{{}}")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..500 {
+                if front.answering() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(front.answering(), 1);
+            open.push(request);
+        }
+        // The run ends: its listeners close, and the sandbox's front goes with the last owner.
+        drop(model);
+        drop(egress);
+        drop(front);
+        let ended = tokio::time::timeout(Duration::from_secs(10), end.wait())
+            .await
+            .unwrap();
+        assert!(
+            !matches!(ended, Ended::Broken(_)),
+            "traffic {traffic}: {ended:?}"
+        );
+        drop(open);
+    }
+}
