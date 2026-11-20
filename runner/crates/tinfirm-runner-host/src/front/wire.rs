@@ -14,8 +14,14 @@
 //! The messages of this version: the front's [`ToMain::Ready`] with its confinement, then a
 //! round trip ([`ToFront::Ping`]) and a check that descriptors arrive ([`ToFront::Check`]);
 //! the egress proxy's listener ([`ToFront::ListenEgress`]), and its destinations, which the
-//! front asks `run` for ([`ToMain::Connect`]) and `run` connects or refuses. The next slices
-//! add the model's and git's proxies, the bridge's and the files' messages.
+//! front asks `run` for ([`ToMain::Connect`]) and `run` connects or refuses; the model proxy's
+//! listener ([`ToFront::ListenModel`]), and its requests ([`ToMain::Request`]), whose bodies
+//! go each on a socket of its own ([`ToFront::Body`]) while the control channel carries their
+//! heads and ends. The next slices add git's proxy, the bridge's and the files' messages.
+//!
+//! Every request of a front has an id that grows with each request ([`ToMain::Connect`] and
+//! [`ToMain::Request`] share them), so that `run` can tell an answer to a request it ended
+//! from one to a request that never was.
 
 use std::io::{IoSlice, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -24,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::confine::Status;
+use crate::model_proxy::{ModelApi, RequestHead, ResponseHead};
 
 /// The length prefix of a frame.
 pub const HEADER: usize = 4;
@@ -62,6 +69,33 @@ pub enum ToFront {
         message: String,
         off_allowlist: bool,
     },
+    /// With a descriptor, a TCP listener that `run` bound: serve the model proxy's HTTP on it
+    /// for the run whose secret is `secret` (crate::model_proxy). Its requests go to `run`
+    /// ([`ToMain::Request`]); the key never comes here.
+    ListenModel {
+        secret: String,
+        api: ModelApi,
+        base_path: String,
+    },
+    /// Stop serving `service`'s listener and end its connections.
+    Unlisten { service: Service },
+    /// With a descriptor, one end of a socket pair for [`ToMain::Request`] `req`: the front
+    /// writes the request's body on it, then shuts its writing down; `run` writes the answer's
+    /// body on it.
+    Body { req: u64 },
+    /// The answer's status and headers for `req`; its body follows on the request's socket.
+    Response { req: u64, head: ResponseHead },
+    /// `run` is done with `req`: the answer's body ended whole (`ok`), or was cut off. Nothing
+    /// of `req` comes after this.
+    End { req: u64, ok: bool },
+}
+
+/// A listener of the front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Service {
+    Egress,
+    Model,
 }
 
 /// The longest proxy credential `run` gives a front.
@@ -71,13 +105,22 @@ pub const MAX_HOST: usize = 253;
 /// The connections a front may have asked for and not yet seen end: its open tunnels and
 /// plain HTTP requests (256 each per run, as in-process), with room for those `run` decides.
 pub const MAX_FRONT_REQUESTS: usize = 512;
+/// The model requests a front may have open at `run`, from its `request` to `run`'s `end`:
+/// the model proxy's connections per run, each with one request at a time.
+pub const MAX_MODEL_REQUESTS: usize = crate::model_proxy::MAX_CONNECTIONS;
+/// The longest secret and base path of a model listener.
+pub const MAX_MODEL_LISTENER: usize = 1024;
 
 impl ToFront {
     /// Whether this message comes with a descriptor.
     pub fn carries_descriptor(&self) -> bool {
         matches!(
             self,
-            ToFront::Check { .. } | ToFront::ListenEgress { .. } | ToFront::Connected { .. }
+            ToFront::Check { .. }
+                | ToFront::ListenEgress { .. }
+                | ToFront::Connected { .. }
+                | ToFront::ListenModel { .. }
+                | ToFront::Body { .. }
         )
     }
 
@@ -103,6 +146,20 @@ impl ToFront {
                 }
                 if message.len() > MAX_TEXT {
                     return Err(format!("a refusal's message over {MAX_TEXT} bytes"));
+                }
+                Ok(())
+            }
+            ToFront::ListenModel {
+                secret, base_path, ..
+            } if secret.len() > MAX_MODEL_LISTENER || base_path.len() > MAX_MODEL_LISTENER => {
+                Err("a model listener's secret or base path out of bounds".into())
+            }
+            ToFront::Response { head, .. } => {
+                if !(100..=599).contains(&head.status) {
+                    return Err(format!("an answer with the status {}", head.status));
+                }
+                if head.headers.len() > crate::model_proxy::MAX_RESPONSE_HEADERS {
+                    return Err("an answer with too many headers".into());
                 }
                 Ok(())
             }
@@ -137,6 +194,28 @@ pub enum ToMain {
     Closed {
         req: u64,
     },
+    /// A client of the model proxy sent a request that the front half let through: `run`
+    /// checks the head again, and answers with [`ToFront::Body`], then [`ToFront::Response`]
+    /// and [`ToFront::End`].
+    Request {
+        req: u64,
+        head: RequestHead,
+    },
+    /// The request body of `req` is on its socket whole.
+    BodyEnd {
+        req: u64,
+    },
+    /// The client of `req` is gone, or its body broke: `run` ends the request and says
+    /// [`ToFront::End`]. Said of a request `run` ended already, it is nothing.
+    Abort {
+        req: u64,
+    },
+    /// The front answered a request of `service` itself (its secret, path, method or head),
+    /// for the run's counts and log.
+    Declined {
+        service: Service,
+        why: crate::model_proxy::Declined,
+    },
 }
 
 impl ToMain {
@@ -163,7 +242,13 @@ impl ToMain {
                 }
                 Ok(())
             }
-            ToMain::Pong { .. } | ToMain::Checked { .. } | ToMain::Closed { .. } => Ok(()),
+            ToMain::Request { head, .. } => head.check(),
+            ToMain::Pong { .. }
+            | ToMain::Checked { .. }
+            | ToMain::Closed { .. }
+            | ToMain::BodyEnd { .. }
+            | ToMain::Abort { .. }
+            | ToMain::Declined { .. } => Ok(()),
         }
     }
 }
@@ -359,6 +444,71 @@ mod tests {
         assert!(refused(403).check().is_ok());
         assert!(refused(400).check().is_err());
         assert!(refused(502).check().is_err());
+    }
+
+    #[test]
+    fn a_model_request_is_a_head_that_http_allows_within_its_bounds() {
+        use crate::model_proxy::{BodyLength, ModelEndpoint, RequestHead, ResponseHead};
+        let head = RequestHead {
+            endpoint: ModelEndpoint::AnthropicMessages,
+            method: "POST".into(),
+            query: Some("beta=true".into()),
+            headers: vec![("anthropic-version".into(), "2023-06-01".into())],
+            length: BodyLength::Exact(2),
+        };
+        let request = |head: &RequestHead| {
+            serde_json::to_vec(&ToMain::Request {
+                req: 1,
+                head: head.clone(),
+            })
+            .unwrap()
+        };
+        assert!(decode_to_main(&request(&head)).is_ok());
+        let mut bad = Vec::new();
+        for value in ["a\r\nhost: elsewhere", "a\nb", "a\0b"] {
+            let mut head = head.clone();
+            head.headers.push(("x-a".into(), value.into()));
+            bad.push(head);
+        }
+        let mut many = head.clone();
+        many.headers = (0..65).map(|i| (format!("x-h{i}"), "v".into())).collect();
+        bad.push(many);
+        let mut long = head.clone();
+        long.headers = vec![("x-a".into(), "v".repeat(8 * 1024 + 1))];
+        bad.push(long);
+        let mut name = head.clone();
+        name.headers = vec![("x a".into(), "v".into())];
+        bad.push(name);
+        for query in ["a b", &"q".repeat(4097)] {
+            let mut head = head.clone();
+            head.query = Some(query.into());
+            bad.push(head);
+        }
+        let mut method = head.clone();
+        method.method = "PO ST".into();
+        bad.push(method);
+        for head in bad {
+            assert!(
+                matches!(
+                    decode_to_main(&request(&head)),
+                    Err(WireError::OutOfBounds(_))
+                ),
+                "{head:?}"
+            );
+        }
+        let response = |status: u16, headers: usize| ToFront::Response {
+            req: 1,
+            head: ResponseHead {
+                status,
+                headers: (0..headers)
+                    .map(|i| (format!("x-h{i}"), "v".into()))
+                    .collect(),
+            },
+        };
+        assert!(response(200, 100).check().is_ok());
+        assert!(response(99, 0).check().is_err());
+        assert!(response(600, 0).check().is_err());
+        assert!(response(200, 101).check().is_err());
     }
 
     #[test]

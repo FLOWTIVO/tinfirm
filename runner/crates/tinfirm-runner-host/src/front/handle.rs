@@ -116,11 +116,27 @@ impl std::fmt::Display for Ended {
 struct Pending {
     pongs: HashMap<u64, oneshot::Sender<()>>,
     checks: HashMap<u64, oneshot::Sender<()>>,
-    /// The front's own requests (`connect`) that are open: `true` once `run` gave the
-    /// connection, until the front says it ended.
-    connects: HashMap<u64, bool>,
+    /// The front's own requests that are open.
+    open: HashMap<u64, Open>,
+    /// How many of them are model requests.
+    model_requests: usize,
     /// The last request id the front used: ids only grow.
     last_req: u64,
+}
+
+/// A request of the front's that is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// A `connect`: `given` once `run` gave the connection, until the front says it ended.
+    Connect { given: bool },
+    /// A model `request`, until `run` ends it: whether its socket went to the front, its
+    /// answer's head did, its body ended, and the front gave it up.
+    Request {
+        body: bool,
+        responded: bool,
+        body_ended: bool,
+        aborted: bool,
+    },
 }
 
 /// What a front asks `run` for ([`FrontHandle::take_requests`]).
@@ -131,6 +147,21 @@ pub enum FrontRequest {
     Connect { req: u64, host: String, port: u16 },
     /// The connection given for `req` has ended.
     Closed { req: u64 },
+    /// A model request: answer with [`FrontHandle::body`], [`FrontHandle::respond`] and
+    /// [`FrontHandle::end`].
+    Request {
+        req: u64,
+        head: crate::model_proxy::RequestHead,
+    },
+    /// The body of request `req` is whole on its socket.
+    BodyEnd { req: u64 },
+    /// The front gave request `req` up: end it.
+    Abort { req: u64 },
+    /// The front answered a request itself.
+    Declined {
+        service: super::wire::Service,
+        why: crate::model_proxy::Declined,
+    },
 }
 
 /// The front's requests that wait for their consumer.
@@ -383,8 +414,10 @@ impl FrontHandle {
 
     /// Gives the front the connection for its request `req`.
     pub async fn grant(&self, req: u64, connection: OwnedFd) -> Result<()> {
-        match lock(&self.pending).connects.get_mut(&req) {
-            Some(granted @ false) => *granted = true,
+        match lock(&self.pending).open.get_mut(&req) {
+            Some(Open::Connect {
+                given: given @ false,
+            }) => *given = true,
             _ => bail!("no open request {req} of the front waits for a connection"),
         }
         self.send(&ToFront::Connected { req }, Some(connection))
@@ -393,9 +426,14 @@ impl FrontHandle {
 
     /// Refuses the front's request `req`, with what its client is to get.
     pub async fn refuse(&self, req: u64, refusal: &crate::egress_proxy::Refusal) -> Result<()> {
-        match lock(&self.pending).connects.remove(&req) {
-            Some(false) => {}
-            _ => bail!("no open request {req} of the front waits for an answer"),
+        {
+            let mut pending = lock(&self.pending);
+            match pending.open.get(&req) {
+                Some(Open::Connect { given: false }) => {
+                    pending.open.remove(&req);
+                }
+                _ => bail!("no open request {req} of the front waits for an answer"),
+            }
         }
         let mut message: String = refusal.message.chars().take(wire::MAX_TEXT / 4).collect();
         message.truncate(wire::MAX_TEXT);
@@ -413,7 +451,46 @@ impl FrontHandle {
 
     /// The front's requests that are open: asked, or given and not yet ended.
     pub fn open_requests(&self) -> usize {
-        lock(&self.pending).connects.len()
+        lock(&self.pending).open.len()
+    }
+
+    /// Gives the front the socket of its model request `req`, on which it writes the body.
+    pub async fn body(&self, req: u64, socket: OwnedFd) -> Result<()> {
+        match lock(&self.pending).open.get_mut(&req) {
+            Some(Open::Request {
+                body: body @ false, ..
+            }) => *body = true,
+            _ => bail!("no open model request {req} of the front waits for its socket"),
+        }
+        self.send(&ToFront::Body { req }, Some(socket)).await
+    }
+
+    /// The answer's head for the model request `req`, once its socket is the front's.
+    pub async fn respond(&self, req: u64, head: crate::model_proxy::ResponseHead) -> Result<()> {
+        match lock(&self.pending).open.get_mut(&req) {
+            Some(Open::Request {
+                body: true,
+                responded: responded @ false,
+                ..
+            }) => *responded = true,
+            _ => bail!("no open model request {req} of the front waits for its answer"),
+        }
+        self.send(&ToFront::Response { req, head }, None).await
+    }
+
+    /// Ends the model request `req`: its answer's body ended whole (`ok`), or not.
+    pub async fn end(&self, req: u64, ok: bool) -> Result<()> {
+        {
+            let mut pending = lock(&self.pending);
+            match pending.open.get(&req) {
+                Some(Open::Request { .. }) => {
+                    pending.open.remove(&req);
+                    pending.model_requests -= 1;
+                }
+                _ => bail!("no open model request {req} of the front to end"),
+            }
+        }
+        self.send(&ToFront::End { req, ok }, None).await
     }
 
     /// One round trip.
@@ -531,6 +608,10 @@ fn kind(message: &ToMain) -> &'static str {
         ToMain::Checked { .. } => "checked",
         ToMain::Connect { .. } => "connect",
         ToMain::Closed { .. } => "closed",
+        ToMain::Request { .. } => "request",
+        ToMain::BodyEnd { .. } => "bodyEnd",
+        ToMain::Abort { .. } => "abort",
+        ToMain::Declined { .. } => "declined",
     }
 }
 
@@ -555,6 +636,121 @@ async fn read_message(reader: &mut OwnedReadHalf) -> Result<Option<ToMain>> {
     Ok(Some(wire::decode_to_main(&payload)?))
 }
 
+/// What a message about the front's own requests is.
+enum Own {
+    /// Not such a message: an answer to `run`.
+    Not,
+    /// One that `run` lets go: about a request it ended already.
+    Nothing,
+    /// One for whoever serves the front's requests.
+    Request(FrontRequest),
+}
+
+/// What a message of the front's own requests asks `run` for; `Err` for one that breaks the
+/// wire's rules.
+fn own_request(pending: &mut Pending, message: &ToMain) -> std::result::Result<Own, String> {
+    let new = |pending: &mut Pending, req: u64| {
+        if req <= pending.last_req {
+            return Err(format!("a request {req} after {}", pending.last_req));
+        }
+        pending.last_req = req;
+        Ok(())
+    };
+    // An answer about a request that `run` has ended already (a client that left while `run`
+    // answered) is nothing; one about a request that never was breaks the wire.
+    let unknown = |pending: &Pending, req: u64, what: &str| {
+        if req <= pending.last_req {
+            Ok(Own::Nothing)
+        } else {
+            Err(format!("{what} of an unknown request {req}"))
+        }
+    };
+    match message {
+        ToMain::Connect { req, host, port } => {
+            new(pending, *req)?;
+            let connects = pending.open.len() - pending.model_requests;
+            if connects >= wire::MAX_FRONT_REQUESTS {
+                return Err(format!(
+                    "more than {} open requests",
+                    wire::MAX_FRONT_REQUESTS
+                ));
+            }
+            pending.open.insert(*req, Open::Connect { given: false });
+            Ok(Own::Request(FrontRequest::Connect {
+                req: *req,
+                host: host.clone(),
+                port: *port,
+            }))
+        }
+        ToMain::Closed { req } => match pending.open.get(req) {
+            Some(Open::Connect { given: true }) => {
+                pending.open.remove(req);
+                Ok(Own::Request(FrontRequest::Closed { req: *req }))
+            }
+            Some(Open::Connect { given: false }) => {
+                Err(format!("request {req} closed before it was given"))
+            }
+            _ => Err(format!("an unknown request {req} closed")),
+        },
+        ToMain::Request { req, head } => {
+            new(pending, *req)?;
+            if pending.model_requests >= wire::MAX_MODEL_REQUESTS {
+                return Err(format!(
+                    "more than {} open model requests",
+                    wire::MAX_MODEL_REQUESTS
+                ));
+            }
+            pending.model_requests += 1;
+            pending.open.insert(
+                *req,
+                Open::Request {
+                    body: false,
+                    responded: false,
+                    body_ended: false,
+                    aborted: false,
+                },
+            );
+            Ok(Own::Request(FrontRequest::Request {
+                req: *req,
+                head: head.clone(),
+            }))
+        }
+        ToMain::BodyEnd { req } => match pending.open.get_mut(req) {
+            Some(Open::Request {
+                body: true,
+                body_ended: ended @ false,
+                ..
+            }) => {
+                *ended = true;
+                Ok(Own::Request(FrontRequest::BodyEnd { req: *req }))
+            }
+            Some(Open::Request { body: false, .. }) => Err(format!(
+                "the body of request {req} ended before it had a socket"
+            )),
+            Some(Open::Request { .. }) => Err(format!("the body of request {req} ended twice")),
+            Some(Open::Connect { .. }) => Err(format!("the body of a connect {req} ended")),
+            None => unknown(pending, *req, "the body's end"),
+        },
+        ToMain::Abort { req } => match pending.open.get_mut(req) {
+            Some(Open::Request {
+                aborted: aborted @ false,
+                ..
+            }) => {
+                *aborted = true;
+                Ok(Own::Request(FrontRequest::Abort { req: *req }))
+            }
+            Some(Open::Request { .. }) => Ok(Own::Nothing),
+            Some(Open::Connect { .. }) => Err(format!("an abort of a connect {req}")),
+            None => unknown(pending, *req, "an abort"),
+        },
+        ToMain::Declined { service, why } => Ok(Own::Request(FrontRequest::Declined {
+            service: *service,
+            why: *why,
+        })),
+        ToMain::Ready { .. } | ToMain::Pong { .. } | ToMain::Checked { .. } => Ok(Own::Not),
+    }
+}
+
 async fn read_loop(
     mut reader: OwnedReadHalf,
     mut child: tokio::process::Child,
@@ -571,47 +767,30 @@ async fn read_loop(
             Err(e) => break Some(format!("{e:#}")),
         };
         // The front's own requests: in order, bounded, and each closed only once given.
-        let request = {
-            let mut pending = lock(&pending);
-            match &message {
-                ToMain::Connect { req, host, port } => {
-                    if *req <= pending.last_req {
-                        break Some(format!("a request {req} after {}", pending.last_req));
-                    }
-                    if pending.connects.len() >= wire::MAX_FRONT_REQUESTS {
-                        break Some(format!(
-                            "more than {} open requests",
-                            wire::MAX_FRONT_REQUESTS
-                        ));
-                    }
-                    pending.last_req = *req;
-                    pending.connects.insert(*req, false);
-                    Some(FrontRequest::Connect {
-                        req: *req,
-                        host: host.clone(),
-                        port: *port,
-                    })
-                }
-                ToMain::Closed { req } => match pending.connects.remove(req) {
-                    Some(true) => Some(FrontRequest::Closed { req: *req }),
-                    Some(false) => {
-                        break Some(format!("request {req} closed before it was given"));
-                    }
-                    None => break Some(format!("an unknown request {req} closed")),
-                },
-                _ => None,
-            }
+        let request = match own_request(&mut lock(&pending), &message) {
+            Ok(request) => request,
+            Err(why) => break Some(why),
         };
-        if let Some(request) = request {
-            if requests.send(request).await.is_err() {
-                break Some("no one serves the front's requests".to_string());
+        match request {
+            Own::Not => {}
+            Own::Nothing => continue,
+            Own::Request(request) => {
+                if requests.send(request).await.is_err() {
+                    break Some("no one serves the front's requests".to_string());
+                }
+                continue;
             }
-            continue;
         }
         let answered = {
             let mut pending = lock(&pending);
             match message {
-                ToMain::Ready { .. } | ToMain::Connect { .. } | ToMain::Closed { .. } => None,
+                ToMain::Ready { .. }
+                | ToMain::Connect { .. }
+                | ToMain::Closed { .. }
+                | ToMain::Request { .. }
+                | ToMain::BodyEnd { .. }
+                | ToMain::Abort { .. }
+                | ToMain::Declined { .. } => None,
                 ToMain::Pong { id } => pending.pongs.remove(&id),
                 ToMain::Checked { id } => pending.checks.remove(&id),
             }
@@ -656,7 +835,8 @@ async fn read_loop(
     let mut pending = lock(&pending);
     pending.pongs.clear();
     pending.checks.clear();
-    pending.connects.clear();
+    pending.open.clear();
+    pending.model_requests = 0;
     drop(pending);
     let _ = ended.send(Some(how));
 }

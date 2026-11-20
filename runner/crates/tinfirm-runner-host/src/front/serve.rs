@@ -6,8 +6,11 @@
 //! `run` closes its end, and then exits. It answers `run`'s requests in order; an egress
 //! listener that `run` passes it is served on the runtime ([`crate::egress_proxy::serve`]),
 //! and each connection it needs is asked of `run` ([`ToMain::Connect`]) and given back as a
-//! descriptor or refused. Its frames go out through one writer, under a lock, so they never
-//! interleave. A message that is not one of the wire's, that breaks its bounds, that wants a
+//! descriptor or refused; a model listener is served there too ([`crate::model_proxy::serve`]),
+//! and each request it lets through goes to `run` ([`ToMain::Request`]), its body and its
+//! answer's body on a socket `run` gives for it. Its frames go out through one writer, under a
+//! lock, so they never interleave, and a new request takes its id under that lock, so the ids
+//! reach `run` in the order they grow. A message that is not one of the wire's, that breaks its bounds, that wants a
 //! descriptor that did not come with it, that comes before `init` or a second time, or that
 //! answers a request the front did not make ends the front with exit code 3: `run`'s messages
 //! are trusted, so such a message means a fault, and the front does not guess.
@@ -18,10 +21,20 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use hyper::body::{Bytes, Frame};
+use tokio::sync::oneshot;
+
 use crate::confine::Status;
 
-use super::wire::{self, CHECK_REPLY, MAX_TO_FRONT, MAX_TO_MAIN, ToFront, ToMain};
+use super::wire::{self, CHECK_REPLY, MAX_TO_FRONT, MAX_TO_MAIN, Service, ToFront, ToMain};
 use crate::egress_proxy::{Connector, FrontHalf, Granted, Refusal};
+use crate::model_proxy::{
+    BoxError, Declined, ModelBackend, ProxyBody, RequestHead, ResponseHead, proxy_error,
+};
 
 /// How much a read takes at most.
 const READ: usize = 64 * 1024;
@@ -99,7 +112,8 @@ impl Channel {
 /// The front's side of writing to `run`: whole frames, one at a time, from any thread.
 struct Writer {
     socket: OwnedFd,
-    lock: std::sync::Mutex<()>,
+    /// Held while a frame is written; it holds the last request id the front used.
+    lock: std::sync::Mutex<u64>,
 }
 
 impl Writer {
@@ -109,6 +123,22 @@ impl Writer {
         wire::send_frame(self.socket.as_fd(), &frame, None)
             .map_err(|e| format!("cannot write the control channel: {e}"))
     }
+
+    /// Sends a new request, `make` of the next id: the id is taken under the lock the frame
+    /// is written under, so that ids reach `run` in the order they grow, whichever of the
+    /// runtime's threads makes them. The id comes back with whether the frame went.
+    fn send_new(&self, make: impl FnOnce(u64) -> ToMain) -> (u64, Result<(), String>) {
+        let mut last = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        *last += 1;
+        let req = *last;
+        let sent = wire::encode(&make(req), MAX_TO_MAIN)
+            .map_err(|e| e.to_string())
+            .and_then(|frame| {
+                wire::send_frame(self.socket.as_fd(), &frame, None)
+                    .map_err(|e| format!("cannot write the control channel: {e}"))
+            });
+        (req, sent)
+    }
 }
 
 /// The front's connections for the egress proxy: each destination is asked of `run`
@@ -116,7 +146,6 @@ impl Writer {
 /// refuses. The front tells `run` when a connection it was given has ended.
 struct WireConnector {
     writer: Arc<Writer>,
-    next: std::sync::atomic::AtomicU64,
     waiting: std::sync::Mutex<HashMap<u64, Answer>>,
 }
 
@@ -177,13 +206,14 @@ impl Connector for WireConnector {
         host: String,
         port: u16,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Granted, Refusal>> + Send>> {
-        let req = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiting
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(req, tx);
-        let sent = self.writer.send(&ToMain::Connect { req, host, port });
+        let (req, sent) = self.writer.send_new(|req| {
+            self.waiting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(req, tx);
+            ToMain::Connect { req, host, port }
+        });
         if sent.is_err() {
             // `run` never heard of it, so it waits for no answer.
             self.waiting
@@ -214,6 +244,277 @@ impl Connector for WireConnector {
     }
 }
 
+/// The front's way to the model proxy's run half: each request's head goes to `run`
+/// ([`ToMain::Request`]), its body on the socket `run` gives for it ([`ToFront::Body`]), and
+/// the answer comes back the same way. At most [`wire::MAX_MODEL_REQUESTS`] are open at `run`
+/// at once, from the request to `run`'s end of it; more wait here.
+#[derive(Clone)]
+struct ModelWire(Arc<ModelInner>);
+
+struct ModelInner {
+    writer: Arc<Writer>,
+    open: Arc<tokio::sync::Semaphore>,
+    waiting: std::sync::Mutex<HashMap<u64, Waiting>>,
+}
+
+/// A model request that `run` has not ended yet.
+struct Waiting {
+    body: Option<oneshot::Sender<OwnedFd>>,
+    response: Option<oneshot::Sender<ResponseHead>>,
+    end: Option<oneshot::Sender<bool>>,
+    /// Set when `run` ended the request: no abort goes then.
+    ended: Arc<AtomicBool>,
+    _place: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Tells `run` to end a request that the front gave up (its client left, or its body broke),
+/// when it is dropped before `run` ended the request. It goes with the request's handler and
+/// then with the answer's body, so whatever drops them, `run` hears of it.
+struct AbortNotice {
+    writer: Arc<Writer>,
+    req: u64,
+    ended: Arc<AtomicBool>,
+}
+
+impl Drop for AbortNotice {
+    fn drop(&mut self) {
+        if !self.ended.load(Ordering::SeqCst) {
+            let _ = self.writer.send(&ToMain::Abort { req: self.req });
+        }
+    }
+}
+
+impl ModelWire {
+    fn waiting<T>(&self, req: u64, take: impl FnOnce(&mut Waiting) -> Option<T>) -> Option<T> {
+        let mut waiting = self.0.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.get_mut(&req).and_then(take)
+    }
+
+    /// The socket of `req`: `false` when no request of that id waits for one.
+    fn body(&self, req: u64, fd: OwnedFd) -> bool {
+        match self.waiting(req, |w| w.body.take()) {
+            Some(tx) => {
+                // A client that left drops the receiver; the socket closes with the send.
+                drop(tx.send(fd));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The answer's head of `req`: `false` when no request of that id waits for one.
+    fn response(&self, req: u64, head: ResponseHead) -> bool {
+        match self.waiting(req, |w| w.response.take()) {
+            Some(tx) => {
+                drop(tx.send(head));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `run`'s end of `req`: `false` when no request of that id is open.
+    fn end(&self, req: u64, ok: bool) -> bool {
+        let waiting = self
+            .0
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&req);
+        match waiting {
+            Some(mut waiting) => {
+                waiting.ended.store(true, Ordering::SeqCst);
+                if let Some(end) = waiting.end.take() {
+                    let _ = end.send(ok);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl ModelBackend for ModelWire {
+    fn call(
+        &self,
+        head: RequestHead,
+        body: ProxyBody,
+    ) -> Pin<Box<dyn Future<Output = (ResponseHead, ProxyBody)> + Send>> {
+        let inner = self.0.clone();
+        Box::pin(async move {
+            let gone = || {
+                proxy_error(
+                    hyper::StatusCode::BAD_GATEWAY,
+                    "the Tinfirm model proxy's runner host did not answer",
+                )
+            };
+            let Ok(place) = inner.open.clone().acquire_owned().await else {
+                return gone();
+            };
+            let (body_tx, body_rx) = oneshot::channel();
+            let (response_tx, response_rx) = oneshot::channel();
+            let (end_tx, end_rx) = oneshot::channel();
+            let ended = Arc::new(AtomicBool::new(false));
+            let (req, sent) = inner.writer.send_new(|req| {
+                inner
+                    .waiting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        req,
+                        Waiting {
+                            body: Some(body_tx),
+                            response: Some(response_tx),
+                            end: Some(end_tx),
+                            ended: ended.clone(),
+                            _place: place,
+                        },
+                    );
+                ToMain::Request { req, head }
+            });
+            if sent.is_err() {
+                inner
+                    .waiting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&req);
+                return gone();
+            }
+            let notice = AbortNotice {
+                writer: inner.writer.clone(),
+                req,
+                ended,
+            };
+            let Ok(fd) = body_rx.await else {
+                return gone();
+            };
+            let socket = std::os::unix::net::UnixStream::from(fd);
+            let Ok(socket) = socket
+                .set_nonblocking(true)
+                .and_then(|()| tokio::net::UnixStream::from_std(socket))
+            else {
+                return gone();
+            };
+            let (read, mut write) = socket.into_split();
+            // The body goes while the answer may come: `run` may answer before it read it all.
+            let head = {
+                let copy = copy_request(body, &mut write, &inner.writer, req);
+                tokio::pin!(copy);
+                let mut copied = false;
+                let mut response_rx = response_rx;
+                loop {
+                    tokio::select! {
+                        copy = &mut copy, if !copied => {
+                            copied = true;
+                            if copy == Copy::ClientBroke {
+                                // `run` waits for a body that will not end: it ends the request.
+                                let _ = inner.writer.send(&ToMain::Abort { req });
+                            }
+                            // A socket `run` closed: it answered without the rest of the body.
+                        }
+                        head = &mut response_rx => break head,
+                    }
+                }
+            };
+            drop(write);
+            let Ok(head) = head else {
+                return gone();
+            };
+            (head, answer_body(read, end_rx, notice))
+        })
+    }
+
+    fn declined(&self, why: Declined) {
+        let _ = self.0.writer.send(&ToMain::Declined {
+            service: Service::Model,
+            why,
+        });
+    }
+}
+
+/// How the copy of a request body ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Copy {
+    Whole,
+    /// The client's body broke (it left, or its framing did).
+    ClientBroke,
+    /// `run` closed the socket: it answered already.
+    SocketClosed,
+}
+
+/// Writes the client's request body on the request's socket, then shuts it down and tells
+/// `run` the body is whole.
+async fn copy_request(
+    mut body: ProxyBody,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    writer: &Writer,
+    req: u64,
+) -> Copy {
+    use http_body_util::BodyExt;
+    use tokio::io::AsyncWriteExt;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return Copy::ClientBroke;
+        };
+        if let Ok(data) = frame.into_data()
+            && write.write_all(&data).await.is_err()
+        {
+            return Copy::SocketClosed;
+        }
+    }
+    if write.shutdown().await.is_err() {
+        return Copy::SocketClosed;
+    }
+    match writer.send(&ToMain::BodyEnd { req }) {
+        Ok(()) => Copy::Whole,
+        Err(_) => Copy::SocketClosed,
+    }
+}
+
+/// The answer's body from the request's socket: whole only when `run` ends the request with
+/// `ok` after the socket's end; otherwise an error, which cuts the client's answer off.
+fn answer_body(
+    read: tokio::net::unix::OwnedReadHalf,
+    end: oneshot::Receiver<bool>,
+    notice: AbortNotice,
+) -> ProxyBody {
+    use http_body_util::BodyExt;
+    use tokio::io::AsyncReadExt;
+    let stream = futures::stream::unfold(Some((read, end, notice)), |state| async move {
+        let (mut read, end, notice) = state?;
+        let mut buffer = vec![0u8; READ];
+        match read.read(&mut buffer).await {
+            Ok(n) if n > 0 => {
+                buffer.truncate(n);
+                Some((
+                    Ok(Frame::data(Bytes::from(buffer))),
+                    Some((read, end, notice)),
+                ))
+            }
+            // The socket's end, or its reset when `run` closed it with bytes of the request
+            // unread (it answered without them): `run`'s end says whether the answer is whole.
+            _ => match end.await {
+                Ok(true) => {
+                    drop(notice);
+                    None
+                }
+                _ => {
+                    // What came before the cut goes out first, as when this process is `run`:
+                    // the server writes what it holds while the body waits, not after an error.
+                    tokio::task::yield_now().await;
+                    Some((
+                        Err::<Frame<Bytes>, BoxError>(
+                            "the model gateway's answer was cut off".into(),
+                        ),
+                        None,
+                    ))
+                }
+            },
+        }
+    });
+    http_body_util::StreamBody::new(stream).boxed_unsync()
+}
+
 /// Serves the control channel until `run` closes it: the front's own messages in this thread's
 /// order, and the egress proxy's HTTP in its runtime.
 pub fn serve(status: Status) -> ExitCode {
@@ -224,7 +525,7 @@ pub fn serve(status: Status) -> ExitCode {
     let writer = match socket.try_clone() {
         Ok(fd) => Arc::new(Writer {
             socket: fd,
-            lock: std::sync::Mutex::new(()),
+            lock: std::sync::Mutex::new(0),
         }),
         Err(e) => return super::fail(&format!("no control channel on stdin: {e}")),
     };
@@ -280,7 +581,9 @@ pub fn serve(status: Status) -> ExitCode {
     runtime.block_on(async move {
         let mut init = false;
         let mut egress: Option<Arc<WireConnector>> = None;
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut model: Option<ModelWire> = None;
+        let egress_shutdown = tokio_util::sync::CancellationToken::new();
+        let model_shutdown = tokio_util::sync::CancellationToken::new();
         while let Some(item) = rx.recv().await {
             let (message, descriptor) = match item {
                 Ok(item) => item,
@@ -318,11 +621,10 @@ pub fn serve(status: Status) -> ExitCode {
                     };
                     let connector = Arc::new(WireConnector {
                         writer: writer.clone(),
-                        next: std::sync::atomic::AtomicU64::new(1),
                         waiting: std::sync::Mutex::new(HashMap::new()),
                     });
                     egress = Some(connector.clone());
-                    let half = FrontHalf::new(authorization, connector, shutdown.clone());
+                    let half = FrontHalf::new(authorization, connector, egress_shutdown.clone());
                     tokio::spawn(crate::egress_proxy::serve(listener, half));
                     continue;
                 }
@@ -349,12 +651,72 @@ pub fn serve(status: Status) -> ExitCode {
                     }
                     continue;
                 }
+                ToFront::ListenModel { .. } if model.is_some() => {
+                    return refuse("a second model listener");
+                }
+                ToFront::ListenModel {
+                    secret,
+                    api,
+                    base_path,
+                } => {
+                    let fd = descriptor.expect("taken with the message");
+                    let listener = std::net::TcpListener::from(fd);
+                    let listener = match listener
+                        .set_nonblocking(true)
+                        .and_then(|()| tokio::net::TcpListener::from_std(listener))
+                    {
+                        Ok(listener) => listener,
+                        Err(e) => return refuse(&format!("the model listener: {e}")),
+                    };
+                    let wire = ModelWire(Arc::new(ModelInner {
+                        writer: writer.clone(),
+                        open: Arc::new(tokio::sync::Semaphore::new(wire::MAX_MODEL_REQUESTS)),
+                        waiting: std::sync::Mutex::new(HashMap::new()),
+                    }));
+                    model = Some(wire.clone());
+                    let half = crate::model_proxy::FrontHalf::new(
+                        secret,
+                        api,
+                        base_path,
+                        Arc::new(wire),
+                        model_shutdown.clone(),
+                    );
+                    tokio::spawn(crate::model_proxy::serve(listener, half));
+                    continue;
+                }
+                ToFront::Unlisten { service } => {
+                    match service {
+                        Service::Egress => egress_shutdown.cancel(),
+                        Service::Model => model_shutdown.cancel(),
+                    }
+                    continue;
+                }
+                ToFront::Body { req } => {
+                    let fd = descriptor.expect("taken with the message");
+                    if !model.as_ref().is_some_and(|m| m.body(req, fd)) {
+                        return refuse("a socket for no request of this front");
+                    }
+                    continue;
+                }
+                ToFront::Response { req, head } => {
+                    if !model.as_ref().is_some_and(|m| m.response(req, head)) {
+                        return refuse("an answer to no request of this front");
+                    }
+                    continue;
+                }
+                ToFront::End { req, ok } => {
+                    if !model.as_ref().is_some_and(|m| m.end(req, ok)) {
+                        return refuse("an end of no request of this front");
+                    }
+                    continue;
+                }
             };
             if let Err(e) = writer.send(&answer) {
                 return super::fail(&e);
             }
         }
-        shutdown.cancel();
+        egress_shutdown.cancel();
+        model_shutdown.cancel();
         ExitCode::SUCCESS
     })
 }

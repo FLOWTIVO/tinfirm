@@ -385,10 +385,10 @@ async fn the_egress_proxy_answers_through_the_tunnel() {
         let host = start_host(&server.url, setup).await;
         let mut conn = server.accept().await;
         conn.handshake(5).await;
-        // With the bridge, a front process serves the proxy's HTTP (path C, part 2).
+        // With the bridge, a front process serves the sandbox's proxy HTTP (path C, part 2).
         assert!(
-            host.host.egress_proxy().await.unwrap().unwrap().has_front(),
-            "no front serves the egress proxy"
+            host.host.sandbox_front().await.unwrap().is_some(),
+            "no front serves the sandboxes' proxies"
         );
         // An allowed destination: the proxy, reached through the tunnel, connects to it.
         let mut spec = AssignSpec::new("egress", None);

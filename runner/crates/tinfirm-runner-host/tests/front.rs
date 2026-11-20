@@ -391,6 +391,10 @@ fn hostile_front_child() {
                 }
             }
         }
+        mode if mode.starts_with("model-") => {
+            let _ = out.write_all(&frame(&ready()));
+            hostile_model_front(&socket, mode);
+        }
         "deaf" => {
             // Ready, and then it never reads its channel.
             let _ = out.write_all(&frame(&ready()));
@@ -412,6 +416,220 @@ fn hostile_front_child() {
     }
     // Stay, as a front that broke the wire and goes on: `run` must end it.
     std::thread::sleep(Duration::from_secs(60));
+}
+
+/// `run`'s next frame, with the descriptor that came with it.
+fn read_with_descriptor(
+    socket: &std::os::fd::OwnedFd,
+) -> Option<(ToFront, Option<std::os::fd::OwnedFd>)> {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+    use std::io::Read;
+    let mut header = [0u8; 4];
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let got = recvmsg(
+        socket,
+        &mut [std::io::IoSliceMut::new(&mut header)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC | RecvFlags::WAITALL,
+    )
+    .ok()?;
+    if got.bytes != 4 {
+        return None;
+    }
+    let mut descriptor = None;
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(mut fds) = message {
+            descriptor = fds.next();
+        }
+    }
+    let mut payload = vec![0u8; u32::from_be_bytes(header) as usize];
+    std::fs::File::from(socket.try_clone().ok()?)
+        .read_exact(&mut payload)
+        .ok()?;
+    Some((wire::decode_to_front(&payload).ok()?, descriptor))
+}
+
+/// The model modes of the hostile fake front: after `ready`, `init` and the model listener,
+/// requests that `run` must refuse by its own rules (`model-rules`), or that break the wire.
+fn hostile_model_front(socket: &std::os::fd::OwnedFd, mode: &str) {
+    use std::io::Write;
+    use tinfirm_runner_host::model_proxy::{BodyLength, ModelEndpoint, RequestHead};
+    let mut out = std::fs::File::from(socket.try_clone().unwrap());
+    let mut send = |message: &ToMain| {
+        let _ = out.write_all(&wire::encode(message, wire::MAX_TO_MAIN).unwrap());
+    };
+    let _init = read_with_descriptor(socket);
+    let _listener = read_with_descriptor(socket);
+    let head = |endpoint, method: &str, length| RequestHead {
+        endpoint,
+        method: method.into(),
+        query: None,
+        headers: vec![("content-type".into(), "application/json".into())],
+        length,
+    };
+    let messages = head(ModelEndpoint::AnthropicMessages, "POST", BodyLength::Empty);
+    // The socket of `req`, then its answer's status and its end.
+    let answer = |req: u64, body: Option<&[u8]>, send: &mut dyn FnMut(&ToMain)| {
+        let mut status = None;
+        loop {
+            match read_with_descriptor(socket)? {
+                (ToFront::Body { req: got }, Some(fd)) if got == req => {
+                    let mut stream = std::os::unix::net::UnixStream::from(fd);
+                    if let Some(body) = body {
+                        let _ = stream.write_all(body);
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                        send(&ToMain::BodyEnd { req });
+                    }
+                    // Kept open, unread: `run` answers on it.
+                    std::mem::forget(stream);
+                }
+                (ToFront::Response { req: got, head }, _) if got == req => {
+                    status = Some(head.status)
+                }
+                (ToFront::End { req: got, .. }, _) if got == req => return status,
+                _ => {}
+            }
+        }
+    };
+    match mode {
+        "model-rules" => {
+            // Heads the front half would never let through: `run` refuses each by its rules.
+            let cases: Vec<(RequestHead, Option<&[u8]>, u16)> = vec![
+                (
+                    head(ModelEndpoint::OpenaiResponses, "POST", BodyLength::Empty),
+                    Some(b""),
+                    404,
+                ),
+                (
+                    head(ModelEndpoint::AnthropicMessages, "GET", BodyLength::Empty),
+                    Some(b""),
+                    405,
+                ),
+                (
+                    head(ModelEndpoint::AnthropicModels, "POST", BodyLength::Empty),
+                    Some(b""),
+                    405,
+                ),
+                (
+                    head(
+                        ModelEndpoint::AnthropicMessages,
+                        "POST",
+                        BodyLength::Exact(tinfirm_runner_host::model_proxy::MAX_REQUEST_BODY + 1),
+                    ),
+                    Some(b""),
+                    413,
+                ),
+                // A body longer than its head said, and one shorter.
+                (
+                    head(
+                        ModelEndpoint::AnthropicMessages,
+                        "POST",
+                        BodyLength::Exact(5),
+                    ),
+                    Some(b"0123456789"),
+                    400,
+                ),
+                (
+                    head(
+                        ModelEndpoint::AnthropicMessages,
+                        "POST",
+                        BodyLength::Exact(10),
+                    ),
+                    Some(b"01234"),
+                    400,
+                ),
+            ];
+            let mut failed = Vec::new();
+            for (i, (head, body, want)) in cases.into_iter().enumerate() {
+                let req = i as u64 + 1;
+                send(&ToMain::Request {
+                    req,
+                    head: head.clone(),
+                });
+                let got = answer(req, body, &mut send);
+                if got != Some(want) {
+                    failed.push(format!("{head:?}: {got:?}, not {want}"));
+                }
+            }
+            if failed.is_empty() {
+                std::process::exit(0);
+            }
+            eprintln!("not refused as expected: {failed:?}");
+            std::process::exit(1);
+        }
+        "model-socket-closed" => {
+            // It closes the request's socket at once and says nothing of its body: `run`
+            // ends the request all the same.
+            let mut streamed = messages.clone();
+            streamed.length = BodyLength::Streamed;
+            send(&ToMain::Request {
+                req: 1,
+                head: streamed,
+            });
+            loop {
+                match read_with_descriptor(socket) {
+                    Some((ToFront::Body { .. }, fd)) => drop(fd),
+                    Some((ToFront::End { req: 1, .. }, _)) => std::process::exit(0),
+                    Some(_) => {}
+                    None => std::process::exit(1),
+                }
+            }
+        }
+        "model-crlf" => {
+            let mut bad = messages.clone();
+            bad.headers
+                .push(("x-injected".into(), "a\r\nhost: elsewhere".into()));
+            send(&ToMain::Request { req: 1, head: bad });
+        }
+        "model-headers" => {
+            let mut many = messages.clone();
+            many.headers = (0..65).map(|i| (format!("x-h{i}"), "v".into())).collect();
+            send(&ToMain::Request { req: 1, head: many });
+        }
+        "model-query" => {
+            let mut bad = messages.clone();
+            bad.query = Some("a b".into());
+            send(&ToMain::Request { req: 1, head: bad });
+        }
+        "model-order" => {
+            send(&ToMain::Request {
+                req: 5,
+                head: messages.clone(),
+            });
+            send(&ToMain::Request {
+                req: 3,
+                head: messages.clone(),
+            });
+        }
+        "model-body-end-twice" => {
+            send(&ToMain::Request {
+                req: 1,
+                head: messages.clone(),
+            });
+            while let Some((message, fd)) = read_with_descriptor(socket) {
+                if let ToFront::Body { .. } = message {
+                    std::mem::forget(fd);
+                    send(&ToMain::BodyEnd { req: 1 });
+                    send(&ToMain::BodyEnd { req: 1 });
+                    break;
+                }
+            }
+        }
+        "model-abort-unknown" => send(&ToMain::Abort { req: 99 }),
+        "model-flood" => {
+            // The gateway holds every request: none ends.
+            for req in 1..=65 {
+                send(&ToMain::Request {
+                    req,
+                    head: messages.clone(),
+                });
+            }
+        }
+        other => panic!("unknown mode {other}"),
+    }
+    // Stay, and keep taking `run`'s messages: `run` must end it.
+    while read_with_descriptor(socket).is_some() {}
 }
 
 fn alive(pid: u32) -> bool {
@@ -841,11 +1059,20 @@ async fn fronts_started_and_dropped_by_the_hundred_leave_no_zombie() {
 // ----- the egress proxy through a front (slice 3) -------------------------------------------
 
 use tinfirm_runner_host::egress_proxy::{EgressGuard, EgressProxy, EgressSettings, Rule};
+use tinfirm_runner_host::front::sandbox::SandboxFront;
 use tinfirm_runner_host::git_proxy::Endpoint;
 
 /// An egress proxy whose listeners a front serves, with `allow` and loopback as `loopback`.
 async fn egress_through(front: FrontCommand, allow: &[String], loopback: bool) -> EgressGuard {
     egress_with(Some(front), allow, loopback).await
+}
+
+/// A sandbox's front started with `command`, if one is named.
+async fn sandbox_front(command: Option<FrontCommand>) -> Option<std::sync::Arc<SandboxFront>> {
+    match command {
+        Some(command) => Some(SandboxFront::start(&command).await.unwrap()),
+        None => None,
+    }
 }
 
 /// An egress proxy whose front half runs in a front, or in this process without one.
@@ -861,8 +1088,12 @@ async fn egress_with(front: Option<FrontCommand>, allow: &[String], loopback: bo
         extra_hosts: Vec::new(),
     };
     EgressProxy::new(settings, &endpoint)
-        .with_front(front)
-        .start_run(uuid::Uuid::new_v4(), Vec::new())
+        .start_run_at(
+            uuid::Uuid::new_v4(),
+            Vec::new(),
+            None,
+            sandbox_front(front).await,
+        )
         .await
         .unwrap()
 }
@@ -1263,8 +1494,12 @@ async fn measure_the_egress_proxy() {
             extra_hosts: Vec::new(),
         };
         let guard = EgressProxy::new(settings, &endpoint)
-            .with_front(front)
-            .start_run(uuid::Uuid::new_v4(), Vec::new())
+            .start_run_at(
+                uuid::Uuid::new_v4(),
+                Vec::new(),
+                None,
+                sandbox_front(front).await,
+            )
             .await
             .unwrap();
         let auth = guard.proxy_authorization().to_string();
@@ -1300,4 +1535,425 @@ async fn measure_the_egress_proxy() {
             1024.0 / took.as_secs_f64()
         );
     }
+}
+
+// ----- the model proxy in a front ------------------------------------------------------------
+
+/// A gateway that takes every connection and answers nothing.
+async fn silent_gateway() -> std::net::SocketAddr {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+            });
+        }
+    });
+    addr
+}
+
+/// A run's model proxy whose listener `front` serves, towards `gateway`.
+async fn model_through(
+    front: FrontCommand,
+    gateway: std::net::SocketAddr,
+) -> tinfirm_runner_host::model_proxy::ModelProxyGuard {
+    use tinfirm_runner_host::model_proxy::{ModelProxy, ModelProxySettings};
+    let settings = ModelProxySettings {
+        allow_private: false,
+        local_gateway: None,
+        allow_loopback: true,
+        allow_http: true,
+    };
+    let endpoint = Endpoint {
+        bind: "127.0.0.2:0".parse().unwrap(),
+        sandbox_host: "127.0.0.2".into(),
+        extra_hosts: Vec::new(),
+    };
+    let access = tinfirm_protocol::ModelAccess {
+        format: tinfirm_protocol::ModelFormat::Anthropic,
+        base_url: Some(format!("http://{gateway}")),
+        region: None,
+        access_key_id: None,
+        api_key: tinfirm_protocol::Secret::new("sk-TEST-ONLY-front-gateway-key"),
+    };
+    ModelProxy::new(settings, &endpoint)
+        .start_run_at(
+            uuid::Uuid::new_v4(),
+            &access,
+            None,
+            sandbox_front(Some(front)).await,
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_front_gets_from_runs_model_proxy_only_what_its_rules_allow() {
+    let gateway = silent_gateway().await;
+    // Requests that `run` refuses by its own rules: each answered with its status.
+    for mode in ["model-rules", "model-socket-closed"] {
+        let guard = model_through(hostile_front(mode, &[]), gateway).await;
+        let front = guard.front().unwrap().clone();
+        let ended = tokio::time::timeout(Duration::from_secs(60), front.handle().wait_ended())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ended, Ended::Exited { code: Some(0), .. }),
+            "{mode}: {ended:?}"
+        );
+        assert_eq!(front.answering(), 0, "{mode}: a task of `run` stays");
+        assert_eq!(
+            guard.counts().0,
+            0,
+            "{mode}: a request reached the gateway whole"
+        );
+    }
+    // Requests that break the wire end the front.
+    for (mode, why) in [
+        ("model-crlf", "a header that HTTP does not allow"),
+        ("model-headers", "more than 64 headers"),
+        ("model-query", "a query with a byte that no query has"),
+        ("model-order", "a request 3 after 5"),
+        ("model-body-end-twice", "the body of request 1 ended twice"),
+        ("model-abort-unknown", "an abort of an unknown request 99"),
+        ("model-flood", "more than 64 open model requests"),
+    ] {
+        let guard = model_through(hostile_front(mode, &[]), gateway).await;
+        let front = guard.front().unwrap().clone();
+        let ended = tokio::time::timeout(Duration::from_secs(20), front.handle().wait_ended())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ended, Ended::Broken(text) if text.contains(why)),
+            "{mode}: {ended:?}"
+        );
+        // Nothing of its requests stays in `run` once its front is gone.
+        for _ in 0..500 {
+            if front.answering() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(front.answering(), 0, "{mode}: a task of `run` stays");
+    }
+}
+
+/// A gateway for the measurements: `x-measure: small` answers `{}`, `sse:N` N events as fast
+/// as it can, `big:N` N bytes; the request body is read whole first.
+async fn measuring_gateway() -> std::net::SocketAddr {
+    use http_body_util::{BodyExt, StreamBody};
+    use hyper::body::{Bytes, Frame};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = stream.set_nodelay(true);
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    |req: hyper::Request<hyper::body::Incoming>| async move {
+                        let what = req
+                            .headers()
+                            .get("x-measure")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("small")
+                            .to_string();
+                        let _ = req.into_body().collect().await;
+                        let (kind, n) = what.split_once(':').unwrap_or((what.as_str(), "0"));
+                        let n: u64 = n.parse().unwrap_or(0);
+                        let frames: Box<dyn Iterator<Item = Bytes> + Send> = match kind {
+                            "sse" => Box::new(
+                                (0..n).map(|i| Bytes::from(format!("data: {{\"i\":{i}}}\n\n"))),
+                            ),
+                            "big" => {
+                                let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+                                Box::new((0..n.div_ceil(64 * 1024)).map(move |_| chunk.clone()))
+                            }
+                            _ => Box::new(std::iter::once(Bytes::from_static(b"{}"))),
+                        };
+                        let body = StreamBody::new(futures::stream::iter(
+                            frames.map(|b| Ok::<_, std::convert::Infallible>(Frame::data(b))),
+                        ));
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(body))
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// The model proxy, with its front half in this process or in a front: the time a small
+/// request adds, the gaps between the events of a long SSE answer, and the throughput of a
+/// large answer and of a large request body.
+/// `cargo test --release -p tinfirm-runner-host --test front measure_the_model -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, run by hand in release"]
+async fn measure_the_model_proxy() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Bytes;
+    use tinfirm_runner_host::model_proxy::{ModelProxy, ModelProxySettings};
+    let gateway = measuring_gateway().await;
+    for in_front in [false, true] {
+        let settings = ModelProxySettings {
+            allow_private: false,
+            local_gateway: None,
+            allow_loopback: true,
+            allow_http: true,
+        };
+        let endpoint = Endpoint {
+            bind: "127.0.0.2:0".parse().unwrap(),
+            sandbox_host: "127.0.0.2".into(),
+            extra_hosts: Vec::new(),
+        };
+        let access = tinfirm_protocol::ModelAccess {
+            format: tinfirm_protocol::ModelFormat::Anthropic,
+            base_url: Some(format!("http://{gateway}")),
+            region: None,
+            access_key_id: None,
+            api_key: tinfirm_protocol::Secret::new("sk-TEST-ONLY-measured-gateway-key"),
+        };
+        let front = sandbox_front(in_front.then(the_front)).await;
+        let guard = ModelProxy::new(settings, &endpoint)
+            .start_run_at(uuid::Uuid::new_v4(), &access, None, front)
+            .await
+            .unwrap();
+        let path = format!(
+            "{}/v1/messages",
+            url::Url::parse(guard.base_url()).unwrap().path()
+        );
+        let stream = tokio::net::TcpStream::connect(guard.local_addr())
+            .await
+            .unwrap();
+        stream.set_nodelay(true).unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake::<_, Full<Bytes>>(
+            hyper_util::rt::TokioIo::new(stream),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(connection);
+        let request = |measure: &str, body: Bytes| {
+            hyper::Request::post(path.as_str())
+                .header("host", "proxy")
+                .header("x-measure", measure)
+                .body(Full::new(body))
+                .unwrap()
+        };
+        let mode = if in_front { "in a front" } else { "in run" };
+        // The time of a small request, the proxy's own share with the gateway's.
+        let mut times = Vec::new();
+        for _ in 0..500 {
+            let started = std::time::Instant::now();
+            sender.ready().await.unwrap();
+            let answer = sender
+                .send_request(request("small", Bytes::from_static(b"{}")))
+                .await
+                .unwrap();
+            let _ = answer.into_body().collect().await.unwrap();
+            times.push(started.elapsed());
+        }
+        times.sort();
+        println!(
+            "{mode}: a small request: median {:?}, p99 {:?}",
+            times[times.len() / 2],
+            times[times.len() * 99 / 100]
+        );
+        // A long SSE answer: the gaps between its parts as they arrive.
+        let started = std::time::Instant::now();
+        sender.ready().await.unwrap();
+        let answer = sender
+            .send_request(request("sse:10000", Bytes::from_static(b"{}")))
+            .await
+            .unwrap();
+        let mut body = answer.into_body();
+        let mut gaps = Vec::new();
+        let mut last = std::time::Instant::now();
+        let mut events = 0;
+        let mut previous = 0u8;
+        while let Some(frame) = body.frame().await {
+            let data = frame.unwrap().into_data().unwrap_or_default();
+            for &byte in data.iter() {
+                if byte == b'\n' && previous == b'\n' {
+                    events += 1;
+                }
+                previous = byte;
+            }
+            gaps.push(last.elapsed());
+            last = std::time::Instant::now();
+        }
+        assert_eq!(events, 10_000);
+        gaps.sort();
+        println!(
+            "{mode}: 10000 SSE events in {:?}, {} parts, gap median {:?}, p99 {:?}",
+            started.elapsed(),
+            gaps.len(),
+            gaps[gaps.len() / 2],
+            gaps[gaps.len() * 99 / 100]
+        );
+        // A large answer.
+        let size = 1u64 << 30;
+        let started = std::time::Instant::now();
+        sender.ready().await.unwrap();
+        let answer = sender
+            .send_request(request(&format!("big:{size}"), Bytes::from_static(b"{}")))
+            .await
+            .unwrap();
+        let mut body = answer.into_body();
+        let mut got = 0u64;
+        while let Some(frame) = body.frame().await {
+            got += frame
+                .unwrap()
+                .into_data()
+                .map(|d| d.len() as u64)
+                .unwrap_or(0);
+        }
+        assert_eq!(got, size);
+        let took = started.elapsed();
+        println!(
+            "{mode}: a 1 GiB answer in {took:?} ({:.0} MiB/s)",
+            1024.0 / took.as_secs_f64()
+        );
+        // A large request body, the largest the proxy takes.
+        let body = Bytes::from(vec![b'y'; 64 * 1024 * 1024]);
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            sender.ready().await.unwrap();
+            let answer = match sender.send_request(request("small", body.clone())).await {
+                Ok(answer) => answer,
+                Err(e) => panic!("{mode}: {e:?}"),
+            };
+            assert!(answer.status().is_success(), "{}", answer.status());
+            let _ = answer.into_body().collect().await.unwrap();
+            times.push(started.elapsed());
+        }
+        times.sort();
+        println!(
+            "{mode}: a 64 MiB request body: median {:?} ({:.0} MiB/s)",
+            times[2],
+            64.0 / times[2].as_secs_f64()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_front_serves_a_sandboxs_egress_and_model_proxies_and_ends_with_the_last() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Bytes;
+    use tinfirm_runner_host::model_proxy::{ModelProxy, ModelProxySettings};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let front = SandboxFront::start(&the_front()).await.unwrap();
+    let pid = front.handle().pgid();
+    // The egress listener, as a VM gets it, and the model listener of its run, on one front.
+    let server = echo_and_http().await;
+    let settings = EgressSettings {
+        allow: vec![Rule::parse(&format!("127.0.0.1:{}", server.port())).unwrap()],
+        allow_private: false,
+        allow_loopback: true,
+    };
+    let endpoint = Endpoint {
+        bind: "127.0.0.2:0".parse().unwrap(),
+        sandbox_host: "127.0.0.2".into(),
+        extra_hosts: Vec::new(),
+    };
+    let egress = EgressProxy::new(settings, &endpoint)
+        .start_run_at(uuid::Uuid::new_v4(), Vec::new(), None, Some(front.clone()))
+        .await
+        .unwrap();
+    let gateway = measuring_gateway().await;
+    let access = tinfirm_protocol::ModelAccess {
+        format: tinfirm_protocol::ModelFormat::Anthropic,
+        base_url: Some(format!("http://{gateway}")),
+        region: None,
+        access_key_id: None,
+        api_key: tinfirm_protocol::Secret::new("sk-TEST-ONLY-shared-front-key"),
+    };
+    let model_settings = ModelProxySettings {
+        allow_private: false,
+        local_gateway: None,
+        allow_loopback: true,
+        allow_http: true,
+    };
+    let model = ModelProxy::new(model_settings, &endpoint)
+        .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front.clone()))
+        .await
+        .unwrap();
+    assert_eq!(egress.front().unwrap().pgid(), pid);
+    assert_eq!(model.front().unwrap().handle().pgid(), pid);
+    drop(front);
+    let model_request = |guard: &tinfirm_runner_host::model_proxy::ModelProxyGuard| {
+        let addr = guard.local_addr();
+        let path = format!(
+            "{}/v1/messages",
+            url::Url::parse(guard.base_url()).unwrap().path()
+        );
+        async move {
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            let (mut sender, connection) = hyper::client::conn::http1::handshake::<_, Full<Bytes>>(
+                hyper_util::rt::TokioIo::new(stream),
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+            tokio::spawn(connection);
+            let request = hyper::Request::post(path.as_str())
+                .header("host", "proxy")
+                .body(Full::new(Bytes::from_static(b"{}")))
+                .unwrap();
+            let answer = sender
+                .send_request(request)
+                .await
+                .map_err(std::io::Error::other)?;
+            let status = answer.status();
+            let body = answer
+                .into_body()
+                .collect()
+                .await
+                .map_err(std::io::Error::other)?;
+            Ok::<_, std::io::Error>((status, body.to_bytes()))
+        }
+    };
+    let (status, body) = model_request(&model).await.unwrap();
+    assert!(status.is_success(), "{status}");
+    assert_eq!(&body[..], b"{}");
+    let auth = egress.proxy_authorization().to_string();
+    let tunnel_works = || async {
+        let (mut tunnel, head) = proxy_request(
+            &egress,
+            &format!(
+                "CONNECT {server} HTTP/1.1\r\nHost: {server}\r\nProxy-Authorization: {auth}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        tunnel.write_all(b"ping").await.unwrap();
+        let mut echoed = [0u8; 4];
+        tunnel.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+    };
+    tunnel_works().await;
+    // The model listener closes with its run; the egress listener and the front stay.
+    let model_addr = model.local_addr();
+    drop(model);
+    let mut closed = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(model_addr).await.is_err() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(closed, "the model listener is still served");
+    tunnel_works().await;
+    assert!(alive(pid));
+    // The front ends with the last of its owners.
+    drop(egress);
+    assert!(
+        gone(pid).await,
+        "the front outlived its sandbox's listeners"
+    );
 }

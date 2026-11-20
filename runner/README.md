@@ -250,13 +250,13 @@ request with an absolute `http://` URL. The part that parses this (the request, 
 `Proxy-Authorization` check and the copying of a tunnel's bytes) is one half; the decision is
 the other: whether the destination is on the run's allowlist, where its name resolves, whether that
 address is refused, the limit of 256 open connections per run (plain requests count too), and
-the connection itself. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), each listener's
-parsing half runs in a [front process](#sandbox-bridge) of its own, confined, which cannot make a
+the connection itself. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), the parsing
+half runs in the sandbox's [front process](#sandbox-bridge), confined, which cannot make a
 connection: it asks `run` for each one by name and port, and `run` decides, connects and hands
 it the connected socket, or answers with the refusal (`400`, `403`, `502` or `503`) that the
 front gives the sandbox. `run` logs each refusal, and a front that asks for more than the wire allows
 (more than 512 open connections, a name over 253 bytes or not printable, port 0, an answer it
-did not wait for) is ended with its listener. Without the bridge both halves run in `run`. A
+did not wait for) is ended, with every listener it serves. Without the bridge both halves run in `run`. A
 destination with a user name (`user@host`) is refused with `400` either way.
 
 **Requirements.** Docker Engine on Linux. With Docker Desktop (or any engine in a VM) `run`
@@ -346,7 +346,20 @@ nothing answers on its port. For a request to `/<run secret>/<path>` it:
 - drops every credential header of the sandbox (`Authorization`, `x-api-key`, `api-key`, `Proxy-Authorization`, `x-litellm-api-key`, `x-goog-api-key`, cookies, `x-tinfirm-runner-token`), the hop-by-hop and forwarding headers, sets `Authorization: Bearer <key>` and, for this host's server only, `x-tinfirm-runner-token: <host token>`, and keeps the rest (`anthropic-version`, `anthropic-beta`, the query);
 - connects to the base URL's origin itself, over https with the system's root certificates, to an address it resolved and checked as the [egress proxy](#egress-proxy) does: loopback, link-local (cloud metadata), reserved and this machine's own addresses are refused, private ones unless `--egress-allow-private`, and loopback and this machine's addresses only for the gateway of `--model-proxy-local-gateway` ([below](#a-gateway-on-this-machine)). It follows no redirect (`502`);
 - streams the answer back as it arrives (SSE), with no total timeout, only an idle one of 10 minutes between two parts; refuses a WebSocket upgrade (`501`); takes request bodies up to 64 MiB and 64 connections per run at once (more wait);
+- takes a request head of at most 64 headers, each name at most 64 bytes and each value at most 8 KiB, 24 KiB in all (`431` above), a query of at most 4 KiB (`414`), and header values that are text (`400` otherwise); passes back at most 100 of the answer's headers, and only those whose values are text;
 - never logs the key or the host's token, and never passes them back: a gateway answer that contains either is cut off (`502` when it is in a header).
+
+**Its two halves.** The part that reads the sandbox's request (the run secret, the path rule,
+the method, `Upgrade`, the bounds of the head) is one half; the other checks the request again
+as it comes (an endpoint of the gateway's format, its method, every header one that HTTP allows,
+the length within 64 MiB), attaches the key and the host's token, makes the request, and scans
+and passes back the answer. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), the first
+half runs in the sandbox's [front process](#sandbox-bridge), which never holds the key or the
+host's token: it hands `run` the request's endpoint, method, query, headers and length, and the
+body on a socket of its own; `run` gives the answer's status and headers back, and its body on
+the same socket, part by part, so an SSE answer still arrives as it comes. A client that leaves,
+before the answer, in its request body or in the answer, ends the request to the gateway too.
+Without the bridge both halves run in `run`, with the same code and the same rules.
 
 With `--egress-proxy` as well, the gateway leaves the run's allowlist (the sandbox no longer needs a
 route to it), and `NO_PROXY` already names the listener's host. A run whose listener cannot start
@@ -803,10 +816,11 @@ not run by hand; `reader.rs`, `confine.rs`).
 - **The front process (being built).** Path C's second part moves the rest of what `run` parses
   from a sandbox (the bridge's TLS, frames and tunnels, and the HTTP of the proxies and the
   platform tools) into a confined process per sandbox, the front, which holds that sandbox's own
-  powers and no credential. So far `run` starts one for each listener of the
-  [egress proxy](#egress-proxy) and the front serves that listener's HTTP; the other listeners
-  and the bridge follow. A front that cannot be confined serves all the same, with a warning in
-  `run`'s log. Its confinement, which it applies to itself before it builds its runtime: limits of 512 MiB of data, 1024 descriptors and
+  powers and no credential. So far `run` starts one for each sandbox that has a listener of the
+  [egress proxy](#egress-proxy) or the [model proxy](#model-proxy), with its first listener (a
+  VM's comes with the VM's egress listener), and the front serves the HTTP of both; it ends with
+  the sandbox. The git proxy, the platform tools and the bridge follow. A front that cannot be
+  confined serves all the same, with a warning in `run`'s log. Its confinement, which it applies to itself before it builds its runtime: limits of 512 MiB of data, 1024 descriptors and
   no core file; not dumpable; Landlock with no directory at all (only `/dev/null` and
   `/dev/urandom`); and the reader's seccomp filter, with on top of it no `execve`, no new process
   (threads only), no `connect`, `bind` or `listen`, and no signal outside its own process group,
@@ -842,6 +856,21 @@ not run by hand; `reader.rs`, `confine.rs`).
     denied`). `run` holds a connection's place in the 256 until its `closed` comes, or the
     front ends; a connection whose client left while `run` connected is closed by the front at
     once, with its `closed`.
+  - **The model messages.** `run` passes the front the listener's socket with the run secret,
+    the format and the base path. For each request the front sends `request` with a request
+    number that only grows (shared with `connect`), the endpoint, method, query, headers and
+    length, within the bounds above; `run` answers with `body` and one end of a new pair of
+    Unix sockets, on which the front writes the request's body and then says `bodyEnd`; then
+    `response` with the answer's status and headers, the answer's body on the same socket, and
+    `end`, which says whether that body is whole. The front finishes its client's answer only on
+    a whole `end`, and cuts it off otherwise. A front gives a request up with `abort` when its
+    client leaves or its body breaks, and `run` then ends it and the request to the gateway. At
+    most 64 requests are open at `run` per front (more wait in the front); a front that opens
+    more, sends a head out of its bounds (a header with CR, LF or NUL, more than 64 headers, a
+    query that is not one), reuses a request number, ends a body twice, or aborts a request that
+    never was, is ended. A front that closes a request's socket and does not say within 10 s
+    whether the body is whole has that request ended. When a front ends, `run` ends all its
+    requests.
 
 ## A VM per run
 

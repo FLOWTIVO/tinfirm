@@ -4,10 +4,13 @@
 //! tools) out of `run`, which holds the credentials. `run` is to start one per sandbox and to
 //! talk with it over typed, bounded messages; it attaches every credential itself.
 //!
-//! So far `run` starts a front for each listener of the egress proxy when the sandboxes run
-//! over the bridge (`--sandbox-bridge` or a VM per run): the front parses that listener's HTTP
-//! and copies its tunnels, and `run` decides and makes each connection
-//! ([`crate::egress_proxy`]). The other listeners and the bridge follow. `front --probe JOB` confines itself as a front does
+//! So far `run` starts one front per sandbox when the sandboxes run over the bridge
+//! (`--sandbox-bridge` or a VM per run), with the sandbox's first proxy listener
+//! ([`sandbox::SandboxFront`]): the front parses the HTTP of the sandbox's egress proxy and
+//! copies its tunnels, while `run` decides and makes each connection ([`crate::egress_proxy`]);
+//! and it reads the sandbox's model requests, which `run` checks again and sends on with the
+//! key ([`crate::model_proxy`]). The git proxy, the platform tools and the bridge follow.
+//! `front --probe JOB` confines itself as a front does
 //! ([`crate::confine::Profile::Front`]) and then tries what a front must be refused, and answers
 //! one line of JSON on stdout ([`Probe`]). `doctor` runs it ([`probe`]). `front` alone serves
 //! the control channel on its stdin ([`wire`]); `run`'s side of it is [`handle::FrontHandle`].
@@ -41,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::confine::{self, Plan, Status};
 
 pub mod handle;
+pub mod sandbox;
 mod serve;
 pub mod wire;
 
@@ -336,8 +340,44 @@ pub fn probe(binary: &Path, job: &ProbeJob, timeout: Duration) -> Result<Probe> 
     serde_json::from_slice(line).context("the front's answer is not a probe's")
 }
 
+/// A real front for the library's own tests: this test binary, started again to run
+/// [`child_main`] alone (crate::model_proxy's tests run each listener in a front this way).
+#[cfg(test)]
+pub(crate) fn test_command() -> handle::FrontCommand {
+    handle::FrontCommand {
+        program: std::env::current_exe().expect("the test binary"),
+        args: [
+            "front::tests::the_front_of_the_librarys_tests",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ]
+        .map(String::from)
+        .to_vec(),
+        env: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "the front of the library's tests, which start it (super::test_command)"]
+    fn the_front_of_the_librarys_tests() {
+        // A panic in any of its threads ends it, with the panic on its stderr, which its
+        // handle keeps: a front that went on without the thread would hide it.
+        let report = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            report(info);
+            std::process::exit(101);
+        }));
+        let code = super::child_main(None);
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            3
+        });
+    }
+
     use super::*;
 
     #[test]

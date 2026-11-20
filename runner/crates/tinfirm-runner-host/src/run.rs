@@ -690,12 +690,19 @@ pub async fn execute(
         }
         // A gateway's key stays on the host (the model proxy is always on): the runtime gets the
         // run's model proxy as its base URL and a dummy key.
+        // One front per sandbox serves its listeners' HTTP on a host with the bridge: a VM's
+        // came with its egress listener; any other's comes with the first listener it needs.
+        let mut front = claimed
+            .as_ref()
+            .and_then(|vm| vm.egress.as_ref())
+            .and_then(|egress| egress.sandbox_front().cloned());
         let model_proxy = start_model_proxy(
             shared,
             &mut sink,
             assign,
             credential,
             access.sandbox_host.as_deref(),
+            &mut front,
         )
         .await;
         let proxy_url = match &model_proxy {
@@ -762,7 +769,7 @@ pub async fn execute(
                 access.model_proxy = model_proxy;
                 let host = access.sandbox_host.clone();
                 let slot = claimed.as_mut().and_then(|vm| vm.egress.take());
-                match start_egress(
+                let started_egress = start_egress(
                     shared,
                     &mut sink,
                     assign,
@@ -770,9 +777,11 @@ pub async fn execute(
                     &mut spec,
                     host.as_deref(),
                     slot,
+                    &mut front,
                 )
-                .await
-                {
+                .await;
+                access.front = front;
+                match started_egress {
                     Ok(egress) => {
                         access.egress = egress;
                         start_sandbox(
@@ -1816,6 +1825,9 @@ struct SandboxAccess {
     egress: Option<EgressGuard>,
     /// The run's model proxy listener, when its model access is a gateway.
     model_proxy: Option<ModelProxyGuard>,
+    /// The sandbox's front, which serves the listeners' HTTP on a host with the bridge; it
+    /// ends with the run's access (and its listeners' guards).
+    front: Option<Arc<crate::front::sandbox::SandboxFront>>,
     /// Where the sandbox reaches the listeners when it is not the endpoint's host: a local
     /// test executor's sandbox over the bridge, on a loopback address of its own.
     sandbox_host: Option<String>,
@@ -1834,6 +1846,7 @@ async fn start_model_proxy(
     assign: &RunAssign,
     credential: &RunCredential,
     sandbox_host: Option<&str>,
+    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
 ) -> Result<Option<ModelProxyGuard>, String> {
     let RunCredential::Model(model) = credential else {
         return Ok(None);
@@ -1850,7 +1863,16 @@ async fn start_model_proxy(
         Ok(proxy) => proxy,
         Err(e) => return Err(unavailable(sink, e)),
     };
-    let guard = match proxy.start_run_at(assign.run_id, model, sandbox_host).await {
+    if front.is_none() {
+        match shared.sandbox_front().await {
+            Ok(started) => *front = started,
+            Err(e) => return Err(unavailable(sink, e)),
+        }
+    }
+    let guard = match proxy
+        .start_run_at(assign.run_id, model, sandbox_host, front.clone())
+        .await
+    {
         Ok(guard) => guard,
         Err(e) => return Err(unavailable(sink, e)),
     };
@@ -1888,6 +1910,7 @@ async fn start_egress(
     spec: &mut SandboxSpec,
     sandbox_host: Option<&str>,
     slot: Option<EgressGuard>,
+    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
 ) -> Result<Option<EgressGuard>, String> {
     if shared.opts.egress.is_none() {
         return Ok(None);
@@ -1931,10 +1954,21 @@ async fn start_egress(
             slot.bind(assign.run_id, rules);
             slot
         }
-        (None, Some(proxy)) => match proxy.start_run_at(assign.run_id, rules, sandbox_host).await {
-            Ok(guard) => guard,
-            Err(e) => return Err(unavailable(sink, e)),
-        },
+        (None, Some(proxy)) => {
+            if front.is_none() {
+                match shared.sandbox_front().await {
+                    Ok(started) => *front = started,
+                    Err(e) => return Err(unavailable(sink, e)),
+                }
+            }
+            match proxy
+                .start_run_at(assign.run_id, rules, sandbox_host, front.clone())
+                .await
+            {
+                Ok(guard) => guard,
+                Err(e) => return Err(unavailable(sink, e)),
+            }
+        }
         (None, None) => return Ok(None),
     };
     // The proxy URL carries the run's credential: masked before it can appear anywhere.

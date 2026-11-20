@@ -431,8 +431,13 @@ impl Pool {
         let sandbox_host = options
             .on_this_machine
             .then(|| crate::bridge::local_sandbox_loopback().to_string());
+        // The VM's front, which serves its listeners' HTTP, comes with its first listener; the
+        // run that claims the VM gives it the rest (crate::front::sandbox).
         let egress = match host.egress_proxy().await? {
-            Some(proxy) => Some(proxy.start_slot(sandbox_host.as_deref()).await?),
+            Some(proxy) => {
+                let front = host.sandbox_front().await?;
+                Some(proxy.start_slot(sandbox_host.as_deref(), front).await?)
+            }
             None => None,
         };
         let mut boot_settings = shape.settings.clone();

@@ -62,6 +62,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::front::sandbox::SandboxFront;
 use crate::git_proxy::{Endpoint, new_secret};
 use crate::secret_eq::secret_eq;
 
@@ -500,9 +501,6 @@ pub struct EgressProxy {
     bind_ip: IpAddr,
     sandbox_host: String,
     extra_hosts: Vec<String>,
-    /// The front process that serves each listener's HTTP (ADR-0112, path C, part 2), on a
-    /// host whose sandboxes use the bridge; `None`: this process serves it.
-    front: Option<crate::front::handle::FrontCommand>,
 }
 
 impl EgressProxy {
@@ -514,46 +512,39 @@ impl EgressProxy {
             bind_ip: endpoint.bind.ip(),
             sandbox_host: endpoint.sandbox_host.clone(),
             extra_hosts: endpoint.extra_hosts.clone(),
-            front: None,
         }
-    }
-
-    /// Whether a front process serves each listener's HTTP.
-    pub fn has_front(&self) -> bool {
-        self.front.is_some()
-    }
-
-    /// Each listener's HTTP is served by a front process started with `front`: this process
-    /// only decides and connects ([`ToFront::ListenEgress`]).
-    ///
-    /// [`ToFront::ListenEgress`]: crate::front::wire::ToFront::ListenEgress
-    pub fn with_front(mut self, front: Option<crate::front::handle::FrontCommand>) -> EgressProxy {
-        self.front = front;
-        self
     }
 
     /// Starts a run's listener: the host-wide rules and `run_rules` apply until the guard is
     /// dropped.
     pub async fn start_run(&self, run_id: Uuid, run_rules: Vec<Rule>) -> Result<EgressGuard> {
-        self.start_run_at(run_id, run_rules, None).await
+        self.start_run_at(run_id, run_rules, None, None).await
     }
 
     /// [`EgressProxy::start_run`], with a proxy URL that names `sandbox_host` in place of the
-    /// endpoint's (a local test executor's sandbox over the bridge).
+    /// endpoint's (a local test executor's sandbox over the bridge), and with the listener's
+    /// HTTP served by the sandbox's `front` when it has one: this process then only decides
+    /// and connects.
     pub async fn start_run_at(
         &self,
         run_id: Uuid,
         run_rules: Vec<Rule>,
         sandbox_host: Option<&str>,
+        front: Option<Arc<SandboxFront>>,
     ) -> Result<EgressGuard> {
-        let guard = self.start_slot(sandbox_host).await?;
+        let guard = self.start_slot(sandbox_host, front).await?;
         guard.bind(run_id, run_rules);
         Ok(guard)
     }
 
     /// A listener of no run yet, for a sandbox VM that no run has claimed yet (crate::pool):
-    /// it refuses every destination until [`EgressGuard::bind`].
-    pub async fn start_slot(&self, sandbox_host: Option<&str>) -> Result<EgressGuard> {
+    /// it refuses every destination until [`EgressGuard::bind`]. With the sandbox's `front`,
+    /// the front serves its HTTP.
+    pub async fn start_slot(
+        &self,
+        sandbox_host: Option<&str>,
+        front: Option<Arc<SandboxFront>>,
+    ) -> Result<EgressGuard> {
         anyhow::ensure!(
             !self.bind_ip.is_unspecified(),
             "the egress proxy must listen on the sandbox network's gateway, not on every address; leave TINFIRM_RUNNER_GIT_PROXY_BIND to an address of that network"
@@ -574,21 +565,23 @@ impl EgressProxy {
             denied_count: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
         });
-        let (front, broker) = match &self.front {
+        let connector: Arc<dyn Connector> = Arc::new(Direct(state.clone()));
+        match &front {
             None => {
                 let half = FrontHalf::new(
                     state.expected_auth.clone(),
-                    Arc::new(Direct(state.clone())),
+                    connector,
                     state.shutdown.clone(),
                 );
                 tokio::spawn(serve(listener, half));
-                (None, None)
             }
-            Some(command) => {
-                let (front, broker) = start_front(command, listener, state.clone()).await?;
-                (Some(front), Some(broker))
+            Some(front) => {
+                front
+                    .listen_egress(listener, state.expected_auth.clone(), connector)
+                    .await
+                    .context("the sandbox's front cannot serve the egress proxy")?;
             }
-        };
+        }
         let sandbox_host = sandbox_host.unwrap_or(&self.sandbox_host).to_string();
         let host = match sandbox_host.parse::<IpAddr>() {
             Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
@@ -603,92 +596,8 @@ impl EgressProxy {
             port,
             extra_hosts: self.extra_hosts.clone(),
             front,
-            broker,
         })
     }
-}
-
-/// Starts a front for `listener` and the broker that answers its requests: a destination it
-/// asks for is decided and connected here ([`RunState::grant`]), and the connection's
-/// descriptor goes to the front, which holds it until it says that it ended.
-async fn start_front(
-    command: &crate::front::handle::FrontCommand,
-    listener: TcpListener,
-    state: Arc<RunState>,
-) -> Result<(
-    Arc<crate::front::handle::FrontHandle>,
-    tokio::task::JoinHandle<()>,
-)> {
-    use crate::front::handle::{FrontHandle, FrontRequest};
-    let front = FrontHandle::spawn(command, Uuid::nil())
-        .await
-        .context("cannot start the egress proxy's front process")?;
-    if !front.status().seccomp {
-        tracing::warn!(
-            problem = front.status().problem.as_deref().unwrap_or("-"),
-            "the egress proxy's front process is not confined"
-        );
-    }
-    let listener = std::os::fd::OwnedFd::from(listener.into_std()?);
-    front
-        .send(
-            &crate::front::wire::ToFront::ListenEgress {
-                authorization: state.expected_auth.clone(),
-            },
-            Some(listener),
-        )
-        .await?;
-    let mut requests = front
-        .take_requests()
-        .context("the front's requests are served already")?;
-    let front = Arc::new(front);
-    let weak = Arc::downgrade(&front);
-    let broker = tokio::spawn(async move {
-        // Each connection's place, until the front says it ended (or the front ends).
-        let held: Arc<Mutex<std::collections::HashMap<u64, tokio::sync::OwnedSemaphorePermit>>> =
-            Arc::default();
-        while let Some(request) = requests.recv().await {
-            match request {
-                FrontRequest::Connect { req, host, port } => {
-                    let (state, weak, held) = (state.clone(), weak.clone(), held.clone());
-                    tokio::spawn(async move {
-                        let granted = state.grant(&host, port).await;
-                        let Some(front) = weak.upgrade() else {
-                            return;
-                        };
-                        let answered = match granted {
-                            Ok((stream, permit)) => match stream.into_std() {
-                                Ok(stream) => {
-                                    lock(&held).insert(req, permit);
-                                    front.grant(req, std::os::fd::OwnedFd::from(stream)).await
-                                }
-                                Err(e) => {
-                                    front
-                                        .refuse(
-                                            req,
-                                            &Refusal::new(
-                                                StatusCode::BAD_GATEWAY,
-                                                format!("tinfirm egress proxy: {e}\n"),
-                                            ),
-                                        )
-                                        .await
-                                }
-                            },
-                            Err(refusal) => front.refuse(req, &refusal).await,
-                        };
-                        if let Err(e) = answered {
-                            lock(&held).remove(&req);
-                            tracing::debug!(error = %format!("{e:#}"), "egress proxy: cannot answer the front");
-                        }
-                    });
-                }
-                FrontRequest::Closed { req } => {
-                    lock(&held).remove(&req);
-                }
-            }
-        }
-    });
-    Ok((front, broker))
 }
 
 /// A run's listener. Dropping it stops the listener and ends the run's open tunnels.
@@ -699,9 +608,8 @@ pub struct EgressGuard {
     sandbox_host: String,
     port: u16,
     extra_hosts: Vec<String>,
-    /// The front that serves the listener's HTTP, when one does; dropped with the guard.
-    front: Option<Arc<crate::front::handle::FrontHandle>>,
-    broker: Option<tokio::task::JoinHandle<()>>,
+    /// The sandbox's front, when it serves the listener's HTTP.
+    front: Option<Arc<SandboxFront>>,
 }
 
 impl EgressGuard {
@@ -790,7 +698,12 @@ impl EgressGuard {
 
     /// The front process that serves this listener, when one does.
     pub fn front(&self) -> Option<&crate::front::handle::FrontHandle> {
-        self.front.as_deref()
+        self.front.as_deref().map(SandboxFront::handle)
+    }
+
+    /// The sandbox's front that serves this listener, when one does.
+    pub fn sandbox_front(&self) -> Option<&Arc<SandboxFront>> {
+        self.front.as_ref()
     }
 
     /// The run's places in use, of its 256 open connections.
@@ -810,11 +723,10 @@ impl EgressGuard {
 impl Drop for EgressGuard {
     fn drop(&mut self) {
         self.state.shutdown.cancel();
-        if let Some(broker) = self.broker.take() {
-            broker.abort();
+        // The front closes the listener; it ends with its sandbox's last owner.
+        if let Some(front) = self.front.take() {
+            front.unlisten(crate::front::wire::Service::Egress);
         }
-        // The front goes with its last handle: its group is killed and it is reaped.
-        self.front.take();
         tracing::info!(run_id = %self.state.run_label(), "egress proxy stopped for a run");
     }
 }
@@ -1820,7 +1732,7 @@ mod tests {
             extra_hosts: Vec::new(),
         };
         let slot = EgressProxy::new(settings, &endpoint)
-            .start_slot(None)
+            .start_slot(None, None)
             .await
             .unwrap();
         // Unbound: not even a host-wide destination.

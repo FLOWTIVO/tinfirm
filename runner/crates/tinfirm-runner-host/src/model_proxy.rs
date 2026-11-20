@@ -68,6 +68,17 @@
 //!   a header that holds it turns the answer into a `502`, and a body that holds it is cut off
 //!   before its last byte reaches the sandbox. The host also keeps the key in the run's
 //!   redactor.
+//!
+//! The proxy is in two halves (ADR-0112, path C, part 2). The front half serves the sandbox's
+//! HTTP: the secret, `Upgrade`, the path rule, the method, the bounds of the head
+//! ([`FrontHalf`], [`serve`]). It turns a request into a typed, bounded [`RequestHead`] and
+//! hands it, with the body, to the run half ([`ModelBackend`]), which checks the head again
+//! (the endpoint is the gateway's format's, the method is the endpoint's, every header is one
+//! that HTTP allows, the length is within the bound), attaches the key and the host's token,
+//! makes the request, scans the answer and gives back a [`ResponseHead`] and the body. On a
+//! host whose sandboxes use the bridge, the front half runs in the sandbox's front process,
+//! which never holds the key: the head goes over its wire, and each body on a socket of its
+//! own (crate::front::sandbox). Elsewhere both halves run here, with the same code.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -83,9 +94,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Body, Bytes, Frame, Incoming};
-use hyper::header::{self, HeaderMap, HeaderValue};
+use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use serde::{Deserialize, Serialize};
 use tinfirm_protocol::{ModelAccess, ModelFormat};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -93,6 +105,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::egress_proxy::{EgressSettings, is_local_address, refused_address, strip_hop_by_hop};
+use crate::front::sandbox::SandboxFront;
 use crate::git_proxy::{Endpoint, host_port, new_secret, tls_config};
 use crate::secret_eq::secret_eq;
 
@@ -139,8 +152,193 @@ const FORWARDING_HEADERS: [&str; 6] = [
     "via",
 ];
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+
+// ----- what the two halves say to each other ----------------------------------------------
+
+/// The headers a request may carry to the run half, and their bounds: a client's head that
+/// is larger is refused with `431` by the front half.
+pub const MAX_HEADERS: usize = 64;
+/// The longest header name of a request.
+pub const MAX_HEADER_NAME: usize = 64;
+/// The longest header value of a request.
+pub const MAX_HEADER_VALUE: usize = 8 * 1024;
+/// All of a request's header names and values together; within a front's message.
+pub const MAX_HEADER_BYTES: usize = 24 * 1024;
+/// The longest query of a request (`414` above).
+pub const MAX_QUERY: usize = 4 * 1024;
+/// The headers of an answer that go back to the front half; more are dropped.
+pub const MAX_RESPONSE_HEADERS: usize = 100;
+
+/// The two API formats the proxy serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelApi {
+    Anthropic,
+    Openai,
+}
+
+/// A model API endpoint that the proxy forwards: the path after the gateway's base path,
+/// and its method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelEndpoint {
+    AnthropicMessages,
+    AnthropicCountTokens,
+    AnthropicModels,
+    OpenaiResponses,
+    OpenaiChatCompletions,
+    OpenaiModels,
+}
+
+impl ModelEndpoint {
+    const ALL: [ModelEndpoint; 6] = [
+        ModelEndpoint::AnthropicMessages,
+        ModelEndpoint::AnthropicCountTokens,
+        ModelEndpoint::AnthropicModels,
+        ModelEndpoint::OpenaiResponses,
+        ModelEndpoint::OpenaiChatCompletions,
+        ModelEndpoint::OpenaiModels,
+    ];
+
+    /// The endpoint of `api` at `path` (after the base path), compared byte for byte.
+    pub fn find(api: ModelApi, path: &str) -> Option<ModelEndpoint> {
+        Self::ALL
+            .into_iter()
+            .find(|endpoint| endpoint.api() == api && endpoint.path() == path)
+    }
+
+    pub fn api(self) -> ModelApi {
+        match self {
+            ModelEndpoint::AnthropicMessages
+            | ModelEndpoint::AnthropicCountTokens
+            | ModelEndpoint::AnthropicModels => ModelApi::Anthropic,
+            _ => ModelApi::Openai,
+        }
+    }
+
+    pub fn path(self) -> &'static str {
+        match self {
+            ModelEndpoint::AnthropicMessages => "/v1/messages",
+            ModelEndpoint::AnthropicCountTokens => "/v1/messages/count_tokens",
+            ModelEndpoint::AnthropicModels => "/v1/models",
+            ModelEndpoint::OpenaiResponses => "/responses",
+            ModelEndpoint::OpenaiChatCompletions => "/chat/completions",
+            ModelEndpoint::OpenaiModels => "/models",
+        }
+    }
+
+    pub fn method(self) -> Method {
+        match self {
+            ModelEndpoint::AnthropicModels | ModelEndpoint::OpenaiModels => Method::GET,
+            _ => Method::POST,
+        }
+    }
+}
+
+/// How long a request's body is, as the front half read it from the client's head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BodyLength {
+    /// No body.
+    Empty,
+    /// `Content-Length`: exactly this many bytes.
+    Exact(u64),
+    /// Chunked: the body's end says where it ends.
+    Streamed,
+}
+
+/// A request of the sandbox, as the front half hands it on: the endpoint it maps to, never
+/// the path or the secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestHead {
+    pub endpoint: ModelEndpoint,
+    pub method: String,
+    pub query: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub length: BodyLength,
+}
+
+impl RequestHead {
+    /// The head's bounds, and that each part is one that HTTP allows (no CR, LF or NUL in a
+    /// value): checked by the run half in every case, and on a front's wire before.
+    pub fn check(&self) -> std::result::Result<(), String> {
+        if self.method.is_empty()
+            || self.method.len() > 16
+            || Method::from_bytes(self.method.as_bytes()).is_err()
+        {
+            return Err("a method that is not one".into());
+        }
+        if let Some(query) = &self.query {
+            if query.len() > MAX_QUERY {
+                return Err(format!("a query over {MAX_QUERY} bytes"));
+            }
+            if !query.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err("a query with a byte that no query has".into());
+            }
+        }
+        if self.headers.len() > MAX_HEADERS {
+            return Err(format!("more than {MAX_HEADERS} headers"));
+        }
+        let mut total = 0;
+        for (name, value) in &self.headers {
+            if name.is_empty() || name.len() > MAX_HEADER_NAME || value.len() > MAX_HEADER_VALUE {
+                return Err("a header out of its bounds".into());
+            }
+            total += name.len() + value.len();
+            if HeaderName::from_bytes(name.as_bytes()).is_err()
+                || HeaderValue::from_bytes(value.as_bytes()).is_err()
+            {
+                return Err("a header that HTTP does not allow".into());
+            }
+        }
+        if total > MAX_HEADER_BYTES {
+            return Err(format!("headers over {MAX_HEADER_BYTES} bytes"));
+        }
+        Ok(())
+    }
+}
+
+/// The answer's status and headers, as the run half gives them back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+/// Why the front half answered a request itself, for the run's log and counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Declined {
+    /// Not the run's secret: `404`.
+    Secret,
+    /// A connection upgrade (WebSocket): `501`.
+    Upgrade,
+    /// A path outside the model API: `404`.
+    Path,
+    /// Another method than the endpoint's: `405`.
+    Method,
+    /// A head over the bounds, or not text: `400`, `414` or `431`.
+    Head,
+    /// A body over [`MAX_REQUEST_BODY`]: `413`.
+    TooLarge,
+}
+
+/// The run half: what makes a request towards the gateway, in this process or in `run`
+/// behind a front's wire. The answer comes back whole, its body streaming.
+pub trait ModelBackend: Send + Sync + 'static {
+    fn call(
+        &self,
+        head: RequestHead,
+        body: ProxyBody,
+    ) -> Pin<Box<dyn Future<Output = (ResponseHead, ProxyBody)> + Send>>;
+
+    /// The front half answered a request itself.
+    fn declined(&self, why: Declined);
+}
 
 /// Whether a run with this model access goes through the model proxy: a gateway (a base URL) of
 /// the `anthropic` or `openai` format. A provider's own API, other formats and the host's own
@@ -277,7 +475,7 @@ impl std::fmt::Debug for HostToken {
 
 /// Where a run's requests go, and with which key.
 struct Gateway {
-    format: ModelFormat,
+    api: ModelApi,
     /// Scheme, host and port, normalised, to compare with `--model-proxy-local-gateway`.
     origin: url::Origin,
     https: bool,
@@ -358,7 +556,10 @@ impl Gateway {
             secrets.push(token.bytes().to_vec());
         }
         Ok(Gateway {
-            format: access.format,
+            api: match access.format {
+                ModelFormat::Anthropic => ModelApi::Anthropic,
+                _ => ModelApi::Openai,
+            },
             origin,
             https,
             host,
@@ -372,20 +573,6 @@ impl Gateway {
             key: AhoCorasick::new(&secrets).context("cannot search for the key")?,
             secrets,
         })
-    }
-
-    /// The method of a model endpoint (the path after the base path), or `None` for any other
-    /// path.
-    fn endpoint_method(&self, endpoint: &str) -> Option<Method> {
-        match (self.format, endpoint) {
-            (ModelFormat::Anthropic, "/v1/messages" | "/v1/messages/count_tokens") => {
-                Some(Method::POST)
-            }
-            (ModelFormat::Anthropic, "/v1/models") => Some(Method::GET),
-            (ModelFormat::Openai, "/responses" | "/chat/completions") => Some(Method::POST),
-            (ModelFormat::Openai, "/models") => Some(Method::GET),
-            _ => None,
-        }
     }
 
     fn label(&self) -> String {
@@ -464,16 +651,19 @@ impl ModelProxy {
     /// Starts a run's listener, which forwards to the gateway of `access` with its key until
     /// the guard is dropped.
     pub async fn start_run(&self, run_id: Uuid, access: &ModelAccess) -> Result<ModelProxyGuard> {
-        self.start_run_at(run_id, access, None).await
+        self.start_run_at(run_id, access, None, None).await
     }
 
     /// [`ModelProxy::start_run`], with a base URL that names `sandbox_host` in place of the
-    /// endpoint's (a local test executor's sandbox over the bridge).
+    /// endpoint's (a local test executor's sandbox over the bridge), and with the listener's
+    /// HTTP served by the sandbox's `front` when it has one: this process then keeps the run
+    /// half only.
     pub async fn start_run_at(
         &self,
         run_id: Uuid,
         access: &ModelAccess,
         sandbox_host: Option<&str>,
+        front: Option<Arc<SandboxFront>>,
     ) -> Result<ModelProxyGuard> {
         anyhow::ensure!(!self.bind_ip.is_unspecified(), UNSPECIFIED_BIND);
         let gateway = Gateway::parse(access, self.settings.allow_http, self.host_token.as_ref())?;
@@ -498,7 +688,6 @@ impl ModelProxy {
         let state = Arc::new(RunState {
             run_id,
             gateway,
-            secret: secret.clone(),
             addresses: self.settings.addresses(),
             local_gateway,
             bind_ip: self.bind_ip,
@@ -507,9 +696,28 @@ impl ModelProxy {
             refused: AtomicU64::new(0),
             shutdown: CancellationToken::new(),
         });
-        tokio::spawn(accept_loop(listener, state.clone()));
+        let backend: Arc<dyn ModelBackend> = Arc::new(Direct(state.clone()));
+        let (api, base_path) = (state.gateway.api, state.gateway.base_path.clone());
+        match &front {
+            None => {
+                let half = FrontHalf::new(
+                    secret.clone(),
+                    api,
+                    base_path,
+                    backend,
+                    state.shutdown.clone(),
+                );
+                tokio::spawn(serve(listener, half));
+            }
+            Some(front) => {
+                front
+                    .listen_model(listener, secret.clone(), api, base_path, backend)
+                    .await
+                    .context("the sandbox's front cannot serve the model proxy")?;
+            }
+        }
         let host_token = state.gateway.host_token.is_some();
-        tracing::info!(run_id = %run_id, port, gateway = %state.gateway.label(), local_gateway, host_token, "model proxy listening for a run");
+        tracing::info!(run_id = %run_id, port, gateway = %state.gateway.label(), local_gateway, host_token, in_front = front.is_some(), "model proxy listening for a run");
         if state.gateway.host_token_withheld {
             tracing::warn!(run_id = %run_id, gateway = %state.gateway.label(), "{HOST_TOKEN_WITHHELD}");
         }
@@ -518,6 +726,7 @@ impl ModelProxy {
             base_url,
             secret,
             port,
+            front,
         })
     }
 }
@@ -528,6 +737,8 @@ pub struct ModelProxyGuard {
     base_url: String,
     secret: String,
     port: u16,
+    /// The sandbox's front, when it serves the listener's HTTP.
+    front: Option<Arc<SandboxFront>>,
 }
 
 impl ModelProxyGuard {
@@ -569,11 +780,19 @@ impl ModelProxyGuard {
             self.state.refused.load(Ordering::Relaxed),
         )
     }
+
+    /// The sandbox's front that serves the listener's HTTP, when one does.
+    pub fn front(&self) -> Option<&Arc<SandboxFront>> {
+        self.front.as_ref()
+    }
 }
 
 impl Drop for ModelProxyGuard {
     fn drop(&mut self) {
         self.state.shutdown.cancel();
+        if let Some(front) = self.front.take() {
+            front.unlisten(crate::front::wire::Service::Model);
+        }
         let (forwarded, refused) = self.counts();
         tracing::info!(run_id = %self.state.run_id, forwarded, refused, "model proxy stopped for a run");
     }
@@ -590,7 +809,6 @@ impl std::fmt::Debug for ModelProxyGuard {
 struct RunState {
     run_id: Uuid,
     gateway: Gateway,
-    secret: String,
     addresses: EgressSettings,
     /// The gateway's origin is the one of `--model-proxy-local-gateway`: it may be on loopback
     /// and this machine's own addresses.
@@ -604,20 +822,57 @@ struct RunState {
     shutdown: CancellationToken,
 }
 
-async fn accept_loop(listener: TcpListener, state: Arc<RunState>) {
+// ----- the front half: the sandbox's HTTP ---------------------------------------------------
+
+/// The proxy's HTTP side for one run's listener: the secret, the format and base path whose
+/// endpoints it maps, and the run half it hands each request to. It holds no key.
+pub struct FrontHalf {
+    secret: String,
+    api: ModelApi,
+    base_path: String,
+    backend: Arc<dyn ModelBackend>,
+    shutdown: CancellationToken,
+}
+
+impl FrontHalf {
+    pub fn new(
+        secret: String,
+        api: ModelApi,
+        base_path: String,
+        backend: Arc<dyn ModelBackend>,
+        shutdown: CancellationToken,
+    ) -> Arc<FrontHalf> {
+        Arc::new(FrontHalf {
+            secret,
+            api,
+            base_path,
+            backend,
+            shutdown,
+        })
+    }
+}
+
+/// Serves the proxy's HTTP on `listener` until the half's shutdown: at most
+/// [`MAX_CONNECTIONS`] connections at once; more wait.
+pub async fn serve(listener: TcpListener, half: Arc<FrontHalf>) {
     let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let permit = tokio::select! {
-            _ = state.shutdown.cancelled() => break,
+            _ = half.shutdown.cancelled() => break,
             permit = limit.clone().acquire_owned() => match permit {
                 Ok(permit) => permit,
                 Err(_) => break,
             },
         };
         let stream = tokio::select! {
-            _ = state.shutdown.cancelled() => break,
+            _ = half.shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+                Ok((stream, _)) => {
+                    // An answer's last part goes at once, not after the client's
+                    // acknowledgement of the one before (Nagle).
+                    let _ = stream.set_nodelay(true);
+                    stream
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "model proxy: accept failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -625,13 +880,13 @@ async fn accept_loop(listener: TcpListener, state: Arc<RunState>) {
                 }
             },
         };
-        let state = state.clone();
+        let half = half.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let shutdown = state.shutdown.clone();
+            let shutdown = half.shutdown.clone();
             let service = hyper::service::service_fn(move |req| {
-                let state = state.clone();
-                async move { Ok::<_, Infallible>(handle(state, req).await) }
+                let half = half.clone();
+                async move { Ok::<_, Infallible>(handle(half, req).await) }
             });
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder
@@ -649,8 +904,6 @@ async fn accept_loop(listener: TcpListener, state: Arc<RunState>) {
         });
     }
 }
-
-// ----- requests --------------------------------------------------------------------------
 
 /// An answer of the proxy itself, in the error shape both APIs use (`error.message`).
 fn error(status: StatusCode, message: &str) -> Response<ProxyBody> {
@@ -670,18 +923,32 @@ fn error(status: StatusCode, message: &str) -> Response<ProxyBody> {
     response
 }
 
-enum Decision {
-    /// The request target to send to the gateway (`<tail>?<query>`).
-    Forward(Uri),
-    Refuse(Box<Response<ProxyBody>>),
+fn method_not_allowed(allowed: &Method) -> Response<ProxyBody> {
+    let mut response = error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed on this endpoint of the model API",
+    );
+    response.headers_mut().insert(
+        header::ALLOW,
+        HeaderValue::from_str(allowed.as_str()).unwrap_or(HeaderValue::from_static("POST")),
+    );
+    response
 }
 
-fn refuse(status: StatusCode, message: &str) -> Decision {
-    Decision::Refuse(Box::new(error(status, message)))
-}
+const NOT_THE_MODEL_API: &str = "not found: the Tinfirm model proxy forwards only the model API (messages, responses, chat completions, models)";
+const TOO_LARGE: &str = "the request body is too large for the Tinfirm model proxy";
 
-/// Decides a request from its method, path and headers alone.
-fn decide(state: &RunState, method: &Method, uri: &Uri, headers: &HeaderMap) -> Decision {
+/// A request the front half answers itself, and why.
+type Refused = Box<(Declined, Response<ProxyBody>)>;
+
+/// The front half's decision on a request from its method, path and headers alone: the
+/// endpoint it maps to, or the answer to give and why.
+fn decide(
+    half: &FrontHalf,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> std::result::Result<ModelEndpoint, Refused> {
     let path = uri.path();
     let (candidate, tail) = match path.strip_prefix('/') {
         Some(rest) => match rest.find('/') {
@@ -690,55 +957,405 @@ fn decide(state: &RunState, method: &Method, uri: &Uri, headers: &HeaderMap) -> 
         },
         None => ("", ""),
     };
-    if !secret_eq(candidate.as_bytes(), state.secret.as_bytes()) {
-        tracing::debug!(run_id = %state.run_id, "model proxy request without the run's secret");
-        return refuse(StatusCode::NOT_FOUND, "not found");
+    if !secret_eq(candidate.as_bytes(), half.secret.as_bytes()) {
+        tracing::debug!("model proxy request without the run's secret");
+        return Err(Box::new((
+            Declined::Secret,
+            error(StatusCode::NOT_FOUND, "not found"),
+        )));
     }
     if headers.contains_key(header::UPGRADE) {
-        tracing::info!(run_id = %state.run_id, "model proxy refused a connection upgrade (WebSocket)");
-        return refuse(
-            StatusCode::NOT_IMPLEMENTED,
-            "the Tinfirm model proxy does not serve WebSocket connections; send the request over HTTP",
-        );
+        return Err(Box::new((
+            Declined::Upgrade,
+            error(
+                StatusCode::NOT_IMPLEMENTED,
+                "the Tinfirm model proxy does not serve WebSocket connections; send the request over HTTP",
+            ),
+        )));
     }
-    let gateway = &state.gateway;
-    let endpoint = tail.strip_prefix(gateway.base_path.as_str()).unwrap_or("");
-    let Some(allowed) = gateway.endpoint_method(endpoint) else {
-        let shown: String = tail.chars().take(200).collect();
-        tracing::info!(run_id = %state.run_id, method = %method, path = %shown.escape_debug(), "model proxy refused a path outside the model API");
-        return refuse(
-            StatusCode::NOT_FOUND,
-            "not found: the Tinfirm model proxy forwards only the model API (messages, responses, chat completions, models)",
-        );
+    let endpoint = tail.strip_prefix(half.base_path.as_str()).unwrap_or("");
+    let Some(endpoint) = ModelEndpoint::find(half.api, endpoint) else {
+        return Err(Box::new((
+            Declined::Path,
+            error(StatusCode::NOT_FOUND, NOT_THE_MODEL_API),
+        )));
     };
-    if *method != allowed {
-        let mut response = error(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed on this endpoint of the model API",
-        );
-        response.headers_mut().insert(
-            header::ALLOW,
-            HeaderValue::from_str(allowed.as_str()).unwrap_or(HeaderValue::from_static("POST")),
-        );
-        return Decision::Refuse(Box::new(response));
+    if *method != endpoint.method() {
+        return Err(Box::new((
+            Declined::Method,
+            method_not_allowed(&endpoint.method()),
+        )));
     }
-    let target = match uri.query() {
-        Some(query) => format!("{tail}?{query}"),
-        None => tail.to_string(),
+    Ok(endpoint)
+}
+
+/// The client's head as the run half gets it, or the answer to a head out of bounds.
+fn request_head(
+    endpoint: ModelEndpoint,
+    parts: &hyper::http::request::Parts,
+    exact: Option<u64>,
+) -> std::result::Result<RequestHead, Refused> {
+    let query = parts.uri.query().map(str::to_string);
+    if query.as_ref().is_some_and(|q| q.len() > MAX_QUERY) {
+        return Err(Box::new((
+            Declined::Head,
+            error(StatusCode::URI_TOO_LONG, "the request's query is too long"),
+        )));
+    }
+    let too_large = || -> Refused {
+        Box::new((
+            Declined::Head,
+            error(
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "the request's headers are too large for the Tinfirm model proxy",
+            ),
+        ))
     };
-    match target.parse::<Uri>() {
-        Ok(target) => Decision::Forward(target),
-        Err(_) => refuse(StatusCode::BAD_REQUEST, "bad request target"),
+    if parts.headers.len() > MAX_HEADERS {
+        return Err(too_large());
+    }
+    let mut headers = Vec::with_capacity(parts.headers.len());
+    let mut total = 0;
+    for (name, value) in &parts.headers {
+        if name.as_str().len() > MAX_HEADER_NAME || value.len() > MAX_HEADER_VALUE {
+            return Err(too_large());
+        }
+        total += name.as_str().len() + value.len();
+        if total > MAX_HEADER_BYTES {
+            return Err(too_large());
+        }
+        let Ok(value) = value.to_str() else {
+            return Err(Box::new((
+                Declined::Head,
+                error(
+                    StatusCode::BAD_REQUEST,
+                    "a request header's value is not text",
+                ),
+            )));
+        };
+        headers.push((name.as_str().to_string(), value.to_string()));
+    }
+    let length = match exact {
+        Some(0) => BodyLength::Empty,
+        Some(n) => BodyLength::Exact(n),
+        None => BodyLength::Streamed,
+    };
+    let head = RequestHead {
+        endpoint,
+        method: parts.method.as_str().to_string(),
+        query,
+        headers,
+        length,
+    };
+    head.check().map_err(|_| -> Refused {
+        Box::new((
+            Declined::Head,
+            error(StatusCode::BAD_REQUEST, "bad request target"),
+        ))
+    })?;
+    Ok(head)
+}
+
+async fn handle(half: Arc<FrontHalf>, req: Request<Incoming>) -> Response<ProxyBody> {
+    let refused = |refused: Refused| {
+        let (why, response) = *refused;
+        half.backend.declined(why);
+        response
+    };
+    let endpoint = match decide(&half, req.method(), req.uri(), req.headers()) {
+        Ok(endpoint) => endpoint,
+        Err(refusal) => return refused(refusal),
+    };
+    let exact = req.body().size_hint().exact();
+    if exact.is_some_and(|len| len > MAX_REQUEST_BODY) {
+        return refused(Box::new((
+            Declined::TooLarge,
+            error(StatusCode::PAYLOAD_TOO_LARGE, TOO_LARGE),
+        )));
+    }
+    let (parts, body) = req.into_parts();
+    let head = match request_head(endpoint, &parts, exact) {
+        Ok(head) => head,
+        Err(refusal) => return refused(refusal),
+    };
+    let body = body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync();
+    let (head, body) = half.backend.call(head, body).await;
+    response_from(head, body)
+}
+
+/// The front half's answer from the run half's head and body. A header that is not one is
+/// dropped (the run half sends none).
+pub(crate) fn response_from(head: ResponseHead, body: ProxyBody) -> Response<ProxyBody> {
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    for (name, value) in head.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            response.headers_mut().append(name, value);
+        }
+    }
+    response
+}
+
+/// The run half's answer as its head and body. A header whose value is not text is dropped,
+/// and so is any after the first [`MAX_RESPONSE_HEADERS`]: a front's wire carries text.
+fn response_head(response: Response<ProxyBody>, run_id: Uuid) -> (ResponseHead, ProxyBody) {
+    let (parts, body) = response.into_parts();
+    let mut headers = Vec::new();
+    let mut dropped = 0;
+    for (name, value) in &parts.headers {
+        match value.to_str() {
+            Ok(value) if headers.len() < MAX_RESPONSE_HEADERS => {
+                headers.push((name.as_str().to_string(), value.to_string()));
+            }
+            _ => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        tracing::debug!(%run_id, dropped, "model proxy: answer headers that are not text, or too many, are dropped");
+    }
+    (
+        ResponseHead {
+            status: parts.status.as_u16(),
+            headers,
+        },
+        body,
+    )
+}
+
+// ----- the run half: the gateway's side ----------------------------------------------------
+
+/// An answer of the proxy itself, as a head and a body.
+pub(crate) fn proxy_error(status: StatusCode, message: &str) -> (ResponseHead, ProxyBody) {
+    response_head(error(status, message), Uuid::nil())
+}
+
+/// The answer to a request that comes after its listener closed.
+pub(crate) fn closed_listener() -> (ResponseHead, ProxyBody) {
+    proxy_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the Tinfirm model proxy of this run has stopped",
+    )
+}
+
+/// The run half in this process: the front half's requests go to the run's gateway.
+pub(crate) struct Direct(Arc<RunState>);
+
+impl ModelBackend for Direct {
+    fn call(
+        &self,
+        head: RequestHead,
+        body: ProxyBody,
+    ) -> Pin<Box<dyn Future<Output = (ResponseHead, ProxyBody)> + Send>> {
+        let state = self.0.clone();
+        Box::pin(async move {
+            let response = state.call(head, body).await;
+            response_head(response, state.run_id)
+        })
+    }
+
+    fn declined(&self, why: Declined) {
+        let state = &self.0;
+        state.refused.fetch_add(1, Ordering::Relaxed);
+        match why {
+            Declined::Secret | Declined::Head | Declined::TooLarge => {
+                tracing::debug!(run_id = %state.run_id, ?why, "model proxy refused a request");
+            }
+            Declined::Upgrade => {
+                tracing::info!(run_id = %state.run_id, "model proxy refused a connection upgrade (WebSocket)");
+            }
+            Declined::Path | Declined::Method => {
+                tracing::info!(run_id = %state.run_id, ?why, "model proxy refused a request outside the model API");
+            }
+        }
     }
 }
 
-async fn handle(state: Arc<RunState>, req: Request<Incoming>) -> Response<ProxyBody> {
-    match decide(&state, req.method(), req.uri(), req.headers()) {
-        Decision::Refuse(response) => {
-            state.refused.fetch_add(1, Ordering::Relaxed);
-            *response
+/// The request body of a head that said how long it is: exactly that many bytes, or an error.
+struct ExactBody {
+    inner: ProxyBody,
+    left: u64,
+}
+
+/// The body did not have the length its head declared.
+#[derive(Debug, thiserror::Error)]
+#[error("the request body does not have the length its head declared")]
+struct LengthMismatch;
+
+impl Body for ExactBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let len = data.len() as u64;
+                    if len > this.left {
+                        return Poll::Ready(Some(Err(Box::new(LengthMismatch))));
+                    }
+                    this.left -= len;
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) if this.left > 0 => Poll::Ready(Some(Err(Box::new(LengthMismatch)))),
+            other => other,
         }
-        Decision::Forward(target) => forward(&state, target, req).await,
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(self.left)
+    }
+}
+
+impl RunState {
+    /// The run half's rules for a request, whoever parsed it: the head's bounds, an endpoint
+    /// of the gateway's format, its method, the length within [`MAX_REQUEST_BODY`]. Then the
+    /// request goes to the gateway with the key.
+    async fn call(self: &Arc<Self>, head: RequestHead, body: ProxyBody) -> Response<ProxyBody> {
+        let refuse = |status: StatusCode, message: &str| {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            error(status, message)
+        };
+        if let Err(why) = head.check() {
+            tracing::warn!(run_id = %self.run_id, %why, "model proxy refused a request head out of its bounds");
+            return refuse(StatusCode::BAD_REQUEST, "bad request");
+        }
+        if head.endpoint.api() != self.gateway.api {
+            tracing::warn!(run_id = %self.run_id, endpoint = ?head.endpoint, "model proxy refused an endpoint of the other format");
+            return refuse(StatusCode::NOT_FOUND, NOT_THE_MODEL_API);
+        }
+        let method = head.endpoint.method();
+        if head.method != method.as_str() {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return method_not_allowed(&method);
+        }
+        let exact = match head.length {
+            BodyLength::Empty => Some(0),
+            BodyLength::Exact(n) => Some(n),
+            BodyLength::Streamed => None,
+        };
+        if exact.is_some_and(|len| len > MAX_REQUEST_BODY) {
+            return refuse(StatusCode::PAYLOAD_TOO_LARGE, TOO_LARGE);
+        }
+        let target = match &head.query {
+            Some(query) => format!("{}{}?{query}", self.gateway.base_path, head.endpoint.path()),
+            None => format!("{}{}", self.gateway.base_path, head.endpoint.path()),
+        };
+        let Ok(target) = target.parse::<Uri>() else {
+            return refuse(StatusCode::BAD_REQUEST, "bad request target");
+        };
+        let mut headers = HeaderMap::new();
+        for (name, value) in &head.headers {
+            match (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    headers.append(name, value);
+                }
+                _ => return refuse(StatusCode::BAD_REQUEST, "bad request header"),
+            }
+        }
+        let body = match exact {
+            Some(left) => ExactBody { inner: body, left }.boxed_unsync(),
+            None => body,
+        };
+        self.forward(method, target, headers, body).await
+    }
+
+    async fn forward(
+        &self,
+        method: Method,
+        target: Uri,
+        headers: HeaderMap,
+        body: ProxyBody,
+    ) -> Response<ProxyBody> {
+        let state = self;
+        let gateway = &state.gateway;
+        let endpoint = target.path().to_string();
+        let mut outgoing =
+            Request::new(Limited::new(body, MAX_REQUEST_BODY as usize).boxed_unsync());
+        *outgoing.method_mut() = method.clone();
+        *outgoing.uri_mut() = target;
+        *outgoing.headers_mut() = upstream_headers(gateway, headers);
+
+        let stream = match connect(state).await {
+            Ok(stream) => stream,
+            Err(message) => {
+                tracing::warn!(run_id = %state.run_id, gateway = %gateway.label(), error = %message, "model proxy: cannot reach the gateway");
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("the Tinfirm model proxy cannot reach the model gateway: {message}"),
+                );
+            }
+        };
+        let response = match send(state, stream, outgoing).await {
+            Ok(response) => response,
+            Err(e) if body_too_large(e.as_ref()) => {
+                state.refused.fetch_add(1, Ordering::Relaxed);
+                return error(StatusCode::PAYLOAD_TOO_LARGE, TOO_LARGE);
+            }
+            Err(e) if length_mismatch(e.as_ref()) => {
+                state.refused.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(run_id = %state.run_id, "model proxy: a request body did not have the length its head declared");
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "the request body does not have the length its head declared",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(run_id = %state.run_id, gateway = %gateway.label(), error = %e, "model proxy: the gateway request failed");
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "the Tinfirm model proxy's request to the model gateway failed",
+                );
+            }
+        };
+        state.forwarded.fetch_add(1, Ordering::Relaxed);
+        let status = response.status();
+        tracing::debug!(run_id = %state.run_id, method = %method, endpoint = %endpoint, status = status.as_u16(), "model proxy request");
+        if status.is_redirection() {
+            tracing::warn!(run_id = %state.run_id, status = status.as_u16(), "model proxy: the gateway answered with a redirect; not following it");
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "the model gateway answered with a redirect; the Tinfirm model proxy does not follow redirects",
+            );
+        }
+        if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "the model gateway asked for proxy authentication",
+            );
+        }
+        let (mut head, body) = response.into_parts();
+        if head
+            .headers
+            .values()
+            .any(|value| gateway.key.is_match(value.as_bytes()))
+        {
+            tracing::warn!(run_id = %state.run_id, "model proxy: the gateway's answer named the key in a header; not passing it on");
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "the model gateway's answer contained the key; the Tinfirm model proxy did not pass it on",
+            );
+        }
+        strip_hop_by_hop(&mut head.headers);
+        head.headers.remove(header::SET_COOKIE);
+        let body = GatewayBody {
+            inner: body,
+            idle: Box::pin(tokio::time::sleep(IDLE_TIMEOUT)),
+            scan: KeyScan::new(gateway),
+            run_id: state.run_id,
+            ended: false,
+        };
+        Response::from_parts(head, body.boxed_unsync())
     }
 }
 
@@ -764,93 +1381,6 @@ fn upstream_headers(gateway: &Gateway, mut headers: HeaderMap) -> HeaderMap {
         HeaderValue::from_static("identity"),
     );
     headers
-}
-
-async fn forward(state: &RunState, target: Uri, req: Request<Incoming>) -> Response<ProxyBody> {
-    let (parts, body) = req.into_parts();
-    let declared_length = parts
-        .headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if declared_length.is_some_and(|len| len > MAX_REQUEST_BODY) {
-        state.refused.fetch_add(1, Ordering::Relaxed);
-        return error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "the request body is too large for the Tinfirm model proxy",
-        );
-    }
-    let gateway = &state.gateway;
-    let endpoint = target.path().to_string();
-    let mut outgoing = Request::new(Limited::new(body, MAX_REQUEST_BODY as usize).boxed_unsync());
-    *outgoing.method_mut() = parts.method.clone();
-    *outgoing.uri_mut() = target;
-    *outgoing.headers_mut() = upstream_headers(gateway, parts.headers);
-
-    let stream = match connect(state).await {
-        Ok(stream) => stream,
-        Err(message) => {
-            tracing::warn!(run_id = %state.run_id, gateway = %gateway.label(), error = %message, "model proxy: cannot reach the gateway");
-            return error(
-                StatusCode::BAD_GATEWAY,
-                &format!("the Tinfirm model proxy cannot reach the model gateway: {message}"),
-            );
-        }
-    };
-    let response = match send(state, stream, outgoing).await {
-        Ok(response) => response,
-        Err(e) if body_too_large(e.as_ref()) => {
-            return error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "the request body is too large for the Tinfirm model proxy",
-            );
-        }
-        Err(e) => {
-            tracing::warn!(run_id = %state.run_id, gateway = %gateway.label(), error = %e, "model proxy: the gateway request failed");
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "the Tinfirm model proxy's request to the model gateway failed",
-            );
-        }
-    };
-    state.forwarded.fetch_add(1, Ordering::Relaxed);
-    let status = response.status();
-    tracing::debug!(run_id = %state.run_id, method = %parts.method, endpoint = %endpoint, status = status.as_u16(), "model proxy request");
-    if status.is_redirection() {
-        tracing::warn!(run_id = %state.run_id, status = status.as_u16(), "model proxy: the gateway answered with a redirect; not following it");
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "the model gateway answered with a redirect; the Tinfirm model proxy does not follow redirects",
-        );
-    }
-    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "the model gateway asked for proxy authentication",
-        );
-    }
-    let (mut head, body) = response.into_parts();
-    if head
-        .headers
-        .values()
-        .any(|value| gateway.key.is_match(value.as_bytes()))
-    {
-        tracing::warn!(run_id = %state.run_id, "model proxy: the gateway's answer named the key in a header; not passing it on");
-        return error(
-            StatusCode::BAD_GATEWAY,
-            "the model gateway's answer contained the key; the Tinfirm model proxy did not pass it on",
-        );
-    }
-    strip_hop_by_hop(&mut head.headers);
-    head.headers.remove(header::SET_COOKIE);
-    let body = GatewayBody {
-        inner: body,
-        idle: Box::pin(tokio::time::sleep(IDLE_TIMEOUT)),
-        scan: KeyScan::new(gateway),
-        run_id: state.run_id,
-        ended: false,
-    };
-    Response::from_parts(head, body.boxed_unsync())
 }
 
 /// A connection to an address of the gateway that the address rules allow.
@@ -979,6 +1509,18 @@ where
         .await
         .map_err(|_| "the model gateway did not answer in time")??;
     Ok(response)
+}
+
+/// `true` when the request body did not have the length its head declared.
+fn length_mismatch(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if e.is::<LengthMismatch>() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
 }
 
 /// `true` when the request body hit [`MAX_REQUEST_BODY`] while it was sent.
@@ -1282,9 +1824,33 @@ mod tests {
         }
     }
 
-    async fn start(format: ModelFormat, base_url: &str) -> ModelProxyGuard {
+    /// Where a test's front half runs: in this process, or in a front of its own.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Run,
+        Front,
+    }
+
+    /// The sandbox's front for `mode`.
+    async fn front(mode: Mode) -> Option<Arc<SandboxFront>> {
+        match mode {
+            Mode::Run => None,
+            Mode::Front => Some(
+                SandboxFront::start(&crate::front::test_command())
+                    .await
+                    .unwrap(),
+            ),
+        }
+    }
+
+    async fn start_in(mode: Mode, format: ModelFormat, base_url: &str) -> ModelProxyGuard {
         ModelProxy::new(test_settings(), &endpoint())
-            .start_run(Uuid::new_v4(), &access(format, base_url))
+            .start_run_at(
+                Uuid::new_v4(),
+                &access(format, base_url),
+                None,
+                front(mode).await,
+            )
             .await
             .unwrap()
     }
@@ -1512,9 +2078,8 @@ mod tests {
         assert!(!format!("{err:#}").contains("sk-bad"), "{err:#}");
     }
 
-    #[tokio::test]
-    async fn the_base_url_is_the_listener_with_the_secret_and_the_base_path() {
-        let anthropic = start(ModelFormat::Anthropic, "http://127.0.0.1:9").await;
+    async fn the_base_url_is_the_listener_with_the_secret_and_the_base_path(mode: Mode) {
+        let anthropic = start_in(mode, ModelFormat::Anthropic, "http://127.0.0.1:9").await;
         assert_eq!(
             anthropic.base_url(),
             format!(
@@ -1524,7 +2089,7 @@ mod tests {
             )
         );
         assert_eq!(anthropic.secret().len(), 43);
-        let openai = start(ModelFormat::Openai, "http://127.0.0.1:9/v1").await;
+        let openai = start_in(mode, ModelFormat::Openai, "http://127.0.0.1:9/v1").await;
         assert_eq!(
             openai.base_url(),
             format!("http://127.0.0.2:{}/{}/v1", openai.port(), openai.secret())
@@ -1537,8 +2102,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn forwards_with_the_real_key_only() {
+    async fn forwards_with_the_real_key_only(mode: Mode) {
         const ANSWER: &str = r#"{"id":"msg_1","content":[{"type":"text","text":"PONG"}]}"#;
         // A whole answer, with its length (as a gateway sends one that does not stream).
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply {
@@ -1552,7 +2116,7 @@ mod tests {
             ..Reply::ok(ANSWER)
         }))
         .await;
-        let guard = start(ModelFormat::Anthropic, &gateway.url("")).await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
         let (status, headers, body) = request(
             &guard,
             Method::POST,
@@ -1621,11 +2185,10 @@ mod tests {
         assert_eq!(guard.counts(), (1, 0));
     }
 
-    #[tokio::test]
-    async fn wrong_or_missing_secrets_are_not_found() {
+    async fn wrong_or_missing_secrets_are_not_found(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
-        let guard = start(ModelFormat::Anthropic, &gateway.url("")).await;
-        let other = start(ModelFormat::Anthropic, &gateway.url("")).await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
+        let other = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
         let secret = guard.secret().to_string();
         let mut last_off = secret.clone();
         let last = last_off.pop().unwrap();
@@ -1656,11 +2219,10 @@ mod tests {
         assert!(gateway.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn only_the_model_endpoints_under_the_base_path_are_forwarded() {
+    async fn only_the_model_endpoints_under_the_base_path_are_forwarded(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
         // An Anthropic gateway at a root.
-        let guard = start(ModelFormat::Anthropic, &gateway.url("")).await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
         let base = base_path(&guard);
         for (method, endpoint) in [
             (Method::POST, "/v1/messages"),
@@ -1728,7 +2290,7 @@ mod tests {
 
         // An OpenAI gateway under `/v1`: its endpoints, under that path only.
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
-        let guard = start(ModelFormat::Openai, &gateway.url("/v1")).await;
+        let guard = start_in(mode, ModelFormat::Openai, &gateway.url("/v1")).await;
         let base = base_path(&guard);
         assert!(base.ends_with("/v1"));
         for (method, endpoint) in [
@@ -1766,8 +2328,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn streams_the_answer_as_it_arrives() {
+    async fn streams_the_answer_as_it_arrives(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply {
             status: StatusCode::OK,
             headers: vec![("content-type", "text/event-stream".into())],
@@ -1778,7 +2339,7 @@ mod tests {
             ],
         }))
         .await;
-        let guard = start(ModelFormat::Anthropic, &gateway.url("")).await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
         let mut stream = TcpStream::connect(listener_addr(&guard)).await.unwrap();
         let head = format!(
             "POST {}/v1/messages HTTP/1.1\r\nHost: proxy\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
@@ -1814,10 +2375,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn websocket_upgrades_are_refused() {
+    async fn websocket_upgrades_are_refused(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
-        let guard = start(ModelFormat::Openai, &gateway.url("/v1")).await;
+        let guard = start_in(mode, ModelFormat::Openai, &gateway.url("/v1")).await;
         let (status, _, body) = request(
             &guard,
             Method::GET,
@@ -1836,15 +2396,14 @@ mod tests {
         assert!(gateway.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn nothing_answers_once_the_run_ends() {
+    async fn nothing_answers_once_the_run_ends(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply {
             status: StatusCode::OK,
             headers: vec![("content-type", "text/event-stream".into())],
             parts: vec![Some("data: {}\n\n".into()), None],
         }))
         .await;
-        let guard = start(ModelFormat::Anthropic, &gateway.url("")).await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
         let addr = listener_addr(&guard);
         // A streaming answer is open when the run ends.
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -1879,8 +2438,7 @@ mod tests {
         assert!(gone, "the listener is still there");
     }
 
-    #[tokio::test]
-    async fn a_key_in_the_answer_never_reaches_the_sandbox() {
+    async fn a_key_in_the_answer_never_reaches_the_sandbox(mode: Mode) {
         // A gateway that echoes the key in its body, split across two parts.
         let (head, tail) = REAL_KEY.split_at(10);
         let echo = FakeGateway::start(Arc::new(move |_: &Seen| Reply {
@@ -1892,7 +2450,7 @@ mod tests {
             ],
         }))
         .await;
-        let guard = start(ModelFormat::Openai, &echo.url("/v1")).await;
+        let guard = start_in(mode, ModelFormat::Openai, &echo.url("/v1")).await;
         let (status, _, body) = request(
             &guard,
             Method::POST,
@@ -1917,7 +2475,7 @@ mod tests {
             ..Reply::ok("{}")
         }))
         .await;
-        let guard = start(ModelFormat::Openai, &header_echo.url("/v1")).await;
+        let guard = start_in(mode, ModelFormat::Openai, &header_echo.url("/v1")).await;
         let (status, headers, body) = request(
             &guard,
             Method::POST,
@@ -1944,15 +2502,14 @@ mod tests {
         assert!(scan.finish().is_none());
     }
 
-    #[tokio::test]
-    async fn redirects_are_not_followed() {
+    async fn redirects_are_not_followed(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply {
             status: StatusCode::TEMPORARY_REDIRECT,
             headers: vec![("location", "https://elsewhere.example/v1/messages".into())],
             parts: vec![],
         }))
         .await;
-        let guard = start(ModelFormat::Anthropic, &gateway.url("")).await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
         let (status, headers, _) = request(
             &guard,
             Method::POST,
@@ -1966,8 +2523,7 @@ mod tests {
         assert_eq!(gateway.seen().len(), 1);
     }
 
-    #[tokio::test]
-    async fn gateway_errors_pass_through() {
+    async fn gateway_errors_pass_through(mode: Mode) {
         // A spent budget or a revoked key: the runtime must see the gateway's answer.
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -1980,7 +2536,7 @@ mod tests {
             )],
         }))
         .await;
-        let guard = start(ModelFormat::Openai, &gateway.url("/v1")).await;
+        let guard = start_in(mode, ModelFormat::Openai, &gateway.url("/v1")).await;
         let (status, headers, body) = request(
             &guard,
             Method::POST,
@@ -1994,10 +2550,9 @@ mod tests {
         assert!(body.contains("Budget has been exceeded"), "{body}");
     }
 
-    #[tokio::test]
-    async fn oversized_request_bodies_are_refused() {
+    async fn oversized_request_bodies_are_refused(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
-        let guard = start(ModelFormat::Anthropic, &gateway.url("")).await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
         let mut stream = TcpStream::connect(listener_addr(&guard)).await.unwrap();
         let head = format!(
             "POST {}/v1/messages HTTP/1.1\r\nHost: proxy\r\nContent-Length: {}\r\n\r\n",
@@ -2012,8 +2567,7 @@ mod tests {
         assert!(gateway.seen().is_empty());
     }
 
-    #[tokio::test]
-    async fn the_gateways_address_is_checked() {
+    async fn the_gateways_address_is_checked(mode: Mode) {
         // Production rules: loopback, link-local (metadata) and reserved addresses are refused,
         // and private ones without --egress-allow-private; nothing is connected to.
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
@@ -2031,7 +2585,12 @@ mod tests {
             "http://10.1.2.3:4000".to_string(),
         ] {
             let guard = proxy
-                .start_run(Uuid::new_v4(), &access(ModelFormat::Anthropic, &url))
+                .start_run_at(
+                    Uuid::new_v4(),
+                    &access(ModelFormat::Anthropic, &url),
+                    None,
+                    front(mode).await,
+                )
                 .await
                 .unwrap();
             let (status, _, body) = request(
@@ -2048,7 +2607,8 @@ mod tests {
         assert!(gateway.seen().is_empty());
         // The listener's own address is never the gateway, even with loopback allowed.
         let own = TcpListener::bind("127.0.0.2:0").await.unwrap();
-        let guard = start(
+        let guard = start_in(
+            mode,
             ModelFormat::Anthropic,
             &format!("http://{}", own.local_addr().unwrap()),
         )
@@ -2064,8 +2624,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     }
 
-    #[tokio::test]
-    async fn only_the_named_local_gateway_may_be_on_this_machine() {
+    async fn only_the_named_local_gateway_may_be_on_this_machine(mode: Mode) {
         async fn post(guard: &ModelProxyGuard) -> (StatusCode, String) {
             let path = format!("{}/v1/messages", base_path(guard));
             let (status, _, body) = request(guard, Method::POST, &path, &[], "{}").await;
@@ -2084,7 +2643,12 @@ mod tests {
             let proxy = &proxy;
             async move {
                 proxy
-                    .start_run(Uuid::new_v4(), &access(ModelFormat::Anthropic, &url))
+                    .start_run_at(
+                        Uuid::new_v4(),
+                        &access(ModelFormat::Anthropic, &url),
+                        None,
+                        front(mode).await,
+                    )
                     .await
                     .unwrap()
             }
@@ -2128,7 +2692,12 @@ mod tests {
             ("http://10.1.2.3:4000", "(private)"),
         ] {
             let guard = ModelProxy::new(settings(url), &endpoint())
-                .start_run(Uuid::new_v4(), &access(ModelFormat::Anthropic, url))
+                .start_run_at(
+                    Uuid::new_v4(),
+                    &access(ModelFormat::Anthropic, url),
+                    None,
+                    front(mode).await,
+                )
                 .await
                 .unwrap();
             let (status, body) = post(&guard).await;
@@ -2141,13 +2710,19 @@ mod tests {
 
     /// A proxy whose host logged in to `server_url` with [`HOST_TOKEN`].
     async fn start_with_host_token(
+        mode: Mode,
         format: ModelFormat,
         base_url: &str,
         server_url: &str,
     ) -> ModelProxyGuard {
         ModelProxy::new(test_settings(), &endpoint())
             .with_host_token(HostToken::new(server_url, HOST_TOKEN).unwrap())
-            .start_run(Uuid::new_v4(), &access(format, base_url))
+            .start_run_at(
+                Uuid::new_v4(),
+                &access(format, base_url),
+                None,
+                front(mode).await,
+            )
             .await
             .unwrap()
     }
@@ -2240,12 +2815,12 @@ mod tests {
         assert!(none.host_token.is_none());
     }
 
-    #[tokio::test]
-    async fn the_host_token_goes_to_its_server_only_and_never_from_the_sandbox() {
+    async fn the_host_token_goes_to_its_server_only_and_never_from_the_sandbox(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
         // The gateway is the host's server: its own token goes with every request, and the one the
         // sandbox sends is dropped (a prompt-injected agent's guess, or a copied token).
         let guard = start_with_host_token(
+            mode,
             ModelFormat::Anthropic,
             &gateway.url("/api/runner/v1/model/anthropic"),
             &gateway.url("/"),
@@ -2291,7 +2866,8 @@ mod tests {
         let other = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
         for base_url in [other.url(""), other.url("/api/runner/v1/model/anthropic")] {
             let guard =
-                start_with_host_token(ModelFormat::Anthropic, &base_url, &gateway.url("")).await;
+                start_with_host_token(mode, ModelFormat::Anthropic, &base_url, &gateway.url(""))
+                    .await;
             assert!(!guard.sends_host_token());
             assert_eq!(guard.host_token_withheld(), base_url.contains(RELAY_PATH));
             let (status, _, body) = request(
@@ -2312,8 +2888,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn the_host_token_in_the_answer_never_reaches_the_sandbox() {
+    async fn the_host_token_in_the_answer_never_reaches_the_sandbox(mode: Mode) {
         // A server that echoes the host's token, split across two parts.
         let (head, tail) = HOST_TOKEN.split_at(12);
         let echo = FakeGateway::start(Arc::new(move |_: &Seen| Reply {
@@ -2326,6 +2901,7 @@ mod tests {
         }))
         .await;
         let guard = start_with_host_token(
+            mode,
             ModelFormat::Openai,
             &echo.url("/api/runner/v1/model/openai/v1"),
             &echo.url(""),
@@ -2356,6 +2932,7 @@ mod tests {
         }))
         .await;
         let guard = start_with_host_token(
+            mode,
             ModelFormat::Openai,
             &header_echo.url("/api/runner/v1/model/openai/v1"),
             &header_echo.url(""),
@@ -2406,4 +2983,180 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("not on every address"), "{err}");
     }
+
+    /// A gateway that takes a request's head and then holds: it answers nothing, or an SSE
+    /// head and one event, and says when `run` closes the connection.
+    struct HoldingGateway {
+        addr: SocketAddr,
+        events: mpsc::UnboundedReceiver<&'static str>,
+    }
+
+    impl HoldingGateway {
+        async fn start(event: Option<&'static str>) -> HoldingGateway {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, events) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut seen = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        let mut head = false;
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                            }
+                            if !head && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                                head = true;
+                                let _ = tx.send("head");
+                                if let Some(event) = event {
+                                    let answer = format!(
+                                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{event}\r\n",
+                                        event.len()
+                                    );
+                                    let _ = stream.write_all(answer.as_bytes()).await;
+                                }
+                            }
+                        }
+                        let _ = tx.send("closed");
+                    });
+                }
+            });
+            HoldingGateway { addr, events }
+        }
+
+        async fn next(&mut self) -> &'static str {
+            tokio::time::timeout(Duration::from_secs(10), self.events.recv())
+                .await
+                .expect("the gateway heard nothing")
+                .unwrap()
+        }
+    }
+
+    /// Waits until nothing of the requests stays: in a front, no open request at its handle
+    /// and no task of `run` that answers one.
+    async fn nothing_stays(guard: &ModelProxyGuard) {
+        let Some(front) = guard.front() else {
+            return;
+        };
+        for _ in 0..500 {
+            if front.answering() == 0 && front.handle().open_requests() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(front.answering(), 0, "a task of `run` stays");
+        assert_eq!(front.handle().open_requests(), 0, "a request stays open");
+        assert!(
+            front.handle().ended().is_none(),
+            "{:?}",
+            front.handle().ended()
+        );
+    }
+
+    async fn a_client_that_leaves_costs_nothing_that_stays(mode: Mode) {
+        // Before the gateway answers.
+        let mut gateway = HoldingGateway::start(None).await;
+        let guard = start_in(
+            mode,
+            ModelFormat::Anthropic,
+            &format!("http://{}", gateway.addr),
+        )
+        .await;
+        let mut client = TcpStream::connect(listener_addr(&guard)).await.unwrap();
+        let head = format!(
+            "POST {}/v1/messages HTTP/1.1\r\nHost: proxy\r\nContent-Length: 2\r\n\r\n{{}}",
+            base_path(&guard)
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        assert_eq!(gateway.next().await, "head");
+        drop(client);
+        assert_eq!(gateway.next().await, "closed", "the upstream request stays");
+        nothing_stays(&guard).await;
+
+        // In the middle of the request body.
+        let mut client = TcpStream::connect(listener_addr(&guard)).await.unwrap();
+        let head = format!(
+            "POST {}/v1/messages HTTP/1.1\r\nHost: proxy\r\nContent-Length: 1000\r\n\r\n0123456789",
+            base_path(&guard)
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        assert_eq!(gateway.next().await, "head");
+        drop(client);
+        assert_eq!(gateway.next().await, "closed", "the upstream request stays");
+        nothing_stays(&guard).await;
+        drop(guard);
+
+        // In the middle of the answer.
+        let mut gateway = HoldingGateway::start(Some("data: {}\n\n")).await;
+        let guard = start_in(
+            mode,
+            ModelFormat::Anthropic,
+            &format!("http://{}", gateway.addr),
+        )
+        .await;
+        let mut client = TcpStream::connect(listener_addr(&guard)).await.unwrap();
+        let head = format!(
+            "POST {}/v1/messages HTTP/1.1\r\nHost: proxy\r\nContent-Length: 2\r\n\r\n{{}}",
+            base_path(&guard)
+        );
+        client.write_all(head.as_bytes()).await.unwrap();
+        assert_eq!(gateway.next().await, "head");
+        let mut received = String::new();
+        let mut buf = [0u8; 4096];
+        while !received.contains("data: {}") {
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("the event did not arrive")
+                .unwrap();
+            assert!(n > 0, "{received}");
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        drop(client);
+        assert_eq!(gateway.next().await, "closed", "the upstream request stays");
+        nothing_stays(&guard).await;
+    }
+
+    /// The tests of the proxy's traffic, with the front half in this process and in a front.
+    macro_rules! in_both {
+        ($($name:ident),* $(,)?) => {
+            mod in_run {
+                $(
+                    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                    async fn $name() {
+                        super::$name(super::Mode::Run).await
+                    }
+                )*
+            }
+            mod in_a_front {
+                $(
+                    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                    async fn $name() {
+                        super::$name(super::Mode::Front).await
+                    }
+                )*
+            }
+        };
+    }
+
+    in_both!(
+        the_base_url_is_the_listener_with_the_secret_and_the_base_path,
+        forwards_with_the_real_key_only,
+        wrong_or_missing_secrets_are_not_found,
+        only_the_model_endpoints_under_the_base_path_are_forwarded,
+        streams_the_answer_as_it_arrives,
+        websocket_upgrades_are_refused,
+        nothing_answers_once_the_run_ends,
+        a_key_in_the_answer_never_reaches_the_sandbox,
+        redirects_are_not_followed,
+        gateway_errors_pass_through,
+        oversized_request_bodies_are_refused,
+        the_gateways_address_is_checked,
+        only_the_named_local_gateway_may_be_on_this_machine,
+        a_client_that_leaves_costs_nothing_that_stays,
+        the_host_token_goes_to_its_server_only_and_never_from_the_sandbox,
+        the_host_token_in_the_answer_never_reaches_the_sandbox,
+    );
 }
