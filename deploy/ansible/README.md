@@ -513,6 +513,7 @@ stop it, and then re-image the machine.
 | `tinfirm_sandbox_node_control_host` | none | The control host's IPv4 address, as the node sees it. Required |
 | `tinfirm_sandbox_node_management_address` | none | The one address admitted to SSH. Required |
 | `tinfirm_sandbox_node_check_ssh_source` | `true` | Stop when the play's SSH comes from another address |
+| `tinfirm_sandbox_node_cloud_init` | `refuse` | `refuse` stops the play on a node whose cloud-init would run at the next start; `disable` writes `/etc/cloud/cloud-init.disabled`. With cloud-init active, a node does not finish its start once the firewall is loaded, since cloud-init waits for the metadata service that the firewall drops |
 | `tinfirm_sandbox_node_agent_port` | `7700` | The listener's TLS port |
 | `tinfirm_sandbox_node_first_port` | `20000` | The first VM's published port; the last is `first_port + max_vms - 1` |
 | `tinfirm_sandbox_node_vm_range` | `10.231.0.0/16` | The VMs' own addresses, which never leave the node |

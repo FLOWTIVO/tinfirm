@@ -37,6 +37,19 @@
 
 # net.ipv4.ip_forward = 1, which the helper reads and never writes, and
 # user.max_user_namespaces = 0 for every process of the node.
+# Before the firewall is enabled: a cloud-init that asked the metadata service at the next
+# start would never get an answer through it.
+- name: Switch cloud-init off for good
+  ansible.builtin.copy:
+    content: "Written by the role tinfirm_sandbox_node: the node's firewall drops the metadata service.\n"
+    dest: /etc/cloud/cloud-init.disabled
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - tinfirm_sandbox_node_cloud_init == 'disable'
+    - _tinfirm_sandbox_node_cloud_init.results[0].stat.exists
+
 - name: Install the node's sysctl settings
   ansible.builtin.copy:
     src: tinfirm-node-agent.sysctl.conf

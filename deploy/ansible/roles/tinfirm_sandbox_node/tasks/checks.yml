@@ -207,6 +207,37 @@
     quiet: true
   loop: [docker.service, firewalld.service, nftables.service]
 
+# The node's firewall is loaded before the network and drops the metadata service, so a
+# cloud-init that runs at the next start would keep the node from finishing that start.
+- name: Check the cloud-init setting
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_cloud_init in ['refuse', 'disable']
+    fail_msg: tinfirm_sandbox_node_cloud_init is `refuse` or `disable`.
+    quiet: true
+
+- name: Look for cloud-init
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: [/usr/bin/cloud-init, /etc/cloud/cloud-init.disabled]
+  register: _tinfirm_sandbox_node_cloud_init
+
+- name: Refuse a node whose cloud-init would run at its next start
+  ansible.builtin.assert:
+    that:
+      - >-
+        tinfirm_sandbox_node_cloud_init == 'disable'
+        or not _tinfirm_sandbox_node_cloud_init.results[0].stat.exists
+        or _tinfirm_sandbox_node_cloud_init.results[1].stat.exists
+    fail_msg: >-
+      cloud-init is installed and enabled on this node. It asks the platform's metadata service at
+      every start, which the node's firewall drops, and the node would not finish its next start.
+      Set tinfirm_sandbox_node_cloud_init to `disable` to let this role switch cloud-init off for
+      good (it writes /etc/cloud/cloud-init.disabled; what cloud-init set up at the first start
+      stays), or switch it off in the node's image yourself.
+    quiet: true
+
 - name: Look for ufw's setting
   ansible.builtin.slurp:
     src: /etc/ufw/ufw.conf

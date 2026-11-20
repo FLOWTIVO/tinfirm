@@ -33,6 +33,7 @@ A node holds no credential, so whoever takes one over reaches the runs on it and
 | Ansible | ansible-core 2.15 or newer on the machine you run the plays from |
 | Machines | Ubuntu 24.04 on x86-64 is the only system a node has run on. The roles also take Debian and the RHEL family, untested |
 | A node that is a VM | Nested virtualisation, so that `/dev/kvm` exists in it. VMware: "Expose hardware assisted virtualization to the guest OS"; Proxmox and KVM: the CPU type `host`. In a cloud: bare metal, or an instance type with nested virtualisation |
+| A node from a cloud image | cloud-init must not run at the node's starts. It asks the platform's metadata service, which the node's firewall drops, and the node then does not finish its start. The node's play refuses such a node; with `tinfirm_sandbox_node_cloud_init: disable` it switches cloud-init off for good, and what cloud-init set up at the first start stays |
 | The binaries | `tinfirm-runner-host` and `tinfirm-node-agent` from one release, which the roles check against its signed `SHA256SUMS` ([Install and run runner hosts](runner-hosts.md#install)) |
 | The VM image | Built by `runner/images/vm/local-disk.sh` of Tinfirm's source with the control host's own binary, on a machine with Docker that is not a node. Tinfirm does not publish it yet |
 | A node's first run | The release, GitHub (Firecracker 1.14.2, Kata Containers 4.3.1 for the guest kernel) or your mirrors of them. After it, the node reaches nothing |

@@ -97,6 +97,14 @@ tinfirm_sandbox_node_management_address: ""
 # true: the role stops when this play's SSH connection comes from another address than
 # tinfirm_sandbox_node_management_address, since the node's firewall would then lock it out.
 tinfirm_sandbox_node_check_ssh_source: true
+# A cloud image's cloud-init asks its platform's metadata service at every start. The node's
+# firewall, which is loaded before the network, drops that, and the node then does not finish
+# its start: on the machine where this was found it took no SSH for 21 minutes
+# (docs/reviews/2026-11-19-node-agent-execution/README.md, "The node's firewall at boot").
+# `refuse` stops the play on a node whose cloud-init would run at the next start. `disable`
+# writes /etc/cloud/cloud-init.disabled, so that cloud-init never runs again on this node:
+# what it set up at the first start (the user, the keys, the network's files) stays.
+tinfirm_sandbox_node_cloud_init: refuse
 # The listener's TLS port (`tls.listen`), which the control host's driver dials.
 tinfirm_sandbox_node_agent_port: 7700
 # The published port of the first VM; VM slot N's is first_port + N (`network.firstPort`). The
