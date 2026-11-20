@@ -145,11 +145,20 @@ mod tests {
         // A link to a file and one to a directory outside: neither target may be touched.
         std::os::unix::fs::symlink(outside.join("kept"), top.join("root/link")).unwrap();
         std::os::unix::fs::symlink(&outside, top.join("root/run/dirlink")).unwrap();
-        // 5000 directories below one another, each with a file beside the next: more levels
-        // than a process may have open files, and a path far beyond the longest a call takes.
+        // 3000 directories below one another, each with a file beside the next: more levels
+        // than a process may have open files by default (1024), and a path of 6000 bytes,
+        // beyond the longest a call takes (4096). Not deeper: a process confined by AppArmor,
+        // as a build container on a CI runner is, is refused every path that does not fit
+        // AppArmor's own buffer (8192 bytes by default) with "File name too long". Where a
+        // smaller limit refuses a level, the tree ends there, and must still be deep.
         let mut at = open_dir(CWD, top.join("root/run")).unwrap();
-        for level in 0..5000 {
-            mkdirat(&at, "d", Mode::from_raw_mode(0o700)).unwrap();
+        let mut levels = 0;
+        for level in 0..3000 {
+            match mkdirat(&at, "d", Mode::from_raw_mode(0o700)) {
+                Ok(()) => levels += 1,
+                Err(Errno::NAMETOOLONG) => break,
+                Err(e) => panic!("cannot make level {level}: {e}"),
+            }
             if level % 500 == 0 {
                 let file = openat(
                     &at,
@@ -163,6 +172,7 @@ mod tests {
             at = open_dir(&at, "d").unwrap();
         }
         drop(at);
+        assert!(levels > 1500, "only {levels} levels could be made");
         // A directory of more entries than one round reads.
         std::fs::create_dir(top.join("root/many")).unwrap();
         for n in 0..(ROUND + 300) {
