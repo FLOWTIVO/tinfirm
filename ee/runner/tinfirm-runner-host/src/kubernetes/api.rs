@@ -443,7 +443,7 @@ impl Api {
             )
             .await
             .map_err(|_| fail(Failure::Timeout(self.timeout)))?
-            .map_err(&fail)?;
+            .map_err(fail)?;
             if status.is_success() {
                 return Ok((call, bytes));
             }
@@ -1526,6 +1526,15 @@ mod tests {
         assert_eq!(
             server_url("fd00:10:96::1", "443").unwrap().as_str(),
             "https://[fd00:10:96::1]/"
+        );
+        // The `Host` header of an IPv6 server keeps the brackets.
+        assert_eq!(
+            crate::attachments::authority(&server_url("fd00:10:96::1", "6443").unwrap()),
+            "[fd00:10:96::1]:6443"
+        );
+        assert_eq!(
+            crate::attachments::authority(&server_url("fd00:10:96::1", "443").unwrap()),
+            "[fd00:10:96::1]"
         );
         assert_eq!(
             server_url("kubernetes.default.svc", "443")
