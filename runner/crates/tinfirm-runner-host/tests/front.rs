@@ -1963,3 +1963,73 @@ async fn one_front_serves_a_sandboxs_egress_and_model_proxies_and_ends_with_the_
         "the front outlived its sandbox's listeners"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_front_serves_one_listener_of_each_service_and_run_refuses_a_second() {
+    use tinfirm_runner_host::model_proxy::{ModelProxy, ModelProxySettings};
+    let front = SandboxFront::start(&the_front()).await.unwrap();
+    let gateway = measuring_gateway().await;
+    let start_model = |front: std::sync::Arc<SandboxFront>| async move {
+        let settings = ModelProxySettings {
+            allow_private: false,
+            local_gateway: None,
+            allow_loopback: true,
+            allow_http: true,
+        };
+        let endpoint = Endpoint {
+            bind: "127.0.0.2:0".parse().unwrap(),
+            sandbox_host: "127.0.0.2".into(),
+            extra_hosts: Vec::new(),
+        };
+        let access = tinfirm_protocol::ModelAccess {
+            format: tinfirm_protocol::ModelFormat::Anthropic,
+            base_url: Some(format!("http://{gateway}")),
+            region: None,
+            access_key_id: None,
+            api_key: tinfirm_protocol::Secret::new("sk-TEST-ONLY-one-listener-key"),
+        };
+        ModelProxy::new(settings, &endpoint)
+            .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front))
+            .await
+    };
+    let server = echo_and_http().await;
+    let egress = EgressProxy::new(
+        EgressSettings {
+            allow: vec![Rule::parse(&format!("127.0.0.1:{}", server.port())).unwrap()],
+            allow_private: false,
+            allow_loopback: true,
+        },
+        &Endpoint {
+            bind: "127.0.0.2:0".parse().unwrap(),
+            sandbox_host: "127.0.0.2".into(),
+            extra_hosts: Vec::new(),
+        },
+    )
+    .start_run_at(uuid::Uuid::new_v4(), Vec::new(), None, Some(front.clone()))
+    .await
+    .unwrap();
+    let model = start_model(front.clone()).await.unwrap();
+    drop(model);
+    // A second model listener, after the first closed: refused by `run`, not by the front.
+    let error = start_model(front.clone()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("a sandbox has one in its life"),
+        "{error:#}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        front.handle().ended().is_none(),
+        "{:?}",
+        front.handle().ended()
+    );
+    // The other listener goes on.
+    let auth = egress.proxy_authorization().to_string();
+    let (_tunnel, head) = proxy_request(
+        &egress,
+        &format!(
+            "CONNECT {server} HTTP/1.1\r\nHost: {server}\r\nProxy-Authorization: {auth}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+}

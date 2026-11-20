@@ -871,7 +871,8 @@ not run by hand; `reader.rs`, `confine.rs`).
     query that is not one), reuses a request number, ends a body twice, or aborts a request that
     never was, is ended. A front that closes a request's socket and does not say within 10 s
     whether the body is whole has that request ended. When a front ends, `run` ends all its
-    requests.
+    requests. A sandbox has one listener of each proxy in its life, and its front serves each
+    once: `run` refuses a second one itself, so a front never hears of it.
 
 ## A VM per run
 

@@ -7,7 +7,8 @@
 //! egress proxy (crate::run). Each listener's guard holds the front, and so does the run's
 //! access (or the VM, until a run claims it): the front ends with the last of them, so with the
 //! sandbox. A listener whose guard is dropped is closed in the front ([`ToFront::Unlisten`]),
-//! and `run` stops answering its requests at once.
+//! and `run` stops answering its requests at once. A sandbox has one listener of each service
+//! in its life, so a front serves each once: `run` refuses a second one itself.
 //!
 //! `run` decides here and the front only asks:
 //! - **egress:** a destination that the front asks for is decided and connected by the egress
@@ -61,6 +62,8 @@ struct Router {
     requests: Mutex<HashMap<u64, Answering>>,
     /// The tasks that answer requests, alive now.
     tasks: Arc<AtomicUsize>,
+    /// The services whose listener the front has served: each once in the sandbox's life.
+    served: Mutex<std::collections::HashSet<Service>>,
 }
 
 /// A model request that `run` answers.
@@ -122,6 +125,22 @@ impl SandboxFront {
         self.router.tasks.load(Ordering::SeqCst)
     }
 
+    /// A sandbox has one listener of each service in its life (its run's, or its VM's), so a
+    /// front serves each once: a second one is refused here, before the front hears of it,
+    /// which would end the front and the sandbox's other listener with it.
+    fn first(&self, service: Service) -> Result<()> {
+        if !lock(&self.router.served).insert(service) {
+            bail!(
+                "the sandbox's front has served a {} listener already; a sandbox has one in its life",
+                match service {
+                    Service::Egress => "egress",
+                    Service::Model => "model",
+                }
+            );
+        }
+        Ok(())
+    }
+
     /// The front serves the egress proxy's HTTP on `listener`, for clients that send
     /// `authorization`; `connector` decides and connects each destination.
     pub(crate) async fn listen_egress(
@@ -130,13 +149,8 @@ impl SandboxFront {
         authorization: String,
         connector: Arc<dyn Connector>,
     ) -> Result<()> {
-        {
-            let mut egress = lock(&self.router.egress);
-            if egress.is_some() {
-                bail!("the sandbox's front serves an egress listener already");
-            }
-            *egress = Some(connector);
-        }
+        self.first(Service::Egress)?;
+        *lock(&self.router.egress) = Some(connector);
         let listener = OwnedFd::from(listener.into_std()?);
         self.handle
             .send(&ToFront::ListenEgress { authorization }, Some(listener))
@@ -153,13 +167,8 @@ impl SandboxFront {
         base_path: String,
         backend: Arc<dyn ModelBackend>,
     ) -> Result<()> {
-        {
-            let mut model = lock(&self.router.model);
-            if model.is_some() {
-                bail!("the sandbox's front serves a model listener already");
-            }
-            *model = Some(backend);
-        }
+        self.first(Service::Model)?;
+        *lock(&self.router.model) = Some(backend);
         let listener = OwnedFd::from(listener.into_std()?);
         self.handle
             .send(
