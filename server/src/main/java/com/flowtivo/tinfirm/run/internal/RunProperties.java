@@ -5,6 +5,8 @@ import java.time.Duration;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 
+import org.slf4j.LoggerFactory;
+
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
@@ -21,7 +23,8 @@ import org.springframework.validation.annotation.Validated;
  *                        row; each further rejection by the same host doubles it ({@link #rejectBackoff(int)})
  * @param rejectBackoffMax the doubled back-off stops growing here ({@code TINFIRM_RUN_REJECT_BACKOFF_MAX}), so that a
  *                        host that rejects every run costs one assignment per run in this time, not one per
- *                        {@code rejectBackoff}
+ *                        {@code rejectBackoff}. A configured value shorter than {@code rejectBackoff} is replaced by
+ *                        {@code rejectBackoff}, with a warning: the wait is then fixed and does not double
  * @param maxEventsPerRun event cap per run; LOG events are dropped first
  * @param streamTimeout   lifetime of one SSE stream; the client reconnects with {@code Last-Event-ID}
  * @param streamKeepAlive an idle SSE stream gets a comment after this, so proxies keep it open
@@ -49,8 +52,12 @@ record RunProperties(@NotNull @DefaultValue("PT60M") Duration maxWallClock, @Min
             throw new IllegalArgumentException("tinfirm.run.stream-keep-alive must be at least 100 milliseconds");
         }
         if (rejectBackoffMax.compareTo(rejectBackoff) < 0) {
-            throw new IllegalArgumentException("tinfirm.run.reject-backoff-max must not be shorter than "
-                    + "tinfirm.run.reject-backoff");
+            // A deployment that set reject-backoff above the new cap's default before the cap existed must still
+            // start: it keeps its fixed wait.
+            LoggerFactory.getLogger(RunProperties.class).warn("tinfirm.run.reject-backoff-max ({}) is shorter than "
+                    + "tinfirm.run.reject-backoff ({}); the cap used is {}, so a rejected run waits {} every time and "
+                    + "the wait does not double", rejectBackoffMax, rejectBackoff, rejectBackoff, rejectBackoff);
+            rejectBackoffMax = rejectBackoff;
         }
         if (prepareTimeout.toSeconds() < 1) {
             throw new IllegalArgumentException("tinfirm.run.prepare-timeout must be at least 1 second");

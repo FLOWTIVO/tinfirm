@@ -153,7 +153,7 @@ No variable lets the model's provider run a tool itself for a run: the model rel
 | `TINFIRM_RUN_MAX_TURNS` | `200` | The most tool calls of a run | `extraConfig` |
 | `TINFIRM_RUN_ACCEPT_TIMEOUT` | `PT10S` | A run its host has not accepted this long after it was sent goes back to the queue | `extraConfig` |
 | `TINFIRM_RUN_REJECT_BACKOFF` | `PT10S` | A run its host rejected is not sent again before this; each further rejection in a row by the same host doubles the wait | `extraConfig` |
-| `TINFIRM_RUN_REJECT_BACKOFF_MAX` | `PT5M` | The longest wait of a run that the same host keeps rejecting; not shorter than `TINFIRM_RUN_REJECT_BACKOFF` | `extraConfig` |
+| `TINFIRM_RUN_REJECT_BACKOFF_MAX` | `PT5M` | The longest wait of a run that the same host keeps rejecting. A value shorter than `TINFIRM_RUN_REJECT_BACKOFF` is not used: the server logs a warning at start and the wait stays at `TINFIRM_RUN_REJECT_BACKOFF` without doubling | `extraConfig` |
 | `TINFIRM_RUN_MAX_EVENTS_PER_RUN` | `20000` | The events stored per run, at least 100; log events go first | `extraConfig` |
 | `TINFIRM_RUN_STREAM_TIMEOUT` | `PT30M` | The lifetime of one live stream of a run's or a conversation's events; the page reconnects | `extraConfig` |
 | `TINFIRM_RUNNER_LEASE_TTL` | `PT30S` | The lease of a running run, renewed by its host's heartbeats | `extraConfig` |

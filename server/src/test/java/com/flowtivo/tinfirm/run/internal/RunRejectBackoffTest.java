@@ -1,7 +1,6 @@
 package com.flowtivo.tinfirm.run.internal;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.Duration;
 import java.util.UUID;
@@ -34,10 +33,12 @@ class RunRejectBackoffTest {
     }
 
     @Test
-    void aCapShorterThanTheBackOffIsRefused() {
-        assertThatThrownBy(() -> properties(Duration.ofSeconds(10), Duration.ofSeconds(5)))
-            .isInstanceOf(IllegalArgumentException.class)
-            .hasMessageContaining("reject-backoff-max");
+    void aCapShorterThanTheBackOffGivesWayToTheBackOff() {
+        // A back-off set above five minutes before the cap existed: the server starts, and the wait stays fixed.
+        RunProperties longer = properties(Duration.ofMinutes(10), Duration.ofMinutes(5));
+        assertThat(longer.rejectBackoffMax()).isEqualTo(Duration.ofMinutes(10));
+        assertThat(longer.rejectBackoff(1)).isEqualTo(Duration.ofMinutes(10));
+        assertThat(longer.rejectBackoff(4)).isEqualTo(Duration.ofMinutes(10));
         assertThat(properties(Duration.ofSeconds(10), Duration.ofSeconds(10)).rejectBackoff(4))
             .isEqualTo(Duration.ofSeconds(10));
     }
