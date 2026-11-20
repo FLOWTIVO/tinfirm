@@ -1058,10 +1058,12 @@ VMs were made, described, listed and deleted on one KVM node through this driver
 a script in this host's place ([the evidence](../docs/reviews/2026-11-19-node-agent-execution/README.md);
 [the agent's state](crates/tinfirm-node-agent/README.md#what-is-built-and-what-is-planned)). The
 Ansible plays that set up a node and a control host (`deploy/ansible/README.md`) ran on machines
-once, on 2026-11-20 (Ubuntu 24.04), with runs of this host's tests' stand-in agent through a node.
+once, on 2026-11-20 (Ubuntu 24.04), with runs of this host's tests' stand-in agent through a node;
+on the same day, conversations with real runtimes (Claude Code and PI, with a real model) ran
+through a node, in a Firecracker VM, with the sandbox's front confined (Landlock and seccomp).
 Still planned: the node's hardening, the single machine (until its firewall is built, the node agent
-refuses a control host on its own machine), and the published VM image. No conversation with a real
-runtime has run through a node, and the Helm chart's runner pod has not run against one. Here, the
+refuses a control host on its own machine), and the published VM image. The Helm chart's runner pod
+has not run against a node. Here, the
 driver is tested against node agents with their fake backend.
 
 - **Editions.** In the core, in every edition: the driver lists no paid feature
@@ -1074,8 +1076,9 @@ driver is tested against node agents with their fake backend.
   VMs (KVM) reaches the machine with every credential (`vm-jail`), or the node, which holds no
   credential, and the other runs on it (`machine`). A configuration that cannot be read, that mixes
   sockets and TLS, or that reaches this host's own address over TLS stops `run` at its start, and
-  `--isolation-level` is refused. Only the tests' stand-in agent has run through a node (above): this
-  is what such a host reports at its start, and `vm-jail` waits for the single machine.
+  `--isolation-level` is refused. Conversations with real runtimes have run through a node once
+  (above): this is what such a host reports at its start, and `vm-jail` waits for the single
+  machine.
 - **Its configuration**, `/etc/tinfirm/node-driver.json` (or `TINFIRM_NODE_DRIVER_CONFIG`):
 
   ```json
