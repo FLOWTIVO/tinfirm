@@ -180,6 +180,17 @@ docker exec tinfirm-postgres-1 pg_dump -U postgres -Fc litellm > litellm-$(date 
 
 A dump is a backup of one moment, unlike point-in-time recovery: take one before every upgrade, and on a schedule.
 
+To check that a dump restores, restore it into a database of its own and drop it afterwards. The running stack is not touched:
+
+```sh
+docker exec tinfirm-postgres-1 createdb -U postgres -O tinfirm_owner restore_check
+docker exec -i tinfirm-postgres-1 pg_restore -U postgres -d restore_check < tinfirm-<time>.dump
+docker exec tinfirm-postgres-1 psql -U postgres -d restore_check -c "SELECT count(*), max(version) FROM flyway_schema_history WHERE success"
+docker exec tinfirm-postgres-1 dropdb -U postgres restore_check
+```
+
+The count and the highest version are those of the running database.
+
 ### Upgrade the stack
 
 From the Compose files of a release ([Try Tinfirm with Docker Compose](quick-start.md#1-start-the-stack)): download and check the new release's `tinfirm-compose-<version>.tar.gz` against its signed `SHA256SUMS` as there, and unpack it beside the old directory. Copy your `.env` into the new directory, and name the new release's image in it, by the digest you verified ([Verify your images](verify-images.md)):
