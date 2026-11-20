@@ -268,6 +268,7 @@ Decided by the owner, 2026-11-11 to 2026-11-14, and on 2026-11-19 or 2026-11-20 
   - The push gets the runner host's own receive-pack client, built last: a confined process without the token packs the objects, and the host sends them. Until it is built and checked against each code host, `git push` stays.
   - Every host that uses the bridge refuses to start where the reader cannot be confined, a Docker host with `--sandbox-bridge` too, unless its operator sets `--allow-unconfined-reader` (built, `8cde967`).
 - 2026-11-20: a sandbox node is a tier-1 asset, a named lower tier than the control host. It holds no credential, so its compromise reaches runs and not accounts. Only the people who administer the control host administer its nodes, and nodes are re-imaged on a schedule. The role and the guides follow this.
+- 2026-11-20: the first conversation through a sandbox node, and decision 8's test of path B on a run in progress, are run after this work is merged, when the owner's test server is of this release. That server, an earlier release, refused the branch's runner host at its hello in the third round on a node, and it is not upgraded to an unmerged branch, whose migrations still change.
 
 ## To specify and verify during the build
 
