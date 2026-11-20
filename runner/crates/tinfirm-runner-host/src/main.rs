@@ -1463,6 +1463,14 @@ async fn doctor(
     let mut checks = Checks { failed: 0 };
     let vm_host = vm_args.executor == ExecutorChoice::Vm;
     let bridged = vm_host || sandbox_args.sandbox_bridge;
+    // The ceiling, as `run` refuses it for this executor.
+    match check_ceiling(max_concurrent_runs, vm_host) {
+        Ok(()) => checks.ok(
+            "max concurrent runs",
+            format!("{max_concurrent_runs} (the ceiling `run` would start with)"),
+        ),
+        Err(e) => checks.fail("max concurrent runs", format!("{e:#}")),
+    }
     // Directories.
     for (what, dir) in [
         ("config dir", &paths.config_dir),
@@ -2173,11 +2181,7 @@ async fn run(
     }
     // First: a forbidden combination is refused before anything else happens.
     let vm_options = vm_args.options()?;
-    if vm_options.is_none() && max_concurrent_runs > MAX_CAPACITY {
-        bail!(
-            "--max-concurrent-runs is at most {MAX_CAPACITY} with Docker: the machine runs every sandbox; more need --executor vm, a VM per run"
-        );
-    }
+    check_ceiling(max_concurrent_runs, vm_options.is_some())?;
     let sandbox_env = parse_entries(
         "--sandbox-env",
         &sandbox_args.sandbox_env,
@@ -2333,6 +2337,18 @@ async fn run(
     let result = host::serve(host, shutdown).await;
     lock.hold_until_exit();
     result
+}
+
+/// The host's ceiling for its executor, as `run` and `doctor` both check it: at most
+/// [`MAX_CAPACITY`] with Docker, whose machine runs every sandbox; up to the flag's own limit
+/// with a VM per run (`vm`).
+fn check_ceiling(max_concurrent_runs: u32, vm: bool) -> Result<()> {
+    if !vm && max_concurrent_runs > MAX_CAPACITY {
+        bail!(
+            "--max-concurrent-runs is at most {MAX_CAPACITY} with Docker: the machine runs every sandbox; more need --executor vm, a VM per run"
+        );
+    }
+    Ok(())
 }
 
 /// The reader of what the sandboxes send back (ADR-0112, open question 1): this binary,

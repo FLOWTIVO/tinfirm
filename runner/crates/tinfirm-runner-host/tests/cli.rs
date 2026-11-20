@@ -1251,6 +1251,52 @@ fn the_node_driver_reports_what_its_nodes_configuration_reaches() {
 }
 
 #[test]
+fn doctor_refuses_the_ceiling_that_run_refuses_for_its_executor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let report = text(&run_with_env(
+        dir,
+        &["doctor", "--max-concurrent-runs", "17"],
+        &[no_docker],
+    ));
+    assert!(
+        report.contains(
+            "[FAIL] max concurrent runs: --max-concurrent-runs is at most 16 with Docker"
+        ),
+        "{report}"
+    );
+    // `run` refuses the same, before anything else.
+    let out = run_with_env(dir, &["run", "--max-concurrent-runs", "17"], &[no_docker]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("--max-concurrent-runs is at most 16 with Docker"),
+        "{}",
+        text(&out)
+    );
+    let report = text(&run_with_env(dir, &["doctor"], &[no_docker]));
+    assert!(report.contains("[ ok ] max concurrent runs: 2"), "{report}");
+    // With a VM per run, 17 is a ceiling `run` takes.
+    let report = text(&run_with_env(
+        dir,
+        &[
+            "doctor",
+            "--executor",
+            "vm",
+            "--vm-driver",
+            "digitalocean",
+            "--max-concurrent-runs",
+            "17",
+        ],
+        &[no_docker],
+    ));
+    assert!(
+        report.contains("[ ok ] max concurrent runs: 17"),
+        "{report}"
+    );
+}
+
+#[test]
 fn doctor_on_a_vm_host_checks_the_driver_and_not_docker() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
