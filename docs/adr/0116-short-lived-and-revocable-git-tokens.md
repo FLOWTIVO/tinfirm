@@ -97,7 +97,7 @@ Each holds its own copy: `Git.authorization`, `Route.authorization`, and the rec
    | A clone or mirror fetch not yet started | Fails with `cannot clone <repository>: <message>`, `GIT_ERROR`, as a failed clone does today |
    | The mirror fetch before the push | Is not attempted. The scan compares with the refs at clone time, as after a failed fetch today |
    | The push of the run's commits | Is not attempted. The repository's error is `<repository>: not pushed: <message>`, the run's `failureMessage` is "git failed in …", and its class is `GIT_ERROR`. The `git` result says `pushed: false` with the commits counted |
-   | The redaction | The token stays on the run's list: what was revealed stays redacted |
+   | The redaction | The token stays on the run's list: what was revealed stays redacted. After the host restarts too: the take-back record keeps salted hashes of every token the run has held, and a run taken back redacts and scans with them |
    | The run's events | A `LOG` event at `warn` with the message, which the run's page and the conversation show |
 
    The repositories that the frame does not name go on as before.
