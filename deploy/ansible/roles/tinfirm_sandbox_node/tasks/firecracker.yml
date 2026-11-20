@@ -1,0 +1,93 @@
+---
+# Firecracker and its jailer from the release's archive, checked against the pinned SHA-256 of
+# the archive and of each binary. The archive is removed afterwards: a second run that finds
+# both binaries with their checksums downloads nothing.
+- name: Read the installed Firecracker and jailer
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+    follow: false
+  loop:
+    - "{{ _tinfirm_sandbox_node_firecracker_path }}"
+    - "{{ _tinfirm_sandbox_node_jailer_path }}"
+  register: _tinfirm_sandbox_node_vmm_installed
+
+- name: Install Firecracker and its jailer
+  when: >-
+    (_tinfirm_sandbox_node_vmm_installed.results[0].stat.checksum | default('')) != _tinfirm_sandbox_node_firecracker_sha256
+    or (_tinfirm_sandbox_node_vmm_installed.results[1].stat.checksum | default('')) != _tinfirm_sandbox_node_jailer_sha256
+  vars:
+    _dir: "{{ _tinfirm_sandbox_node_cache_dir }}/firecracker"
+  block:
+    - name: Download the Firecracker release
+      ansible.builtin.get_url:
+        url: "{{ _tinfirm_sandbox_node_firecracker_url }}"
+        dest: "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _tinfirm_sandbox_node_firecracker_archive }}"
+        checksum: "{{ _tinfirm_sandbox_node_firecracker.archive }}"
+        mode: "0644"
+
+    - name: Create the directory of the unpacked release
+      ansible.builtin.file:
+        path: "{{ _dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Unpack Firecracker and its jailer
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -xzf
+          - "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _tinfirm_sandbox_node_firecracker_archive }}"
+          - -C
+          - "{{ _dir }}"
+          - --no-same-owner
+          - "{{ _tinfirm_sandbox_node_firecracker_dir }}/firecracker{{ _tinfirm_sandbox_node_firecracker_suffix }}"
+          - "{{ _tinfirm_sandbox_node_firecracker_dir }}/jailer{{ _tinfirm_sandbox_node_firecracker_suffix }}"
+      changed_when: true
+
+    # The jailer names the chroot after the VMM's file, so the helper's configuration names a
+    # file called `firecracker`; `start-jailer` takes a file called `jailer`.
+    - name: Install Firecracker and its jailer
+      ansible.builtin.copy:
+        src: "{{ _dir }}/{{ _tinfirm_sandbox_node_firecracker_dir }}/{{ item.member }}{{ _tinfirm_sandbox_node_firecracker_suffix }}"
+        dest: "{{ item.dest }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - {member: firecracker, dest: "{{ _tinfirm_sandbox_node_firecracker_path }}"}
+        - {member: jailer, dest: "{{ _tinfirm_sandbox_node_jailer_path }}"}
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Remove the downloaded release
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _dir }}"
+        - "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _tinfirm_sandbox_node_firecracker_archive }}"
+
+- name: Read Firecracker and its jailer as installed
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+    follow: false
+  loop:
+    - "{{ _tinfirm_sandbox_node_firecracker_path }}"
+    - "{{ _tinfirm_sandbox_node_jailer_path }}"
+  register: _tinfirm_sandbox_node_vmm_now
+
+- name: Check Firecracker and its jailer against their checksums
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_vmm_now.results[0].stat.isreg | default(false)
+      - _tinfirm_sandbox_node_vmm_now.results[1].stat.isreg | default(false)
+      - _tinfirm_sandbox_node_vmm_now.results[0].stat.checksum == _tinfirm_sandbox_node_firecracker_sha256
+      - _tinfirm_sandbox_node_vmm_now.results[1].stat.checksum == _tinfirm_sandbox_node_jailer_sha256
+    fail_msg: >-
+      {{ _tinfirm_sandbox_node_firecracker_path }} or {{ _tinfirm_sandbox_node_jailer_path }} is not
+      the binary of Firecracker {{ tinfirm_sandbox_node_firecracker_version }} whose SHA-256 the role
+      pins: nothing uses them until they are.
+    quiet: true

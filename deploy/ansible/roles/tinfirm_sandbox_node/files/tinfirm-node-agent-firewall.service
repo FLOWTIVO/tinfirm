@@ -1,0 +1,17 @@
+# Loads the node's own firewall before the agent starts. Loading it again replaces its one
+# table and leaves the VMs' tables as they are.
+[Unit]
+Description=Tinfirm node agent: the node's own firewall
+Before=tinfirm-node-agent-helper.service tinfirm-node-agent-listener.service network-pre.target
+Wants=network-pre.target
+After=tinfirm-node-agent-modules.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/tinfirm/node-agent/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/tinfirm/node-agent/firewall.nft
+ExecStop=-/usr/sbin/nft delete table inet tinfirm_node
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,79 @@
+# The helper: root, no network. It makes and deletes the VMs for the listener alone.
+#
+# Its safety rests on its four operations and their checks, not on this confinement: with
+# CAP_SYS_ADMIN and the device-mapper it is root in effect for whoever controls its code. The
+# lines below stop accidents and narrow an exploit's path. Each was kept only after a VM was
+# made through it, reached from the control host, and deleted with nothing left
+# (docs/reviews/2026-11-19-node-agent-execution).
+[Unit]
+Description=Tinfirm node agent: the helper (root), which makes and deletes the VMs
+Requires=tinfirm-node-agent-modules.service
+After=tinfirm-node-agent-modules.service systemd-tmpfiles-setup.service systemd-sysctl.service
+
+[Service]
+ExecStart=/usr/local/bin/tinfirm-node-agent helper --config /etc/tinfirm/node-agent/helper.json
+Restart=on-failure
+RestartSec=1
+# A helper that stops or is started again leaves the VMs running: each VMM is in a cgroup of
+# its own, which the jailer made, outside this unit's, and the helper finds it again by its
+# jail. So the unit's own kill mode stays the default (`control-group`): what a stop ends is
+# the helper and the tools of a make it was in the middle of, which would otherwise go on
+# beside the next helper's cleanup.
+UMask=0077
+
+# What is left of root. The jailer needs six of these itself (the VMM's bounding set is cut
+# to them): CHOWN, DAC_OVERRIDE, SETGID, SETUID, SYS_ADMIN, MKNOD. The helper needs SETPCAP
+# to cut that set, NET_ADMIN for the namespace, the veth, the tap device and the firewall.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SETGID CAP_SETUID CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_MKNOD
+NoNewPrivileges=yes
+
+# No network: its one socket is the local one, and `ip` and `nft` speak netlink.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+
+# The file system: read-only but for its own places.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tinfirm-node-agent/helper /var/lib/tinfirm-node-agent/work /srv/tinfirm-jails /run/tinfirm-node-agent-helper /run/netns /run/lock
+ProtectHome=yes
+PrivateTmp=yes
+
+# The devices: KVM and the tap device for the jails, the loop devices and the device-mapper
+# for the disks, and what the jailer puts into every jail.
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rwm
+DeviceAllow=/dev/net/tun rwm
+DeviceAllow=/dev/urandom rwm
+DeviceAllow=/dev/userfaultfd rwm
+DeviceAllow=/dev/null rw
+DeviceAllow=/dev/loop-control rw
+DeviceAllow=block-loop rwm
+DeviceAllow=/dev/mapper/control rw
+DeviceAllow=block-device-mapper rwm
+
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=net mnt pid
+SystemCallArchitectures=native
+# The VMM inherits this filter through the jailer, beside Firecracker's own: @sandbox is
+# Firecracker installing its filter, and its timers must stay allowed.
+SystemCallFilter=@system-service @mount @privileged @sandbox
+SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap @cpu-emulation @keyring @memlock @pkey @aio @resources
+SystemCallErrorNumber=EPERM
+
+# Not set, each for a reason found on a real node:
+# - ProtectKernelTunables: the helper switches IPv6 off and forwarding on in each VM's
+#   namespace, under /proc/sys. With it the helper refuses every make ("the setting did not
+#   take").
+# - ProtectControlGroups: the jailer makes each VM's cgroup.
+# - PrivateNetwork: the veth's end on the node and the node's table of each VM are the node's.
+# - PrivateIPC: the device-mapper's tools wait for udev through a System V semaphore.
+
+[Install]
+WantedBy=multi-user.target

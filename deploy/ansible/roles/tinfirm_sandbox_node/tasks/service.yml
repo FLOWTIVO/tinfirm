@@ -1,0 +1,14 @@
+---
+# In their order: the modules, the node's firewall, the helper, the listener. A helper that
+# stops or starts again leaves its VMs running: each VMM is in a cgroup of its own.
+- name: Start the node agent's units
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: "{{ _tinfirm_sandbox_node_unit_files is changed or _tinfirm_sandbox_node_dropin is changed }}"
+  loop: "{{ _tinfirm_sandbox_node_units }}"
+
+# A changed binary, configuration or unit: the restarts that were asked for, now.
+- name: Restart what changed
+  ansible.builtin.meta: flush_handlers

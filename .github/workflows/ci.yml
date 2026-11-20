@@ -364,14 +364,31 @@ jobs:
         with:
           version: v4.3.0
       # The release key's public half ships with the Compose files, where install.sh gives it
-      # to the auto-deploy hosts, and with the runner host's Ansible role (M13): copies of the
-      # one customers verify against.
+      # to the auto-deploy hosts, and with the runner host's and the sandbox node's Ansible
+      # roles (M13): copies of the one customers verify against.
       - name: The shipped cosign.pub
         run: |
-          for copy in deploy/compose/auto-deploy/cosign.pub deploy/ansible/roles/tinfirm_runner_host/files/cosign.pub; do
+          for copy in deploy/compose/auto-deploy/cosign.pub deploy/ansible/roles/tinfirm_runner_host/files/cosign.pub \
+            deploy/ansible/roles/tinfirm_sandbox_node/files/cosign.pub; do
             cmp docs-site/content/cosign.pub "$copy" \
               || { echo "::error::$copy must be a copy of docs-site/content/cosign.pub"; exit 1; }
           done
+      # The sandbox node's role installs the node agent's units as they ran on a node: copies,
+      # and the firewall's template is the units' file with the node's values in its defines.
+      - name: The sandbox node role's units
+        run: |
+          set -euo pipefail
+          units=runner/crates/tinfirm-node-agent/units
+          role=deploy/ansible/roles/tinfirm_sandbox_node
+          for unit in tinfirm-node-agent-firewall.service tinfirm-node-agent-helper.service \
+            tinfirm-node-agent-listener.service tinfirm-node-agent-modules.service \
+            tinfirm-node-agent.sysctl.conf tinfirm-node-agent.tmpfiles.conf; do
+            cmp "$units/$unit" "$role/files/$unit" \
+              || { echo "::error::$role/files/$unit must be a copy of $units/$unit"; exit 1; }
+          done
+          diff <(grep -v '^define ' "$units/tinfirm-node-agent.nft") \
+            <(grep -v -e '^define ' -e '^{%' -e '^# {{ ansible_managed }}$' "$role/templates/firewall.nft.j2") \
+            || { echo "::error::$role/templates/firewall.nft.j2 must be $units/tinfirm-node-agent.nft with the node's values in its define lines"; exit 1; }
       # The check the auto-deploy hosts run on SHA256SUMS.sig (openssl, no cosign), against
       # a throwaway P-256 key and a signature in cosign's format (base64 DER).
       - name: The signature check of SHA256SUMS

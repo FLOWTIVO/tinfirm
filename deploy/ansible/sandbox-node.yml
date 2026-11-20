@@ -1,0 +1,13 @@
+---
+# Tinfirm sandbox nodes: machines with KVM that run a control host's VMs and hold no credential
+# (ADR-0112; deploy/ansible/README.md, "Sandbox nodes"). Not ready for production.
+#
+#   ansible-playbook -i inventory.yml deploy/ansible/sandbox-node.yml
+#
+# Run control-host.yml first: each node pins the control host's client certificate.
+
+- name: Tinfirm sandbox nodes
+  hosts: tinfirm_sandbox_nodes
+  become: true
+  roles:
+    - role: tinfirm_sandbox_node

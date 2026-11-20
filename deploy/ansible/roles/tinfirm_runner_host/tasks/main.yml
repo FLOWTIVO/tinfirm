@@ -3,22 +3,39 @@
 # Containers with Cloud Hypervisor as Docker's `kata` runtime, the runner host binary as a
 # systemd service with `--sandbox-runtime kata --sandbox-docker --egress-proxy
 # --sandbox-bridge` under systemd sandboxing, and the runner images.
+#
+# Or, with tinfirm_runner_host_executor `vm` (control-host.yml), a control host (ADR-0112): the
+# binary, the node driver's configuration and client certificate, and the service with
+# `run --executor vm --vm-driver node`. No Docker, no Kata, no runner images, no KVM: the VMs
+# run on the sandbox nodes, and their image holds the runner images.
 
 - name: Check the target and the variables
   ansible.builtin.import_tasks: checks.yml
 
 - name: Install Docker Engine
   ansible.builtin.import_tasks: docker.yml
+  when: not (_tinfirm_runner_host_vm | bool)
 
 - name: Install Kata Containers and register its runtime with Docker
   ansible.builtin.import_tasks: kata.yml
+  when: not (_tinfirm_runner_host_vm | bool)
+
+- name: Install the packages of a control host
+  ansible.builtin.import_tasks: packages.yml
+  when: _tinfirm_runner_host_vm | bool
 
 - name: Install and register the runner host
   ansible.builtin.import_tasks: runner.yml
 
+- name: Make the client certificate and write the sandbox nodes' configuration
+  ansible.builtin.import_tasks: nodes.yml
+  when: _tinfirm_runner_host_vm | bool
+
 - name: Build the runner images
   ansible.builtin.import_tasks: images.yml
-  when: tinfirm_runner_host_images_build | bool
+  when:
+    - tinfirm_runner_host_images_build | bool
+    - not (_tinfirm_runner_host_vm | bool)
 
 - name: Run the runner host as a systemd service
   ansible.builtin.import_tasks: service.yml

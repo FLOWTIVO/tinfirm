@@ -2,6 +2,19 @@
 # Defaults of the role tinfirm_runner_host (deploy/ansible/README.md, ADR-0025).
 # Every variable that a site may set is here. Secrets (the host token, header tokens) belong
 # in Ansible Vault, never in this file or an inventory in git.
+#
+# Two kinds of host (tinfirm_runner_host_executor, below): a runner host whose sandboxes are
+# Kata Containers microVMs of its own Docker (`docker`, the default, runner-host.yml), or a
+# control host whose VMs run on sandbox nodes (`vm`, control-host.yml; ADR-0112), which needs
+# no Docker, no Kata and no runner image. The Docker, Kata and image settings are the first's.
+
+# --- What kind of host -------------------------------------------------------------------------
+
+# `docker`: `run` with Docker and Kata on this machine. `vm`: a control host,
+# `run --executor vm --vm-driver node`, whose VMs run on the sandbox nodes of
+# tinfirm_runner_host_nodes (the sandbox node role, sandbox-node.yml). control-host.yml sets
+# `vm`. Sandbox nodes are not ready for production: no conversation has run through one.
+tinfirm_runner_host_executor: docker
 
 # --- Docker Engine -----------------------------------------------------------------------
 
@@ -174,3 +187,24 @@ tinfirm_runner_host_images_runtime: all
 tinfirm_runner_host_images_build_args: {}
 # How long the image build may take, in seconds.
 tinfirm_runner_host_images_build_timeout: 3600
+
+# --- A control host with sandbox nodes (tinfirm_runner_host_executor: vm) ------------------------
+
+# The sandbox nodes, each as the node's play shows it at its end:
+#   - name: node-1                  # 1 to 32 bytes of a-z, 0-9 and -
+#     address: 10.0.0.20:7700       # the node agent's TLS listener, HOST:PORT
+#     nodeSha256: 0123…             # the node's certificate's SHA-256, 64 hex digits
+#     templates: [sandbox-2c4g]     # the templates of the node's helper.json it offers
+#     publishedPorts: {first: 20000, last: 20001}   # optional: listed for your firewall
+# A node without nodeSha256 is not written yet: the role makes and shows the client
+# certificate and stops before it starts the host (the first set-up, deploy/ansible/README.md).
+tinfirm_runner_host_nodes: []
+# The template every VM is made from (`--vm-template`); at least one node must offer it.
+tinfirm_runner_host_vm_template: ""
+# Where the bridge listens in the VM (`--vm-port`): the nodes' templates' bridgePort.
+tinfirm_runner_host_vm_port: 7443
+# More checks a VM must fail before a run enters it (`--vm-probe`): tcp:HOST:PORT, dns:NAME or
+# http://HOST[:PORT]/PATH, such as your database or your other networks.
+tinfirm_runner_host_vm_probe: []
+# What the driver does with a node agent of another release: warn or refuse (`peerBuild`).
+tinfirm_runner_host_node_peer_build: warn

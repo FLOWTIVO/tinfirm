@@ -1,0 +1,92 @@
+---
+# Renders every template of the two roles with example-vars.yml into render_dir, without a
+# target machine, for check-rendered.py (deploy/ansible/README.md, "Checks"):
+#
+#   ansible-playbook -i localhost, deploy/ansible/tests/render.yml -e render_dir=/tmp/rendered
+#   python3 -I deploy/ansible/tests/check-rendered.py /tmp/rendered
+
+- name: Render the roles' templates with example values
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  # vars_files, not include_vars: a task's own vars then override them, as in the role.
+  vars_files:
+    - ../roles/tinfirm_sandbox_node/defaults/main.yml
+    - ../roles/tinfirm_sandbox_node/vars/main.yml
+    - ../roles/tinfirm_runner_host/defaults/main.yml
+    - ../roles/tinfirm_runner_host/vars/main.yml
+    - example-vars.yml
+  vars:
+    _node: "{{ playbook_dir }}/../roles/tinfirm_sandbox_node"
+    _host: "{{ playbook_dir }}/../roles/tinfirm_runner_host"
+  tasks:
+    - name: Check the output directory
+      ansible.builtin.assert:
+        that:
+          - render_dir is defined
+          - render_dir is match('^/')
+        fail_msg: Give -e render_dir=<an absolute directory>.
+        quiet: true
+
+    - name: Create the output directory
+      ansible.builtin.file:
+        path: "{{ render_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render the sandbox node's templates
+      ansible.builtin.template:
+        src: "{{ _node }}/templates/{{ item }}.j2"
+        dest: "{{ render_dir }}/{{ item }}"
+        mode: "0644"
+      loop: [helper.json, listener.json, firewall.nft, listener-control-host.conf]
+
+    - name: Render the node's firewall for one VM and a static address
+      ansible.builtin.template:
+        src: "{{ _node }}/templates/firewall.nft.j2"
+        dest: "{{ render_dir }}/firewall-one-vm-static.nft"
+        mode: "0644"
+      vars:
+        tinfirm_sandbox_node_max_vms: 1
+        tinfirm_sandbox_node_dhcp: false
+
+    - name: Render the control host's driver configuration
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/node-driver.json.j2"
+        dest: "{{ render_dir }}/node-driver.json"
+        mode: "0644"
+
+    - name: Render the runner host's unit with Docker and Kata
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+
+    - name: Render the control host's unit
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.vm.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: vm
+
+    - name: Show the derived values the tasks use
+      ansible.builtin.copy:
+        content: "{{ _derived | to_nice_json }}\n"
+        dest: "{{ render_dir }}/derived.json"
+        mode: "0644"
+      vars:
+        _derived:
+          firecracker_url: "{{ _tinfirm_sandbox_node_firecracker_url }}"
+          firecracker: "{{ _tinfirm_sandbox_node_firecracker }}"
+          firecracker_sha256: "{{ _tinfirm_sandbox_node_firecracker_sha256 }}"
+          jailer_sha256: "{{ _tinfirm_sandbox_node_jailer_sha256 }}"
+          kernel_url: "{{ _tinfirm_sandbox_node_kernel_url }}"
+          kernel_pins: "{{ _tinfirm_sandbox_node_kernel_pins }}"
+          kernel_sha256: "{{ _tinfirm_sandbox_node_kernel_sha256 }}"
+          published_ports: "{{ _tinfirm_sandbox_node_published_ports }}"
+          node_name: "{{ tinfirm_sandbox_node_name }}"
+          nodes_unpinned: "{{ _tinfirm_runner_host_nodes_unpinned }}"
+          packages: "{{ _tinfirm_sandbox_node_packages }}"

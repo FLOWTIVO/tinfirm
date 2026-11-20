@@ -1,0 +1,62 @@
+---
+# The listener's user and its group of the same name. The helper is root; the VMs' users are
+# uids from vmUidBase without an account. With the single machine (planned) the runner host's
+# user would be the third; a sandbox node has none.
+- name: Create the listener's group
+  ansible.builtin.group:
+    name: "{{ _tinfirm_sandbox_node_listener_user }}"
+    gid: "{{ tinfirm_sandbox_node_listener_uid if tinfirm_sandbox_node_listener_uid | string | length > 0 else omit }}"
+    system: true
+
+- name: Create the listener's user
+  ansible.builtin.user:
+    name: "{{ _tinfirm_sandbox_node_listener_user }}"
+    uid: "{{ tinfirm_sandbox_node_listener_uid if tinfirm_sandbox_node_listener_uid | string | length > 0 else omit }}"
+    group: "{{ _tinfirm_sandbox_node_listener_user }}"
+    system: true
+    create_home: false
+    home: /nonexistent
+    shell: /usr/sbin/nologin
+
+- name: Read the listener's uid
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ _tinfirm_sandbox_node_listener_user }}"
+
+- name: Keep the listener's uid
+  ansible.builtin.set_fact:
+    _tinfirm_sandbox_node_listener_uid: "{{ ansible_facts['getent_passwd'][_tinfirm_sandbox_node_listener_user][1] }}"
+
+# The directories, with the owners and modes that the two processes check at their start.
+# systemd-tmpfiles makes them again at every boot (/run is a tmpfs).
+- name: Install the agent's directories (tmpfiles.d)
+  ansible.builtin.copy:
+    src: tinfirm-node-agent.tmpfiles.conf
+    dest: /etc/tmpfiles.d/tinfirm-node-agent.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: _tinfirm_sandbox_node_tmpfiles
+
+- name: Look for the helper's socket directory
+  ansible.builtin.stat:
+    path: /run/tinfirm-node-agent-helper
+  register: _tinfirm_sandbox_node_run_dir
+
+- name: Create the agent's directories
+  ansible.builtin.command:
+    argv: [systemd-tmpfiles, --create, /etc/tmpfiles.d/tinfirm-node-agent.conf]
+  changed_when: true
+  when: _tinfirm_sandbox_node_tmpfiles is changed or not _tinfirm_sandbox_node_run_dir.stat.exists
+
+- name: Create the agent's configuration directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/tinfirm
+    - "{{ _tinfirm_sandbox_node_etc }}"
+    - "{{ _tinfirm_sandbox_node_cache_dir }}"

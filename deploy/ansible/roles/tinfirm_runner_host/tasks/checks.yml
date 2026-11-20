@@ -9,6 +9,15 @@
       {{ ansible_facts['distribution'] }} on {{ ansible_facts['architecture'] }}.
     quiet: true
 
+- name: Check the kind of host
+  ansible.builtin.assert:
+    that:
+      - tinfirm_runner_host_executor in ['docker', 'vm']
+    fail_msg: >-
+      tinfirm_runner_host_executor is `docker` (Docker and Kata on this machine) or `vm` (a control
+      host whose VMs run on sandbox nodes), not {{ tinfirm_runner_host_executor }}.
+    quiet: true
+
 - name: Check the runner host binary source
   ansible.builtin.assert:
     that:
@@ -24,11 +33,14 @@
       tinfirm_runner_host_kata_runtime_name must start with `kata`: `run --sandbox-docker` refuses any
       other runtime.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
+# A control host runs no VM: it needs no KVM (ADR-0112 decision 3).
 - name: Look for /dev/kvm
   ansible.builtin.stat:
     path: /dev/kvm
   register: _tinfirm_runner_host_kvm
+  when: not (_tinfirm_runner_host_vm | bool)
 
 - name: Check that the VM can run VMs (nested virtualisation)
   ansible.builtin.assert:
@@ -40,6 +52,7 @@
       start a VM per sandbox. Enable nested virtualisation for the VM in the hypervisor
       (deploy/ansible/README.md); without it, Kata and `--sandbox-docker` are out.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
 # L27 of the security review of 2026-10-27: nothing the role downloads is trusted on TLS alone.
 - name: Check the checksum of the runner host's release archive
@@ -64,6 +77,7 @@
       {{ tinfirm_runner_host_kata_version }} on {{ _tinfirm_runner_host_kata_arch }}, and downloads the
       release only against one.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
 - name: Check the fingerprint of Docker's key
   ansible.builtin.assert:
@@ -73,6 +87,7 @@
       tinfirm_runner_host_docker_key_fingerprint must be the 40 hex digits (upper case, no spaces) of
       the key that signs Docker's packages.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
 - name: Check the user's uid against the sandbox bridge
   ansible.builtin.assert:
@@ -83,7 +98,9 @@
       mounts that the sandbox writes as uid 1000: set tinfirm_runner_host_uid to 1000, or keep the
       bridge on.
     quiet: true
-  when: tinfirm_runner_host_create_user | bool
+  when:
+    - tinfirm_runner_host_create_user | bool
+    - not (_tinfirm_runner_host_vm | bool)
 
 # The unit's ProtectHome hides /home, /root and /run/user from the service.
 - name: Check that the runner host's directories are outside the hidden homes
@@ -99,3 +116,47 @@
     - "{{ tinfirm_runner_host_home }}"
     - "{{ tinfirm_runner_host_config_dir }}"
     - "{{ tinfirm_runner_host_data_dir }}"
+
+# A control host (ADR-0112): its nodes and their template, as runner/README.md's "Sandbox
+# nodes" defines the driver's configuration. The driver checks the same again at `run`'s start.
+- name: Check the sandbox nodes
+  when: _tinfirm_runner_host_vm | bool
+  block:
+    - name: Check that there are nodes and a template
+      ansible.builtin.assert:
+        that:
+          - tinfirm_runner_host_nodes | length >= 1
+          - tinfirm_runner_host_nodes | length <= 64
+          - tinfirm_runner_host_nodes | map(attribute='name') | unique | length == tinfirm_runner_host_nodes | length
+          - tinfirm_runner_host_vm_template is match('^[a-z0-9][a-z0-9-]{0,62}$')
+          - tinfirm_runner_host_nodes | selectattr('templates', 'contains', tinfirm_runner_host_vm_template) | list | length >= 1
+          - tinfirm_runner_host_node_peer_build in ['warn', 'refuse']
+          - tinfirm_runner_host_vm_port | int >= 1
+          - tinfirm_runner_host_vm_port | int <= 65535
+        fail_msg: >-
+          A control host needs tinfirm_runner_host_nodes (1 to 64 nodes, each name once),
+          tinfirm_runner_host_vm_template (a template that at least one node offers), and
+          tinfirm_runner_host_node_peer_build warn or refuse.
+        quiet: true
+
+    - name: Check each node
+      ansible.builtin.assert:
+        that:
+          - item.keys() | difference(['name', 'address', 'nodeSha256', 'templates', 'publishedPorts']) | length == 0
+          - item.name | default('') is match('^[a-z0-9-]{1,32}$')
+          - item.address | default('') is match('^.+:[0-9]{1,5}$')
+          - (item.address | default(':0') | split(':') | last | int) >= 1
+          - (item.address | default(':0') | split(':') | last | int) <= 65535
+          - not (item.address | default('') is match('^(127\\.|localhost:|\\[::1\\]:|0\\.0\\.0\\.0:)'))
+          - item.templates | default([]) | length >= 1
+          - item.templates | select('match', '^[a-z0-9][a-z0-9-]{0,62}$') | list | length == item.templates | length
+          - (item.nodeSha256 | default('')) | length == 0 or item.nodeSha256 is match('^[0-9a-fA-F]{64}$')
+        fail_msg: >-
+          Node {{ item.name | default('?') }}: name (1 to 32 bytes of a-z, 0-9 and -), address
+          (HOST:PORT of the node agent's TLS listener, not this machine's loopback: the single
+          machine is planned), templates (names of the node's helper.json), and nodeSha256 (64 hex
+          digits, or empty until the node's play has shown it); optionally publishedPorts.
+        quiet: true
+      loop: "{{ tinfirm_runner_host_nodes }}"
+      loop_control:
+        label: "{{ item.name | default('?') }}"

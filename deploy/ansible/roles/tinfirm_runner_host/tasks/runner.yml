@@ -5,7 +5,8 @@
     uid: "{{ tinfirm_runner_host_uid }}"
     home: "{{ tinfirm_runner_host_home }}"
     shell: /usr/sbin/nologin
-    groups: [docker]
+    # A control host has no Docker, and its user is in no group of Docker's.
+    groups: "{{ omit if _tinfirm_runner_host_vm | bool else ['docker'] }}"
     append: true
   when: tinfirm_runner_host_create_user | bool
 
@@ -15,7 +16,9 @@
     name: "{{ tinfirm_runner_host_user }}"
     groups: [docker]
     append: true
-  when: not (tinfirm_runner_host_create_user | bool)
+  when:
+    - not (tinfirm_runner_host_create_user | bool)
+    - not (_tinfirm_runner_host_vm | bool)
 
 - name: Create the runner host's directories
   ansible.builtin.file:
@@ -43,6 +46,8 @@
 # nothing against whoever can replace them, so SHA256SUMS is trusted only once its signature
 # SHA256SUMS.sig verifies against the public key the role ships (as tinfirm-auto-deploy and
 # deploy/release/assets.sh verify-sums do), and the archive is then checked against it.
+# SHA256SUMS and its signature are fetched again at every run, only for that check: those
+# steps count as no change, so that a second run of the role reports none.
 - name: Install the runner host binary from a release archive
   when: tinfirm_runner_host_binary_url | length > 0
   vars:
@@ -70,6 +75,7 @@
         - "{{ _sums }}"
         - "{{ _sums }}.sig"
         - "{{ _sums }}.der"
+      changed_when: false
 
     - name: Download the release's SHA256SUMS.sig
       ansible.builtin.get_url:
@@ -78,6 +84,7 @@
         headers: "{{ tinfirm_runner_host_binary_url_headers }}"
         mode: "0644"
       register: _tinfirm_runner_host_sums_sig
+      changed_when: false
       # Missing (404) is a release without a signature, admitted only with allow_unsigned.
       failed_when: >-
         _tinfirm_runner_host_sums_sig is failed
@@ -94,6 +101,7 @@
             dest: "{{ _sums }}"
             headers: "{{ tinfirm_runner_host_binary_url_headers }}"
             mode: "0644"
+          changed_when: false
           no_log: "{{ tinfirm_runner_host_binary_url_headers | length > 0 }}"
 
         - name: Put the public key on the host

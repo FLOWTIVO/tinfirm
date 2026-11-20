@@ -1,6 +1,21 @@
 ---
 # Values the role derives from defaults/main.yml and the facts. Sites set defaults/main.yml.
 
+# A control host (ADR-0112): `run --executor vm --vm-driver node`.
+_tinfirm_runner_host_vm: "{{ tinfirm_runner_host_executor == 'vm' }}"
+# The node driver's files, at the paths runner/README.md names ("Sandbox nodes"). `run` reads
+# the configuration at its start, and names it to the driver it starts.
+_tinfirm_runner_host_node_config: /etc/tinfirm/node-driver.json
+_tinfirm_runner_host_node_dir: /etc/tinfirm/node-driver
+_tinfirm_runner_host_node_cert: /etc/tinfirm/node-driver/client.crt
+_tinfirm_runner_host_node_key: /etc/tinfirm/node-driver/client.key
+# The nodes whose pin is not set yet: while there is one, the role writes no driver
+# configuration and does not start the host.
+_tinfirm_runner_host_nodes_unpinned: >-
+  {{ tinfirm_runner_host_nodes | rejectattr('nodeSha256', 'defined') | map(attribute='name') | list
+     + tinfirm_runner_host_nodes | selectattr('nodeSha256', 'defined') | rejectattr('nodeSha256', 'truthy')
+       | map(attribute='name') | list }}
+
 _tinfirm_runner_host_kata_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
 # The Go runtime's shim from the static release, and the configuration the role writes.
 _tinfirm_runner_host_kata_shim: /opt/kata/bin/containerd-shim-kata-v2
