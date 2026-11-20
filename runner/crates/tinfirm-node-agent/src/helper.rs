@@ -753,8 +753,8 @@ impl HelperClient {
             match (answer.remove("ok"), answer.remove("error")) {
                 (Some(ok), None) if answer.is_empty() => Ok(ok),
                 (None, Some(error)) if answer.is_empty() => Err(serde_json::from_value(error)
-                    .unwrap_or_else(|_| unreachable("the helper's error is not readable".into()))),
-                _ => Err(unreachable("the helper's answer is not readable".into())),
+                    .unwrap_or_else(|_| unreachable("the helper's error is not readable; the helper may be of another build: restart the listener".into()))),
+                _ => Err(unreachable("the helper's answer is not readable; the helper may be of another build: restart the listener".into())),
             }
         };
         match tokio::time::timeout(self.timeout, work).await {
@@ -799,7 +799,7 @@ impl HelperClient {
 
 fn typed<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, HelperError> {
     serde_json::from_value(value)
-        .map_err(|_| HelperError::new(Code::Failed, "the helper's answer is not readable"))
+        .map_err(|_| HelperError::new(Code::Failed, "the helper's answer is not readable; the helper may be of another build: restart the listener"))
 }
 
 #[cfg(test)]
@@ -1039,6 +1039,55 @@ mod tests {
         let a = VmId::generate().unwrap();
         write_user_data(&f, &a, b"{}");
         helper.make(&a, &template()).unwrap();
+    }
+
+    #[test]
+    fn a_vmm_outside_the_profile_fails_its_make_only_where_the_configuration_requires_it() {
+        use crate::plan::VmmProfile;
+        let f = fixture();
+        // Not required (the default): an unconfined VMM is made, as before.
+        let helper = Helper::start(f.config.clone(), f.backend.clone()).unwrap();
+        assert_eq!(helper.config().vmm_profile, VmmProfile::NotRequired);
+        let a = VmId::generate().unwrap();
+        write_user_data(&f, &a, b"{}");
+        helper.make(&a, &template()).unwrap();
+        helper.delete(&a).unwrap();
+        drop(helper);
+
+        // Required: the unconfined VMM fails the make, which names the label it found, and
+        // the VM is removed as any failed make's, its slot free again.
+        let mut config = f.config.clone();
+        config.vmm_profile = VmmProfile::Required;
+        let helper = Helper::start(config, f.backend.clone()).unwrap();
+        let b = VmId::generate().unwrap();
+        write_user_data(&f, &b, b"{}");
+        let refused = helper.make(&b, &template()).unwrap_err();
+        assert_eq!(refused.code, Code::Failed);
+        assert!(
+            refused
+                .message
+                .contains("runs as \"unconfined\", not as tinfirm-vmm (enforce)")
+                && refused.message.contains("vmmProfile \"required\""),
+            "{refused}"
+        );
+        assert!(f.backend.vms().is_empty());
+        assert!(helper.list().unwrap().vms.is_empty());
+        // In complain mode: the same.
+        f.backend
+            .set_vmm_label(Ok("tinfirm-vmm (complain)\n".into()));
+        let message = helper.make(&b, &template()).unwrap_err().message;
+        assert!(message.contains("tinfirm-vmm (complain)"), "{message}");
+        // A label that cannot be read is no proof: the make fails and says why.
+        f.backend.set_vmm_label(Err(
+            "/proc/1000 cannot be looked at (permission denied)".into()
+        ));
+        let message = helper.make(&b, &template()).unwrap_err().message;
+        assert!(message.contains("permission denied"), "{message}");
+        // Under the profile in enforce mode: made.
+        f.backend
+            .set_vmm_label(Ok("tinfirm-vmm (enforce)\n".into()));
+        assert_eq!(helper.make(&b, &template()).unwrap().port, 20000);
+        assert_eq!(f.backend.vms().len(), 1);
     }
 
     #[test]

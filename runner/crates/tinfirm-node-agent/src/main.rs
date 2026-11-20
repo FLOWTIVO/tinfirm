@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tinfirm_node_agent::{helper, linux, listener, plan, tls};
+use tinfirm_node_agent::{harden, helper, linux, listener, plan, tls};
 
 #[derive(Parser)]
 #[command(name = "tinfirm-node-agent", version = tinfirm_node_agent::wire::build_id())]
@@ -32,6 +32,14 @@ enum Command {
             env = "TINFIRM_NODE_LISTENER_CONFIG",
             default_value = "/etc/tinfirm/node-agent/listener.json"
         )]
+        config: PathBuf,
+    },
+    /// Sets the hardening's settings that last until a reboot, as `hardening.json` asks: kexec
+    /// off, lockdown at `integrity`, module loading off once every module the agent needs is
+    /// there. Run at each boot by `tinfirm-node-agent-hardening.service`; a second run changes
+    /// nothing.
+    Harden {
+        #[arg(long, default_value = harden::CONFIG)]
         config: PathBuf,
     },
     /// Writes a new key (PKCS #8 DER, 0600) and its self-signed certificate (DER), which must
@@ -90,6 +98,10 @@ async fn run(command: Command) -> Result<()> {
         Command::Listener { config } => {
             listener::run(listener::ListenerConfig::load(&config)?).await
         }
+        Command::Harden { config } => harden::harden(
+            std::path::Path::new("/"),
+            &harden::HardenConfig::load(&config)?,
+        ),
         Command::Identity { cert, key } => {
             println!("{}", tls::write_identity(&cert, &key, tls::SERVER_NAME)?);
             Ok(())

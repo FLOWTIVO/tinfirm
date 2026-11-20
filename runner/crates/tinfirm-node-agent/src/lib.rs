@@ -10,6 +10,8 @@
 //!   network, the disks and the VMM; [`bounding`] cuts the VMM's capability bounding set.
 //!   In `check` it also reads the machine's hardening mark ([`hardening`]), and writes no
 //!   setting.
+//! - **`harden`** ([`harden`]), run once at each boot by its own unit, writes the three
+//!   settings of the mark that last until a reboot.
 //!
 //! Both wires read each line as strict JSON ([`strict`]): no object names a key twice.
 //!
@@ -17,6 +19,7 @@
 
 pub mod backend;
 pub mod bounding;
+pub mod harden;
 pub mod hardening;
 pub mod helper;
 pub mod id;

@@ -95,6 +95,9 @@ struct FakeState {
     /// What the fake node answers of its hardening; `None` for the default (every line
     /// failing).
     hardening: Option<Hardening>,
+    /// The AppArmor label its VMMs get; `None` for `unconfined`, as a node without the
+    /// profile gives.
+    vmm_label: Option<Result<String, String>>,
     fail_next_make: bool,
     fail_next_delete: bool,
     fail_deletes: bool,
@@ -154,6 +157,12 @@ impl FakeBackend {
         self.state().hardening = Some(hardening);
     }
 
+    /// The label each new VMM runs under, as `/proc/<pid>/attr/apparmor/current` gives it, or
+    /// why it cannot be read.
+    pub fn set_vmm_label(&self, label: Result<String, String>) {
+        self.state().vmm_label = Some(label);
+    }
+
     /// The next make fails half-way: it leaves a VM whose VMM does not run.
     pub fn fail_next_make(&self) {
         self.state().fail_next_make = true;
@@ -207,6 +216,14 @@ impl Backend for FakeBackend {
             );
             return Err(BackendError::Failed("the fake VMM did not start".into()));
         }
+        // The VMM started: its label, where the configuration requires the profile. A VMM
+        // that fails it runs on, as on a node, until the helper removes the VM.
+        let label = state
+            .vmm_label
+            .clone()
+            .unwrap_or_else(|| Ok("unconfined\n".into()));
+        let pid = 1000 + plan.names.slot;
+        let problem = hardening::make_label_problem(plan.vmm_profile, pid, &label);
         state.vms.insert(
             plan.names.serial,
             FakeVm {
@@ -215,7 +232,10 @@ impl Backend for FakeBackend {
                 alive: true,
             },
         );
-        Ok(())
+        match problem {
+            Some(problem) => Err(BackendError::Failed(problem)),
+            None => Ok(()),
+        }
     }
 
     fn delete(&self, names: &Names) -> Result<(), BackendError> {

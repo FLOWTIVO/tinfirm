@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::plan::HardeningConfig;
+use crate::plan::{HardeningConfig, VmmProfile};
 
 /// The lines of the mark, in the order of the answer.
 pub mod line {
@@ -258,6 +258,77 @@ pub fn utc_text(seconds: i64) -> String {
         rest % 3600 / 60,
         rest % 60
     )
+}
+
+/// The AppArmor label a VMM runs under, from `/proc/<pid>/attr/apparmor/current`, or from
+/// `attr/current` on a kernel without the first; or why neither can be read. Each error names
+/// its kind, so that a process that `/proc` hides or refuses differs from one that is gone.
+pub fn vmm_label(root: &Path, pid: u32) -> Result<String, String> {
+    let dir = root.join(format!("proc/{pid}"));
+    if let Err(e) = dir.symlink_metadata() {
+        return Err(format!(
+            "/proc/{pid} cannot be looked at ({}): the VMM ended, or /proc hides it from the helper",
+            e.kind()
+        ));
+    }
+    let read = |name: &str| {
+        let path = dir.join(name);
+        let file = std::fs::File::open(&path);
+        let mut text = String::new();
+        file.and_then(|f| f.take(MAX_SETTING).read_to_string(&mut text))
+            .map(|_| text)
+            .map_err(|e| {
+                (
+                    e.kind(),
+                    format!("/proc/{pid}/{name} cannot be read ({})", e.kind()),
+                )
+            })
+    };
+    match read("attr/apparmor/current") {
+        Ok(label) => Ok(label),
+        Err((std::io::ErrorKind::NotFound, first)) => {
+            read("attr/current").map_err(|(_, second)| format!("{first}, and {second}"))
+        }
+        Err((_, why)) => Err(why),
+    }
+}
+
+/// What is wrong with a VMM's label, as one sentence; `None` when it runs under the profile in
+/// enforce mode. The make (with `vmmProfile` required) and the line `vmm-mac` both ask it.
+pub fn vmm_label_problem(pid: u32, label: &Result<String, String>) -> Option<String> {
+    let wanted = format!("{PROFILE} (enforce)");
+    match label {
+        Ok(label) => {
+            let label = label.trim_end_matches(['\n', '\0']).trim();
+            (label != wanted).then(|| {
+                format!(
+                    "the VMM {pid} runs as \"{}\", not as {wanted}",
+                    shown(label)
+                )
+            })
+        }
+        // The helper's own words: a pid and the error's kind.
+        Err(why) => Some(format!(
+            "the AppArmor label of the VMM {pid} is not known: {why}"
+        )),
+    }
+}
+
+/// What fails a make for its VMM's label: with `vmmProfile` `"required"`, a VMM that does not
+/// run under the profile in enforce mode, or whose label cannot be read. `None` otherwise.
+pub fn make_label_problem(
+    profile: VmmProfile,
+    pid: u32,
+    label: &Result<String, String>,
+) -> Option<String> {
+    match profile {
+        VmmProfile::NotRequired => None,
+        VmmProfile::Required => vmm_label_problem(pid, label).map(|problem| {
+            format!(
+                "{problem}, and this node's configuration requires it (vmmProfile \"required\")"
+            )
+        }),
+    }
 }
 
 /// The TCP sockets in the LISTEN state of one of the kernel's `/proc/net/tcp` or `tcp6`
@@ -629,20 +700,8 @@ impl Checker {
             }
         };
         for pid in pids {
-            let proc = self.root.join(format!("proc/{pid}/attr"));
-            let label = match read_text(&proc.join("apparmor/current"), MAX_SETTING) {
-                Err(Unread::Missing) => read_text(&proc.join("current"), MAX_SETTING),
-                other => other,
-            };
-            match label {
-                Ok(label) if label.trim_end_matches(['\n', '\0']).trim() == wanted => {}
-                Ok(label) => {
-                    return no(format!(
-                        "the VMM {pid} runs as \"{}\", not as {wanted}",
-                        shown(label.trim_end_matches(['\n', '\0']).trim())
-                    ));
-                }
-                Err(e) => return no(format!("the AppArmor label of the VMM {pid} {e}")),
+            if let Some(problem) = vmm_label_problem(*pid, &vmm_label(&self.root, *pid)) {
+                return no(problem);
             }
         }
         Line::new(
@@ -1237,6 +1296,51 @@ mod tests {
         // No VMM runs: the profile loaded in enforce mode is enough.
         let h = checker.check(Some(&wanted()), &Ok(vec![]), Instant::now());
         assert_eq!(failing(&h), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_vmms_label_that_cannot_be_read_says_the_errors_kind() {
+        let dir = hardened_root();
+        let root = dir.path();
+        // No /proc/<pid> at all: gone, or hidden by `ProtectProc=invisible`.
+        let gone = vmm_label(root, 777).unwrap_err();
+        assert_eq!(
+            gone,
+            "/proc/777 cannot be looked at (entity not found): the VMM ended, or /proc hides it from the helper"
+        );
+        // The process is there, its attr files are not: both are named, each with its kind.
+        std::fs::create_dir_all(root.join("proc/778")).unwrap();
+        let missing = vmm_label(root, 778).unwrap_err();
+        assert_eq!(
+            missing,
+            "/proc/778/attr/apparmor/current cannot be read (entity not found), and /proc/778/attr/current cannot be read (entity not found)"
+        );
+        // Another error of the first file is not hidden by the second.
+        std::fs::create_dir_all(root.join("proc/779/attr/apparmor/current")).unwrap();
+        put(root, "proc/779/attr/current", "tinfirm-vmm (enforce)\n");
+        let refused = vmm_label(root, 779).unwrap_err();
+        assert!(refused.contains("is a directory"), "{refused}");
+        // Through the line, within its bound.
+        let h = Checker::new(root).check(Some(&wanted()), &Ok(vec![778]), Instant::now());
+        let found = &line_of(&h, line::VMM_MAC).found;
+        assert!(
+            found.contains("entity not found") && found.chars().count() <= MAX_FOUND,
+            "{found}"
+        );
+        // The problem a make sees.
+        assert_eq!(
+            vmm_label_problem(1, &Ok("tinfirm-vmm (enforce)\n".into())),
+            None
+        );
+        assert_eq!(
+            vmm_label_problem(1, &Ok("tinfirm-vmm (complain)\n".into())).unwrap(),
+            "the VMM 1 runs as \"tinfirm-vmm (complain)\", not as tinfirm-vmm (enforce)"
+        );
+        assert!(
+            vmm_label_problem(1, &Err("x (permission denied)".into()))
+                .unwrap()
+                .contains("permission denied")
+        );
     }
 
     #[test]

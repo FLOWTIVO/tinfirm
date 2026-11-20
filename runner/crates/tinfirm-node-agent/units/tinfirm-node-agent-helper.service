@@ -11,7 +11,11 @@ Description=Tinfirm node agent: the helper (root), which makes and deletes the V
 # in its `define` lines) starts no helper, and so takes no VM, instead of forwarding with no
 # table of its own. `check` also says whether the table is there.
 Requires=tinfirm-node-agent-modules.service tinfirm-node-agent-firewall.service
-After=tinfirm-node-agent-modules.service tinfirm-node-agent-firewall.service systemd-tmpfiles-setup.service systemd-sysctl.service
+# The hardening is wanted, not required: one that fails lowers the node's mark (ADR-0113,
+# decision 5) and stops nothing. Ordered after it, so that the helper's first check reads the
+# settings it wrote.
+Wants=tinfirm-node-agent-hardening.service
+After=tinfirm-node-agent-modules.service tinfirm-node-agent-firewall.service tinfirm-node-agent-hardening.service systemd-tmpfiles-setup.service systemd-sysctl.service
 
 [Service]
 ExecStart=/usr/local/bin/tinfirm-node-agent helper --config /etc/tinfirm/node-agent/helper.json

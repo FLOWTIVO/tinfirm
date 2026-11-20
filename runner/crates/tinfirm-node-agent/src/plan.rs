@@ -128,6 +128,21 @@ pub enum NodeFirewall {
     NotRequired,
 }
 
+/// Whether a make requires its VMM to run under the AppArmor profile `tinfirm-vmm` in enforce
+/// mode (`crate::hardening::PROFILE`). Not required unless the configuration says so, so that
+/// a configuration written before it loads, and a node without the profile makes VMs as it
+/// did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VmmProfile {
+    /// A VMM that runs under another label fails its make, and is removed as any failed
+    /// make's.
+    Required,
+    /// The make does not ask; the hardening mark's line `vmm-mac` still reports it.
+    #[default]
+    NotRequired,
+}
+
 /// What the hardening mark's lines need of the configuration (`crate::hardening`), which the
 /// role writes. Optional as a whole, so that a configuration written before it still loads:
 /// without it, the lines `listening-sockets` and `max-uptime` fail and say why.
@@ -169,6 +184,9 @@ pub struct HelperConfig {
     pub network: Network,
     pub firecracker: Firecracker,
     pub templates: BTreeMap<TemplateName, Template>,
+    /// `"not-required"` by default; `"required"` where the role loads the profile.
+    #[serde(default)]
+    pub vmm_profile: VmmProfile,
     /// What the hardening mark needs; absent in a configuration written before it.
     #[serde(default)]
     pub hardening: Option<HardeningConfig>,
@@ -532,6 +550,8 @@ pub struct VmPlan {
     pub template: Template,
     pub network: Network,
     pub firecracker: Firecracker,
+    /// Whether its VMM must run under the AppArmor profile.
+    pub vmm_profile: VmmProfile,
 }
 
 /// The plan of the VM in `slot` with `serial`, from `template`.
@@ -553,6 +573,7 @@ pub fn plan(config: &HelperConfig, template: &Template, slot: u32, serial: u64) 
         template: template.clone(),
         network: config.network.clone(),
         firecracker: config.firecracker.clone(),
+        vmm_profile: config.vmm_profile,
     }
 }
 
@@ -633,6 +654,34 @@ pub(crate) mod tests {
         assert_eq!(t.bridge_port, DEFAULT_BRIDGE_PORT);
         assert_eq!(t.pids_max, 64);
         assert_eq!(config.node_firewall, NodeFirewall::Required);
+    }
+
+    #[test]
+    fn the_vmm_profile_is_not_required_unless_the_configuration_says_so() {
+        let parse = |value: Option<serde_json::Value>| {
+            let mut json = config_json();
+            if let Some(value) = value {
+                json["vmmProfile"] = value;
+            }
+            serde_json::from_value::<HelperConfig>(json).map(|c| c.vmm_profile)
+        };
+        assert_eq!(parse(None).unwrap(), VmmProfile::NotRequired);
+        assert_eq!(
+            parse(Some("required".into())).unwrap(),
+            VmmProfile::Required
+        );
+        assert_eq!(
+            parse(Some("not-required".into())).unwrap(),
+            VmmProfile::NotRequired
+        );
+        for wrong in ["notRequired", "Required", "optional", ""] {
+            assert!(parse(Some(wrong.into())).is_err(), "{wrong} was taken");
+        }
+        // Each VM's plan carries it.
+        let mut config = config();
+        config.vmm_profile = VmmProfile::Required;
+        let t = config.templates.values().next().unwrap().clone();
+        assert_eq!(plan(&config, &t, 0, 0).vmm_profile, VmmProfile::Required);
     }
 
     #[test]

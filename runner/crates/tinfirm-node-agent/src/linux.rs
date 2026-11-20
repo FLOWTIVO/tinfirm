@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use crate::backend::{Backend, BackendError, Checked, NodeTable, Present};
 use crate::bounding;
 use crate::hardening::{self, Hardening};
-use crate::plan::{Firecracker, HelperConfig, Names, Template, VmPlan};
+use crate::plan::{Firecracker, HelperConfig, Names, Template, VmPlan, VmmProfile};
 use crate::spool::MAX_USER_DATA;
 
 /// The VMM's API socket, inside its chroot.
@@ -1469,6 +1469,15 @@ impl LinuxBackend {
                 "the VMM does not run as it must: {}",
                 problems.join("; ")
             )));
+        }
+        // Its AppArmor label, where the configuration requires the profile: the profile
+        // attaches when the jailer execs Firecracker, so the VMM that runs now has it or never
+        // will. Read only when required, so that a node without the profile asks nothing.
+        if plan.vmm_profile == VmmProfile::Required {
+            let label = hardening::vmm_label(Path::new("/"), pid);
+            if let Some(problem) = hardening::make_label_problem(plan.vmm_profile, pid, &label) {
+                return Err(failed(problem));
+            }
         }
         self.done(Step::Vmm)
     }
