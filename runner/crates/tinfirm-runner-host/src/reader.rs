@@ -248,6 +248,13 @@ impl Probe {
 }
 
 /// How the host starts its readers.
+/// What a reader reads: a stream that this process copies to the reader's stdin, or a pipe that
+/// becomes the reader's stdin, so that what comes on it never passes through this process.
+pub enum Input<'a> {
+    Read(&'a mut dyn Read),
+    Pipe(std::os::fd::OwnedFd),
+}
+
 #[derive(Debug, Clone)]
 pub struct Reader {
     binary: PathBuf,
@@ -360,6 +367,18 @@ impl Reader {
         gzip: bool,
         timeout: Duration,
     ) -> Result<Unpacked> {
+        self.unpack_from(Input::Read(input), dest, limits, gzip, timeout)
+    }
+
+    /// [`Reader::unpack`] of `input`, which may be a pipe that the reader reads itself.
+    pub fn unpack_from(
+        &self,
+        input: Input<'_>,
+        dest: &Path,
+        limits: &Limits,
+        gzip: bool,
+        timeout: Duration,
+    ) -> Result<Unpacked> {
         let meta = std::fs::symlink_metadata(dest)
             .with_context(|| format!("{} does not exist", dest.display()))?;
         if !meta.is_dir() {
@@ -423,6 +442,11 @@ impl Reader {
     /// The one regular file of the archive `input`, at most `max` bytes ([`files::read_one`],
     /// in a reader). Blocking.
     pub fn read_one(&self, input: &mut dyn Read, max: u64, timeout: Duration) -> Result<ReadOne> {
+        self.read_one_from(Input::Read(input), max, timeout)
+    }
+
+    /// [`Reader::read_one`] of `input`, which may be a pipe that the reader reads itself.
+    pub fn read_one_from(&self, input: Input<'_>, max: u64, timeout: Duration) -> Result<ReadOne> {
         let max = max.min(MAX_READ_ONE);
         let extra = usize::try_from(max).context("too large")?;
         let (done, rest) = self.exchange(&Work::ReadOne { max }, Some(input), extra, timeout)?;
@@ -454,6 +478,29 @@ impl Reader {
     pub fn import_bundle(
         &self,
         input: &mut dyn Read,
+        repo: &Path,
+        scratch: &Path,
+        name: &str,
+        head: &str,
+        limits: &Limits,
+        timeout: Duration,
+    ) -> Result<()> {
+        self.import_bundle_from(
+            Input::Read(input),
+            repo,
+            scratch,
+            name,
+            head,
+            limits,
+            timeout,
+        )
+    }
+
+    /// [`Reader::import_bundle`] of `input`, which may be a pipe that the reader reads itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_bundle_from(
+        &self,
+        input: Input<'_>,
         repo: &Path,
         scratch: &Path,
         name: &str,
@@ -519,7 +566,7 @@ impl Reader {
     fn exchange(
         &self,
         work: &Work,
-        input: Option<&mut dyn Read>,
+        input: Option<Input<'_>>,
         extra: usize,
         timeout: Duration,
     ) -> Result<(Done, Vec<u8>)> {
@@ -534,10 +581,9 @@ impl Reader {
             .env_clear()
             .env("PATH", scrubbed_path())
             .current_dir("/")
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
+            .stdin(match &input {
+                Some(Input::Read(_)) => Stdio::piped(),
+                Some(Input::Pipe(_)) | None => Stdio::null(),
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -546,8 +592,19 @@ impl Reader {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command
-            .spawn()
+        // A pipe is the reader's stdin itself: what comes on it never passes through this
+        // process. This process's copy of it is closed once the reader has it.
+        let (input, pipe) = match input {
+            Some(Input::Pipe(fd)) => (None, Some(fd)),
+            other => (other, None),
+        };
+        if let Some(fd) = &pipe {
+            command.stdin(Stdio::from(fd.try_clone()?));
+        }
+        let spawned = command.spawn();
+        drop(command);
+        drop(pipe);
+        let mut child = spawned
             .with_context(|| format!("cannot start the reader {}", self.binary.display()))?;
         let pgid = child.id();
         // Whatever happens below, nothing of the reader outlives this call.
@@ -578,7 +635,7 @@ impl Reader {
                 true
             }
         });
-        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        if let (Some(Input::Read(input)), Some(mut stdin)) = (input, child.stdin.take()) {
             // A reader that stops reading (it refused, or died) ends the copy; its answer says
             // why. The caller reads the rest of the stream.
             let _ = io::copy(input, &mut stdin);

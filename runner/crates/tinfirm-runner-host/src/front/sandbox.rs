@@ -164,7 +164,7 @@ impl SandboxFront {
 
     /// The front serves the egress proxy's HTTP on `listener`, for clients that send
     /// `authorization`; `connector` decides and connects each destination.
-    pub(crate) async fn listen_egress(
+    pub async fn listen_egress(
         &self,
         listener: TcpListener,
         authorization: String,

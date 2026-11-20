@@ -5,11 +5,16 @@
 //! `run` keeps the ticket and the session key, and decides each `hello` that the front hands
 //! it with the bridge crate's own rule ([`tinfirm_bridge::host::judge`]): the front applies the
 //! decision and holds the link. What comes back from the front is checked again here: an
-//! answer of the wrong kind, a command's output over its bound or not text, or a probe's name
-//! that was not asked ends the front.
+//! answer of the wrong kind, a command's output over its bound or not text, a probe's name
+//! that was not asked, or tunnels on other addresses than asked end the front.
+//!
+//! The sandbox's files go in on a socket of their own, which `run` packs into, and come out on
+//! a pipe whose other end is a reader's stdin ([`crate::reader::Input::Pipe`]): an archive of
+//! the sandbox's never passes through `run`. A tunnel names a service of the front, never an
+//! address.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +29,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::sandbox::SandboxFront;
-use super::wire::{Admission, Reply, ToFront, WireHello, WireIdentity, WireTiming};
+use super::wire::{
+    Admission, Reply, Service, ToFront, WireHello, WireIdentity, WireTiming, WireTunnel,
+};
+use crate::reader::Input;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -439,6 +447,60 @@ impl FrontSession {
         })
     }
 
+    /// Before [`FrontSession::start`]: the sandbox listens on each tunnel's address, and the
+    /// connections it gets there go to the front's service that the tunnel names, never to an
+    /// address. The addresses the sandbox listens on, in order: the asked ones, or for a port 0
+    /// the one it got.
+    pub async fn open_tunnels(
+        &mut self,
+        tunnels: &[(SocketAddr, Service)],
+        timeout: Duration,
+    ) -> Result<Vec<SocketAddr>> {
+        anyhow::ensure!(!self.started, "the adapter was started already");
+        anyhow::ensure!(
+            tunnels.len() <= tinfirm_bridge::tunnel::MAX_TUNNELS,
+            "a sandbox has at most {} tunnels",
+            tinfirm_bridge::tunnel::MAX_TUNNELS
+        );
+        let asked: Vec<WireTunnel> = tunnels
+            .iter()
+            .map(|&(listen, service)| WireTunnel { listen, service })
+            .collect();
+        let reply = self
+            .front
+            .handle()
+            .ask(
+                |id| ToFront::OpenTunnels {
+                    id,
+                    tunnels: asked,
+                    timeout_ms: millis(timeout),
+                },
+                Vec::new(),
+                timeout + MARGIN,
+            )
+            .await
+            .context("the sandbox cannot listen for its tunnels")?;
+        match reply {
+            Reply::Listening { addrs } => {
+                let fits = addrs.len() == tunnels.len()
+                    && addrs
+                        .iter()
+                        .zip(tunnels)
+                        .all(|(got, (asked, _))| asked.port() == 0 || got == asked);
+                if !fits {
+                    let why = "the front answered the tunnels with other addresses than asked";
+                    self.front.handle().break_wire(why.to_string());
+                    bail!("{why}");
+                }
+                Ok(addrs)
+            }
+            Reply::Failed { message } => {
+                Err(anyhow!("{message}")).context("the sandbox cannot listen for its tunnels")
+            }
+            other => Err(self.broken("the tunnels", &other)),
+        }
+    }
+
     pub async fn signal(&self, signal: Signal) -> Result<()> {
         self.front
             .handle()
@@ -535,6 +597,7 @@ fn broken(front: &SandboxFront, asked: &str, reply: &Reply) -> anyhow::Error {
         Reply::Reclaimed { .. } => "reclaimed",
         Reply::ExecDone { .. } => "execDone",
         Reply::Probed { .. } => "probed",
+        Reply::Listening { .. } => "listening",
         Reply::Failed { .. } => "failed",
     };
     let why = format!("the front answered {asked} with `{kind}`");
@@ -641,6 +704,106 @@ impl FrontFiles {
                 format!("cannot run {} in the sandbox", argv.first().unwrap_or(&""))
             }),
             other => Err(broken(&self.front, "a command", &other)),
+        }
+    }
+
+    /// Packs `host_dir`, without `exclude`, into the sandbox's directory `dir`: the archive goes
+    /// on a socket of its own, at the pace the sandbox takes it.
+    pub async fn put_dir(
+        &self,
+        host_dir: &std::path::Path,
+        dir: &str,
+        exclude: Vec<String>,
+        timeout: Duration,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.state.ended.is_cancelled(),
+            "the sandbox's bridge is gone"
+        );
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+        // Shut down when the put ends, so that a packer whose reader stopped never waits.
+        let guard = ours.try_clone()?;
+        let host_dir = host_dir.to_path_buf();
+        let packing = tokio::task::spawn_blocking(move || {
+            // Its end is said with a shutdown, which the copy kept to stop it does not hold
+            // back.
+            let ours = tinfirm_bridge::files::pack(&host_dir, &[], &exclude, ours)?;
+            ours.shutdown(std::net::Shutdown::Write)
+        });
+        let asked = self
+            .front
+            .handle()
+            .ask(
+                |id| ToFront::Put {
+                    id,
+                    dir: dir.to_string(),
+                    timeout_ms: millis(timeout),
+                },
+                vec![OwnedFd::from(theirs)],
+                timeout + MARGIN,
+            )
+            .await;
+        let _ = guard.shutdown(std::net::Shutdown::Both);
+        let packed = packing.await.map_err(|e| anyhow!("{e}"))?;
+        match asked.with_context(|| format!("cannot put {dir} into the sandbox"))? {
+            Reply::Done => {
+                packed.with_context(|| format!("cannot pack the files of {dir}"))?;
+                Ok(())
+            }
+            Reply::Failed { message } => Err(anyhow!("{message}"))
+                .with_context(|| format!("the sandbox cannot unpack {dir}")),
+            other => Err(broken(&self.front, "a put", &other)),
+        }
+    }
+
+    /// Asks the sandbox for `paths` of its directory `dir` (all of it when empty), without
+    /// `exclude`, as a tar archive, and hands `consume` a pipe on which the front writes it:
+    /// a reader's stdin ([`Input::Pipe`]), so that the archive never passes through this
+    /// process. Fails when `consume` fails, or when the archive did not come whole.
+    pub async fn receive<T, F>(
+        &self,
+        dir: &str,
+        paths: Vec<String>,
+        exclude: Vec<String>,
+        timeout: Duration,
+        consume: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Input<'static>) -> Result<T> + Send + 'static,
+    {
+        anyhow::ensure!(
+            !self.state.ended.is_cancelled(),
+            "the sandbox's bridge is gone"
+        );
+        let (read, write) = std::io::pipe()?;
+        let consuming =
+            tokio::task::spawn_blocking(move || consume(Input::Pipe(OwnedFd::from(read))));
+        let asked = self
+            .front
+            .handle()
+            .ask(
+                |id| ToFront::Get {
+                    id,
+                    dir: dir.to_string(),
+                    paths,
+                    exclude,
+                    timeout_ms: millis(timeout),
+                },
+                vec![OwnedFd::from(write)],
+                timeout + MARGIN,
+            )
+            .await;
+        let consumed = consuming
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+            .with_context(|| format!("cannot take the files of {dir}"))?;
+        match asked.with_context(|| format!("cannot take the files of {dir}"))? {
+            Reply::Done => Ok(consumed),
+            Reply::Failed { message } => {
+                Err(anyhow!("{message}")).with_context(|| format!("the sandbox cannot send {dir}"))
+            }
+            other => Err(broken(&self.front, "a get", &other)),
         }
     }
 

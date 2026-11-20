@@ -1177,3 +1177,450 @@ async fn a_late_answer_is_taken_once_and_any_other_answer_to_nothing_ends_the_fr
         }
     }
 }
+
+// ----- files and tunnels through a front --------------------------------------------------
+
+/// This process's children that are alive: fronts, readers, bridges.
+fn children() -> usize {
+    let me = std::process::id().to_string();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+        .filter(|stat| {
+            // `pid (comm) state ppid …`; the name may hold spaces, the last `)` ends it.
+            let Some(rest) = stat.rfind(')').map(|at| &stat[at + 1..]) else {
+                return false;
+            };
+            let mut fields = rest.split_whitespace();
+            let state = fields.next();
+            let ppid = fields.next();
+            ppid == Some(me.as_str()) && state != Some("Z")
+        })
+        .count()
+}
+
+fn reader() -> tinfirm_runner_host::reader::Reader {
+    tinfirm_runner_host::reader::Reader::new(BIN).allowing_unconfined(true)
+}
+
+fn limits(max_bytes: u64) -> tinfirm_bridge::files::Limits {
+    tinfirm_bridge::files::Limits {
+        max_files: 100,
+        max_bytes,
+        max_file_bytes: max_bytes,
+    }
+}
+
+/// A file of `mib` MiB, written whole (tar packs a sparse file as its holes).
+fn big_file(path: &std::path::Path, mib: usize) {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path).unwrap();
+    let chunk: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    for _ in 0..mib {
+        file.write_all(&chunk).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_go_in_and_come_back_through_a_front_and_a_readers_pipe() {
+    let _one = SERIAL.lock().await;
+    let (front, session, bridge, _, _) = connected("run-front-files").await;
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("source");
+    std::fs::create_dir_all(source.join("a/b")).unwrap();
+    std::fs::write(source.join("a/b/in.txt"), "from the host\n").unwrap();
+    big_file(&source.join("big.bin"), 64);
+    std::fs::create_dir_all(source.join(".cache")).unwrap();
+    std::fs::write(source.join(".cache/skip"), "cached").unwrap();
+    let sandbox_dir = host.path().join("sandbox/work");
+    let dir = sandbox_dir.to_str().unwrap().to_string();
+    let files = session.files();
+    files
+        .put_dir(&source, &dir, vec![".cache".into()], WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(sandbox_dir.join("a/b/in.txt")).unwrap(),
+        "from the host\n"
+    );
+    assert!(!sandbox_dir.join(".cache").exists());
+    assert_eq!(
+        std::fs::metadata(sandbox_dir.join("big.bin"))
+            .unwrap()
+            .len(),
+        64 << 20
+    );
+    // Back, through a reader whose stdin is the front's pipe.
+    let dest = host.path().join("back");
+    std::fs::create_dir_all(&dest).unwrap();
+    let into = dest.clone();
+    let unpacked = files
+        .receive(&dir, Vec::new(), vec!["a".into()], WAIT, move |input| {
+            reader().unpack_from(input, &into, &limits(80 << 20), false, WAIT)
+        })
+        .await
+        .unwrap();
+    assert_eq!(unpacked.files, 1);
+    assert_eq!(
+        std::fs::read(dest.join("big.bin")).unwrap(),
+        std::fs::read(source.join("big.bin")).unwrap()
+    );
+    let one = files
+        .receive(&dir, vec!["a/b/in.txt".into()], Vec::new(), WAIT, |input| {
+            reader().read_one_from(input, 1024, WAIT)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        one,
+        tinfirm_bridge::files::ReadOne::File(b"from the host\n".to_vec())
+    );
+    // A reader that stops early (its archive is over its bounds) fails the get with its own
+    // reason; the rest of the stream is read and dropped, and the session goes on.
+    let small = host.path().join("small");
+    std::fs::create_dir_all(&small).unwrap();
+    let refused = files
+        .receive(&dir, Vec::new(), Vec::new(), WAIT, move |input| {
+            let tight = tinfirm_bridge::files::Limits {
+                max_files: 100,
+                max_bytes: 1024,
+                max_file_bytes: 1 << 30,
+            };
+            reader().unpack_from(input, &small, &tight, false, WAIT)
+        })
+        .await;
+    assert!(refused.is_err());
+    // The reader is gone: the front is this process's one child.
+    eventually("no reader stays", || children() == 1).await;
+    let out = files
+        .exec(&["echo", "still"], &[], None, None, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(out.stdout, "still\n");
+    assert_eq!(front.handle().bridge_waiting(), (0, 0));
+    assert!(front.handle().ended().is_none());
+    assert_eq!(finish(&session, bridge).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_put_or_a_get_cut_by_the_bridge_or_the_front_leaves_nothing_in_run() {
+    let _one = SERIAL.lock().await;
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    big_file(&source.join("big.bin"), 256);
+    // What a sandbox holds: the same file, in its own directory on this machine.
+    let sandbox_dir = host.path().join("sandbox");
+    std::fs::create_dir_all(&sandbox_dir).unwrap();
+    std::fs::hard_link(source.join("big.bin"), sandbox_dir.join("big.bin")).unwrap();
+    let dir = sandbox_dir.to_str().unwrap().to_string();
+    // A first front, so that what the runtime keeps for good is there before the count.
+    let (front, session, bridge, _, _) = connected("run-front-cut-0").await;
+    assert_eq!(finish(&session, bridge).await, 0);
+    drop((session, front));
+    eventually("no child stays", || children() == 0).await;
+    let before = descriptors();
+    for (case, cut) in [
+        ("get", "bridge"),
+        ("get", "front"),
+        ("put", "bridge"),
+        ("put", "front"),
+    ] {
+        let run_id = format!("run-front-cut-{case}-{cut}");
+        let identity = Identity::generate().unwrap();
+        let ticket = "t".repeat(64);
+        let (front, registration, addr) = bridged_front(
+            &run_id,
+            Expected::Ticket(Hidden::new(ticket.clone())),
+            &identity,
+            0,
+        )
+        .await;
+        registration
+            .allow_peer(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
+        let mut bridge = bridge_process(addr, &run_id, &ticket, &identity);
+        let session = registration.connected(WAIT).await.unwrap();
+        let files = session.files();
+        let (dir, source, into) = (dir.clone(), source.clone(), host.path().join(&run_id));
+        std::fs::create_dir_all(&into).unwrap();
+        let transfer = tokio::spawn(async move {
+            match case {
+                "get" => files
+                    .receive(&dir, Vec::new(), Vec::new(), WAIT, move |input| {
+                        reader().unpack_from(input, &into, &limits(512 << 20), false, WAIT)
+                    })
+                    .await
+                    .map(drop),
+                _ => {
+                    files
+                        .put_dir(&source, &format!("{dir}-{case}"), Vec::new(), WAIT)
+                        .await
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !transfer.is_finished(),
+            "{case} {cut}: it ended before its cut"
+        );
+        match cut {
+            "bridge" => {
+                let _ = bridge.kill().await;
+            }
+            _ => tinfirm_runner_host::confine::kill_group(front.handle().pgid()),
+        }
+        let done = tokio::time::timeout(WAIT, transfer)
+            .await
+            .unwrap_or_else(|_| panic!("{case} {cut}: the transfer hung"))
+            .unwrap();
+        assert!(done.is_err(), "{case} {cut}: a cut transfer succeeded");
+        assert_eq!(front.handle().bridge_waiting().0, 0, "{case} {cut}");
+        drop(session);
+        drop(front);
+        let _ = bridge.kill().await;
+        let _ = std::fs::remove_dir_all(format!("{}-{case}", sandbox_dir.display()));
+        eventually("no reader, front or bridge stays", || children() == 0).await;
+    }
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while descriptors() > before && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        descriptors() <= before,
+        "{before} before, {} now",
+        descriptors()
+    );
+}
+
+/// A broker that refuses every destination, for an egress listener in a front.
+struct Refusing;
+
+impl tinfirm_runner_host::egress_proxy::Connector for Refusing {
+    fn connect(
+        &self,
+        _host: String,
+        _port: u16,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        tinfirm_runner_host::egress_proxy::Granted,
+                        tinfirm_runner_host::egress_proxy::Refusal,
+                    >,
+                > + Send,
+        >,
+    > {
+        Box::pin(async {
+            Err(tinfirm_runner_host::egress_proxy::Refusal {
+                status: 403,
+                message: "no\n".into(),
+                off_allowlist: true,
+            })
+        })
+    }
+}
+
+/// An answer's head, however many reads it takes.
+async fn read_head(stream: &mut TcpStream) -> String {
+    let mut out = Vec::new();
+    tokio::time::timeout(WAIT, async {
+        let mut buf = [0u8; 4096];
+        while !out.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await
+    .expect("an answer");
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_reaches_the_fronts_service_and_no_address() {
+    use tinfirm_runner_host::front::wire::Service;
+    let _one = SERIAL.lock().await;
+    let (front, mut session, bridge, _, _) = connected("run-front-tunnel").await;
+    let egress = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    front
+        .listen_egress(egress, "Basic c2VjcmV0".into(), Arc::new(Refusing))
+        .await
+        .unwrap();
+    let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    // A service the front does not serve is no tunnel.
+    let refused = session.open_tunnels(&[(any, Service::Model)], WAIT).await;
+    assert!(
+        format!("{:#}", refused.unwrap_err()).contains("does not serve"),
+        "a tunnel to no service"
+    );
+    let addrs = session
+        .open_tunnels(&[(any, Service::Egress)], WAIT)
+        .await
+        .unwrap();
+    assert_eq!(addrs.len(), 1);
+    assert_ne!(addrs[0].port(), 0);
+    let mut io = session.start(shell("echo up; sleep 30")).await.unwrap();
+    read_until(&mut io, "up").await;
+    let connect = "CONNECT example.com:443 HTTP/1.1\r\nhost: example.com:443\r\n";
+    for (auth, want) in [
+        ("", "HTTP/1.1 407"),
+        ("proxy-authorization: Basic c2VjcmV0\r\n", "HTTP/1.1 403"),
+    ] {
+        let mut stream = TcpStream::connect(addrs[0]).await.unwrap();
+        stream
+            .write_all(format!("{connect}{auth}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let answer = read_head(&mut stream).await;
+        assert!(answer.starts_with(want), "{answer}");
+    }
+    session.stop(Duration::from_secs(1)).await.unwrap();
+    let _ = drain(&mut io).await;
+    let code = finish(&session, bridge).await;
+    assert_ne!(code, sandbox::EXIT_HOST_GONE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_not_asked_for_and_streams_past_the_bound_are_refused() {
+    use tinfirm_bridge::control::Tunnel;
+    use tinfirm_bridge::tunnel::MAX_STREAMS;
+    use tinfirm_runner_host::front::wire::Service;
+    let _one = SERIAL.lock().await;
+    let identity = Identity::generate().unwrap();
+    let ticket = "t".repeat(64);
+    let (front, registration, addr) = bridged_front(
+        "run-front-streams",
+        Expected::Ticket(Hidden::new(ticket.clone())),
+        &identity,
+        0,
+    )
+    .await;
+    registration
+        .allow_peer(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .await
+        .unwrap();
+    front
+        .listen_egress(
+            TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            "Basic c2VjcmV0".into(),
+            Arc::new(Refusing),
+        )
+        .await
+        .unwrap();
+    // A sandbox that speaks the bridge's frames itself.
+    let tls = hostile_connect(addr, &identity).await;
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    let payload =
+        serde_json::to_vec(&hello("run-front-streams", Some(&ticket), None, Some(0))).unwrap();
+    writer
+        .write_all(&Frame::new(Kind::Control, frame::STREAM_CONTROL, 0, payload).encode())
+        .await
+        .unwrap();
+    let welcome = frame::read_frame(&mut reader).await.unwrap().unwrap();
+    assert!(matches!(
+        serde_json::from_slice::<Control>(&welcome.payload).unwrap(),
+        Control::Welcome { .. }
+    ));
+    let mut session = registration.connected(WAIT).await.unwrap();
+    let mut seq = 0u64;
+
+    let listen: SocketAddr = "127.0.0.1:4100".parse().unwrap();
+    let asking = tokio::spawn(async move {
+        let addrs = session
+            .open_tunnels(&[(listen, Service::Egress)], WAIT)
+            .await;
+        (session, addrs)
+    });
+    // The front's controls, until the tunnels are asked.
+    let next_control = |frame: Frame| -> Option<Control> {
+        (frame.kind == Kind::Control && frame.seq > 0)
+            .then(|| serde_json::from_slice(&frame.payload).ok())
+            .flatten()
+    };
+    let id = loop {
+        let frame = tokio::time::timeout(WAIT, frame::read_frame(&mut reader))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Some(Control::Tunnels { id, .. }) = next_control(frame) {
+            break id;
+        }
+    };
+    writer
+        .write_all(&control(
+            &mut seq,
+            &Control::Listening {
+                id,
+                tunnels: vec![Tunnel {
+                    id: 1,
+                    addr: listen.to_string(),
+                }],
+            },
+        ))
+        .await
+        .unwrap();
+    let (_session, addrs) = asking.await.unwrap();
+    assert_eq!(addrs.unwrap(), [listen]);
+    // A stream on a tunnel that was not asked for, then one more stream than the bound.
+    let first = frame::STREAM_DYNAMIC;
+    writer
+        .write_all(&control(
+            &mut seq,
+            &Control::Open {
+                stream: first,
+                tunnel: 9,
+            },
+        ))
+        .await
+        .unwrap();
+    for n in 1..=MAX_STREAMS as u32 + 1 {
+        writer
+            .write_all(&control(
+                &mut seq,
+                &Control::Open {
+                    stream: first + n,
+                    tunnel: 1,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    // TLS holds what was written until it is flushed.
+    writer.flush().await.unwrap();
+    let past = first + MAX_STREAMS as u32 + 1;
+    let mut reset = Vec::new();
+    while !(reset.contains(&first) && reset.contains(&past)) {
+        let frame = tokio::time::timeout(WAIT, frame::read_frame(&mut reader))
+            .await
+            .expect("the front resets the streams it does not take")
+            .unwrap()
+            .expect("the front keeps the connection");
+        if let Some(Control::Reset { stream }) = next_control(frame) {
+            reset.push(stream);
+        }
+    }
+    // The streams within the bound reached the egress service and stay open.
+    assert_eq!(reset.len(), 2, "{reset:?}");
+    assert!(front.handle().ended().is_none());
+}
+
+/// A frame of the sandbox's, numbered after `seq`.
+fn numbered(seq: &mut u64, kind: Kind, stream: u32, payload: Vec<u8>) -> Vec<u8> {
+    *seq += 1;
+    Frame::new(kind, stream, *seq, payload).encode()
+}
+
+/// A control message of the sandbox's, numbered after `seq`.
+fn control(seq: &mut u64, control: &Control) -> Vec<u8> {
+    numbered(
+        seq,
+        Kind::Control,
+        frame::STREAM_CONTROL,
+        serde_json::to_vec(control).unwrap(),
+    )
+}

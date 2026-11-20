@@ -22,7 +22,10 @@
 //! way; and the sandbox's bridge ([`ToFront::BridgeInit`]): each connection's `hello`, which
 //! `run` decides ([`ToMain::Hello`], [`ToFront::Admit`]), the adapter's start with its stdio on
 //! three sockets, its signals and stop, the reclaim, the close, the host's commands and the
-//! network probe, and the ends of the adapter and of the session. The files' messages follow.
+//! network probe, and the ends of the adapter and of the session; the sandbox's files, which go
+//! in on a socket of their own ([`ToFront::Put`]) and come out on a pipe that is a reader's
+//! stdin in `run` ([`ToFront::Get`]); and the tunnels, each to a service of the front
+//! ([`ToFront::OpenTunnels`]).
 //!
 //! Every message from a front is at most [`MAX_TO_MAIN`] bytes but a command's end, which
 //! holds its two outputs in base64 and may take [`MAX_EXEC_FRAME`].
@@ -179,6 +182,31 @@ pub enum ToFront {
     Exec {
         exec: tinfirm_bridge::control::Exec,
     },
+    /// With a descriptor, one end of a socket pair on which `run` writes a tar archive of its
+    /// own: into the sandbox's directory `dir` ([`Reply::Done`] once it is unpacked).
+    Put {
+        id: u64,
+        dir: String,
+        timeout_ms: u64,
+    },
+    /// With a descriptor, the writing end of a pipe whose reading end is a reader's stdin in
+    /// `run`: the sandbox's `paths` of `dir` (all when empty), without `exclude`, as a tar
+    /// archive, written on it ([`Reply::Done`] once it went whole).
+    Get {
+        id: u64,
+        dir: String,
+        paths: Vec<String>,
+        exclude: Vec<String>,
+        timeout_ms: u64,
+    },
+    /// Before the start: the sandbox listens on each tunnel's address, and the connections it
+    /// gets there go to the front's service the tunnel names, never to an address
+    /// ([`Reply::Listening`]).
+    OpenTunnels {
+        id: u64,
+        tunnels: Vec<WireTunnel>,
+        timeout_ms: u64,
+    },
     /// Probe the sandbox's network from inside ([`Reply::Probed`]).
     Probe {
         id: u64,
@@ -186,6 +214,18 @@ pub enum ToFront {
         timeout_ms: u64,
     },
 }
+
+/// A tunnel: where the sandbox listens, and the front's service its connections reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WireTunnel {
+    pub listen: std::net::SocketAddr,
+    pub service: Service,
+}
+
+/// The longest path of the sandbox's a `put` or a `get` names, and the most paths of a `get`.
+pub const MAX_FILES_PATH: usize = 4096;
+pub const MAX_FILES_PATHS: usize = 1024;
 
 /// A bridge's TLS identity on the wire: its certificate and its PKCS #8 key, DER in base64.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +401,10 @@ pub enum Reply {
         stdout: String,
         stderr: String,
     },
+    /// The addresses the sandbox listens on for its tunnels, in the order asked.
+    Listening {
+        addrs: Vec<std::net::SocketAddr>,
+    },
     /// The names of the checks that got through.
     Probed {
         open: Vec<String>,
@@ -452,7 +496,9 @@ impl ToFront {
             | ToFront::ListenModel { .. }
             | ToFront::ListenGit { .. }
             | ToFront::Body { .. }
-            | ToFront::Dialed {} => 1,
+            | ToFront::Dialed {}
+            | ToFront::Put { .. }
+            | ToFront::Get { .. } => 1,
             ToFront::BridgeInit { listen, .. } => usize::from(*listen),
             ToFront::Start { .. } => 3,
             _ => 0,
@@ -520,6 +566,31 @@ impl ToFront {
                 Err(format!("a refusal's message over {MAX_TEXT} bytes"))
             }
             ToFront::Start { start, .. } => start.check(),
+            ToFront::Put { dir, .. } if dir.len() > MAX_FILES_PATH => {
+                Err("a put's directory out of bounds".into())
+            }
+            ToFront::Get {
+                dir,
+                paths,
+                exclude,
+                ..
+            } => {
+                let fits = |p: &String| p.len() <= MAX_FILES_PATH;
+                if !fits(dir)
+                    || paths.len() > MAX_FILES_PATHS
+                    || exclude.len() > MAX_FILES_PATHS
+                    || !paths.iter().all(fits)
+                    || !exclude.iter().all(fits)
+                {
+                    return Err("a get's paths out of bounds".into());
+                }
+                Ok(())
+            }
+            ToFront::OpenTunnels { tunnels, .. }
+                if tunnels.len() > tinfirm_bridge::tunnel::MAX_TUNNELS =>
+            {
+                Err("too many tunnels".into())
+            }
             ToFront::Response { head, .. } => {
                 if !(100..=599).contains(&head.status) {
                     return Err(format!("an answer with the status {}", head.status));
@@ -638,6 +709,9 @@ impl ToMain {
                     if stdout.len() > MAX_EXEC_OUTPUT_B64 || stderr.len() > MAX_EXEC_OUTPUT_B64 =>
                 {
                     Err("a command's output over its bound".into())
+                }
+                Reply::Listening { addrs } if addrs.len() > tinfirm_bridge::tunnel::MAX_TUNNELS => {
+                    Err("too many tunnels".into())
                 }
                 Reply::Probed { open }
                     if open.len() > MAX_PROBED || open.iter().any(|n| n.len() > MAX_PROBE_NAME) =>
@@ -1052,6 +1126,55 @@ mod tests {
             timing.host_timing().handshake,
             std::time::Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn the_files_and_tunnels_messages_keep_their_bounds() {
+        let get = |dir: usize, paths: usize| ToFront::Get {
+            id: 1,
+            dir: "d".repeat(dir),
+            paths: vec!["p".into(); paths],
+            exclude: Vec::new(),
+            timeout_ms: 1,
+        };
+        assert!(get(10, 10).check().is_ok());
+        assert_eq!(get(10, 10).descriptors(), 1);
+        assert!(get(MAX_FILES_PATH + 1, 0).check().is_err());
+        assert!(get(1, MAX_FILES_PATHS + 1).check().is_err());
+        let put = |dir: usize| ToFront::Put {
+            id: 1,
+            dir: "d".repeat(dir),
+            timeout_ms: 1,
+        };
+        assert_eq!(put(1).descriptors(), 1);
+        assert!(put(MAX_FILES_PATH + 1).check().is_err());
+        let tunnel = WireTunnel {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            service: Service::Egress,
+        };
+        let tunnels = |n: usize| ToFront::OpenTunnels {
+            id: 1,
+            tunnels: vec![tunnel; n],
+            timeout_ms: 1,
+        };
+        assert!(tunnels(tinfirm_bridge::tunnel::MAX_TUNNELS).check().is_ok());
+        assert!(
+            tunnels(tinfirm_bridge::tunnel::MAX_TUNNELS + 1)
+                .check()
+                .is_err()
+        );
+        let listening = |n: usize| ToMain::Answer {
+            id: 1,
+            reply: Reply::Listening {
+                addrs: vec![tunnel.listen; n],
+            },
+        };
+        let decode = |message: &ToMain| decode_to_main(&serde_json::to_vec(message).unwrap());
+        assert!(decode(&listening(2)).is_ok());
+        assert!(matches!(
+            decode(&listening(tinfirm_bridge::tunnel::MAX_TUNNELS + 1)),
+            Err(WireError::OutOfBounds(_))
+        ));
     }
 
     #[test]

@@ -902,6 +902,102 @@ impl SandboxFiles {
         Ok(())
     }
 
+    /// Sends the tar archive that `archive` gives into the sandbox's directory `dir`, and
+    /// waits for the sandbox to have unpacked it, all within `timeout`. The bytes are carried
+    /// at the stream's pace: an archive that comes slowly holds only this stream back.
+    pub async fn put_from<R>(&self, dir: &str, archive: R, timeout: Duration) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let opened = self.state.stream()?;
+        let stream = opened.id();
+        let (id, answer) = self.state.pending();
+        let put = Control::Put {
+            id,
+            stream,
+            dir: dir.to_string(),
+        };
+        if let Err(e) = self.state.send(id, &put).await {
+            self.state.streams.abort(stream);
+            return Err(e);
+        }
+        self.state
+            .streams
+            .run_io(opened, archive, tokio::io::sink());
+        match self.state.answer(id, answer, timeout).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.state.streams.abort(stream);
+                Err(e).with_context(|| format!("the sandbox cannot unpack {dir}"))
+            }
+        }
+    }
+
+    /// Asks the sandbox for `paths` of its directory `dir` (all of it when empty), without
+    /// `exclude`, as a tar archive, and writes it into `into` as it comes, all within
+    /// `timeout`. `Ok` only when the sandbox said it sent the archive and the archive's end
+    /// reached `into`, which is then shut down; a stream cut short drops `into` unshut.
+    pub async fn get_into<W>(
+        &self,
+        dir: &str,
+        paths: Vec<String>,
+        exclude: Vec<String>,
+        into: W,
+        timeout: Duration,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let opened = self.state.stream()?;
+        let stream = opened.id();
+        let (id, answer) = self.state.pending();
+        let get = Control::Get {
+            id,
+            stream,
+            dir: dir.to_string(),
+            paths,
+            exclude,
+        };
+        if let Err(e) = self.state.send(id, &get).await {
+            self.state.streams.abort(stream);
+            return Err(e);
+        }
+        let (whole_tx, whole) = oneshot::channel();
+        self.state.streams.run_io(
+            opened,
+            tokio::io::empty(),
+            ShutdownSays {
+                inner: into,
+                whole: Some(whole_tx),
+            },
+        );
+        let got = tokio::time::timeout(timeout, async {
+            self.state
+                .answer(id, answer, timeout)
+                .await
+                .with_context(|| format!("the sandbox cannot send {dir}"))?;
+            whole
+                .await
+                .map_err(|_| anyhow!("the files of {dir} were cut off"))
+        })
+        .await;
+        match got {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.state.streams.abort(stream);
+                Err(e)
+            }
+            Err(_) => {
+                self.state.streams.abort(stream);
+                lock(&self.state.waiters).remove(&id);
+                bail!(
+                    "the files of {dir} did not arrive within {} s",
+                    timeout.as_secs()
+                )
+            }
+        }
+    }
+
     /// Unpacks `paths` of the sandbox's directory `dir` (all of it when empty), without
     /// `exclude`, into `dest`: directories and regular files only, within `limits`
     /// ([`files::unpack_untrusted`]), in this process.
@@ -1080,6 +1176,42 @@ impl SandboxFiles {
             }),
             _ => bail!("the sandbox answered a command with something else"),
         }
+    }
+}
+
+/// A writer that says when it was shut down whole: the end of a stream that reached it.
+struct ShutdownSays<W> {
+    inner: W,
+    whole: Option<oneshot::Sender<()>>,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ShutdownSays<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
+        if let std::task::Poll::Ready(Ok(())) = polled
+            && let Some(whole) = self.whole.take()
+        {
+            let _ = whole.send(());
+        }
+        polled
     }
 }
 

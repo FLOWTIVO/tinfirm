@@ -606,6 +606,7 @@ pub fn serve(status: Status) -> ExitCode {
         }));
         let mut model = false;
         let mut bridge: Option<Arc<super::bridge::FrontBridge>> = None;
+        let services: super::bridge::Services = Default::default();
         let mut git: Option<Arc<crate::git_proxy::FrontRoutes>> = None;
         let egress_shutdown = tokio_util::sync::CancellationToken::new();
         let model_shutdown = tokio_util::sync::CancellationToken::new();
@@ -651,10 +652,13 @@ pub fn serve(status: Status) -> ExitCode {
                     });
                     egress = Some(connector.clone());
                     let half = FrontHalf::new(authorization, connector, egress_shutdown.clone());
-                    tokio::spawn(crate::egress_proxy::serve(
-                        crate::front::conn::Acceptor::listener(listener, false),
-                        half,
-                    ));
+                    let (acceptor, handoff) =
+                        crate::front::conn::Acceptor::new(Some(listener), false);
+                    services
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(Service::Egress, handoff);
+                    tokio::spawn(crate::egress_proxy::serve(acceptor, half));
                     continue;
                 }
                 ToFront::Connected { req } => {
@@ -705,10 +709,13 @@ pub fn serve(status: Status) -> ExitCode {
                         Arc::new(ServiceWire::new(&requests, Service::Model)),
                         model_shutdown.clone(),
                     );
-                    tokio::spawn(crate::model_proxy::serve(
-                        crate::front::conn::Acceptor::listener(listener, true),
-                        half,
-                    ));
+                    let (acceptor, handoff) =
+                        crate::front::conn::Acceptor::new(Some(listener), true);
+                    services
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(Service::Model, handoff);
+                    tokio::spawn(crate::model_proxy::serve(acceptor, half));
                     continue;
                 }
                 ToFront::ListenGit { .. } if git.is_some() => {
@@ -726,8 +733,14 @@ pub fn serve(status: Status) -> ExitCode {
                     };
                     let routes = Arc::new(crate::git_proxy::FrontRoutes::default());
                     git = Some(routes.clone());
+                    let (acceptor, handoff) =
+                        crate::front::conn::Acceptor::new(Some(listener), true);
+                    services
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(Service::Git, handoff);
                     tokio::spawn(crate::git_proxy::serve_in_front(
-                        crate::front::conn::Acceptor::listener(listener, true),
+                        acceptor,
                         routes,
                         Arc::new(ServiceWire::new(&requests, Service::Git)),
                         limits,
@@ -743,6 +756,10 @@ pub fn serve(status: Status) -> ExitCode {
                     continue;
                 }
                 ToFront::Unlisten { service } => {
+                    services
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&service);
                     match service {
                         Service::Egress => egress_shutdown.cancel(),
                         Service::Model => model_shutdown.cancel(),
@@ -775,6 +792,7 @@ pub fn serve(status: Status) -> ExitCode {
                         listen.then(|| descriptors.pop().expect("taken with the message"));
                     match super::bridge::FrontBridge::start(
                         writer.clone(),
+                        services.clone(),
                         &identity,
                         &timing,
                         listener,
@@ -854,6 +872,55 @@ pub fn serve(status: Status) -> ExitCode {
                         return refuse("a command for no bridge");
                     };
                     bridge.exec(exec);
+                    continue;
+                }
+                ToFront::Put {
+                    id,
+                    dir,
+                    timeout_ms,
+                } => {
+                    let socket = descriptors.pop().expect("taken with the message");
+                    let Some(bridge) = &bridge else {
+                        return refuse("a put for no bridge");
+                    };
+                    bridge.put(
+                        id,
+                        dir,
+                        socket,
+                        std::time::Duration::from_millis(timeout_ms),
+                    );
+                    continue;
+                }
+                ToFront::Get {
+                    id,
+                    dir,
+                    paths,
+                    exclude,
+                    timeout_ms,
+                } => {
+                    let pipe = descriptors.pop().expect("taken with the message");
+                    let Some(bridge) = &bridge else {
+                        return refuse("a get for no bridge");
+                    };
+                    bridge.get(
+                        id,
+                        dir,
+                        paths,
+                        exclude,
+                        pipe,
+                        std::time::Duration::from_millis(timeout_ms),
+                    );
+                    continue;
+                }
+                ToFront::OpenTunnels {
+                    id,
+                    tunnels,
+                    timeout_ms,
+                } => {
+                    let Some(bridge) = &bridge else {
+                        return refuse("tunnels for no bridge");
+                    };
+                    bridge.open_tunnels(id, tunnels, std::time::Duration::from_millis(timeout_ms));
                     continue;
                 }
                 ToFront::Probe {
