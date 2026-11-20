@@ -59,10 +59,11 @@ libc = "0.2"
 # The reader's confinement (ADR-0112, open question 1; runner/README.md, "The reader"), Linux
 # only: Landlock for the file system, the network and the scopes, a seccomp filter, and the
 # prctl calls (`PR_SET_DUMPABLE`) and process-group signals that the workspace's `unsafe_code`
-# rule keeps out of our own code. rustix is already in the binary (through tar's xattr).
+# rule keeps out of our own code. rustix is already in the binary (through tar's xattr). Its
+# `net` feature sends descriptors to a front process (`SCM_RIGHTS`); it adds no crate.
 landlock = "0.4.7"
 seccompiler = "0.5.0"
-rustix = { version = "1.1.5", default-features = false, features = ["std", "process"] }
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "net"] }
 
 jsonschema = { version = "0.61", default-features = false }
 tempfile = "3.27"

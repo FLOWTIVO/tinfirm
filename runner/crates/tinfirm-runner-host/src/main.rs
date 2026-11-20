@@ -2424,10 +2424,25 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths) {
         Err(e) => Err(anyhow::Error::from(e)),
     };
     const UNUSED: &str = "the front process of a sandbox; `run` does not start it yet";
+    // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed.
+    let wire = async {
+        let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
+        let front =
+            tinfirm_runner_host::front::handle::FrontHandle::spawn(&command, uuid::Uuid::new_v4())
+                .await?;
+        front.ping().await?;
+        front.check_descriptor().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    let wire = match wire {
+        Ok(()) => "its wire to `run` works: ready, a round trip, a descriptor passed".to_string(),
+        Err(e) => format!("its wire to `run` failed: {e:#}"),
+    };
     match probe {
         Ok(probe) if probe.confined() => checks.ok(
             "front",
-            format!("confined: {} ({UNUSED})", probe.describe()),
+            format!("confined: {}; {wire} ({UNUSED})", probe.describe()),
         ),
         Ok(probe) => checks.info(
             "front",

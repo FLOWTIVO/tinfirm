@@ -110,16 +110,20 @@ fn a_front_reads_no_file_of_the_host_reaches_no_other_process_and_starts_nothing
 }
 
 #[test]
-fn a_front_without_its_probe_serves_nothing_yet() {
+fn a_front_whose_stdin_is_not_its_channel_serves_nothing() {
     let out = Command::new(BIN)
         .arg(front::SUBCOMMAND)
         .env_clear()
+        .stdin(Stdio::null())
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     let message = String::from_utf8_lossy(&out.stderr);
-    assert!(message.contains("only runs its probe"), "{message}");
+    assert!(
+        message.contains("stdin must be the control channel"),
+        "{message}"
+    );
     let out = Command::new(BIN)
         .args([
             front::SUBCOMMAND,
@@ -131,6 +135,340 @@ fn a_front_without_its_probe_serves_nothing_yet() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
+}
+
+// ----- the wire between `run` and a front (slice 2) -----------------------------------------
+
+use front::handle::{Ended, FrontCommand, FrontHandle};
+use front::wire::{self, ToFront, ToMain};
+
+/// The real front: this binary's `front`.
+fn the_front() -> FrontCommand {
+    FrontCommand {
+        program: PathBuf::from(BIN),
+        args: vec![front::SUBCOMMAND.to_string()],
+        env: Vec::new(),
+    }
+}
+
+/// Where [`hostile_front`] tells [`hostile_front_child`] what to do.
+const HOSTILE: &str = "TINFIRM_TEST_HOSTILE_FRONT";
+/// The file whose descriptor the hostile front sends towards `run`.
+const HOSTILE_FILE: &str = "TINFIRM_TEST_HOSTILE_FILE";
+
+/// A fake front that breaks the wire in the way `mode` names: this test binary, started again.
+fn hostile_front(mode: &str, extra: &[(&str, &str)]) -> FrontCommand {
+    let mut env = vec![(HOSTILE.to_string(), mode.to_string())];
+    env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    FrontCommand {
+        program: std::env::current_exe().unwrap(),
+        args: ["hostile_front_child", "--exact", "--ignored", "--nocapture"]
+            .map(String::from)
+            .to_vec(),
+        env,
+    }
+}
+
+/// A seeded xorshift, as the bridge's hostile peers use.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+/// The hostile fake front: what [`HOSTILE`] says, on its stdin, the control channel. Run only
+/// by the tests that start it.
+#[test]
+#[ignore = "the hostile fake front of the wire tests, which start it"]
+fn hostile_front_child() {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let Ok(mode) = std::env::var(HOSTILE) else {
+        return;
+    };
+    let socket = std::io::stdin().as_fd().try_clone_to_owned().unwrap();
+    let mut out = std::fs::File::from(socket.try_clone().unwrap());
+    let ready = || ToMain::Ready {
+        status: tinfirm_runner_host::confine::Status::none("a hostile fake front"),
+    };
+    let frame = |message: &ToMain| wire::encode(message, wire::MAX_TO_MAIN).unwrap();
+    // Reads `run`'s next frame (the tests' fronts answer pings in order).
+    let mut input = std::fs::File::from(socket.try_clone().unwrap());
+    let mut next_ping = move || -> Option<u64> {
+        use std::io::Read;
+        loop {
+            let mut header = [0u8; 4];
+            input.read_exact(&mut header).ok()?;
+            let mut payload = vec![0u8; u32::from_be_bytes(header) as usize];
+            input.read_exact(&mut payload).ok()?;
+            if let ToFront::Ping { id } = wire::decode_to_front(&payload).ok()? {
+                return Some(id);
+            }
+        }
+    };
+    let mut rng = Rng(0x5eed_f00d_cafe_1234);
+    match mode.as_str() {
+        "garbage" => loop {
+            let bytes: Vec<u8> = (0..4096).map(|_| rng.next() as u8).collect();
+            if out.write_all(&bytes).is_err() {
+                return;
+            }
+        },
+        "huge" => {
+            let _ = out.write_all(&0x7fff_ffffu32.to_be_bytes());
+            let _ = out.write_all(&[b'{'; 1024]);
+        }
+        "empty" => {
+            let _ = out.write_all(&[0, 0, 0, 0]);
+        }
+        "unknown-field" => {
+            let mut payload = serde_json::to_value(ready()).unwrap();
+            payload["shell"] = serde_json::json!("sh");
+            let payload = serde_json::to_vec(&payload).unwrap();
+            let _ = out.write_all(&(payload.len() as u32).to_be_bytes());
+            let _ = out.write_all(&payload);
+        }
+        "not-json" => {
+            let payload = b"\xff\xfenot json at all";
+            let _ = out.write_all(&(payload.len() as u32).to_be_bytes());
+            let _ = out.write_all(payload);
+        }
+        "second-ready" => {
+            let _ = out.write_all(&frame(&ready()));
+            let _ = out.write_all(&frame(&ready()));
+        }
+        "unasked-pong" => {
+            let _ = out.write_all(&frame(&ready()));
+            let _ = out.write_all(&frame(&ToMain::Pong { id: 999 }));
+        }
+        "flood" => {
+            let _ = out.write_all(&frame(&ready()));
+            for id in 1_000.. {
+                if out.write_all(&frame(&ToMain::Pong { id })).is_err() {
+                    return;
+                }
+            }
+        }
+        "random-frames" => {
+            let _ = out.write_all(&frame(&ready()));
+            loop {
+                let length = (rng.next() % 2048) as usize + 1;
+                let mut bytes = (length as u32).to_be_bytes().to_vec();
+                bytes.extend(
+                    (0..length).map(|_| b"{}\"type:pongid,0123456789 "[rng.next() as usize % 25]),
+                );
+                if out.write_all(&bytes).is_err() {
+                    return;
+                }
+            }
+        }
+        "descriptors" => {
+            // Every frame it sends carries a descriptor of a file `run` must never get.
+            let file = std::fs::File::open(std::env::var(HOSTILE_FILE).unwrap()).unwrap();
+            let fd = std::os::fd::OwnedFd::from(file);
+            wire::send_frame(socket.as_fd(), &frame(&ready()), Some(&fd)).unwrap();
+            while let Some(id) = next_ping() {
+                wire::send_frame(socket.as_fd(), &frame(&ToMain::Pong { id }), Some(&fd)).unwrap();
+            }
+        }
+        "silent" => std::thread::sleep(Duration::from_secs(60)),
+        "early-exit" => {
+            eprintln!("boom before ready");
+            std::process::exit(7);
+        }
+        "crash-later" => {
+            let _ = out.write_all(&frame(&ready()));
+            if let Some(id) = next_ping() {
+                let _ = out.write_all(&frame(&ToMain::Pong { id }));
+                eprintln!("crashed after a pong");
+                std::process::exit(9);
+            }
+        }
+        other => panic!("unknown mode {other}"),
+    }
+    // Stay, as a front that broke the wire and goes on: `run` must end it.
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+fn alive(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        !stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('Z')
+    })
+}
+
+/// Waits until `pid` is gone (or a zombie).
+async fn gone(pid: u32) -> bool {
+    for _ in 0..100 {
+        if !alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_front_says_it_is_ready_answers_takes_a_descriptor_and_goes_with_its_handle() {
+    let handle = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(handle.status().seccomp, "{:?}", handle.status());
+    assert!(handle.status().not_dumpable, "{:?}", handle.status());
+    for _ in 0..3 {
+        handle.ping().await.unwrap();
+    }
+    handle.check_descriptor().await.unwrap();
+    handle.check_descriptor().await.unwrap();
+    assert_eq!(handle.ended(), None);
+    let pid = handle.pgid();
+    assert!(alive(pid));
+    // A message without the descriptor it carries is refused before it goes.
+    assert!(handle.send(&ToFront::Check { id: 99 }, None).await.is_err());
+    drop(handle);
+    assert!(gone(pid).await, "the front outlived its handle");
+}
+
+#[test]
+fn a_front_exits_when_its_channel_closes() {
+    use std::io::Read;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut child = Command::new(BIN)
+        .arg(front::SUBCOMMAND)
+        .env_clear()
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut header = [0u8; 4];
+    (&ours).read_exact(&mut header).unwrap();
+    let mut payload = vec![0u8; u32::from_be_bytes(header) as usize];
+    (&ours).read_exact(&mut payload).unwrap();
+    assert!(matches!(
+        wire::decode_to_main(&payload).unwrap(),
+        ToMain::Ready { .. }
+    ));
+    drop(ours);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+}
+
+/// The descriptors of this process that point at `path`.
+fn descriptors_of(path: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| std::fs::read_link(e.path()).is_ok_and(|target| target == path))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_front_ends_only_its_own_handle_and_run_gets_no_descriptor_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let canary = dir.path().join("canary");
+    std::fs::write(&canary, "a file only a hostile front opened").unwrap();
+    let canary_path = canary.to_string_lossy().into_owned();
+    // A real front beside the hostile ones, which must go on as if nothing happened.
+    let honest = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    for mode in [
+        "garbage",
+        "huge",
+        "empty",
+        "unknown-field",
+        "not-json",
+        "second-ready",
+        "unasked-pong",
+        "flood",
+        "random-frames",
+    ] {
+        // Those that break the wire before `ready` fail the start; the others end the handle.
+        let ended = match FrontHandle::spawn(&hostile_front(mode, &[]), uuid::Uuid::new_v4()).await
+        {
+            Err(e) => {
+                let e = format!("{e:#}");
+                assert!(
+                    e.contains("broke its wire") || e.contains("not `ready`"),
+                    "{mode}: {e}"
+                );
+                continue;
+            }
+            Ok(handle) => {
+                let pid = handle.pgid();
+                let ended = tokio::time::timeout(Duration::from_secs(10), handle.wait_ended())
+                    .await
+                    .unwrap_or_else(|_| panic!("{mode}: the handle did not end the front"));
+                assert!(handle.ping().await.is_err(), "{mode}");
+                assert!(gone(pid).await, "{mode}: the front was not ended");
+                ended
+            }
+        };
+        assert!(matches!(ended, Ended::Broken(_)), "{mode}: {ended:?}");
+    }
+    // A front that sends descriptors along: `run` never holds one, and the wire goes on.
+    let handle = FrontHandle::spawn(
+        &hostile_front("descriptors", &[(HOSTILE_FILE, canary_path.as_str())]),
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        handle.ping().await.unwrap();
+    }
+    assert_eq!(
+        descriptors_of(&canary),
+        0,
+        "run holds a descriptor a front sent"
+    );
+    drop(handle);
+    // A front that never says it is ready, or exits first, fails its start, with its words.
+    let started = std::time::Instant::now();
+    let error = FrontHandle::spawn(&hostile_front("silent", &[]), uuid::Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not ready within"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+    let error = FrontHandle::spawn(&hostile_front("early-exit", &[]), uuid::Uuid::new_v4())
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("boom before ready"),
+        "{error:#}"
+    );
+    // A front that crashes later: its handle says how, with its stderr.
+    let handle = FrontHandle::spawn(&hostile_front("crash-later", &[]), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    let _ = handle.ping().await;
+    let ended = tokio::time::timeout(Duration::from_secs(10), handle.wait_ended())
+        .await
+        .unwrap();
+    match &ended {
+        Ended::Exited { code, stderr, .. } => {
+            assert_eq!(*code, Some(9), "{ended:?}");
+            assert!(stderr.contains("crashed after a pong"), "{ended:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(ended.to_string().contains("exited with code 9"), "{ended}");
+    // The honest front was touched by none of it.
+    honest.ping().await.unwrap();
+    honest.check_descriptor().await.unwrap();
+    assert_eq!(honest.ended(), None);
 }
 
 /// Where [`front_without_landlock`] hands the probe's job to [`launch_front_without_landlock`].
@@ -213,4 +551,46 @@ fn without_landlock_the_fronts_seccomp_filter_still_refuses_sockets_signals_and_
     assert!(!probe.spawn && !probe.exec, "{probe:?}");
     assert!(probe.own_group && probe.runtime, "{probe:?}");
     ended(bystander);
+}
+
+/// The plan's 2.8, as far as this slice makes it measurable: a front's start (to `ready`), its
+/// memory while idle, a round trip and a descriptor passed.
+/// `cargo test --release -p tinfirm-runner-host --test front measure -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement, run by hand in release"]
+async fn measure_the_wire() {
+    let mut starts = Vec::new();
+    for _ in 0..20 {
+        let started = std::time::Instant::now();
+        let front = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        starts.push(started.elapsed());
+        drop(front);
+    }
+    starts.sort();
+    let front = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    let rss = std::fs::read_to_string(format!("/proc/{}/status", front.pgid()))
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))
+        .unwrap()
+        .to_string();
+    let started = std::time::Instant::now();
+    for _ in 0..10_000 {
+        front.ping().await.unwrap();
+    }
+    let ping = started.elapsed() / 10_000;
+    let started = std::time::Instant::now();
+    for _ in 0..1_000 {
+        front.check_descriptor().await.unwrap();
+    }
+    let check = started.elapsed() / 1_000;
+    println!(
+        "start to ready: median {:?}, slowest {:?}; idle {rss}; round trip {ping:?}; descriptor passed and answered {check:?}",
+        starts[starts.len() / 2],
+        starts[starts.len() - 1]
+    );
 }

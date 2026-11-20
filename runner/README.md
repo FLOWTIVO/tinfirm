@@ -796,6 +796,19 @@ not run by hand; `reader.rs`, `confine.rs`).
   (threads only), no `connect`, `bind` or `listen`, and no signal outside its own process group,
   the signal 0 included. A pair of Unix sockets stays allowed, which reaches no other process.
   `doctor` starts one and says `front: confined: …`, or why not, as a note.
+  - **Its wire to `run`.** A front's stdin is one end of a pair of Unix sockets, its control
+    channel; `run` holds the other. Each message is its length in 4 bytes, then JSON of one of a
+    closed set of messages with no unknown field: at most 64 KiB from a front, 1 MiB from `run`.
+    The front says it is ready, with its confinement, then answers `run`'s messages in order,
+    and exits when `run` closes its end, so it ends with `run` even after `kill -9`.
+    Descriptors go one way only: `run` sends them with `SCM_RIGHTS`, and reads its end with
+    plain reads, so a descriptor that a front sends back is closed by the kernel. A front that
+    sends anything else (a frame over its bound, bytes that are not one of the messages, a
+    second `ready`, an answer to nothing `run` asked) is ended at once, its process group
+    killed, and only its own handle says why; every other front goes on. A front that is not
+    ready within 10 s, or exits, is reported with its exit status and the start of its stderr.
+    `doctor` also tries the wire: "its wire to `run` works: ready, a round trip, a descriptor
+    passed".
 
 ## A VM per run
 

@@ -4,10 +4,12 @@
 //! tools) out of `run`, which holds the credentials. `run` is to start one per sandbox and to
 //! talk with it over typed, bounded messages; it attaches every credential itself.
 //!
-//! This version builds the front's confinement and its probe, nothing more: `run` starts no
-//! front yet. `front --probe JOB` confines itself as a front does
+//! This version builds the front's confinement, its probe and the wire to `run`; `run` starts
+//! no front for a sandbox yet. `front --probe JOB` confines itself as a front does
 //! ([`crate::confine::Profile::Front`]) and then tries what a front must be refused, and answers
-//! one line of JSON on stdout ([`Probe`]). `doctor` runs it ([`probe`]).
+//! one line of JSON on stdout ([`Probe`]). `doctor` runs it ([`probe`]). `front` alone serves
+//! the control channel on its stdin ([`wire`]): it says it is ready, answers a round trip and
+//! takes a descriptor; `run`'s side of it is [`handle::FrontHandle`].
 //!
 //! What a front applies to itself, before it builds any runtime or reads a byte:
 //! - resource limits: 512 MiB of data, 1024 descriptors, no core file;
@@ -36,6 +38,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::confine::{self, Plan, Status};
+
+pub mod handle;
+mod serve;
+pub mod wire;
 
 /// The hidden subcommand that starts a front.
 pub const SUBCOMMAND: &str = "front";
@@ -144,9 +150,7 @@ pub fn child_main(probe: Option<&str>) -> ExitCode {
     let job = match job {
         Some(Ok(job)) => job,
         Some(Err(e)) => return fail(&format!("the probe's job is not valid: {e}")),
-        None => {
-            return fail("this version's front only runs its probe (--probe); `run` starts none");
-        }
+        None => return serve::serve(status),
     };
     let answer = run_probe(status, &job);
     let mut out = std::io::stdout().lock();
