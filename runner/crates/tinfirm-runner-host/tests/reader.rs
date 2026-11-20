@@ -557,10 +557,26 @@ fn hostile_bundles_are_refused_and_the_clone_keeps_its_head() {
 // ----- readers that lie or die ---------------------------------------------------------------
 
 /// A script in the reader's place.
+///
+/// A child process writes the script, not this one. A file that any process has open for
+/// writing cannot be executed ("Text file busy"), and a descriptor that this process opened
+/// would be held, between a fork and its exec, by every child that another test's thread
+/// starts at that moment: the script was then busy when its test ran it.
 fn fake_reader(dir: &Path, body: &str) -> Reader {
+    use std::io::Write;
     let path = dir.join("fake-reader");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut script = writer.stdin.take().unwrap();
+    script
+        .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+        .unwrap();
+    drop(script);
+    assert!(writer.wait().unwrap().success());
     Reader::new(path)
 }
 
