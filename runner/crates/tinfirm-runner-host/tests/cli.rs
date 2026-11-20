@@ -1250,6 +1250,132 @@ fn the_node_driver_reports_what_its_nodes_configuration_reaches() {
     );
 }
 
+#[test]
+fn doctor_on_a_vm_host_checks_the_driver_and_not_docker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let driver = format!(
+        "node {}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fake-vm-driver/fake-driver.mjs")
+            .display()
+    );
+    let vm = [
+        "doctor",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        driver.as_str(),
+        "--vm-template",
+        "sandbox-test",
+    ];
+    // No Docker on this host: a socket that is not there.
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let report = text(&run_with_env(
+        dir,
+        &vm,
+        &[no_docker, ("FAKE_VM_SLOTS", "4")],
+    ));
+    assert!(
+        report.contains("[ ok ] vm driver: `fake` test; the template `sandbox-test` keeps the contract of a sandbox VM; room for 4 more VM(s) and 0 of this host's own, for --max-concurrent-runs 2"),
+        "{report}"
+    );
+    assert!(report.contains("[info] docker: not used"), "{report}");
+    assert!(!report.contains("[FAIL] docker"), "{report}");
+    assert!(!report.contains("image CLAUDE_CODE"), "{report}");
+    assert!(!report.contains("your uid is not 1000"), "{report}");
+    // Without the room `run` would need, or with a template that breaks the contract: it fails
+    // as `run` would refuse to start.
+    let mut more = vm.to_vec();
+    more.extend(["--max-concurrent-runs", "5"]);
+    let report = text(&run_with_env(
+        dir,
+        &more,
+        &[no_docker, ("FAKE_VM_SLOTS", "4")],
+    ));
+    assert!(
+        report.contains("[FAIL] vm driver: --max-concurrent-runs is 5, but the VM driver `fake` has room for 4 more VM(s)"),
+        "{report}"
+    );
+    let problems = r#"["the firewall allows outbound tcp to 0.0.0.0/0"]"#;
+    let report = text(&run_with_env(
+        dir,
+        &vm,
+        &[no_docker, ("FAKE_VM_PROBLEMS", problems)],
+    ));
+    assert!(
+        report.contains("[FAIL] vm driver: the VM template `sandbox-test` breaks the contract"),
+        "{report}"
+    );
+    // The options of the environment, as `run` reads them from a service's environment file.
+    let out = run_with_env(
+        dir,
+        &["doctor"],
+        &[
+            no_docker,
+            ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+            ("TINFIRM_RUNNER_VM_DRIVER", driver.as_str()),
+        ],
+    );
+    let report = text(&out);
+    assert!(!out.status.success());
+    assert!(
+        report.contains("[FAIL] vm driver: --executor vm needs --vm-template"),
+        "{report}"
+    );
+    // The node driver: a client key that others can read fails before any node is asked.
+    use std::os::unix::fs::PermissionsExt;
+    let (cert, key) = (dir.join("client.crt"), dir.join("client.key"));
+    std::fs::write(&cert, b"certificate").unwrap();
+    std::fs::write(&key, b"key").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let config = dir.join("node-driver.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({"nodes": [
+            {"name": "node-1", "address": "192.0.2.10:7700", "nodeSha256": "ab".repeat(32),
+             "certificate": cert, "key": key, "templates": ["sandbox-4c8g"]}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let node = [
+        "doctor",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "node",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    let config = config.to_string_lossy().into_owned();
+    let report = text(&run_with_env(
+        dir,
+        &node,
+        &[no_docker, ("TINFIRM_NODE_DRIVER_CONFIG", config.as_str())],
+    ));
+    assert!(
+        report.contains("[FAIL] node driver configuration: node `node-1`")
+            && report.contains("readable by it alone (0600)"),
+        "{report}"
+    );
+    assert!(!report.contains("vm driver:"), "{report}");
+    // A key of this user's alone: the configuration passes, and the node, which is not there,
+    // gives no room.
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let report = text(&run_with_env(
+        dir,
+        &node,
+        &[no_docker, ("TINFIRM_NODE_DRIVER_CONFIG", config.as_str())],
+    ));
+    assert!(
+        report.contains("[ ok ] node driver configuration:")
+            && report.contains("1 node(s) (node-1); every client key is this user's alone"),
+        "{report}"
+    );
+    assert!(report.contains("[FAIL] vm driver:"), "{report}");
+}
+
 /// Where [`run_without_landlock`] hands the runner host's arguments to
 /// [`launch_without_landlock`]. Linux alone has Landlock and the seccomp filter that stands in
 /// for a kernel without it, so these helpers and their two tests are built there only.

@@ -69,8 +69,22 @@ enum Command {
     /// Build the runner images locally.
     #[command(subcommand)]
     Images(ImagesCommand),
-    /// Check Docker, images, credentials and the server connection.
-    Doctor,
+    /// Check this host's setup as `run` would start it, with the same options and environment:
+    /// its directories, the reader's and the front's confinement, git, the credentials and the
+    /// server connection; Docker and its images with the Docker executor, and the VM driver
+    /// (its configuration, a `verify` of the template and its room) with `--executor vm`,
+    /// which needs no Docker.
+    Doctor {
+        /// The ceiling `run` starts with: with --executor vm, the driver must have room for it,
+        /// as at `run`'s start.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_HOST_CAPACITY)))]
+        max_concurrent_runs: u32,
+        #[command(flatten)]
+        sandbox: SandboxArgs,
+        // Boxed: the variant would be far larger than the enum's others.
+        #[command(flatten)]
+        vm: Box<VmArgs>,
+    },
     /// Inspect and prune the host's repository mirrors.
     #[command(subcommand)]
     Mirrors(MirrorsCommand),
@@ -911,7 +925,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             no_cache,
             build_args,
         }) => build_images(&paths, runtime, no_cache, &build_args).await,
-        Command::Doctor => doctor(&paths).await,
+        Command::Doctor {
+            max_concurrent_runs,
+            sandbox,
+            vm,
+        } => doctor(&paths, max_concurrent_runs, &sandbox, &vm).await,
         Command::Mirrors(MirrorsCommand::List) => list_mirrors(&paths),
         Command::Mirrors(MirrorsCommand::Prune {
             older_than_days,
@@ -1436,8 +1454,15 @@ impl Checks {
     }
 }
 
-async fn doctor(paths: &Paths) -> Result<()> {
+async fn doctor(
+    paths: &Paths,
+    max_concurrent_runs: u32,
+    sandbox_args: &SandboxArgs,
+    vm_args: &VmArgs,
+) -> Result<()> {
     let mut checks = Checks { failed: 0 };
+    let vm_host = vm_args.executor == ExecutorChoice::Vm;
+    let bridged = vm_host || sandbox_args.sandbox_bridge;
     // Directories.
     for (what, dir) in [
         ("config dir", &paths.config_dir),
@@ -1494,10 +1519,16 @@ async fn doctor(paths: &Paths) -> Result<()> {
             ),
         ),
     }
-    // The level of isolation that `run` reports with the environment's settings (ADR-0113).
-    doctor_isolation(&mut checks);
+    // The level of isolation that `run` reports with these settings (ADR-0113).
+    doctor_isolation(&mut checks, sandbox_args, vm_args);
     // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1).
-    doctor_reader(&mut checks, paths).await;
+    doctor_reader(
+        &mut checks,
+        paths,
+        bridged,
+        sandbox_args.allow_unconfined_reader,
+    )
+    .await;
     doctor_front(&mut checks, paths).await;
     // git.
     match git::git_version().await {
@@ -1507,6 +1538,91 @@ async fn doctor(paths: &Paths) -> Result<()> {
             "not found on PATH (the host clones and pushes with git)",
         ),
     }
+    if vm_host {
+        // A VM per run: the driver in Docker's place, and no Docker at all on this host.
+        doctor_vm(&mut checks, paths, max_concurrent_runs, vm_args).await;
+        checks.info(
+            "docker",
+            "not used: --executor vm creates a VM per run, and its images are the VM image's",
+        );
+    } else {
+        doctor_docker(&mut checks, paths).await;
+    }
+    doctor_credentials(&mut checks, paths).await;
+    if checks.failed > 0 {
+        bail!("{} check(s) failed", checks.failed);
+    }
+    println!("All checks passed.");
+    Ok(())
+}
+
+/// With `--executor vm`: what `run --executor vm` checks at its start. The driver's options;
+/// with `--vm-driver node`, its configuration and client keys; then the driver's `hello` and a
+/// `verify` of the template, with room for `max_concurrent_runs` VMs, this host's own counted
+/// as at `run`'s start ([`tinfirm_runner_host::vm::Vms::check`]).
+async fn doctor_vm(checks: &mut Checks, paths: &Paths, max_concurrent_runs: u32, vm_args: &VmArgs) {
+    let options = match vm_args.options() {
+        Ok(Some((options, _))) => options,
+        Ok(None) => return,
+        Err(e) => {
+            checks.fail("vm driver", format!("{e:#}"));
+            return;
+        }
+    };
+    if let Some(tinfirm_runner_host::vm::Builtin::Node { config }) = &options.driver.builtin {
+        match tinfirm_runner_host::node::NodeConfig::load(config) {
+            Ok(loaded) => checks.ok(
+                "node driver configuration",
+                format!(
+                    "{}: {} node(s) ({}); every client key is this user's alone",
+                    config.display(),
+                    loaded.nodes.len(),
+                    loaded
+                        .nodes
+                        .iter()
+                        .map(|node| node.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            Err(e) => {
+                checks.fail("node driver configuration", format!("{e:#}"));
+                return;
+            }
+        }
+    }
+    let template = options.template.clone();
+    let vms = tinfirm_runner_host::vm::Vms::new(options);
+    let (_, state) = tinfirm_runner_host::config::HostStateFile::load(paths);
+    let own = state.runner_host_id.map(|id| id.to_string());
+    match vms.check(max_concurrent_runs, own.as_deref()).await {
+        Ok((hello, verified, held)) => {
+            let room = match verified.max_vms {
+                Some(room) => format!(
+                    "room for {room} more VM(s) and {held} of this host's own, for --max-concurrent-runs {max_concurrent_runs}"
+                ),
+                None => "the driver names no limit".to_string(),
+            };
+            let checked = if verified.checked.is_empty() {
+                String::new()
+            } else {
+                format!("; checked: {}", verified.checked.join("; "))
+            };
+            checks.ok(
+                "vm driver",
+                format!(
+                    "`{}` {}; the template `{template}` keeps the contract of a sandbox VM; {room}{checked}",
+                    hello.driver,
+                    hello.version.as_deref().unwrap_or("(no version)"),
+                ),
+            );
+        }
+        Err(e) => checks.fail("vm driver", format!("{e:#}")),
+    }
+}
+
+/// With the Docker executor: Docker, its runtimes and the runner images.
+async fn doctor_docker(checks: &mut Checks, paths: &Paths) {
     // Docker and images.
     let docker = match docker::connect() {
         Ok(d) => match d.version().await {
@@ -1670,7 +1786,10 @@ async fn doctor(paths: &Paths) -> Result<()> {
             );
         }
     }
-    // Credentials (presence and format only; no network calls).
+}
+
+/// The model credentials (presence and format only; no network call), and the server.
+async fn doctor_credentials(checks: &mut Checks, paths: &Paths) {
     let store = CredentialStore::new(paths);
     match store.list() {
         Ok(list) if list.is_empty() => {
@@ -1745,27 +1864,16 @@ async fn doctor(paths: &Paths) -> Result<()> {
             }
         }
     }
-    if checks.failed > 0 {
-        bail!("{} check(s) failed", checks.failed);
-    }
-    println!("All checks passed.");
-    Ok(())
 }
 
-/// The level of isolation that `run` would report with `TINFIRM_RUNNER_EXECUTOR`,
-/// `TINFIRM_RUNNER_SANDBOX_RUNTIME`, `TINFIRM_RUNNER_VM_DRIVER` (with `node`,
-/// `TINFIRM_NODE_DRIVER_CONFIG`) and
-/// `TINFIRM_RUNNER_ISOLATION_*`, and what an escape from a
-/// sandbox reaches on such a host (ADR-0112, decision 7). `run`'s flags are not seen here.
-fn doctor_isolation(checks: &mut Checks) {
-    let var = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    let sandboxes = match var("TINFIRM_RUNNER_EXECUTOR").as_deref() {
-        Some("vm") => match var("TINFIRM_RUNNER_VM_DRIVER")
+/// The level of isolation that `run` would report with these options and environment
+/// (`--executor`, `--sandbox-runtime`, `--vm-driver`, with `node` its configuration, and
+/// `--isolation-*`), and what an escape from a sandbox reaches on such a host (ADR-0112,
+/// decision 7).
+fn doctor_isolation(checks: &mut Checks, sandbox_args: &SandboxArgs, vm_args: &VmArgs) {
+    let sandboxes = match vm_args.executor {
+        ExecutorChoice::Vm => match vm_args
+            .vm_driver
             .as_deref()
             .map(tinfirm_runner_host::vm::DriverCommand::parse)
         {
@@ -1774,8 +1882,8 @@ fn doctor_isolation(checks: &mut Checks) {
         },
         // Docker's runtime by its name, as `run` reads it; a name that `run` would refuse
         // reads as runc here.
-        _ => Ok(Sandboxes::docker(
-            &SandboxSettings::new(var("TINFIRM_RUNNER_SANDBOX_RUNTIME"), false, Vec::new())
+        ExecutorChoice::Docker => Ok(Sandboxes::docker(
+            &SandboxSettings::new(sandbox_args.sandbox_runtime.clone(), false, Vec::new())
                 .unwrap_or_default(),
         )),
     };
@@ -1786,35 +1894,12 @@ fn doctor_isolation(checks: &mut Checks) {
             return;
         }
     };
-    let level = var("TINFIRM_RUNNER_ISOLATION_LEVEL");
-    let hardened = var("TINFIRM_RUNNER_ISOLATION_HARDENED");
-    let parsed_level = level
-        .as_deref()
-        .map(|v| StatedLevel::from_str(v, false))
-        .transpose();
-    let parsed_hardened = hardened
-        .as_deref()
-        .map(|v| HardenedChoice::from_str(v, false))
-        .transpose();
-    let (level, hardened) = match (parsed_level, parsed_hardened) {
-        (Ok(level), Ok(hardened)) => (level, hardened),
-        (Err(e), _) | (_, Err(e)) => {
-            checks.fail("isolation", format!("TINFIRM_RUNNER_ISOLATION_*: {e}"));
-            return;
-        }
-    };
-    if level.is_none() && hardened.is_some() {
-        checks.fail(
-            "isolation",
-            "TINFIRM_RUNNER_ISOLATION_HARDENED needs TINFIRM_RUNNER_ISOLATION_LEVEL",
-        );
-        return;
-    }
-    match isolation::derive(sandboxes, stated_isolation(level, hardened)) {
+    let stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);
+    match isolation::derive(sandboxes, stated) {
         Ok(reported) => {
             let escape = isolation::what_an_escape_reaches(sandboxes, &reported);
             let detail = format!(
-                "reports {} (as `run` with this environment; its flags are not seen here). {escape}",
+                "reports {} (as `run` with these options and this environment). {escape}",
                 isolation::describe(&reported)
             );
             // A VM host of a driver of your own, shown as a container host until you state its
@@ -2337,15 +2422,7 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths) {
 }
 
 /// What `doctor` says of the reader (ADR-0112, open question 1) and of this process's memory.
-async fn doctor_reader(checks: &mut Checks, paths: &Paths) {
-    let flag = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-    };
-    let vm_host = std::env::var("TINFIRM_RUNNER_EXECUTOR").is_ok_and(|v| v.trim() == "vm");
-    let bridged = vm_host || flag("TINFIRM_RUNNER_SANDBOX_BRIDGE");
-    let allow = flag("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER");
+async fn doctor_reader(checks: &mut Checks, paths: &Paths, bridged: bool, allow: bool) {
     match tinfirm_runner_host::confine::protect_host_process() {
         Ok(()) => checks.ok(
             "host memory",
