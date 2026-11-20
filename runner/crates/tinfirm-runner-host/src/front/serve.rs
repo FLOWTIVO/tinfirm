@@ -654,7 +654,10 @@ pub fn serve(status: Status) -> ExitCode {
                     });
                     egress = Some(connector.clone());
                     let half = FrontHalf::new(authorization, connector, egress_shutdown.clone());
-                    tokio::spawn(crate::egress_proxy::serve(listener, half));
+                    tokio::spawn(crate::egress_proxy::serve(
+                        crate::front::conn::Acceptor::listener(listener, false),
+                        half,
+                    ));
                     continue;
                 }
                 ToFront::Connected { req } => {
@@ -705,7 +708,10 @@ pub fn serve(status: Status) -> ExitCode {
                         Arc::new(ServiceWire::new(&requests, Service::Model)),
                         model_shutdown.clone(),
                     );
-                    tokio::spawn(crate::model_proxy::serve(listener, half));
+                    tokio::spawn(crate::model_proxy::serve(
+                        crate::front::conn::Acceptor::listener(listener, true),
+                        half,
+                    ));
                     continue;
                 }
                 ToFront::ListenGit { .. } if git.is_some() => {
@@ -724,7 +730,7 @@ pub fn serve(status: Status) -> ExitCode {
                     let routes = Arc::new(crate::git_proxy::FrontRoutes::default());
                     git = Some(routes.clone());
                     tokio::spawn(crate::git_proxy::serve_in_front(
-                        listener,
+                        crate::front::conn::Acceptor::listener(listener, true),
                         routes,
                         Arc::new(ServiceWire::new(&requests, Service::Git)),
                         limits,

@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::confine::{self, Plan, Status};
 
+pub mod conn;
 pub mod handle;
 pub mod head;
 pub mod sandbox;

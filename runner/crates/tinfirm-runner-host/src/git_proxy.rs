@@ -1510,13 +1510,14 @@ async fn serve_connection(inner: Arc<Inner>, stream: TcpStream) {
 
 /// One connection, served by `handler`, until it ends, the listener shuts down, or it is idle
 /// for `idle_timeout` while none of its requests is handled.
-async fn serve_with<F, Fut>(
-    stream: TcpStream,
+async fn serve_with<S, F, Fut>(
+    stream: S,
     header_read_timeout: Duration,
     idle_timeout: Duration,
     shutdown: CancellationToken,
     handler: F,
 ) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Response<ProxyBody>> + Send + 'static,
 {
@@ -1570,7 +1571,7 @@ async fn serve_with<F, Fut>(
 /// each request it lets through to `run` (`backend`), within `limits`, until `shutdown`. Its
 /// peers are the sandbox's own tunnels, so no peer counts against another.
 pub async fn serve_in_front(
-    listener: TcpListener,
+    mut acceptor: crate::front::conn::Acceptor,
     routes: Arc<FrontRoutes>,
     backend: Arc<dyn Backend>,
     limits: FrontLimits,
@@ -1593,15 +1594,15 @@ pub async fn serve_in_front(
         };
         let stream = tokio::select! {
             _ = shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(_) => {
+            accepted = acceptor.accept() => match accepted {
+                None => break,
+                Some(Ok(stream)) => stream,
+                Some(Err(_)) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             },
         };
-        let _ = stream.set_nodelay(true);
         let (half, shutdown) = (half.clone(), shutdown.clone());
         tokio::spawn(async move {
             let _permit = permit;
@@ -1719,12 +1720,12 @@ impl Drop for Busy {
 }
 
 /// A connection's stream that records every byte read or written in its [`Activity`].
-struct Tracked {
-    inner: TcpStream,
+struct Tracked<S> {
+    inner: S,
     activity: Arc<Activity>,
 }
 
-impl AsyncRead for Tracked {
+impl<S: AsyncRead + Unpin> AsyncRead for Tracked<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -1739,7 +1740,7 @@ impl AsyncRead for Tracked {
     }
 }
 
-impl AsyncWrite for Tracked {
+impl<S: AsyncWrite + Unpin> AsyncWrite for Tracked<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -2319,9 +2320,7 @@ mod tests {
             MAX_REQUEST_BODY + 1
         );
         stream.write_all(head.as_bytes()).await.unwrap();
-        let mut answer = vec![0u8; 1024];
-        let n = stream.read(&mut answer).await.unwrap();
-        let answer = String::from_utf8_lossy(&answer[..n]);
+        let answer = read_head(&mut stream).await;
         assert!(answer.starts_with("HTTP/1.1 413"), "{answer}");
         assert!(upstream.seen().is_empty());
     }

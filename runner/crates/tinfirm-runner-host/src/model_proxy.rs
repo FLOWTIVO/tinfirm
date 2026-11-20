@@ -592,7 +592,10 @@ impl ModelProxy {
                     backend,
                     state.shutdown.clone(),
                 );
-                tokio::spawn(serve(listener, half));
+                tokio::spawn(serve(
+                    crate::front::conn::Acceptor::listener(listener, true),
+                    half,
+                ));
             }
             Some(front) => {
                 front
@@ -737,9 +740,11 @@ impl FrontHalf {
     }
 }
 
-/// Serves the proxy's HTTP on `listener` until the half's shutdown: at most
-/// [`MAX_CONNECTIONS`] connections at once; more wait.
-pub async fn serve(listener: TcpListener, half: Arc<FrontHalf>) {
+/// Serves the proxy's HTTP on the connections of `acceptor` until the half's shutdown: at
+/// most [`MAX_CONNECTIONS`] connections at once; more wait. A TCP connection should come with
+/// no-delay ([`crate::front::conn::Acceptor::new`]): an answer's last part then goes at once,
+/// not after the client's acknowledgement of the one before (Nagle).
+pub async fn serve(mut acceptor: crate::front::conn::Acceptor, half: Arc<FrontHalf>) {
     let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let permit = tokio::select! {
@@ -751,14 +756,10 @@ pub async fn serve(listener: TcpListener, half: Arc<FrontHalf>) {
         };
         let stream = tokio::select! {
             _ = half.shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => {
-                    // An answer's last part goes at once, not after the client's
-                    // acknowledgement of the one before (Nagle).
-                    let _ = stream.set_nodelay(true);
-                    stream
-                }
-                Err(e) => {
+            accepted = acceptor.accept() => match accepted {
+                None => break,
+                Some(Ok(stream)) => stream,
+                Some(Err(e)) => {
                     tracing::warn!(error = %e, "model proxy: accept failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;

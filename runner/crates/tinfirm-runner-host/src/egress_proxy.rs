@@ -573,7 +573,10 @@ impl EgressProxy {
                     connector,
                     state.shutdown.clone(),
                 );
-                tokio::spawn(serve(listener, half));
+                tokio::spawn(serve(
+                    crate::front::conn::Acceptor::listener(listener, false),
+                    half,
+                ));
             }
             Some(front) => {
                 front
@@ -1016,8 +1019,8 @@ impl FrontHalf {
     }
 }
 
-/// Serves the proxy's HTTP on `listener` until the half's shutdown.
-pub async fn serve(listener: TcpListener, half: Arc<FrontHalf>) {
+/// Serves the proxy's HTTP on the connections of `acceptor` until the half's shutdown.
+pub async fn serve(mut acceptor: crate::front::conn::Acceptor, half: Arc<FrontHalf>) {
     let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let permit = tokio::select! {
@@ -1029,9 +1032,10 @@ pub async fn serve(listener: TcpListener, half: Arc<FrontHalf>) {
         };
         let stream = tokio::select! {
             _ = half.shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
-                Err(e) => {
+            accepted = acceptor.accept() => match accepted {
+                None => break,
+                Some(Ok(stream)) => stream,
+                Some(Err(e)) => {
                     tracing::warn!(error = %e, "egress proxy: accept failed");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
@@ -1627,7 +1631,10 @@ mod tests {
         let recording = Arc::new(Recording(Mutex::new(Vec::new())));
         let auth = basic_auth("the-secret");
         let half = FrontHalf::new(auth.clone(), recording.clone(), CancellationToken::new());
-        tokio::spawn(serve(listener, half));
+        tokio::spawn(serve(
+            crate::front::conn::Acceptor::listener(listener, false),
+            half,
+        ));
         let a = format!("Proxy-Authorization: {auth}\r\n");
         // Malformed requests, smuggling, oversized heads, wrong credentials: none reaches it.
         let hostile = [
