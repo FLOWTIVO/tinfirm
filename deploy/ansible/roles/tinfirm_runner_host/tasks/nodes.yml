@@ -155,7 +155,10 @@
       - node
       - --config
       - "{{ _tinfirm_runner_host_node_config }}"
-    stdin: '{"jsonrpc":"2.0","id":1,"method":"verify","params":{"template":"{{ tinfirm_runner_host_vm_template }}"}}'
+    # The leading space is needed: Ansible turns a templated value that starts with a brace into
+    # a dictionary, and the driver would get Python's writing of it, which is not JSON, and
+    # answer nothing (seen 2026-11-20). The driver skips the space.
+    stdin: " {{ {'jsonrpc': '2.0', 'id': 1, 'method': 'verify', 'params': {'template': tinfirm_runner_host_vm_template}} | to_json }}"
   become: true
   become_user: "{{ tinfirm_runner_host_user }}"
   register: _tinfirm_runner_host_verify
@@ -174,9 +177,11 @@
       - _tinfirm_runner_host_verified.result.problems | length == 0
     fail_msg: >-
       The driver's verify of {{ tinfirm_runner_host_vm_template }} found:
-      {{ (_tinfirm_runner_host_verified.result.problems
-          | default([_tinfirm_runner_host_verified.error.message | default(_tinfirm_runner_host_verify.stderr)])) | join('; ') }}.
-      `run` refuses to start with this. Checked: {{ _tinfirm_runner_host_verified.result.checked | default([]) | join('; ') }}
+      {{ ((_tinfirm_runner_host_verified.result | default({})).problems
+          | default([(_tinfirm_runner_host_verified.error | default({})).message
+                     | default(_tinfirm_runner_host_verify.stderr, true)
+                     | default('the driver gave no answer (exit ' ~ _tinfirm_runner_host_verify.rc ~ ')', true)])) | join('; ') }}.
+      `run` refuses to start with this. Checked: {{ (_tinfirm_runner_host_verified.result | default({})).checked | default([]) | join('; ') }}
     success_msg: >-
       The nodes have {{ _tinfirm_runner_host_verified.result.maxVms }} free VMs of
       {{ tinfirm_runner_host_vm_template }}; checked: {{ _tinfirm_runner_host_verified.result.checked | join('; ') }}

@@ -50,6 +50,30 @@
     - tinfirm_sandbox_node_cloud_init == 'disable'
     - _tinfirm_sandbox_node_cloud_init.results[0].stat.exists
 
+# Before the firewall is enabled: it drops the node's DNS queries too. On a machine whose own
+# name is in no file (a cloud image whose name the platform's DNS answers), sudo then waits
+# 10 seconds for that name at every call, which is longer than Ansible waits for sudo: the
+# play's next task would fail (seen on a cloud image of Ubuntu 24.04, 2026-11-20). The name is
+# the one the kernel gives (`uname -n`), which sudo looks up; where it is a full name, the short
+# one goes on the same line.
+- name: Look for the node's own name in /etc/hosts
+  ansible.builtin.command:
+    argv: [getent, -s, files, hosts, "{{ ansible_facts['nodename'] }}"]
+  register: _tinfirm_sandbox_node_own_name
+  changed_when: false
+  failed_when: _tinfirm_sandbox_node_own_name.rc not in [0, 2]
+
+- name: Make the node's own name resolve without DNS
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: >-
+      127.0.1.1 {{ ansible_facts['nodename'] }}{{
+        '' if ansible_facts['nodename'] == ansible_facts['hostname'] else ' ' ~ ansible_facts['hostname'] }}
+    owner: root
+    group: root
+    mode: "0644"
+  when: _tinfirm_sandbox_node_own_name.rc == 2
+
 - name: Install the node's sysctl settings
   ansible.builtin.copy:
     src: tinfirm-node-agent.sysctl.conf

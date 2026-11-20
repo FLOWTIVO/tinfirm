@@ -1,4 +1,19 @@
 ---
+# The settings are applied by a handler when their file changes. A run that failed between the
+# file and the handler leaves the file in place and the settings unapplied, and a later run
+# sees no change (seen 2026-11-20): so apply them here whenever the node does not have them.
+- name: Read the node's sysctl settings
+  ansible.builtin.command:
+    argv: [sysctl, -n, net.ipv4.ip_forward, user.max_user_namespaces]
+  register: _tinfirm_sandbox_node_sysctl_before
+  changed_when: false
+
+- name: Apply the node's sysctl settings that are not in force
+  ansible.builtin.command:
+    argv: [sysctl, -p, /etc/sysctl.d/60-tinfirm-node-agent.conf]
+  changed_when: true
+  when: _tinfirm_sandbox_node_sysctl_before.stdout_lines != ['1', '0']
+
 # In their order: the modules, the node's firewall, the helper, the listener. A helper that
 # stops or starts again leaves its VMs running: each VMM is in a cgroup of its own.
 - name: Start the node agent's units

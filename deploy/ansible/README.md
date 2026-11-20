@@ -8,8 +8,9 @@ Three playbooks:
 | `control-host.yml` | `tinfirm_runner_host`, with `tinfirm_runner_host_executor: vm` | A control host: the runner host with `run --executor vm --vm-driver node`, which holds the credentials and runs no agent code ([ADR-0112](../../docs/adr/0112-no-credential-on-a-sandbox-machine.md)) |
 | `sandbox-node.yml` | `tinfirm_sandbox_node` | A sandbox node: the node agent, Firecracker, the guest kernel, the VM image and the node's own firewall. It holds no credential |
 
-The last two are not ready for production: no conversation has run through a node, and the
-roles have not run on a machine yet ([below](#sandbox-nodes-and-their-control-host)).
+The last two are not ready for production. The roles ran on machines once (2026-11-20, Ubuntu
+24.04), with runs of a stand-in agent through a node; no conversation with a real runtime has
+run through a node ([below](#sandbox-nodes-and-their-control-host)).
 
 ## Runner hosts with Kata Containers
 
@@ -208,9 +209,10 @@ on large workspaces).
 
 ## Sandbox nodes and their control host
 
-> **Not ready for production.** No conversation has run through a sandbox node, and these two
-> plays have not run on a machine yet: the checks below ran without one. Use them to prepare
-> and to test. The test plan for two machines is in [Test on two machines](#test-on-two-machines).
+> **Not ready for production.** No conversation with a real runtime has run through a sandbox
+> node. The two plays ran on machines once, on 2026-11-20, with runs of the runner host tests'
+> stand-in agent: [Test on two machines](#test-on-two-machines) says what ran and what it found.
+> Use them to prepare and to test.
 
 [ADR-0112](../../docs/adr/0112-no-credential-on-a-sandbox-machine.md) splits a runner host with
 VMs in two. The **control host** keeps every credential (the host's token, the runs' git and
@@ -330,7 +332,7 @@ Build it, compress it, and give the role the file and its SHA-256:
 
 ```sh
 sudo runner/images/vm/local-disk.sh /path/to/tinfirm-runner-host ./out   # the control host's binary
-zstd -T0 ./out/tinfirm-vm.img -o tinfirm-vm.img.zst                      # about 1 GB of 32 GiB
+zstd -T0 ./out/tinfirm-vm.img -o tinfirm-vm.img.zst                      # 1 to 4 GB of 32 GiB, by the runtimes
 sha256sum tinfirm-vm.img.zst
 ```
 
@@ -551,7 +553,7 @@ variables above have no effect. The binary, login, user, `run` and sandbox setti
 
 ### Checks
 
-What ran for these plays, without a machine (no KVM and no systemd where they were written):
+What runs for these plays without a machine (no KVM and no systemd):
 `ansible-playbook --syntax-check` of the three playbooks, `ansible-lint --profile production`,
 and the templates rendered with example values and checked against the node agent's and the
 runner host's READMEs:
@@ -576,23 +578,59 @@ done
 
 ### Test on two machines
 
-Not run yet. On two fresh Ubuntu 24.04 VMs with KVM in one subnet, `ctl` (the control host) and
-`node` (the node), from a third machine or from `ctl` as the management address:
+Ran once, on 2026-11-20, at commit `bfa9bfd`, on Ubuntu 24.04 machines: a control host
+(2 vCPUs), a node (4 vCPUs, KVM) and a third machine as the management address, in one subnet.
+The runs were those of the runner host tests' stand-in agent, in an image added to the VM image:
+no model and no real runtime. Three defects of the plays were found and are fixed here:
+
+- After the node's firewall was loaded, the next task failed with "Timeout (12s) waiting for
+  privilege escalation prompt". The firewall drops the node's DNS queries, the cloud image's own
+  name was in no file, and sudo waited 10 seconds for it at every call. The role now writes the
+  name into `/etc/hosts` before the firewall is enabled.
+- A run that failed after the sysctl file was written left the settings unapplied for good: the
+  handler that applies them runs only when the file changes. The role now applies them whenever
+  the node does not have them.
+- `control-host.yml` got no answer to its `verify`: Ansible turned the request, a string that
+  starts with a brace, into a dictionary, and the driver got text that is not JSON. The task then
+  failed in its own message instead of naming the cause. Both are fixed.
+
+The steps, each as it ran:
 
 1. Build the VM image on a machine with Docker that is neither of them, with the control host's
-   `tinfirm-runner-host`, and compress it (above).
+   `tinfirm-runner-host`, and compress it (above). 407 seconds on 4 vCPUs with two runtimes; the
+   compressed file was 3.8 GB, not 1 GB.
 2. Register a company runner host in Tinfirm and keep its token in Vault.
-3. Run `control-host.yml`: it ends with the client fingerprint and "not started".
+3. Run `control-host.yml`: it ends with the client fingerprint and "not started". 36 seconds.
 4. Set the fingerprint on the node, run `sandbox-node.yml`: every template "no problem", the node's
    fingerprint. On the node: `systemctl is-active tinfirm-node-agent-{modules,firewall,helper,listener}`,
-   `nft list table inet tinfirm_node`, `sysctl user.max_user_namespaces` (0).
+   `nft list table inet tinfirm_node`, `sysctl user.max_user_namespaces` (0). 172 seconds on a
+   fresh node, most of it the image.
 5. Set the node's fingerprint, run `control-host.yml`: the driver's `verify` with no problem and the
    node's free VMs, then the host **Online** in Tinfirm, its log line with `machine`.
-6. Run a conversation on the host, and see a VM made and deleted on the node.
+6. Run a conversation on the host, and see a VM made and deleted on the node. Ran with the
+   stand-in agent: 9 seconds from the assignment to the push.
 7. Run both plays again: `changed=0` on both.
-8. Replace the node's image and follow [Replace a node](#replace-a-node).
+8. Replace the node's image and follow [Replace a node](#replace-a-node). Ran with a new VM in
+   the node's place. With the old pin kept, the play fails at its `verify`: "the node's
+   certificate does not match its pin".
 9. Empty the node's `nodeSha256` and run `control-host.yml`: the play names the node as waiting,
-   the host drains and runs again, and with the only node out it is stopped and
-   `/etc/tinfirm/node-driver.json` is gone. Pin it again: the host starts.
+   and with the only node out the host is stopped and `/etc/tinfirm/node-driver.json` is gone.
+   Pin it again: the host starts. With one node only, "the host drains and runs again" did not run.
 10. Run `control-host.yml` against a machine with Docker installed: it fails in its checks, and
     changes nothing there.
+
+Also ran: the node rebooted (it takes SSH again after 14 seconds, with its four units and its
+table), `tinfirm_sandbox_node_cloud_init: refuse` on a cloud image (the play stops before it
+changes anything), the node's egress (the four targets time out), and the firewall table deleted
+(the helper makes no VM, and `doctor` on the control host names the table).
+
+Not run: the play's SSH from another address than the management address, a wrong image
+checksum, a second node, an upgrade of a node, another distribution, and aarch64.
+
+Two things to know that the plays do not change:
+
+- The first `control-host.yml` with a pinned node starts the host and reloads it in the same run
+  (the unit is new, and the driver's file changed): the host drains with no run and starts again
+  within 5 seconds.
+- Where an earlier run left a node with its firewall loaded and its own name in no file, give
+  Ansible more time once: `ANSIBLE_TIMEOUT=40 ansible-playbook … sandbox-node.yml`.
