@@ -1,0 +1,21 @@
+hello: 3 ms, {'protocol': 1, 'driver': 'node', 'version': '1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0'}
+verify: 13 ms, problems [], maxVms 2
+create: 495 ms, id node-1:vm-5fecbb0b55b501e0a8789e2757f8ce28; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 6442 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 116 ms; then describe says gone; the port answers `nothing`
+create: 168 ms, id node-1:vm-729a45362ad1464f01063f370c7d6058; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2938 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 71 ms; then describe says gone; the port answers `nothing`
+create: 165 ms, id node-1:vm-605d22c8bc9358acf7daca4adf35ad23; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 3042 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 112 ms; then describe says gone; the port answers `nothing`
+create: 169 ms, id node-1:vm-f2566139f9ccb9b008f76625c1eb8669; describe: 12 ms, running at 10.0.0.6:20000
+guest ready: 3249 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 113 ms; then describe says gone; the port answers `nothing`
+create: 171 ms, id node-1:vm-541c46205c0de444228827117b888e84; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 3011 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 104 ms; then describe says gone; the port answers `nothing`
+create: 173 ms, id node-1:vm-5dc88f96bc6408ef25e05696c71f981d; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2966 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 100 ms; then describe says gone; the port answers `nothing`
+left: jails 0, VMMs 0, device-mapper 0, VM tables 0, work files 0; the node: firewall table 1, user.max_user_namespaces = 0

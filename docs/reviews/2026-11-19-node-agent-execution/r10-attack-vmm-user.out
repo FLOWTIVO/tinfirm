@@ -1,0 +1,58 @@
+two VMs: tfvm-000000000081-0000 (VMM pid 10844, uid 1100000, guest 10.231.0.6) and tfvm-000000000082-0001 (VMM pid 10986, uid 1100001, guest 10.231.0.14)
+VMM of tfvm-000000000081-0000: Uid: 1100000 1100000 1100000 1100000;Gid: 1100000 1100000 1100000 1100000;Groups:  ;CapInh: 0000000000000000;CapPrm: 0000000000000000;CapEff: 0000000000000000;CapBnd: 00000000082000c3;NoNewPrivs: 1;Seccomp: 2;Seccomp_filters: 27;
+VMM of tfvm-000000000082-0001: Uid: 1100001 1100001 1100001 1100001;Gid: 1100001 1100001 1100001 1100001;Groups:  ;CapInh: 0000000000000000;CapPrm: 0000000000000000;CapEff: 0000000000000000;CapBnd: 00000000082000c3;NoNewPrivs: 1;Seccomp: 2;Seccomp_filters: 27;
+its namespaces: net net:[4026532255] pid pid:[4026532317] mnt mnt:[4026532315]; the node's: net net:[4026531833] pid pid:[4026531836] mnt mnt:[4026531832]
+
+== A. inside the jail of tfvm-000000000081-0000, as its VMM's user
+a process of the shell (pid 11123 on the node): Uid: 1100000 1100000 1100000 1100000;Gid: 1100000 1100000 1100000 1100000;Groups:  ;CapInh: 0000000000000000;CapPrm: 0000000000000000;CapEff: 0000000000000000;CapBnd: 00000000002c00c2;NoNewPrivs: 1;Seccomp: 0;Seccomp_filters: 0; (the shell sees no /proc: refused (ls: /proc: No such file or directory))
+what / holds: busybox dev firecracker firecracker.log firecracker.pid root.disk run userdata.disk vm.json vmlinux
+interfaces:  lo  veth0@if43  tap0 ; routes: default via 10.231.0.1 dev veth0 ;10.231.0.0/30 dev veth0 scope link  src 10.231.0.2 ;10.231.0.4/30 dev tap0 scope link  src 10.231.0.5 ;
+-- the other VM, by every name the node has for it
+its jail: refused (ls: /srv/tinfirm-jails/firecracker/tfvm-000000000082-0001/root: No suc) ; the jails' directory: refused (ls: /srv/tinfirm-jails/firecracker: No such file or directory) ; its snapshot file: refused (head: /var/lib/tinfirm-node-agent/work/tfvm-000000000082-0001.snapshot) ; its snapshot device: refused (head: /dev/mapper/tinfirm-tfvm-000000000082-0001: No such file or dire) ; its API socket: refused (ls: /srv/tinfirm-jails/firecracker/tfvm-000000000082-0001/root/run/fir)
+a device node of its disk made here (mknod b 252 1): refused (mknod: /other.disk: Operation not permitted)
+signal 0 to its VMM (pid 10986 on the node): refused (kill: can't kill pid 10986: No such process) ; to pid 1 of its own PID namespace, its own VMM: ALLOWED
+-- the agent and the node
+the helper's socket: refused (ls: /run/tinfirm-node-agent-helper/helper.sock: No such file or direct) ; the node's key: refused (head: /etc/tinfirm/node-agent/node.key: No such file or directory) ; the spool: refused (ls: /var/lib/tinfirm-node-agent/spool: No such file or directory) ; /etc: refused (ls: /etc: No such file or directory) ; /home: refused (ls: /home: No such file or directory)
+-- leaving the chroot and the namespaces
+chroot: refused (chroot: can't change root directory to '/': Operation not permitted) ; mount proc: refused (mount: permission denied (are you root?)) ; a new network namespace: refused (unshare: unshare(0x40000000): Operation not permitted) ; a new mount namespace: refused (unshare: unshare(0x20000): Operation not permitted) ; a new user namespace: refused (unshare: unshare(0x10000000): No space left on device)
+write outside its own directories: ALLOWED (its own, by design) ; a set-uid copy of the shell, run: uid 1100000 (its own: the file is its own, and NoNewPrivs)
+-- its own things, which it holds by design
+its own disk: ALLOWED ; its own user data: ALLOWED ; /dev/kvm: ALLOWED
+-- the network, from its namespace
+connect to its-own-guest's-bridge (10.231.0.6:7443): refused (nc: timed out)
+connect to the-other-guest's-bridge (10.231.0.14:7443): refused (nc: timed out)
+connect to the-other-VM's-namespace (10.231.0.10:7443): refused (nc: timed out)
+connect to the-other-VM's-published-port (10.0.0.6:20001): refused (nc: timed out)
+connect to its-own-published-port (10.0.0.6:20000): refused (nc: timed out)
+connect to the-agent's-port (10.0.0.6:7700): refused (nc: timed out)
+connect to the-node's-SSH (10.0.0.6:22): refused (nc: timed out)
+connect to the-node's-end-of-its-veth (10.231.0.1:22): refused (nc: timed out)
+connect to the-control-host (10.0.0.5:22): refused (nc: timed out)
+connect to a-metadata-service (169.254.169.254:80): refused (nc: timed out)
+connect to Azure's-host-agent (168.63.129.16:80): refused (nc: timed out)
+connect to the-internet (1.1.1.1:443): refused (nc: timed out)
+
+== B. outside the jail, in the node's namespaces, with only the rights of uid 1100000
+the shell itself: Uid: 1100000 1100000 1100000 1100000;CapEff: 0000000000000000;CapBnd: 0000000000000000;NoNewPrivs: 1;
+-- the other VM
+its jail: refused (ls: cannot open directory '/srv/tinfirm-jails/firecracker/tfvm-0000000) ; its chroot: refused (ls: cannot access '/srv/tinfirm-jails/firecracker/tfvm-000000000082-00) ; its disk's node there: refused (head: cannot open '/srv/tinfirm-jails/firecracker/tfvm-000000000082-00) ; its user data: refused (head: cannot open '/srv/tinfirm-jails/firecracker/tfvm-000000000082-00) ; its API socket: refused (PermissionError: [Errno 13] Permission denied)
+its snapshot file: refused (head: cannot open '/var/lib/tinfirm-node-agent/work/tfvm-000000000082-) ; its console file: refused (head: cannot open '/var/lib/tinfirm-node-agent/work/tfvm-000000000082-) ; the work directory: refused (ls: cannot open directory '/var/lib/tinfirm-node-agent/work': Permissi) ; its snapshot device: refused (head: cannot open '/dev/mapper/tinfirm-tfvm-000000000082-0001' for rea) ; write to it: refused (sh: 1: cannot create /dev/mapper/tinfirm-tfvm-000000000082-0001: Permi)
+its VMM's memory: refused (sh: 1: cannot open /proc/10986/mem: Permission denied) ; environment: refused (head: cannot open '/proc/10986/environ' for reading: Permission denied) ; root: refused (ls: cannot access '/proc/10986/root/': Permission denied) ; open files: refused (ls: cannot open directory '/proc/10986/fd': Permission denied) ; command line: ALLOWED (public on Linux; it holds no secret)
+trace its VMM: refused (errno 1) ; signal 0: refused (kill: (10986): Operation not permitted) ; SIGKILL: refused (kill: (10986): Operation not permitted)
+-- its own VM's things, by the node's names
+its own jail directory: refused (ls: cannot open directory '/srv/tinfirm-jails/firecracker/tfvm-0000000) (root's, 0700: even its own chroot has no path from outside) ; its own snapshot file: refused (head: cannot open '/var/lib/tinfirm-node-agent/work/tfvm-000000000081-) ; the list of jails: ALLOWED (their names say nothing of a run)
+-- the agent
+the helper's socket: refused (PermissionError: [Errno 13] Permission denied) ; its directory: refused (ls: cannot open directory '/run/tinfirm-node-agent-helper': Permission) ; the helper's record: refused (ls: cannot open directory '/var/lib/tinfirm-node-agent/helper': Permis) ; the spool: refused (ls: cannot open directory '/var/lib/tinfirm-node-agent/spool': Permiss) ; the listener's records: refused (ls: cannot open directory '/var/lib/tinfirm-node-agent/listener': Perm)
+the node's key: refused (head: cannot open '/etc/tinfirm/node-agent/node.key' for reading: Perm) ; the listener's configuration: refused (head: cannot open '/etc/tinfirm/node-agent/listener.json' for reading:) ; the helper's configuration: ALLOWED (0644: paths and numbers, no secret) ; write it: refused (sh: 1: cannot create /etc/tinfirm/node-agent/helper.json: Permission d) ; the shared image: ALLOWED (0444, by design)
+the helper's memory: refused (sh: 1: cannot open /proc/10700/mem: Permission denied) ; signal 0 to the helper: refused (kill: (10700): Operation not permitted) ; to the listener: refused (kill: (10707): Operation not permitted)
+-- what needs root
+a network namespace: refused (mount --make-shared /run/netns failed: Operation not permitted) ; a firewall table: refused (^^^^^^^^^^^^^^^^^) ; read the firewall: refused (netlink: Error: cache initialization failed: Operation not permitted) ; the device-mapper: refused (Command failed.) ; a loop device: refused (losetup: /etc/hostname: failed to set up loop device: Permission denie) ; a cgroup: refused (mkdir: cannot create directory ‘/sys/fs/cgroup/tinfirm-vms/x’: Per) ; kill a VM by its cgroup: refused (sh: 1: cannot create /sys/fs/cgroup/tinfirm-vms/tfvm-000000000082-0001) ; a tap device: refused (ioctl(TUNSETIFF): Operation not permitted)
+-- the network, from the node itself
+connect to the-other-VM's-published-port (10.0.0.6:20001): refused (ConnectionRefusedError: [Errno 111] Connection refused)
+connect to the-other-VM's-namespace (10.231.0.10:7443): refused (TimeoutError: timed out)
+connect to the-other-guest (10.231.0.14:7443): refused (TimeoutError: timed out)
+connect to the-agent's-port (10.0.0.6:7700): refused (TimeoutError: timed out)
+connect to the-control-host's-SSH (10.0.0.5:22): refused (TimeoutError: timed out)
+the agent's port without the control host's key: refused (TimeoutError)
+
+== after: VMM of tfvm-000000000081-0000 runs, VMM of tfvm-000000000082-0001 runs, helper runs, listener runs, jails 2

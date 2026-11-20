@@ -1,0 +1,10 @@
+the image: node:22; the node: 4 CPUs, 15982 MiB
+chunk 4 KiB: dockerd up 3.166 s, pull 13.992 s, run (2000 small files and 200 MiB) 18.25 s, stop and sync 1.109 s, all 36.521 s; the snapshot: 1822 MiB allocated (0 of them its own tables), the file 1822 MiB on disk; the kernel's unreclaimable slab grew by 13 MiB
+   after the unmount, with the snapshot still there: slab above the start by 5 MiB
+chunk 32 KiB: dockerd up 2.638 s, pull 13.639 s, run (2000 small files and 200 MiB) 20.70 s, stop and sync 1.079 s, all 38.067 s; the snapshot: 1827 MiB allocated (0 of them its own tables), the file 1827 MiB on disk; the kernel's unreclaimable slab grew by 10 MiB
+   after the unmount, with the snapshot still there: slab above the start by 2 MiB
+chunk 4 KiB: dockerd up 3.152 s, pull 14.188 s, run (2000 small files and 200 MiB) 17.63 s, stop and sync 1.072 s, all 36.051 s; the snapshot: 1821 MiB allocated (0 of them its own tables), the file 1821 MiB on disk; the kernel's unreclaimable slab grew by 11 MiB
+   after the unmount, with the snapshot still there: slab above the start by 3 MiB
+chunk 32 KiB: dockerd up 3.162 s, pull 14.348 s, run (2000 small files and 200 MiB) 21.72 s, stop and sync 1.073 s, all 40.313 s; the snapshot: 1827 MiB allocated (0 of them its own tables), the file 1827 MiB on disk; the kernel's unreclaimable slab grew by 10 MiB
+   after the unmount, with the snapshot still there: slab above the start by 2 MiB
+docker's tables removed; left: table ip security;

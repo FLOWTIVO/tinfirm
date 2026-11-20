@@ -443,3 +443,114 @@ A VM by hand in the agent's layout, with a program in its disk that writes a mar
 ```
 
 Kata's guest kernel is built without `ioperm` and `iopl`, has no `/dev/port` and loads no module, so a process in the guest, root included, has no way to the port. Code in the guest's kernel has: the VMM emulates the port whatever the kernel's command line says, and copies what is written to its standard output, the console file, up to the 64 MiB bound. The same file holds Firecracker's own log, which goes to standard output too (its standard error stayed empty), and a guest's kernel can make Firecracker write lines there (`vcpu: IO write @ 0x71 failed`). So "nothing of a guest's log is on the node" was too strong; the README now says what holds. Not changed: the VMM's standard output. Sending it to `/dev/null` would lose Firecracker's own messages, which is where a make's failure is explained; giving Firecracker a log file of its own (`--log-path`) and its standard output to `/dev/null` would keep both apart, and is proposed.
+
+## Third round, 2026-11-20 (05:56 to 08:15 UTC)
+
+On the branch at `54663cd`. The node as before (`vm-sbx-ctl`, 10.0.0.6); the control host was a machine of its own this time (10.0.0.5, a D2s_v6 VM), which drove the node through the runner host's node driver over TLS (`control-host.py`). The agent ran under its units with the node's firewall table, the sysctl file and `tls.controlHost` for 10.0.0.5. The VM image was built again with the branch's runner host (`local-disk.sh`, 313 s).
+
+| Command | Result |
+|---|---|
+| `cargo test -p tinfirm-node-agent`, umask 022 and umask 002 | 82 + 16 + 2 passed under each, the 8 real tests skip |
+| `cargo clippy -p tinfirm-node-agent --all-targets -- -D warnings`, `cargo fmt -p tinfirm-node-agent --check` | clean |
+| `tests/linux_kvm.rs` as root on the node (`r10-linux-kvm.out`) | 8 passed in 47.25 s; make 141 ms, guest ready 3054 ms, delete 89 ms |
+| `tree::tests` as root on the node | 4 passed, the sticky directory's among them (it skips when not root) |
+| Six cycles from the control host, final tree (`r10-two-machines.out`) | create 165 to 173 ms (495 the first), ready 2.9 to 3.2 s, delete 71 to 116 ms; nothing left |
+| `shellcheck -S warning` (0.9.0) on the three `r10-*.sh` and the three scripts of `tests/attack/` | clean |
+
+### No conversation ran: the server refused the host's hello (`r10-server-refuses-hello.out`)
+
+The round was to run real conversations from the owner's server through the node agent. The runner host of the branch, started with `run --executor vm --vm-driver node` and a valid login (`doctor` reports that the server accepted the token), verified the node (`node node-1: 2 free` and every check) and was then refused before `welcome`:
+
+```
+WARN  Invalid hello message: isolationTiers[0].<list element> must match "container|gvisor|microvm"  code=BAD_MESSAGE
+ERROR fatal connection error error=the server refused this runner host's hello (close 1008: Expected a valid hello)
+```
+
+The host reports `machine` with this driver, and the server is an earlier release that does not know the value, as `runner/README.md` says under "Compatibility with the server". Nothing was worked around and nothing was changed at the server. So still **no conversation has run through a node**, and everything below was driven by the script in the runner host's place.
+
+### A jail is a file system of its own (`r10-node.out`, `r10-node.sh`)
+
+Chosen over a project quota, which needs a file system set up for it on every node: the helper mounts a tmpfs on each chroot (`size=` from `firecracker.jailMib`, 64 MiB by default; 1024 inodes; `nosuid`) before it puts anything there. A VM's user can then fill its own jail and nothing else: not the jails' file system, and not the work directory, where the other VMs' snapshots are sparse files that a full disk would invalidate (the review's R3). The price is memory, at most `jailMib` for each VM, which `check` counts.
+
+```
+in the helper's mount namespace: .../tfvm-...-0000/root rw,nosuid,relatime shared:372 - tmpfs tinfirm-jail rw,size=65536k,nr_inodes=1024,mode=700,inode64
+in the node's own namespace the chroot is an empty directory: 0 entries; the user data and the VMM's files are in memory only
+-- the VM's user fills it: 22781952 bytes copied; names until none is left: 1007; chmod 1700 on a directory with a file, and on the chroot: done
+... the node's work file system changed by 28 KiB; the VMM still runs: 1
+-- the next VM beside it: create: 150 ms ... running at 10.0.0.6:20001
+delete of the filled, sticky one: delete: ({}, 57)
+left: jails 0, VMMs 0, device-mapper 0, ..., jail mounts in the helper's namespace 0, in the node's 0
+```
+
+Under the helper's unit the mount is in the helper's own mount namespace, so nothing of a jail, the user-data disk included, is on the node's disk. A helper that is started again does not see the earlier helper's jails as mounts (section 2 of the file): their file systems end with their VMMs, and the delete finds an empty directory and leaves nothing. The same is a real test (`a_vms_user_that_fills_its_jail_takes_nothing_from_the_node_or_the_next_vm`).
+
+### The review's R1: a sticky bit made a jail undeletable (`r10-review-before.out`)
+
+Confirmed on the node with the agent as of `bb0cb70`: after `chmod 1700` on the chroot by the VM's user, every delete failed with `the jail ... (permission denied)`, the VM stayed listed as `failed` with its slot, and only root with every capability could undo it by hand. Two things close it. The jail's own file system is unmounted, whatever is in it. And `remove_tree`, which still removes what a jail's directory holds otherwise, now makes itself the owner of each directory before it empties it, and no longer reads "permission denied" as "a directory". The unit test for it runs only as root, since it needs another user's files: a thread without `CAP_FOWNER` is refused the plain unlink first, and then removes the tree. What else a user can set on its own files was thought through, not tried: the crate's README lists it.
+
+### The removal keeps no list (`src/tree.rs`)
+
+The list of moved directories is gone: the top is read again, a round of 1024 names at a time, until a pass finds nothing, so a directory of millions of directories costs the helper one round of names. The loop has no early end (the review's R4): the test fills the top with more than two rounds of directories left by an earlier attempt, beside one directory that holds ten rounds of directories. Time is bounded by the number of entries, and that by the jail's 1024 inodes where the jail is its own file system.
+
+### The room check fails closed, and what `check` now counts
+
+`room_problem` no longer counts a snapshot it cannot read as absent: a work directory or an entry that cannot be read makes the answer "the room is not known", for `check` and for a make (unit test). `check` counts for each VM its guest's memory, 128 MiB for the VMM, the jail's `jailMib`, and the kernel's memory for a snapshot written full (the review's R2, below).
+
+### Firecracker's log, and what a failed start now says (`r10-linux-kvm.out`)
+
+Firecracker writes its own messages to `firecracker.log` in the jail (`--log-path`). Its standard output carries the guest's serial console alone: a file with `guestConsole`, `/dev/null` without, so code in a guest's kernel that writes to the serial port's address writes into nothing (the second round's finding 9). Its standard error is a file of its own. A make whose VMM ends before its guest runs now says why:
+
+```
+the VMM ended before its guest ran: Firecracker's log ends with: ... [tfvm-...:main:ERROR] RunWithApiError error: Failed to build MicroVM from Json: ... Cannot load kernel due to invalid memory configuration or invalid kernel image: Kernel Loader: failed to load ELF kernel image: Kernel Loader: Unable to read elf header | ...; its standard error: Error: RunWithApi(BuildFromJson(StartMicroVM(ConfigureSystem(KernelLoader(Elf(ReadElfHeader))))))
+```
+
+Two things were found on the way. Asking Firecracker's API while it gives up on its configuration ends its API thread first (`Firecracker panicked ... VMM disconnected`, then a seccomp kill), and the log then never names the cause: the helper now asks the API only once the log says that the VM is started. And a guest can make the log grow, since Firecracker warns of every access to a port it does not emulate: the log is bounded by the jail's size.
+
+### `io.max` (`r10-io-max.out`, `r10-io-max.sh`)
+
+A template can carry it (`ioMax`), but not through the jailer, which refuses a cgroup value with `=` in it (`Invalid format for cgroups: io.max=252:0 rbps=...`): the helper writes it into the VM's cgroup once the jailer has made it. The root cgroup of the node did not hand down the controller `io`; the helper's unit now asks the service manager for it (`IOAccounting=yes`), and `check` names it when a template has an `ioMax` and the controller is missing.
+
+```
+-- no ioMax in the template:  the guest's bridge answers 3614 ms after the create was sent
+-- ioMax 4 MiB/s and 200 operations/s each way: io.max of the VM's cgroup: 252:0 rbps=4194304 wbps=4194304 riops=200 wiops=200
+   the guest's bridge did not answer within 180 s; io.stat: 252:0 rbytes=180707328 ... rios=44079 ...
+-- back to no limit: 3164 ms
+```
+
+The limit holds for a real VMM's reads (a guest's boot reads 180 MiB in 44 000 operations, which 200 a second stretch to minutes). Not measured: writes under a limit, and a limit that an ordinary run should have.
+
+### The snapshot's chunk size (`r10-snapshot-chunk.out`, `r10-snapshot-chunk.sh`)
+
+Not measured in a conversation, since none ran. A stand-in on the node: the node's own dockerd with its data on a mounted snapshot of the VM image, where the guest's dockerd has it, pulling `node:22` and running a container that writes 2000 small files and 200 MiB.
+
+| Chunk | All | Snapshot on disk | Kernel's slab, grown by |
+|---|---|---|---|
+| 4 KiB | 36.5 s, 36.1 s | 1822 MiB, 1821 MiB | 13 MiB, 11 MiB |
+| 32 KiB | 38.1 s, 40.3 s | 1827 MiB, 1827 MiB | 10 MiB, 10 MiB |
+
+No clear gain either way, so the default stays 4 KiB. For such writes the kernel's memory is small (about 6 MiB for each GiB written). The second round's worst case stands for writes at random, about 150 bytes for each chunk: `check` counts 160 bytes for every chunk of `snapshotMib` in each VM's memory (R2), 320 MiB for the 8 GiB of the template that ran.
+
+### The node's firewall at boot (`r10-reboot.out`), the review's R5
+
+- The helper's unit now requires the firewall's unit: with a typing mistake in the file (`control_host = 10.0.0.555`) the firewall's unit fails and neither helper nor listener starts. `check` also says whether the table is there (`NOT THERE: the node's own firewall table ...` after a delete by hand), as a line and not as a problem, since the helper works without it.
+- The unit's file replaces the table in one transaction, and the unit no longer deletes the table when it stops: a restart leaves no moment without it (`the table before 1, after 1`).
+- The unit has no default dependencies and is wanted by `sysinit.target`. A reboot with the four units enabled: the firewall was active 3.6 s after the start, before `network-pre.target` (4.6 s) and the network (4.7 s); the helper at 4.4 s, the listener at 6.0 s; no ordering cycle; a cycle from the control host passed.
+- **That reboot needed cloud-init switched off.** With cloud-init as the image has it, the node did not finish its start: the table was loaded at 3.3 s, cloud-init then asked the metadata service ten times in 310 s and failed, nothing more was logged, and the node refused SSH for 21 minutes until it was deleted. A node's image must not need a network service of its platform for its start. The crate's README says so; the role does not handle it yet.
+
+### The review's other findings
+
+- **R6**: a `firecracker.jailer` that is not named `jailer` is refused when the configuration is read (`Error: firecracker.jailer must be a file named \`jailer\``).
+- **R7**: parsing a request's parameters by reference, so that no copy is dropped unwiped on a failure, was tried and dropped: it left the user data once more in the listener's memory on every create (`r10-listener-memory.out`: found in two of two runs after one further call). With the code as it was, the ticket was found in the listener's memory in one of three runs after one further call, and not after three calls with either: the second round's "not found" was one run. What stays is outside the agent's code. A `create` refused for its form still drops its copy unwiped. The spool is not on a tmpfs; the README says what that leaves.
+- **R8**: the crate's README now says what the code does about the jail's size, the chunk's cost, the removal and the sticky bit.
+
+### The role's author's list
+
+Fixed in the README: one account, not two; the fixed paths; the modes of the image and the kernel; ufw and firewalld beside Docker; updates need their mirror in the firewall's file; how an image is replaced under running VMs; no kernel pinned for aarch64; what the helper checks of the control host's address; the owner of what `identity` writes; the role's state. The firewall's file has a `define ssh_port`. Not built: a `check` subcommand for an operator. It would need the helper's socket opened as the listener's user and the helper's wire spoken from a second place; the role's small client does that today.
+
+### Still not tested after this round
+
+- A conversation through a node: the server must be of the branch's release first.
+- The snapshot's chunk size and `io.max` under a real run's writes.
+- AppArmor: the node has it enabled (24 profiles enforced), and an unconfined process made 6000 directories below one another without a refusal. No enforcing profile at hand let a test process make directories, and no profile was written, so what a confined helper's `remove_tree` meets was not shown. It names every entry relative to an open directory, by one name, so it passes no long path to the kernel; whether AppArmor's own path of such an entry (which it builds for its check, and which is what a CI container's `mkdir` met at 8192 bytes) refuses the removal under a profile is open, and belongs to the hardening that writes the profile.
+- The role: it did not run. Its copies of the units and of the firewall's file were changed with this round's.
+- An aarch64 node.
