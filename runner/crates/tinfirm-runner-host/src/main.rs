@@ -2435,14 +2435,19 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths) {
         anyhow::Ok(())
     }
     .await;
-    let wire = match wire {
-        Ok(()) => "its wire to `run` works: ready, a round trip, a descriptor passed".to_string(),
-        Err(e) => format!("its wire to `run` failed: {e:#}"),
-    };
+    // A warning while `run` starts no front; a failure once the slice that has `run` start
+    // fronts for its sandboxes lands (path C part 2, slice 6), as the reader's probe is.
+    match wire {
+        Ok(()) => checks.ok("front wire", "ready, a round trip, a descriptor passed"),
+        Err(e) => checks.warn(
+            "front wire",
+            format!("{e:#} (`run` does not start fronts yet)"),
+        ),
+    }
     match probe {
         Ok(probe) if probe.confined() => checks.ok(
             "front",
-            format!("confined: {}; {wire} ({UNUSED})", probe.describe()),
+            format!("confined: {} ({UNUSED})", probe.describe()),
         ),
         Ok(probe) => checks.info(
             "front",

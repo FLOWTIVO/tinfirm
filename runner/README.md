@@ -805,10 +805,15 @@ not run by hand; `reader.rs`, `confine.rs`).
     plain reads, so a descriptor that a front sends back is closed by the kernel. A front that
     sends anything else (a frame over its bound, bytes that are not one of the messages, a
     second `ready`, an answer to nothing `run` asked) is ended at once, its process group
-    killed, and only its own handle says why; every other front goes on. A front that is not
-    ready within 10 s, or exits, is reported with its exit status and the start of its stderr.
-    `doctor` also tries the wire: "its wire to `run` works: ready, a round trip, a descriptor
-    passed".
+    killed, and only its own handle says why; every other front goes on. So is a channel that
+    ends inside a frame, and a front that does not answer a request within 10 s. A front that is
+    not ready within 10 s, or exits, is reported with its exit status and the start of its
+    stderr. A front's process group is signalled only until the front is reaped, under one lock
+    with the reaping, so a group id given to another process since is never signalled; the host
+    reaps every front, also after its handle is dropped.
+    `doctor` also tries the wire, on a line of its own: `[ ok ] front wire: ready, a round
+    trip, a descriptor passed`, or a warning with the reason (a failure once `run` starts
+    fronts).
 
 ## A VM per run
 

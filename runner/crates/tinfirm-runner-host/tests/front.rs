@@ -169,6 +169,17 @@ fn hostile_front(mode: &str, extra: &[(&str, &str)]) -> FrontCommand {
     }
 }
 
+/// Reads one frame of `run`'s from `socket`.
+fn next_message_init(socket: &std::os::fd::OwnedFd) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut input = std::fs::File::from(socket.try_clone().ok()?);
+    let mut header = [0u8; 4];
+    input.read_exact(&mut header).ok()?;
+    let mut payload = vec![0u8; u32::from_be_bytes(header) as usize];
+    input.read_exact(&mut payload).ok()?;
+    Some(payload)
+}
+
 /// A seeded xorshift, as the bridge's hostile peers use.
 struct Rng(u64);
 
@@ -199,14 +210,17 @@ fn hostile_front_child() {
     let frame = |message: &ToMain| wire::encode(message, wire::MAX_TO_MAIN).unwrap();
     // Reads `run`'s next frame (the tests' fronts answer pings in order).
     let mut input = std::fs::File::from(socket.try_clone().unwrap());
-    let mut next_ping = move || -> Option<u64> {
+    let mut next_message = move || -> Option<ToFront> {
         use std::io::Read;
+        let mut header = [0u8; 4];
+        input.read_exact(&mut header).ok()?;
+        let mut payload = vec![0u8; u32::from_be_bytes(header) as usize];
+        input.read_exact(&mut payload).ok()?;
+        wire::decode_to_front(&payload).ok()
+    };
+    let mut next_ping = move || -> Option<u64> {
         loop {
-            let mut header = [0u8; 4];
-            input.read_exact(&mut header).ok()?;
-            let mut payload = vec![0u8; u32::from_be_bytes(header) as usize];
-            input.read_exact(&mut payload).ok()?;
-            if let ToFront::Ping { id } = wire::decode_to_front(&payload).ok()? {
+            if let ToFront::Ping { id } = next_message()? {
                 return Some(id);
             }
         }
@@ -280,6 +294,31 @@ fn hostile_front_child() {
         "early-exit" => {
             eprintln!("boom before ready");
             std::process::exit(7);
+        }
+        "partial-header" => {
+            let _ = out.write_all(&frame(&ready()));
+            // `init` read first: an exit with unread bytes would reset the channel.
+            let _ = next_message_init(&socket);
+            let _ = out.write_all(&[0, 0]);
+            std::process::exit(0);
+        }
+        "partial-payload" => {
+            let _ = out.write_all(&frame(&ready()));
+            // `init` read first: an exit with unread bytes would reset the channel.
+            let _ = next_message_init(&socket);
+            let _ = out.write_all(&[0, 0, 0, 100]);
+            let _ = out.write_all(b"{\"type\":");
+            std::process::exit(0);
+        }
+        "exit-after-ready" => {
+            let _ = out.write_all(&frame(&ready()));
+            // `init` read first: an exit with unread bytes would reset the channel.
+            let _ = next_message_init(&socket);
+            std::process::exit(0);
+        }
+        "mute" => {
+            let _ = out.write_all(&frame(&ready()));
+            while next_ping().is_some() {}
         }
         "crash-later" => {
             let _ = out.write_all(&frame(&ready()));
@@ -551,6 +590,136 @@ fn without_landlock_the_fronts_seccomp_filter_still_refuses_sockets_signals_and_
     assert!(!probe.spawn && !probe.exec, "{probe:?}");
     assert!(probe.own_group && probe.runtime, "{probe:?}");
     ended(bystander);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_front_that_does_not_answer_is_ended_and_leaves_no_request_waiting() {
+    let mut handle = FrontHandle::spawn(&hostile_front("mute", &[]), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    handle.set_answer_timeout(Duration::from_millis(300));
+    let error = handle.ping().await.unwrap_err();
+    assert!(format!("{error:#}").contains("did not answer"), "{error:#}");
+    assert_eq!(handle.waiting(), 0, "the request stays recorded");
+    let ended = tokio::time::timeout(Duration::from_secs(10), handle.wait_ended())
+        .await
+        .unwrap();
+    assert!(
+        matches!(&ended, Ended::Broken(why) if why.contains("did not answer")),
+        "{ended:?}"
+    );
+    // A request on an ended front fails at once and leaves nothing recorded either.
+    assert!(handle.ping().await.is_err());
+    assert!(handle.check_descriptor().await.is_err());
+    assert_eq!(handle.waiting(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_end_inside_a_frame_is_a_broken_wire_and_one_between_frames_is_not() {
+    for (mode, why) in [
+        ("partial-header", "inside a frame's header"),
+        ("partial-payload", "within a frame"),
+    ] {
+        let handle = FrontHandle::spawn(&hostile_front(mode, &[]), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(10), handle.wait_ended())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ended, Ended::Broken(text) if text.contains(why)),
+            "{mode}: {ended:?}"
+        );
+    }
+    let handle = FrontHandle::spawn(
+        &hostile_front("exit-after-ready", &[]),
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(10), handle.wait_ended())
+        .await
+        .unwrap();
+    assert!(
+        matches!(ended, Ended::Exited { code: Some(0), .. }),
+        "{ended:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_signals_no_group_once_its_front_is_reaped() {
+    let handle = FrontHandle::spawn(
+        &hostile_front("exit-after-ready", &[]),
+        uuid::Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    let pgid = handle.pgid();
+    assert_eq!(handle.signalled_group(), Some(pgid));
+    handle.wait_ended().await;
+    // Reaped: its id may belong to another process by now, and is never signalled again.
+    assert_eq!(handle.signalled_group(), None);
+    drop(handle);
+    // A live front's group is signalled at the drop, before it is reaped.
+    let live = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    let pid = live.pgid();
+    assert_eq!(live.signalled_group(), Some(pid));
+    drop(live);
+    assert!(gone(pid).await);
+}
+
+/// The children of this process that are zombies.
+fn zombies() -> Vec<u32> {
+    let me = std::process::id();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                let fields: Vec<&str> = stat
+                    .rsplit(')')
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect();
+                fields.first() == Some(&"Z") && fields.get(1) == Some(&me.to_string().as_str())
+            })
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fronts_started_and_dropped_by_the_hundred_leave_no_zombie() {
+    let mut pids = Vec::new();
+    for _ in 0..300 {
+        let front = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        pids.push(front.pgid());
+        drop(front);
+    }
+    // Every front is reaped by its handle's reader, shortly after the drop.
+    let mut left = Vec::new();
+    for _ in 0..200 {
+        let zombies = zombies();
+        left = pids
+            .iter()
+            .copied()
+            .filter(|p| zombies.contains(p) || alive(*p))
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        left.is_empty(),
+        "{} fronts not reaped: {left:?}",
+        left.len()
+    );
 }
 
 /// The plan's 2.8, as far as this slice makes it measurable: a front's start (to `ready`), its

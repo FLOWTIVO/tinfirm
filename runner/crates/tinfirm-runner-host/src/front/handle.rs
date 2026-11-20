@@ -9,7 +9,13 @@
 //! front sends along is closed by the kernel and never reaches `run`.
 //!
 //! A front that ends by itself (a crash, or its own refusal) is [`Ended::Exited`], with its
-//! exit status and the start of what it wrote on stderr.
+//! exit status and the start of what it wrote on stderr. A front that does not answer within
+//! its time is ended too, and so is one whose channel ends inside a frame.
+//!
+//! Its process group is signalled only while the front is not yet reaped: every signal, and
+//! the step that reaps the front, happen under one lock, which the reaping step clears, so a
+//! group id that the system gave to another process since is never signalled. The reader always runs to the end and reaps the front, also after the
+//! handle is dropped.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -24,7 +30,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{oneshot, watch};
-use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::confine::{self, Status};
@@ -106,6 +111,29 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The front's process group while it may be signalled, and why `run` broke its wire.
+struct Life {
+    /// `Some` until the front is about to be reaped; signals go only under this lock.
+    group: Mutex<Option<u32>>,
+    /// Set when `run` ends the front for a reason of its own (a request without an answer).
+    broken: Mutex<Option<String>>,
+}
+
+impl Life {
+    /// Kills the front's group, if it is not reaped yet.
+    fn kill(&self) {
+        if let Some(pgid) = *lock(&self.group) {
+            confine::kill_group(pgid);
+        }
+    }
+
+    /// Ends the front for `why`, which its end then reports.
+    fn break_wire(&self, why: String) {
+        lock(&self.broken).get_or_insert(why);
+        self.kill();
+    }
+}
+
 /// A front process and its control channel.
 pub struct FrontHandle {
     pgid: u32,
@@ -114,7 +142,8 @@ pub struct FrontHandle {
     pending: Arc<Mutex<Pending>>,
     next_id: AtomicU64,
     ended: watch::Receiver<Option<Ended>>,
-    reader: JoinHandle<()>,
+    life: Arc<Life>,
+    answer_timeout: Duration,
 }
 
 impl std::fmt::Debug for FrontHandle {
@@ -149,8 +178,10 @@ impl FrontHandle {
         // a front that exits would not end its channel.
         drop(process);
         let pgid = child.id().context("the front has no pid")?;
-        // From here on, an error kills the front's group.
-        let guard = KillOnDrop(Some(pgid));
+        let life = Arc::new(Life {
+            group: Mutex::new(Some(pgid)),
+            broken: Mutex::new(None),
+        });
         let stderr = Arc::new(Mutex::new(Vec::new()));
         if let Some(mut pipe) = child.stderr.take() {
             let kept = stderr.clone();
@@ -168,34 +199,44 @@ impl FrontHandle {
         }
         ours.set_nonblocking(true)?;
         let (mut reader, writer) = UnixStream::from_std(ours)?.into_split();
-        let status = match tokio::time::timeout(READY_TIMEOUT, read_message(&mut reader)).await {
-            Ok(Ok(Some(ToMain::Ready { status }))) => status,
-            Ok(Ok(Some(other))) => bail!(
+        let ready = match tokio::time::timeout(READY_TIMEOUT, read_message(&mut reader)).await {
+            Ok(Ok(Some(ToMain::Ready { status }))) => Ok(status),
+            Ok(Ok(Some(other))) => Err(format!(
                 "the front's first message was not `ready` but {}",
                 kind(&other)
-            ),
-            Ok(Ok(None)) => {
-                let _ = child.wait().await;
-                let stderr = String::from_utf8_lossy(&lock(&stderr)).trim().to_string();
-                bail!("the front ended before it was ready: {stderr}")
-            }
-            Ok(Err(e)) => bail!("the front broke its wire before it was ready: {e}"),
-            Err(_) => bail!(
+            )),
+            Ok(Ok(None)) => Err("the front ended before it was ready".to_string()),
+            Ok(Err(e)) => Err(format!(
+                "the front broke its wire before it was ready: {e:#}"
+            )),
+            Err(_) => Err(format!(
                 "the front was not ready within {} s",
                 READY_TIMEOUT.as_secs()
-            ),
+            )),
+        };
+        let status = match ready {
+            Ok(status) => status,
+            Err(why) => {
+                // Ended and reaped here: nothing of it outlives the failed start.
+                let _ = reap(&life, &mut child, true).await;
+                let stderr = String::from_utf8_lossy(&lock(&stderr)).trim().to_string();
+                if stderr.is_empty() {
+                    bail!("{why}");
+                }
+                bail!("{why}: {stderr}");
+            }
         };
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (ended_tx, ended) = watch::channel(None);
-        let reader = tokio::spawn(read_loop(
+        tokio::spawn(read_loop(
             reader,
             child,
             pgid,
             pending.clone(),
             ended_tx,
             stderr,
+            life.clone(),
         ));
-        std::mem::forget(guard);
         let handle = FrontHandle {
             pgid,
             status,
@@ -203,7 +244,8 @@ impl FrontHandle {
             pending,
             next_id: AtomicU64::new(1),
             ended,
-            reader,
+            life,
+            answer_timeout: ANSWER_TIMEOUT,
         };
         handle.send(&ToFront::Init { run: run_id }, None).await?;
         Ok(handle)
@@ -217,6 +259,22 @@ impl FrontHandle {
     /// The front's process group.
     pub fn pgid(&self) -> u32 {
         self.pgid
+    }
+
+    /// How long a round trip or a check may take from now on (tests shorten it).
+    pub fn set_answer_timeout(&mut self, timeout: Duration) {
+        self.answer_timeout = timeout;
+    }
+
+    /// The process group that the handle would still signal: `None` once the front is reaped.
+    pub fn signalled_group(&self) -> Option<u32> {
+        *lock(&self.life.group)
+    }
+
+    /// The requests that wait for the front's answer.
+    pub fn waiting(&self) -> usize {
+        let pending = lock(&self.pending);
+        pending.pongs.len() + pending.checks.len()
     }
 
     /// How the front ended, once it has.
@@ -268,8 +326,13 @@ impl FrontHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         lock(&self.pending).pongs.insert(id, tx);
-        self.send(&ToFront::Ping { id }, None).await?;
-        self.answer(rx).await
+        let answered = match self.send(&ToFront::Ping { id }, None).await {
+            Ok(()) => self.answer(rx).await,
+            Err(e) => Err(e),
+        };
+        // An answer that comes after this is to nothing asked: the wire is broken then.
+        lock(&self.pending).pongs.remove(&id);
+        answered
     }
 
     /// Sends the front a descriptor and reads back what it writes on it: descriptors arrive.
@@ -280,9 +343,15 @@ impl FrontHandle {
         let mut ours = UnixStream::from_std(ours)?;
         let (tx, rx) = oneshot::channel();
         lock(&self.pending).checks.insert(id, tx);
-        self.send(&ToFront::Check { id }, Some(OwnedFd::from(theirs)))
-            .await?;
-        self.answer(rx).await?;
+        let answered = match self
+            .send(&ToFront::Check { id }, Some(OwnedFd::from(theirs)))
+            .await
+        {
+            Ok(()) => self.answer(rx).await,
+            Err(e) => Err(e),
+        };
+        lock(&self.pending).checks.remove(&id);
+        answered?;
         let mut reply = Vec::new();
         tokio::time::timeout(
             ANSWER_TIMEOUT,
@@ -298,12 +367,18 @@ impl FrontHandle {
         Ok(())
     }
 
+    /// Waits for an answer. A front that does not answer in time is ended: what it would
+    /// still send could only be an answer to nothing asked.
     async fn answer(&self, rx: oneshot::Receiver<()>) -> Result<()> {
         tokio::select! {
-            answered = tokio::time::timeout(ANSWER_TIMEOUT, rx) => match answered {
+            answered = tokio::time::timeout(self.answer_timeout, rx) => match answered {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(_)) => bail!("{}", self.ended().map_or_else(|| "the front ended".to_string(), |e| e.to_string())),
-                Err(_) => bail!("the front did not answer within {} s", ANSWER_TIMEOUT.as_secs()),
+                Err(_) => {
+                    let why = format!("the front did not answer within {:?}", self.answer_timeout);
+                    self.life.break_wire(why.clone());
+                    bail!("{why}")
+                }
             },
             ended = self.wait_ended() => bail!("{ended}"),
         }
@@ -313,20 +388,44 @@ impl FrontHandle {
 impl Drop for FrontHandle {
     fn drop(&mut self) {
         // Its channel closes with the handle, and the front exits on that; its group goes too,
-        // whatever it is doing.
-        confine::kill_group(self.pgid);
-        self.reader.abort();
+        // whatever it is doing, unless it is reaped already. The reader goes on and reaps it.
+        self.life.kill();
     }
 }
 
-/// Kills a group that has not been handed on yet.
-struct KillOnDrop(Option<u32>);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        if let Some(pgid) = self.0.take() {
-            confine::kill_group(pgid);
+/// Reaps the front, `kill`ing its group first if asked, so that no signal can reach a group id
+/// given to another process since: each look at it (`try_wait`, which reaps) and each kill
+/// happens under the group's lock, and the lock is cleared in the same step that reaps it. It
+/// is called once the channel has ended, so the front is gone or going, and looks every 10 ms
+/// until then.
+async fn reap(
+    life: &Life,
+    child: &mut tokio::process::Child,
+    kill: bool,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut killed = !kill;
+    loop {
+        {
+            let mut group = lock(&life.group);
+            if !killed {
+                if let Some(pgid) = *group {
+                    confine::kill_group(pgid);
+                }
+                killed = true;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    group.take();
+                    return Ok(status);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    group.take();
+                    return Err(e);
+                }
+            }
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -341,10 +440,14 @@ fn kind(message: &ToMain) -> &'static str {
 /// The next message from the front: `Ok(None)` at the end of its channel.
 async fn read_message(reader: &mut OwnedReadHalf) -> Result<Option<ToMain>> {
     let mut header = [0u8; wire::HEADER];
-    match reader.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let mut got = 0;
+    while got < wire::HEADER {
+        match reader.read(&mut header[got..]).await? {
+            // An end before any byte of a frame is the channel's end; within one it is not.
+            0 if got == 0 => return Ok(None),
+            0 => bail!("the channel ended inside a frame's header"),
+            read => got += read,
+        }
     }
     let length = wire::frame_length(header, MAX_TO_MAIN)?;
     let mut payload = vec![0u8; length];
@@ -362,6 +465,7 @@ async fn read_loop(
     pending: Arc<Mutex<Pending>>,
     ended: watch::Sender<Option<Ended>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    life: Arc<Life>,
 ) {
     let broken = loop {
         let message = match read_message(&mut reader).await {
@@ -386,11 +490,13 @@ async fn read_loop(
     };
     if let Some(why) = &broken {
         tracing::warn!(pgid, why = %why, "a front broke its wire; it is ended");
-        confine::kill_group(pgid);
     }
-    let status = child.wait().await;
+    // A front whose wire broke is killed before it is reaped; one that closed its channel is
+    // waited for, and killed if it stays (it may not keep anything running).
+    let status = reap(&life, &mut child, true).await;
     // Its stderr is read to its end, or the group's kill ended it.
     tokio::time::sleep(Duration::from_millis(50)).await;
+    let broken = broken.or_else(|| lock(&life.broken).take());
     let how = match broken {
         Some(why) => Ended::Broken(why),
         None => {
