@@ -78,3 +78,7 @@ path = "../../../ee/runner/tinfirm-runner-host/tests/pool_runs.rs"
 [[test]]
 name = "digitalocean_runs"
 path = "../../../ee/runner/tinfirm-runner-host/tests/digitalocean_runs.rs"
+
+[[test]]
+name = "pod_driver_runs"
+path = "../../../ee/runner/tinfirm-runner-host/tests/pod_driver_runs.rs"

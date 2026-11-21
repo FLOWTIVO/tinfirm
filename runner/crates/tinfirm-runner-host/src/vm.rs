@@ -15,10 +15,10 @@
 //! created for whichever run claims it (crate::pool), and is deleted after that run.
 //!
 //! The executor and the driver protocol are in the core (ADR-0114): an operator can bring a
-//! driver of their own. The drivers built into this binary for a provider are paid
-//! (DigitalOcean's, crate::digitalocean): a host with one lists the feature `sandbox.elastic`
-//! ([`DriverCommand::elastic`]). The driver for sandbox nodes (crate::node) is this binary's
-//! too, and in the core ([`Builtin::Node`]).
+//! driver of their own. The drivers built into this binary for a provider or a cluster are paid
+//! (DigitalOcean's, crate::digitalocean, and the pod per run, crate::kubernetes): a host with
+//! one lists the feature `sandbox.elastic` ([`DriverCommand::elastic`]). The driver for sandbox
+//! nodes (crate::node) is this binary's too, and in the core ([`Builtin::Node`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -116,15 +116,21 @@ pub enum Builtin {
     Digitalocean,
     /// Sandbox nodes (crate::node, ADR-0112), in the core, with the configuration it reads.
     Node { config: PathBuf },
+    /// A pod per run in a Kubernetes cluster (crate::kubernetes, ADR-0115 decision 2), paid,
+    /// with the configuration it reads.
+    Pod { config: PathBuf },
 }
 
 impl DriverCommand {
-    /// `--vm-driver`: `digitalocean` or `node` for this binary's own drivers, or a command line
-    /// of the operator's own driver, split at white space (no quoting).
+    /// `--vm-driver`: `digitalocean`, `node` or `pod` for this binary's own drivers, or a
+    /// command line of the operator's own driver, split at white space (no quoting).
     pub fn parse(value: &str) -> Result<DriverCommand> {
         let value = value.trim();
         if value == crate::node::BUILTIN_NODE {
             return DriverCommand::node(crate::node::config_path());
+        }
+        if value == crate::kubernetes::BUILTIN_POD {
+            return DriverCommand::pod(crate::kubernetes::config_path());
         }
         if value == BUILTIN_DIGITALOCEAN {
             return Ok(DriverCommand {
@@ -162,11 +168,32 @@ impl DriverCommand {
         })
     }
 
-    /// One of this binary's paid drivers (ADR-0114), DigitalOcean's today: the host lists the
-    /// feature `sandbox.elastic`, which a server refuses without its licence's elastic
-    /// runners. The node driver and an operator's own driver are not.
+    /// The driver of a pod per run (crate::kubernetes, ADR-0115 decision 2) with its
+    /// configuration at `config`, which it gets as `--config`: the host and the driver read one
+    /// file.
+    pub fn pod(config: PathBuf) -> Result<DriverCommand> {
+        Ok(DriverCommand {
+            program: std::env::current_exe().context("cannot find this executable")?,
+            args: vec![
+                "vm-driver".into(),
+                crate::kubernetes::BUILTIN_POD.into(),
+                "--config".into(),
+                config.to_string_lossy().into_owned(),
+            ],
+            env: Vec::new(),
+            builtin: Some(Builtin::Pod { config }),
+        })
+    }
+
+    /// One of this binary's paid drivers (ADR-0114), DigitalOcean's and the pod per run, whose
+    /// room is a provider's quota or the runs' namespace's: the host lists the feature
+    /// `sandbox.elastic`, which a server refuses without its licence's elastic runners. The
+    /// node driver and an operator's own driver are not.
     pub fn elastic(&self) -> bool {
-        matches!(self.builtin, Some(Builtin::Digitalocean))
+        matches!(
+            self.builtin,
+            Some(Builtin::Digitalocean | Builtin::Pod { .. })
+        )
     }
 }
 
@@ -1959,6 +1986,16 @@ mod tests {
         assert_eq!(node.program, std::env::current_exe().unwrap());
         assert_eq!(node.builtin, Some(Builtin::Node { config }));
         assert!(!node.elastic());
+        // The pod per run is this binary's, and paid.
+        let pod = DriverCommand::parse("pod").unwrap();
+        let config = crate::kubernetes::config_path();
+        assert_eq!(
+            pod.args,
+            ["vm-driver", "pod", "--config", &config.to_string_lossy()]
+        );
+        assert_eq!(pod.program, std::env::current_exe().unwrap());
+        assert_eq!(pod.builtin, Some(Builtin::Pod { config }));
+        assert!(pod.elastic());
         let own = DriverCommand::parse("  /opt/drivers/hetzner --project sandboxes ").unwrap();
         assert_eq!(own.program, PathBuf::from("/opt/drivers/hetzner"));
         assert_eq!(own.args, ["--project", "sandboxes"]);

@@ -21,7 +21,7 @@
 //!
 //! Every field is checked when the file is loaded, and an error names the field. The runner
 //! pod's own node is not here: the chart cannot know it when it renders the file. The driver
-//! takes it from the downward API (planned: `TINFIRM_NODE_NAME`).
+//! takes it from the downward API (`TINFIRM_NODE_NAME`, super::NODE_NAME_ENV).
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -108,7 +108,10 @@ pub struct Template {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Tap {
     pub mode: TapMode,
-    /// The NetworkAttachmentDefinition, `name` or `namespace/name` (Multus only).
+    /// The NetworkAttachmentDefinition, `name` or `namespace/name` (Multus only), which the
+    /// cluster's admin installs: its chain is the `tap` plugin with static IPAM and the
+    /// `tuning` plugin that turns the tap's forwarding off (super::spec::MULTUS_ANNOTATION
+    /// shows it).
     #[serde(default)]
     pub network_attachment: Option<String>,
     /// The tap's /30: the pod's side has its first address, the guest the second.

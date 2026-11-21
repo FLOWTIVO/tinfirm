@@ -3,8 +3,8 @@
 //! the network policies the driver expects to find, and a pod's state in the driver protocol.
 //! Part of elastic runners, under the Tinfirm Enterprise licence (`ee/LICENSE`).
 //!
-//! What runs in the pod (`vm-pod`) is planned. [`vm_pod`] holds every path, name and variable
-//! that it and these objects must agree on.
+//! What runs in the pod is `vm-pod` (super::vm_pod). [`vm_pod`] holds every path, name and
+//! variable that it and these objects must agree on.
 
 use std::collections::BTreeMap;
 
@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use super::api::{dns_subdomain, label_value};
 use super::config::{DiskVolume, PodConfig, TapMode};
 
-/// What the run's pod and `vm-pod` agree on. `vm-pod` (planned) uses these constants and no
-/// literal of its own.
+/// What the run's pod and `vm-pod` agree on. `vm-pod` uses these constants and no literal of
+/// its own.
 pub mod vm_pod {
     /// The runner host's binary in the run pod's image; `vm-pod` is its subcommand.
     pub const BINARY: &str = "/tinfirm/tinfirm-runner-host";
@@ -74,7 +74,30 @@ pub const SANDBOX_VALUE: &str = "vm";
 /// A run pod's name is this and 32 hex digits; its ticket Secret's the other, with the same.
 pub const POD_PREFIX: &str = "tinfirm-vm-";
 pub const TICKET_PREFIX: &str = "tinfirm-ticket-";
-/// Multus' annotation that attaches the tap.
+/// Multus' annotation that attaches the tap: `<networkAttachment>@tap0`.
+///
+/// The cluster's admin installs the NetworkAttachmentDefinition in the runs' namespace; the
+/// chart does not. Its chain must make the tap with the pod's side of `tap.cidr` (here the
+/// default `172.30.0.0/30`) and set the tap's own IPv4 forwarding to 0, which the pod cannot do
+/// and without which `vm-pod` does not start the VM (super::vm_pod::check_tap):
+///
+/// ```json
+/// {
+///   "cniVersion": "1.0.0",
+///   "name": "tinfirm-tap",
+///   "plugins": [
+///     {"type": "tap", "ipam": {"type": "static", "addresses": [{"address": "172.30.0.1/30"}]}},
+///     {"type": "tuning", "sysctl": {"net.ipv4.conf.IFNAME.forwarding": "0"}}
+///   ]
+/// }
+/// ```
+///
+/// The `tuning` plugin puts the interface's name, `tap0`, in place of `IFNAME`. The `tap`
+/// plugin gets no `owner` or `group`: any process of the pod's network namespace may then open
+/// the tap, and the pod has only its own user. Where the pods have IPv6, the same sysctl
+/// object also takes `"net.ipv6.conf.IFNAME.forwarding": "0"`; where they have none, that key
+/// would fail the attachment, since its file does not exist. On OKD the `tap` plugin also takes
+/// the container's SELinux label (`selinuxcontext`).
 pub const MULTUS_ANNOTATION: &str = "k8s.v1.cni.cncf.io/networks";
 /// The largest user data: as DigitalOcean's driver allows.
 pub const MAX_USER_DATA: usize = 64 * 1024;

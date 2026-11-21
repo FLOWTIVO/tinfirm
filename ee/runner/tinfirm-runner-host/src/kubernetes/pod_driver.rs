@@ -22,6 +22,7 @@
 //! create refused for it says so in its message.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,11 +79,7 @@ impl PodDriver {
     /// One request of the driver protocol.
     pub async fn handle(&self, method: &str, params: Value) -> Result<Value> {
         match method {
-            "hello" => Ok(json!({
-                "protocol": DRIVER_PROTOCOL,
-                "driver": DRIVER,
-                "version": env!("CARGO_PKG_VERSION"),
-            })),
+            "hello" => Ok(hello()),
             "verify" => self.verify(str_param(&params, "template")?).await,
             "create" => {
                 self.create(
@@ -553,6 +550,77 @@ where
         async move { driver.handle(&method, params).await }
     })
     .await
+}
+
+/// `vm-driver pod`: the driver of the configuration at `config_path`, on stdin and stdout,
+/// with the API server's credential from `api_dir` (`token` and `ca.crt`, the chart's
+/// projected volume) and the runner pod's node from `TINFIRM_NODE_NAME`. A configuration that
+/// does not load stops it before it answers anything. Where it cannot reach the cluster at all
+/// (outside a pod, no token file), it still answers `hello`, and every other method fails with
+/// the reason: so `run` refuses to start at its `verify`, and `doctor` says why.
+pub async fn run(config_path: &Path, api_dir: &Path) -> Result<()> {
+    let config = PodConfig::load(config_path)?;
+    let runner_node = std::env::var(super::NODE_NAME_ENV).ok();
+    match in_cluster(api_dir) {
+        Ok(api) => {
+            serve(
+                Arc::new(PodDriver::new(config, api, runner_node)),
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+            )
+            .await
+        }
+        Err(e) => {
+            let why = format!("{e:#}");
+            eprintln!("{why}");
+            crate::vm::serve_driver(
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+                move |method, _params| {
+                    let why = why.clone();
+                    async move {
+                        match method.as_str() {
+                            "hello" => Ok(hello()),
+                            "verify" | "create" | "describe" | "delete" | "list" => {
+                                bail!("{why}")
+                            }
+                            other => bail!("no method `{other}`"),
+                        }
+                    }
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// The client of the cluster the runner pod runs in, with the token and CA files of `api_dir`.
+/// The token file is checked first: outside a pod it is what is missing, and its absence says
+/// most plainly where the driver must run.
+fn in_cluster(api_dir: &Path) -> Result<Api> {
+    let token = api_dir.join("token");
+    let not_in_cluster = |what: String| {
+        anyhow::anyhow!(
+            "the pod driver cannot reach the cluster's API: {what}. It runs in the Helm chart's runner pod (runner.vm.driver `pod`), which mounts its ServiceAccount's token and the cluster's CA at {}",
+            super::DEFAULT_API_DIR
+        )
+    };
+    if let Err(e) = std::fs::metadata(&token) {
+        return Err(not_in_cluster(format!(
+            "cannot read the token file {}: {e}",
+            token.display()
+        )));
+    }
+    Api::in_cluster(&api_dir.join("ca.crt"), &token).map_err(|e| not_in_cluster(format!("{e:#}")))
+}
+
+/// The answer to `hello`.
+fn hello() -> Value {
+    json!({
+        "protocol": DRIVER_PROTOCOL,
+        "driver": DRIVER,
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str> {

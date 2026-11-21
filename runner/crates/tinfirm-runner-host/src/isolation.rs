@@ -15,6 +15,7 @@
 //! | A VM per run through a provider's driver of this binary (`digitalocean`) | `machine` | `none` | left out |
 //! | The `node` driver (crate::node), every node over its local socket | `vm-jail` | `yes` when the nodes report it, else left out (`no`) | left out |
 //! | The `node` driver, every node over TLS at an address that is not this host's own | `machine` | `yes` when the nodes report it, else left out (`no`) | left out |
+//! | The `pod` driver (crate::kubernetes), whose configuration states that the workers for runs hold nothing else | `machine` | `no` | `true` |
 //! | The operator's own driver, with `--isolation-level` (and `--isolation-hardened`) | the stated level | the stated value | `true` |
 //! | The operator's own driver, without a stated level | `container` | left out | left out |
 //! | The local test executor | `container` | left out | left out |
@@ -32,6 +33,16 @@
 //! the driver knew ([`crate::vm::Vms::hardening`]); at its start a node that does not answer
 //! makes it `no`. The hardening an operator's own driver sends is not read: the operator's
 //! statement stands for it.
+//!
+//! The `pod` driver's level rests on the operator's statement in its configuration
+//! (`isolationStatement`, crate::kubernetes::config): the driver keeps every run pod off the
+//! runner pod's worker, which the host can rely on, but whether the workers for runs hold
+//! nothing else, and what their kubelet's credential and cloud identity open, it cannot see
+//! (ADR-0115, decisions 1 and 6). A configuration without the statement does not load, so the
+//! host does not start with it; `--isolation-level` is refused, since the statement has its
+//! one place in the driver's configuration. A worker whose pods use user namespaces cannot
+//! have the first line of hardening (ADR-0115, decision 2; ADR-0113, decision 5), so such a
+//! host reports `hardened: no`, and reads no mark from the driver.
 //!
 //! A host of this release never sends `microvm`, which a server of this release refuses; a
 //! server of an earlier release refuses `machine` and `vm-jail`. So VM hosts and the server
@@ -54,6 +65,10 @@ pub enum Sandboxes {
     /// the VM executor's last known value ([`crate::vm::Vms::hardening`]), `no` where the
     /// driver was not asked.
     Nodes(crate::node::Isolation, crate::vm::Mark),
+    /// A pod per run in a Kubernetes cluster through this binary's `pod` driver
+    /// (`--vm-driver pod`, ADR-0115 decision 2), whose configuration carries the operator's
+    /// statement that the workers for runs hold nothing else.
+    ClusterPods,
     /// A VM per run through the operator's own driver: where the VMs run cannot be seen here.
     OwnDriverVms,
     /// The local test executor: the agent is a process of this machine.
@@ -99,6 +114,12 @@ impl Sandboxes {
                 .and_then(|config| config.isolation())
                 .map(|isolation| Sandboxes::Nodes(isolation, crate::vm::Mark::No))
                 .map_err(|e| format!("--vm-driver node: {e:#}")),
+            // Loading checks the statement: without it, no level and no start.
+            Some(crate::vm::Builtin::Pod { config }) => {
+                crate::kubernetes::config::PodConfig::load(config)
+                    .map(|_| Sandboxes::ClusterPods)
+                    .map_err(|e| format!("--vm-driver pod: {e:#}"))
+            }
             None => Ok(Sandboxes::OwnDriverVms),
         }
     }
@@ -157,6 +178,13 @@ pub fn derive(sandboxes: Sandboxes, stated: Option<Stated>) -> Result<Reported, 
             },
             (mark == crate::vm::Mark::Yes).then_some(Hardened::Yes),
         )),
+        // The operator's statement in the driver's configuration; never hardened (ADR-0115,
+        // decision 2).
+        (Sandboxes::ClusterPods, None) => Ok(Reported {
+            tier: IsolationTier::Machine,
+            hardened: Some(Hardened::No),
+            stated: true,
+        }),
         (Sandboxes::OwnDriverVms, Some(stated)) => match stated.level {
             IsolationTier::Machine | IsolationTier::VmJail => Ok(Reported {
                 tier: stated.level,
@@ -182,6 +210,10 @@ pub fn derive(sandboxes: Sandboxes, stated: Option<Stated>) -> Result<Reported, 
             "--isolation-level is for a VM driver of your own: with --vm-driver node this host reports `{}` itself, from its nodes' configuration, and a statement never overrides what the host can see",
             nodes.as_str()
         )),
+        (Sandboxes::ClusterPods, Some(_)) => Err(
+            "--isolation-level is for a VM driver of your own: with --vm-driver pod the level is the statement of the driver's configuration (isolationStatement), and this host reports `machine`, hardened `no`, from it"
+                .into(),
+        ),
         (Sandboxes::LocalTest, Some(_)) => {
             Err("--isolation-level is for a VM driver of your own, not the local test executor".into())
         }
@@ -227,6 +259,7 @@ pub fn what_an_escape_reaches(sandboxes: Sandboxes, reported: &Reported) -> Stri
         IsolationTier::Container | IsolationTier::Gvisor => "An agent that escapes its sandbox reaches this machine, which holds the host's token and every run's git token, and the other runs on it.".into(),
         IsolationTier::Machine if sandboxes == Sandboxes::ProviderVms => "An agent that escapes its VM reaches the provider's machine, which holds nothing of Tinfirm's.".into(),
         IsolationTier::Machine if matches!(sandboxes, Sandboxes::Nodes(..)) => "An agent that escapes its VM reaches its sandbox node, which holds no credential, and the other runs on that node.".into(),
+        IsolationTier::Machine if sandboxes == Sandboxes::ClusterPods => "An agent that escapes its VM is the unprivileged user of its run's pod, in a user namespace of its own; a flaw of the kernel under the VMs (KVM) or of the user namespace reaches that worker, which runs no runner pod and, as the operator states, nothing but run pods, and the other runs on it.".into(),
         IsolationTier::VmJail if matches!(sandboxes, Sandboxes::Nodes(..)) => "An agent that leaves its VM through the VMM is one jailed user that reads no credential; a flaw of the kernel under the VMs (KVM) reaches this machine, with every credential.".into(),
         IsolationTier::Machine => format!(
             "An agent that escapes its VM reaches the machine that runs it{stated}: no credential is there, but the other runs on that machine are."
@@ -445,6 +478,83 @@ mod tests {
             Some(Hardened::No)
         );
         assert_eq!(derive(of(&own).unwrap(), None), Ok(Reported::CONTAINER));
+    }
+
+    /// The pod driver's configuration that the chart renders for its CI values.
+    const POD_CONFIG: &str =
+        include_str!("../../../../deploy/helm/tinfirm/ci/expected/pod-driver.json");
+
+    #[test]
+    fn the_pod_driver_reports_machine_as_its_configuration_states() {
+        use crate::vm::DriverCommand;
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, value: &serde_json::Value| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let good: serde_json::Value = serde_json::from_str(POD_CONFIG).unwrap();
+        // With the statement: `machine`, hardened `no`, stated by the operator.
+        let pod = DriverCommand::pod(file("good.json", &good)).unwrap();
+        let sandboxes = Sandboxes::of_driver(&pod).unwrap();
+        assert_eq!(sandboxes, Sandboxes::ClusterPods);
+        let reported = derive(sandboxes, None).unwrap();
+        assert_eq!(
+            reported,
+            Reported {
+                tier: IsolationTier::Machine,
+                hardened: Some(Hardened::No),
+                stated: true,
+            }
+        );
+        assert_eq!(
+            describe(&reported),
+            "machine, hardened no, stated by the operator"
+        );
+        assert!(!unstated(sandboxes, &reported));
+        let text = what_an_escape_reaches(sandboxes, &reported);
+        assert!(
+            text.contains("unprivileged user of its run's pod"),
+            "{text}"
+        );
+        assert!(text.contains("runs no runner pod"), "{text}");
+        // No mark of the driver's changes it: user namespaces rule out the hardening.
+        assert_eq!(sandboxes.hardened(Mark::Yes), Sandboxes::ClusterPods);
+        // A statement by flag is refused: the configuration holds it.
+        for level in [IsolationTier::Machine, IsolationTier::VmJail] {
+            let error = derive(
+                sandboxes,
+                Some(Stated {
+                    level,
+                    hardened: Hardened::Yes,
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("with --vm-driver pod the level is the statement of the driver's configuration (isolationStatement)"),
+                "{error}"
+            );
+        }
+        // Without the statement, or with another sentence: no level, so no start.
+        let mut missing = good.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("isolationStatement");
+        let mut wrong = good.clone();
+        wrong["isolationStatement"] = serde_json::json!("the workers hold other pods too");
+        for (name, value) in [("missing.json", &missing), ("wrong.json", &wrong)] {
+            let pod = DriverCommand::pod(file(name, value)).unwrap();
+            let error = Sandboxes::of_driver(&pod).unwrap_err();
+            assert!(error.starts_with("--vm-driver pod: "), "{error}");
+            assert!(error.contains("isolationStatement"), "{name}: {error}");
+        }
+        let pod = DriverCommand::pod(dir.path().join("absent.json")).unwrap();
+        assert!(
+            Sandboxes::of_driver(&pod)
+                .unwrap_err()
+                .contains("--vm-driver pod: cannot read")
+        );
     }
 
     #[test]

@@ -169,6 +169,15 @@ enum Command {
         #[command(subcommand)]
         driver: VmDriverCommand,
     },
+    /// In a run's pod of the `pod` driver (ADR-0115 decision 2): runs the run's VM with
+    /// Firecracker as the pod's unprivileged user, and relays the pod's bridge port to it. The
+    /// pod's specification starts it, `vm-pod ready` as its readiness probe and `vm-pod
+    /// tap-setup` as its init container; it is not run by hand.
+    #[command(hide = true)]
+    VmPod {
+        #[command(subcommand)]
+        step: Option<VmPodStep>,
+    },
     /// In a sandbox VM (ADR-0096): reads the VM's user data and runs the run's container with
     /// the sandbox bridge. The VM's image starts it at boot; it is not run by hand.
     #[command(hide = true)]
@@ -226,6 +235,37 @@ enum VmDriverCommand {
         )]
         config: PathBuf,
     },
+    /// A pod per run in a Kubernetes cluster (ADR-0115 decision 2), in a namespace of the runs'
+    /// own, with Firecracker in each pod as an unprivileged user; from the Helm chart's runner
+    /// pod, with its ServiceAccount's token.
+    Pod {
+        /// The driver's configuration: the runs' namespace, the run pod's image, sizes, tap,
+        /// devices and workers (ee/runner/tinfirm-runner-host/src/kubernetes/config.rs).
+        #[arg(
+            long,
+            env = tinfirm_runner_host::kubernetes::CONFIG_ENV,
+            default_value = tinfirm_runner_host::kubernetes::DEFAULT_CONFIG
+        )]
+        config: PathBuf,
+        /// The directory of the API server's credential: `token`, the runner pod's
+        /// ServiceAccount token, which is read for each request, and `ca.crt`, the cluster's CA.
+        #[arg(
+            long,
+            env = "TINFIRM_KUBERNETES_API_DIR",
+            default_value = tinfirm_runner_host::kubernetes::DEFAULT_API_DIR
+        )]
+        kubernetes_api: PathBuf,
+    },
+}
+
+/// The steps of a run's pod after `vm-pod` (crate::kubernetes::spec::vm_pod); without one,
+/// `vm-pod` runs the VM.
+#[derive(Subcommand)]
+enum VmPodStep {
+    /// The readiness probe: succeeds once the guest's bridge has accepted.
+    Ready,
+    /// The init container of the variant without Multus: makes the VM's tap.
+    TapSetup,
 }
 
 /// How `run` creates the sandboxes (docs/archive/v1/CONVENTIONS.md §15.3, ADR-0025).
@@ -435,10 +475,11 @@ struct VmArgs {
         default_value_t = ExecutorChoice::Docker
     )]
     executor: ExecutorChoice,
-    /// The VM driver (--executor vm): `digitalocean` or `node`, this binary's own drivers, or
-    /// the command line of another (split at white space). It holds the provider's credential;
-    /// this host holds none. DigitalOcean's driver is part of elastic runners (Pro and
-    /// Enterprise): the server refuses a host with it unless its licence holds them. The `node`
+    /// The VM driver (--executor vm): `digitalocean`, `node` or `pod`, this binary's own
+    /// drivers, or the command line of another (split at white space). It holds the provider's
+    /// credential; this host holds none. DigitalOcean's driver and `pod` (a pod per run in the
+    /// Kubernetes cluster this host runs in, ADR-0115) are part of elastic runners (Pro and
+    /// Enterprise): the server refuses a host with one unless its licence holds them. The `node`
     /// driver (sandbox nodes, ADR-0112) and your own driver need no licence.
     #[arg(long, env = "TINFIRM_RUNNER_VM_DRIVER", value_name = "COMMAND")]
     vm_driver: Option<String>,
@@ -486,7 +527,8 @@ struct VmArgs {
     /// which hold no credential; `vm-jail` when each VM's VMM runs in a jail of its own on this
     /// machine. Without it such a host reports `container`, and the server places its runs as
     /// on a container host. Refused with the Docker executor, `--vm-driver digitalocean` and
-    /// `--vm-driver node`, whose level this host derives itself.
+    /// `--vm-driver node`, whose level this host derives itself, and `--vm-driver pod`, whose
+    /// configuration states it.
     #[arg(
         long,
         env = "TINFIRM_RUNNER_ISOLATION_LEVEL",
@@ -634,6 +676,15 @@ impl VmArgs {
             options
                 .probe
                 .push(parse_probe(check).map_err(|e| anyhow::anyhow!("--vm-probe: {e}"))?);
+        }
+        // A run pod must not reach the cluster's API server, which this pod reaches.
+        if matches!(
+            options.driver.builtin,
+            Some(tinfirm_runner_host::vm::Builtin::Pod { .. })
+        ) {
+            options
+                .probe
+                .extend(tinfirm_runner_host::kubernetes::probe());
         }
         let pool = tinfirm_runner_host::ready_vms::ReadyVmOptions {
             max_ready: self.pool_max_ready,
@@ -803,6 +854,15 @@ fn main() -> ExitCode {
     if let Command::Front { probe } = &cli.command {
         return tinfirm_runner_host::front::child_main(probe.as_deref());
     }
+    // A run pod's program writes its own lines, and its readiness probe runs every second.
+    if let Command::VmPod { step } = &cli.command {
+        use tinfirm_runner_host::kubernetes::vm_pod;
+        return match step {
+            None => in_runtime(async { Ok(vm_pod::run().await) }),
+            Some(VmPodStep::Ready) => exit_code(vm_pod::ready()),
+            Some(VmPodStep::TapSetup) => exit_code(vm_pod::tap_setup()),
+        };
+    }
     init_tracing(&cli.log);
     if matches!(cli.command, Command::Bridge) {
         return bridge();
@@ -820,6 +880,16 @@ fn main() -> ExitCode {
                 let config = config.clone();
                 in_runtime(async move {
                     tinfirm_runner_host::node::run(&config).await?;
+                    Ok(0)
+                })
+            }
+            VmDriverCommand::Pod {
+                config,
+                kubernetes_api,
+            } => {
+                let (config, api) = (config.clone(), kubernetes_api.clone());
+                in_runtime(async move {
+                    tinfirm_runner_host::kubernetes::pod_driver::run(&config, &api).await?;
                     Ok(0)
                 })
             }
@@ -846,6 +916,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A program's exit code as the process's: 1 for one outside 0 to 255.
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
 /// Runs `task` to its end on a runtime of its own; its exit code, or 1 with its error.
@@ -986,6 +1061,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Bridge => bail!("`bridge` runs in a sandbox, started by `run --sandbox-bridge`"),
         Command::VmDriver { .. }
+        | Command::VmPod { .. }
         | Command::VmBoot { .. }
         | Command::Reader { .. }
         | Command::Front { .. } => {
@@ -1589,11 +1665,12 @@ async fn doctor(
 }
 
 /// With `--executor vm`: what `run --executor vm` checks at its start. The driver's options;
-/// with `--vm-driver node`, its configuration and client keys; then the driver's `hello` and a
-/// `verify` of the template, with room for `max_concurrent_runs` VMs, this host's own counted
-/// as at `run`'s start ([`tinfirm_runner_host::vm::Vms::check`]). With `--vm-driver node`, the
-/// hardening of its nodes too, each line that does not hold named; that hardening is returned
-/// for the isolation's check. `None` where the driver was not asked.
+/// with `--vm-driver node`, its configuration and client keys, with `--vm-driver pod` its
+/// configuration; then the driver's `hello` and a `verify` of the template, with room for
+/// `max_concurrent_runs` VMs, this host's own counted as at `run`'s start
+/// ([`tinfirm_runner_host::vm::Vms::check`]). With `--vm-driver node`, the hardening of its
+/// nodes too, each line that does not hold named; that hardening is returned for the
+/// isolation's check. `None` where the driver was not asked.
 async fn doctor_vm(
     checks: &mut Checks,
     paths: &Paths,
@@ -1612,6 +1689,32 @@ async fn doctor_vm(
         options.driver.builtin,
         Some(tinfirm_runner_host::vm::Builtin::Node { .. })
     );
+    if let Some(tinfirm_runner_host::vm::Builtin::Pod { config }) = &options.driver.builtin {
+        match tinfirm_runner_host::kubernetes::config::PodConfig::load(config) {
+            Ok(loaded) => checks.ok(
+                "pod driver configuration",
+                format!(
+                    "{}: the runs' namespace {}, template(s) {}, tap {}",
+                    config.display(),
+                    loaded.namespace,
+                    loaded
+                        .templates
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    match loaded.tap.mode {
+                        tinfirm_runner_host::kubernetes::config::TapMode::Multus => "multus",
+                        tinfirm_runner_host::kubernetes::config::TapMode::Init => "init",
+                    }
+                ),
+            ),
+            Err(e) => {
+                checks.fail("pod driver configuration", format!("{e:#}"));
+                return None;
+            }
+        }
+    }
     if let Some(tinfirm_runner_host::vm::Builtin::Node { config }) = &options.driver.builtin {
         match tinfirm_runner_host::node::NodeConfig::load(config) {
             Ok(loaded) => checks.ok(
@@ -3056,4 +3159,110 @@ fn read_pid(path: &std::path::Path) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|pid| *pid > 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tinfirm_runner_host::kubernetes::{config, spec};
+
+    /// The pod driver's configuration that the chart renders for its CI values.
+    const POD_CONFIG: &str =
+        include_str!("../../../../deploy/helm/tinfirm/ci/expected/pod-driver.json");
+
+    /// Each command line that a run pod's specification gives this binary, without the binary.
+    fn command_lines(config: &config::PodConfig) -> Vec<Vec<String>> {
+        let id = spec::VmId::random();
+        let labels = std::collections::BTreeMap::from([(
+            tinfirm_runner_host::vm::HOST_LABEL.to_string(),
+            "host-1".to_string(),
+        )]);
+        let pod = spec::pod(config, "sandbox-4c8g", &id, &labels, "worker-1").unwrap();
+        let mut lines = Vec::new();
+        for kind in ["containers", "initContainers"] {
+            for container in pod["spec"][kind].as_array().into_iter().flatten() {
+                lines.push(container["command"].clone());
+                if let Some(probe) = container["readinessProbe"]["exec"].get("command") {
+                    lines.push(probe.clone());
+                }
+            }
+        }
+        lines
+            .into_iter()
+            .map(|line| serde_json::from_value::<Vec<String>>(line).unwrap())
+            .inspect(|line| assert_eq!(line[0], spec::vm_pod::BINARY, "{line:?}"))
+            .collect()
+    }
+
+    /// What this binary's parser makes of a command line: the step of `vm-pod` it names.
+    fn vm_pod_step(line: &[String]) -> Option<&'static str> {
+        match Cli::try_parse_from(line).map(|cli| cli.command) {
+            Ok(Command::VmPod { step: None }) => Some("vm-pod"),
+            Ok(Command::VmPod {
+                step: Some(VmPodStep::Ready),
+            }) => Some("ready"),
+            Ok(Command::VmPod {
+                step: Some(VmPodStep::TapSetup),
+            }) => Some("tap-setup"),
+            Ok(_) => None,
+            Err(e) => panic!("{line:?}: {e}"),
+        }
+    }
+
+    #[test]
+    fn the_run_pods_command_lines_are_this_binarys_vm_pod_steps() {
+        let multus = config::PodConfig::from_json(POD_CONFIG).unwrap();
+        let steps: Vec<_> = command_lines(&multus)
+            .iter()
+            .map(|line| vm_pod_step(line))
+            .collect();
+        assert_eq!(steps, [Some("vm-pod"), Some("ready")]);
+        let mut value: serde_json::Value = serde_json::from_str(POD_CONFIG).unwrap();
+        value["tap"] = serde_json::json!({"mode": "init", "cidr": "172.30.0.0/30"});
+        let init = config::PodConfig::from_json(&value.to_string()).unwrap();
+        let steps: Vec<_> = command_lines(&init)
+            .iter()
+            .map(|line| vm_pod_step(line))
+            .collect();
+        assert_eq!(steps, [Some("vm-pod"), Some("ready"), Some("tap-setup")]);
+        // A step the pod does not name is refused, not taken as the VM's run.
+        assert!(Cli::try_parse_from([spec::vm_pod::BINARY, "vm-pod", "start"]).is_err());
+    }
+
+    #[test]
+    fn the_pod_driver_is_a_subcommand_with_the_charts_paths() {
+        let cli = Cli::try_parse_from(["tinfirm-runner-host", "vm-driver", "pod"]).unwrap();
+        let Command::VmDriver {
+            driver:
+                VmDriverCommand::Pod {
+                    config,
+                    kubernetes_api,
+                },
+        } = cli.command
+        else {
+            panic!("not the pod driver");
+        };
+        // The defaults, unless the environment of this test names others.
+        if std::env::var_os(tinfirm_runner_host::kubernetes::CONFIG_ENV).is_none() {
+            assert_eq!(
+                config,
+                PathBuf::from("/etc/tinfirm/pod-driver/pod-driver.json")
+            );
+        }
+        if std::env::var_os("TINFIRM_KUBERNETES_API_DIR").is_none() {
+            assert_eq!(kubernetes_api, PathBuf::from("/etc/tinfirm/kubernetes-api"));
+        }
+        // The command line that `--vm-driver pod` starts.
+        let driver = tinfirm_runner_host::vm::DriverCommand::parse("pod").unwrap();
+        let line: Vec<String> = std::iter::once("tinfirm-runner-host".to_string())
+            .chain(driver.args.iter().cloned())
+            .collect();
+        let cli = Cli::try_parse_from(&line).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::VmDriver {
+                driver: VmDriverCommand::Pod { .. }
+            }
+        ));
+    }
 }

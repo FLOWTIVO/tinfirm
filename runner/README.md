@@ -96,9 +96,10 @@ The archive also holds `LICENSE` (MIT), `ee/LICENSE` and `THIRD-PARTY-LICENSES.t
 of the crates the binary is built with ([ADR-0082](../docs/adr/0082-licence-notices-and-dependency-licences.md)).
 The binary holds elastic runners' code too, under the Tinfirm Enterprise licence
 ([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md),
-[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)): DigitalOcean's VM driver, ready
-VMs and session bundles. They are Pro's and Enterprise's: a server whose licence does not hold
-them refuses a host started with `--vm-driver digitalocean` or `--pool-max-ready` above 0
+[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)): DigitalOcean's VM driver, the
+driver of a pod per run in a Kubernetes cluster, ready VMs and session bundles. They are Pro's and
+Enterprise's: a server whose licence does not hold them refuses a host started with
+`--vm-driver digitalocean`, `--vm-driver pod` or `--pool-max-ready` above 0
 (`EDITION_REQUIRED`, and the host stops), and hands out no session bundle. The sandbox bridge and
 a VM per run with a driver of your own are in every edition, as is a host with Docker, as below.
 
@@ -538,6 +539,7 @@ The host derives its level from what it can see, and only takes your word where 
 | `--executor vm --vm-driver digitalocean` | `machine` | `none` |
 | `--executor vm --vm-driver node`, every node over its local socket ([Sandbox nodes](#sandbox-nodes)) | `vm-jail` | `yes` when every node that offers `--vm-template` reports it, else left out (`no`) |
 | `--executor vm --vm-driver node`, every node over TLS at an address that is not this host's own | `machine` | `yes` when every node that offers `--vm-template` reports it, else left out (`no`) |
+| `--executor vm --vm-driver pod`, whose configuration states that the workers for runs hold nothing else | `machine`, with `"isolationStated": true` | `no` |
 | `--executor vm` with a driver of your own and `--isolation-level` | What `--isolation-level` states, with `"isolationStated": true` | What `--isolation-hardened` states |
 | `--executor vm` with a driver of your own and no `--isolation-level` | `container` | left out (`no`) |
 | Protocol 1 | `container` | not sent |
@@ -555,6 +557,13 @@ The host derives its level from what it can see, and only takes your word where 
   host until you state its level.
 - **A statement never overrides what the host can see:** `run` refuses `--isolation-level` with
   the Docker executor, with `--vm-driver digitalocean` and with `--vm-driver node`.
+- **The pod per run** ([ADR-0115](../docs/adr/0115-sandbox-vms-in-a-kubernetes-cluster.md),
+  decision 2) keeps every run's pod off the worker of this host's pod, but cannot see what else
+  the workers for runs hold. Its configuration states it (`isolationStatement`, the Helm chart's
+  `runner.vm.cluster.isolationStatement`, word for word "the workers for runs hold nothing
+  else"); without that statement `run` does not start, and `--isolation-level` is refused, since
+  the statement has its one place there. A worker whose pods use user namespaces cannot have the
+  first line of hardening, so such a host reports `hardened: no`.
 - **The node driver's hardening** is what the nodes report
   ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 5): each node
   agent's helper checks every line of a hardened machine, and its `verify` carries the mark. The
@@ -1024,10 +1033,10 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 
 - **Editions** ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). The VM executor,
   the driver protocol and the VM image's recipe are in every edition: with a driver of your own
-  (below), a Community server takes the host. DigitalOcean's driver (`--vm-driver digitalocean`) and
-  ready VMs are Pro's and Enterprise's (elastic runners): such a host lists `sandbox.elastic` or
-  `sandbox.pool` in its `hello`, and a server whose licence does not hold elastic runners refuses it
-  with `EDITION_REQUIRED`.
+  (below), a Community server takes the host. DigitalOcean's driver (`--vm-driver digitalocean`), the
+  pod per run (`--vm-driver pod`) and ready VMs are Pro's and Enterprise's (elastic runners): such a
+  host lists `sandbox.elastic` or `sandbox.pool` in its `hello`, and a server whose licence does not
+  hold elastic runners refuses it with `EDITION_REQUIRED`.
 - **How a run goes.** Without ready VMs, every run starts cold:
   1. The run asks for a VM, and the driver creates one from the template. Its user data names no
      run.
@@ -1125,7 +1134,7 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
 | `--executor docker\|vm` | `TINFIRM_RUNNER_EXECUTOR` | `docker` | Containers of this machine's Docker, or a VM per run |
-| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver (Pro and Enterprise), `node`, its driver for [sandbox nodes](#sandbox-nodes) (every edition), or the command line of your own (split at white space) |
+| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver (Pro and Enterprise), `node`, its driver for [sandbox nodes](#sandbox-nodes) (every edition), `pod`, its driver of a pod per run in the Kubernetes cluster this host runs in (Pro and Enterprise; its configuration in `TINFIRM_POD_DRIVER_CONFIG`, the Helm chart's `runner.vm.driver: pod`), or the command line of your own (split at white space) |
 | `--vm-template NAME` | `TINFIRM_RUNNER_VM_TEMPLATE` | | The driver's template: image, size, network and firewall |
 | `--vm-port PORT` | `TINFIRM_RUNNER_VM_PORT` | `7443` | Where the bridge listens in the VM |
 | `--vm-start-timeout SECONDS` | `TINFIRM_RUNNER_VM_START_TIMEOUT` | `900` | From the create to the bridge's first connection (30 to 3600) |

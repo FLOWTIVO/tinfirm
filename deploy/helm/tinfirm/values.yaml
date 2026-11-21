@@ -592,9 +592,11 @@ runner:
     #   not run against a node yet. `run` refuses the driver at its start when a node's
     #   `verify` reports a problem.
     # - `pod`: a pod per run in a namespace of the runs' own, with Firecracker in it as an
-    #   unprivileged process (ADR-0115, decision 2), on workers with KVM. Paid (ADR-0114). Set
-    #   vm.cluster and vm.pod. The runner host's binary has no `pod` driver yet, so `run`
-    #   refuses this value until a later change adds it.
+    #   unprivileged process (ADR-0115, decision 2), on workers with KVM. Pro and Enterprise
+    #   (ADR-0114): a server without elastic runners refuses the host. Set vm.cluster and
+    #   vm.pod. Not ready for production: the driver has run against no cluster yet. `run`
+    #   refuses to start while the driver's check of the runs' namespace (its two network
+    #   policies, its quota, the admission policy's refusals) reports a problem.
     driver: digitalocean
     # The template every VM is created from (run --vm-template): a key of
     # vm.digitalocean.templates or vm.pod.templates, or a template that one of vm.node.nodes
@@ -730,6 +732,25 @@ runner:
         # plugin), from the NetworkAttachmentDefinition networkAttachment (`name` or
         # `namespace/name`); the pod passes `restricted`. `init`: an init container with
         # NET_ADMIN in the pod's own network namespace makes it.
+        #
+        # With `multus` the cluster's admin installs the attachment; the chart does not. Its
+        # chain makes the tap with the pod's side of cidr (the first address) and turns the
+        # tap's own IPv4 forwarding off, which the pod cannot do: the run pod's program does
+        # not start the VM while the tap forwards. For the default cidr:
+        #   apiVersion: k8s.cni.cncf.io/v1
+        #   kind: NetworkAttachmentDefinition
+        #   metadata: {name: tinfirm-tap, namespace: tinfirm-runs}
+        #   spec:
+        #     config: |
+        #       {"cniVersion": "1.0.0", "name": "tinfirm-tap", "plugins": [
+        #         {"type": "tap", "ipam": {"type": "static", "addresses": [{"address": "172.30.0.1/30"}]}},
+        #         {"type": "tuning", "sysctl": {"net.ipv4.conf.IFNAME.forwarding": "0"}}
+        #       ]}
+        # The `tuning` plugin puts the tap's name, tap0, in place of IFNAME. The `tap` plugin
+        # gets no owner or group. Where the pods have IPv6, add
+        # "net.ipv6.conf.IFNAME.forwarding": "0" to the sysctl object; where they have none,
+        # leave it out, since the attachment then fails on it. On OKD the `tap` plugin also
+        # takes the container's SELinux label (selinuxcontext).
         mode: multus
         networkAttachment: ""
         # The tap's /30: the pod's side has its first address, the guest the second.
