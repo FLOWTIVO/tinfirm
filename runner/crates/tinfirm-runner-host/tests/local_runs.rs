@@ -2240,6 +2240,28 @@ async fn the_branch_changes_during_the_run(
     branch_existed: bool,
     meanwhile: impl FnOnce(&TestRepo) -> Option<String>,
 ) {
+    the_branch_changes_during_the_run_with(branch_existed, meanwhile, HostSetup::local(), false)
+        .await;
+}
+
+/// A host whose runs push with the runner host's own client (`run --push-client host`).
+fn own_push_client() -> HostSetup {
+    let mut setup = HostSetup::local();
+    setup.options = Some(Box::new(|opts| {
+        opts.push_client = tinfirm_runner_host::git_push::PushClient::Host;
+    }));
+    setup
+}
+
+/// `own_client`: the host pushes with its own client (`own_push_client`); the run's requests
+/// for the push must come from it, and otherwise from git (unless `TINFIRM_TEST_PUSH_CLIENT`
+/// sets the host's client for every test host).
+async fn the_branch_changes_during_the_run_with(
+    branch_existed: bool,
+    meanwhile: impl FnOnce(&TestRepo) -> Option<String>,
+    setup: HostSetup,
+    own_client: bool,
+) {
     use common::git_http::{GitHttpServer, test_git_authorization};
     let repo = TestRepo::new();
     if branch_existed {
@@ -2254,7 +2276,7 @@ async fn the_branch_changes_during_the_run(
     let http = GitHttpServer::start(repo.dir.path(), Some(test_git_authorization())).await;
     let url = format!("{}/origin.git", http.url);
     let mut server = FakeServer::start().await;
-    let host = start_host(&server.url, HostSetup::local()).await;
+    let host = start_host(&server.url, setup).await;
     let mut conn = server.accept().await;
     conn.handshake(5).await;
     let mut spec = AssignSpec::new("rebase", Some(&url));
@@ -2300,6 +2322,12 @@ async fn the_branch_changes_during_the_run(
     // Their change is still there, and the host sent nothing to the repository.
     assert_eq!(repo.branch_head("agent/TEST-1"), theirs);
     assert_eq!(receive_packs(&http.seen()), 0);
+    // The ref discovery for the push came from the client this host pushes with.
+    let host_client = own_client || std::env::var(PUSH_CLIENT_ENV).is_ok_and(|v| v == "host");
+    assert_eq!(
+        common::git_http::assert_pushed_by(&http.seen(), host_client),
+        1
+    );
     assert!(
         t.events_of("GIT")
             .iter()
@@ -2360,6 +2388,106 @@ async fn a_branch_deleted_during_the_run_is_not_recreated() {
             None
         })
         .await;
+    })
+    .await;
+}
+
+/// The same three with the runner host's own push client: the same reason, and nothing sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_own_push_client_never_overwrites_a_branch_that_changed() {
+    with_timeout(240, async {
+        the_branch_changes_during_the_run_with(
+            true,
+            |repo| {
+                Some(repo.commit_to_branch(
+                    "agent/TEST-1",
+                    "theirs.txt",
+                    "pushed during the run\n",
+                    "Their change",
+                ))
+            },
+            own_push_client(),
+            true,
+        )
+        .await;
+        the_branch_changes_during_the_run_with(
+            false,
+            |repo| {
+                Some(repo.commit_to_branch(
+                    "agent/TEST-1",
+                    "theirs.txt",
+                    "pushed during the run\n",
+                    "Their change",
+                ))
+            },
+            own_push_client(),
+            true,
+        )
+        .await;
+        the_branch_changes_during_the_run_with(
+            true,
+            |repo| {
+                repo.delete_branch("agent/TEST-1");
+                None
+            },
+            own_push_client(),
+            true,
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A run whose agent rebases its branch, pushed by the runner host's own client: the
+/// repository has HEAD, from one ref discovery and one push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_own_push_client_pushes_a_rebased_branch_with_the_lease() {
+    use common::git_http::{GitHttpServer, test_git_authorization};
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let earlier = repo.commit_to_branch(
+            "agent/TEST-1",
+            "earlier.txt",
+            "from an earlier run\n",
+            "Earlier work",
+        );
+        repo.commit_to_main("upstream.txt", "from upstream\n", "Upstream change");
+        let http = GitHttpServer::start(repo.dir.path(), Some(test_git_authorization())).await;
+        let url = format!("{}/origin.git", http.url);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, own_push_client()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(5).await;
+        let spec = AssignSpec::new("rebase", Some(&url));
+        conn.send(spec.to_json());
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_contiguous_seq();
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(
+            finished["outcome"],
+            "SUCCEEDED",
+            "{finished:#}\n{}",
+            t.agent_text()
+        );
+        assert_eq!(finished["git"][0]["pushed"], true, "{finished:#}");
+        let head = repo.branch_head("agent/TEST-1").unwrap();
+        assert_ne!(head, earlier);
+        assert_eq!(finished["git"][0]["headSha"], head);
+        assert_eq!(
+            repo.subjects("agent/TEST-1"),
+            vec!["Earlier work", "Upstream change", "Initial commit"]
+        );
+        let seen = http.seen();
+        assert_eq!(receive_packs(&seen), 1);
+        assert_eq!(common::git_http::assert_pushed_by(&seen, true), 2);
+        let discoveries = seen
+            .iter()
+            .filter(|r| r.query == "service=git-receive-pack")
+            .count();
+        assert_eq!(discoveries, 1, "{seen:?}");
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
     })
     .await;
 }

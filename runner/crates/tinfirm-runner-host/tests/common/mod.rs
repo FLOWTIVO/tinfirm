@@ -1200,6 +1200,9 @@ pub type SetOptions = Box<dyn FnOnce(&mut HostOptions) + Send>;
 /// (`run --sandbox-bridge`, ADR-0095): the local tests then run with the files and the
 /// listeners over the bridge, as `make runner-test` and CI run them a second time.
 pub const BRIDGE_ENV: &str = "TINFIRM_TEST_SANDBOX_BRIDGE";
+/// With `host`, the test hosts push with the runner host's own client (`run --push-client
+/// host`); a test can also set it in [`HostSetup::options`].
+pub const PUSH_CLIENT_ENV: &str = "TINFIRM_TEST_PUSH_CLIENT";
 
 /// Whether [`BRIDGE_ENV`] is set, or [`VM_ENV`], whose runs go over the bridge too.
 pub fn bridged_tests() -> bool {
@@ -1412,6 +1415,11 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
     }
     // The tests use file:// bare repositories.
     opts.allow_insecure_repo_urls = true;
+    // `TINFIRM_TEST_PUSH_CLIENT=host`: every run pushes with the runner host's own client
+    // (crate::git_push) where its repository is served over HTTP.
+    if std::env::var(PUSH_CLIENT_ENV).is_ok_and(|v| v == "host") {
+        opts.push_client = tinfirm_runner_host::git_push::PushClient::Host;
+    }
     opts.reconnect_min_backoff = Duration::from_millis(100);
     opts.reconnect_max_backoff = Duration::from_millis(500);
     opts.cancel_grace = Duration::from_secs(5);

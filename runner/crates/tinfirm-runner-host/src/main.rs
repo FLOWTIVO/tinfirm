@@ -140,6 +140,19 @@ enum Command {
             value_parser = clap::value_parser!(u64).range(1..=tinfirm_runner_host::mcp::MAX_UPLOAD_BYTES)
         )]
         upload_max_bytes: u64,
+        /// Which client pushes a run's work: `git` (the default), `git push` with the run's git
+        /// token in its environment; or `host`, the runner host's own receive-pack client, which
+        /// has the objects packed by a process without the token (a reader, with
+        /// --sandbox-bridge or --executor vm) and sends them itself, so that the token is in no
+        /// process that reads a sandbox's objects. `host` has been checked against no code host
+        /// yet (GitHub, GitLab, Gitea, Azure DevOps): turn it on only to test it.
+        #[arg(
+            long,
+            env = "TINFIRM_RUNNER_PUSH_CLIENT",
+            value_enum,
+            default_value_t = PushClientChoice::Git
+        )]
+        push_client: PushClientChoice,
         #[command(flatten)]
         sandbox: SandboxArgs,
         // Boxed: the variant would be far larger than the enum's others.
@@ -393,6 +406,25 @@ struct SandboxArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     allow_unconfined_reader: bool,
+}
+
+/// `run --push-client`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PushClientChoice {
+    /// `git push`, with the run's git token in its environment.
+    Git,
+    /// The runner host's own receive-pack client: the token stays in `run`, and a process
+    /// without it packs the objects. Checked against no code host yet.
+    Host,
+}
+
+impl From<PushClientChoice> for tinfirm_runner_host::git_push::PushClient {
+    fn from(choice: PushClientChoice) -> Self {
+        match choice {
+            PushClientChoice::Git => tinfirm_runner_host::git_push::PushClient::Git,
+            PushClientChoice::Host => tinfirm_runner_host::git_push::PushClient::Host,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1031,6 +1063,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             token_file,
             no_image_rebuild,
             upload_max_bytes,
+            push_client,
             sandbox,
             vm,
         } => {
@@ -1042,6 +1075,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 login,
                 no_image_rebuild,
                 upload_max_bytes,
+                push_client.into(),
                 sandbox,
                 *vm,
             )
@@ -2345,6 +2379,7 @@ async fn run(
     login: Option<(String, PathBuf)>,
     no_image_rebuild: bool,
     upload_max_bytes: u64,
+    push_client: tinfirm_runner_host::git_push::PushClient,
     sandbox_args: SandboxArgs,
     vm_args: VmArgs,
 ) -> Result<()> {
@@ -2506,6 +2541,12 @@ async fn run(
     opts.model_proxy = model_proxy;
     opts.max_concurrent_runs = max_concurrent_runs;
     opts.upload_max_bytes = upload_max_bytes;
+    opts.push_client = push_client;
+    if push_client == tinfirm_runner_host::git_push::PushClient::Host {
+        tracing::warn!(
+            "--push-client host: the runner host's own receive-pack client pushes the runs' work, and the git tokens stay out of git's process tree. It has been checked against no code host yet (GitHub, GitLab, Gitea, Azure DevOps); without the option, `git push` pushes"
+        );
+    }
     opts.sandbox = settings;
     opts.isolation_stated = isolation_stated;
     // What the host reports, as `Host::new` derives it: with the node driver, with the

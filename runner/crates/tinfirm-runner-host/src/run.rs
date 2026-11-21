@@ -4387,7 +4387,11 @@ async fn finalize_git(
                 .push(format!("{}: not pushed: {reason}", repo.label()));
             continue;
         }
-        match repo.git.push(&repo.ws.branch).await {
+        match repo
+            .git
+            .push_with(&repo.ws.branch, head.clone(), &shared.opts.push_settings())
+            .await
+        {
             Ok(out) if out.status.success() => {
                 finalized.results[i].pushed = true;
                 sink.git(repo.ws, GitAction::Pushed, head, Some(commits));

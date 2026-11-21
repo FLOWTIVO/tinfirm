@@ -125,6 +125,10 @@ pub struct HostOptions {
     /// `hello.runnerVersion`: the release's version ([`crate::version::RUNNER_VERSION`]),
     /// which the server shows and decides nothing from (ADR-0109).
     pub runner_version: String,
+    /// `run --push-client`: which client pushes a run's work (crate::git_push). `git`, the
+    /// default, is `git push` with the run's token in its environment; `host` is the runner
+    /// host's own receive-pack client, which has been checked against no code host yet.
+    pub push_client: crate::git_push::PushClient,
 }
 
 impl HostOptions {
@@ -161,6 +165,15 @@ impl HostOptions {
             isolation_stated: None,
             upload_max_bytes: crate::attachments::DEFAULT_UPLOAD_MAX_BYTES,
             runner_version: crate::version::RUNNER_VERSION.to_string(),
+            push_client: crate::git_push::PushClient::Git,
+        }
+    }
+
+    /// How this host pushes ([`crate::git::Git::push_with`]).
+    pub fn push_settings(&self) -> crate::git_push::PushSettings {
+        crate::git_push::PushSettings {
+            client: self.push_client,
+            allow_http: self.allow_insecure_repo_urls,
         }
     }
 
