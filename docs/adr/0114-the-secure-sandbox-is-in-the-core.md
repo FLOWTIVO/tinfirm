@@ -27,7 +27,7 @@
    |---|---|
    | The sandbox bridge (ADR-0095) | Drivers for a VM per run at a provider (DigitalOcean's today): machines that come with a run and go with it |
    | The VM executor (ADR-0096) with the `node` driver, and the driver protocol | Ready VMs and their schedules (ADR-0098, ADR-0099): a run that starts at once |
-   | The node agent (ADR-0112), on the runner host's machine or on nodes of its own, as many as a company sets up | The cluster's own forms of ADR-0115: a pod per run, KubeVirt, the node agent as a DaemonSet. Sandboxes that a cluster places and scales |
+   | The node agent (ADR-0112), on the runner host's machine or on nodes of its own, as many as a company sets up | The cluster's own forms of ADR-0115: a pod per run, KubeVirt, the node agent as a DaemonSet (the last two were set aside on 2026-11-21, ADR-0115 decision 1). Sandboxes that a cluster places and scales |
    | The VM image and its recipe | Session bundles (ADR-0097): a turn resumes on any runner host, so that hosts can come and go |
    | The levels, the hardening mark, and an agent's choice of isolation (ADR-0113) | |
    | The runner host as a pod of the chart, with nodes outside the cluster (ADR-0101, decision 8; ADR-0115's first form) | |
