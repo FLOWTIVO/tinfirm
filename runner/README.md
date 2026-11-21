@@ -867,10 +867,12 @@ The reader:
   then puts back the clone's `.git` configuration and reads `HEAD` again.
 - **git after the import.** The clone then holds objects a sandbox made, so every git command `run`
   runs on it afterwards (the ahead count, `HEAD`, the credential scan's listings) runs in a reader
-  too, read only. The push alone runs in `run`'s process tree, because it needs the run's git token.
-  It reads objects that `fsck` checked, from a clone whose configuration `run` restored, to the run's
-  branch alone. A flaw in git's reading of such objects in the push would still reach that run's
-  token and the files of `run`'s user: this is what is left of path C for the pack.
+  too, read only. By default the push alone runs in `run`'s process tree, because it needs the run's
+  git token. It reads objects that `fsck` checked, from a clone whose configuration `run` restored,
+  to the run's branch alone. A flaw in git's reading of such objects in the push would still reach
+  that run's token and the files of `run`'s user: this is what is left of path C for the pack. With
+  `run --push-client host` a reader writes the pack too, and the token stays in `run`, which sends
+  the pack unread ([The push](#the-push)); that client has been checked against no code host yet.
 
 The front:
 
@@ -924,8 +926,9 @@ Both:
   answers of the code host and of the model's gateway (not the sandbox's input, but a model's text
   passes through them), and on a personal Docker host a Codex login's `auth.json`, which the
   sandbox can write. Those are bounded and tested with a hostile peer; a flaw in one of them still
-  reaches the host's credentials with no second flaw. The push, too, runs in `run`'s process tree
-  with the run's token (above).
+  reaches the host's credentials with no second flaw. By default the push, too, runs in `run`'s
+  process tree with the run's token (above); with `--push-client host` it does not, and `run` parses
+  the code host's answers to it instead ([The push](#the-push)).
 - **Where they cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS),
   every host that uses the bridge refuses to start: `--executor vm` and a Docker host with
   `--sandbox-bridge` alike, before any image is built. At its start `run` runs a reader's probe
@@ -1037,6 +1040,91 @@ Both:
     and a browser's request to the tools are refused by `run` as by the shared listener of a host
     without the bridge; a
     front that opens more than 64 of these requests at once is ended.
+
+### The push
+
+By default `run` pushes a run's work with `git push` (step 8 of [What a run does](#what-a-run-does)):
+git runs in `run`'s process tree with the run's git token in its environment, and its
+`pack-objects` reads the objects that a sandbox made. `run --push-client host`
+(`TINFIRM_RUNNER_PUSH_CLIENT=host`) pushes with the runner host's own receive-pack client instead
+(`git_push.rs`), so that no process that reads a sandbox's objects holds the token. **This client has
+been checked against no code host yet** (GitHub, GitLab, Gitea, Azure DevOps). Until it has, `git
+push` stays the default, and `host` is for testing it. With `--push-client host`, for a repository
+over https:
+
+1. `run` reads the run's token at that request, from the run's holder of git tokens, as the git
+   proxy does ([Revoked git tokens](#revoked-git-tokens-protocol-v2)). It sends
+   `GET <repository>/info/refs?service=git-receive-pack` (protocol v0, as git 2.43 pushes over
+   HTTP) and reads the answer as pkt-lines alone, each bounded and checked: at most 32 MiB,
+   262,144 refs, 65,520 bytes a line and 4096 bytes a ref name. The first line must be
+   `# service=git-receive-pack`. A ref name with a control character, a space or DEL, an HTML page,
+   a dumb server's answer, an encoded answer, a status other than 200, and a redirect each fail the
+   push. The `shallow` lines of a shallow repository, after the refs, are checked (at most
+   65,536) and dropped, as git's own push drops them. No redirect is followed, so the token goes to the repository's own URL alone, as with the
+   [git proxy](#git-in-the-sandbox).
+2. It compares the branch's tip there with the lease (the tip at clone time, or none) before it
+   sends anything. A branch that moved, was created or was deleted during the run is refused as
+   git refuses it, `[rejected] (stale info)`, and nothing reaches the repository. A branch that is
+   at HEAD already is up to date, and nothing is sent.
+3. A process without any credential writes the pack. With the bridge (`--sandbox-bridge`,
+   `--executor vm`) it is a [reader](#the-reader-and-the-front), confined as for its other git
+   commands: it reads the clone, writes nothing, and its stdout is the pack. Without the bridge it is
+   `git pack-objects` as a child of `run` without the token in its environment, like `run`'s other
+   git commands on the workspace. It packs the objects reachable from HEAD and from none of at most
+   257 tips: the lease's, and the first 256 that the repository lists (`HEAD` first, then branches,
+   then tags) and that the clone had at clone time. The pack is a full one, never a thin pack. A
+   repository with more refs still gets a correct pack, only perhaps a larger one.
+4. `run` reads the token again and POSTs `<old> <new> refs/heads/<branch>`, where `old` is the lease
+   (the zero id for a new branch), so that the repository checks it again when it updates the
+   branch. Then follows the pack as the writer writes it: unread, in chunks of 64 KiB, never held
+   whole. A request up to 1 MiB goes with a `Content-Length`, once the writer has ended well; a
+   larger one in chunks (`Transfer-Encoding: chunked`), as git does with its `http.postBuffer`. A
+   receive-pack takes a pack once its checksum, at its end, has come, without waiting for the end
+   of the request, so `run` holds the most recent chunk back and sends the last one only once the
+   writer has ended well. A writer that fails, or does not end within 30 s of its output's end,
+   never has its pack's end sent: the request is broken off, and the repository never has a whole
+   pack to take. The push has one deadline of 60 minutes, from the first reading of the token to
+   the report (the ref discovery, the check of the clone's objects, packing and sending), and the
+   ref discovery 120 s of it; when it passes, the writer's process group is killed and the push
+   fails.
+5. It reads the report-status, out of the side-band when the repository has `side-band-64k`: at
+   most 16 MiB in all, of which 1 MiB of report. The newest 16 KiB of the repository's messages
+   are kept (its errors come last), and of a progress meter only its last state. A fatal message
+   (band 3), an `unpack` line that is not `ok`, an `ng` line, and a status for another ref or for
+   none each fail the push.
+
+The outcome is worded as `git push --porcelain` words it, so a run reports the same reasons as with
+`git push` ("the remote branch changed during the run …", "the push was rejected …", "the
+repository refused the push", "git push failed"), with the repository's own messages as
+`remote: …` lines. A repository of another scheme (`file://`, for tests and local development) is
+pushed by git, which needs no token for it, and the host's log says so at each such push. The runner host makes no shallow clone (the mirror
+fetches every branch and tag, and `run` deletes a `shallow` file that an agent plants), so a pack
+never needs `--shallow`.
+
+Where it differs from `git push`, which an operator can meet:
+
+- **No proxy.** It connects to the repository's host directly: neither `HTTPS_PROXY` nor git's
+  `http.proxy` applies. A host that reaches its code host only through a proxy cannot use it.
+- **Its own trust.** It trusts the system's root certificates, or those of `SSL_CERT_FILE` and
+  `SSL_CERT_DIR` when they are set, as the git proxy does; not git's `http.sslCAInfo` or
+  `http.sslVerify`.
+- **No git configuration.** Nothing of the host user's git configuration applies: no `insteadOf`
+  rewrite, no `http.extraHeader`, no `push.followTags` or other `push.*` setting.
+- **Larger packs.** It never sends a thin pack, so a push can be larger than git's.
+- **Limits that can refuse a push** that `git push` makes: a repository whose ref advertisement
+  is over 32 MiB or 262,144 refs, and a push that takes more than 60 minutes. Switch back to
+  `--push-client git` for such a repository.
+- **The log.** When it fails, the host's log says so in fixed words; what the repository and the
+  pack's writer said reaches only the run's events, redacted as everything there.
+
+What it does not close: `run` parses the code host's answers itself, bounded as above; and a
+`git pack-objects` that a hostile repository took over can send any bytes to the run's repository
+as the pack, under the run's token. That can add objects there; the branch still moves only to the
+HEAD that `run` checked, and only from the lease. Tested in `tests/git_push.rs` (against
+`git http-backend` and hostile fake hosts), `tests/reader.rs` (the reader's pack), the parsers' unit
+tests with seeded random input, and runs in `tests/local_runs.rs`. `TINFIRM_TEST_PUSH_CLIENT=host`
+sets this client on every test host, which uses it for the repositories that a test serves over
+HTTP; most tests use `file://` repositories, which git pushes, and the log says so.
 
 ## A VM per run
 
@@ -1466,7 +1554,7 @@ firewall, the probe from a Droplet) and the nightly conformance test.
 | `doctor [--max-concurrent-runs N] [run's sandbox and VM options]` | Checks the setup as `run` would start with the same options and environment (`TINFIRM_RUNNER_*`): the ceiling N (default 2) as `run` takes it for the executor (at most 16 with Docker), directories and their modes, git, credentials, server, [the reader and the front](#the-reader-and-the-front) (their confinement, and the front's wire), and the level of isolation. With the Docker executor, Docker, its runtimes and the runner images: the names of the recorded image build arguments and each image that `run` would rebuild. With `--executor vm`, no Docker (it says "not used"), but what `run --executor vm` checks at its start: the driver's options; with `--vm-driver node`, its configuration and that every client key is this user's alone (0600); then the driver's `hello` and a `verify` of `--vm-template`, with room for N VMs (default 2), this host's own VMs counted as at `run`'s start ([Checked at start](#a-vm-per-run)); with `--vm-driver node`, the nodes' hardening, with each line that does not hold, which the level of isolation then reports. Also the number of mirrors and their total size, and the runs that the next `run` takes back, with those whose work waits on this host for the server |
 | `mirrors list` | Lists the repository mirrors: key, size, last use, last gc, repository URL |
 | `mirrors prune [--older-than-days N] [--dry-run]` | Deletes idle mirrors and collects garbage in the others, like `run` does every 6 hours; refused while `run` is active (`--dry-run` only shows what it would do) |
-| `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |
+| `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--push-client git\|host] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |
 | `drain [--no-wait]` | Asks the `run` of this config directory to [drain](#drain-and-upgrades): sends SIGHUP to the PID in `run.lock` and waits until `run` has exited (`--no-wait` returns after the signal). Exits 0, also when no `run` is active ("Nothing to drain") |
 | `node identity --cert <file> --key <file>`, `node fingerprint --cert <file>` | The TLS identity of a control host for [sandbox nodes](#sandbox-nodes): writes a new key (0600) and certificate, which must not exist, and prints its SHA-256; prints a certificate's SHA-256. The files of `tinfirm-node-agent identity` |
 
@@ -2247,7 +2335,9 @@ new session (`resumeOutcome` `NO_SESSION`).
    it still does not). So the agent may rebase its branch onto the default branch, but when
    someone else pushed to the branch, created it or deleted it during the run, the push is
    refused: nothing is pushed or overwritten, and the reason is "the remote branch changed
-   during the run". Never a plain force. A read-only repository (`workspaces[].readOnly`,
+   during the run". Never a plain force. `run --push-client host` pushes with the runner host's
+   own client and the same lease, without the token in git's process tree, and has been checked
+   against no code host yet ([The push](#the-push)). A read-only repository (`workspaces[].readOnly`,
    ADR-0017) is never pushed, and its commits are not scanned. A failed push does not stop the
    others; the run then fails with `GIT_ERROR` and a `failureMessage` that names the
    repositories. `run.finished` carries one git result per cloned repository (in
