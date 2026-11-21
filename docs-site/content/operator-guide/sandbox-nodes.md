@@ -4,7 +4,7 @@ This page is for the people who run a company's runner hosts on plain Linux mach
 
 !!! warning "Not ready for production"
 
-    The two plays ran on machines once, on 2026-11-20 (Ubuntu 24.04), and ten conversations with real runtimes ran through the node they set up. The node's hardening and the published VM image are planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). Use this form to prepare and to test, and a runner host of its own or DigitalOcean's driver for production until then.
+    The two plays ran on machines once, on 2026-11-20 (Ubuntu 24.04), and ten conversations with real runtimes ran through the node they set up. The node's hardening is planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). Tinfirm publishes no VM image: you build it ([What you need](#what-you-need)). Use this form to prepare and to test, and a runner host of its own or DigitalOcean's driver for production until then.
 
 ## How it works
 
@@ -35,7 +35,7 @@ A node holds no credential, so whoever takes one over reaches the runs on it and
 | A node that is a VM | Nested virtualisation, so that `/dev/kvm` exists in it. VMware: "Expose hardware assisted virtualization to the guest OS"; Proxmox and KVM: the CPU type `host`. In a cloud: bare metal, or an instance type with nested virtualisation |
 | A node from a cloud image | cloud-init must not run at the node's starts. It asks the platform's metadata service, which the node's firewall drops, and the node then does not finish its start. The node's play refuses such a node; with `tinfirm_sandbox_node_cloud_init: disable` it switches cloud-init off for good, and what cloud-init set up at the first start stays |
 | The binaries | `tinfirm-runner-host` and `tinfirm-node-agent` from one release, which the roles check against its signed `SHA256SUMS` ([Install and run runner hosts](runner-hosts.md#install)) |
-| The VM image | Built by `runner/images/vm/local-disk.sh` of Tinfirm's source with the control host's own binary, on a machine with Docker that is not a node. Tinfirm does not publish it yet |
+| The VM image | Built by `runner/images/vm/local-disk.sh` of Tinfirm's source with the control host's own binary, on a machine with Docker that is not a node. Tinfirm publishes none: built with every runtime, the image holds Claude Code, which Tinfirm does not redistribute ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4) |
 | A node's first run | The release, GitHub (Firecracker 1.14.2, Kata Containers 4.3.1 for the guest kernel) or your mirrors of them. After it, the node reaches nothing |
 
 Build and compress the image, and note its SHA-256:

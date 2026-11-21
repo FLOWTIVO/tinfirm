@@ -188,7 +188,7 @@ Not needed: any change to the kubelet, to containerd or CRI-O, a capability in t
 
 ## Build the run pod's image
 
-Tinfirm publishes no image of a run pod. You build it, as you build the VM image for sandbox nodes, with `ee/runner/images/vm/pod-image.sh` of Tinfirm's source, on a Linux x86-64 machine with Docker:
+Tinfirm publishes no image of a run pod, and no VM image for it to hold. You build both: the VM image with `runner/images/vm/local-disk.sh`, as for sandbox nodes, and the pod's image with `ee/runner/images/vm/pod-image.sh` of Tinfirm's source, on a Linux x86-64 machine with Docker:
 
 ```sh
 # The release's runner host binary, checked against its signed SHA256SUMS

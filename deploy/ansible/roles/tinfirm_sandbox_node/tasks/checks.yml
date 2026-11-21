@@ -70,8 +70,8 @@
       - tinfirm_sandbox_node_image_checksum is match('^sha256:[0-9a-fA-F]{64}$')
     fail_msg: >-
       Set exactly one of tinfirm_sandbox_node_image_src and tinfirm_sandbox_node_image_url, and
-      tinfirm_sandbox_node_image_checksum to its "sha256:<hex>". Tinfirm does not publish the VM
-      image for a local disk yet: build it with runner/images/vm/local-disk.sh.
+      tinfirm_sandbox_node_image_checksum to its "sha256:<hex>". Tinfirm publishes no VM
+      image for a local disk: build it with runner/images/vm/local-disk.sh.
     quiet: true
 
 # The helper takes IPv4 addresses for the node and the control host (`network`).

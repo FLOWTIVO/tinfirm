@@ -58,7 +58,8 @@ passed CI), carries the runner host binary. Only the runner HOST is published: t
 images, which contain Claude Code, never are;
 `images build` builds them on
 your machine, and `run` rebuilds them when a new binary brings other Dockerfiles
-([Runner images](#rebuilds-after-an-upgrade)).
+([Runner images](#rebuilds-after-an-upgrade)). Nor is the VM image of
+[sandbox nodes](#sandbox-nodes), which holds the runner images: you build it.
 
 | Asset | Host |
 |---|---|
@@ -1256,9 +1257,12 @@ once, on 2026-11-20 (Ubuntu 24.04), with runs of this host's tests' stand-in age
 on the same day, conversations with real runtimes (Claude Code and PI, with a real model) ran
 through a node, in a Firecracker VM, with the sandbox's front confined (Landlock and seccomp).
 The node's hardening is built and has not run on a node: the Ansible role's tasks that set it up,
-the node agent's checks of it, and this host's reading of them. Still planned: the
-published VM image. The Helm chart's runner pod has not run against a node. Here, the driver is
-tested against node agents with their fake backend.
+the node agent's checks of it, and this host's reading of them. Tinfirm publishes no VM image:
+the image holds Claude Code when built with every runtime, and Tinfirm does not redistribute it,
+so you build the image with `images/vm/local-disk.sh` and this host's own binary
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4). A CI job that
+builds and boots the image is planned. The Helm chart's runner pod has not run against a node.
+Here, the driver is tested against node agents with their fake backend.
 
 - **Editions.** In the core, in every edition: the driver lists no paid feature
   ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)).

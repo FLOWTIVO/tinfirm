@@ -8,7 +8,7 @@
 #
 # Not done by this role: the single machine (ADR-0112 decision 5), which the node agent refuses
 # today, and `verify` trying the node's own egress. Sandbox nodes are not ready for production:
-# the hardening below has not run on a machine yet, and the published VM image is not built.
+# the hardening below has not run on a machine yet. Tinfirm publishes no VM image: the site builds it.
 
 # --- The node agent's binary -----------------------------------------------------------------
 
@@ -65,7 +65,8 @@ tinfirm_sandbox_node_kernel_checksums: {}
 
 # --- The VM image for a local disk -------------------------------------------------------------
 
-# Tinfirm does not publish this image yet (planned: signed, with each release). Build it with
+# Tinfirm publishes no such image (ADR-0112 decision 4): it holds Claude Code when built with
+# every runtime, and Tinfirm does not redistribute Claude Code. Build it with
 # runner/images/vm/local-disk.sh and the control host's own runner host binary, then give it
 # here, compressed with zstd (`zstd tinfirm-vm.img`, a name ending in .zst) or as it is. A file
 # that is not compressed is copied or downloaded whole: 32 GiB by default, holes included.

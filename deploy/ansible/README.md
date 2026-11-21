@@ -10,8 +10,8 @@ Three playbooks:
 
 The last two are not ready for production. The roles ran on machines once (2026-11-20, Ubuntu
 24.04), with ten conversations with real runtimes through the node; a node's hardening has not
-run on a machine yet, and the published VM image is not built
-([below](#sandbox-nodes-and-their-control-host)).
+run on a machine yet. Tinfirm publishes no VM image: you build it
+([below](#the-vm-image)).
 
 ## Runner hosts with Kata Containers
 
@@ -224,8 +224,8 @@ on large workspaces).
 
 > **Not ready for production.** The two plays ran on machines once, on 2026-11-20, on one
 > distribution: [Test on two machines](#test-on-two-machines) says what ran and what it found. A
-> node's hardening has not run on a machine yet, and the published VM image is not built. Use them
-> to prepare and to test.
+> node's hardening has not run on a machine yet, and the VM image is yours to build
+> ([The VM image](#the-vm-image)). Use them to prepare and to test.
 
 [ADR-0112](../../docs/adr/0112-no-credential-on-a-sandbox-machine.md) splits a runner host with
 VMs in two. The **control host** keeps every credential (the host's token, the runs' git and
@@ -342,12 +342,14 @@ node opens no connection to anything, a package mirror included.
 | Control node | ansible-core 2.15 or newer (`ansible.builtin` only). SSH to each node from its management address |
 | Control host | Ubuntu, Debian or the RHEL family, systemd, Linux 5.19 or later with Landlock. It reaches the server, the code hosts and the model gateway, as a runner host does, and each node's agent port and published ports. It needs no KVM, no Docker and no inbound port |
 | Sandbox node | `/dev/kvm` (on a VM: nested virtualisation, as above), Linux 5.14 or later (`cgroup.kill`), cgroup v2, systemd, an IPv4 address that the control host reaches, memory for `maxVms` VMs of each template and disk room for their snapshots. During its first run only: the release, GitHub (Firecracker, Kata) or your mirrors of them. Only Ubuntu 24.04 on x86-64 has run a node |
-| VM image | Built by `runner/images/vm/local-disk.sh` with the control host's own runner host binary, on a machine with Docker that is not a node. Tinfirm does not publish it yet |
+| VM image | Built by `runner/images/vm/local-disk.sh` with the control host's own runner host binary, on a machine with Docker that is not a node. Tinfirm publishes none |
 
 ### The VM image
 
-Tinfirm does not publish the VM image for a local disk yet (planned: signed, with each release).
-Build it, compress it, and give the role the file and its SHA-256:
+Tinfirm publishes no VM image for a local disk. Built with every runtime, as it is by default, the
+image holds Claude Code in two runner images, and Tinfirm does not redistribute Claude Code
+([ADR-0112](../../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4). Build it,
+compress it, and give the role the file and its SHA-256:
 
 ```sh
 sudo runner/images/vm/local-disk.sh /path/to/tinfirm-runner-host ./out   # the control host's binary

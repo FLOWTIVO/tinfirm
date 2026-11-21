@@ -1,9 +1,9 @@
 ---
-# The VM image for a local disk, which every VM shares read-only. Tinfirm publishes none yet:
-# the site builds it with runner/images/vm/local-disk.sh and gives a file or a URL with its
-# SHA-256. The role checks the file as given, unpacks it if it is compressed with zstd, puts it
-# in place, and records the checksum beside it: a second run with the same checksum leaves the
-# image alone. Nothing of the download is kept.
+# The VM image for a local disk, which every VM shares read-only. Tinfirm publishes none
+# (ADR-0112 decision 4): the site builds it with runner/images/vm/local-disk.sh and gives a
+# file or a URL with its SHA-256. The role checks the file as given, unpacks it if it is
+# compressed with zstd, puts it in place, and records the checksum beside it: a second run with
+# the same checksum leaves the image alone. Nothing of the download is kept.
 #
 # Replace the image only on a node without VMs: how a node changes its image under running
 # VMs is not specified yet (ADR-0112, "Upgrades"). The helper is started again afterwards.
