@@ -30,10 +30,18 @@ fn limits() -> Limits {
     }
 }
 
+/// The binary that is the reader: the build's, or `TINFIRM_TEST_BIN` where the user who runs
+/// the tests cannot reach the build's directory.
+fn bin() -> PathBuf {
+    std::env::var_os("TINFIRM_TEST_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(BIN))
+}
+
 /// Whether this kernel confines a reader: the confinement tests need it; the others run either
 /// way, with an unconfined reader where they must.
 fn confinable() -> bool {
-    Reader::new(BIN)
+    Reader::new(bin())
         .probe(&[], None, WAIT)
         .map(|probe| probe.confined())
         .unwrap_or(false)
@@ -41,7 +49,7 @@ fn confinable() -> bool {
 
 /// The real reader, confined where this kernel can.
 fn reader() -> Reader {
-    Reader::new(BIN).allowing_unconfined(!confinable())
+    Reader::new(bin()).allowing_unconfined(!confinable())
 }
 
 /// One archive entry of any type, name and claimed size, as a hostile sandbox could send it.
@@ -946,4 +954,182 @@ fn without_landlock_the_seccomp_filter_alone_keeps_a_readers_signals_in_its_grou
     assert!(target.try_wait().unwrap().is_none(), "the bystander lives");
     target.kill().unwrap();
     target.wait().unwrap();
+}
+
+// ----- the push's pack (path C, slice 7) ---------------------------------------------------
+
+/// Runs a pack's reader to its end: its stdout (the pack) and whether it succeeded.
+fn run_pack(mut command: tokio::process::Command) -> (Vec<u8>, bool, String) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let out = command.output().await.unwrap();
+        (
+            out.stdout,
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    })
+}
+
+/// A repository with a base commit, a bare copy of it as the code host's, and two commits more.
+fn pack_scene(format: &str) -> (tempfile::TempDir, PathBuf, PathBuf, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("runs/run-1/workspace/repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", &format!("--object-format={format}")]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let server = dir.path().join("server.git");
+    let repo_arg = repo.to_string_lossy().into_owned();
+    let server_arg = server.to_string_lossy().into_owned();
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            "--no-local",
+            &repo_arg,
+            &server_arg,
+        ],
+    );
+    for i in 0..2 {
+        std::fs::write(repo.join(format!("work-{i}.txt")), format!("work {i}\n")).unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", &format!("work {i}")]);
+    }
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    (dir, repo, server, base, head)
+}
+
+#[test]
+fn a_pack_holds_the_objects_the_repository_lacks_and_unpacks_there() {
+    for format in ["sha1", "sha256"] {
+        let (_dir, repo, server, base, head) = pack_scene(format);
+        let command = reader()
+            .pack_objects_command(&repo, &head, std::slice::from_ref(&base), true)
+            .unwrap();
+        let (pack, ok, stderr) = run_pack(command);
+        assert!(ok, "{format}: {stderr}");
+        assert_eq!(&pack[..4], b"PACK", "{format}");
+        assert_eq!(u32::from_be_bytes(pack[4..8].try_into().unwrap()), 2);
+        // Two commits, two trees and two blobs: nothing of the base.
+        assert_eq!(
+            u32::from_be_bytes(pack[8..12].try_into().unwrap()),
+            6,
+            "{format}"
+        );
+        // The code host's side takes it, and then has every object of HEAD.
+        let mut unpack = Command::new("git")
+            .args(["unpack-objects", "-q"])
+            .current_dir(&server)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(unpack.stdin.as_mut().unwrap(), &pack).unwrap();
+        drop(unpack.stdin.take());
+        assert!(unpack.wait().unwrap().success(), "{format}");
+        git(&server, &["update-ref", "refs/heads/agent", &head]);
+        git(&server, &["fsck", "--no-dangling", "--strict"]);
+        // A pack that leaves out HEAD itself is empty, and still a pack (a new branch at a tip
+        // the repository has).
+        let command = reader()
+            .pack_objects_command(&repo, &head, std::slice::from_ref(&head), false)
+            .unwrap();
+        let (pack, ok, stderr) = run_pack(command);
+        assert!(ok, "{stderr}");
+        assert_eq!(&pack[..4], b"PACK");
+        assert_eq!(u32::from_be_bytes(pack[8..12].try_into().unwrap()), 0);
+        assert_eq!(pack.len(), 12 + if format == "sha1" { 20 } else { 32 });
+    }
+}
+
+#[test]
+fn a_pack_of_an_object_the_clone_lacks_fails_and_writes_no_pack() {
+    let (_dir, repo, _server, _base, head) = pack_scene("sha1");
+    let missing = "0123456789abcdef0123456789abcdef01234567".to_string();
+    let command = reader()
+        .pack_objects_command(&repo, &head, &[missing], false)
+        .unwrap();
+    let (pack, ok, stderr) = run_pack(command);
+    assert!(!ok);
+    assert!(pack.is_empty(), "{} bytes", pack.len());
+    assert!(
+        stderr.contains("bad") || stderr.contains("ended with"),
+        "{stderr}"
+    );
+}
+
+/// What a `git pack-objects` that a hostile repository took over could do: in the reader's
+/// place of git, a script that prints its environment and tries to read a file that stands for
+/// the host's token, on the stdout that `run` would send to the code host.
+#[test]
+fn a_pack_writer_taken_over_gets_no_credential_and_reads_nothing_of_the_host() {
+    let scene = Scene::new();
+    let (_dir, repo, _server, base, head) = pack_scene("sha1");
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    let script = fake.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho ENV-BEGIN\nenv\necho ENV-END\nif cat '{}' 2>/dev/null; then echo CANARY-READ; else echo CANARY-REFUSED; fi\n",
+            scene.canary.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = reader()
+        .pack_objects_command(&repo, &head, &[base], false)
+        .unwrap();
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    command.env("PATH", path);
+    let (out, ok, stderr) = run_pack(command);
+    let out = String::from_utf8_lossy(&out);
+    assert!(ok, "{stderr}\n{out}");
+    let env: Vec<&str> = out
+        .split("ENV-BEGIN\n")
+        .nth(1)
+        .and_then(|rest| rest.split("ENV-END").next())
+        .unwrap()
+        .lines()
+        .collect();
+    // Only what the reader's git gets: PATH, HOME and git's own settings; no token.
+    for line in &env {
+        let name = line.split('=').next().unwrap();
+        assert!(
+            matches!(
+                name,
+                "PATH" | "HOME" | "PWD" | "SHLVL" | "_" | "OLDPWD" | "SSH_ASKPASS"
+            ) || name.starts_with("GIT_"),
+            "{line}"
+        );
+        assert!(
+            !name.contains("TOKEN") && !line.contains("Authorization"),
+            "{line}"
+        );
+    }
+    assert!(
+        !env.iter().any(|l| l.starts_with("GIT_CONFIG_COUNT")),
+        "{env:?}"
+    );
+    if confinable() {
+        assert!(out.contains("CANARY-REFUSED"), "{out}");
+        assert!(!out.contains("tfr_TEST_ONLY_canary_host_token"), "{out}");
+    } else {
+        eprintln!(
+            "SKIPPED (the file part): this kernel cannot confine a reader; the environment was checked"
+        );
+    }
+    scene.untouched();
 }

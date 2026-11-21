@@ -322,21 +322,22 @@ fn gateway_of(network: &NetworkInspect) -> Option<IpAddr> {
 
 // ----- routes --------------------------------------------------------------------------
 
-/// The repository a route leads to, split for requests.
+/// The repository a route leads to, split for requests; the host's own push uses it too
+/// ([`crate::git_push`]).
 #[derive(Debug, Clone)]
-struct Upstream {
-    https: bool,
+pub(crate) struct Upstream {
+    pub(crate) https: bool,
     /// Host name or IP to connect to (no brackets).
-    host: String,
-    port: u16,
+    pub(crate) host: String,
+    pub(crate) port: u16,
     /// Value of the `Host` header.
-    authority: String,
+    pub(crate) authority: String,
     /// Repository path without a trailing slash; empty for a repository at the root.
-    path: String,
+    pub(crate) path: String,
 }
 
 impl Upstream {
-    fn parse(repo_url: &str, allow_http: bool) -> Result<Upstream> {
+    pub(crate) fn parse(repo_url: &str, allow_http: bool) -> Result<Upstream> {
         let url = url::Url::parse(repo_url).context("invalid repository URL")?;
         let https = match url.scheme() {
             "https" => true,
@@ -1311,12 +1312,11 @@ async fn forward(
         }
     }
     if let Some(authorization) = authorization {
-        match HeaderValue::from_str(authorization.expose()) {
-            Ok(mut value) => {
-                value.set_sensitive(true);
+        match authorization_value(authorization) {
+            Some(value) => {
                 headers.insert(header::AUTHORIZATION, value);
             }
-            Err(_) => return text(StatusCode::BAD_GATEWAY, "invalid git credentials"),
+            None => return text(StatusCode::BAD_GATEWAY, "invalid git credentials"),
         }
     }
 
@@ -1376,6 +1376,15 @@ async fn forward(
         }
     }
     out
+}
+
+/// The `Authorization` header that carries `authorization` upstream, marked sensitive (hyper
+/// leaves it out of its debug output and HPACK); `None` when it is no header value. The host's
+/// own push attaches the token the same way ([`crate::git_push`]).
+pub(crate) fn authorization_value(authorization: &Secret) -> Option<HeaderValue> {
+    let mut value = HeaderValue::from_str(authorization.expose()).ok()?;
+    value.set_sensitive(true);
+    Some(value)
 }
 
 /// `true` when the request body hit [`MAX_REQUEST_BODY`] while it was sent.

@@ -384,6 +384,11 @@ impl Git {
         self.reader.is_some()
     }
 
+    /// The readers this clone's git commands run in, once it holds a sandbox's objects.
+    pub(crate) fn reader(&self) -> Option<&crate::reader::Reader> {
+        self.reader.as_ref()
+    }
+
     /// git with `args` on this clone: with the token for `auth` (the push alone), in a reader
     /// once the clone holds a sandbox's objects, and otherwise in this host's process tree.
     async fn run_input(
@@ -753,13 +758,15 @@ impl Git {
     /// force. The URL is named explicitly, so nothing in `.git/config` decides where the push
     /// goes.
     ///
-    /// The push runs in the host's process tree with the token, also when the clone reads
-    /// through a reader: git's `pack-objects` then reads objects that a sandbox sent. They were
-    /// checked by `fsck` in the reader, the clone's `.git` was put back by [`Git::sanitize`],
-    /// and the refspec names the run's branch alone. What a flaw of git's in reading such
-    /// objects would still reach from here is the process's environment (this run's git token)
-    /// and the files of the host's user; not the host's memory, which is not dumpable
-    /// ([`crate::confine::protect_host_process`]). runner/README.md, "The reader".
+    /// This push (`run --push-client git`, the default) runs in the host's process tree with
+    /// the token, also when the clone reads through a reader: git's `pack-objects` then reads
+    /// objects that a sandbox sent. They were checked by `fsck` in the reader, the clone's
+    /// `.git` was put back by [`Git::sanitize`], and the refspec names the run's branch alone.
+    /// What a flaw of git's in reading such objects would still reach from here is the
+    /// process's environment (this run's git token) and the files of the host's user; not the
+    /// host's memory, which is not dumpable ([`crate::confine::protect_host_process`]).
+    /// runner/README.md, "The reader". The runner host's own client closes that
+    /// ([`Git::push_with`], [`crate::git_push`]).
     pub async fn push(&self, branch: &str) -> Result<GitOutput> {
         let refname = format!("refs/heads/{branch}");
         let expected = match branch_tip(&self.base, branch) {
@@ -782,6 +789,44 @@ impl Git {
             ],
         )
         .await
+    }
+}
+
+impl Git {
+    /// The push of `head` (HEAD, as the run checked it; read again when `None`) to
+    /// `refs/heads/<branch>`, by the client `settings` names, with the same lease as
+    /// [`Git::push`]. `run --push-client host` ([`crate::git_push`]): the runner host's own
+    /// receive-pack client, for http(s) repositories; the pack is made in a process that holds
+    /// no token (a reader, once the clone holds a sandbox's objects), and the token stays in
+    /// this process. A repository of another scheme (`file://`, the tests and local
+    /// development) is pushed by git, which needs no token for it. The output is in
+    /// `git push --porcelain`'s words either way.
+    pub async fn push_with(
+        &self,
+        branch: &str,
+        head: Option<String>,
+        settings: &crate::git_push::PushSettings,
+    ) -> Result<GitOutput> {
+        if settings.client == crate::git_push::PushClient::Git {
+            return self.push(branch).await;
+        }
+        // The scheme as `url` reads it (case-insensitive), as the client's own parse does; a
+        // plain http repository the client refuses unless the host takes it.
+        let scheme = url::Url::parse(&self.repo_url)
+            .map(|u| u.scheme().to_string())
+            .unwrap_or_default();
+        if scheme == "https" || scheme == "http" {
+            let head = match head {
+                Some(head) => head,
+                None => self.head().await?,
+            };
+            return crate::git_push::push(self, branch, &head, settings.allow_http).await;
+        }
+        tracing::info!(
+            scheme = %scheme,
+            "--push-client host takes http(s) repositories alone: git push pushes this one"
+        );
+        self.push(branch).await
     }
 }
 

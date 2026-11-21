@@ -21,6 +21,7 @@ pub mod egress_proxy;
 pub mod front;
 pub mod git;
 pub mod git_proxy;
+pub mod git_push;
 pub mod git_refresh;
 pub mod git_tokens;
 pub mod health;

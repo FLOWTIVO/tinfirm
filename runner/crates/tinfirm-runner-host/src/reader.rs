@@ -29,8 +29,11 @@
 //!   reader. After that the host's clone holds objects of the sandbox's, and so every later
 //!   git command on it that reads objects runs through the reader too, confined the same way
 //!   ([`Reader::git_command`]): the ahead count, the HEAD and the credential scan's listings.
-//!   Only the push runs as before, with the run's git token ([`crate::git::Git::push`]),
-//!   after [`crate::git::Git::sanitize`] has put back the clone's own configuration.
+//!   By default the push runs as before, with the run's git token
+//!   ([`crate::git::Git::push`]), after [`crate::git::Git::sanitize`] has put back the clone's
+//!   own configuration. With `run --push-client host`, the push's pack is made in a reader too
+//!   ([`Reader::pack_objects_command`]), and the token stays in `run`, which sends the pack
+//!   unread ([`crate::git_push`]).
 //!
 //! Where the reader cannot be confined (no Landlock 2, macOS), it still runs as a process of its
 //! own without a token, but nothing keeps it from the host's files: [`Reader::probe`] tells, and
@@ -72,6 +75,8 @@ const READER_IDENTITY: (&str, &str) = ("Tinfirm runner host", "runner@tinfirm.in
 /// The longest bundle header ([`check_bundle_header`]), and its most lines.
 const MAX_BUNDLE_HEADER: u64 = 1 << 20;
 const MAX_BUNDLE_LINES: usize = 10_000;
+/// The most tips a pack leaves out: the client's own bound ([`crate::git_push::MAX_PACK_TIPS`]).
+const MAX_PACK_EXCLUDE: usize = crate::git_push::MAX_PACK_TIPS;
 /// Where the reader fetches the sandbox's HEAD to, for a moment.
 const IMPORTED_REF: &str = "refs/tinfirm/sandbox";
 
@@ -118,6 +123,16 @@ enum Work {
     },
     /// Run git in `repo` (read only) with `args`, after the host's safe settings.
     Git { repo: PathBuf, args: Vec<String> },
+    /// Write on stdout a pack of the objects of `repo` (read only) that are reachable from
+    /// `head` and from none of `exclude`: `git pack-objects --revs --stdout`, for the host's own
+    /// push ([`crate::git_push`]). Its stdout is the pack and nothing else; the host passes it on
+    /// unread.
+    PackObjects {
+        repo: PathBuf,
+        head: String,
+        exclude: Vec<String>,
+        delta_base_offset: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -560,6 +575,49 @@ impl Reader {
         command
     }
 
+    /// A reader that writes on its stdout a pack of the objects of the clone `repo` that are
+    /// reachable from `head` and from none of `exclude` (with `delta_base_offset`, deltas may
+    /// name their base by its offset, `ofs-delta`), and nothing else: the push's pack
+    /// ([`crate::git_push`]). It may only read `repo`, as [`Reader::git_command`]'s readers, and
+    /// is given no credential. Its stderr is git's. It runs in a process group of its own: the
+    /// caller kills the group once it has ended ([`confine::kill_group`]).
+    pub fn pack_objects_command(
+        &self,
+        repo: &Path,
+        head: &str,
+        exclude: &[String],
+        delta_base_offset: bool,
+    ) -> Result<tokio::process::Command> {
+        check_pack_names(head, exclude).map_err(|e| anyhow!(e))?;
+        let job = Job {
+            allow_unconfined: self.allow_unconfined,
+            work: Work::PackObjects {
+                repo: repo.to_path_buf(),
+                head: head.to_string(),
+                exclude: exclude.to_vec(),
+                delta_base_offset,
+            },
+        };
+        let job = serde_json::to_string(&job)?;
+        if job.len() > MAX_JOB {
+            bail!("the pack's job is too long");
+        }
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
+            .arg(SUBCOMMAND)
+            .arg(job)
+            .env_clear()
+            .env("PATH", scrubbed_path())
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        Ok(command)
+    }
+
     /// Starts a reader with `work`, feeds it `input`, and reads its answer: the line and what
     /// follows it (at most `extra` bytes). The reader and everything it started are killed
     /// once it has ended, or after `timeout`.
@@ -881,6 +939,24 @@ fn is_object_name(value: &str) -> bool {
     (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// The names of a pack's job: `head` and at most [`MAX_PACK_EXCLUDE`] tips to leave out, all full
+/// object names of one format.
+fn check_pack_names(head: &str, exclude: &[String]) -> Result<(), String> {
+    if !is_object_name(head) {
+        return Err(format!("`{}` is not an object name", clean(head, 80)));
+    }
+    if exclude.len() > MAX_PACK_EXCLUDE {
+        return Err(format!("a pack leaves out at most {MAX_PACK_EXCLUDE} tips"));
+    }
+    if exclude
+        .iter()
+        .any(|tip| !is_object_name(tip) || tip.len() != head.len())
+    {
+        return Err("a tip to leave out is not an object name of HEAD's format".into());
+    }
+    Ok(())
+}
+
 /// One plain file name that ends in `.bundle`.
 fn is_bundle_name(name: &str) -> bool {
     name.len() <= 128
@@ -916,17 +992,27 @@ pub fn child_main(job: &str) -> ExitCode {
         );
     }
     if !status.confined() && !job.allow_unconfined {
-        return answer(
-            Answer::Error(format!(
-                "the reader cannot be confined here, and the host takes no unconfined reader: {}",
-                status.describe()
-            )),
-            None,
+        let refusal = format!(
+            "the reader cannot be confined here, and the host takes no unconfined reader: {}",
+            status.describe()
         );
+        // A pack's stdout is the pack, which the host sends on unread: its refusal goes where
+        // the host reads the reason of a failed pack, on stderr.
+        if matches!(job.work, Work::PackObjects { .. }) {
+            eprintln!("tinfirm reader: {refusal}");
+            return ExitCode::from(2);
+        }
+        return answer(Answer::Error(refusal), None);
     }
     match job.work {
         Work::Probe { .. } => unreachable!("answered above"),
         Work::Git { repo, args } => exec_git(&repo, &args),
+        Work::PackObjects {
+            repo,
+            head,
+            exclude,
+            delta_base_offset,
+        } => pack_objects(&repo, &head, &exclude, delta_base_offset),
         Work::Unpack { dest, gzip, limits } => answer(unpack(&dest, gzip, limits.into()), None),
         Work::ReadOne { max } => match read_one(max) {
             Ok((done, content)) => answer(Answer::Ok(done), content),
@@ -963,7 +1049,7 @@ fn parse_job(text: &str) -> Result<Job, String> {
         Work::Probe { .. } | Work::ReadOne { .. } => Vec::new(),
         Work::Unpack { dest, .. } => vec![dest],
         Work::Bundle { repo, scratch, .. } => vec![repo, scratch],
-        Work::Git { repo, .. } => vec![repo],
+        Work::Git { repo, .. } | Work::PackObjects { repo, .. } => vec![repo],
     };
     if paths.iter().any(|p| !plain(p) || p.parent().is_none()) {
         return Err("a path of the job is not an absolute, plain path below the root".into());
@@ -983,7 +1069,9 @@ fn plan(work: &Work) -> Plan {
             git: true,
             ..Plan::default()
         },
-        Work::Git { repo, .. } => Plan {
+        // The pack's job reads the clone as the other git jobs do, and writes nothing: its pack
+        // goes to its stdout.
+        Work::Git { repo, .. } | Work::PackObjects { repo, .. } => Plan {
             read: vec![repo.clone()],
             git: true,
             ..Plan::default()
@@ -1014,7 +1102,7 @@ fn limit_resources(work: &Work) {
             limit(Resource::Fsize, 0);
             limit(Resource::Data, READER_MEMORY);
         }
-        Work::Probe { .. } | Work::Bundle { .. } | Work::Git { .. } => {}
+        Work::Probe { .. } | Work::Bundle { .. } | Work::Git { .. } | Work::PackObjects { .. } => {}
     }
 }
 
@@ -1209,6 +1297,54 @@ fn exec_git(repo: &Path, args: &[String]) -> ExitCode {
     }
 }
 
+/// `git pack-objects --revs --stdout` in `repo`: the revisions (`head`, and `^tip` for each tip
+/// to leave out) on its stdin, the pack on this process's stdout, which it inherits, and its
+/// exit code this process's. Nothing else is written on stdout.
+fn pack_objects(repo: &Path, head: &str, exclude: &[String], delta_base_offset: bool) -> ExitCode {
+    if let Err(e) = check_pack_names(head, exclude) {
+        eprintln!("tinfirm reader: {e}");
+        return ExitCode::from(2);
+    }
+    let mut args = vec!["pack-objects", "--revs", "--stdout", "-q"];
+    if delta_base_offset {
+        args.push("--delta-base-offset");
+    }
+    let mut child = match git(repo, Path::new("/nonexistent"))
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("tinfirm reader: cannot run git: {e}");
+            return ExitCode::from(127);
+        }
+    };
+    let mut revisions = format!("{head}\n");
+    for tip in exclude {
+        revisions.push('^');
+        revisions.push_str(tip);
+        revisions.push('\n');
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        // A git that ended before it read them says why on stderr, and its status tells.
+        let _ = stdin.write_all(revisions.as_bytes());
+    }
+    match child.wait() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
+            eprintln!("tinfirm reader: git pack-objects ended with {status}");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("tinfirm reader: cannot wait for git: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn bundle(
     repo: &Path,
     scratch: &Path,
@@ -1389,6 +1525,57 @@ mod tests {
         }
         let ok: Answer = serde_json::from_str(r#"{"ok":{"kind":"bundle","head":"ab"}}"#).unwrap();
         assert!(matches!(ok, Answer::Ok(Done::Bundle { .. })));
+    }
+
+    #[test]
+    fn a_pack_reads_the_clone_alone_and_names_only_objects() {
+        let work = Work::PackObjects {
+            repo: "/data/runs/r/workspace/repo".into(),
+            head: "a".repeat(40),
+            exclude: vec!["b".repeat(40)],
+            delta_base_offset: true,
+        };
+        // The plan of the other git jobs: read the clone, run the system's git, write nothing.
+        assert_eq!(
+            plan(&work),
+            Plan {
+                read: vec!["/data/runs/r/workspace/repo".into()],
+                git: true,
+                ..Plan::default()
+            }
+        );
+        let job = serde_json::to_string(&Job {
+            allow_unconfined: false,
+            work,
+        })
+        .unwrap();
+        assert!(parse_job(&job).is_ok());
+        assert!(parse_job(&job.replace("/data/runs", "data/runs")).is_err());
+        let head = "a".repeat(64);
+        assert!(check_pack_names(&head, &["b".repeat(64)]).is_ok());
+        assert!(check_pack_names(&head, &vec!["b".repeat(64); MAX_PACK_EXCLUDE]).is_ok());
+        for (head, exclude) in [
+            ("HEAD".to_string(), vec![]),
+            ("--all".to_string(), vec![]),
+            (head.clone(), vec!["b".repeat(40)]),
+            (head.clone(), vec!["--not".to_string()]),
+            (
+                head.clone(),
+                vec![format!("{}\n{}", "b".repeat(31), "c".repeat(32))],
+            ),
+            (head.clone(), vec!["b".repeat(64); MAX_PACK_EXCLUDE + 1]),
+        ] {
+            assert!(
+                check_pack_names(&head, &exclude).is_err(),
+                "{head} {exclude:?}"
+            );
+        }
+        let reader = Reader::new("/nonexistent");
+        assert!(
+            reader
+                .pack_objects_command(Path::new("/r"), "HEAD", &[], false)
+                .is_err()
+        );
     }
 
     #[test]
