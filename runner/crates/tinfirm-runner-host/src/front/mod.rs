@@ -4,20 +4,22 @@
 //! tools) out of `run`, which holds the credentials. `run` is to start one per sandbox and to
 //! talk with it over typed, bounded messages; it attaches every credential itself.
 //!
-//! So far `run` starts one front per sandbox when the sandboxes run over the bridge
-//! (`--sandbox-bridge` or a VM per run), with the sandbox's first proxy listener
-//! ([`sandbox::SandboxFront`]): the front parses the HTTP of the sandbox's egress proxy and
-//! copies its tunnels, while `run` decides and makes each connection ([`crate::egress_proxy`]);
-//! it reads the sandbox's model requests, which `run` checks again and sends on with the
-//! key ([`crate::model_proxy`]); and it reads the fetches and tool calls of the run's own
-//! listener of the git proxy and the platform tools, which `run` checks again and answers with
-//! the run's tokens and tools ([`crate::git_proxy`]). The sandbox's bridge can run in its front
-//! too ([`session::FrontSession`]: the front does the TLS and the link, `run` decides each
-//! `hello`), but `run` does not use it for its sandboxes yet.
+//! `run` starts one front per sandbox when the sandboxes run over the bridge
+//! (`--sandbox-bridge` or a VM per run), with the sandbox ([`sandbox::SandboxFront`]). The
+//! front holds the sandbox's bridge ([`session::FrontSession`]): it does the TLS, reads the
+//! `hello`, which `run` decides, and then holds the link, the streams and the tunnels. The
+//! tunnels end in the front's own HTTP services: it parses the HTTP of the sandbox's egress
+//! proxy, while `run` decides and makes each connection ([`crate::egress_proxy`]); it reads
+//! the sandbox's model requests, which `run` checks again and sends on with the key
+//! ([`crate::model_proxy`]); and it reads the fetches and tool calls to the git proxy and the
+//! platform tools, which `run` checks again and answers with the run's tokens and tools
+//! ([`crate::git_proxy`]).
 //! `front --probe JOB` confines itself as a front does
 //! ([`crate::confine::Profile::Front`]) and then tries what a front must be refused, and answers
-//! one line of JSON on stdout ([`Probe`]). `doctor` runs it ([`probe`]). `front` alone serves
-//! the control channel on its stdin ([`wire`]); `run`'s side of it is [`handle::FrontHandle`].
+//! one line of JSON on stdout ([`Probe`]). `run` runs it at its start and refuses to start
+//! where it is not confined, unless `--allow-unconfined-reader`; `doctor` runs it too
+//! ([`probe`]). `front` alone serves the control channel on its stdin ([`wire`]); `run`'s side
+//! of it is [`handle::FrontHandle`].
 //!
 //! What a front applies to itself, before it builds any runtime or reads a byte:
 //! - resource limits: 512 MiB of data, 1024 descriptors, no core file;
@@ -144,6 +146,9 @@ impl Probe {
             if !got.is_empty() {
                 text.push_str("; but it ");
                 text.push_str(&got.join(", "));
+            }
+            if !self.own_group {
+                text.push_str("; but it could not signal its own process group");
             }
             if !self.runtime {
                 text.push_str("; but its runtime did not run");

@@ -1915,3 +1915,211 @@ async fn a_tunnel_port_that_a_program_of_the_sandbox_holds_is_named_with_its_ser
     assert!(front.handle().ended().is_none());
     assert_eq!(finish(&session, bridge).await, 0);
 }
+
+/// Connects each destination the front asks for to `to`, whatever its name.
+struct ConnectingTo(SocketAddr);
+
+impl tinfirm_runner_host::egress_proxy::Connector for ConnectingTo {
+    fn connect(
+        &self,
+        _host: String,
+        _port: u16,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        tinfirm_runner_host::egress_proxy::Granted,
+                        tinfirm_runner_host::egress_proxy::Refusal,
+                    >,
+                > + Send,
+        >,
+    > {
+        let to = self.0;
+        Box::pin(async move {
+            let stream = TcpStream::connect(to).await.map_err(|e| {
+                tinfirm_runner_host::egress_proxy::Refusal {
+                    status: 502,
+                    message: format!("{e}\n"),
+                    off_allowlist: false,
+                }
+            })?;
+            Ok(tinfirm_runner_host::egress_proxy::Granted {
+                stream,
+                held: Box::new(()),
+            })
+        })
+    }
+}
+
+fn median(mut times: Vec<Duration>) -> (Duration, Duration) {
+    times.sort();
+    let p99 = times[(times.len() * 99 / 100).min(times.len() - 1)];
+    (times[times.len() / 2], p99)
+}
+
+/// What the bridge costs through a front, as the bridge crate's `measure_the_bridge` measures
+/// it with the host's side in one process: a handshake, a command's round trip, a put and a
+/// get of 1 GiB, and 1 GiB through a tunnel (here to the front's egress proxy, which `run`
+/// connects to a sink). Run by hand, in release:
+/// `cargo test --release -p tinfirm-runner-host --test front_bridge measure -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, run by hand in release"]
+async fn measure_the_bridge_through_a_front() {
+    use tinfirm_runner_host::front::wire::Service;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const LONG: Duration = Duration::from_secs(600);
+    let _one = SERIAL.lock().await;
+    let (mut starts, mut times) = (Vec::new(), Vec::new());
+    for i in 0..20 {
+        let run_id = format!("run-measure-{i}");
+        let identity = Identity::generate().unwrap();
+        let started = std::time::Instant::now();
+        let (front, registration, addr) =
+            bridged_front(&run_id, Expected::new_ticket().unwrap(), &identity, 0).await;
+        registration
+            .allow_peer(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
+        starts.push(started.elapsed());
+        let started = std::time::Instant::now();
+        let bridge = spawn_bridge(addr, &run_id, registration.ticket().unwrap(), &identity);
+        let session = registration.connected(WAIT).await.unwrap();
+        times.push(started.elapsed());
+        finish(&session, bridge).await;
+        drop(front);
+    }
+    let (p50, p99) = median(starts);
+    println!("a front started with its bridge's listener: median {p50:?}, p99 {p99:?}");
+    let (p50, p99) = median(times);
+    println!("handshake (start of the bridge to the session): median {p50:?}, p99 {p99:?}");
+
+    let (front, mut session, bridge, _, _) = connected("run-measure").await;
+    let files = session.files();
+    let mut times = Vec::new();
+    for _ in 0..200 {
+        let started = std::time::Instant::now();
+        let out = files.exec(&["true"], &[], None, None, WAIT).await.unwrap();
+        assert_eq!(out.code, Some(0));
+        times.push(started.elapsed());
+    }
+    let (p50, p99) = median(times);
+    println!("exec round trip (`true`): median {p50:?}, p99 {p99:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    big_file(&source.join("big.bin"), 1024);
+    let sandbox_dir = dir.path().join("sandbox");
+    let started = std::time::Instant::now();
+    files
+        .put_dir(&source, sandbox_dir.to_str().unwrap(), Vec::new(), LONG)
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    println!(
+        "put of 1 GiB: {took:?} ({:.0} MiB/s)",
+        1024.0 / took.as_secs_f64()
+    );
+    std::fs::remove_dir_all(&source).unwrap();
+    let started = std::time::Instant::now();
+    let read = files
+        .receive(
+            sandbox_dir.to_str().unwrap(),
+            Vec::new(),
+            Vec::new(),
+            LONG,
+            |input| {
+                let tinfirm_runner_host::reader::Input::Pipe(pipe) = input else {
+                    anyhow::bail!("not a pipe");
+                };
+                Ok(std::io::copy(
+                    &mut std::fs::File::from(pipe),
+                    &mut std::io::sink(),
+                )?)
+            },
+        )
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(read > GIB);
+    println!(
+        "get of 1 GiB: {took:?} ({:.0} MiB/s)",
+        1024.0 / took.as_secs_f64()
+    );
+    std::fs::remove_dir_all(&sandbox_dir).unwrap();
+
+    // A sink that reads everything and answers its byte count when the client half-closes.
+    let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = sink.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut total: u64 = 0;
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    total += n as u64;
+                }
+                let _ = stream
+                    .write_all(format!("total {total}\n").as_bytes())
+                    .await;
+            });
+        }
+    });
+    front
+        .listen_egress(
+            None,
+            "Basic c2VjcmV0".into(),
+            Arc::new(ConnectingTo(sink_addr)),
+        )
+        .await
+        .unwrap();
+    let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let addrs = session
+        .open_tunnels(&[(any, Service::Egress)], WAIT)
+        .await
+        .unwrap();
+    let mut io = session
+        .start(shell("echo ready; cat >/dev/null"))
+        .await
+        .unwrap();
+    read_until(&mut io, "ready").await;
+    let mut socket = TcpStream::connect(addrs[0]).await.unwrap();
+    socket
+        .write_all(
+            format!(
+                "CONNECT {sink_addr} HTTP/1.1\r\nhost: {sink_addr}\r\nproxy-authorization: Basic c2VjcmV0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let head = read_head(&mut socket).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let (mut reader, mut writer) = socket.into_split();
+    let started = std::time::Instant::now();
+    let writing = tokio::spawn(async move {
+        let chunk = vec![7u8; 1024 * 1024];
+        for _ in 0..1024 {
+            writer.write_all(&chunk).await.unwrap();
+        }
+        writer.shutdown().await.unwrap();
+    });
+    let mut answer = String::new();
+    tokio::time::timeout(LONG, reader.read_to_string(&mut answer))
+        .await
+        .unwrap()
+        .unwrap();
+    let took = started.elapsed();
+    writing.await.unwrap();
+    assert_eq!(answer, format!("total {GIB}\n"));
+    println!(
+        "1 GiB through a tunnel: {took:?} ({:.0} MiB/s)",
+        1024.0 / took.as_secs_f64()
+    );
+    io.stdin.shutdown().await.unwrap();
+    let _ = drain(&mut io).await;
+    finish(&session, bridge).await;
+}

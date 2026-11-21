@@ -251,7 +251,7 @@ request with an absolute `http://` URL. The part that parses this (the request, 
 the other: whether the destination is on the run's allowlist, where its name resolves, whether that
 address is refused, the limit of 256 open connections per run (plain requests count too), and
 the connection itself. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), the parsing
-half runs in the sandbox's [front process](#sandbox-bridge), confined, which cannot make a
+half runs in the sandbox's [front process](#the-reader-and-the-front), confined, which cannot make a
 connection: it asks `run` for each one by name and port, and `run` decides, connects and hands
 it the connected socket, or answers with the refusal (`400`, `403`, `502` or `503`) that the
 front gives the sandbox. `run` logs each refusal, and a front that asks for more than the wire allows
@@ -354,7 +354,7 @@ the method, `Upgrade`, the bounds of the head) is one half; the other checks the
 as it comes (an endpoint of the gateway's format, its method, every header one that HTTP allows,
 the length within 64 MiB), attaches the key and the host's token, makes the request, and scans
 and passes back the answer. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), the first
-half runs in the sandbox's [front process](#sandbox-bridge), which never holds the key or the
+half runs in the sandbox's [front process](#the-reader-and-the-front), which never holds the key or the
 host's token: it hands `run` the request's endpoint, method, query, headers and length, and the
 body on a socket of its own; `run` gives the answer's status and headers back, and its body on
 the same socket, part by part, so an SSE answer still arrives as it comes. A client that leaves,
@@ -594,28 +594,43 @@ sandbox bridge ([ADR-0095](../docs/adr/0095-sandbox-bridge.md)) instead of Docke
 for now, and in every edition ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)):
 the host lists `sandbox.bridge` in its `hello`, which needs protocol 2. A server from before
 ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is
-`crates/tinfirm-bridge` and the host's modules `bridge.rs`, `sandbox_files.rs` and `takeback.rs`.
+`crates/tinfirm-bridge`, the host's modules `bridge.rs`, `sandbox_files.rs` and `takeback.rs`, and
+the sandbox's [front](#the-reader-and-the-front) (`front/`), a confined process per sandbox that
+holds its bridge.
 
 - **How it runs.** The container runs this host's binary, mounted read-only at
-  `/opt/tinfirm/tinfirm-runner-host`, as `bridge`; the image's entrypoint still runs first. The bridge
-  connects to this host's bridge listener (on the git proxy's address, on a port the system picks)
-  over TLS 1.3, pinned to a certificate that the host creates when it starts. It presents the run's
-  one-time ticket, and starts the image's command when the host sends `start`.
+  `/opt/tinfirm/tinfirm-runner-host`, as `bridge`; the image's entrypoint still runs first. Each
+  sandbox has a bridge listener and a TLS identity of its own, which `run` makes for it and only the
+  sandbox's [front](#the-reader-and-the-front) holds: the listener is on the git proxy's address (the
+  sandbox network's gateway), on a port the system picks or one of `--sandbox-bridge-ports FROM-TO`
+  (`TINFIRM_RUNNER_SANDBOX_BRIDGE_PORTS`, both included; a run that finds no free port in the range
+  fails). The bridge connects there over TLS 1.3, pinned to its sandbox's own certificate, which no
+  other sandbox's bridge pins. It presents the run's one-time ticket, which the front hands to `run`
+  and `run` checks, and starts the image's command when the host sends `start`.
+  - The front takes a connection only from the container's own address on the sandbox network,
+    which `run` reads once the container has started (the local test executor's: loopback); any
+    other is closed before its TLS handshake. Where every sandbox comes from one address (Docker
+    Desktop, `TINFIRM_RUNNER_SANDBOX_NETWORK=host`, a listener address set with
+    `TINFIRM_RUNNER_GIT_PROXY_BIND`), it takes any address, and `run` decides by the run's ticket
+    alone; each front still holds only its own sandbox's key.
 - **The run's credentials are not in the container's settings.** `docker inspect` shows only:
-  - the bridge's own settings (`TINFIRM_BRIDGE_ADDR`, `_RUN`, the one-time `_TICKET`, `_PIN`);
+  - the bridge's own settings (`TINFIRM_BRIDGE_ADDR`, `_RUN`, the one-time `_TICKET`, and `_PIN`,
+    the pin of its sandbox's own certificate);
   - the entrypoint's (`TINFIRM_SANDBOX_*`);
   - the proxy variables of the agent's own dockerd.
 
   Every other variable of the run, the credential among them, reaches the adapter in `start`.
-- **The host's listeners are on loopback, and the sandbox reaches them through the bridge.** The git
-  proxy and the platform tools, the model proxy and the egress proxy listen on 127.0.0.1 of this
-  host, where no sandbox reaches them; only the bridge listener stays on the sandbox network's
-  gateway. Before the agent starts, the bridge listens on the sandbox's own 127.0.0.1 at each
-  listener's port and carries every connection there to that listener over the bridge (a tunnel), so
-  `origin`, the MCP endpoint, the model's base URL and the proxy variables name the sandbox's
-  loopback. The listeners' own checks do not change. With `TINFIRM_RUNNER_SANDBOX_NETWORK=host` the
-  listeners take 127.0.0.2, and `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` set where the bridge
-  listener goes.
+- **The sandbox reaches its proxies only through the bridge.** This host binds no listener for a
+  sandbox's git proxy and platform tools, model proxy or egress proxy; the bridge listener is the
+  only port of this host's that is meant for a sandbox. Before the agent starts, the bridge listens on the sandbox's own
+  127.0.0.1, at port 18761 (the git proxy and the platform tools), 18762 (the model proxy) and 18763
+  (the egress proxy), and carries every connection there over the bridge (a tunnel) to that service
+  in the sandbox's front, never to an address. So `origin`, the MCP endpoint, the model's base URL
+  and the proxy variables name the sandbox's loopback. The front reads each request, and `run`
+  checks it again with the rules it always applied and adds the credentials. A program of the image
+  that holds one of the three ports fails the run at its start, with an error that names the
+  service and the port. `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` set where the bridge listeners
+  go.
   - Each connection has a window of 128 KiB per direction, so one that stalls holds back no other;
     at most 128 are open per run.
   - A container of the agent's own Docker reaches the tunnels only on Docker's `host` network,
@@ -628,14 +643,14 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     the mirrors serve them), the skills, the attachments and an empty `/output`.
   - The platform tools read the agent's files through the bridge.
   - After the agent, the host runs its git steps in the sandbox: the WIP commit, then a bundle of
-    `HEAD`. A [reader](#the-reader) fetches the bundle into the host's own clone, which the agent
+    `HEAD`. A [reader](#the-reader-and-the-front) fetches the bundle into the host's own clone, which the agent
     never reached, with every object checked, and the host pushes from there with the usual checks.
     The host never runs git in a `.git` that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
     `core.packedGitWindowSize` set to 1 TiB, so git maps a whole pack at once: the fetch from a
     bundle of git 2.43 to 2.48 closes a file descriptor twice, and with git's default window of
     1 GiB the fetch of a bundle over 1 GiB could fail with `packfile … cannot be mapped: Bad file
     descriptor`.
-  - The session home and `/output` come back, unpacked by a [reader](#the-reader) as directories
+  - The session home and `/output` come back, unpacked by a [reader](#the-reader-and-the-front) as directories
     and regular files only (links and devices are left out), at most 2 GiB and 4 GiB; then the
     sandbox goes.
   - The images need `/attachments` and `/output` writable by the agent: the images of this version
@@ -645,13 +660,18 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
   25 s, it stops the agent (SIGINT, then SIGTERM, then SIGKILL), and keeps the sandbox and its files
   for 15 minutes more, for this host after a restart (below). The host ends the run after 30 s
   without the bridge; a bridge that it no longer knows is refused, and ends at once.
-- **What the host holds for a sandbox is bounded.** Each side of the link acknowledges only
-  what it has handed on to its reader, and reads at most 8 MiB ahead of it; the adapter's
-  output waits for the run's loop in a queue of 256 chunks. A run whose host falls behind, or
-  a sandbox that floods, is held back through the bridge's credit and then TCP: the adapter's
-  writes block in the sandbox, nothing is dropped, and nothing piles up in the host. A bridge
-  that connects again and again while the run's loop has not taken the earlier connections'
-  events (64 at most) is dropped without an answer, and tries again later.
+- **What the host holds for a sandbox is bounded.** Each side of the link (the bridge, and the
+  sandbox's front) acknowledges only what it has handed on to its reader, and reads at most 8 MiB
+  ahead of it; the adapter's output waits for the run's loop in a queue of 256 chunks. A run whose
+  host falls behind, or a sandbox that floods, is held back through the bridge's credit and then
+  TCP: the adapter's writes block in the sandbox, nothing is dropped, and nothing piles up in the
+  host. A front has at most 8 connections in their handshake or waiting for `run`'s decision at
+  once; a bridge that opens more has the others dropped without an answer, and tries again later.
+- **What it costs.** The bridge through a front, against the bridge crate's host side in one
+  process (release build, loopback, one machine): a handshake takes about 1.9 ms (1 ms in one
+  process), a command's round trip about 1.85 ms (1.5 to 1.7 ms), and 1 GiB goes in at about
+  400 MiB/s (440 to 465), comes out at about 375 MiB/s (445) and goes through a tunnel at about
+  450 MiB/s (530). A front starts, with its bridge's listener, in about 3.3 ms, once per sandbox.
 - **A bridge that does not connect** within 180 s, or a container that ends before its bridge does,
   fails the run with `INFRA`. The container's last log lines (the entrypoint's) are in the run's log.
 - **Requirements.**
@@ -659,23 +679,31 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     binaries for Linux are; `run` refuses any other.
   - `TINFIRM_RUNNER_BRIDGE_BINARY` names another binary, for example on macOS with Docker Desktop:
     the Linux release binary of the same version, in a directory that Docker Desktop shares.
-  - A host firewall must admit the bridge's port from the sandbox network, as it must for the model
-    proxy's listeners.
+  - A host firewall between the sandbox network and this host must admit TCP to the bridge ports:
+    a port per sandbox, from `--sandbox-bridge-ports`, or without it from the system's range for
+    local ports (`net.ipv4.ip_local_port_range`). It admits no port of a proxy: the host binds
+    none. The first start after an upgrade from a version before the fronts also opens the shared
+    port that `runs/bridge.json` keeps, only while that version's runs are taken back (below). With
+    a [VM per run](#a-vm-per-run) the control host dials each VM and listens on nothing for it.
 - **A restart of this host loses no work** ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
   threat model R36). While a run's sandbox lives, this host keeps a record of it in its data
   directory (`runs/<run id>.json`, 0600): the assignment, the sandbox, the bridge's session key, the
-  repositories as cloned and the agent's session; the bridge listener keeps its identity and port in
-  `runs/bridge.json`. A `run` that starts after a crash, a `kill -9` or an upgrade finds the records
-  and takes each run back before it connects: the run is in its `hello`, so Tinfirm keeps it; the
-  listener starts with the same identity on the same port, and the sandbox's bridge comes back to
-  it. The agent that the earlier process started stops, its work comes back and is pushed, its
+  repositories as cloned and the agent's session, and the sandbox's bridge (`bridge`: its TLS
+  identity, and on Docker its port and its peer's address; a VM's dial target is the record's
+  sandbox). A `run` that starts after a crash, a `kill -9` or an upgrade finds the records and
+  takes each run back before it connects: the run is in its `hello`, so Tinfirm keeps it; a new
+  front starts for each sandbox with the same identity, listening on the same port (a VM's dials
+  it), and the sandbox's bridge comes back to it with the session's key. A record without `bridge`
+  (one of the version before the fronts) is taken back through one shared listener in `run`,
+  whose identity and port `runs/bridge.json` keeps; that is the only use of the shared listener and
+  of that file. The agent that the earlier process started stops, its work comes back and is pushed, its
   session is saved, and the run ends failed with `INFRA`, saying what was saved; the next message
   goes on from there. A sandbox that does not come back within 2 minutes is removed, and its work
   is lost.
   - The turn does not go on in place: the agent is stopped. Runs without the bridge, and a Docker
     host's runs when the machine itself restarts (Docker stops the containers), are lost.
   - The records hold the run's credentials (the repositories' tokens, a model access key) and the
-    listener's private key while the sandbox lives, as the config directory holds the host token.
+    bridge's private key while the sandbox lives, as the config directory holds the host token.
     A record's git tokens are those the run holds now: when Tinfirm revokes a repository's token
     ([Revoked git tokens](#revoked-git-tokens-protocol-v2)), the host writes the record again,
     whole and 0600, without the token and with the repository in its `revoked` list (the
@@ -751,15 +779,30 @@ ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_RE
     a second crash. The record keeps a token's latest value and its expiry until the run ends.
   - `run` must start with the same data directory and, for Docker, the same sandbox network, within
     the 15 minutes; `run --sandbox-bridge` must stay on.
+- **A front that ends during a run** (a crash, or a flaw that ended it) is replaced once: a new front
+  takes the session back with the run's key, on the same port (a VM's dials it again), the agent
+  is stopped, its work comes back and is saved, and the run fails with `INFRA`, saying what was
+  saved and what was not. When the new front ends too, the run fails and says that its work is
+  lost. The other runs and the host are not touched.
 
-### The reader
+<a id="the-reader"></a>
+
+### The reader and the front
 
 `run` holds every run's git token, its own token to the server and the one-run model tokens. With
-the bridge it also reads what a hostile sandbox sends back: archives and a git pack. A flaw in that
-reading used to run in `run`'s own process, with all of those in reach (path C of
-[ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)). Now each reading runs in a
-process of its own that holds no credential: `tinfirm-runner-host reader` (hidden from the help,
-not run by hand; `reader.rs`, `confine.rs`).
+the bridge, what a hostile sandbox sends is parsed outside it, in processes that hold no credential
+and confine themselves (path C of
+[ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)), so that a flaw in that parsing
+needs a second flaw to reach a credential. Both are this binary, as hidden subcommands that `run`
+starts and nobody runs by hand:
+
+- the **reader** (`tinfirm-runner-host reader`; `reader.rs`, `confine.rs`), one process per
+  archive or git bundle that comes back from a sandbox;
+- the **front** (`tinfirm-runner-host front`; `front/`, `confine.rs`), one process per sandbox,
+  which holds the sandbox's bridge and parses everything the sandbox sends while it runs: the
+  bridge's TLS, frames and tunnels, and the HTTP of its proxies and platform tools.
+
+The reader:
 
 - **What it reads.** The session home and `/output` coming back, each repository's bundle (with
   the fetch into the host's clone, `fsck` and the checkout of the new `HEAD`), a session bundle
@@ -804,42 +847,84 @@ not run by hand; `reader.rs`, `confine.rs`).
   It reads objects that `fsck` checked, from a clone whose configuration `run` restored, to the run's
   branch alone. A flaw in git's reading of such objects in the push would still reach that run's
   token and the files of `run`'s user: this is what is left of path C for the pack.
-- **What it does not protect against.** A flaw of the kernel (Landlock, seccomp) from inside the
-  reader; and what `run` still parses itself: the bridge's frames and control messages, the
-  tunnels, and the HTTP requests to the git, model and egress proxies and the platform tools, which
-  then add the credentials. Those are bounded and tested with a hostile peer, not split yet.
-- **Where it cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS), every
-  host that uses the bridge refuses to start: `--executor vm` and a Docker host with
-  `--sandbox-bridge` alike, before any image is built. `--allow-unconfined-reader`
-  (`TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`) starts it anyway, with a warning, and gives up the
-  reader's confinement: the reader still runs as a process of its own without a token, but a flaw
-  in its reading of a sandbox's archive or git bundle reaches every file of the host's user (the
-  host's token and stored credentials among them), and can end `run` and its runs with a signal;
-  where seccomp is missing too, it reaches the network as well. A Docker host without the bridge
-  uses no reader and checks none.
+
+The front:
+
+- **What it does.** `run` starts one with each sandbox (a VM's with its create, a ready VM's too),
+  and it ends with the sandbox. It does the bridge's TLS and reads each connection's `hello`, which
+  it hands to `run`; `run` decides with the ticket or the session key it keeps, and the front then
+  holds the link, the adapter's stdio, the files going in and out and the tunnels. The tunnels end
+  in its own services: the HTTP of the [git proxy](#git-in-the-sandbox) and the
+  [platform tools](#platform-tools), of the [model proxy](#model-proxy) and of the
+  [egress proxy](#egress-proxy). For each request it hands `run` a typed head within fixed bounds
+  and the body on a socket of its own; `run` checks it again with the rules it always applied, adds
+  the credential and makes the request. It makes no connection: `run` makes each and passes it the
+  socket.
+- **What it holds.** Only what belongs to its sandbox, which the sandbox holds anyway or which is
+  useless anywhere else: the sandbox's TLS key, which no other sandbox's bridge pins; the bridge's
+  ticket and session key (`run` decides each `hello` with its own copy, and no other front has this
+  run's entry); the `start` environment, which is what the agent gets anyway (a dummy key behind a
+  model gateway; a provider key or a login only where the sandbox holds it by design); the `exec`
+  environment (`GIT_*` settings only); the route secrets of the git proxy, the platform tools and
+  the model proxy, and the egress proxy's credential; and the archives that go into the sandbox
+  (the host's clones, whose `.git/config` holds the route secret and no token, the session home,
+  the skills and the attachments). It holds no git token, no model key, no host token, no other
+  sandbox's identity, ticket or session key, and not the shared listener's key.
+- **What it cannot do** (Linux 5.19 or later, with Landlock enabled), applied by itself before it
+  builds its runtime: limits of 512 MiB of data, 1024 descriptors and no core file; not dumpable;
+  Landlock with no directory at all (only `/dev/null` and `/dev/urandom`), and where the kernel has
+  them no TCP `bind` or `connect` and no signal or abstract socket outside its domain; and the
+  reader's seccomp filter, with on top of it no `execve`, no new process (threads only), no
+  `connect`, `bind` or `listen`, and no signal outside its own process group, the signal 0
+  included. A pair of Unix sockets stays allowed, which reaches no other process. It runs as
+  `run`'s user, in a process group of its own, with an empty environment and no descriptor but its
+  control channel on stdin, `/dev/null` on stdout and a pipe to `run` for its stderr.
+
+Both:
+
+- **What they do not protect against.** A flaw of the kernel (Landlock, seccomp) from inside a
+  reader or a front; and what `run` still parses itself: the agent's ACP messages (lines of up to
+  8 MiB), the JSON of the platform tools' calls (1 MiB at most), the fronts' messages (closed,
+  bounded types), the readers' answers and the walk of what they wrote, stderr and log text, the
+  answers of the code host and of the model's gateway (not the sandbox's input, but a model's text
+  passes through them), and on a personal Docker host a Codex login's `auth.json`, which the
+  sandbox can write. Those are bounded and tested with a hostile peer; a flaw in one of them still
+  reaches the host's credentials with no second flaw. The push, too, runs in `run`'s process tree
+  with the run's token (above).
+- **Where they cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS),
+  every host that uses the bridge refuses to start: `--executor vm` and a Docker host with
+  `--sandbox-bridge` alike, before any image is built. At its start `run` runs a reader's probe
+  and a front's, and one refusal names each that is not confined: "this system cannot confine the
+  reader of what sandboxes send back (…) nor the front process of a sandbox (…)". A front whose
+  probe got through anything it must be refused (a host file, a socket, another process, a
+  program), or that could not signal its own process group or run its runtime, counts as not
+  confined too. `--allow-unconfined-reader` (`TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), one flag
+  for both, starts it anyway, with a warning that names what it gives up:
+  - of the reader: it still runs as a process of its own without a token, but a flaw in its
+    reading of a sandbox's archive or git bundle reaches every file of the host's user (the host's
+    token and stored credentials among them), and can end `run` and its runs with a signal; where
+    seccomp is missing too, it reaches the network as well;
+  - of the fronts: each still runs as a process of its own that holds no credential, but a flaw in
+    its parsing of its sandbox's bridge (the TLS, the frames, the tunnels) or of the HTTP to the
+    sandbox's proxies reaches every file of the host's user, the host's token and stored
+    credentials among them; where seccomp is missing too, it also reaches the network, starts
+    programs and can end `run` and its runs with a signal.
+
+  A Docker host without the bridge uses no reader and no front, and checks neither.
 - **`doctor`** runs a reader, which confines itself and tries to open the config and data
   directories, its parent's memory and a socket, and says `reader: confined: Landlock ABI 7 (files,
-  TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable`, or why not: a
-  failure where `run` would refuse (`TINFIRM_RUNNER_SANDBOX_BRIDGE` or `TINFIRM_RUNNER_EXECUTOR=vm`
-  set, without `TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), a warning where the flag accepts it, and
-  a note where the bridge is off. `host memory` says whether `run` can make itself not dumpable.
-- **The front process (being built).** Path C's second part moves the rest of what `run` parses
-  from a sandbox (the bridge's TLS, frames and tunnels, and the HTTP of the proxies and the
-  platform tools) into a confined process per sandbox, the front, which holds that sandbox's own
-  powers and no credential. So far `run` starts one for each sandbox with its first listener (a
-  VM's comes with the VM's egress listener, any other's with its run's own listener of the
-  [git proxy](#git-in-the-sandbox) and the [platform tools](#platform-tools)), and the front
-  serves the HTTP of the sandbox's git proxy, platform tools, [model proxy](#model-proxy) and
-  [egress proxy](#egress-proxy); it ends with the sandbox. The bridge follows. A front that cannot be
-  confined serves all the same, with a warning in `run`'s log. Its confinement, which it applies to itself before it builds its runtime: limits of 512 MiB of data, 1024 descriptors and
-  no core file; not dumpable; Landlock with no directory at all (only `/dev/null` and
-  `/dev/urandom`); and the reader's seccomp filter, with on top of it no `execve`, no new process
-  (threads only), no `connect`, `bind` or `listen`, and no signal outside its own process group,
-  the signal 0 included. A pair of Unix sockets stays allowed, which reaches no other process.
-  `doctor` starts one and says `front: confined: …`, or why not.
+  TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable`, or why not. It
+  runs a front's probe, which also tries to reach `doctor`'s process and to start a program, and
+  says `front: confined: …`, or why not. Each line has the outcome `run` would give: a failure
+  where `run` would refuse (`TINFIRM_RUNNER_SANDBOX_BRIDGE` or `TINFIRM_RUNNER_EXECUTOR=vm` set,
+  without `TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), a warning where the flag accepts it, and a note
+  where the bridge is off. `host memory` says whether `run` can make itself not dumpable, and
+  `front wire` whether a front starts and answers (below).
+- **The front's messages.** What `run` and a front say to each other:
   - **Its wire to `run`.** A front's stdin is one end of a pair of Unix sockets, its control
     channel; `run` holds the other. Each message is its length in 4 bytes, then JSON of one of a
-    closed set of messages with no unknown field: at most 64 KiB from a front, 1 MiB from `run`.
+    closed set of messages with no unknown field: at most 64 KiB from a front (a command's end,
+    which carries its output, 192 KiB), 1 MiB from `run`.
     The front says it is ready, with its confinement, then answers `run`'s messages in order,
     and exits when `run` closes its end, so it ends with `run` even after `kill -9`.
     Descriptors go one way only: `run` sends them with `SCM_RIGHTS`, and reads its end with
@@ -857,18 +942,39 @@ not run by hand; `reader.rs`, `confine.rs`).
     reaps every front, also after its handle is dropped.
     `doctor` also tries the wire, on a line of its own: `[ ok ] front wire: ready, a round
     trip, a descriptor passed`, or a failure with the reason when `run` would start fronts
-    (`--sandbox-bridge` or `--executor vm`), since no run starts there without one. The
-    `front` line is a warning there when the front cannot be confined.
-  - **The egress messages.** `run` passes the front the listener's socket with the credential
-    it must ask for; the front sends `connect` with a request number that only grows, a host
+    (`--sandbox-bridge` or `--executor vm`), since no run starts there without one.
+  - **The bridge messages.** `run` passes the front the sandbox's TLS identity and the bridge's
+    timing (`bridgeInit`), with the listener it bound for that sandbox, or, for a VM, with none:
+    `run` then dials the VM's bridge and passes each connection (`dialed`), and the front says
+    whether the session's link has a connection (`link`), so that `run` dials again only while it
+    is down, at most once per retry interval, and only to the VM's target. `allowPeer` names the
+    one address the front takes connections from. For each connection's `hello` the front sends
+    `hello` (the run, the ticket or the session key, each at most 128 printable bytes, the
+    sequence numbers and the bridge's build), at most 8 at once; `run` answers `admit` with a new
+    session and its key, a resumption, a take-back after a frame number, or a refusal with its
+    code, and the front says whether the link took the connection (`admitted`). Then `run` asks,
+    each with its own id and a typed answer: `openTunnels` (each tunnel's address and the front's
+    service it reaches), `start` with the adapter's stdin, stdout and stderr on three sockets,
+    `signal`, `stop`, `stdinEnd` (`run` ended the adapter's stdin on purpose: a stdin socket that
+    ends without it passes no end on), `exec` (a command and its output, at most 64 KiB each),
+    `put` (a tar archive of `run`'s own on a socket pair, unpacked in the sandbox), `get` (the
+    sandbox's files as a tar archive, written on a pipe whose other end is a reader's stdin, so
+    `run` never holds the archive), `probe` (the network probe), `reclaim` and `close`. The front
+    says when the adapter exited (`exited`) and when the session ended (`sessionEnded`). A front
+    that sends a `hello` out of its bounds or a ninth at once, says `admitted` of a `hello` that
+    `run` has not admitted, says `exited` or `sessionEnded` twice, or says `link` after its
+    session ended, breaks the wire and is ended.
+  - **The egress messages.** `run` tells the front the credential the sandbox's egress proxy must
+    ask for (on a host that binds the proxy a listener, with that listener's socket); the front
+    sends `connect` with a request number that only grows, a host
     name or address and a port, and `closed` once that connection ends; `run` answers with
     `connected` and the socket, or `refused` with a status, a message and whether the
     destination is off the allowlist (only then does the client get `x-tinfirm-egress:
     denied`). `run` holds a connection's place in the 256 until its `closed` comes, or the
     front ends; a connection whose client left while `run` connected is closed by the front at
     once, with its `closed`.
-  - **The model messages.** `run` passes the front the listener's socket with the run secret,
-    the format and the base path. For each request the front sends `request` with a request
+  - **The model messages.** `run` tells the front the run secret, the format and the base path of
+    the sandbox's model proxy (on a host that binds the proxy a listener, with its socket). For each request the front sends `request` with a request
     number that only grows (shared with `connect`), the endpoint, method, query, headers and
     length, within the bounds above (a header value travels as a string whose characters are
     its bytes, U+0000 to U+00FF, and its bounds count those bytes); `run` answers with `body` and one end of a new pair of
@@ -884,8 +990,9 @@ not run by hand; `reader.rs`, `confine.rs`).
     whether the body is whole has that request ended. When a front ends, `run` ends all its
     requests. A sandbox has one listener of each proxy in its life, and its front serves each
     once: `run` refuses a second one itself, so a front never hears of it.
-  - **The git messages.** `run` passes the front its run's own listener with its bounds (open
-    connections, the time for a request's headers, the idle time of a connection), then the
+  - **The git messages.** `run` tells the front the bounds of the sandbox's git proxy and
+    platform tools (open connections, the time for a request's headers, the idle time of a
+    connection; on a host that binds them a listener, with its socket), then the
     run's routes as they are (`gitRoutes`: each repository route's number, secret, repository
     path and branch, and the platform tools' number and secret), again whenever they change,
     each followed by a round trip so that a request after them finds them. For each fetch or
@@ -914,7 +1021,10 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   1. The run asks for a VM, and the driver creates one from the template. Its user data names no
      run.
   2. Once the driver reports it running, this host dials the sandbox bridge in the VM, which listens
-     on `--vm-port`. The VM's firewall lets in only this host, to that port, and lets nothing out.
+     on `--vm-port`, and passes the connection to the VM's [front](#the-reader-and-the-front),
+     which holds the VM's bridge from its create; it dials again only while the bridge's link is
+     down. The VM's firewall lets in only this host, to that port, and lets nothing out; this host
+     listens on nothing for its VMs.
      A driver that names a `port` in `describe` is dialed at that port of the VM's address instead:
      a sandbox node publishes each VM's bridge on a port of its own address and forwards it to
      `--vm-port` in the VM ([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)).
@@ -923,8 +1033,10 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
      bridge, as in [Sandbox bridge](#sandbox-bridge).
   5. After the agent, the work comes back over the bridge, and the driver deletes the VM.
 - **The user data holds no credential.** It holds the bridge's settings (the VM's id, its one-time
-  ticket, this host's certificate pin), the runner image of a runtime, the sandbox's own settings
-  (`--sandbox-env`), and the URL of the VM's own egress proxy listener. Anything in the VM can read it
+  ticket, the pin of the VM's own bridge certificate, which its front holds, and the port to listen
+  on), the runner image of a runtime, the sandbox's own settings (`--sandbox-env`), and the URL of
+  the VM's egress proxy, `127.0.0.1:18763` on the VM's loopback, which the bridge's tunnel carries to
+  its front; no address of this host's. Anything in the VM can read it
   from the metadata service. In the VM, `vm-boot` reads it from the source that the kernel command
   line names (`tinfirm.user-data=disk:/dev/vdb`: a sandbox node's VM gets it on a small read-only
   disk, ADR-0112), or else from DigitalOcean's metadata service; one VM image serves both.
@@ -1034,9 +1146,11 @@ creates, probes, hands to runs and deletes ([ADR-0098](../docs/adr/0098-ready-vm
 - **What Tinfirm sees.** This host reports its ready, starting and busy VMs, its cold start and the
   runs of the last 24 hours that took a ready VM or started cold (`host.pool.status`), at most every 10
   seconds; the card shows them.
-- **What a ready VM holds.** Nothing of a run: no prompt, no file, no credential. Its egress proxy
-  listener, which its container's settings name, refuses every destination until a run takes the VM
-  and binds its rules to it.
+- **What a ready VM holds.** Nothing of a run: no prompt, no file, no credential. Its front holds
+  its bridge's session while it waits. Its egress proxy, which its settings name and its front
+  serves through its tunnel, refuses every destination until a run takes the VM and binds its rules
+  to it. A ready VM has no record: after a restart, this host deletes it as a leftover and makes a
+  new one, with a new front.
 - **One shape.** The ready VMs run the runner image of `--pool-runtime` with this host's sandbox
   settings. A run of another runtime gets a VM created for it (a cold start); when this host's slots
   are full, a ready VM goes to make room. With `--pool-runtime any`, every run starts from the image
@@ -1307,7 +1421,7 @@ firewall, the probe from a Droplet) and the nightly conformance test.
 | `credential add anthropic-api-key\|openai-api-key --label <l> [--pool 3]` | Stores an API key; the pool (1–16) is a ceiling |
 | `credential list`, `credential remove <label>` | Manage credentials |
 | `images build [--runtime claude\|codex\|pi\|opencode\|all\|multi] [--no-cache] [--build-arg KEY=VALUE]…` | Builds the runner images locally, with the [build arguments](#image-build-arguments) of a host without internet access, and records the arguments and runtimes in `images.json` for [the rebuilds of `run`](#rebuilds-after-an-upgrade) |
-| `doctor [--max-concurrent-runs N] [run's sandbox and VM options]` | Checks the setup as `run` would start with the same options and environment (`TINFIRM_RUNNER_*`): the ceiling N (default 2) as `run` takes it for the executor (at most 16 with Docker), directories and their modes, git, credentials, server, [the reader](#the-reader) and the front, and the level of isolation. With the Docker executor, Docker, its runtimes and the runner images: the names of the recorded image build arguments and each image that `run` would rebuild. With `--executor vm`, no Docker (it says "not used"), but what `run --executor vm` checks at its start: the driver's options; with `--vm-driver node`, its configuration and that every client key is this user's alone (0600); then the driver's `hello` and a `verify` of `--vm-template`, with room for N VMs (default 2), this host's own VMs counted as at `run`'s start ([Checked at start](#a-vm-per-run)); with `--vm-driver node`, the nodes' hardening, with each line that does not hold, which the level of isolation then reports. Also the number of mirrors and their total size, and the runs that the next `run` takes back, with those whose work waits on this host for the server |
+| `doctor [--max-concurrent-runs N] [run's sandbox and VM options]` | Checks the setup as `run` would start with the same options and environment (`TINFIRM_RUNNER_*`): the ceiling N (default 2) as `run` takes it for the executor (at most 16 with Docker), directories and their modes, git, credentials, server, [the reader and the front](#the-reader-and-the-front) (their confinement, and the front's wire), and the level of isolation. With the Docker executor, Docker, its runtimes and the runner images: the names of the recorded image build arguments and each image that `run` would rebuild. With `--executor vm`, no Docker (it says "not used"), but what `run --executor vm` checks at its start: the driver's options; with `--vm-driver node`, its configuration and that every client key is this user's alone (0600); then the driver's `hello` and a `verify` of `--vm-template`, with room for N VMs (default 2), this host's own VMs counted as at `run`'s start ([Checked at start](#a-vm-per-run)); with `--vm-driver node`, the nodes' hardening, with each line that does not hold, which the level of isolation then reports. Also the number of mirrors and their total size, and the runs that the next `run` takes back, with those whose work waits on this host for the server |
 | `mirrors list` | Lists the repository mirrors: key, size, last use, last gc, repository URL |
 | `mirrors prune [--older-than-days N] [--dry-run]` | Deletes idle mirrors and collects garbage in the others, like `run` does every 6 hours; refused while `run` is active (`--dry-run` only shows what it would do) |
 | `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |
@@ -2174,8 +2288,9 @@ process, with one route and one route secret per repository.
   `CREDENTIAL_LEAK`.
 - One listener serves all runs, and also the [platform tools](#platform-tools), so every run
   needs it. The first run starts it, on a random port. With `--sandbox-bridge` or a
-  [VM per run](#a-vm-per-run) each run gets a listener of its own instead, which the sandbox's
-  [front process](#sandbox-bridge) serves: the front reads the sandbox's requests (the route
+  [VM per run](#a-vm-per-run) this host binds no listener for it: the sandbox reaches it through a
+  tunnel of its bridge, at port 18761 of its own loopback, to its
+  [front process](#the-reader-and-the-front): the front reads the sandbox's requests (the route
   secret, the path and the method, the headers within the bounds below, the body's framing)
   and hands `run` the route's number, the request's head and its body; `run` checks it again,
   reads the route's token, makes the request and passes the answer back. The front never
@@ -2193,9 +2308,10 @@ process, with one route and one route secret per repository.
   must be one of this machine's, and not `0.0.0.0` or `::`, or `run` refuses to start: the
   model proxy, which is always on, listens there. With `TINFIRM_RUNNER_SANDBOX_NETWORK=none`
   there is no proxy, and `run` refuses to start for the same reason.
-- If the proxy cannot start (or, with the bridge, the sandbox's front), the run goes on with a
+- If the proxy cannot start, the run goes on with a
   warning, without fetch and without the platform tools; a run whose model access is a gateway fails instead, because its model
-  proxy has no address to listen on.
+  proxy has no address to listen on. With the bridge, a sandbox whose front cannot start does not
+  start either, and its run fails.
 - A route reads its repository's token from the run's holder at each request, never a copy
   taken when the run started. Once Tinfirm has revoked the token
   ([below](#revoked-git-tokens-protocol-v2)), each new request gets 403 with Tinfirm's message
@@ -2286,9 +2402,9 @@ Every run gets the Tinfirm platform tools over MCP (docs/archive/v1/CONVENTIONS.
 [protocol v2](#protocol-versions) the renamed set of
 [Platform tools under protocol v2](#platform-tools-under-protocol-v2)). They are served by
 the host process, not by the sandbox, at `http://<proxy host>:<port>/<mcp secret>/mcp` on
-the git proxy's listener (with the bridge, the run's own listener, which the sandbox's front
-serves: the front reads the HTTP and hands `run` the body, at most 1 MiB, whose JSON `run`
-reads and answers), and passed to the agent in ACP `session/new` and `session/load` as
+the git proxy's listener (with the bridge, the sandbox's tunnel to its front, at port 18761
+of its own loopback: the front reads the HTTP and hands `run` the body, at most 1 MiB, whose JSON
+`run` reads and answers), and passed to the agent in ACP `session/new` and `session/load` as
 `mcpServers: [{"type": "http", "name": "tinfirm", "url": …, "headers": []}]`. With protocol
 v1 the six tools are the following; they serve a server from before protocol v2, since the
 current server sends runs only to v2 hosts, and their texts speak of that server's tasks:

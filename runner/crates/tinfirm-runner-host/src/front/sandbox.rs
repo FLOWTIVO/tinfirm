@@ -99,13 +99,14 @@ impl std::fmt::Debug for SandboxFront {
 }
 
 impl SandboxFront {
-    /// Starts a sandbox's front. One that cannot confine itself serves all the same, with a
-    /// warning in the log (path C part 2 decides in its last slice whether `run` refuses it).
+    /// Starts a sandbox's front. `run` refuses to start where a front's probe is not confined,
+    /// unless `--allow-unconfined-reader` accepts it; a front that cannot confine itself then
+    /// serves, with a warning in the log.
     pub async fn start(command: &FrontCommand) -> Result<Arc<SandboxFront>> {
         let handle = FrontHandle::spawn(command, uuid::Uuid::nil())
             .await
             .context("cannot start the sandbox's front process")?;
-        if !handle.status().seccomp {
+        if !handle.status().confined() {
             tracing::warn!(
                 problem = handle.status().problem.as_deref().unwrap_or("-"),
                 "the sandbox's front process is not confined"

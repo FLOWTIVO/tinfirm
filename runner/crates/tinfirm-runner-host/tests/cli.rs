@@ -1428,11 +1428,27 @@ fn doctor_on_a_vm_host_checks_the_driver_and_not_docker() {
 #[cfg(target_os = "linux")]
 const WITHOUT_LANDLOCK: &str = "TINFIRM_TEST_WITHOUT_LANDLOCK";
 
+/// The system calls that [`launch_without_landlock`] refuses, as JSON numbers; without it,
+/// `landlock_create_ruleset` alone.
+#[cfg(target_os = "linux")]
+const REFUSED_SYSCALLS: &str = "TINFIRM_TEST_REFUSED_SYSCALLS";
+
 /// Like [`run_with_env`], on a system where the reader cannot be confined: this test binary
 /// starts itself again, and [`launch_without_landlock`] runs the host there with Landlock refused
 /// as a kernel without it refuses it. The host and its readers inherit that.
 #[cfg(target_os = "linux")]
 fn run_without_landlock(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    run_refusing(dir, &[libc::SYS_landlock_create_ruleset], args, env)
+}
+
+/// Like [`run_without_landlock`], with `syscalls` refused in its place.
+#[cfg(target_os = "linux")]
+fn run_refusing(
+    dir: &Path,
+    syscalls: &[libc::c_long],
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Output {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([
         "--exact",
@@ -1440,17 +1456,18 @@ fn run_without_landlock(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Outp
         "--nocapture",
         "--test-threads=1",
     ])
-    .env(WITHOUT_LANDLOCK, serde_json::to_string(args).unwrap());
+    .env(WITHOUT_LANDLOCK, serde_json::to_string(args).unwrap())
+    .env(REFUSED_SYSCALLS, serde_json::to_string(syscalls).unwrap());
     host_env(&mut cmd, dir, env).output().unwrap()
 }
 
-/// Not a test of its own: does nothing unless [`run_without_landlock`] started it. Then it
-/// installs a seccomp filter on its thread that answers `landlock_create_ruleset` with `ENOSYS`,
-/// as a kernel without Landlock does, and replaces itself with the runner host.
+/// Not a test of its own: does nothing unless [`run_refusing`] started it. Then it installs a
+/// seccomp filter on its thread that answers the system calls it was given (by default
+/// `landlock_create_ruleset`, as a kernel without Landlock does) with `ENOSYS`, and replaces
+/// itself with the runner host.
 #[cfg(target_os = "linux")]
 #[test]
 fn launch_without_landlock() {
-    use std::collections::BTreeMap;
     use std::os::unix::process::CommandExt;
 
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
@@ -1459,9 +1476,13 @@ fn launch_without_landlock() {
         return;
     };
     let args: Vec<String> = serde_json::from_str(&args).unwrap();
+    let refused: Vec<libc::c_long> = std::env::var(REFUSED_SYSCALLS).map_or_else(
+        |_| vec![libc::SYS_landlock_create_ruleset],
+        |refused| serde_json::from_str(&refused).unwrap(),
+    );
     let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
     let filter: BpfProgram = SeccompFilter::new(
-        BTreeMap::from([(libc::SYS_landlock_create_ruleset, Vec::new())]),
+        refused.into_iter().map(|call| (call, Vec::new())).collect(),
         SeccompAction::Allow,
         SeccompAction::Errno(libc::ENOSYS as u32),
         arch,
@@ -1473,13 +1494,14 @@ fn launch_without_landlock() {
     let error = Command::new(BIN)
         .args(args)
         .env_remove(WITHOUT_LANDLOCK)
+        .env_remove(REFUSED_SYSCALLS)
         .exec();
     panic!("cannot start the runner host: {error}");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn every_host_with_the_bridge_refuses_a_reader_it_cannot_confine() {
+fn every_host_with_the_bridge_refuses_a_reader_and_a_front_it_cannot_confine() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let out = run(
@@ -1519,6 +1541,15 @@ fn every_host_with_the_bridge_refuses_a_reader_it_cannot_confine() {
                 && message.contains("the host's token and stored credentials"),
             "{args:?} {env:?}: {message}"
         );
+        // The front's probe cannot be confined either, and one refusal names both.
+        assert!(
+            message.contains("nor the front process of a sandbox (no Landlock")
+                && message.contains(
+                    "and the fronts' confinement: each front still runs as a process of its own"
+                )
+                && message.contains("its sandbox's bridge"),
+            "{args:?} {env:?}: {message}"
+        );
         // Refused before Docker is asked for anything.
         assert!(!message.contains("DOCKER_HOST"), "{message}");
     }
@@ -1540,23 +1571,117 @@ fn every_host_with_the_bridge_refuses_a_reader_it_cannot_confine() {
         assert!(
             message.contains("cannot confine the reader")
                 && message.contains("--allow-unconfined-reader accepts this")
-                && message.contains("can end `run` and its runs with a signal"),
+                && message.contains("can end `run` and its runs with a signal")
+                && message.contains("nor the front process of a sandbox")
+                && message.contains("and the fronts' confinement"),
             "{args:?} {env:?}: {message}"
         );
         assert!(!message.contains("refuses to start"), "{message}");
         assert!(message.contains("DOCKER_HOST"), "{message}");
     }
-    // A Docker host without the bridge uses no reader, and checks none.
+    // A Docker host without the bridge uses no reader and no front, and checks neither.
     let out = run_without_landlock(dir, &["run"], &[no_docker]);
     assert!(!out.status.success());
     let message = text(&out);
     assert!(!message.contains("reader"), "{message}");
+    assert!(!message.contains("front"), "{message}");
     assert!(message.contains("DOCKER_HOST"), "{message}");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
+fn a_host_with_the_bridge_refuses_a_front_it_cannot_confine_beside_a_confined_reader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let out = run(
+        dir,
+        &["login", "--server", "http://127.0.0.1:9/"],
+        Some(&format!("{HOST_TOKEN}\n")),
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    // `kill` refused: the reader still confines itself, but a front cannot signal its own
+    // process group, which it must be able to, so its probe does not count as confined.
+    let refused = [libc::SYS_kill];
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let vm = [
+        "run",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "digitalocean",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    for (args, env) in [
+        (&["run", "--sandbox-bridge"][..], &[no_docker][..]),
+        (&vm[..], &[][..]),
+    ] {
+        let out = run_refusing(dir, &refused, args, env);
+        assert!(!out.status.success(), "{args:?}");
+        let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            message.contains("this system cannot confine the front process of a sandbox (Landlock ABI")
+                && message.contains("but it could not signal its own process group")
+                && message.contains("refuses to start here")
+                && message.contains("--allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up the fronts' confinement: each front still runs as a process of its own")
+                && message.contains("the host's token and stored credentials"),
+            "{args:?}: {message}"
+        );
+        // The reader is confined, and the refusal does not name it.
+        assert!(!message.contains("cannot confine the reader"), "{message}");
+        assert!(!message.contains("the reader's confinement"), "{message}");
+        assert!(!message.contains("DOCKER_HOST"), "{message}");
+    }
+    // With the flag, a warning that names what is given up, and the host goes on to Docker.
+    let out = run_refusing(
+        dir,
+        &refused,
+        &["run", "--sandbox-bridge", "--allow-unconfined-reader"],
+        &[no_docker],
+    );
+    assert!(!out.status.success());
+    let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        message.contains("this system cannot confine the front process of a sandbox")
+            && message.contains(
+                "--allow-unconfined-reader accepts this and gives up the fronts' confinement"
+            ),
+        "{message}"
+    );
+    assert!(!message.contains("refuses to start"), "{message}");
+    assert!(message.contains("DOCKER_HOST"), "{message}");
+    // `doctor` gives the same outcome: the reader passes, the front fails, or is a warning
+    // with the flag.
+    let doctor = |env: &[(&str, &str)]| {
+        text(&run_refusing(dir, &refused, &["doctor"], env))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let report = doctor(&[("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1")]);
+    assert!(report.contains("[ ok ] reader: confined"), "{report}");
+    assert!(
+        report.contains("[FAIL] front: cannot be confined here: Landlock ABI")
+            && report.contains("but it could not signal its own process group")
+            && report.contains("refuses to start without --allow-unconfined-reader, which gives up the fronts' confinement"),
+        "{report}"
+    );
+    let report = doctor(&[
+        ("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1"),
+        ("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER", "1"),
+    ]);
+    assert!(
+        report.contains("[warn] front: cannot be confined here")
+            && report.contains("--allow-unconfined-reader accepts this: each front still runs"),
+        "{report}"
+    );
+    assert!(!report.contains("[FAIL] front"), "{report}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_fails_where_run_would_refuse_an_unconfined_reader_or_front() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     let doctor = |env: &[(&str, &str)]| {
@@ -1575,10 +1700,10 @@ fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
                 && report.contains("refuses to start without --allow-unconfined-reader, which gives up the reader's confinement"),
             "{env:?}: {report}"
         );
-        // A front that cannot be confined still serves the sandbox's egress: a warning.
+        // `run` refuses a front it cannot confine as it refuses the reader.
         assert!(
-            report.contains("[warn] front: cannot be confined here")
-                && report.contains("each one parses a sandbox's HTTP with no confinement"),
+            report.contains("[FAIL] front: cannot be confined here")
+                && report.contains("refuses to start without --allow-unconfined-reader, which gives up the fronts' confinement"),
             "{env:?}: {report}"
         );
         let mut allowed = env.to_vec();
@@ -1589,12 +1714,19 @@ fn doctor_fails_where_run_would_refuse_an_unconfined_reader() {
                 && report.contains("--allow-unconfined-reader accepts this"),
             "{allowed:?}: {report}"
         );
+        assert!(
+            report.contains("[warn] front: cannot be confined here")
+                && report.contains("--allow-unconfined-reader accepts this: each front still runs"),
+            "{allowed:?}: {report}"
+        );
     }
     let report = doctor(&[]);
     // Without the bridge, `run` starts no front: a note.
     assert!(
         report.contains("[info] front: cannot be confined here")
-            && report.contains("`run` starts one per sandbox for its git proxy"),
+            && report.contains(
+                "`run` starts one per sandbox, for its bridge and the HTTP of its git proxy"
+            ),
         "{report}"
     );
     assert!(

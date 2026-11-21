@@ -182,9 +182,9 @@ enum Command {
         #[arg(long)]
         bridge: Option<PathBuf>,
     },
-    /// The front process of a sandbox (ADR-0112, path C): confined, it is to parse what the
-    /// sandbox sends in `run`'s place. This version runs only its probe (`doctor`); it is not
-    /// run by hand.
+    /// The front process of a sandbox (ADR-0112, path C): confined, it parses what the sandbox
+    /// sends in `run`'s place. `run` starts one per sandbox with --sandbox-bridge or --executor
+    /// vm, and its probe at its start; `doctor` starts its probe. It is not run by hand.
     #[command(hide = true)]
     Front {
         /// Confine as a front does, try what a front must be refused, and answer on stdout.
@@ -340,11 +340,13 @@ struct SandboxArgs {
     )]
     sandbox_bridge_ports: Option<(u16, u16)>,
     /// Run sandboxes over the bridge although this system cannot confine the reader of what
-    /// they send back (Landlock 2 and seccomp: Linux 5.19 or later). Without it, a host with
-    /// --sandbox-bridge or --executor vm refuses to start on such a system. With it, the reader
-    /// still runs as a process of its own without a token, but a flaw in its reading of a
-    /// sandbox's archive or git bundle reaches every file of this host's user, the host's token
-    /// and stored credentials among them, and can end `run` with a signal.
+    /// they send back or the front process of each sandbox (Landlock 2 and seccomp: Linux 5.19
+    /// or later). Without it, a host with --sandbox-bridge or --executor vm refuses to start on
+    /// such a system. With it, the reader and the fronts still run as processes of their own
+    /// without a token, but a flaw in the reader's reading of a sandbox's archive or git bundle,
+    /// or in a front's parsing of its sandbox's bridge or of the HTTP to its proxies, reaches
+    /// every file of this host's user, the host's token and stored credentials among them, and
+    /// can end `run` with a signal.
     #[arg(
         long,
         env = "TINFIRM_RUNNER_ALLOW_UNCONFINED_READER",
@@ -1539,7 +1541,8 @@ async fn doctor(
             ),
         ),
     }
-    // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1).
+    // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1);
+    // then the front of each sandbox (path C, part 2), as `run` checks both at its start.
     doctor_reader(
         &mut checks,
         paths,
@@ -1547,7 +1550,13 @@ async fn doctor(
         sandbox_args.allow_unconfined_reader,
     )
     .await;
-    doctor_front(&mut checks, paths, bridged).await;
+    doctor_front(
+        &mut checks,
+        paths,
+        bridged,
+        sandbox_args.allow_unconfined_reader,
+    )
+    .await;
     // git.
     match git::git_version().await {
         Some(v) => checks.ok("git", v),
@@ -2317,10 +2326,10 @@ async fn run(
     }
     secure_fs::ensure_private_dir(&paths.data_dir)?;
     secure_fs::ensure_private_dir(&paths.config_dir)?;
-    // The reader of what the sandboxes send back, before any image is built: a host that
-    // cannot confine it is refused at once.
+    // The reader of what the sandboxes send back and a probe of their front, before any image
+    // is built: a host that cannot confine either is refused at once.
     let reader = if sandbox_args.sandbox_bridge || vm_options.is_some() {
-        Some(check_reader(paths, sandbox_args.allow_unconfined_reader).await?)
+        Some(check_reader_and_front(paths, sandbox_args.allow_unconfined_reader).await?)
     } else {
         None
     };
@@ -2422,36 +2431,72 @@ fn check_ceiling(max_concurrent_runs: u32, vm: bool) -> Result<()> {
     Ok(())
 }
 
-/// The reader of what the sandboxes send back (ADR-0112, open question 1): this binary,
-/// confined. A probe confines itself as a reader does and tries to open this host's
-/// directories, its own memory and a socket. Where it cannot be confined, every host that uses
+/// The reader of what the sandboxes send back (ADR-0112, open question 1) and the front process
+/// of each sandbox (path C, part 2): this binary, confined. A reader's probe confines itself as
+/// a reader does and tries to open this host's directories, its own memory and a socket; a
+/// front's probe confines itself as a front does and tries those and to reach this process and
+/// to start a program ([`probe_front`]). Where either cannot be confined, every host that uses
 /// the bridge (`--sandbox-bridge`, `--executor vm`) is refused unless `allow`
-/// (`--allow-unconfined-reader`).
-async fn check_reader(paths: &Paths, allow: bool) -> Result<tinfirm_runner_host::reader::Reader> {
+/// (`--allow-unconfined-reader`, whose one policy covers both); with it, a warning says what
+/// is given up.
+async fn check_reader_and_front(
+    paths: &Paths,
+    allow: bool,
+) -> Result<tinfirm_runner_host::reader::Reader> {
     let reader = tinfirm_runner_host::reader::Reader::from_current_exe()?;
-    let probe = probe_reader(paths, &reader).await?;
-    if probe.confined() {
+    let reader_probe = probe_reader(paths, &reader).await?;
+    let front_probe = probe_front(paths)
+        .await
+        .context("the probe of a sandbox's front failed")?;
+    let mut cannot = Vec::new();
+    let mut cost = Vec::new();
+    if reader_probe.confined() {
         tracing::info!(
-            reader = %probe.describe(),
+            reader = %reader_probe.describe(),
             "the reader of what sandboxes send back is confined: archives and git bundles are parsed in a process per reading that holds no credential"
         );
+    } else {
+        cannot.push(format!(
+            "the reader of what sandboxes send back ({})",
+            reader_probe.describe()
+        ));
+        cost.push(format!(
+            "the reader's confinement: {UNCONFINED_READER_COST}"
+        ));
+    }
+    if front_probe.confined() {
+        tracing::info!(
+            front = %front_probe.describe(),
+            "the front process of a sandbox is confined: each sandbox's bridge and the HTTP to its proxies are parsed in a process of its own that holds no credential"
+        );
+    } else {
+        cannot.push(format!(
+            "the front process of a sandbox ({})",
+            front_probe.describe()
+        ));
+        cost.push(format!("the fronts' confinement: {UNCONFINED_FRONT_COST}"));
+    }
+    if cannot.is_empty() {
         return Ok(reader);
     }
-    let cannot = format!(
-        "this system cannot confine the reader of what sandboxes send back ({})",
-        probe.describe()
-    );
+    let cannot = format!("this system cannot confine {}", cannot.join(" nor "));
+    let cost = cost.join("; and ");
     if !allow {
         bail!(
-            "{cannot}. A host that runs its sandboxes over the bridge (--sandbox-bridge, --executor vm) refuses to start here: run it on Linux 5.19 or later with Landlock enabled at boot. --allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up the reader's confinement: {UNCONFINED_READER_COST}"
+            "{cannot}. A host that runs its sandboxes over the bridge (--sandbox-bridge, --executor vm) refuses to start here: run it on Linux 5.19 or later with Landlock enabled at boot. --allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up {cost}"
         );
     }
-    tracing::warn!("{cannot}. --allow-unconfined-reader accepts this: {UNCONFINED_READER_COST}");
-    Ok(reader.allowing_unconfined(true))
+    tracing::warn!("{cannot}. --allow-unconfined-reader accepts this and gives up {cost}");
+    Ok(reader.allowing_unconfined(!reader_probe.confined()))
 }
 
 /// What `--allow-unconfined-reader` gives up, for the refusal, the warning and `doctor`.
 const UNCONFINED_READER_COST: &str = "the reader still runs as a process of its own without a token, but a flaw in its reading of a sandbox's archive or git bundle reaches every file of this host's user, the host's token and stored credentials among them, and can end `run` and its runs with a signal; where seccomp is missing too, it reaches the network as well";
+
+/// What `--allow-unconfined-reader` gives up of the fronts, for the refusal, the warning and
+/// `doctor`. With seccomp alone, a front still makes no socket, starts no program and signals
+/// nothing outside its own process group.
+const UNCONFINED_FRONT_COST: &str = "each front still runs as a process of its own that holds no credential, but a flaw in its parsing of its sandbox's bridge (the TLS, the frames, the tunnels) or of the HTTP to the sandbox's proxies reaches every file of this host's user, the host's token and stored credentials among them; where seccomp is missing too, it also reaches the network, starts programs and can end `run` and its runs with a signal";
 
 /// A reader's probe, with this host's directories and its memory to be refused.
 async fn probe_reader(
@@ -2472,11 +2517,10 @@ async fn probe_reader(
     .context("the reader's probe failed")
 }
 
-/// What `doctor` says of the front process of a sandbox (ADR-0112, path C, part 2), which
-/// `run` starts for each sandbox's listeners with --sandbox-bridge or --executor vm: a front
-/// confines itself and tries to open this host's directories and memory, to make a socket,
-/// to reach this process and to start a program.
-async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool) {
+/// A front's probe (ADR-0112, path C, part 2), started as `run` starts a front: it confines
+/// itself as a front does and tries to open this host's directories and memory, to make a
+/// socket, to reach this process and to start a program.
+async fn probe_front(paths: &Paths) -> Result<tinfirm_runner_host::front::Probe> {
     let job = tinfirm_runner_host::front::ProbeJob {
         deny_read: vec![
             paths.config_dir.clone(),
@@ -2486,16 +2530,20 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool) {
         signal: vec![std::process::id()],
         linger: false,
     };
-    let probe = match std::env::current_exe() {
-        Ok(binary) => tokio::task::spawn_blocking(move || {
-            tinfirm_runner_host::front::probe(&binary, &job, std::time::Duration::from_secs(30))
-        })
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|probe| probe),
-        Err(e) => Err(anyhow::Error::from(e)),
-    };
-    const USED: &str = "`run` starts one per sandbox for its git proxy, platform tools, model and egress proxies with --sandbox-bridge or --executor vm";
+    let binary = std::env::current_exe().context("cannot find this executable")?;
+    tokio::task::spawn_blocking(move || {
+        tinfirm_runner_host::front::probe(&binary, &job, std::time::Duration::from_secs(30))
+    })
+    .await
+    .context("the front's probe did not end")?
+}
+
+/// What `doctor` says of the front process of a sandbox (ADR-0112, path C, part 2), which `run`
+/// starts for each sandbox with --sandbox-bridge or --executor vm: its wire to `run`, and its
+/// probe ([`probe_front`]) with the outcome `run` gives it at its start
+/// ([`check_reader_and_front`]).
+async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool, allow: bool) {
+    const USED: &str = "`run` starts one per sandbox, for its bridge and the HTTP of its git proxy, platform tools, model and egress proxies, with --sandbox-bridge or --executor vm";
     // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed.
     let wire = async {
         let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
@@ -2507,39 +2555,44 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool) {
         anyhow::Ok(())
     }
     .await;
-    // With the bridge, a front that cannot start is a run that cannot start: its egress
-    // listener needs one. Without it, `run` starts no front.
+    // With the bridge, a front that cannot start is a run that cannot start: its sandbox's
+    // bridge and proxies are served by it. Without it, `run` starts no front.
     match wire {
         Ok(()) => checks.ok("front wire", "ready, a round trip, a descriptor passed"),
         Err(e) if bridged => checks.fail(
             "front wire",
-            format!("{e:#} (runs get no git fetch or platform tools, and a run with a model gateway or the egress proxy cannot start: each sandbox's proxies need a front)"),
+            format!("{e:#} (no run can start: each sandbox's bridge and proxies are served by its front)"),
         ),
         Err(e) => checks.info(
             "front wire",
             format!("{e:#} (only used with --sandbox-bridge or --executor vm)"),
         ),
     }
-    // A front that cannot be confined still serves, with a warning in `run`'s log, until `run`
-    // refuses to start without a confined front (path C part 2, slice 6), as it does for the
-    // reader.
-    match probe {
-        Ok(probe) if probe.confined() => checks.ok(
-            "front",
-            format!("confined: {} ({USED})", probe.describe()),
-        ),
-        Ok(probe) if bridged => checks.warn(
-            "front",
-            format!(
-                "cannot be confined here: {}. `run` starts its fronts all the same, and each one parses a sandbox's HTTP with no confinement",
-                probe.describe()
-            ),
-        ),
-        Ok(probe) => checks.info(
-            "front",
-            format!("cannot be confined here: {} ({USED})", probe.describe()),
-        ),
-        Err(e) if bridged => checks.warn("front", format!("{e:#} ({USED})")),
+    match probe_front(paths).await {
+        Ok(probe) if probe.confined() => {
+            checks.ok("front", format!("confined: {} ({USED})", probe.describe()))
+        }
+        Ok(probe) => {
+            let detail = format!("cannot be confined here: {}", probe.describe());
+            if bridged && !allow {
+                checks.fail(
+                    "front",
+                    format!(
+                        "{detail}. `run` with --sandbox-bridge or --executor vm refuses to start without --allow-unconfined-reader, which gives up the fronts' confinement: {UNCONFINED_FRONT_COST}"
+                    ),
+                );
+            } else if bridged {
+                checks.warn(
+                    "front",
+                    format!(
+                        "{detail}. --allow-unconfined-reader accepts this: {UNCONFINED_FRONT_COST}"
+                    ),
+                );
+            } else {
+                checks.info("front", format!("{detail} ({USED})"));
+            }
+        }
+        Err(e) if bridged => checks.fail("front", format!("{e:#} ({USED})")),
         Err(e) => checks.info("front", format!("{e:#} ({USED})")),
     }
 }
