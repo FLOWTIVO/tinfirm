@@ -565,9 +565,20 @@ The host derives its level from what it can see, and only takes your word where 
   host takes the value of the `verify` at its start, where "not known" is `no`: it vouches for no
   node it did not hear from. Later, "not known" keeps the last value. Its log and `doctor` name each
   line that does not hold (`node node-1: io-uring: kernel.io_uring_disabled is 0, not 2`). A lower
-  mark stops nothing: the host still starts and its nodes still take VMs. For now the host sends
-  the value of its start in every hello; a change while it runs reaches the server when it starts
-  again (planned: at once). A driver of your own is not asked: `--isolation-hardened` states it.
+  mark stops nothing: the host still starts and its nodes still take VMs. While it runs, the host
+  asks the driver's `verify` every 5 minutes, and at each of its other health checks (a failed
+  create, a run that comes while the driver can make no VM, and the recheck then), never two at
+  once; the scheduled `verify` also counts for whether the driver can make a VM, as any other.
+  Each hello reports the value the host knows when it sends it. A change reaches the server by a
+  new hello, since the hello is the one frame that carries the mark: the host closes its
+  connection (1000) and connects again at once. A loss (`yes` to `no`) is logged as a warning
+  that names the lines and is sent at once; a gain (`no` to `yes`) once it held for two checks
+  in a row, so that a node whose mark flaps does not move the server's placement with it. "Not
+  known" changes nothing, there is at most one such reconnect per 5 minutes, and none while the
+  connection is down: the next hello carries the value. Runs go on through the reconnect as
+  through any other: the server keeps their leases, the new hello lists them, and their events
+  follow on the new connection. A driver of your own is not asked: `--isolation-hardened` states
+  it.
 - **Where it shows.** `run` logs the level at its start, with what an escape from a sandbox reaches
   on such a host. `doctor` says the same for the settings in its environment
   (`TINFIRM_RUNNER_EXECUTOR`, `TINFIRM_RUNNER_VM_DRIVER`, `TINFIRM_RUNNER_ISOLATION_*`; it does not
@@ -1089,8 +1100,10 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   table is missing, stops it from taking runs: it rejects each new run with `NO_FREE_SLOT` and a
   reason that names the cause ("the VM driver can make no VM now (…)"). This host asks `verify`
   again before a rejection (at most every 5 s) and on its own every 30 s, and takes runs again once
-  the answer is clean or a create succeeds. A clean answer after a failed create leaves the host as
-  it was: the failure was the VM's own. A `verify` that fails or does not answer changes nothing.
+  the answer is clean or a create succeeds. With `--vm-driver node` it also asks every 5 minutes
+  while it takes runs, for the nodes' hardening ([Isolation level](#isolation-level)); such an
+  answer with problems and no room stops it from taking runs too, before a run's create fails. A
+  clean answer after a failed create leaves the host as it was: the failure was the VM's own. A `verify` that fails or does not answer changes nothing.
   A run's admission, and the report of the run whose create failed, wait at most 5 s for `verify`;
   a slower answer is used when it comes. Its log has one warning when it stops taking runs and one
   line when it takes them again. With a server that lists the feature `host.health`

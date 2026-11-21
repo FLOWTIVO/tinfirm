@@ -87,6 +87,9 @@ const RECHECK_FRESH: Duration = Duration::from_secs(5);
 /// check ([`VmOptions::check_wait`]); the check goes on by itself, bounded by the driver's own
 /// [`VERIFY_TIMEOUT`], and its answer is recorded when it comes.
 const CHECK_WAIT: Duration = Duration::from_secs(5);
+/// How often the host asks the node driver's `verify` on its own, as a health check, for the
+/// hardening of its nodes (ADR-0113, decision 5; [`VmOptions::hardening_every`]).
+const HARDENING_EVERY: Duration = Duration::from_secs(300);
 /// The most of the driver's problems that the host passes on in a rejection: it goes to the
 /// server, and is shown as the run's queue reason.
 const CAUSE_MAX: usize = 1000;
@@ -192,6 +195,10 @@ pub struct VmOptions {
     /// The longest a run's admission, or the report of a failed create, waits for the driver's
     /// `verify` in a health check; then it goes on with what is known. No flag sets it.
     pub check_wait: Duration,
+    /// With the built-in node driver: how often the host asks its `verify` on its own for the
+    /// nodes' hardening ([`Vms::ask_hardening`]), and the least time between two reconnects
+    /// for a change of the mark. No flag sets it.
+    pub hardening_every: Duration,
     /// After a delete that failed: the first wait before the host tries it again on its own
     /// ([`DELETE_RETRY`]). No flag sets it.
     pub delete_retry: Duration,
@@ -213,6 +220,7 @@ impl VmOptions {
             image_version: ImageVersion::Warn,
             recheck: RECHECK,
             check_wait: CHECK_WAIT,
+            hardening_every: HARDENING_EVERY,
             delete_retry: DELETE_RETRY,
             on_this_machine: false,
         }
@@ -403,6 +411,16 @@ pub struct Hardening {
     pub hardened: Mark,
     /// Why not `yes`: the lines that do not hold, as the driver named them.
     pub not_hardened: Vec<String>,
+}
+
+/// The mark that the last checks of the hardening answered, and how many checks in a row
+/// answered it ([`Vms::streak_watch`]). A check that cannot tell neither counts nor breaks
+/// the row: it says nothing of the nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Streak {
+    pub mark: Mark,
+    /// 0 before the driver's `verify` has answered.
+    pub checks: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -927,6 +945,8 @@ pub struct Vms {
     /// The last known hardening of the machines that run the VMs, from the driver's `verify`
     /// ([`Vms::note_hardening`]).
     hardening: tokio::sync::watch::Sender<Hardening>,
+    /// The mark of each check that knew one, in a row ([`Vms::streak_watch`]).
+    streak: tokio::sync::watch::Sender<Streak>,
 }
 
 /// The VMs whose delete failed, by id, and whether a task tries them again now.
@@ -997,6 +1017,10 @@ impl Vms {
                 hardened: Mark::No,
                 not_hardened: vec![NOT_ASKED.to_string()],
             }),
+            streak: tokio::sync::watch::Sender::new(Streak {
+                mark: Mark::No,
+                checks: 0,
+            }),
         })
     }
 
@@ -1006,7 +1030,10 @@ impl Vms {
     // template are hardened: `yes`, `no`, or nothing when it cannot tell (a node did not answer,
     // and none said `no`). Nothing keeps the last value the host knows: a node that is down
     // takes no run, and its next answer counts. At the start there is no value to keep, so
-    // nothing there is `no`: the host cannot vouch for a node it did not hear.
+    // nothing there is `no`: the host cannot vouch for a node it did not hear. With the node
+    // driver the host asks `verify` every `hardening_every` on its own, as one more health
+    // check ([`Vms::ask_hardening`]), and at every other health check; the host tells the
+    // server of a change by a new hello (crate::host).
 
     /// The last known hardening of the machines that run this host's VMs: `no` until the
     /// driver's `verify` has answered.
@@ -1017,6 +1044,40 @@ impl Vms {
     /// The same, as it changes.
     pub fn hardening_watch(&self) -> tokio::sync::watch::Receiver<Hardening> {
         self.hardening.subscribe()
+    }
+
+    /// The mark of the checks in a row that knew one, told at each such check, a check that
+    /// answers the same mark again included.
+    pub fn streak_watch(&self) -> tokio::sync::watch::Receiver<Streak> {
+        self.streak.subscribe()
+    }
+
+    /// Whether the host reads the driver's hardening: only this binary's node driver's. An
+    /// operator's own driver keeps its operator's statement (crate::isolation).
+    pub fn reads_hardening(&self) -> bool {
+        matches!(self.options.driver.builtin, Some(Builtin::Node { .. }))
+    }
+
+    /// With the node driver, until `stop`: asks its `verify` every `hardening_every` for the
+    /// nodes' hardening. Each ask is a health check ([`Vms::check_within`]): it waits for a
+    /// check that is under way instead of starting a second `verify`, and its answer counts
+    /// for whether the driver can make a VM as any check's does. Nothing with another driver.
+    pub async fn ask_hardening(self: &Arc<Vms>, stop: tokio_util::sync::CancellationToken) {
+        if !self.reads_hardening() {
+            return;
+        }
+        let every = self.options.hardening_every;
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            // Bounded by the driver's own time for `verify`.
+            self.check_within(VERIFY_TIMEOUT + Duration::from_secs(5))
+                .await;
+        }
     }
 
     /// Notes what a `verify` said of the hardening: its value, or with none, the last known
@@ -1047,6 +1108,19 @@ impl Vms {
             *known = now.clone();
             true
         });
+        // After the value: who is told of the check reads the value it found.
+        self.streak.send_modify(|streak| {
+            *streak = match *streak {
+                Streak { mark, checks } if mark == now.hardened => Streak {
+                    mark,
+                    checks: checks.saturating_add(1),
+                },
+                _ => Streak {
+                    mark: now.hardened,
+                    checks: 1,
+                },
+            }
+        });
         let template = &self.options.template;
         match (before, now.hardened) {
             (Some(Mark::Yes), Mark::No) => tracing::warn!(
@@ -1073,6 +1147,9 @@ impl Vms {
     // once the answer is clean or a create succeeds. A `verify` that fails or does not answer
     // changes nothing either way. No admission and no failed run's report waits longer than
     // `check_wait` for the driver: the check goes on by itself. Each change is logged once.
+    // With the node driver the host also asks every `hardening_every`, while it takes runs
+    // too ([`Vms::ask_hardening`]): an answer with problems and no room then puts it into the
+    // state before a run's create fails for it.
 
     /// Asks the driver's `verify`, within the driver's own [`VERIFY_TIMEOUT`].
     async fn health(&self) -> Health {
@@ -2077,6 +2154,51 @@ mod tests {
         watch.borrow_and_update();
         vms.note_hardening(&verified(Some(Mark::No), &[line]), false);
         assert!(!watch.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_checks_in_a_row_count_for_their_mark_and_one_that_cannot_tell_for_nothing() {
+        let vms = Vms::new(VmOptions::new(
+            DriverCommand::node(PathBuf::from("/nonexistent/node-driver.json")).unwrap(),
+            "sandbox".into(),
+        ));
+        assert!(vms.reads_hardening());
+        let mut streak = vms.streak_watch();
+        let note = |hardened: Option<Mark>| {
+            vms.note_hardening(
+                &Verified {
+                    hardened,
+                    ..Verified::default()
+                },
+                false,
+            )
+        };
+        let row = |mark, checks| Streak { mark, checks };
+        assert_eq!(*streak.borrow_and_update(), row(Mark::No, 0));
+        note(Some(Mark::Yes));
+        assert_eq!(*streak.borrow_and_update(), row(Mark::Yes, 1));
+        // Not known: neither counted nor a break, and nobody is told.
+        note(None);
+        assert!(!streak.has_changed().unwrap());
+        // The same mark again is told, though the value did not change.
+        note(Some(Mark::Yes));
+        assert!(streak.has_changed().unwrap());
+        assert_eq!(*streak.borrow_and_update(), row(Mark::Yes, 2));
+        note(Some(Mark::No));
+        assert_eq!(*streak.borrow_and_update(), row(Mark::No, 1));
+        // The start's check that cannot tell is a `no`.
+        vms.note_hardening(&Verified::default(), true);
+        assert_eq!(*streak.borrow_and_update(), row(Mark::No, 2));
+        // An operator's own driver's hardening is not read.
+        let own = Vms::new(VmOptions::new(
+            DriverCommand::parse("/usr/local/bin/my-driver").unwrap(),
+            "sandbox".into(),
+        ));
+        assert!(!own.reads_hardening());
+        let stop = tokio_util::sync::CancellationToken::new();
+        tokio::time::timeout(Duration::from_secs(5), own.ask_hardening(stop))
+            .await
+            .expect("no schedule for an operator's driver");
     }
 
     #[tokio::test]

@@ -7,7 +7,11 @@
 //! going; their events are buffered in the [`Outbox`](crate::outbox::Outbox) and flushed
 //! after the next `welcome`. Close code 4401
 //! (bad token) and 4409 (replaced by another connection) are fatal. When everything is
-//! delivered after a shutdown or a drain, the host closes with 1000.
+//! delivered after a shutdown or a drain, the host closes with 1000. It closes with 1000 too,
+//! and connects again at once, when it asks for a new hello: the hello is the one frame that
+//! carries the host's level of isolation, and the node driver's hardening mark can change
+//! while the host runs (ADR-0113, decision 5). Runs go on through that reconnect as through
+//! any other.
 //!
 //! The protocol version is the host's ([`Shared::protocol_version`]): `hello` names it, and
 //! frames are parsed with that version's message types, so a frame of the other version is
@@ -89,6 +93,9 @@ enum Ended {
     Drained,
     /// The connection was lost; `welcomed` says whether it had been established.
     Lost { reason: String, welcomed: bool },
+    /// The host closed the connection for a new hello, which the next one sends at once
+    /// ([`crate::host::Shared::rehello_watch`]).
+    Rehello,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,12 +127,21 @@ pub async fn run(host: Host, drain: CancellationToken) -> Result<()> {
         }
         let ended = session(&host, url.as_str(), &drain).await;
         host.on_disconnect();
-        if matches!(ended, Ok(Ended::Lost { welcomed: true, .. })) {
+        if matches!(
+            ended,
+            Ok(Ended::Lost { welcomed: true, .. } | Ended::Rehello)
+        ) {
             backoff = host.opts.reconnect_min_backoff;
         }
         let delay = retry_delay(backoff, holds_runs(&host));
         match ended {
             Ok(Ended::Drained) => return Ok(()),
+            // The server keeps the runs' leases while the host is away; the next hello lists
+            // them, and their frames go out after its welcome.
+            Ok(Ended::Rehello) => {
+                tracing::info!("connecting again at once for a new hello");
+                continue;
+            }
             Ok(Ended::Lost { reason, .. }) => {
                 tracing::warn!(%reason, retry_in_ms = delay.as_millis() as u64, "connection to the server lost");
             }
@@ -423,6 +439,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let version = host.protocol_version();
+    // Before the hello is built: an ask for a new hello after this one is built is one that
+    // this hello may not answer.
+    let mut rehello = host.rehello_watch();
     let hello = Message::Hello(host.hello().await);
     write(&mut socket, &hello).await?;
     flush(&mut socket).await?;
@@ -588,6 +607,16 @@ where
             }
             _ = drain.cancelled(), if !draining => {
                 draining = true;
+            }
+            // A new hello: what the outbox has not written goes out on the next connection, and
+            // what it wrote lately goes out again there, as after any reconnect.
+            Ok(()) = rehello.changed(), if !draining => {
+                let close = socket.close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "a new hello follows".into(),
+                }));
+                let _ = tokio::time::timeout(WRITE_TIMEOUT, close).await;
+                return Ok(Ended::Rehello);
             }
             // More of the outbox waits: write the next batch.
             _ = std::future::ready(()), if pending => {}

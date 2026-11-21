@@ -388,10 +388,18 @@ pub struct Shared {
     pool: Option<Arc<crate::pool::Pool>>,
     /// The pool's ready VMs (crate::ready_vms), with `--pool-max-ready` above 0.
     ready_vms: Option<Arc<crate::ready_vms::ReadyVms>>,
-    /// The level of isolation the host reports (crate::isolation), derived once at its start:
-    /// the node driver's configuration is read then. `run` refused a host whose level is an
-    /// error before it started; such a host reports `container`.
-    isolation: crate::isolation::Reported,
+    /// What the host's level of isolation is derived from (crate::isolation), read once at
+    /// its start: the node driver's configuration is read then. Each hello derives the level
+    /// from it, with the node driver's hardening as the VM executor knows it at that time
+    /// ([`Shared::isolation`]). `None`: the level was an error at the start, which `run`
+    /// refuses before it starts; such a host reports `container`.
+    sandboxes: Option<crate::isolation::Sandboxes>,
+    /// The node driver's hardening mark that the last hello carried; `None` when it carried
+    /// none (protocol 1, or no node driver).
+    hello_mark: Mutex<Option<crate::vm::Mark>>,
+    /// Counts the times the host asked for a new hello, which the connection makes by a
+    /// reconnect: the node driver's hardening mark changed ([`tell_hardening`]).
+    rehello: watch::Sender<u64>,
     /// The Public Suffix List the server sent (`psl.update`), if the host holds one.
     public_suffix: Arc<PublicSuffixStore>,
     /// Bare mirrors of the task repositories.
@@ -449,10 +457,16 @@ impl Shared {
             capacity = capacity.with_pool(opts.ready_vms.max_ready);
         }
         let outbox = Arc::new(Outbox::with_retention(opts.finished_retention));
-        let isolation = opts.isolation().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "this host reports the level of isolation `container`");
-            crate::isolation::Reported::CONTAINER
-        });
+        // A statement that contradicts what the host sees is an error whatever the nodes'
+        // hardening, so the start's derivation tells for every later one.
+        let sandboxes = crate::isolation::Sandboxes::of(&opts.executor, &opts.sandbox)
+            .and_then(|sandboxes| {
+                crate::isolation::derive(sandboxes, opts.isolation_stated).map(|_| sandboxes)
+            })
+            .map_err(|e| {
+                tracing::warn!(error = %e, "this host reports the level of isolation `container`");
+            })
+            .ok();
         let ready_vms = opts.keeps_ready_vms().then(|| {
             crate::ready_vms::ReadyVms::new(
                 opts.ready_vms.clone(),
@@ -493,7 +507,9 @@ impl Shared {
             model_proxy: tokio::sync::Mutex::new(None),
             pool,
             ready_vms,
-            isolation,
+            sandboxes,
+            hello_mark: Mutex::new(None),
+            rehello: watch::Sender::new(0),
             heartbeat_secs: AtomicU64::new(10),
             lease_ttl_secs: AtomicU64::new(30),
             runner_host_id: Mutex::new(state.runner_host_id),
@@ -1146,6 +1162,32 @@ impl Shared {
         self.welcome_done.subscribe()
     }
 
+    /// The level of isolation the host reports now (crate::isolation, ADR-0113): what it read
+    /// at its start, with the node driver's hardening as the VM executor knows it now
+    /// ([`crate::vm::Vms::hardening`]).
+    pub fn isolation(&self) -> crate::isolation::Reported {
+        let Some(sandboxes) = self.sandboxes else {
+            return crate::isolation::Reported::CONTAINER;
+        };
+        let sandboxes = match &self.opts.executor {
+            Executor::Vm(vms) => sandboxes.hardened(vms.hardening().hardened),
+            _ => sandboxes,
+        };
+        crate::isolation::derive(sandboxes, self.opts.isolation_stated)
+            .unwrap_or(crate::isolation::Reported::CONTAINER)
+    }
+
+    /// The host's asks for a new hello, as they come: the connection ends with a close of
+    /// its own and connects again at once ([`tell_hardening`]).
+    pub fn rehello_watch(&self) -> watch::Receiver<u64> {
+        self.rehello.subscribe()
+    }
+
+    /// How often the host asked for a new hello (tests).
+    pub fn rehellos(&self) -> u64 {
+        *self.rehello.borrow()
+    }
+
     /// The connection ended.
     pub fn on_disconnect(&self) {
         self.connected.store(false, Ordering::SeqCst);
@@ -1263,20 +1305,29 @@ impl Shared {
                 }),
             }
         }
-        // The level of isolation (ADR-0113), as the host derived it when it started: with
-        // protocol 2, the one value of `isolationTiers`, with `hardened` and
-        // `isolationStated`. Protocol 1 reports `container`, as before, and neither field.
-        // No host of this release sends `microvm`, which a server of this release refuses; a
-        // server of an earlier release refuses `machine` and `vm-jail` (ADR-0113, decision 2).
+        // The level of isolation (ADR-0113), derived now: with the node driver, with the
+        // hardening its nodes last reported. With protocol 2, the one value of
+        // `isolationTiers`, with `hardened` and `isolationStated`. Protocol 1 reports
+        // `container`, as before, and neither field. No host of this release sends `microvm`,
+        // which a server of this release refuses; a server of an earlier release refuses
+        // `machine` and `vm-jail` (ADR-0113, decision 2).
         let (isolation_tiers, hardened, isolation_stated) = if v2 {
-            (
-                vec![self.isolation.tier],
-                self.isolation.hardened,
-                self.isolation.stated,
-            )
+            let isolation = self.isolation();
+            (vec![isolation.tier], isolation.hardened, isolation.stated)
         } else {
             (vec![IsolationTier::Container], None, false)
         };
+        // What the server learns of the nodes' hardening from this hello: [`tell_hardening`]
+        // compares it with what the nodes report later.
+        *lock(&self.hello_mark) = (v2
+            && matches!(self.sandboxes, Some(crate::isolation::Sandboxes::Nodes(..))))
+        .then(|| {
+            if hardened == Some(tinfirm_protocol::Hardened::Yes) {
+                crate::vm::Mark::Yes
+            } else {
+                crate::vm::Mark::No
+            }
+        });
         Hello {
             protocol_version: self.protocol_version(),
             runner_version: self.opts.runner_version.clone(),
@@ -2687,6 +2738,79 @@ async fn deliver_within(connection: &mut JoinHandle<Result<()>>, limit: Duration
 
 /// Serves until `shutdown` fires (SIGINT/SIGTERM), a drain is complete, or the connection
 /// fails fatally. After a drain it returns `Ok` once every message is delivered.
+/// Whether a new hello is wanted: the hello of the connection carried `sent`, and the checks
+/// of the nodes' hardening found `now`. A loss is told at once; a gain once it held for two
+/// checks in a row, so that a node whose mark flaps does not move the server's placement
+/// with it.
+fn hello_is_stale(sent: crate::vm::Mark, now: crate::vm::Streak) -> bool {
+    use crate::vm::Mark;
+    match (sent, now.mark) {
+        (Mark::Yes, Mark::No) => true,
+        (Mark::No, Mark::Yes) => now.checks >= 2,
+        _ => false,
+    }
+}
+
+/// Tells the server of a change of the node driver's hardening mark (ADR-0113, decision 5)
+/// until `stop`: the protocol carries the mark in the hello alone, so the host asks the
+/// connection for a new hello, which it makes by a reconnect (crate::connection). Runs go on
+/// meanwhile, as through any reconnect: the server keeps their leases, and the new hello lists
+/// them. Nothing is asked while the connection is down, since the next hello carries the
+/// value of its time, and at most once per `hardening_every`. Nothing on a host that does not
+/// report the nodes' mark.
+async fn tell_hardening(host: Host, stop: CancellationToken) {
+    let Executor::Vm(vms) = &host.opts.executor else {
+        return;
+    };
+    if !vms.reads_hardening() || !host.speaks_v2() {
+        return;
+    }
+    let every = vms.options.hardening_every;
+    let mut streak = vms.streak_watch();
+    let mut answer = host.hello_answer();
+    let mut asked: Option<tokio::time::Instant> = None;
+    loop {
+        let now = *streak.borrow_and_update();
+        answer.borrow_and_update();
+        let sent = if host.is_connected() {
+            *lock(&host.hello_mark)
+        } else {
+            None
+        };
+        if let Some(sent) = sent
+            && hello_is_stale(sent, now)
+        {
+            if let Some(at) = asked
+                && at.elapsed() < every
+            {
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    () = tokio::time::sleep_until(at + every) => continue,
+                }
+            }
+            let hardening = vms.hardening();
+            if now.mark == crate::vm::Mark::No {
+                tracing::warn!(
+                    not_hardened = %hardening.not_hardened.join("; "),
+                    "the nodes' hardening mark is `no` now: this host reconnects, so that the server gets a hello with it"
+                );
+            } else {
+                tracing::info!(
+                    checks = now.checks,
+                    "the nodes' hardening mark is `yes` now: this host reconnects, so that the server gets a hello with it"
+                );
+            }
+            asked = Some(tokio::time::Instant::now());
+            host.rehello.send_modify(|n| *n += 1);
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            changed = streak.changed() => if changed.is_err() { return },
+            changed = answer.changed() => if changed.is_err() { return },
+        }
+    }
+}
+
 pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     // Before anything that cleans up what no run holds: these runs hold theirs.
     host.take_back_runs().await;
@@ -2711,6 +2835,17 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     // The host's report that it can take no run (ADR-0117); nothing on a host without a state
     // of its own.
     let health = tokio::spawn(crate::health::run(host.clone(), finish.clone()));
+    // With the node driver: its `verify` on a schedule, and a new hello when the nodes'
+    // hardening mark changes (ADR-0113, decision 5).
+    let hardening = match &host.opts.executor {
+        Executor::Vm(vms) => {
+            let vms = vms.clone();
+            let stop = finish.clone();
+            Some(tokio::spawn(async move { vms.ask_hardening(stop).await }))
+        }
+        _ => None,
+    };
+    let tell = tokio::spawn(tell_hardening(host.clone(), finish.clone()));
     let ticker = {
         let host = host.clone();
         let stop = finish.clone();
@@ -2752,6 +2887,10 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     finish.cancel();
     ticker.abort();
     health.abort();
+    tell.abort();
+    if let Some(hardening) = hardening {
+        hardening.abort();
+    }
     // A pass stops between two steps, but a gc that has started runs to its end: killing
     // `git gc` would leave its `git prune` running without the mirror's lock.
     maintenance_stop.cancel();
@@ -3575,6 +3714,255 @@ mod tests {
         }
         let h = hello(vm("/usr/local/bin/my-driver"), vms(), Some(stated), &config).await;
         assert_eq!(level(&h), seen(IsolationTier::Container));
+    }
+
+    /// A host of protocol `version` with the node driver, its nodes over a local socket, that
+    /// asks for the hardening every `every`; connected.
+    fn node_host(dir: &std::path::Path, version: u32, every: Duration) -> Host {
+        use crate::config::HostConfig;
+        let nodes = dir.join("node-driver.json");
+        std::fs::write(
+            &nodes,
+            r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox"]}]}"#,
+        )
+        .unwrap();
+        let mut options = crate::vm::VmOptions::new(
+            crate::vm::DriverCommand::node(nodes).unwrap(),
+            "sandbox".into(),
+        );
+        options.hardening_every = every;
+        let mut opts = HostOptions::new(
+            Paths::new(dir.join("config"), dir.join("data")),
+            Executor::Vm(crate::vm::Vms::new(options)),
+        );
+        opts.sandbox = crate::sandbox::SandboxSettings::for_vms(None, false, Vec::new()).unwrap();
+        let mut config = HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYhosttokenforthehardeningmark00001"),
+        );
+        config.protocol_version = version;
+        let host = Shared::new(opts, config);
+        welcome(&host);
+        host
+    }
+
+    fn welcome(host: &Host) {
+        host.on_welcome(&tinfirm_protocol::Welcome {
+            protocol_version: Some(host.protocol_version()),
+            runner_host_id: Uuid::new_v4(),
+            company_id: Uuid::new_v4(),
+            server_version: None,
+            heartbeat_interval_seconds: 10,
+            lease_ttl_seconds: 30,
+            features: Vec::new(),
+        });
+    }
+
+    /// What a check of the node driver's `verify` says of the hardening: `None`, "not known".
+    fn note(host: &Host, mark: Option<crate::vm::Mark>) {
+        let Executor::Vm(vms) = &host.opts.executor else {
+            unreachable!("a VM host");
+        };
+        vms.note_hardening(
+            &crate::vm::Verified {
+                hardened: mark,
+                not_hardened: match mark {
+                    Some(crate::vm::Mark::Yes) => Vec::new(),
+                    _ => vec!["node local: io-uring: kernel.io_uring_disabled is 0, not 2".into()],
+                },
+                ..Default::default()
+            },
+            false,
+        );
+    }
+
+    #[tokio::test]
+    async fn each_hello_carries_the_nodes_hardening_of_its_time() {
+        use crate::vm::Mark;
+        use tinfirm_protocol::Hardened;
+        let dir = tempfile::tempdir().unwrap();
+        let host = node_host(dir.path(), 2, Duration::from_secs(300));
+        let marks = |hello: &Hello| (hello.isolation_tiers.clone(), hello.hardened);
+        // Not asked yet: `no`, left out.
+        let hello = host.hello().await;
+        assert_eq!(marks(&hello), (vec![IsolationTier::VmJail], None));
+        assert_eq!(*lock(&host.hello_mark), Some(Mark::No));
+        // The host was built before the nodes said `yes`: the hello reads it when it is built.
+        note(&host, Some(Mark::Yes));
+        let hello = host.hello().await;
+        assert_eq!(
+            marks(&hello),
+            (vec![IsolationTier::VmJail], Some(Hardened::Yes))
+        );
+        assert_eq!(*lock(&host.hello_mark), Some(Mark::Yes));
+        assert_eq!(host.isolation().hardened, Some(Hardened::Yes));
+        // "Not known" keeps it.
+        note(&host, None);
+        assert_eq!(host.hello().await.hardened, Some(Hardened::Yes));
+        note(&host, Some(Mark::No));
+        assert_eq!(
+            marks(&host.hello().await),
+            (vec![IsolationTier::VmJail], None)
+        );
+        assert_eq!(*lock(&host.hello_mark), Some(Mark::No));
+        // Protocol 1 reports `container` and carries no mark.
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = node_host(dir.path(), 1, Duration::from_secs(300));
+        note(&v1, Some(Mark::Yes));
+        assert_eq!(
+            marks(&v1.hello().await),
+            (vec![IsolationTier::Container], None)
+        );
+        assert_eq!(*lock(&v1.hello_mark), None);
+    }
+
+    #[test]
+    fn a_loss_makes_the_hello_stale_at_once_and_a_gain_after_two_checks() {
+        use crate::vm::{Mark, Streak};
+        let streak = |mark, checks| Streak { mark, checks };
+        assert!(hello_is_stale(Mark::Yes, streak(Mark::No, 1)));
+        assert!(!hello_is_stale(Mark::No, streak(Mark::Yes, 1)));
+        assert!(hello_is_stale(Mark::No, streak(Mark::Yes, 2)));
+        assert!(hello_is_stale(Mark::No, streak(Mark::Yes, 7)));
+        for mark in [Mark::Yes, Mark::No] {
+            for checks in [0, 1, 2] {
+                assert!(!hello_is_stale(mark, streak(mark, checks)));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_of_the_nodes_mark_asks_for_a_new_hello_once_per_interval_at_most() {
+        use crate::vm::Mark::{No, Yes};
+        const EVERY: Duration = Duration::from_secs(1);
+        // Lets the task see what happened: far less than the interval.
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        // The connection's part: it ends, and the next one sends a new hello.
+        async fn reconnect(host: &Host) {
+            host.on_disconnect();
+            host.hello().await;
+            welcome(host);
+            settle().await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let host = node_host(dir.path(), 2, EVERY);
+        host.hello().await;
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(tell_hardening(host.clone(), stop.clone()));
+        settle().await;
+        assert_eq!(host.rehellos(), 0);
+
+        // A gain: not after one check, nor after a check that cannot tell, but after the
+        // second `yes` in a row.
+        note(&host, Some(Yes));
+        settle().await;
+        note(&host, None);
+        settle().await;
+        assert_eq!(host.rehellos(), 0);
+        note(&host, Some(Yes));
+        settle().await;
+        assert_eq!(host.rehellos(), 1);
+        reconnect(&host).await;
+        assert_eq!(*lock(&host.hello_mark), Some(Yes));
+        // More checks that say `yes`, or cannot tell: nothing.
+        note(&host, Some(Yes));
+        note(&host, None);
+        settle().await;
+        assert_eq!(host.rehellos(), 1);
+
+        // A loss: at once once the interval since the last ask is over, here at its end.
+        note(&host, Some(No));
+        settle().await;
+        assert_eq!(host.rehellos(), 1);
+        tokio::time::sleep(EVERY).await;
+        settle().await;
+        assert_eq!(host.rehellos(), 2);
+        reconnect(&host).await;
+        assert_eq!(*lock(&host.hello_mark), Some(No));
+        // A loss a whole interval after the last ask: at once.
+        tokio::time::sleep(EVERY).await;
+        note(&host, Some(Yes));
+        note(&host, Some(Yes));
+        settle().await;
+        assert_eq!(host.rehellos(), 3);
+        reconnect(&host).await;
+        note(&host, Some(No));
+        settle().await;
+        assert_eq!(host.rehellos(), 3, "within the interval of the last ask");
+        tokio::time::sleep(EVERY).await;
+        settle().await;
+        assert_eq!(host.rehellos(), 4);
+        reconnect(&host).await;
+        tokio::time::sleep(EVERY).await;
+
+        // A mark that flaps faster than the interval, while no reconnect answers the asks: at
+        // most one ask per interval, the first at once.
+        let before = host.rehellos();
+        for step in 0..39 {
+            if step % 2 == 0 {
+                note(&host, Some(Yes));
+                note(&host, Some(Yes));
+            } else {
+                note(&host, Some(No));
+            }
+            tokio::time::sleep(EVERY / 10).await;
+        }
+        let asked = host.rehellos() - before;
+        assert!((1..=4).contains(&asked), "{asked} asks in 3.9 intervals");
+        reconnect(&host).await;
+        note(&host, Some(No));
+        reconnect(&host).await;
+        tokio::time::sleep(EVERY).await;
+
+        // While the connection is down: nothing; the next hello carries the value.
+        let before = host.rehellos();
+        host.on_disconnect();
+        note(&host, Some(Yes));
+        note(&host, Some(Yes));
+        tokio::time::sleep(EVERY * 2).await;
+        assert_eq!(host.rehellos(), before);
+        host.hello().await;
+        welcome(&host);
+        settle().await;
+        assert_eq!(host.rehellos(), before);
+        assert_eq!(*lock(&host.hello_mark), Some(Yes));
+
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_host_that_reports_the_nodes_mark_asks_for_a_new_hello() {
+        let stop = CancellationToken::new();
+        let ends = |host: Host| {
+            let stop = stop.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), tell_hardening(host, stop))
+                    .await
+                    .is_ok()
+            }
+        };
+        // Protocol 1 carries no mark.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ends(node_host(dir.path(), 1, Duration::from_secs(1))).await);
+        // An operator's own driver: its operator's statement stands.
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = HostOptions::new(
+            Paths::new(dir.path().join("config"), dir.path().join("data")),
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                crate::vm::DriverCommand::parse("/usr/local/bin/my-driver").unwrap(),
+                "sandbox".into(),
+            ))),
+        );
+        opts.sandbox = crate::sandbox::SandboxSettings::for_vms(None, false, Vec::new()).unwrap();
+        let mut config = crate::config::HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYhosttokenforthehardeningmark00002"),
+        );
+        config.protocol_version = 2;
+        assert!(ends(Shared::new(opts, config)).await);
     }
 
     #[test]

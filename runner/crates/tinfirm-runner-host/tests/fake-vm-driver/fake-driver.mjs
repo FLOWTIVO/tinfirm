@@ -18,6 +18,10 @@
 //                      the problems and maxVms 0, and a create fails
 //   FAKE_VM_CREATE_FAILS  when set, every create fails with this message, and verify stays
 //                      clean: a failure of the VM alone, such as its user data
+//   FAKE_VM_HARDENED   a file: while it is there, `verify` adds its content, a JSON object such
+//                      as {"hardened": "no", "notHardened": ["node n1: io-uring: ..."]}, to
+//                      its answer, as the node driver reports its nodes' hardening; without
+//                      it, `verify` says nothing of the hardening ("not known")
 //   FAKE_VM_VERIFY     a file: while it is there, `verify` fails when it holds `fail`, and
 //                      answers after N ms when it holds `slow N`, with what FAKE_VM_BROKEN
 //                      said when the call came
@@ -80,6 +84,12 @@ function brokenProblems() {
   return JSON.parse(readFileSync(env.FAKE_VM_BROKEN, "utf8"));
 }
 
+// What FAKE_VM_HARDENED adds to `verify`'s answer while its file is there, else nothing.
+function hardening() {
+  if (!env.FAKE_VM_HARDENED || !existsSync(env.FAKE_VM_HARDENED)) return {};
+  return JSON.parse(readFileSync(env.FAKE_VM_HARDENED, "utf8"));
+}
+
 // FAKE_VM_DOWN: whether the "node" does not answer now.
 function down() {
   return Boolean(env.FAKE_VM_DOWN && existsSync(env.FAKE_VM_DOWN));
@@ -125,8 +135,9 @@ const methods = {
     if (mode === "fail") throw new Error("the provider's API is not reachable");
     const broken = brokenProblems();
     if (mode.startsWith("slow ")) await new Promise((resolve) => setTimeout(resolve, Number(mode.slice(5))));
-    if (broken) return { problems: broken, maxVms: 0, checked: [`template ${template}`] };
+    if (broken) return { problems: broken, maxVms: 0, checked: [`template ${template}`], ...hardening() };
     return {
+      ...hardening(),
       problems: JSON.parse(env.FAKE_VM_PROBLEMS || "[]"),
       maxVms: env.FAKE_VM_SLOTS
         ? Math.max(0, Number(env.FAKE_VM_SLOTS) - [...vms.values()].filter((vm) => vm.state !== "gone").length)

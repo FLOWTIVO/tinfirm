@@ -1600,3 +1600,288 @@ async fn an_agent_in_a_vm_that_exits_by_itself_is_reported_as_the_agents_end() {
     })
     .await;
 }
+
+/// The fake driver standing in for this binary's node driver (ADR-0113, decision 5): the host
+/// reads the hardening of its `verify` and asks it every `every`, and reports `vm-jail` from a
+/// node configuration in `dir`, whose one node is reached over its local socket. The driver
+/// adds the content of `hardened` to each `verify` while that file is there
+/// (`FAKE_VM_HARDENED`); `env` sets more of its settings.
+fn node_like(
+    dir: &std::path::Path,
+    log: &std::path::Path,
+    hardened: &std::path::Path,
+    every: Duration,
+    env: &[(&str, &str)],
+) -> tinfirm_runner_host::vm::VmOptions {
+    let config = dir.join("node-driver.json");
+    std::fs::write(
+        &config,
+        json!({"nodes": [{
+            "name": "node-1",
+            "socket": "/run/tinfirm-node-agent/agent.sock",
+            "templates": ["sandbox-test"]
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let hardened = hardened.to_string_lossy().into_owned();
+    let mut env = env.to_vec();
+    env.push(("FAKE_VM_HARDENED", &hardened));
+    let mut options = vm_options(log, &env);
+    options.driver.builtin = Some(tinfirm_runner_host::vm::Builtin::Node { config });
+    options.hardening_every = every;
+    options
+}
+
+/// What the "nodes" report of their hardening from now on, written whole: the driver never
+/// reads half a file.
+fn set_mark(path: &std::path::Path, mark: Value) {
+    let next = path.with_extension("next");
+    std::fs::write(&next, mark.to_string()).unwrap();
+    std::fs::rename(&next, path).unwrap();
+}
+
+/// The times of the driver's `verify` calls since the `from`th call of its log.
+fn verify_times(log: &std::path::Path, from: usize) -> Vec<u64> {
+    calls_of(&vm_driver_calls(log)[from..], "verify")
+        .iter()
+        .map(|c| c["at"].as_u64().unwrap())
+        .collect()
+}
+
+/// Waits until the host closes `conn` by itself, with 1000; returns how long that took.
+async fn closed_by_the_host(conn: &mut Conn) -> Duration {
+    let started = std::time::Instant::now();
+    while conn.next().await.is_some() {}
+    let close = conn.close_frame.lock().unwrap().clone();
+    assert_eq!(
+        close.as_ref().map(|(code, _)| *code),
+        Some(1000),
+        "{close:?}"
+    );
+    started.elapsed()
+}
+
+/// ADR-0113, decision 5: with the node driver the host asks `verify` on its own every
+/// `hardening_every`, one call at a time: a health check under way, here after a create that
+/// failed, is not doubled, and a slow `verify` holds the next one back. An operator's own
+/// driver is not asked on a schedule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_node_driver_is_asked_for_its_hardening_on_its_interval_one_call_at_a_time() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let hardened = dir.path().join("hardened");
+        let verify = dir.path().join("verify");
+        let verify_path = verify.to_string_lossy().into_owned();
+        let options = node_like(
+            dir.path(),
+            &log,
+            &hardened,
+            Duration::from_millis(100),
+            &[
+                ("FAKE_VM_VERIFY", &verify_path),
+                ("FAKE_VM_CREATE_FAILS", "the user data is over the limit"),
+            ],
+        );
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, v2_vm(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        // On its interval, from the first call on: the driver's process starts with it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while verify_times(&log, 0).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host did not ask the driver"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let from = vm_driver_calls(&log).len();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let times = verify_times(&log, from);
+        assert!(times.len() >= 5, "{times:?}");
+
+        // A slow `verify` (400 ms), and runs whose create fails, each followed by a health
+        // check: never a second call while one is under way.
+        std::fs::write(&verify, "slow 400").unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let from = vm_driver_calls(&log).len();
+        for _ in 0..3 {
+            let spec = v2_spec();
+            conn.send(spec.to_json());
+            let finished = conn.take_run("run.finished", spec.run_id).await;
+            assert_eq!(finished["outcome"], "FAILED", "{finished}");
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let times = verify_times(&log, from);
+        assert!(times.len() >= 2, "{times:?}");
+        for pair in times.windows(2) {
+            // Each call is logged when it comes; the one before answered 400 ms after its own.
+            assert!(pair[1] - pair[0] >= 380, "two calls at once: {times:?}");
+        }
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+
+        // An operator's own driver: no `verify` on a schedule.
+        let log = dir.path().join("own.log");
+        let mut options = vm_options(&log, &[]);
+        options.hardening_every = Duration::from_millis(100);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, v2_vm(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(
+            verify_times(&log, 0).is_empty(),
+            "{:#?}",
+            vm_driver_calls(&log)
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// The scheduled `verify` is a health check like any other: an answer with problems and no
+/// room puts the host into the state where it takes no new run, before any run's create fails
+/// for it, and the host tells a server that takes `host.health`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scheduled_verify_finds_that_the_driver_can_make_no_vm_before_a_run_fails() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let hardened = dir.path().join("hardened");
+        let broken = dir.path().join("broken");
+        let broken_path = broken.to_string_lossy().into_owned();
+        let options = node_like(
+            dir.path(),
+            &log,
+            &hardened,
+            Duration::from_millis(200),
+            &[("FAKE_VM_BROKEN", &broken_path)],
+        );
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, v2_vm(options)).await;
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, &["host.health"]).await;
+        std::fs::write(
+            &broken,
+            r#"["node node-1: the node's own firewall table (inet tinfirm_node) is not loaded"]"#,
+        )
+        .unwrap();
+        let unhealthy = next_health(&mut conn).await;
+        assert_eq!(
+            unhealthy["problems"][0]["code"], "VM_DRIVER_NO_VM",
+            "{unhealthy}"
+        );
+        let spec = v2_spec();
+        conn.send(spec.to_json());
+        let rejected = conn.take_run("run.rejected", spec.run_id).await;
+        assert_eq!(rejected["code"], "NO_FREE_SLOT", "{rejected}");
+        assert!(
+            calls_of(&vm_driver_calls(&log), "create").is_empty(),
+            "no VM was asked for"
+        );
+        // Fixed: the next check finds it, and the host says so.
+        std::fs::remove_file(&broken).unwrap();
+        let healthy = next_health(&mut conn).await;
+        assert_eq!(healthy["problems"], json!([]), "{healthy}");
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// ADR-0113, decision 5: a change of the nodes' hardening mark while the host runs reaches the
+/// server by a new hello. A gain only once it held for two checks; a loss at once (within the
+/// interval); "not known" changes nothing. The host closes the connection with 1000 and
+/// connects again at once, and a run in progress goes on through it: the new hello lists it,
+/// its frames come on the new connection without a second `run.accepted`, and it ends well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_of_the_nodes_hardening_reaches_the_server_by_a_new_hello_and_a_run_goes_on() {
+    with_timeout(120, async {
+        const EVERY: Duration = Duration::from_millis(300);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let hardened = dir.path().join("hardened");
+        set_mark(&hardened, json!({"hardened": "yes"}));
+        let options = node_like(dir.path(), &log, &hardened, EVERY, &[]);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, v2_vm(options)).await;
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        // Before the driver answered (the tests' host has no start check): `no`, left out.
+        assert_eq!(hello["isolationTiers"], json!(["vm-jail"]), "{hello}");
+        assert!(hello["hardened"].is_null(), "{hello}");
+        let from = vm_driver_calls(&log).len();
+
+        // The gain: after the second check that says `yes`.
+        closed_by_the_host(&mut conn).await;
+        assert!(
+            verify_times(&log, from).len() >= 2,
+            "{:#?}",
+            vm_driver_calls(&log)
+        );
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        assert_eq!(hello["hardened"], "yes", "{hello}");
+        assert_eq!(hello["isolationTiers"], json!(["vm-jail"]), "{hello}");
+
+        // A run in progress.
+        let mut spec = AssignSpec::new("gate", None);
+        spec.protocol_version = 2;
+        conn.send(spec.to_json());
+        conn.take_run("run.accepted", spec.run_id).await;
+        conn.wait_running(spec.run_id).await;
+
+        // The loss: the host reconnects within the interval and the check's own time, and the
+        // new hello leaves the mark out.
+        set_mark(
+            &hardened,
+            json!({
+                "hardened": "no",
+                "notHardened": ["node node-1: io-uring: kernel.io_uring_disabled is 0, not 2"],
+            }),
+        );
+        let took = closed_by_the_host(&mut conn).await;
+        assert!(took < EVERY * 2 + Duration::from_secs(2), "{took:?}");
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        assert!(hello["hardened"].is_null(), "{hello}");
+        let active = hello["activeRuns"].as_array().unwrap();
+        assert_eq!(active.len(), 1, "{hello}");
+        assert_eq!(active[0]["runId"], spec.run_id.to_string());
+        assert_eq!(active[0]["epoch"], 1);
+        // The run goes on, on the new connection.
+        conn.wait_running(spec.run_id).await;
+
+        // "Not known" (no mark in `verify`): no new hello.
+        std::fs::remove_file(&hardened).unwrap();
+        let (connections, rehellos) = (
+            host.host
+                .connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            host.host.rehellos(),
+        );
+        tokio::time::sleep(EVERY * 4).await;
+        assert_eq!(host.host.rehellos(), rehellos);
+        assert_eq!(
+            host.host
+                .connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            connections
+        );
+
+        release(&host.paths, spec.run_id);
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(
+            !conn.frames.iter().any(|f| f["type"] == "run.accepted"),
+            "accepted is not repeated"
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
