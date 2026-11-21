@@ -688,6 +688,12 @@ const TOOL_OUTPUT_MAX: u64 = 1024 * 1024;
 /// with its whole process group (`ip netns exec` starts a second process), and that is a
 /// failure to run it, not an answer.
 fn tool(argv: &[String], stdin: Option<&str>) -> Result<String, ToolError> {
+    // In the unit tests, a test that stands in for the node's tools on its own thread answers
+    // here, and records each command in its order (`tests::FakeNode`).
+    #[cfg(test)]
+    if let Some(answer) = tests::fake_tool(argv, stdin) {
+        return answer;
+    }
     tool_within(argv, stdin, TOOL_TIMEOUT)
 }
 
@@ -2753,5 +2759,737 @@ mod tests {
             "Error: [31m no such table"
         );
         assert_eq!(plain(&[b'a'; 1000]).len(), 300);
+    }
+
+    // ----- the make's and the delete's effects, on a node that the tests stand in for -------
+
+    /// The node's tools as a test stands in for them, on one thread: each command is recorded
+    /// as it ran (with the first line of what it read), and answered as a node would. The
+    /// tables that `nft -f -` loaded are kept, so `nft list table` and `nft delete table`
+    /// answer by them. An entry of `answers` replaces the answer of every command that starts
+    /// with its words: `Ok` with what it prints, `Err` with what it writes when it fails.
+    #[derive(Debug, Default)]
+    pub(super) struct FakeNode {
+        ran: Vec<String>,
+        tables: std::collections::BTreeMap<String, String>,
+        answers: Vec<(String, Result<String, String>)>,
+    }
+
+    thread_local! {
+        static FAKE_NODE: std::cell::RefCell<Option<FakeNode>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The answer of the fake node of this thread, where a test set one up.
+    pub(super) fn fake_tool(
+        argv: &[String],
+        stdin: Option<&str>,
+    ) -> Option<Result<String, ToolError>> {
+        FAKE_NODE.with(|node| {
+            let mut node = node.borrow_mut();
+            Some(node.as_mut()?.run(argv, stdin))
+        })
+    }
+
+    impl FakeNode {
+        fn answer(mut self, prefix: &str, answer: Result<&str, &str>) -> FakeNode {
+            self.answers.push((
+                prefix.to_string(),
+                answer.map(str::to_string).map_err(str::to_string),
+            ));
+            self
+        }
+
+        fn run(&mut self, argv: &[String], stdin: Option<&str>) -> Result<String, ToolError> {
+            let line = argv.join(" ");
+            self.ran.push(match stdin {
+                Some(text) => format!("{line} < {}", text.lines().next().unwrap_or("")),
+                None => line.clone(),
+            });
+            let fail = |said: &str| ToolError::Exit {
+                shown: format!("`{line}` failed: {}", plain(said.as_bytes())),
+                said: said.to_string(),
+            };
+            if let Some((_, answer)) = self.answers.iter().find(|(p, _)| line.starts_with(p)) {
+                return answer.clone().map_err(|said| fail(&said));
+            }
+            let w: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let loaded = |text: &str| {
+                text.lines()
+                    .next()
+                    .and_then(|l| l.strip_prefix("table "))
+                    .and_then(|l| l.strip_suffix(" {"))
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let missing = "Error: No such file or directory\n";
+            match w.as_slice() {
+                ["nft", "-f", "-"] => {
+                    let text = stdin.unwrap_or("");
+                    self.tables.insert(loaded(text), text.to_string());
+                    Ok(String::new())
+                }
+                ["ip", "netns", "exec", jail, "nft", "-f", "-"] => {
+                    let text = stdin.unwrap_or("");
+                    self.tables
+                        .insert(format!("{jail}: {}", loaded(text)), text.to_string());
+                    Ok(String::new())
+                }
+                ["nft", "list", "table", family, name] => self
+                    .tables
+                    .get(&format!("{family} {name}"))
+                    .cloned()
+                    .ok_or_else(|| fail(missing)),
+                [
+                    "ip",
+                    "netns",
+                    "exec",
+                    jail,
+                    "nft",
+                    "list",
+                    "table",
+                    family,
+                    name,
+                ] => self
+                    .tables
+                    .get(&format!("{jail}: {family} {name}"))
+                    .cloned()
+                    .ok_or_else(|| fail(missing)),
+                ["nft", "delete", "table", family, name] => self
+                    .tables
+                    .remove(&format!("{family} {name}"))
+                    .map(|_| String::new())
+                    .ok_or_else(|| fail(missing)),
+                [.., "sysctl", "-n", _] => Ok("1".into()),
+                ["losetup", "--noheadings", ..] => Ok(String::new()),
+                ["losetup", "--find", "--show", "--read-only", _] => Ok("/dev/loop0".into()),
+                ["losetup", "--find", "--show", _] => Ok("/dev/loop1".into()),
+                ["blockdev", "--getsz", _] => Ok("16".into()),
+                ["dmsetup", "info", ..] => Ok("252:3".into()),
+                // The device node, as a regular file: the helper gives it to the VM's user next.
+                ["mknod", "-m", "600", path, "b", _, _] => {
+                    std::fs::File::options()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(path)
+                        .map_err(|e| fail(&e.to_string()))?;
+                    Ok(String::new())
+                }
+                _ => Ok(String::new()),
+            }
+        }
+    }
+
+    /// Runs `f` with `node` standing in for the node's tools on this thread, and returns what
+    /// `f` returned with the commands that ran, the test's directory written as `$DIR`.
+    fn on_fake_node<T>(node: FakeNode, dir: &Path, f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        FAKE_NODE.with(|n| *n.borrow_mut() = Some(node));
+        let result = f();
+        let node = FAKE_NODE.with(|n| n.borrow_mut().take()).unwrap();
+        let dir = dir.display().to_string();
+        let ran = node.ran.iter().map(|l| l.replace(&dir, "$DIR")).collect();
+        (result, ran)
+    }
+
+    /// A node in a temporary directory: the jails, the work directory, the cgroup parent (an
+    /// absolute path, which `places` joins as it is), the kernel and the image's path. The
+    /// snapshot is 1 MiB, so the room check passes on any machine.
+    struct Rig {
+        dir: tempfile::TempDir,
+        config: HelperConfig,
+        plan: VmPlan,
+    }
+
+    const KERNEL_BYTES: &[u8] = b"a guest kernel";
+    const USER_DATA: &[u8] = br#"{"tinfirm":1}"#;
+
+    fn rig(change: impl FnOnce(&mut HelperConfig, &mut Template)) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.firecracker.chroot_base = dir.path().join("jails");
+        config.firecracker.work = dir.path().join("work");
+        config.firecracker.cgroup_parent = dir.path().join("cg").display().to_string();
+        std::fs::create_dir(dir.path().join("work")).unwrap();
+        std::fs::create_dir(dir.path().join("cg")).unwrap();
+        std::fs::write(dir.path().join("vmlinux"), KERNEL_BYTES).unwrap();
+        let mut template = config.templates.values().next().unwrap().clone();
+        template.snapshot_mib = 1;
+        template.kernel = dir.path().join("vmlinux");
+        template.image = dir.path().join("vm.img");
+        change(&mut config, &mut template);
+        let plan = plan(&config, &template, 0, 1);
+        Rig { dir, config, plan }
+    }
+
+    /// A test that fails while the jail's file system is mounted leaves no mount behind: the
+    /// temporary directory could not be removed under it.
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = rustix::mount::unmount(&self.plan.chroot, rustix::mount::UnmountFlags::DETACH);
+        }
+    }
+
+    impl Rig {
+        fn path(&self, rest: &str) -> PathBuf {
+            self.dir.path().join(rest)
+        }
+
+        /// A stand-in for `start-jailer`: a script that writes its arguments to `jailer.args`
+        /// and then runs `body`.
+        fn starter(&self, body: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.path("starter");
+            let args = self.path("jailer.args");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n{body}\n",
+                    args.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        /// What is left in the jails' and the work directory.
+        fn left(&self) -> Vec<String> {
+            let mut left = Vec::new();
+            for dir in ["jails/firecracker", "work"] {
+                if let Ok(entries) = std::fs::read_dir(self.path(dir)) {
+                    for entry in entries {
+                        left.push(format!("{dir}/{}", entry.unwrap().file_name().display()));
+                    }
+                }
+            }
+            left.sort();
+            left
+        }
+    }
+
+    /// Every command of a make that succeeds up to its VMM, in its order (slot 0, serial 1).
+    const MAKE_COMMANDS: &[&str] = &[
+        // The network.
+        "ip netns add tfvm-000000000001-0000",
+        "ip netns exec tfvm-000000000001-0000 sysctl -w net.ipv6.conf.all.disable_ipv6=1",
+        "ip netns exec tfvm-000000000001-0000 sysctl -w net.ipv6.conf.default.disable_ipv6=1",
+        "ip netns exec tfvm-000000000001-0000 sysctl -w net.ipv4.ip_forward=1",
+        "ip link add tfv000000000001 type veth peer name veth0 netns tfvm-000000000001-0000",
+        "sysctl -w net.ipv6.conf.tfv000000000001.disable_ipv6=1",
+        "ip addr add 10.231.0.1/30 dev tfv000000000001",
+        "ip link set tfv000000000001 up",
+        "ip -n tfvm-000000000001-0000 link set lo up",
+        "ip -n tfvm-000000000001-0000 addr add 10.231.0.2/30 dev veth0",
+        "ip -n tfvm-000000000001-0000 link set veth0 up",
+        "ip -n tfvm-000000000001-0000 route add default via 10.231.0.1",
+        "ip -n tfvm-000000000001-0000 tuntap add dev tap0 mode tap user 1100000 group 1100000",
+        "ip -n tfvm-000000000001-0000 addr add 10.231.0.5/30 dev tap0",
+        "ip -n tfvm-000000000001-0000 link set tap0 up",
+        "ip netns exec tfvm-000000000001-0000 sysctl -n net.ipv6.conf.all.disable_ipv6",
+        "ip netns exec tfvm-000000000001-0000 sysctl -n net.ipv6.conf.default.disable_ipv6",
+        "ip netns exec tfvm-000000000001-0000 sysctl -n net.ipv4.ip_forward",
+        "sysctl -n net.ipv6.conf.tfv000000000001.disable_ipv6",
+        "sysctl -n net.ipv4.ip_forward",
+        // The firewall.
+        "nft -f - < table inet tinfirm_000000000001 {",
+        "ip netns exec tfvm-000000000001-0000 nft -f - < table inet tinfirm {",
+        "nft list table inet tinfirm_000000000001",
+        "ip netns exec tfvm-000000000001-0000 nft list table inet tinfirm",
+        // The disks.
+        "losetup --noheadings --output NAME,RO --associated $DIR/vm.img",
+        "losetup --find --show --read-only $DIR/vm.img",
+        "losetup --find --show $DIR/work/tfvm-000000000001-0000.snapshot",
+        "blockdev --getsz /dev/loop0",
+        "dmsetup create --noudevsync tinfirm-tfvm-000000000001-0000 --table 0 16 snapshot /dev/loop0 /dev/loop1 N 8",
+        "dmsetup info -c --noheadings -o major,minor tinfirm-tfvm-000000000001-0000",
+        // The jail.
+        "mknod -m 600 $DIR/jails/firecracker/tfvm-000000000001-0000/root/root.disk b 252 3",
+    ];
+
+    /// How many of [`MAKE_COMMANDS`] have run once a step is done.
+    fn commands_after(step: Step) -> usize {
+        match step {
+            Step::Mark => 0,
+            Step::Network => 20,
+            Step::Firewall => 24,
+            Step::Disks => 30,
+            Step::Jail | Step::Vmm => 31,
+        }
+    }
+
+    /// The commands of a delete on a node where no device, interface or namespace of the VM
+    /// is left (this machine's own `/sys` says so): only the table is asked, before its step
+    /// and after it, and removed when it is there.
+    fn delete_commands(table_loaded: bool) -> Vec<String> {
+        let list = "nft list table inet tinfirm_000000000001";
+        let mut commands = vec![list.to_string()];
+        if table_loaded {
+            commands.push("nft delete table inet tinfirm_000000000001".into());
+        }
+        commands.push(list.into());
+        commands
+    }
+
+    fn make_then_delete(made_up_to: Step, table_loaded: bool) -> Vec<String> {
+        let mut commands: Vec<String> = MAKE_COMMANDS[..commands_after(made_up_to)]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        commands.extend(delete_commands(table_loaded));
+        commands
+    }
+
+    fn is_root() -> bool {
+        rustix::process::geteuid().is_root()
+    }
+
+    /// Whether the chroot is a mount point, from this process's mount table.
+    fn mounted(chroot: &Path) -> Option<String> {
+        let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        let wanted = chroot.display().to_string();
+        table
+            .lines()
+            .find(|l| l.split_whitespace().nth(4) == Some(wanted.as_str()))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn a_make_made_to_fail_after_each_of_its_first_four_steps_runs_its_commands_in_order_and_leaves_nothing()
+     {
+        for step in [Step::Mark, Step::Network, Step::Firewall, Step::Disks] {
+            let rig = self::rig(|_, _| {});
+            let backend = LinuxBackend::new(rig.config.clone()).failing_after(step, false);
+            let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+                backend.make(&rig.plan, USER_DATA)
+            });
+            assert_eq!(
+                made,
+                Err(BackendError::Failed(format!(
+                    "the make was made to fail after its step {step:?} (a test)"
+                ))),
+                "{step:?}"
+            );
+            let loaded = matches!(step, Step::Firewall | Step::Disks);
+            assert_eq!(ran, make_then_delete(step, loaded), "{step:?}");
+            assert_eq!(rig.left(), Vec::<String>::new(), "{step:?}");
+            // The directory of the jails stays: it is the node's, not the VM's.
+            assert!(rig.path("jails/firecracker").is_dir(), "{step:?}");
+            assert!(lock(&backend.failed_deletes).is_empty(), "{step:?}");
+        }
+    }
+
+    #[test]
+    fn a_make_left_after_its_disks_holds_its_mark_and_its_snapshot_file_and_a_delete_removes_them()
+    {
+        let rig = self::rig(|_, _| {});
+        let backend = LinuxBackend::new(rig.config.clone()).failing_after(Step::Disks, true);
+        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.make(&rig.plan, USER_DATA)
+        });
+        assert!(made.is_err());
+        assert_eq!(ran, MAKE_COMMANDS[..commands_after(Step::Disks)]);
+        assert_eq!(
+            rig.left(),
+            [
+                "jails/firecracker/tfvm-000000000001-0000",
+                "work/tfvm-000000000001-0000.snapshot"
+            ]
+        );
+        let jail = std::fs::metadata(rig.path("jails/firecracker/tfvm-000000000001-0000")).unwrap();
+        assert_eq!(jail.mode() & 0o7777, 0o700);
+        let snapshot = std::fs::metadata(rig.path("work/tfvm-000000000001-0000.snapshot")).unwrap();
+        assert_eq!(snapshot.mode() & 0o7777, 0o600);
+        assert_eq!(snapshot.len(), 1024 * 1024);
+        // Nothing is in the jail yet: its file system comes with the next step.
+        assert!(!rig.plan.chroot.exists());
+
+        // The table loaded in that make is still in the fake node's: a node's own delete.
+        let mut node = FakeNode::default();
+        node.tables
+            .insert("inet tinfirm_000000000001".into(), node_rules(&rig.plan));
+        let (deleted, ran) = on_fake_node(node, rig.dir.path(), || backend.delete(&rig.plan.names));
+        assert_eq!(deleted, Ok(()));
+        assert_eq!(ran, delete_commands(true));
+        assert_eq!(rig.left(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_setting_that_did_not_take_or_a_tool_that_fails_ends_the_make_with_its_words() {
+        let jail = "tfvm-000000000001-0000";
+        let cases: [(&str, Result<&str, &str>, String, usize); 6] = [
+            (
+                "ip netns exec tfvm-000000000001-0000 sysctl -n net.ipv4.ip_forward",
+                Ok("0"),
+                format!(
+                    "`ip netns exec {jail} sysctl -n net.ipv4.ip_forward` says 0, not 1: the setting did not take"
+                ),
+                18,
+            ),
+            (
+                "ip link add",
+                Err("RTNETLINK answers: File exists\n"),
+                format!(
+                    "`ip link add tfv000000000001 type veth peer name veth0 netns {jail}` failed: RTNETLINK answers: File exists"
+                ),
+                5,
+            ),
+            (
+                "ip netns exec tfvm-000000000001-0000 nft list table",
+                Ok("table inet tinfirm { policy drop; }"),
+                "the namespace's table is not as it was loaded: three chains must drop by policy"
+                    .to_string(),
+                24,
+            ),
+            (
+                "blockdev",
+                Ok("many"),
+                "the shared image's size cannot be read".to_string(),
+                28,
+            ),
+            (
+                "dmsetup create",
+                Err("device-mapper: create ioctl failed: Device or resource busy\n"),
+                "`dmsetup create --noudevsync tinfirm-tfvm-000000000001-0000 --table 0 16 snapshot /dev/loop0 /dev/loop1 N 8` failed: device-mapper: create ioctl failed: Device or resource busy".to_string(),
+                29,
+            ),
+            (
+                "dmsetup info",
+                Ok("252"),
+                "the snapshot's device numbers cannot be read".to_string(),
+                30,
+            ),
+        ];
+        for (prefix, answer, error, ran_of_make) in cases {
+            let rig = self::rig(|_, _| {});
+            let backend = LinuxBackend::new(rig.config.clone());
+            let node = FakeNode::default().answer(prefix, answer);
+            let (made, ran) =
+                on_fake_node(node, rig.dir.path(), || backend.make(&rig.plan, USER_DATA));
+            assert_eq!(made, Err(BackendError::Failed(error)), "{prefix}");
+            let mut wanted: Vec<String> = MAKE_COMMANDS[..ran_of_make]
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
+            wanted.extend(delete_commands(ran_of_make > 20));
+            assert_eq!(ran, wanted, "{prefix}");
+            assert_eq!(rig.left(), Vec::<String>::new(), "{prefix}");
+        }
+
+        // A shared image that is attached already is used as it is.
+        let rig = self::rig(|_, _| {});
+        let backend = LinuxBackend::new(rig.config.clone()).failing_after(Step::Disks, false);
+        let node = FakeNode::default().answer("losetup --noheadings", Ok("/dev/loop9 1"));
+        let (_, ran) = on_fake_node(node, rig.dir.path(), || backend.make(&rig.plan, USER_DATA));
+        assert_eq!(
+            ran[24..29],
+            [
+                "losetup --noheadings --output NAME,RO --associated $DIR/vm.img",
+                "losetup --find --show $DIR/work/tfvm-000000000001-0000.snapshot",
+                "blockdev --getsz /dev/loop9",
+                "dmsetup create --noudevsync tinfirm-tfvm-000000000001-0000 --table 0 16 snapshot /dev/loop9 /dev/loop1 N 8",
+                "dmsetup info -c --noheadings -o major,minor tinfirm-tfvm-000000000001-0000",
+            ]
+        );
+
+        // A node's table of the VM that does not read as it was loaded: the make fails, and so
+        // does the delete of the table, whose words follow the make's.
+        let rig = self::rig(|_, _| {});
+        let backend = LinuxBackend::new(rig.config.clone());
+        let node =
+            FakeNode::default().answer("nft list table inet tinfirm_", Ok("table inet x {}"));
+        let (made, ran) = on_fake_node(node, rig.dir.path(), || backend.make(&rig.plan, USER_DATA));
+        assert_eq!(
+            made,
+            Err(BackendError::Failed(format!(
+                "the node's table of the VM is not as it was loaded; and of the VM {jail} this is left: the firewall table tinfirm_000000000001"
+            )))
+        );
+        let mut wanted: Vec<String> = MAKE_COMMANDS[..23].iter().map(|c| c.to_string()).collect();
+        wanted.extend(delete_commands(true));
+        assert_eq!(ran, wanted);
+        // The jail stays, so that the VM is still listed and keeps its slot.
+        assert_eq!(rig.left(), [format!("jails/firecracker/{jail}")]);
+        assert!(lock(&backend.failed_deletes).contains(&1));
+    }
+
+    #[test]
+    fn a_make_left_after_its_jail_holds_the_vms_files_on_a_file_system_of_its_own() {
+        if !is_root() {
+            eprintln!("skipped: the jail's file system is mounted, which needs root");
+            return;
+        }
+        let rig = self::rig(|_, _| {});
+        let backend = LinuxBackend::new(rig.config.clone()).failing_after(Step::Jail, true);
+        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.make(&rig.plan, USER_DATA)
+        });
+        assert!(made.is_err());
+        assert_eq!(ran, MAKE_COMMANDS);
+        let chroot = &rig.plan.chroot;
+        let mount = mounted(chroot).expect("the jail's file system is mounted");
+        let fields: Vec<&str> = mount.split(" - ").nth(1).unwrap().split(' ').collect();
+        assert_eq!(fields[..2], ["tmpfs", "tinfirm-jail"], "{mount}");
+        assert!(
+            fields[2].contains("size=65536k,nr_inodes=1024,mode=700"),
+            "{mount}"
+        );
+        assert!(
+            mount.split(' ').nth(5).unwrap().contains("nosuid"),
+            "{mount}"
+        );
+        let root = std::fs::metadata(chroot).unwrap();
+        assert_eq!(
+            (root.uid(), root.gid(), root.mode() & 0o7777),
+            (0, 0, 0o700)
+        );
+        let config = serde_json::to_vec(&firecracker_config(&rig.plan)).unwrap();
+        let disk = user_data_disk(USER_DATA).unwrap();
+        for (name, bytes) in [
+            (KERNEL, KERNEL_BYTES),
+            (USER_DATA_DISK, disk.as_slice()),
+            (VM_CONFIG, config.as_slice()),
+            (VMM_LOG, b"".as_slice()),
+            (ROOT_DISK, b"".as_slice()),
+        ] {
+            let path = chroot.join(name.trim_start_matches('/'));
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid(), meta.mode() & 0o7777),
+                (1_100_000, 1_100_000, 0o600),
+                "{name}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+        }
+        let mut names: Vec<String> = std::fs::read_dir(chroot)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().display().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "firecracker.log",
+                "root.disk",
+                "userdata.disk",
+                "vm.json",
+                "vmlinux"
+            ]
+        );
+
+        // The delete unmounts the jail's file system, with what is in it, and removes the jail.
+        let mut node = FakeNode::default();
+        node.tables
+            .insert("inet tinfirm_000000000001".into(), node_rules(&rig.plan));
+        let (deleted, ran) = on_fake_node(node, rig.dir.path(), || backend.delete(&rig.plan.names));
+        assert_eq!(deleted, Ok(()));
+        assert_eq!(ran, delete_commands(true));
+        assert_eq!(mounted(chroot), None);
+        assert_eq!(rig.left(), Vec::<String>::new());
+
+        // Made to fail after the same step, the make removes it all itself.
+        let rig = self::rig(|_, _| {});
+        let backend = LinuxBackend::new(rig.config.clone()).failing_after(Step::Jail, false);
+        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.make(&rig.plan, USER_DATA)
+        });
+        assert_eq!(
+            made,
+            Err(BackendError::Failed(
+                "the make was made to fail after its step Jail (a test)".into()
+            ))
+        );
+        assert_eq!(ran, make_then_delete(Step::Jail, true));
+        assert_eq!(mounted(&rig.plan.chroot), None);
+        assert_eq!(rig.left(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_jailer_is_started_through_start_jailer_with_the_console_and_its_errors_in_files() {
+        if !is_root() {
+            eprintln!("skipped: the jail's file system is mounted, which needs root");
+            return;
+        }
+        let rig = self::rig(|config, _| config.firecracker.guest_console = true);
+        let starter = rig.starter("echo 'to the console'\necho 'jailer says no' >&2\nexit 3");
+        let backend = LinuxBackend::new(rig.config.clone())
+            .with_starter(&starter)
+            .failing_after(Step::Vmm, true);
+        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.make(&rig.plan, USER_DATA)
+        });
+        assert_eq!(
+            made,
+            Err(BackendError::Failed(
+                "the jailer failed (exit status: 3): jailer says no".into()
+            ))
+        );
+        assert_eq!(ran, MAKE_COMMANDS);
+        let args = std::fs::read_to_string(rig.path("jailer.args")).unwrap();
+        let mut wanted = vec![bounding::START_JAILER.to_string()];
+        wanted.extend(jailer_argv(&rig.plan));
+        assert_eq!(args.lines().collect::<Vec<_>>(), wanted);
+        // The console is the VMM's standard output, and the errors file its standard error.
+        let work = |name: &str| rig.path(&format!("work/tfvm-000000000001-0000.{name}"));
+        assert_eq!(
+            std::fs::read_to_string(work("console")).unwrap(),
+            "to the console\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work("errors")).unwrap(),
+            "jailer says no\n"
+        );
+        for name in ["console", "errors"] {
+            let meta = std::fs::metadata(work(name)).unwrap();
+            assert_eq!((meta.uid(), meta.mode() & 0o7777), (0, 0o600), "{name}");
+        }
+        let (deleted, _) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.delete(&rig.plan.names)
+        });
+        assert_eq!(deleted, Ok(()));
+        assert_eq!(rig.left(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn after_the_jailer_the_make_sets_the_io_limit_and_fails_at_once_when_the_vmm_is_gone() {
+        if !is_root() {
+            eprintln!("skipped: the jail's file system is mounted, which needs root");
+            return;
+        }
+        // An io.max that cannot be written: its cgroup is not there, since nothing made it.
+        let rig = self::rig(|_, template| {
+            template.io_max = Some(crate::plan::IoMax {
+                read_bytes_per_second: Some(1_048_576),
+                write_bytes_per_second: None,
+                reads_per_second: None,
+                writes_per_second: None,
+            })
+        });
+        let backend = LinuxBackend::new(rig.config.clone()).with_starter(rig.starter("exit 0"));
+        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.make(&rig.plan, USER_DATA)
+        });
+        assert_eq!(
+            made,
+            Err(BackendError::Failed(format!(
+                "cannot set the VM's io.max to `252:3 rbps=1048576`: entity not found (the cgroup controller io must be handed down to {})",
+                rig.path("cg").display()
+            )))
+        );
+        assert_eq!(ran, make_then_delete(Step::Vmm, true));
+        assert_eq!(
+            std::fs::read_to_string(rig.path("cg/cgroup.subtree_control")).unwrap(),
+            "+io"
+        );
+        assert_eq!(rig.left(), Vec::<String>::new());
+
+        // Without one: the jailer ended well, and no process is in the VM's cgroup.
+        let rig = self::rig(|_, _| {});
+        let backend = LinuxBackend::new(rig.config.clone()).with_starter(rig.starter("exit 0"));
+        let start = Instant::now();
+        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.make(&rig.plan, USER_DATA)
+        });
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            made,
+            Err(BackendError::Failed(
+                "the VMM ended before its guest ran: Firecracker's log ends with: (nothing); its standard error: (nothing)".into()
+            ))
+        );
+        assert_eq!(ran, make_then_delete(Step::Vmm, true));
+        assert!(!rig.path("cg/cgroup.subtree_control").exists());
+        assert_eq!(rig.left(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_jailer_that_does_not_end_is_killed_after_ten_seconds() {
+        if !is_root() {
+            eprintln!("skipped: the jail's file system is mounted, which needs root");
+            return;
+        }
+        let rig = self::rig(|_, _| {});
+        let backend =
+            LinuxBackend::new(rig.config.clone()).with_starter(rig.starter("exec sleep 60"));
+        let start = Instant::now();
+        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.make(&rig.plan, USER_DATA)
+        });
+        let took = start.elapsed();
+        assert!(
+            took >= START_TIMEOUT && took < START_TIMEOUT + Duration::from_secs(5),
+            "{took:?}"
+        );
+        assert_eq!(
+            made,
+            Err(BackendError::Failed(
+                "the jailer did not finish starting the VMM in time".into()
+            ))
+        );
+        assert_eq!(ran, make_then_delete(Step::Vmm, true));
+        assert_eq!(rig.left(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_delete_that_leaves_something_waits_once_names_it_and_keeps_the_jail() {
+        let rig = self::rig(|_, _| {});
+        let backend = LinuxBackend::new(rig.config.clone());
+        let names = rig.plan.names;
+        let places = places(&rig.config.firecracker, &names);
+        std::fs::create_dir_all(&places.jail_dir).unwrap();
+        // A cgroup with a process that does not end, as far as the delete can see.
+        std::fs::create_dir(&places.cgroup).unwrap();
+        std::fs::write(places.cgroup.join("cgroup.procs"), "4242\n").unwrap();
+        let left = format!(
+            "of the VM tfvm-000000000001-0000 this is left: processes of its cgroup, the cgroup {}",
+            places.cgroup.display()
+        );
+
+        // The first delete waits for the processes and for the cgroup, each its 5 s.
+        let start = Instant::now();
+        let (deleted, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.delete(&names)
+        });
+        let took = start.elapsed();
+        assert!(
+            took >= 2 * KILL_TIMEOUT && took < 2 * KILL_TIMEOUT + Duration::from_secs(4),
+            "{took:?}"
+        );
+        assert_eq!(deleted, Err(BackendError::Failed(left.clone())));
+        assert_eq!(ran, delete_commands(false));
+        assert_eq!(
+            std::fs::read_to_string(places.cgroup.join("cgroup.kill")).unwrap(),
+            "1"
+        );
+        assert!(places.jail_dir.is_dir());
+        assert!(lock(&backend.failed_deletes).contains(&names.serial));
+
+        // The next one does not wait again, and says the same.
+        let start = Instant::now();
+        let (deleted, _) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.delete(&names)
+        });
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(deleted, Err(BackendError::Failed(left)));
+        assert!(places.jail_dir.is_dir());
+
+        // Once the processes are gone and the cgroup can go, the delete removes it all, and the
+        // VM is no longer one whose delete failed.
+        std::fs::remove_dir_all(&places.cgroup).unwrap();
+        let (deleted, _) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+            backend.delete(&names)
+        });
+        assert_eq!(deleted, Ok(()));
+        assert!(!places.cgroup.exists());
+        assert_eq!(rig.left(), Vec::<String>::new());
+        assert!(!lock(&backend.failed_deletes).contains(&names.serial));
     }
 }
