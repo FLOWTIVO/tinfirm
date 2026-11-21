@@ -31,12 +31,16 @@ pub mod vm_pod {
     /// The VM's kernel and root file system image, in the run pod's image.
     pub const KERNEL: &str = "/tinfirm/vm/vmlinux";
     pub const IMAGE: &str = "/tinfirm/vm/rootfs.ext4";
+    /// Firecracker, in the run pod's image; it runs without the jailer.
+    pub const FIRECRACKER: &str = "/tinfirm/vm/firecracker";
     /// The ticket Secret's volume, read-only, and the one file in it.
     pub const TICKET_DIR: &str = "/tinfirm/ticket";
     pub const TICKET_KEY: &str = "user-data";
     /// The memory volume: Firecracker's API socket, the user-data disk and the ready file.
     pub const RUN_DIR: &str = "/tinfirm/run";
     pub const API_SOCKET: &str = "/tinfirm/run/firecracker.sock";
+    /// Firecracker's configuration, which `vm-pod` writes.
+    pub const CONFIG_FILE: &str = "/tinfirm/run/firecracker.json";
     pub const USER_DATA_DISK: &str = "/tinfirm/run/userdata.disk";
     pub const READY_FILE: &str = "/tinfirm/run/ready";
     /// The disk volume, and the run's writable root disk in it: a sparse copy of [`IMAGE`],

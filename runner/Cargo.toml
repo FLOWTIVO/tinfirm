@@ -74,6 +74,12 @@ zeroizing-alloc = "0.1.1"
 jsonschema = { version = "0.61", default-features = false }
 tempfile = "3.27"
 
+# No `unsafe` code of our own: what needs a system call goes through rustix or another library.
+# The exceptions are functions that carry `#[allow(unsafe_code)]` and say why, and each is named
+# here and in `crates/tinfirm-runner-host/tests/unsafe_code.rs`, which fails on any other:
+# - `ee/runner/tinfirm-runner-host/src/kubernetes/tap.rs`, `make_tap` and `int_ioctl`: the ioctl
+#   calls on `/dev/net/tun` that make a VM's tap in a run's pod (ADR-0115), which no library of
+#   the workspace wraps (the owner, 2026-11-21).
 [workspace.lints.rust]
 unsafe_code = "deny"
 
