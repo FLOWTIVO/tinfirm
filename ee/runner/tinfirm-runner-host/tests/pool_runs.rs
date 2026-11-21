@@ -819,3 +819,90 @@ async fn a_window_fills_early_and_its_end_is_followed_without_the_server() {
     })
     .await;
 }
+
+/// A run's VM whose delete fails while its node does not answer (a node that reboots) is deleted
+/// later by the host on its own, without a restart, once the node answers again: its slot is
+/// free again. Nothing else is deleted meanwhile: neither the VM of a run that still runs nor a
+/// ready VM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_whose_delete_failed_while_its_node_was_down_is_deleted_once_it_answers() {
+    with_timeout(180, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let down = dir.path().join("down");
+        let down_env = down.to_string_lossy().into_owned();
+        let mut options = vm_options(&log, &[("FAKE_VM_DOWN", &down_env)]);
+        options.delete_retry = Duration::from_millis(300);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, pool_host(options, quick())).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let pool = pool_of(&host);
+        pool.set_scheduled(1);
+        until("one VM ready", 30, || pool.status().ready == 1).await;
+
+        // A run that goes on, in vm-1; its replacement, vm-2, is ready.
+        let live = AssignSpec::new("gate", None);
+        conn.send(live.to_json());
+        conn.wait_running(live.run_id).await;
+        until("the replacement ready", 30, || pool.status().ready == 1).await;
+
+        // A run that ends, in vm-2, while the node does not answer: its delete fails.
+        std::fs::write(&down, "").unwrap();
+        let ended = AssignSpec::new("bridge-env", None);
+        conn.send(ended.to_json());
+        let t = conn.until_finished(ended.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(
+            t.text().contains("took a ready sandbox VM (vm-2)"),
+            "{}",
+            t.text()
+        );
+        let calls = vm_driver_calls(&log);
+        let gone = |calls: &[Value], id: &str| {
+            calls_of(calls, "deleted")
+                .iter()
+                .any(|c| c["params"]["id"] == id)
+        };
+        assert!(
+            deleted(&calls, "vm-2") && !gone(&calls, "vm-2"),
+            "{calls:#?}"
+        );
+
+        // The node answers again: the host deletes vm-2 on its own.
+        std::fs::remove_file(&down).unwrap();
+        until("vm-2 deleted after the node is back", 30, || {
+            gone(&vm_driver_calls(&log), "vm-2")
+        })
+        .await;
+        until("vm-3 ready", 30, || pool.status().ready == 1).await;
+        let calls = vm_driver_calls(&log);
+        // Neither the live run's VM nor the ready one was touched.
+        assert!(!deleted(&calls, "vm-1"), "{calls:#?}");
+        assert!(!deleted(&calls, "vm-3"), "{calls:#?}");
+        // And vm-2 is not tried again once it is deleted.
+        let tries = calls_of(&calls, "delete")
+            .iter()
+            .filter(|c| c["params"]["id"] == "vm-2")
+            .count();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let calls = vm_driver_calls(&log);
+        assert_eq!(
+            calls_of(&calls, "delete")
+                .iter()
+                .filter(|c| c["params"]["id"] == "vm-2")
+                .count(),
+            tries,
+            "{calls:#?}"
+        );
+
+        // The live run ends as usual, and its VM goes.
+        release(&host.paths, live.run_id);
+        let t = conn.until_finished(live.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(gone(&vm_driver_calls(&log), "vm-1"));
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}

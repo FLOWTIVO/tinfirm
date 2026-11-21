@@ -946,6 +946,15 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 - **Leftovers.** After each connection to the server, this host lists its VMs and deletes those it does
   not hold: after a crash of this host, or a delete that failed. Each VM has the labels `tinfirm-host`
   (this host's id) and `tinfirm-vm` (the VM's own id); the run that takes it is in this host's log.
+- **A delete that fails** (its node is down or reboots, the driver does not answer) is tried 3 times
+  over a few seconds, and then again on its own, without a restart of this host: after 15 s, then
+  after twice the wait before, up to 5 minutes, and every 5 minutes from then on until the delete
+  succeeds. Only the VMs whose delete this host asked for are tried, never one that a run, a ready
+  VM or a run taken back holds. The log has "the sandbox VM is left; the host tries its delete
+  again later", then "sandbox VM deleted, after a delete that had failed" once the node answers.
+  The first 12 failed tries (about 40 minutes) are warnings; the twelfth says "the sandbox VM is
+  still left; the host keeps trying its delete", and the tries after it are in the debug log only.
+  The cleanup at the next connection or start deletes such a VM too.
 - **A VM that ends during its run** (its VMM dies, its node reboots) ends the run's bridge session
   without the adapter's exit status once the bridge has been gone for 30 s. This host then asks the
   driver's `describe` once, for at most 25 s: when the VM is gone or failed, or the driver cannot
@@ -1148,7 +1157,8 @@ driver is tested against node agents with their fake backend.
 - **A node that is down.** `describe` and `delete` of its VMs fail (never `gone`), and the run that
   waits on one ends as `INFRA` when its timeouts expire. `list` lists the VMs of the nodes that answer:
   this host deletes only leftovers it is shown, so a node that does not answer keeps its VMs until it
-  answers again. A run whose VM it took down ends as `INFRA`.
+  answers again. A delete that failed while it was down is tried again on its own
+  ([A delete that fails](#a-vm-per-run)), and a run whose VM it took down ends as `INFRA`.
 - **The port.** Each node publishes each VM's bridge on a port of its own address, which `describe`
   names (above); the VM's bridge listens on `--vm-port` inside it, and its user data comes on a small
   read-only disk that `vm-boot` reads.

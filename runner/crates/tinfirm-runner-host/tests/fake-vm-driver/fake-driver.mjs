@@ -33,6 +33,8 @@
 //   FAKE_VM_DELETE_MS  how long a `delete` takes before it answers (default 0); the VM goes,
 //                      and the log gets a line {method: "deleted", params: {id}}, when it
 //                      answers
+//   FAKE_VM_DOWN       a file: while it is there, `delete` and `describe` fail as for a node
+//                      that does not answer (a node that reboots), and the VMs stay
 //   FAKE_VM_DIE        a file: once it is there, every running "VM" dies as a VM whose VMM
 //                      was killed: its bridge is killed, `describe` says `failed` from then
 //                      on, and the file is removed
@@ -76,6 +78,11 @@ function log(method, params) {
 function brokenProblems() {
   if (!env.FAKE_VM_BROKEN || !existsSync(env.FAKE_VM_BROKEN)) return null;
   return JSON.parse(readFileSync(env.FAKE_VM_BROKEN, "utf8"));
+}
+
+// FAKE_VM_DOWN: whether the "node" does not answer now.
+function down() {
+  return Boolean(env.FAKE_VM_DOWN && existsSync(env.FAKE_VM_DOWN));
 }
 
 // FAKE_VM_DIE: the running "VMs" die once the file is there.
@@ -182,10 +189,12 @@ const methods = {
     return { id };
   },
   describe({ id }) {
+    if (down()) throw new Error("cannot reach the node: connection refused");
     const vm = vms.get(id);
     return vm ? view(vm) : { id, state: "gone", labels: {} };
   },
   async delete({ id, labels }) {
+    if (down()) throw new Error("cannot reach the node: connection refused");
     const vm = vms.get(id);
     // A real driver's guard: only a VM with each of the host's labels.
     for (const [k, v] of Object.entries(labels || {})) {

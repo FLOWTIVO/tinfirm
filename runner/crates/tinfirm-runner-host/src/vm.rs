@@ -61,8 +61,17 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(180);
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(60);
 const DELETE_TIMEOUT: Duration = Duration::from_secs(120);
 const LIST_TIMEOUT: Duration = Duration::from_secs(120);
-/// How often a delete is tried before the VM is left to the next cleanup.
+/// How often a delete is tried at once before the VM is left to its later tries.
 const DELETE_ATTEMPTS: u32 = 3;
+/// After a delete that failed: the first wait before the host tries it again
+/// ([`VmOptions::delete_retry`]). Each later wait is twice the one before, up to
+/// [`DELETE_RETRY_MAX`].
+const DELETE_RETRY: Duration = Duration::from_secs(15);
+const DELETE_RETRY_MAX: Duration = Duration::from_secs(300);
+/// How many failed tries of a delete the host warns of (about 40 minutes with the default
+/// waits). It goes on trying after them, once per [`DELETE_RETRY_MAX`], and says so once: a
+/// node that comes back after hours gets its slot back without a restart of this host.
+const DELETE_RETRIES: u32 = 12;
 /// How long a run whose VM's bridge was lost waits for the driver's `describe` of the VM.
 const LOST_WAIT: Duration = Duration::from_secs(25);
 /// The longest line the driver may answer with.
@@ -181,6 +190,9 @@ pub struct VmOptions {
     /// The longest a run's admission, or the report of a failed create, waits for the driver's
     /// `verify` in a health check; then it goes on with what is known. No flag sets it.
     pub check_wait: Duration,
+    /// After a delete that failed: the first wait before the host tries it again on its own
+    /// ([`DELETE_RETRY`]). No flag sets it.
+    pub delete_retry: Duration,
     /// Test-only: the driver's "VMs" are processes on this machine, so the sandbox shares this
     /// machine's network and file system as the local test executor's does.
     #[doc(hidden)]
@@ -199,6 +211,7 @@ impl VmOptions {
             image_version: ImageVersion::Warn,
             recheck: RECHECK,
             check_wait: CHECK_WAIT,
+            delete_retry: DELETE_RETRY,
             on_this_machine: false,
         }
     }
@@ -840,6 +853,8 @@ pub struct Vms {
     /// The [`VM_LABEL`]s of this process's VMs that are not deleted yet, from just before
     /// their create: the leftover cleanup never takes one of them.
     live: Mutex<HashSet<String>>,
+    /// The VMs whose delete failed, which the host tries again on its own ([`Vms::delete_later`]).
+    left: Mutex<Left>,
     /// The builds of VM images that the host has warned of ([`ImageVersion::Warn`]).
     warned: Mutex<HashSet<Option<String>>>,
     /// Set while the driver can make no VM ([`Vms::refusal`]).
@@ -857,6 +872,22 @@ pub struct Vms {
     made: AtomicU64,
     /// Counts the health checks that ended, for those that wait for one.
     checks: tokio::sync::watch::Sender<u64>,
+}
+
+/// The VMs whose delete failed, by id, and whether a task tries them again now.
+#[derive(Default)]
+struct Left {
+    vms: HashMap<String, LeftVm>,
+    retrying: bool,
+}
+
+/// A VM whose delete failed: the host label its delete names, its [`VM_LABEL`], how often it
+/// was tried again, and when it is tried next.
+struct LeftVm {
+    host: String,
+    label: Option<String>,
+    tries: u32,
+    next: tokio::time::Instant,
 }
 
 /// What a health check found.
@@ -899,6 +930,7 @@ impl Vms {
             options,
             driver,
             live: Mutex::new(HashSet::new()),
+            left: Mutex::new(Left::default()),
             warned: Mutex::new(HashSet::new()),
             no_vms: Mutex::new(None),
             no_vms_since: AtomicU64::new(0),
@@ -1342,13 +1374,103 @@ impl Vms {
     }
 
     /// Deletes the VM `id`; its [`VM_LABEL`] `label` is no longer live then, whatever the
-    /// outcome: a VM whose delete failed is the leftover cleanup's.
-    async fn delete_labelled(&self, id: &str, host: &str, label: Option<&str>) -> bool {
+    /// outcome: a VM whose delete failed is tried again later ([`Vms::delete_later`]), and is
+    /// the leftover cleanup's too.
+    async fn delete_labelled(self: &Arc<Vms>, id: &str, host: &str, label: Option<&str>) -> bool {
         let deleted = self.delete(id, host).await;
         if let Some(label) = label {
             lock(&self.live).remove(label);
         }
+        if !deleted {
+            self.delete_later(id, host, label);
+        }
         deleted
+    }
+
+    /// A VM whose delete failed (its node was down, or its driver did not answer): the host
+    /// tries it again on its own, first after `delete_retry` and then after twice the wait
+    /// before, up to [`DELETE_RETRY_MAX`], until the delete succeeds. One task tries every
+    /// such VM, one delete at a time, and ends when none is left. Only VMs whose delete this
+    /// process asked for are tried, never one that it holds: a run's, a ready one, or one whose
+    /// run it took back.
+    fn delete_later(self: &Arc<Vms>, id: &str, host: &str, label: Option<&str>) {
+        let mut left = lock(&self.left);
+        left.vms.entry(id.to_string()).or_insert_with(|| LeftVm {
+            host: host.to_string(),
+            label: label.map(str::to_string),
+            tries: 0,
+            next: tokio::time::Instant::now() + self.options.delete_retry,
+        });
+        if left.retrying {
+            return;
+        }
+        left.retrying = true;
+        drop(left);
+        let vms = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let next = {
+                    let Some(vms) = vms.upgrade() else { return };
+                    let mut left = lock(&vms.left);
+                    let Some(next) = left.vms.values().map(|vm| vm.next).min() else {
+                        left.retrying = false;
+                        return;
+                    };
+                    next
+                };
+                tokio::time::sleep_until(next).await;
+                let Some(vms) = vms.upgrade() else { return };
+                vms.delete_left().await;
+            }
+        });
+    }
+
+    /// Tries the delete of each VM of [`Vms::delete_later`] whose time has come, once.
+    async fn delete_left(&self) {
+        let now = tokio::time::Instant::now();
+        let due: Vec<(String, String, Option<String>)> = lock(&self.left)
+            .vms
+            .iter()
+            .filter(|(_, vm)| vm.next <= now)
+            .map(|(id, vm)| (id.clone(), vm.host.clone(), vm.label.clone()))
+            .collect();
+        for (id, host, label) in due {
+            if label.as_ref().is_some_and(|l| lock(&self.live).contains(l)) {
+                // Held by this process again: not a leftover.
+                lock(&self.left).vms.remove(&id);
+                continue;
+            }
+            let labels = BTreeMap::from([(HOST_LABEL.to_string(), host)]);
+            let deleted = self.driver.delete(&id, &labels).await;
+            let mut left = lock(&self.left);
+            let Some(vm) = left.vms.get_mut(&id) else {
+                continue;
+            };
+            vm.tries = vm.tries.saturating_add(1);
+            let tries = vm.tries;
+            match deleted {
+                Ok(()) => {
+                    left.vms.remove(&id);
+                    tracing::info!(vm = %id, tries, "sandbox VM deleted, after a delete that had failed");
+                }
+                Err(e) => {
+                    let wait = delete_retry_wait(self.options.delete_retry, tries);
+                    vm.next = tokio::time::Instant::now() + wait;
+                    let error = format!("{e:#}");
+                    match tries.cmp(&DELETE_RETRIES) {
+                        std::cmp::Ordering::Less => {
+                            tracing::warn!(vm = %id, tries, retry_in_s = wait.as_secs(), %error, "cannot delete the sandbox VM yet");
+                        }
+                        std::cmp::Ordering::Equal => {
+                            tracing::error!(vm = %id, tries, retry_in_s = wait.as_secs(), %error, "the sandbox VM is still left; the host keeps trying its delete, and logs the next tries at the debug level");
+                        }
+                        std::cmp::Ordering::Greater => {
+                            tracing::debug!(vm = %id, tries, %error, "cannot delete the sandbox VM yet");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn delete(&self, id: &str, host: &str) -> bool {
@@ -1367,14 +1489,23 @@ impl Vms {
                 }
             }
         }
-        tracing::error!(vm = %id, "the sandbox VM is left; the host deletes it with its leftovers at its next connection");
+        tracing::error!(
+            vm = %id,
+            retry_in_s = self.options.delete_retry.as_secs(),
+            "the sandbox VM is left; the host tries its delete again later, and deletes it with its leftovers at its next connection"
+        );
         false
     }
 
     /// Deletes this host's VMs that this process does not hold: those whose delete failed,
     /// and those of an earlier process of this host. A VM of a host before ADR-0098, which
-    /// has no [`VM_LABEL`], is kept while its run is in `live`.
-    pub async fn cleanup_orphans(&self, host: &str, live: &HashSet<Uuid>) -> Result<usize> {
+    /// has no [`VM_LABEL`], is kept while its run is in `live`. A delete that fails here is
+    /// tried again later ([`Vms::delete_later`]).
+    pub async fn cleanup_orphans(
+        self: &Arc<Vms>,
+        host: &str,
+        live: &HashSet<Uuid>,
+    ) -> Result<usize> {
         let labels = BTreeMap::from([(HOST_LABEL.to_string(), host.to_string())]);
         let mut deleted = 0;
         for vm in self.driver.list(&labels).await? {
@@ -1399,10 +1530,20 @@ impl Vms {
             tracing::info!(vm = %vm.id, run = ?run, "deleting a leftover sandbox VM");
             if self.delete(&vm.id, host).await {
                 deleted += 1;
+            } else {
+                self.delete_later(&vm.id, host, vm.labels.get(VM_LABEL).map(String::as_str));
             }
         }
         Ok(deleted)
     }
+}
+
+/// The wait before the next try of a failed delete that was tried again `tries` times already:
+/// `first`, doubled with each try, up to [`DELETE_RETRY_MAX`].
+fn delete_retry_wait(first: Duration, tries: u32) -> Duration {
+    first
+        .saturating_mul(2u32.saturating_pow(tries))
+        .min(DELETE_RETRY_MAX)
 }
 
 /// A VM: deleted by [`VmGuard::delete`], or when it is dropped.
@@ -1517,6 +1658,20 @@ pub fn user_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_delete_is_tried_again_less_and_less_often_and_for_a_bounded_time() {
+        let waits: Vec<u64> = (0..DELETE_RETRIES)
+            .map(|tries| delete_retry_wait(DELETE_RETRY, tries).as_secs())
+            .collect();
+        assert_eq!(
+            waits,
+            [15, 30, 60, 120, 240, 300, 300, 300, 300, 300, 300, 300]
+        );
+        // About 40 minutes of tries that the host warns of; then one try per 5 minutes.
+        assert_eq!(waits.iter().sum::<u64>(), 2565);
+        assert_eq!(delete_retry_wait(DELETE_RETRY, u32::MAX), DELETE_RETRY_MAX);
+    }
 
     #[test]
     fn a_vm_image_of_another_build_warns_and_is_refused_only_when_asked() {
