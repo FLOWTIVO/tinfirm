@@ -996,8 +996,7 @@ Both:
     `run` has not admitted, says `exited` or `sessionEnded` twice, or says `link` after its
     session ended, breaks the wire and is ended.
   - **The egress messages.** `run` tells the front the credential the sandbox's egress proxy must
-    ask for (on a host that binds the proxy a listener, with that listener's socket); the front
-    sends `connect` with a request number that only grows, a host
+    ask for, which the sandbox reaches through its tunnel; the front sends `connect` with a request number that only grows, a host
     name or address and a port, and `closed` once that connection ends; `run` answers with
     `connected` and the socket, or `refused` with a status, a message and whether the
     destination is off the allowlist (only then does the client get `x-tinfirm-egress:
@@ -1005,7 +1004,7 @@ Both:
     front ends; a connection whose client left while `run` connected is closed by the front at
     once, with its `closed`.
   - **The model messages.** `run` tells the front the run secret, the format and the base path of
-    the sandbox's model proxy (on a host that binds the proxy a listener, with its socket). For each request the front sends `request` with a request
+    the sandbox's model proxy, which the sandbox reaches through its tunnel. For each request the front sends `request` with a request
     number that only grows (shared with `connect`), the endpoint, method, query, headers and
     length, within the bounds above (a header value travels as a string whose characters are
     its bytes, U+0000 to U+00FF, and its bounds count those bytes); `run` answers with `body` and one end of a new pair of
@@ -1023,7 +1022,7 @@ Both:
     once: `run` refuses a second one itself, so a front never hears of it.
   - **The git messages.** `run` tells the front the bounds of the sandbox's git proxy and
     platform tools (open connections, the time for a request's headers, the idle time of a
-    connection; on a host that binds them a listener, with its socket), then the
+    connection), which the sandbox reaches through its tunnel, then the
     run's routes as they are (`gitRoutes`: each repository route's number, secret, repository
     path and branch, and the platform tools' number and secret), again whenever they change,
     each followed by a round trip so that a request after them finds them. For each fetch or
@@ -1031,7 +1030,8 @@ Both:
     place of its path and secret, and the same sockets, answers and ends follow. A route the
     run does not have, a request its route does not take (another method, another query, a
     push), a body over its bound or not of its declared length, a header with CR, LF or NUL,
-    and a browser's request to the tools are refused by `run` as by the shared listener; a
+    and a browser's request to the tools are refused by `run` as by the shared listener of a host
+    without the bridge; a
     front that opens more than 64 of these requests at once is ended.
 
 ## A VM per run

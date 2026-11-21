@@ -77,8 +77,9 @@ pub enum ToFront {
         id: u64,
     },
     /// Serve the egress proxy's HTTP, for clients that send
-    /// `Proxy-Authorization: <authorization>` (crate::egress_proxy): with `listener`, on the
-    /// TCP listener that `run` bound and passes along; always for the tunnels that name it.
+    /// `Proxy-Authorization: <authorization>` (crate::egress_proxy), for the tunnels that name
+    /// it, and with `listener` on the TCP listener that `run` bound and passes along too (only
+    /// the tests of the front's services pass one: a sandbox reaches it through its tunnel).
     /// Every destination is `run`'s to decide ([`ToMain::Connect`]).
     ListenEgress {
         authorization: String,
@@ -98,8 +99,9 @@ pub enum ToFront {
         off_allowlist: bool,
     },
     /// Serve the model proxy's HTTP for the run whose secret is `secret` (crate::model_proxy):
-    /// with `listener`, on the TCP listener that `run` passes along; always for the tunnels
-    /// that name it. Its requests go to `run` ([`ToMain::Request`]); the key never comes here.
+    /// for the tunnels that name it, and with `listener` on the TCP listener that `run` passes
+    /// along too (as for [`ToFront::ListenEgress`]). Its requests go to `run`
+    /// ([`ToMain::Request`]); the key never comes here.
     ListenModel {
         secret: String,
         api: ModelApi,
@@ -128,8 +130,9 @@ pub enum ToFront {
         ok: bool,
     },
     /// Serve one run's git proxy fetches and platform tools' endpoint (crate::git_proxy),
-    /// within `limits`, for the routes of [`ToFront::GitRoutes`]: with `listener`, on the TCP
-    /// listener that `run` passes along; always for the tunnels that name it. Their requests
+    /// within `limits`, for the routes of [`ToFront::GitRoutes`], for the tunnels that name it,
+    /// and with `listener` on the TCP listener that `run` passes along too (as for
+    /// [`ToFront::ListenEgress`]). Their requests
     /// go to `run` ([`ToMain::Request`]); no git token and no tool comes here.
     ListenGit {
         limits: FrontLimits,
