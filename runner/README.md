@@ -39,6 +39,9 @@ All of it is MIT. The binary also compiles in the paid code of elastic runners, 
 Packer template, [ready VMs](#ready-vms) and [session bundles](#session-bundles-protocol-v2), with
 their tests.
 
+A maintainer's map of the host's code (its processes, its modules, and the stages of a run from
+its assignment to its report) is [`crates/tinfirm-runner-host/MAP.md`](crates/tinfirm-runner-host/MAP.md).
+
 ## Install
 
 Requirements: Docker (Docker Desktop, or Docker Engine on Linux) and `git` on the host. A
