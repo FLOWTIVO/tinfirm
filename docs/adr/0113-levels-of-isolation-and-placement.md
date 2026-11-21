@@ -26,7 +26,7 @@
    | Level | The wall | Credentials | Other runs | Who has it |
    |---|---|---|---|---|
    | `machine` | Another machine | On another machine | Kept apart by a jail around each VM, or by a machine per run | A VM per run at a provider (ADR-0096); a control host with sandbox nodes (ADR-0112); the forms of ADR-0115 that meet its conditions |
-   | `vm-jail` | A jail around each VM | On the same machine, out of a VMM's user's reach | Kept apart by the jail | A runner host and the node agent on one machine (ADR-0112, decision 5) |
+   | `vm-jail` | A jail around each VM | On the same machine, out of a VMM's user's reach | Kept apart by the jail | A runner host and the node agent on one machine (ADR-0112, decision 5; set aside on 2026-11-21, so no supported host reports this level now) |
    | `container` | The container and the kernel | On the same machine, behind the kernel alone | Not kept apart | A container of the host's Docker, with runc or gVisor |
 
    - A level says where the credentials are. It does not say that two flaws are needed: ADR-0112's paths B (KVM) and C (the control host's readers) are one flaw each. The host's page shows the paths for its level, in the words of ADR-0112, decision 1.

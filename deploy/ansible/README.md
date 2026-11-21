@@ -543,7 +543,8 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
 - **SELinux on a Red Hat family node** (ADR-0113 decision 5): such a node reports `no` for the line
   `vmm-mac`, and the role refuses the AppArmor switch there.
 - **The single machine** (ADR-0112 decision 5): the runner host and the node agent on one machine.
-  The helper refuses a control host on the node's own machine, and so does the role.
+  It is set aside and not built. The helper refuses a control host on the node's own machine, and so
+  does the role.
 - **`verify` trying the node's own egress** (the server, the model gateway, the code hosts, a
   metadata service). It is planned in the agent: check it from the node yourself (below).
 - **An upgrade in place** of a node under running VMs: how the agent and the image of several nodes

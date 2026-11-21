@@ -132,6 +132,6 @@ A control host runs no Docker socket and no hypervisor: its user would otherwise
 ## What the roles do not do yet
 
 - The hardening of a node beyond the jail ([ADR-0113](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0113-levels-of-isolation-and-placement.md), decision 5): kernel lockdown, kernel modules disabled after boot, an AppArmor profile for the VMMs. It is not specified yet, and the host reports its nodes as not hardened.
-- A runner host and the node agent on one machine. The node agent refuses a control host on its own machine until that form has its own firewall.
+- A runner host and the node agent on one machine. That form is set aside and not built: the node agent refuses a control host on its own machine, so the control host runs on another machine.
 - A check from the node itself that it reaches nothing. Try it yourself after the play, as root on the node: a connection to the control host, to `1.1.1.1:443` and to `169.254.169.254:80` must each time out.
 - An upgrade of a node in place while VMs run. Replace its image instead.

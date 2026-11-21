@@ -87,7 +87,7 @@ tinfirm_sandbox_node_image_checksum: ""
 tinfirm_sandbox_node_address: "{{ ansible_facts['default_ipv4']['address'] | default('') }}"
 # The control host's IPv4 address, as the node sees its connections: the one source of
 # connections to the agent and to the published ports. Required. It must not be the node's own
-# address: the single machine is planned, and the helper refuses it.
+# address: the single machine is set aside (ADR-0112 decision 5), and the helper refuses it.
 tinfirm_sandbox_node_control_host: ""
 # The one IPv4 address the node admits to SSH: the operator's way in, and this play's. Required.
 # It may be the control host's; then a control host that is taken over reaches the node's SSH

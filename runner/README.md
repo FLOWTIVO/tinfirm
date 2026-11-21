@@ -1244,7 +1244,8 @@ C7 of the
 nodes**, machines that hold nothing, each with the node agent (`crates/tinfirm-node-agent`). The
 driver relays `verify`, `create`, `describe`, `delete` and `list` to each node agent's listener, over
 TLS with pinned certificates both ways, or over the listener's local socket when the agent runs on
-this host's own machine (a single machine, planned).
+this host's own machine (a single machine, which is set aside and not built: the node agent refuses
+a control host on its own machine).
 
 **Not ready for use yet.** The node agent's execution (its jail, network, disks and VMM) is built.
 VMs were made, described, listed and deleted on one KVM node through this driver over TLS, driven by
@@ -1255,8 +1256,7 @@ once, on 2026-11-20 (Ubuntu 24.04), with runs of this host's tests' stand-in age
 on the same day, conversations with real runtimes (Claude Code and PI, with a real model) ran
 through a node, in a Firecracker VM, with the sandbox's front confined (Landlock and seccomp).
 The node's hardening is built and has not run on a node: the Ansible role's tasks that set it up,
-the node agent's checks of it, and this host's reading of them. Still planned: the single machine
-(until its firewall is built, the node agent refuses a control host on its own machine) and the
+the node agent's checks of it, and this host's reading of them. Still planned: the
 published VM image. The Helm chart's runner pod has not run against a node. Here, the driver is
 tested against node agents with their fake backend.
 

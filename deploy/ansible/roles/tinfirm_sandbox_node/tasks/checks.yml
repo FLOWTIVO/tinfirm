@@ -95,8 +95,8 @@
       - tinfirm_sandbox_node_control_host not in (ansible_facts['all_ipv4_addresses'] | default([]))
     fail_msg: >-
       tinfirm_sandbox_node_control_host is an address of this node. A runner host and the node
-      agent on one machine is the single machine of ADR-0112 decision 5, which is planned: the
-      helper refuses it until its own firewall table is built.
+      agent on one machine is the single machine of ADR-0112 decision 5, which is set aside and not
+      built: the helper refuses it. Run the control host on another machine.
     quiet: true
 
 - name: Check the VMs' range

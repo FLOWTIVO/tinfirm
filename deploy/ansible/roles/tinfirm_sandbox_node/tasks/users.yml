@@ -1,6 +1,6 @@
 ---
 # The listener's user and its group of the same name. The helper is root; the VMs' users are
-# uids from vmUidBase without an account. With the single machine (planned) the runner host's
+# uids from vmUidBase without an account. With the single machine (set aside, ADR-0112 decision 5) the runner host's
 # user would be the third; a sandbox node has none.
 - name: Create the listener's group
   ansible.builtin.group:
