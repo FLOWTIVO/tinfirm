@@ -1,0 +1,80 @@
+---
+# The guest kernel: the one Kata Containers publishes, taken out of its static release. The
+# archive (about 1 GB) is downloaded only while the installed kernel is not the pinned one, and
+# removed once the kernel is in place.
+- name: Read the installed guest kernel
+  ansible.builtin.stat:
+    path: "{{ _tinfirm_sandbox_node_kernel }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: _tinfirm_sandbox_node_kernel_installed
+
+- name: Install the guest kernel
+  when: >-
+    not _tinfirm_sandbox_node_kernel_installed.stat.isreg | default(false)
+    or _tinfirm_sandbox_node_kernel_installed.stat.checksum != _tinfirm_sandbox_node_kernel_sha256
+  vars:
+    _dir: "{{ _tinfirm_sandbox_node_cache_dir }}/kernel"
+  block:
+    - name: Download Kata Containers' static release
+      ansible.builtin.get_url:
+        url: "{{ _tinfirm_sandbox_node_kernel_url }}"
+        dest: "{{ _tinfirm_sandbox_node_cache_dir }}/{{ tinfirm_sandbox_node_kernel_archive }}"
+        checksum: "{{ _tinfirm_sandbox_node_kernel_pins.archive }}"
+        mode: "0644"
+        timeout: 600
+
+    - name: Create the directory of the unpacked kernel
+      ansible.builtin.file:
+        path: "{{ _dir }}"
+        state: directory
+        mode: "0700"
+
+    # Only the kernel; `--no-anchored` matches the member with or without a leading "./".
+    - name: Take the kernel out of the archive
+      ansible.builtin.command:
+        argv:
+          - tar
+          - --zstd
+          - -xf
+          - "{{ _tinfirm_sandbox_node_cache_dir }}/{{ tinfirm_sandbox_node_kernel_archive }}"
+          - -C
+          - "{{ _dir }}"
+          - --no-same-owner
+          - --no-anchored
+          - "{{ _tinfirm_sandbox_node_kernel_pins.member }}"
+      changed_when: true
+
+    - name: Install the guest kernel
+      ansible.builtin.copy:
+        src: "{{ _dir }}/{{ _tinfirm_sandbox_node_kernel_pins.member }}"
+        dest: "{{ _tinfirm_sandbox_node_kernel }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0444"
+
+    - name: Remove the downloaded release
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _dir }}"
+        - "{{ _tinfirm_sandbox_node_cache_dir }}/{{ tinfirm_sandbox_node_kernel_archive }}"
+
+- name: Read the guest kernel as installed
+  ansible.builtin.stat:
+    path: "{{ _tinfirm_sandbox_node_kernel }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: _tinfirm_sandbox_node_kernel_now
+
+- name: Check the guest kernel against its checksum
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_kernel_now.stat.isreg | default(false)
+      - _tinfirm_sandbox_node_kernel_now.stat.checksum == _tinfirm_sandbox_node_kernel_sha256
+    fail_msg: >-
+      {{ _tinfirm_sandbox_node_kernel }} is not the kernel {{ _tinfirm_sandbox_node_kernel_pins.member }}
+      whose SHA-256 the role pins.
+    quiet: true

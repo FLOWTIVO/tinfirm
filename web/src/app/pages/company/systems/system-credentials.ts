@@ -379,7 +379,7 @@ export function withdrawalText(
                 </div>
                 @if (!c.bot) {
                   <div class="flex shrink-0 items-center gap-1">
-                    @if (c.enabled && c.status !== 'OK' && canReconnect()) {
+                    @if (c.enabled && c.status !== 'OK' && canReconnect() && c.kind !== 'APP') {
                       <button
                         hlmBtn
                         variant="outline"
@@ -634,7 +634,7 @@ export function withdrawalText(
 
     <ng-template #menu let-c>
       <hlm-dropdown-menu class="w-72">
-        @if (canReconnect()) {
+        @if (canReconnect() && c.kind !== 'APP') {
           <button
             hlmDropdownMenuItem
             type="button"
@@ -933,6 +933,7 @@ export class SystemCredentials {
   }
 
   protected reconnectLabel(credential: SystemCredential): string {
+    if (credential.kind === 'APP') return 'Add the installation again';
     if (this.reconnectsBySignIn(credential)) return 'Sign in again';
     return credential.kind === 'CLIENT' && takesClient(this.system())
       ? 'Store new client credentials'

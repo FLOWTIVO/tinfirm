@@ -159,9 +159,11 @@ tinfirm:
     # Limits handed to the runner host with every assignment.
     max-wall-clock: ${TINFIRM_RUN_MAX_WALL_CLOCK:PT60M}
     max-turns: ${TINFIRM_RUN_MAX_TURNS:200}
-    # An assigned run without run.accepted goes back to the queue after this; a rejected run waits this long.
+    # An assigned run without run.accepted goes back to the queue after this; a rejected run waits reject-backoff,
+    # twice as long after each further rejection in a row by the same host, at most reject-backoff-max.
     accept-timeout: ${TINFIRM_RUN_ACCEPT_TIMEOUT:PT10S}
     reject-backoff: ${TINFIRM_RUN_REJECT_BACKOFF:PT10S}
+    reject-backoff-max: ${TINFIRM_RUN_REJECT_BACKOFF_MAX:PT5M}
     # Stored events per run; LOG events are dropped first.
     max-events-per-run: ${TINFIRM_RUN_MAX_EVENTS_PER_RUN:20000}
     # Lifetime of one SSE stream of run events; the client reconnects with Last-Event-ID.

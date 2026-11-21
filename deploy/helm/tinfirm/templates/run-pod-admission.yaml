@@ -1,0 +1,252 @@
+{{- /*
+Rendered where the cluster serves admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy
+(Kubernetes 1.30 and later), which `helm install` and Argo CD see; `helm template` sees no
+cluster unless given --api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy.
+Where it is not rendered, the driver's dry runs find the hostile pods admitted, and the driver
+does not start.
+*/}}
+{{- if and .Values.runner.enabled (eq .Values.runner.vm.driver "pod") (eq .Values.runner.vm.cluster.admission "validatingAdmissionPolicy") (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+{{- include "tinfirm.runner.validate" . }}
+{{- $c := .Values.runner.vm.cluster }}
+{{- $p := .Values.runner.vm.pod }}
+{{- $image := include "tinfirm.runner.podImage" . }}
+{{- $sizes := list }}
+{{- range $p.templates }}{{ $sizes = append $sizes (printf "%dMi" (int .diskMib)) }}{{ end }}
+{{- $sizes = $sizes | uniq | sortAlpha }}
+# The admission policy for run pods (ADR-0115, decision 2). The driver may create pods in the
+# runs' namespace, and whoever may create a pod can mount any Secret of its namespace and name
+# any ServiceAccount there: RBAC alone is no boundary. Every pod of the namespace, whoever
+# creates or changes it, must be what the driver builds (spec.rs, `pod`): its name, the runs'
+# ServiceAccount, no token, a user namespace, no host namespace, no pull Secret, no ephemeral
+# container; as volumes only emptyDirs, its own ticket's Secret and, with disk.volume
+# `ephemeral`, one empty claim of the configured class and of a template's disk size; in every
+# container the image by digest, no Secret in the environment, no privilege, every capability
+# dropped, none added but NET_ADMIN in the init container of tap mode `init`, and no host
+# port; placed by the default scheduler on the workers for runs, off the runner pod's node. A
+# rule whose field is missing fails closed (failurePolicy Fail). The driver's own check creates
+# refused pods with dryRun at each check and starts no VM while one is admitted.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $c.namespace }}-pods
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      # pods/ephemeralcontainers: its object is the whole pod, with the new container.
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [pods, pods/ephemeralcontainers]
+  variables:
+    - name: containers
+      expression: >-
+        object.spec.containers
+        + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+    - name: ticket
+      expression: >-
+        object.metadata.name.startsWith('tinfirm-vm-')
+        ? 'tinfirm-ticket-' + object.metadata.name.substring(11) : ''
+  validations:
+    - expression: "object.metadata.name.matches('^tinfirm-vm-[0-9a-f]{32}$')"
+      message: "a run pod's name is tinfirm-vm- and 32 hex digits"
+    - expression: >-
+        has(object.spec.serviceAccountName)
+        && object.spec.serviceAccountName == '{{ $c.runServiceAccount }}'
+      message: "a run pod runs as the ServiceAccount {{ $c.runServiceAccount }}"
+    - expression: >-
+        has(object.spec.automountServiceAccountToken)
+        && object.spec.automountServiceAccountToken == false
+      message: "a run pod sets automountServiceAccountToken: false"
+    - expression: "has(object.spec.hostUsers) && object.spec.hostUsers == false"
+      message: "a run pod has a user namespace of its own (hostUsers: false)"
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork)
+        && !(has(object.spec.hostPID) && object.spec.hostPID)
+        && !(has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: "a run pod shares no namespace of its worker"
+    - expression: "!has(object.spec.imagePullSecrets) || object.spec.imagePullSecrets.size() == 0"
+      message: "a run pod names no pull Secret: the runs' namespace holds no Secret but the tickets"
+    - expression: "!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0"
+      message: "a run pod gets no ephemeral container"
+    - expression: >-
+        has(object.spec.volumes) && object.spec.volumes.all(v,
+        has(v.emptyDir)
+        {{- if eq $p.disk.volume "ephemeral" }} || has(v.ephemeral){{ end }}
+        || (has(v.secret) && has(v.secret.secretName) && v.secret.secretName == variables.ticket))
+      message: "a run pod's volumes are emptyDirs{{ if eq $p.disk.volume "ephemeral" }}, its disk's claim{{ end }} and its own ticket's Secret (tinfirm-ticket- and the pod's 32 hex digits), nothing else"
+    - expression: "has(object.spec.volumes) && object.spec.volumes.exists_one(v, has(v.secret))"
+      message: "a run pod has one Secret volume, its ticket's"
+    {{- if eq $p.disk.volume "ephemeral" }}
+    - expression: "object.spec.volumes.filter(v, has(v.ephemeral)).size() == 1"
+      message: "a run pod has one claim, its disk's"
+    - expression: >-
+        object.spec.volumes.all(v, !has(v.ephemeral)
+        || (!has(v.ephemeral.volumeClaimTemplate.spec.dataSource)
+        && !has(v.ephemeral.volumeClaimTemplate.spec.dataSourceRef)
+        && !has(v.ephemeral.volumeClaimTemplate.spec.volumeName)
+        && !has(v.ephemeral.volumeClaimTemplate.spec.selector)
+        && has(v.ephemeral.volumeClaimTemplate.spec.accessModes)
+        && v.ephemeral.volumeClaimTemplate.spec.accessModes == ['ReadWriteOnce']
+        && has(v.ephemeral.volumeClaimTemplate.spec.volumeMode)
+        && v.ephemeral.volumeClaimTemplate.spec.volumeMode == 'Filesystem'
+        && 'storage' in v.ephemeral.volumeClaimTemplate.spec.resources.requests
+        && {{ $sizes | toJson }}.exists(s,
+        quantity(v.ephemeral.volumeClaimTemplate.spec.resources.requests.storage).compareTo(quantity(s)) == 0)
+        {{- if $p.disk.storageClassName }}
+        && has(v.ephemeral.volumeClaimTemplate.spec.storageClassName)
+        && v.ephemeral.volumeClaimTemplate.spec.storageClassName == '{{ $p.disk.storageClassName }}'))
+        {{- else }}
+        && !has(v.ephemeral.volumeClaimTemplate.spec.storageClassName)))
+        {{- end }}
+      message: "a run pod's disk is an empty claim of its own (no dataSource, dataSourceRef, volumeName or selector), ReadWriteOnce, Filesystem, of a template's disk size ({{ $sizes | join ", " }}){{ with $p.disk.storageClassName }} and of the class {{ . }}{{ else }} and of the cluster's default class{{ end }}"
+    {{- end }}
+    # Placement: where the scheduler puts the pod, on the workers for runs, never beside the
+    # runner pod. The scheduler binds through pods/binding, which this policy does not see, and
+    # spec.nodeName cannot change in an update: the rule refuses it on CREATE alone.
+    - expression: >-
+        request.operation != 'CREATE' || !has(object.spec.nodeName) || object.spec.nodeName == ''
+      message: "a run pod names no node: the scheduler places it"
+    - expression: "!has(object.spec.schedulerName) || object.spec.schedulerName == 'default-scheduler'"
+      message: "a run pod is placed by the default scheduler"
+    - expression: >-
+        has(object.spec.nodeSelector) && object.spec.nodeSelector == {{ $p.nodeSelector | toJson }}
+      message: "a run pod's nodeSelector is runner.vm.pod.nodeSelector, the workers for runs"
+    # The API server adds the two tolerations of not-ready and unreachable nodes, NoExecute, with
+    # their tolerationSeconds, before this policy sees the pod; they decide only when a pod is
+    # evicted.
+    - expression: >-
+        !has(object.spec.tolerations) || object.spec.tolerations.all(t,
+        (has(t.key) && (t.key == 'node.kubernetes.io/not-ready' || t.key == 'node.kubernetes.io/unreachable')
+        && has(t.operator) && t.operator == 'Exists' && !has(t.value)
+        && has(t.effect) && t.effect == 'NoExecute')
+        {{- range $p.tolerations }}
+        || ({{ include "tinfirm.runs.tolerationRule" . }})
+        {{- end }})
+      message: "a run pod tolerates no taint but those of runner.vm.pod.tolerations and the API server's two defaults"
+    - expression: >-
+        has(object.spec.affinity) && has(object.spec.affinity.podAntiAffinity)
+        && has(object.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution)
+        && object.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.exists(t,
+        has(t.labelSelector) && has(t.labelSelector.matchLabels)
+        && t.labelSelector.matchLabels == {{ include "tinfirm.runner.selectorLabels" . | fromYaml | toJson }}
+        && !has(t.labelSelector.matchExpressions)
+        && has(t.namespaceSelector) && has(t.namespaceSelector.matchLabels)
+        && t.namespaceSelector.matchLabels == {{ dict "kubernetes.io/metadata.name" .Release.Namespace | toJson }}
+        && !has(t.namespaceSelector.matchExpressions)
+        && !has(t.matchLabelKeys) && !has(t.mismatchLabelKeys)
+        && t.topologyKey == 'kubernetes.io/hostname')
+      message: "a run pod keeps off the runner pod's node: the required anti-affinity against its labels in namespace {{ .Release.Namespace }}, by kubernetes.io/hostname"
+    - expression: "has(object.spec.affinity) && !has(object.spec.affinity.podAffinity)"
+      message: "a run pod has no pod affinity, which would draw it toward other pods"
+    # The runner pod's node is known to the driver alone: the policy lets a node affinity only
+    # exclude nodes by name, never draw the pod toward one.
+    - expression: >-
+        has(object.spec.affinity) && (!has(object.spec.affinity.nodeAffinity)
+        || (!has(object.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution)
+        && (!has(object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution)
+        || object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.all(term,
+        !has(term.matchExpressions) && has(term.matchFields)
+        && term.matchFields.all(f, f.key == 'metadata.name' && f.operator == 'NotIn')))))
+      message: "a run pod's node affinity only excludes nodes by name (metadata.name NotIn)"
+    - expression: >-
+        variables.containers.all(c,
+        (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)))
+        && (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef))))
+      message: "a run pod's containers take nothing from a Secret into their environment"
+    - expression: "variables.containers.all(c, has(c.image) && c.image == '{{ $image }}')"
+      message: "a run pod's containers run the image {{ $image }}"
+    - expression: >-
+        variables.containers.all(c, has(c.securityContext)
+        && has(c.securityContext.allowPrivilegeEscalation)
+        && c.securityContext.allowPrivilegeEscalation == false
+        && !(has(c.securityContext.privileged) && c.securityContext.privileged))
+      message: "a run pod's containers are not privileged and set allowPrivilegeEscalation: false"
+    - expression: >-
+        variables.containers.all(c, has(c.securityContext)
+        && has(c.securityContext.capabilities)
+        && has(c.securityContext.capabilities.drop)
+        && 'ALL' in c.securityContext.capabilities.drop)
+      message: "a run pod's containers drop every capability"
+    - expression: >-
+        object.spec.containers.all(c, !has(c.securityContext)
+        || !has(c.securityContext.capabilities)
+        || !has(c.securityContext.capabilities.add)
+        || c.securityContext.capabilities.add.size() == 0)
+      message: "a run pod's containers add no capability"
+    {{- if eq $p.tap.mode "init" }}
+    - expression: >-
+        !has(object.spec.initContainers) || object.spec.initContainers.all(c,
+        !has(c.securityContext) || !has(c.securityContext.capabilities)
+        || !has(c.securityContext.capabilities.add)
+        || c.securityContext.capabilities.add.all(a, a == 'NET_ADMIN'))
+      message: "a run pod's init container adds no capability but NET_ADMIN, which makes the tap"
+    {{- else }}
+    - expression: "!has(object.spec.initContainers) || object.spec.initContainers.size() == 0"
+      message: "a run pod has no init container: the network plugin hands it its tap (tap mode multus)"
+    {{- end }}
+    - expression: >-
+        variables.containers.all(c, !has(c.ports)
+        || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+      message: "a run pod opens no port of its worker"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $c.namespace }}-pods
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $c.namespace }}-pods
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $c.namespace }}
+---
+# The Secrets of the runs' namespace (ADR-0115, decision 2): only the runs' tickets, as the
+# driver makes them (spec.rs, `ticket_secret`): named tinfirm-ticket- and 32 hex digits,
+# Opaque, immutable, and owned by the run pod of the same digits, which the cluster deletes
+# them with. No other Secret, a ServiceAccount's token or a pull Secret neither.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $c.namespace }}-secrets
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [secrets]
+  validations:
+    - expression: "object.metadata.name.matches('^tinfirm-ticket-[0-9a-f]{32}$')"
+      message: "a Secret of the runs' namespace is a ticket: tinfirm-ticket- and 32 hex digits"
+    - expression: "has(object.type) && object.type == 'Opaque'"
+      message: "a ticket's Secret is of type Opaque"
+    - expression: "has(object.immutable) && object.immutable == true"
+      message: "a ticket's Secret is immutable"
+    - expression: >-
+        has(object.metadata.ownerReferences) && object.metadata.ownerReferences.exists(r,
+        r.kind == 'Pod' && r.name == 'tinfirm-vm-' + object.metadata.name.substring(15))
+      message: "a ticket's Secret is owned by its run pod, which the cluster deletes it with"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $c.namespace }}-secrets
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $c.namespace }}-secrets
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $c.namespace }}
+{{- end }}

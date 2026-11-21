@@ -39,6 +39,7 @@ import {
 } from '../../../shared/run-status';
 import { formatDay, Time } from '../../../shared/time';
 import { WhoActsWhoPays } from '../../../shared/who-acts-who-pays';
+import { placementText } from '../../../shared/runner-hosts/isolation-view';
 import { RunRepositories } from './run-repositories';
 import { Transcript } from './transcript';
 
@@ -161,6 +162,12 @@ import { Transcript } from './transcript';
               <div data-testid="run-host">
                 <dt>Runner host</dt>
                 <dd>{{ host }}{{ r.runnerHostKind ? ', ' + hostKinds[r.runnerHostKind] : '' }}</dd>
+              </div>
+            }
+            @if (placement(); as p) {
+              <div data-testid="run-placement">
+                <dt>Isolation</dt>
+                <dd>{{ p }}</dd>
               </div>
             }
             @if (session(); as s) {
@@ -386,6 +393,11 @@ export class RunPage {
     return r ? runDuration(r.startedAt, r.finishedAt) : null;
   });
   protected readonly failureLabel = computed(() => failureClassLabel(this.run()?.failureClass));
+  /** The level its host was placed at, and why it ran there (ADR-0113). */
+  protected readonly placement = computed(() => {
+    const r = this.run();
+    return r ? placementText(r.isolationLevel, r.placementNote) : null;
+  });
   protected readonly session = computed(() => {
     const r = this.run();
     return r ? resumeText(r) : null;

@@ -1,0 +1,47 @@
+commit: ae1f5093491dee687219f48dd67888399b9d764a
+$ deploy/release/assets.sh build-id rolling-test1234
+1.0.0-rc.2-SNAPSHOT+rolling-test1234
+$ deploy/release/assets.sh runner-linux x86_64-unknown-linux-musl rolling-test1234 /tmp/assets
+exit 0, 330 s
+#17 exporting to client directory
+#17 copying files 27.77MB 0.1s done
+#17 DONE 0.1s
+/tmp/assets/tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+/tmp/assets/tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+-rw-r--r--  1 root      root      2213590 Nov 19 22:42 tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+-rw-r--r--  1 root      root      9335962 Nov 19 22:42 tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+the build's last lines:
+#17 copying files 27.77MB 0.1s done
+#17 DONE 0.1s
+/tmp/assets/tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+/tmp/assets/tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+
+$ sha256sum tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+4e8df560c43731ac364f82ae16dc4ef081e31bf48409d9192081d4d325bec6b2  tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+$ tar -tvzf tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+drwxr-xr-x 0/0               0 2026-11-19 22:33 tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl/
+-rw-r--r-- 0/0            1890 2026-11-19 22:33 tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl/LICENSE
+-rw-r--r-- 0/0          250754 2026-11-19 22:33 tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl/THIRD-PARTY-LICENSES.txt
+-rwxr-xr-x 0/0         4727120 2026-11-19 22:33 tinfirm-node-agent-rolling-test1234-x86_64-unknown-linux-musl/tinfirm-node-agent
+$ file tinfirm-node-agent
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+$ tinfirm-node-agent --version
+tinfirm-node-agent 1.0.0-rc.2-SNAPSHOT+rolling-test1234
+
+$ sha256sum tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+25c3e5bff40ad75f3ed3935c442412560b3ec447f5822e8800c287f96450f7d6  tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+$ tar -tvzf tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl.tar.gz
+drwxr-xr-x 0/0               0 2026-11-19 22:33 tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl/
+-rw-r--r-- 0/0            1890 2026-11-19 22:33 tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl/LICENSE
+-rw-r--r-- 0/0          250754 2026-11-19 22:33 tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl/THIRD-PARTY-LICENSES.txt
+drwxr-xr-x 0/0               0 2026-11-19 22:33 tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl/ee/
+-rw-r--r-- 0/0            3575 2026-11-19 22:33 tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl/ee/LICENSE
+-rwxr-xr-x 0/0        23037312 2026-11-19 22:33 tinfirm-runner-host-rolling-test1234-x86_64-unknown-linux-musl/tinfirm-runner-host
+$ file tinfirm-runner-host
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+$ tinfirm-runner-host --version
+tinfirm-runner-host 1.0.0-rc.2-SNAPSHOT (rolling-test1234)
+
+any path with ee/ in either archive: 2
+$ strings tinfirm-node-agent | grep -c 'ee/runner'
+0

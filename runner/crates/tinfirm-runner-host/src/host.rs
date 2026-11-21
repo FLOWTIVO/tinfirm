@@ -13,9 +13,9 @@ use tinfirm_protocol::{
     AssignedCredential, CredentialKind, CredentialState, CredentialStatus, ErrorMessage,
     Executor as ExecutorKind, Hello, IsolationTier, MAX_WORKSPACES, Message, ModelAccess,
     PslUpdate, PublicSuffixListVersion, RequestKind, RunAccepted, RunAsk, RunAskAck, RunAssign,
-    RunCancel, RunRef, RunRejected, RunRepositoryRequest, RunRequest, RunRequestAck, RunSteer,
-    RunTaskCreate, RunTaskCreateAck, Runtime, RuntimeInfo, WorkspaceSpec, feature,
-    is_valid_workspace_dir, reject_code,
+    RunCancel, RunGitRevoke, RunGitRevoked, RunRef, RunRejected, RunRepositoryRequest, RunRequest,
+    RunRequestAck, RunSteer, RunTaskCreate, RunTaskCreateAck, Runtime, RuntimeInfo, WorkspaceSpec,
+    feature, is_valid_workspace_dir, reject_code,
 };
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -30,6 +30,7 @@ use crate::credentials::CredentialStore;
 use crate::docker;
 use crate::egress_proxy::{EgressProxy, EgressSettings, Rule};
 use crate::git_proxy::{self, GitProxy};
+use crate::git_tokens::RunGitTokens;
 use crate::homes::SessionHomes;
 use crate::images;
 use crate::maintenance;
@@ -107,9 +108,16 @@ pub struct HostOptions {
     /// run's credentials leave the sandbox's settings. `None`: the host attaches to the
     /// adapter's stdio.
     pub bridge: Option<crate::bridge::BridgeOptions>,
-    /// The VM executor's pool of ready VMs (crate::pool, ADR-0098): the operator's ceilings
-    /// and its tuning (`run --pool-*`). Other executors have no pool.
-    pub pool: crate::pool::PoolOptions,
+    /// Ready VMs of the VM executor (crate::ready_vms, paid, ADR-0098, ADR-0114): the
+    /// operator's ceilings and the tuning (`run --pool-*`). With `max_ready` 0, the default,
+    /// the host keeps no VM ready and every run starts cold. Other executors have none.
+    pub ready_vms: crate::ready_vms::ReadyVmOptions,
+    /// The operator's statement of the level of isolation (`run --isolation-level`,
+    /// `--isolation-hardened`, ADR-0113), for a VM driver of their own; `None`: none.
+    pub isolation_stated: Option<crate::isolation::Stated>,
+    /// A VM that came up this long before a run claims it is probed again then
+    /// ([`crate::pool::REPROBE_AFTER`]; no flag sets it).
+    pub vm_reprobe_after: Duration,
     /// The largest file an upload reads (`save_artifact`, `upload_attachment`, `/output`):
     /// `run --upload-max-bytes`, by default the server's own default limit (25 MiB). A larger
     /// file is refused on its size before it is read.
@@ -117,6 +125,10 @@ pub struct HostOptions {
     /// `hello.runnerVersion`: the release's version ([`crate::version::RUNNER_VERSION`]),
     /// which the server shows and decides nothing from (ADR-0109).
     pub runner_version: String,
+    /// `run --push-client`: which client pushes a run's work (crate::git_push). `git`, the
+    /// default, is `git push` with the run's token in its environment; `host` is the runner
+    /// host's own receive-pack client, which has been checked against no code host yet.
+    pub push_client: crate::git_push::PushClient,
 }
 
 impl HostOptions {
@@ -148,9 +160,20 @@ impl HostOptions {
             tool_request_timeout: TOOL_REQUEST_TIMEOUT,
             maintenance: maintenance::Settings::from_env(),
             bridge: None,
-            pool: crate::pool::PoolOptions::default(),
+            ready_vms: crate::ready_vms::ReadyVmOptions::default(),
+            vm_reprobe_after: crate::pool::REPROBE_AFTER,
+            isolation_stated: None,
             upload_max_bytes: crate::attachments::DEFAULT_UPLOAD_MAX_BYTES,
             runner_version: crate::version::RUNNER_VERSION.to_string(),
+            push_client: crate::git_push::PushClient::Git,
+        }
+    }
+
+    /// How this host pushes ([`crate::git::Git::push_with`]).
+    pub fn push_settings(&self) -> crate::git_push::PushSettings {
+        crate::git_push::PushSettings {
+            client: self.push_client,
+            allow_http: self.allow_insecure_repo_urls,
         }
     }
 
@@ -167,10 +190,26 @@ impl HostOptions {
             .unwrap_or_else(|| images::default_image(runtime).to_string())
     }
 
-    /// Whether every run starts from the multi-runtime image: the VM executor's pool with
+    /// Whether every run starts from the multi-runtime image: the VM executor with
     /// `--pool-runtime any` (ADR-0101).
     pub fn multi_runtime_image(&self) -> bool {
-        self.pool.multi_runtime && matches!(self.executor, Executor::Vm(_))
+        self.ready_vms.multi_runtime && matches!(self.executor, Executor::Vm(_))
+    }
+
+    /// The level of isolation the host reports (crate::isolation, ADR-0113): derived from
+    /// its executor (with Docker, its runtime; with `--vm-driver node`, its nodes'
+    /// configuration), or the operator's statement for a VM driver of their own. An error when
+    /// the statement contradicts what the host can see, or the node driver's configuration
+    /// cannot be read or is refused.
+    pub fn isolation(&self) -> Result<crate::isolation::Reported, String> {
+        crate::isolation::Sandboxes::of(&self.executor, &self.sandbox)
+            .and_then(|sandboxes| crate::isolation::derive(sandboxes, self.isolation_stated))
+    }
+
+    /// Whether the host keeps ready VMs (crate::ready_vms): the VM executor with
+    /// `--pool-max-ready` above 0.
+    pub fn keeps_ready_vms(&self) -> bool {
+        self.ready_vms.max_ready > 0 && matches!(self.executor, Executor::Vm(_))
     }
 
     /// The command the host names for a run of `runtime`: its adapter, for the multi-runtime
@@ -262,6 +301,31 @@ const DRAIN_POLL: Duration = Duration::from_millis(200);
 const DRAINING_REASON: &str =
     "the runner host is draining: it finishes its active runs and then restarts";
 
+/// Where the current connection's answer to the hello is (ADR-0116, decision 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloAnswer {
+    /// No connection, or no `welcome` yet.
+    NotConnected,
+    /// `welcome` came; `revokes`: the server lists `run.git.revoke` in `welcome.features`, so
+    /// it sends `welcome.done` after every pending revocation of the runs the hello listed.
+    Welcomed { revokes: bool },
+    /// `welcome.done` came.
+    Done,
+}
+
+impl HelloAnswer {
+    /// Whether a run taken back may use its git tokens and push now: this process has been
+    /// welcomed, and the server sent every revocation it keeps for the run (`welcome.done`), or
+    /// it is an older one, which keeps none. There is no time after which a run goes on
+    /// without it.
+    pub fn complete(self) -> bool {
+        matches!(
+            self,
+            HelloAnswer::Done | HelloAnswer::Welcomed { revokes: false }
+        )
+    }
+}
+
 /// Why a run is asked to stop from outside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopRequest {
@@ -282,6 +346,11 @@ struct RunEntry {
     stop: watch::Sender<Option<StopRequest>>,
     /// The execution's `run.steer`s, for its agent session.
     steering: Arc<Steering>,
+    /// The execution's git tokens, which a `run.git.revoke` drops (ADR-0116).
+    git_tokens: Arc<RunGitTokens>,
+    /// `run.git.revoked` frames of a run still being admitted, which has no queue in the
+    /// outbox yet: [`Shared::admit`] queues them after its `run.accepted`.
+    unqueued_revoked: Vec<RunGitRevoked>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -317,6 +386,9 @@ pub struct Shared {
     run_secrets: Mutex<HashMap<(Uuid, i64), Vec<String>>>,
     /// Git proxy secrets of active runs: redacted, but no credentials.
     run_masked: Mutex<HashMap<(Uuid, i64), Vec<String>>>,
+    /// The git tokens of runs taken back that their records keep as salted hashes alone
+    /// (crate::secret_hashes): redacted and scanned for as credentials.
+    run_hashed: Mutex<HashMap<(Uuid, i64), Arc<crate::secret_hashes::HashedMatcher>>>,
     /// The fetch-only git proxy and platform MCP listener, started by the first run.
     git_proxy: tokio::sync::Mutex<Option<GitProxy>>,
     /// The sandbox bridge's listener (ADR-0095), started by the first run with `opts.bridge`.
@@ -327,6 +399,20 @@ pub struct Shared {
     model_proxy: tokio::sync::Mutex<Option<Arc<ModelProxy>>>,
     /// The VM executor's pool (crate::pool): every VM of its runs comes from it.
     pool: Option<Arc<crate::pool::Pool>>,
+    /// The pool's ready VMs (crate::ready_vms), with `--pool-max-ready` above 0.
+    ready_vms: Option<Arc<crate::ready_vms::ReadyVms>>,
+    /// What the host's level of isolation is derived from (crate::isolation), read once at
+    /// its start: the node driver's configuration is read then. Each hello derives the level
+    /// from it, with the node driver's hardening as the VM executor knows it at that time
+    /// ([`Shared::isolation`]). `None`: the level was an error at the start, which `run`
+    /// refuses before it starts; such a host reports `container`.
+    sandboxes: Option<crate::isolation::Sandboxes>,
+    /// The node driver's hardening mark that the last hello carried; `None` when it carried
+    /// none (protocol 1, or no node driver).
+    hello_mark: Mutex<Option<crate::vm::Mark>>,
+    /// Counts the times the host asked for a new hello, which the connection makes by a
+    /// reconnect: the node driver's hardening mark changed ([`tell_hardening`]).
+    rehello: watch::Sender<u64>,
     /// The Public Suffix List the server sent (`psl.update`), if the host holds one.
     public_suffix: Arc<PublicSuffixStore>,
     /// Bare mirrors of the task repositories.
@@ -342,6 +428,11 @@ pub struct Shared {
     platform_requests: Mutex<HashMap<Uuid, PendingRequest>>,
     /// Between `welcome` and the end of that connection.
     connected: AtomicBool,
+    /// Where the current connection's answer to the hello is (ADR-0116): set at each
+    /// `welcome` and by `welcome.done`, cleared at a disconnect.
+    welcome_done: watch::Sender<HelloAnswer>,
+    /// Whether the current connection's server takes `host.health` (ADR-0117).
+    pub server_takes_health: crate::health::ServerTakesHealth,
     heartbeat_secs: AtomicU64,
     lease_ttl_secs: AtomicU64,
     runner_host_id: Mutex<Option<Uuid>>,
@@ -351,6 +442,10 @@ pub struct Shared {
     /// such an error names the stale epoch.
     stale_hints: Mutex<HashMap<Uuid, std::time::Instant>>,
     shutting_down: AtomicBool,
+    /// Sandboxes of runs taken back that hold work the take-back record cannot yet call
+    /// collected, left for the next start of the host: kept until this process ends, so that
+    /// their sessions are not ended and their bridges wait for the next process.
+    left_sandboxes: Mutex<Vec<crate::sandbox::Sandbox>>,
     /// Set by the connection after each welcome; tests read it.
     pub connections: AtomicU64,
 }
@@ -371,16 +466,29 @@ impl Shared {
             Vec::new()
         });
         let mut capacity = Capacity::new(opts.max_concurrent_runs, &startup_credentials);
-        if matches!(opts.executor, Executor::Vm(_)) {
-            capacity = capacity.with_pool(opts.pool.max_ready);
+        if opts.keeps_ready_vms() {
+            capacity = capacity.with_pool(opts.ready_vms.max_ready);
         }
         let outbox = Arc::new(Outbox::with_retention(opts.finished_retention));
-        let pool = match &opts.executor {
-            Executor::Vm(vms) => Some(crate::pool::Pool::new(
-                vms.clone(),
-                opts.pool.clone(),
-                crate::pool::Shape::for_runtime(&opts, opts.pool.runtime),
-            )),
+        // A statement that contradicts what the host sees is an error whatever the nodes'
+        // hardening, so the start's derivation tells for every later one.
+        let sandboxes = crate::isolation::Sandboxes::of(&opts.executor, &opts.sandbox)
+            .and_then(|sandboxes| {
+                crate::isolation::derive(sandboxes, opts.isolation_stated).map(|_| sandboxes)
+            })
+            .map_err(|e| {
+                tracing::warn!(error = %e, "this host reports the level of isolation `container`");
+            })
+            .ok();
+        let ready_vms = opts.keeps_ready_vms().then(|| {
+            crate::ready_vms::ReadyVms::new(
+                opts.ready_vms.clone(),
+                crate::pool::Shape::for_runtime(&opts, opts.ready_vms.runtime),
+            )
+        });
+        let pool = match (&opts.executor, &ready_vms) {
+            (Executor::Vm(vms), Some(ready_vms)) => Some(ready_vms.pool(vms.clone())),
+            (Executor::Vm(vms), None) => Some(crate::pool::Pool::new(vms.clone(), None)),
             _ => None,
         };
         let shared = Arc::new(Shared {
@@ -394,6 +502,8 @@ impl Shared {
             platform_requests: Mutex::new(HashMap::new()),
             public_suffix: Arc::new(PublicSuffixStore::load(&opts.paths)),
             connected: AtomicBool::new(false),
+            welcome_done: watch::Sender::new(HelloAnswer::NotConnected),
+            server_takes_health: Default::default(),
             opts,
             config,
             outbox,
@@ -403,17 +513,23 @@ impl Shared {
             redactor: RwLock::new(Arc::new(Redactor::default())),
             run_secrets: Mutex::new(HashMap::new()),
             run_masked: Mutex::new(HashMap::new()),
+            run_hashed: Mutex::new(HashMap::new()),
             git_proxy: tokio::sync::Mutex::new(None),
             bridge: tokio::sync::Mutex::new(None),
             egress_proxy: tokio::sync::Mutex::new(None),
             model_proxy: tokio::sync::Mutex::new(None),
             pool,
+            ready_vms,
+            sandboxes,
+            hello_mark: Mutex::new(None),
+            rehello: watch::Sender::new(0),
             heartbeat_secs: AtomicU64::new(10),
             lease_ttl_secs: AtomicU64::new(30),
             runner_host_id: Mutex::new(state.runner_host_id),
             state_file,
             stale_hints: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            left_sandboxes: Mutex::new(Vec::new()),
             connections: AtomicU64::new(0),
         });
         shared.refresh_redactor();
@@ -438,7 +554,8 @@ impl Shared {
             secrets.extend(values.iter().cloned());
         }
         let masked: Vec<String> = lock(&self.run_masked).values().flatten().cloned().collect();
-        let redactor = Arc::new(Redactor::with_masked(secrets, masked));
+        let hashed = lock(&self.run_hashed).values().cloned().collect();
+        let redactor = Arc::new(Redactor::with_masked(secrets, masked).with_hashed(hashed));
         *self.redactor.write().unwrap_or_else(|e| e.into_inner()) = redactor;
     }
 
@@ -460,9 +577,35 @@ impl Shared {
         self.refresh_redactor();
     }
 
+    /// The redactor of a run's bulk scans (its outgoing commits, its session bundle, its
+    /// `/output`): every credential by value, as [`Shared::redactor`] has them, and of the
+    /// hashed ones only those of `run_id`'s execution `epoch`. The hashes stand for that
+    /// execution's earlier tokens, which no other run's sandbox ever had; and each run's hashes
+    /// cost a pass of their own, so a scan with every run's would cost as many passes as there
+    /// are runs taken back. The execution is named exactly: a newer epoch of a run may replace
+    /// a copy this host still ends, and each scans with its own hashes.
+    pub fn run_redactor(&self, run_id: Uuid, epoch: i64) -> Arc<Redactor> {
+        let own = lock(&self.run_hashed).get(&(run_id, epoch)).cloned();
+        Arc::new(self.redactor().with_only_hashed(own))
+    }
+
+    /// The tokens a run taken back held before its restart, known by their salted hashes alone
+    /// (crate::secret_hashes): from now on until the run ends they are redacted and scanned for
+    /// as its other credentials are.
+    pub fn add_run_hashed(
+        &self,
+        run_id: Uuid,
+        epoch: i64,
+        hashed: Arc<crate::secret_hashes::HashedMatcher>,
+    ) {
+        lock(&self.run_hashed).insert((run_id, epoch), hashed);
+        self.refresh_redactor();
+    }
+
     fn remove_run_secrets(&self, run_id: Uuid, epoch: i64) {
         lock(&self.run_secrets).remove(&(run_id, epoch));
         lock(&self.run_masked).remove(&(run_id, epoch));
+        lock(&self.run_hashed).remove(&(run_id, epoch));
         self.refresh_redactor();
     }
 
@@ -476,20 +619,8 @@ impl Shared {
         if let Some(proxy) = slot.as_ref() {
             return Ok(Some(proxy.clone()));
         }
-        let Some(endpoint) = git_proxy::endpoint(
-            &self.opts.executor,
-            self.opts.sandbox_network.as_deref(),
-            &self.opts.git_proxy,
-        )
-        .await?
-        else {
+        let Some(endpoint) = self.proxies_endpoint().await? else {
             return Ok(None);
-        };
-        // With the bridge, the sandboxes reach the listeners only through their tunnels.
-        let endpoint = if self.opts.bridge.is_some() {
-            crate::bridge::listeners_endpoint(self.sandbox_shares_host_network())
-        } else {
-            endpoint
         };
         let proxy = GitProxy::start(endpoint, self.opts.allow_insecure_repo_urls).await?;
         tracing::info!(
@@ -501,43 +632,20 @@ impl Shared {
         Ok(Some(proxy))
     }
 
-    /// Whether a sandbox shares this machine's network namespace: the local test executor (and
-    /// the VM executor's test mode), or Docker's `host` network.
-    fn sandbox_shares_host_network(&self) -> bool {
-        self.opts.executor.on_this_machine() || self.opts.sandbox_network.as_deref() == Some("host")
+    /// The git proxy's shared listener, if it was started; never starts it.
+    pub async fn started_git_proxy(&self) -> Option<GitProxy> {
+        self.git_proxy.lock().await.clone()
     }
 
-    /// The sandbox bridge's listener, started on first use where the sandboxes reach this host
-    /// (the sandbox network's gateway), on a port the system picks. The git proxy's and the
-    /// other listeners then bind loopback ([`crate::bridge::listeners_endpoint`]). `Ok(None)`
-    /// without `opts.bridge`, or when the sandboxes have no network.
-    pub async fn bridge(&self) -> Result<Option<BridgeListener>> {
-        Ok(self
-            .start_bridge(Vec::new())
-            .await?
-            .map(|(listener, _)| listener))
+    /// The sandbox bridge's shared listener, if it was started; never starts it.
+    pub async fn started_bridge(&self) -> Option<BridgeListener> {
+        self.bridge.lock().await.clone()
     }
 
-    /// The bridge listener, started on first use. Its identity and port are kept with the
-    /// runs' records, for the next process of this host (ADR-0101). With `reclaim`, the
-    /// sessions of the runs that this host takes back after a restart: the listener starts
-    /// with the identity and on the port that the process before had, which their bridges pin
-    /// and dial, and their registrations come back in order.
-    async fn start_bridge(
-        &self,
-        reclaim: Vec<(String, tinfirm_bridge::control::Hidden)>,
-    ) -> Result<Option<(BridgeListener, Vec<tinfirm_bridge::host::Registration>)>> {
-        let Some(options) = &self.opts.bridge else {
-            return Ok(None);
-        };
-        let mut slot = self.bridge.lock().await;
-        if let Some(listener) = slot.as_ref() {
-            anyhow::ensure!(
-                reclaim.is_empty(),
-                "the sandbox bridge listens already; runs are taken back before it starts"
-            );
-            return Ok(Some((listener.clone(), Vec::new())));
-        }
+    /// Where the proxies' listeners bind and how a sandbox names them, without binding any:
+    /// with the bridge, this machine's loopback, which a sandbox reaches only through its
+    /// tunnels. `Ok(None)` when the sandboxes have no network.
+    pub async fn proxies_endpoint(&self) -> Result<Option<git_proxy::Endpoint>> {
         let Some(endpoint) = git_proxy::endpoint(
             &self.opts.executor,
             self.opts.sandbox_network.as_deref(),
@@ -547,12 +655,88 @@ impl Shared {
         else {
             return Ok(None);
         };
-        let kept = if reclaim.is_empty() {
-            None
+        // With the bridge, the sandboxes reach the listeners only through their tunnels.
+        Ok(Some(if self.opts.bridge.is_some() {
+            crate::bridge::listeners_endpoint(self.sandbox_shares_host_network())
         } else {
-            self.records.listener()
+            endpoint
+        }))
+    }
+
+    /// Where a sandbox's bridge listener binds, and how the sandbox names it: the sandbox
+    /// network's gateway (or what `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` say). `Ok(None)`
+    /// when the sandboxes have no network.
+    pub async fn bridge_endpoint(&self) -> Result<Option<git_proxy::Endpoint>> {
+        git_proxy::endpoint(
+            &self.opts.executor,
+            self.opts.sandbox_network.as_deref(),
+            &self.opts.git_proxy,
+        )
+        .await
+    }
+
+    /// The address a sandbox's bridge connects from, as this host sees it, where it can tell
+    /// one sandbox from another: the local executor's processes connect from loopback, and a
+    /// Docker container on the sandbox network from its own address on it (`network`), when
+    /// the bridge listens on that network's gateway. `None` where every sandbox comes from one
+    /// address (Docker Desktop, the host's network, a listener address of the operator's own):
+    /// there the front takes a connection from any address, and `run` decides by the run's
+    /// ticket alone.
+    pub fn bridge_peer(&self, endpoint: &git_proxy::Endpoint) -> crate::sandbox::BridgePeer {
+        use crate::sandbox::BridgePeer;
+        match &self.opts.executor {
+            Executor::Local { .. } => BridgePeer::Loopback,
+            Executor::Docker(_)
+                if !endpoint.bind.ip().is_loopback()
+                    && self.opts.git_proxy.bind.is_none()
+                    && self.opts.sandbox_network.as_deref() != Some("host") =>
+            {
+                BridgePeer::Container(
+                    self.opts
+                        .sandbox_network
+                        .clone()
+                        .unwrap_or_else(|| "bridge".to_string()),
+                )
+            }
+            _ => BridgePeer::Any,
+        }
+    }
+
+    /// Whether a sandbox shares this machine's network namespace: the local test executor (and
+    /// the VM executor's test mode), or Docker's `host` network.
+    fn sandbox_shares_host_network(&self) -> bool {
+        self.opts.executor.on_this_machine() || self.opts.sandbox_network.as_deref() == Some("host")
+    }
+
+    /// The sandbox bridge's shared listener, which serves only the runs of records of the
+    /// version before each sandbox's bridge was its front's ([`crate::bridge::BridgeListener`]):
+    /// started where the sandboxes reach this host (the sandbox network's gateway), with the
+    /// identity and on the port that the process before kept with its records (ADR-0101), which
+    /// the bridges of `reclaim`'s runs pin and dial. Their registrations come back in order. Its
+    /// identity and port are kept again, for the next process of this host. `Ok(None)` without
+    /// `opts.bridge`, or when the sandboxes have no network.
+    async fn start_bridge(
+        &self,
+        reclaim: Vec<(String, tinfirm_bridge::control::Hidden)>,
+    ) -> Result<Option<(BridgeListener, Vec<tinfirm_bridge::host::Registration>)>> {
+        let Some(options) = &self.opts.bridge else {
+            return Ok(None);
         };
-        let (identity, port) = match kept {
+        let mut slot = self.bridge.lock().await;
+        anyhow::ensure!(
+            slot.is_none(),
+            "the sandbox bridge listens already; runs are taken back before it starts"
+        );
+        let Some(endpoint) = git_proxy::endpoint(
+            &self.opts.executor,
+            self.opts.sandbox_network.as_deref(),
+            &self.opts.git_proxy,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let (identity, port) = match self.records.listener() {
             Some(kept) => kept,
             None => (tinfirm_bridge::tls::Identity::generate()?, 0),
         };
@@ -589,11 +773,7 @@ impl Shared {
             sandbox_host = %endpoint.sandbox_host,
             "sandbox bridge listening"
         );
-        let listener = BridgeListener {
-            server,
-            sandbox_host: endpoint.sandbox_host,
-            extra_hosts: endpoint.extra_hosts,
-        };
+        let listener = BridgeListener { server };
         *slot = Some(listener.clone());
         Ok(Some((listener, registrations)))
     }
@@ -611,6 +791,18 @@ impl Shared {
         let mut held = Vec::new();
         for record in std::mem::take(&mut records) {
             let run_id = record.run_id();
+            if record.collected {
+                // Its work came back from the sandbox before an earlier restart: only the push
+                // and the report are left, from this host's disk (ADR-0116, decision 10).
+                if self.opts.paths.workspace(run_id).is_dir() {
+                    tracing::info!(%run_id, epoch = record.assign.epoch, "taking back a run whose work this host holds; it waits for the server before it pushes");
+                    self.spawn_taken_back(record, None);
+                } else {
+                    tracing::warn!(%run_id, "a run of the process before this one cannot be taken back: its work is no longer on this host");
+                    self.records.remove(run_id);
+                }
+                continue;
+            }
             let sandbox = if self.opts.bridge.is_none() {
                 Err(anyhow::anyhow!(
                     "this host runs no agent over the sandbox bridge now"
@@ -623,6 +815,25 @@ impl Shared {
                 Err(e) => {
                     tracing::warn!(%run_id, error = %format!("{e:#}"), "a run of the process before this one cannot be taken back");
                     self.records.remove(run_id);
+                }
+            }
+        }
+        // A run whose sandbox's front held its bridge comes back through a new front, with the
+        // identity, the port and the peer that its record keeps.
+        let (fronted, held): (Vec<_>, Vec<_>) = held
+            .into_iter()
+            .partition(|(record, _)| record.bridge.is_some());
+        for (record, sandbox) in fronted {
+            let run_id = record.run_id();
+            match self.register_front_again(&record).await {
+                Ok(registration) => {
+                    tracing::info!(%run_id, epoch = record.assign.epoch, "taking back a run of the process before this one, through a new front");
+                    self.spawn_taken_back(record, Some((sandbox, registration)));
+                }
+                Err(e) => {
+                    tracing::warn!(%run_id, error = %format!("{e:#}"), "a run of the process before this one cannot be taken back");
+                    self.records.remove(run_id);
+                    sandbox.discard(Duration::from_secs(5)).await;
                 }
             }
         }
@@ -654,57 +865,135 @@ impl Shared {
             return;
         }
         for ((record, sandbox), registration) in held.into_iter().zip(registrations) {
-            let (run_id, epoch) = (record.run_id(), record.assign.epoch);
-            if let crate::takeback::SandboxRecord::Vm { address, .. } = &record.sandbox
+            if let crate::takeback::SandboxRecord::Vm { address, port, .. } = &record.sandbox
                 && let Executor::Vm(vms) = &self.opts.executor
             {
-                // The VM's bridge listens: this host dials it, as it did before.
-                registration.dial(git_proxy::host_port(address, vms.options.port));
+                // The VM's bridge listens: this host dials it, as it did before, at the port the
+                // driver named, or at `--vm-port` for a record without one.
+                registration.dial(git_proxy::host_port(
+                    address,
+                    port.unwrap_or(vms.options.port),
+                ));
             }
-            tracing::info!(%run_id, epoch, "taking back a run of the process before this one");
-            let (stop_tx, stop_rx) = watch::channel(None);
-            let steering = Steering::new(run_id, epoch, self.outbox.clone());
-            lock(&self.runs).insert(
-                run_id,
-                RunEntry {
-                    epoch,
-                    task_id: record.assign.work_item().id,
-                    credential_label: record.assign.credential_label.clone(),
-                    stop: stop_tx,
-                    steering: steering.clone(),
-                    handle: None,
-                },
+            tracing::info!(run_id = %record.run_id(), epoch = record.assign.epoch, "taking back a run of the process before this one");
+            self.spawn_taken_back(
+                record,
+                Some((sandbox, crate::sandbox::Registered::Shared(registration))),
             );
-            self.outbox.resume_run(run_id, epoch, record.seq_floor);
-            let shared = self.clone();
-            let handle = tokio::spawn(async move {
-                let finished =
-                    run::take_back(&shared, record, sandbox, registration, stop_rx).await;
-                steering.close("the run ended");
-                match finished {
-                    Some(finished) => {
-                        tracing::info!(%run_id, outcome = ?finished.outcome, class = ?finished.failure_class, "run taken back and finished");
-                        shared.outbox.push_finished(finished);
-                    }
-                    None => {
-                        tracing::info!(%run_id, epoch, "run taken back and aborted (stale epoch)");
-                        shared.outbox.drop_run(run_id, epoch);
+        }
+    }
+
+    /// What the record of a run taken back keeps of its bridge in a front, if any: its identity,
+    /// and its listener, or, for a VM's bridge, which listens, where this host dials it: where
+    /// the record's sandbox says, at the port the driver named, or at `--vm-port` for a record
+    /// without one.
+    pub(crate) fn kept_bridge(
+        &self,
+        record: &crate::takeback::RunRecord,
+    ) -> Option<Result<crate::sandbox::BridgeKeep>> {
+        let dial = match (&record.sandbox, &self.opts.executor) {
+            (crate::takeback::SandboxRecord::Vm { address, port, .. }, Executor::Vm(vms)) => Some(
+                git_proxy::host_port(address, port.unwrap_or(vms.options.port)),
+            ),
+            _ => None,
+        };
+        record.bridge.as_ref().map(|bridge| bridge.keep(dial))
+    }
+
+    /// A new front for the bridge of a run taken back whose record keeps its identity: on the
+    /// kept port (when it is taken now, on another, which the bridge does not find, as with the
+    /// shared listener's port), or dialing the VM's bridge.
+    async fn register_front_again(
+        &self,
+        record: &crate::takeback::RunRecord,
+    ) -> Result<crate::sandbox::Registered> {
+        let options = self
+            .opts
+            .bridge
+            .as_ref()
+            .context("this host runs no agent over the sandbox bridge now")?;
+        let keep = self
+            .kept_bridge(record)
+            .context("the record keeps no bridge of a front")??;
+        keep.register_again(
+            options,
+            &record.bridge_id,
+            record.session_key.clone(),
+            Duration::from_secs(2),
+        )
+        .await
+    }
+
+    /// Registers a run taken back as a run of this host's, listed in `hello.activeRuns`, and
+    /// starts its task ([`run::take_back`]).
+    fn spawn_taken_back(
+        self: &Arc<Self>,
+        record: crate::takeback::RunRecord,
+        sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
+    ) {
+        let (run_id, epoch) = (record.run_id(), record.assign.epoch);
+        let (stop_tx, stop_rx) = watch::channel(None);
+        let steering = Steering::new(run_id, epoch, self.outbox.clone());
+        // No token that the server revoked comes back (ADR-0116).
+        let git_tokens =
+            RunGitTokens::restored(&record.assign, &record.revoked, record.redaction.as_ref());
+        // The record on disk is the holder's before the run can get a revocation: one that
+        // comes from now on writes it again before the host confirms it.
+        let kept = Arc::new(crate::takeback::RecordHandle::kept(
+            &self.records,
+            record.clone(),
+        ));
+        git_tokens.keep_record(kept.clone());
+        lock(&self.runs).insert(
+            run_id,
+            RunEntry {
+                epoch,
+                task_id: record.assign.work_item().id,
+                credential_label: record.assign.credential_label.clone(),
+                stop: stop_tx,
+                steering: steering.clone(),
+                git_tokens: git_tokens.clone(),
+                unqueued_revoked: Vec::new(),
+                handle: None,
+            },
+        );
+        self.outbox.resume_run(run_id, epoch, record.seq_floor);
+        let shared = self.clone();
+        let handle = tokio::spawn(async move {
+            let end = run::take_back(&shared, record, kept, &git_tokens, sandbox, stop_rx).await;
+            git_tokens.close_log();
+            steering.close("the run ended");
+            match end {
+                run::TakenBackEnd::Finished(finished) => {
+                    tracing::info!(%run_id, outcome = ?finished.outcome, class = ?finished.failure_class, "run taken back and finished");
+                    shared.outbox.push_finished(*finished);
+                }
+                run::TakenBackEnd::Aborted => {
+                    tracing::info!(%run_id, epoch, "run taken back and aborted (stale epoch)");
+                    shared.outbox.drop_run(run_id, epoch);
+                }
+                run::TakenBackEnd::Left(sandbox) => {
+                    tracing::info!(%run_id, epoch, "run taken back and left for the next start of the host");
+                    // A sandbox that still holds the work lives as long as this process: its
+                    // bridge then waits for the next one, which takes the session back.
+                    if let Some(sandbox) = sandbox {
+                        lock(&shared.left_sandboxes).push(*sandbox);
                     }
                 }
-                {
-                    let mut runs = lock(&shared.runs);
-                    if runs.get(&run_id).is_some_and(|e| e.epoch == epoch) {
-                        runs.remove(&run_id);
-                    }
-                }
-                shared.drop_platform_requests(run_id, epoch);
-                shared.remove_run_secrets(run_id, epoch);
-            });
-            if let Some(entry) = lock(&self.runs).get_mut(&run_id)
-                && entry.epoch == epoch
-            {
-                entry.handle = Some(handle);
             }
+            {
+                let mut runs = lock(&shared.runs);
+                if runs.get(&run_id).is_some_and(|e| e.epoch == epoch) {
+                    runs.remove(&run_id);
+                }
+            }
+            shared.drop_platform_requests(run_id, epoch);
+            shared.remove_run_secrets(run_id, epoch);
+        });
+        if let Some(entry) = lock(&self.runs).get_mut(&run_id)
+            && entry.epoch == epoch
+        {
+            entry.handle = Some(handle);
         }
     }
 
@@ -719,12 +1008,25 @@ impl Shared {
         if let Some(proxy) = slot.as_ref() {
             return Ok(Some(proxy.clone()));
         }
-        let Some(git_proxy) = self.git_proxy().await? else {
+        let Some(endpoint) = self.proxies_endpoint().await? else {
             return Ok(None);
         };
-        let proxy = Arc::new(EgressProxy::new(settings.clone(), git_proxy.endpoint()));
+        let proxy = Arc::new(EgressProxy::new(settings.clone(), &endpoint));
         *slot = Some(proxy.clone());
         Ok(Some(proxy))
+    }
+
+    /// A new sandbox's front process, which holds that sandbox's bridge and serves the HTTP of
+    /// its proxies (ADR-0112, path C, part 2): with the bridge only; `Ok(None)` without it,
+    /// where this process serves them. One per sandbox: a VM's when the VM is created
+    /// (crate::pool), any other's where its run decides what serves its proxies (crate::run).
+    pub async fn sandbox_front(&self) -> Result<Option<Arc<crate::front::sandbox::SandboxFront>>> {
+        match &self.opts.bridge {
+            Some(bridge) => Ok(Some(
+                crate::front::sandbox::SandboxFront::start(&bridge.front).await?,
+            )),
+            None => Ok(None),
+        }
     }
 
     /// The model proxy, which is always on, created on first use; its runs' listeners bind where
@@ -738,14 +1040,13 @@ impl Shared {
         if let Some(proxy) = slot.as_ref() {
             return Ok(proxy.clone());
         }
-        let Some(git_proxy) = self.git_proxy().await? else {
+        let Some(endpoint) = self.proxies_endpoint().await? else {
             anyhow::bail!("the sandboxes have no network, so they cannot reach the model proxy");
         };
         let host_token = HostToken::new(&self.config.server_url, self.config.token.expose())
             .context("the model proxy cannot send this host's token to its server")?;
         let proxy = Arc::new(
-            ModelProxy::new(self.opts.model_proxy.clone(), git_proxy.endpoint())
-                .with_host_token(host_token),
+            ModelProxy::new(self.opts.model_proxy.clone(), &endpoint).with_host_token(host_token),
         );
         *slot = Some(proxy.clone());
         Ok(proxy)
@@ -794,12 +1095,17 @@ impl Shared {
     }
 
     pub fn on_welcome(&self, welcome: &tinfirm_protocol::Welcome) {
+        self.server_takes_health.on_welcome(welcome);
+        self.welcome_done.send_replace(HelloAnswer::Welcomed {
+            revokes: welcome.lists(feature::RUN_GIT_REVOKE),
+        });
         self.connected.store(true, Ordering::SeqCst);
         // A new connection: forget the host.config version, and drop answers that the old
         // connection did not write. The server sends host.config after welcome.
         lock(&self.capacity).new_connection();
-        self.outbox
-            .retain_control(|m| !matches!(m, Message::HostConfigApplied(_)));
+        self.outbox.retain_control(|m| {
+            !matches!(m, Message::HostConfigApplied(_)) && !crate::health::of_ended_connection(m)
+        });
         // Platform requests that still wait may have been lost with the old connection; the
         // server answers a repeated requestId again without storing it twice.
         for pending in lock(&self.platform_requests).values() {
@@ -833,9 +1139,41 @@ impl Shared {
         self.connected.load(Ordering::SeqCst)
     }
 
+    /// Where the current connection's answer to the hello is, as it changes.
+    pub fn hello_answer(&self) -> watch::Receiver<HelloAnswer> {
+        self.welcome_done.subscribe()
+    }
+
+    /// The level of isolation the host reports now (crate::isolation, ADR-0113): what it read
+    /// at its start, with the node driver's hardening as the VM executor knows it now
+    /// ([`crate::vm::Vms::hardening`]).
+    pub fn isolation(&self) -> crate::isolation::Reported {
+        let Some(sandboxes) = self.sandboxes else {
+            return crate::isolation::Reported::CONTAINER;
+        };
+        let sandboxes = match &self.opts.executor {
+            Executor::Vm(vms) => sandboxes.hardened(vms.hardening().hardened),
+            _ => sandboxes,
+        };
+        crate::isolation::derive(sandboxes, self.opts.isolation_stated)
+            .unwrap_or(crate::isolation::Reported::CONTAINER)
+    }
+
+    /// The host's asks for a new hello, as they come: the connection ends with a close of
+    /// its own and connects again at once ([`tell_hardening`]).
+    pub fn rehello_watch(&self) -> watch::Receiver<u64> {
+        self.rehello.subscribe()
+    }
+
+    /// How often the host asked for a new hello (tests).
+    pub fn rehellos(&self) -> u64 {
+        *self.rehello.borrow()
+    }
+
     /// The connection ended.
     pub fn on_disconnect(&self) {
         self.connected.store(false, Ordering::SeqCst);
+        self.welcome_done.send_replace(HelloAnswer::NotConnected);
         lock(&self.capacity).new_connection();
         self.outbox.on_disconnect();
     }
@@ -949,13 +1287,29 @@ impl Shared {
                 }),
             }
         }
-        // The tier of the sandbox runtime (`microvm` for Kata) is reported with protocol v2;
-        // a v1 server refuses a hello with `microvm`, so v1 reports `container`, as before.
-        let isolation_tiers = if v2 {
-            vec![self.opts.sandbox.tier().isolation_tier()]
+        // The level of isolation (ADR-0113), derived now: with the node driver, with the
+        // hardening its nodes last reported. With protocol 2, the one value of
+        // `isolationTiers`, with `hardened` and `isolationStated`. Protocol 1 reports
+        // `container`, as before, and neither field. No host of this release sends `microvm`,
+        // which a server of this release refuses; a server of an earlier release refuses
+        // `machine` and `vm-jail` (ADR-0113, decision 2).
+        let (isolation_tiers, hardened, isolation_stated) = if v2 {
+            let isolation = self.isolation();
+            (vec![isolation.tier], isolation.hardened, isolation.stated)
         } else {
-            vec![IsolationTier::Container]
+            (vec![IsolationTier::Container], None, false)
         };
+        // What the server learns of the nodes' hardening from this hello: [`tell_hardening`]
+        // compares it with what the nodes report later.
+        *lock(&self.hello_mark) = (v2
+            && matches!(self.sandboxes, Some(crate::isolation::Sandboxes::Nodes(..))))
+        .then(|| {
+            if hardened == Some(tinfirm_protocol::Hardened::Yes) {
+                crate::vm::Mark::Yes
+            } else {
+                crate::vm::Mark::No
+            }
+        });
         Hello {
             protocol_version: self.protocol_version(),
             runner_version: self.opts.runner_version.clone(),
@@ -979,14 +1333,16 @@ impl Shared {
             },
             features: {
                 let mut features = features(v2, &self.opts.executor, self.opts.bridge.is_some());
-                if v2 && self.pool.is_some() {
+                if v2 && self.ready_vms.is_some() {
                     features.push(feature::SANDBOX_POOL.to_string());
                 }
                 features
             },
-            pool: (v2 && self.pool.is_some()).then_some(tinfirm_protocol::HelloPool {
-                max_ready: self.opts.pool.max_ready,
+            pool: (v2 && self.ready_vms.is_some()).then_some(tinfirm_protocol::HelloPool {
+                max_ready: self.opts.ready_vms.max_ready,
             }),
+            hardened,
+            isolation_stated,
         }
     }
 
@@ -1009,11 +1365,17 @@ impl Shared {
         lock(&self.runs).len()
     }
 
-    // ----- the VM pool (crate::pool) -----------------------------------------------------
+    // ----- the VM pool (crate::pool) and its ready VMs (crate::ready_vms) ------------------
 
     /// The VM executor's pool; `None` for the other executors.
     pub fn pool(&self) -> Option<&Arc<crate::pool::Pool>> {
         self.pool.as_ref()
+    }
+
+    /// The pool's ready VMs; `None` without `--pool-max-ready` above 0, or for the other
+    /// executors.
+    pub fn ready_vms(&self) -> Option<&Arc<crate::ready_vms::ReadyVms>> {
+        self.ready_vms.as_ref()
     }
 
     /// `host.pool.status` (v2, the feature `sandbox.pool`, ADR-0099), on the current
@@ -1024,14 +1386,14 @@ impl Shared {
         }
     }
 
-    /// What the pool reads of this host in a pass: its effective `maxConcurrentRuns` (0
+    /// What the ready VMs read of this host in a pass: its effective `maxConcurrentRuns` (0
     /// while it drains), its active runs, and its connection.
-    pub fn pool_view(&self) -> crate::pool::HostView {
+    pub fn ready_vms_view(&self) -> crate::ready_vms::HostView {
         let (pool_size, draining) = {
             let capacity = lock(&self.capacity);
             (capacity.max_concurrent_runs(), capacity.is_draining())
         };
-        crate::pool::HostView {
+        crate::ready_vms::HostView {
             pool_size,
             active_runs: self.active_run_count(),
             draining: draining || self.is_shutting_down(),
@@ -1101,6 +1463,7 @@ impl Shared {
             Message::RunAssign(assign) => self.handle_assign(assign),
             Message::RunCancel(cancel) => self.handle_cancel(cancel),
             Message::RunSteer(steer) => self.handle_steer(steer),
+            Message::RunGitRevoke(revoke) => self.handle_git_revoke(revoke),
             Message::RunRepositoryRequestAck(ack) => self.handle_platform_ack(
                 ack.run_id,
                 ack.request_id,
@@ -1119,6 +1482,11 @@ impl Shared {
             Message::PslUpdate(update) => self.handle_psl_update(update),
             Message::Error(error) => self.handle_error(error),
             Message::Welcome(_) => {}
+            Message::WelcomeDone(_) => {
+                // After the frames it promises: a revocation it names was applied already.
+                tracing::info!("the server's answer to the hello is complete (welcome.done)");
+                self.welcome_done.send_replace(HelloAnswer::Done);
+            }
             other => self.outbox.push_control(Message::Error(ErrorMessage {
                 code: "BAD_MESSAGE".into(),
                 message: format!("unexpected message type `{}`", other.message_type()),
@@ -1202,8 +1570,8 @@ impl Shared {
                 // meanwhile cannot be overtaken by this older state.
                 self.outbox
                     .push_control(Message::HostConfigApplied(applied));
-                if let Some(pool) = &self.pool {
-                    pool.apply_config(config.pool.as_ref());
+                if let Some(ready_vms) = &self.ready_vms {
+                    ready_vms.apply_config(config.pool.as_ref());
                 }
             }
             ApplyOutcome::Outdated { last } => {
@@ -1241,8 +1609,8 @@ impl Shared {
         }
         drop(capacity);
         // A draining host keeps no ready VM.
-        if let Some(pool) = &self.pool {
-            pool.poke();
+        if let Some(ready_vms) = &self.ready_vms {
+            ready_vms.poke();
         }
         // Before the log line: whatever happens to it, [`serve`] learns of the drain.
         self.drain_requested.cancel();
@@ -1337,6 +1705,7 @@ impl Shared {
         }
         let (stop_tx, stop_rx) = watch::channel(None);
         let steering = Steering::new(assign.run_id, assign.epoch, self.outbox.clone());
+        let git_tokens = RunGitTokens::new(&assign);
         // Take the slot. The draining flag, the task, the host's slots and the pool are
         // checked under the lock of the runs, so two assignments cannot both take the last
         // slot, and no run starts after a drain found none active.
@@ -1399,6 +1768,8 @@ impl Shared {
                             credential_label: label.map(str::to_string),
                             stop: stop_tx,
                             steering: steering.clone(),
+                            git_tokens: git_tokens.clone(),
+                            unqueued_revoked: Vec::new(),
                             handle: None,
                         },
                     )
@@ -1421,8 +1792,17 @@ impl Shared {
                 let _ = tokio::time::timeout(STALE_COPY_WAIT, stale_copy).await;
             }
             if admitted {
-                let finished =
-                    run::execute(&shared, &assign, &credential, stop_rx, &steering).await;
+                let finished = run::execute(
+                    &shared,
+                    &assign,
+                    &credential,
+                    &git_tokens,
+                    stop_rx,
+                    &steering,
+                )
+                .await;
+                // Before run.finished: a revocation that comes later is no event of the run.
+                git_tokens.close_log();
                 // Before run.finished: the steers the agent did not take wait for the next turn.
                 steering.close("the run ended");
                 match finished {
@@ -1575,8 +1955,21 @@ impl Shared {
                 )),
             };
         }
-        let runs = lock(&self.runs);
-        let Some(entry) = runs.get(&assign.run_id).filter(|e| e.epoch == assign.epoch) else {
+        // A VM driver that can make no VM (crate::vm, `Vms::refusal`): the run waits in the
+        // server's queue with the cause, instead of failing at its create. The protocol has
+        // no code of its own for it; the host has no slot to give, and the reason says why.
+        // A refusal found before keeps its own reason.
+        if refusal.is_none()
+            && let Executor::Vm(vms) = &self.opts.executor
+            && let Some(reason) = vms.refusal().await
+        {
+            refusal = Some((reject_code::NO_FREE_SLOT, reason));
+        }
+        let mut runs = lock(&self.runs);
+        let Some(entry) = runs
+            .get_mut(&assign.run_id)
+            .filter(|e| e.epoch == assign.epoch)
+        else {
             // A newer epoch took the run over; that one answers the server.
             return false;
         };
@@ -1606,6 +1999,10 @@ impl Shared {
             run_id: assign.run_id,
             epoch: assign.epoch,
         });
+        // A `run.git.revoke` that came during the admission is confirmed after the accept.
+        for revoked in std::mem::take(&mut entry.unqueued_revoked) {
+            self.outbox.push_revoked(revoked);
+        }
         true
     }
 
@@ -1657,6 +2054,51 @@ impl Shared {
                     epoch: Some(cancel.epoch),
                 }));
             }
+        }
+    }
+
+    /// `run.git.revoke` (ADR-0116): the execution's holder drops the named repositories'
+    /// tokens, and its take-back record is written again without them. Then the host confirms
+    /// the frame with `run.git.revoked`, in the run's order through the outbox, naming every
+    /// repository of the frame that the run has, those revoked already included: a frame that
+    /// comes twice is confirmed twice. A frame for another epoch, or for a run this host does
+    /// not hold or no longer holds, is ignored and confirmed by nothing, as is one that names
+    /// none of the run's repositories. A record that could not be written is not confirmed: the
+    /// server sends the frame again at the next hello, and the write is tried again then.
+    fn handle_git_revoke(&self, revoke: RunGitRevoke) {
+        let tokens = lock(&self.runs)
+            .get(&revoke.run_id)
+            .filter(|e| e.epoch == revoke.epoch)
+            .map(|e| e.git_tokens.clone());
+        let Some(tokens) = tokens else {
+            tracing::debug!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke for an execution this host does not run; ignored");
+            return;
+        };
+        tracing::info!(run_id = %revoke.run_id, epoch = revoke.epoch, reason = %revoke.reason, "the server revokes git tokens of a run");
+        let applied = tokens.revoke(&revoke.component_ids, &revoke.reason, &revoke.message);
+        if !applied.recorded {
+            tracing::warn!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke not confirmed: the run's take-back record still holds the token");
+            return;
+        }
+        if applied.named.is_empty() {
+            tracing::debug!(run_id = %revoke.run_id, epoch = revoke.epoch, "run.git.revoke names none of the run's repositories; nothing to confirm");
+            return;
+        }
+        let revoked = RunGitRevoked {
+            run_id: revoke.run_id,
+            epoch: revoke.epoch,
+            component_ids: applied.named,
+        };
+        // Under the lock of the runs, as the admission opens the run's queue.
+        let mut runs = lock(&self.runs);
+        let Some(entry) = runs
+            .get_mut(&revoke.run_id)
+            .filter(|e| e.epoch == revoke.epoch)
+        else {
+            return;
+        };
+        if !self.outbox.push_revoked(revoked.clone()) {
+            entry.unqueued_revoked.push(revoked);
         }
     }
 
@@ -1814,6 +2256,8 @@ impl Shared {
                 credential_label: Some(credential_label.to_string()),
                 stop,
                 steering: Steering::new(run_id, epoch, self.outbox.clone()),
+                git_tokens: RunGitTokens::new_empty(run_id, epoch),
+                unqueued_revoked: Vec::new(),
                 handle: None,
             },
         );
@@ -2003,6 +2447,7 @@ impl PlatformRequester for HostRequester {
         let timeout: fn(&HostOptions) -> Duration = match frame.request.kind() {
             RequestKind::Tool => |opts| opts.tool_request_timeout,
             RequestKind::Ask
+            | RequestKind::GitToken
             | RequestKind::Access
             | RequestKind::Network
             | RequestKind::Artifact => |opts| opts.repository_request_timeout,
@@ -2122,8 +2567,10 @@ pub(crate) fn validate_model_access(access: &ModelAccess, runtime: Runtime) -> R
 /// The optional features of protocol v2 that a host with `executor` implements
 /// (`hello.features`): `run.steer`, `run.skills` when the skills reach the sandbox (Docker
 /// mounts them, a VM gets them over the bridge; the local test executor has no mounts,
-/// ADR-0064), and `session.bundle` (ADR-0097), which the server uses for company hosts only. A
-/// v1 host lists none.
+/// ADR-0064), `session.bundle` (ADR-0097), which the server uses for company hosts only,
+/// `run.git.revoke` and `run.git.refresh` (ADR-0116), `sandbox.bridge` with the sandbox bridge (ADR-0095), `sandbox.elastic` when the VM
+/// driver is one of this binary's paid ones (ADR-0114), and `host.health` with a VM per run,
+/// whose driver's state the host reports (ADR-0117). A v1 host lists none.
 pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
     if !v2 {
         return Vec::new();
@@ -2133,11 +2580,28 @@ pub fn features(v2: bool, executor: &Executor, bridged: bool) -> Vec<String> {
         features.push(feature::RUN_SKILLS.to_string());
     }
     features.push(feature::SESSION_BUNDLE.to_string());
+    // Every executor: the holder of a run's git tokens is the host's (ADR-0116).
+    features.push(feature::RUN_GIT_REVOKE.to_string());
+    features.push(feature::RUN_GIT_REFRESH.to_string());
     if bridged {
         features.push(feature::SANDBOX_BRIDGE.to_string());
     }
+    if let Executor::Vm(vms) = executor
+        && vms.options.driver.elastic()
+    {
+        features.push(feature::SANDBOX_ELASTIC.to_string());
+    }
+    if crate::health::lists_feature(executor) {
+        features.push(feature::HOST_HEALTH.to_string());
+    }
     features
 }
+
+/// The longest git token the host takes, in an assignment or a renewal: the longest token the
+/// server keeps (16 KiB, its bound for an OAuth access token; a token a person enters is at
+/// most 4000 characters, and a fine-grained GitHub token has 93). It is also the bound of what
+/// a take-back record's hashes of a token may be ([`crate::secret_hashes::MAX_FORM_LEN`]).
+pub const MAX_GIT_TOKEN_BYTES: usize = 16384;
 
 /// `run.assign.workspaces` (docs/archive/v1/CONVENTIONS.md §15.4 step 1): at most 20, each `dir` a valid and
 /// unique directory name, and each repository valid ([`validate_workspace`]).
@@ -2187,6 +2651,22 @@ pub fn validate_workspace(ws: &WorkspaceSpec, allow_insecure: bool) -> Result<()
     }
     if !safe_ref(&ws.default_branch) {
         return Err(format!("invalid defaultBranch `{}`", ws.default_branch));
+    }
+    if let Some(git) = &ws.git
+        && git.token.expose().len() > MAX_GIT_TOKEN_BYTES
+    {
+        return Err(format!("git.token is over {MAX_GIT_TOKEN_BYTES} bytes"));
+    }
+    // ADR-0116: a token that expires names its credential's mirror, and only together.
+    if let Some(git) = &ws.git {
+        match (&git.expires_at, &git.mirror_key) {
+            (None, None) => {}
+            (Some(_), Some(key)) if tinfirm_protocol::is_valid_mirror_key(key) => {}
+            (Some(_), Some(_)) => {
+                return Err("git.mirrorKey is not 64 lowercase hex characters".into());
+            }
+            _ => return Err("git.expiresAt and git.mirrorKey come together".into()),
+        }
     }
     Ok(())
 }
@@ -2240,6 +2720,79 @@ async fn deliver_within(connection: &mut JoinHandle<Result<()>>, limit: Duration
 
 /// Serves until `shutdown` fires (SIGINT/SIGTERM), a drain is complete, or the connection
 /// fails fatally. After a drain it returns `Ok` once every message is delivered.
+/// Whether a new hello is wanted: the hello of the connection carried `sent`, and the checks
+/// of the nodes' hardening found `now`. A loss is told at once; a gain once it held for two
+/// checks in a row, so that a node whose mark flaps does not move the server's placement
+/// with it.
+fn hello_is_stale(sent: crate::vm::Mark, now: crate::vm::Streak) -> bool {
+    use crate::vm::Mark;
+    match (sent, now.mark) {
+        (Mark::Yes, Mark::No) => true,
+        (Mark::No, Mark::Yes) => now.checks >= 2,
+        _ => false,
+    }
+}
+
+/// Tells the server of a change of the node driver's hardening mark (ADR-0113, decision 5)
+/// until `stop`: the protocol carries the mark in the hello alone, so the host asks the
+/// connection for a new hello, which it makes by a reconnect (crate::connection). Runs go on
+/// meanwhile, as through any reconnect: the server keeps their leases, and the new hello lists
+/// them. Nothing is asked while the connection is down, since the next hello carries the
+/// value of its time, and at most once per `hardening_every`. Nothing on a host that does not
+/// report the nodes' mark.
+async fn tell_hardening(host: Host, stop: CancellationToken) {
+    let Executor::Vm(vms) = &host.opts.executor else {
+        return;
+    };
+    if !vms.reads_hardening() || !host.speaks_v2() {
+        return;
+    }
+    let every = vms.options.hardening_every;
+    let mut streak = vms.streak_watch();
+    let mut answer = host.hello_answer();
+    let mut asked: Option<tokio::time::Instant> = None;
+    loop {
+        let now = *streak.borrow_and_update();
+        answer.borrow_and_update();
+        let sent = if host.is_connected() {
+            *lock(&host.hello_mark)
+        } else {
+            None
+        };
+        if let Some(sent) = sent
+            && hello_is_stale(sent, now)
+        {
+            if let Some(at) = asked
+                && at.elapsed() < every
+            {
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    () = tokio::time::sleep_until(at + every) => continue,
+                }
+            }
+            let hardening = vms.hardening();
+            if now.mark == crate::vm::Mark::No {
+                tracing::warn!(
+                    not_hardened = %hardening.not_hardened.join("; "),
+                    "the nodes' hardening mark is `no` now: this host reconnects, so that the server gets a hello with it"
+                );
+            } else {
+                tracing::info!(
+                    checks = now.checks,
+                    "the nodes' hardening mark is `yes` now: this host reconnects, so that the server gets a hello with it"
+                );
+            }
+            asked = Some(tokio::time::Instant::now());
+            host.rehello.send_modify(|n| *n += 1);
+        }
+        tokio::select! {
+            () = stop.cancelled() => return,
+            changed = streak.changed() => if changed.is_err() { return },
+            changed = answer.changed() => if changed.is_err() { return },
+        }
+    }
+}
+
 pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     // Before anything that cleans up what no run holds: these runs hold theirs.
     host.take_back_runs().await;
@@ -2256,11 +2809,25 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
         host.clone(),
         maintenance_stop.clone(),
     ));
-    // The VM pool's passes; when they stop, its ready VMs are deleted.
+    // The ready VMs' passes (crate::ready_vms), with `--pool-max-ready` above 0.
     let pool_stop = CancellationToken::new();
-    let pool = host
-        .pool()
-        .map(|pool| tokio::spawn(pool.clone().run(host.clone(), pool_stop.clone())));
+    let ready_vms = host
+        .ready_vms()
+        .map(|ready_vms| tokio::spawn(ready_vms.clone().run(host.clone(), pool_stop.clone())));
+    // The host's report that it can take no run (ADR-0117); nothing on a host without a state
+    // of its own.
+    let health = tokio::spawn(crate::health::run(host.clone(), finish.clone()));
+    // With the node driver: its `verify` on a schedule, and a new hello when the nodes'
+    // hardening mark changes (ADR-0113, decision 5).
+    let hardening = match &host.opts.executor {
+        Executor::Vm(vms) => {
+            let vms = vms.clone();
+            let stop = finish.clone();
+            Some(tokio::spawn(async move { vms.ask_hardening(stop).await }))
+        }
+        _ => None,
+    };
+    let tell = tokio::spawn(tell_hardening(host.clone(), finish.clone()));
     let ticker = {
         let host = host.clone();
         let stop = finish.clone();
@@ -2301,6 +2868,11 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     }
     finish.cancel();
     ticker.abort();
+    health.abort();
+    tell.abort();
+    if let Some(hardening) = hardening {
+        hardening.abort();
+    }
     // A pass stops between two steps, but a gc that has started runs to its end: killing
     // `git gc` would leave its `git prune` running without the mirror's lock.
     maintenance_stop.cancel();
@@ -2309,8 +2881,12 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     }
     let _ = maintenance.await;
     pool_stop.cancel();
-    if let Some(pool) = pool {
-        let _ = pool.await;
+    if let Some(ready_vms) = ready_vms {
+        let _ = ready_vms.await;
+    }
+    // No more claims; the VMs that no run holds are deleted.
+    if let Some(pool) = host.pool() {
+        pool.stop().await;
     }
     host.stop_git_proxy().await;
     match stop {
@@ -2579,6 +3155,7 @@ mod tests {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         });
         host
     }
@@ -2721,6 +3298,7 @@ mod tests {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         });
         let again = host.outbox.take_next().expect("the request is sent again");
         let Message::RunRequest(again) = again else {
@@ -2763,6 +3341,7 @@ mod tests {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         };
         let started = std::time::Instant::now();
         let ask = tokio::spawn(requester.send_request(v2_request(run_id, ask_payload())));
@@ -2792,6 +3371,62 @@ mod tests {
         assert!(tool_took >= Duration::from_millis(2800), "{tool_took:?}");
         assert!(tool_took < Duration::from_millis(4300), "{tool_took:?}");
         assert_eq!(host.waiting_platform_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn each_epoch_of_a_run_scans_with_its_own_hashes() {
+        use crate::config::HostConfig;
+        use crate::secret_hashes::{HashedMatcher, SecretHashes};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let local = Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        let config = HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TEST_ONLY_host_token_of_the_epoch_test_0123"),
+        );
+        let host = Shared::new(HostOptions::new(paths, local), config);
+        let run = Uuid::new_v4();
+        // Epoch 1, a copy this host still ends, and epoch 2, which replaced it: each held an
+        // earlier token of its own.
+        let (first, second) = (
+            "ghs_TEST_ONLY_earlier_of_epoch_1_0123",
+            "ghs_TEST_ONLY_earlier_of_epoch_2_4567",
+        );
+        for (epoch, token) in [(1, first), (2, second)] {
+            let mut hashes = SecretHashes::new();
+            hashes.add(token);
+            host.add_run_hashed(run, epoch, Arc::new(HashedMatcher::new(&hashes).unwrap()));
+        }
+        let one = host.run_redactor(run, 1);
+        let two = host.run_redactor(run, 2);
+        assert!(one.contains_credential(first.as_bytes()));
+        assert!(!one.contains_credential(second.as_bytes()));
+        assert!(two.contains_credential(second.as_bytes()));
+        assert!(!two.contains_credential(first.as_bytes()));
+        // An execution with no hashes, or another run, gets none of these.
+        assert!(
+            !host
+                .run_redactor(run, 3)
+                .contains_credential(first.as_bytes())
+        );
+        assert!(
+            !host
+                .run_redactor(Uuid::new_v4(), 1)
+                .contains_credential(first.as_bytes())
+        );
+        // The host-wide redactor of events and log lines has both.
+        assert!(host.redactor().contains_credential(first.as_bytes()));
+        assert!(host.redactor().contains_credential(second.as_bytes()));
+        // Once epoch 1 ends, its hashes go, and epoch 2 keeps its own.
+        host.remove_run_secrets(run, 1);
+        assert!(!host.redactor().contains_credential(first.as_bytes()));
+        assert!(
+            host.run_redactor(run, 2)
+                .contains_credential(second.as_bytes())
+        );
     }
 
     #[tokio::test]
@@ -2848,7 +3483,8 @@ mod tests {
             "{}",
             hello.runner_version
         );
-        assert_eq!(hello.isolation_tiers, vec![IsolationTier::Microvm]);
+        // The local test executor reports `container`, whatever its sandbox settings.
+        assert_eq!(hello.isolation_tiers, vec![IsolationTier::Container]);
         assert!(v2.speaks_v2());
         let runtimes: Vec<Runtime> = hello.runtimes.iter().map(|r| r.runtime).collect();
         assert_eq!(runtimes, Runtime::ALL.to_vec());
@@ -2861,6 +3497,454 @@ mod tests {
             plain.hello().await.isolation_tiers,
             vec![IsolationTier::Container]
         );
+    }
+
+    #[tokio::test]
+    async fn hello_reports_the_level_of_isolation_in_its_tiers() {
+        use crate::config::HostConfig;
+        use crate::isolation::Stated;
+        use crate::sandbox::SandboxSettings;
+        use tinfirm_protocol::Hardened;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let mut config = HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYhosttokenforthehelloframe00000123"),
+        );
+        let hello = |executor: Executor, sandbox: SandboxSettings, stated, config: &HostConfig| {
+            let mut opts = HostOptions::new(paths.clone(), executor);
+            opts.sandbox = sandbox;
+            opts.isolation_stated = stated;
+            let host = Shared::new(opts, config.clone());
+            async move { host.hello().await }
+        };
+        // The tiers, `hardened` and `isolationStated` of a hello.
+        let level = |h: &Hello| (h.isolation_tiers.clone(), h.hardened, h.isolation_stated);
+        let seen = |tier| (vec![tier], None, false);
+        // The feature of the decision that this one replaces is gone (ADR-0113).
+        let no_old_feature = |h: &Hello| !h.features.iter().any(|f| f == "host.isolation");
+        // Never contacted: the hello's image checks fail at once.
+        let docker = || {
+            Executor::Docker(
+                bollard::Docker::connect_with_http(
+                    "http://127.0.0.1:9",
+                    1,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .unwrap(),
+            )
+        };
+        let vm = |driver: &str| {
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                crate::vm::DriverCommand::parse(driver).unwrap(),
+                "sandbox".into(),
+            )))
+        };
+        let vms = || SandboxSettings::for_vms(None, false, Vec::new()).unwrap();
+        let runtime =
+            |name: &str| SandboxSettings::new(Some(name.into()), false, Vec::new()).unwrap();
+
+        // Docker with runc or Kata: `container` (a Kata host's VMM is root on this machine).
+        for sandbox in [SandboxSettings::default(), runtime("runc"), runtime("kata")] {
+            let h = hello(docker(), sandbox, None, &config).await;
+            assert_eq!(level(&h), seen(IsolationTier::Container));
+            assert!(no_old_feature(&h));
+        }
+        // Docker with gVisor: `gvisor`.
+        let h = hello(docker(), runtime("runsc"), None, &config).await;
+        assert_eq!(level(&h), seen(IsolationTier::Gvisor));
+        // A provider's VM per run: `machine`, and no machine of the host's own.
+        let h = hello(vm("digitalocean"), vms(), None, &config).await;
+        assert_eq!(
+            level(&h),
+            (vec![IsolationTier::Machine], Some(Hardened::None), false)
+        );
+        assert!(no_old_feature(&h));
+        // The operator's own driver: `container` until the operator states a level.
+        let h = hello(vm("/usr/local/bin/my-driver"), vms(), None, &config).await;
+        assert_eq!(level(&h), seen(IsolationTier::Container));
+        let stated = Stated {
+            level: IsolationTier::VmJail,
+            hardened: Hardened::Yes,
+        };
+        let h = hello(vm("/usr/local/bin/my-driver"), vms(), Some(stated), &config).await;
+        assert_eq!(
+            level(&h),
+            (vec![IsolationTier::VmJail], Some(Hardened::Yes), true)
+        );
+        // The node driver (ADR-0112): what its configuration reaches, never a statement.
+        let node = |config: &std::path::Path| {
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                crate::vm::DriverCommand::node(config.to_path_buf()).unwrap(),
+                "sandbox".into(),
+            )))
+        };
+        let sockets = dir.path().join("sockets.json");
+        std::fs::write(
+            &sockets,
+            r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox"]}]}"#,
+        )
+        .unwrap();
+        let h = hello(node(&sockets), vms(), None, &config).await;
+        assert_eq!(level(&h), seen(IsolationTier::VmJail));
+        assert!(no_old_feature(&h));
+        assert!(!h.features.iter().any(|f| f == feature::SANDBOX_ELASTIC));
+        // TLS nodes at addresses that are not this host's own (TEST-NET-1).
+        let (cert, key) = (dir.path().join("client.crt"), dir.path().join("client.key"));
+        std::fs::write(&cert, b"not parsed until the driver dials").unwrap();
+        std::fs::write(&key, b"not parsed until the driver dials").unwrap();
+        std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let tls = dir.path().join("tls.json");
+        std::fs::write(
+            &tls,
+            serde_json::json!({"nodes": [{
+                "name": "node-1",
+                "address": "192.0.2.10:7700",
+                "nodeSha256": "ab".repeat(32),
+                "certificate": cert,
+                "key": key,
+                "templates": ["sandbox"]
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let h = hello(node(&tls), vms(), None, &config).await;
+        assert_eq!(level(&h), seen(IsolationTier::Machine));
+        // The nodes' hardening, as the driver's `verify` at the start reported it (ADR-0113,
+        // decision 5): `yes` is sent, `no` is left out.
+        let mark = |mark| crate::vm::Verified {
+            hardened: Some(mark),
+            ..Default::default()
+        };
+        let checked = |driver: crate::vm::DriverCommand, mark| {
+            let vms = crate::vm::Vms::new(crate::vm::VmOptions::new(driver, "sandbox".into()));
+            vms.note_hardening(&mark, true);
+            Executor::Vm(vms)
+        };
+        let node_driver = || crate::vm::DriverCommand::node(tls.clone()).unwrap();
+        let h = hello(
+            checked(node_driver(), mark(crate::vm::Mark::Yes)),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(
+            level(&h),
+            (vec![IsolationTier::Machine], Some(Hardened::Yes), false)
+        );
+        let h = hello(
+            checked(node_driver(), mark(crate::vm::Mark::No)),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(level(&h), seen(IsolationTier::Machine));
+        // A driver that could not tell at the start: `no`.
+        let h = hello(
+            checked(node_driver(), Default::default()),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(level(&h), seen(IsolationTier::Machine));
+        // An operator's own driver whose `verify` says `yes`: its operator's statement stands.
+        let own = || crate::vm::DriverCommand::parse("/usr/local/bin/my-driver").unwrap();
+        let h = hello(
+            checked(own(), mark(crate::vm::Mark::Yes)),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(level(&h), seen(IsolationTier::Container));
+        let no = Stated {
+            level: IsolationTier::VmJail,
+            hardened: Hardened::No,
+        };
+        let h = hello(
+            checked(own(), mark(crate::vm::Mark::Yes)),
+            vms(),
+            Some(no),
+            &config,
+        )
+        .await;
+        assert_eq!(
+            level(&h),
+            (vec![IsolationTier::VmJail], Some(Hardened::No), true)
+        );
+        // A statement with the node driver: the host reports `container` (`run` refuses it at
+        // start).
+        let h = hello(node(&tls), vms(), Some(stated), &config).await;
+        assert_eq!(level(&h), seen(IsolationTier::Container));
+        // The local test executor: `container`.
+        let local = Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        let h = hello(local, SandboxSettings::default(), None, &config).await;
+        assert_eq!(level(&h), seen(IsolationTier::Container));
+        // Protocol 1: `container` as before, whatever the host, and neither field.
+        config.protocol_version = 1;
+        for (executor, sandbox) in [(docker(), runtime("runsc")), (vm("digitalocean"), vms())] {
+            let h = hello(executor, sandbox, None, &config).await;
+            assert_eq!(level(&h), seen(IsolationTier::Container));
+            assert!(h.features.is_empty());
+        }
+        let h = hello(vm("/usr/local/bin/my-driver"), vms(), Some(stated), &config).await;
+        assert_eq!(level(&h), seen(IsolationTier::Container));
+    }
+
+    /// A host of protocol `version` with the node driver, its nodes over a local socket, that
+    /// asks for the hardening every `every`; connected.
+    fn node_host(dir: &std::path::Path, version: u32, every: Duration) -> Host {
+        use crate::config::HostConfig;
+        let nodes = dir.join("node-driver.json");
+        std::fs::write(
+            &nodes,
+            r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox"]}]}"#,
+        )
+        .unwrap();
+        let mut options = crate::vm::VmOptions::new(
+            crate::vm::DriverCommand::node(nodes).unwrap(),
+            "sandbox".into(),
+        );
+        options.hardening_every = every;
+        let mut opts = HostOptions::new(
+            Paths::new(dir.join("config"), dir.join("data")),
+            Executor::Vm(crate::vm::Vms::new(options)),
+        );
+        opts.sandbox = crate::sandbox::SandboxSettings::for_vms(None, false, Vec::new()).unwrap();
+        let mut config = HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYhosttokenforthehardeningmark00001"),
+        );
+        config.protocol_version = version;
+        let host = Shared::new(opts, config);
+        welcome(&host);
+        host
+    }
+
+    fn welcome(host: &Host) {
+        host.on_welcome(&tinfirm_protocol::Welcome {
+            protocol_version: Some(host.protocol_version()),
+            runner_host_id: Uuid::new_v4(),
+            company_id: Uuid::new_v4(),
+            server_version: None,
+            heartbeat_interval_seconds: 10,
+            lease_ttl_seconds: 30,
+            features: Vec::new(),
+        });
+    }
+
+    /// What a check of the node driver's `verify` says of the hardening: `None`, "not known".
+    fn note(host: &Host, mark: Option<crate::vm::Mark>) {
+        let Executor::Vm(vms) = &host.opts.executor else {
+            unreachable!("a VM host");
+        };
+        vms.note_hardening(
+            &crate::vm::Verified {
+                hardened: mark,
+                not_hardened: match mark {
+                    Some(crate::vm::Mark::Yes) => Vec::new(),
+                    _ => vec!["node local: io-uring: kernel.io_uring_disabled is 0, not 2".into()],
+                },
+                ..Default::default()
+            },
+            false,
+        );
+    }
+
+    #[tokio::test]
+    async fn each_hello_carries_the_nodes_hardening_of_its_time() {
+        use crate::vm::Mark;
+        use tinfirm_protocol::Hardened;
+        let dir = tempfile::tempdir().unwrap();
+        let host = node_host(dir.path(), 2, Duration::from_secs(300));
+        let marks = |hello: &Hello| (hello.isolation_tiers.clone(), hello.hardened);
+        // Not asked yet: `no`, left out.
+        let hello = host.hello().await;
+        assert_eq!(marks(&hello), (vec![IsolationTier::VmJail], None));
+        assert_eq!(*lock(&host.hello_mark), Some(Mark::No));
+        // The host was built before the nodes said `yes`: the hello reads it when it is built.
+        note(&host, Some(Mark::Yes));
+        let hello = host.hello().await;
+        assert_eq!(
+            marks(&hello),
+            (vec![IsolationTier::VmJail], Some(Hardened::Yes))
+        );
+        assert_eq!(*lock(&host.hello_mark), Some(Mark::Yes));
+        assert_eq!(host.isolation().hardened, Some(Hardened::Yes));
+        // "Not known" keeps it.
+        note(&host, None);
+        assert_eq!(host.hello().await.hardened, Some(Hardened::Yes));
+        note(&host, Some(Mark::No));
+        assert_eq!(
+            marks(&host.hello().await),
+            (vec![IsolationTier::VmJail], None)
+        );
+        assert_eq!(*lock(&host.hello_mark), Some(Mark::No));
+        // Protocol 1 reports `container` and carries no mark.
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = node_host(dir.path(), 1, Duration::from_secs(300));
+        note(&v1, Some(Mark::Yes));
+        assert_eq!(
+            marks(&v1.hello().await),
+            (vec![IsolationTier::Container], None)
+        );
+        assert_eq!(*lock(&v1.hello_mark), None);
+    }
+
+    #[test]
+    fn a_loss_makes_the_hello_stale_at_once_and_a_gain_after_two_checks() {
+        use crate::vm::{Mark, Streak};
+        let streak = |mark, checks| Streak { mark, checks };
+        assert!(hello_is_stale(Mark::Yes, streak(Mark::No, 1)));
+        assert!(!hello_is_stale(Mark::No, streak(Mark::Yes, 1)));
+        assert!(hello_is_stale(Mark::No, streak(Mark::Yes, 2)));
+        assert!(hello_is_stale(Mark::No, streak(Mark::Yes, 7)));
+        for mark in [Mark::Yes, Mark::No] {
+            for checks in [0, 1, 2] {
+                assert!(!hello_is_stale(mark, streak(mark, checks)));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_of_the_nodes_mark_asks_for_a_new_hello_once_per_interval_at_most() {
+        use crate::vm::Mark::{No, Yes};
+        const EVERY: Duration = Duration::from_secs(1);
+        // Lets the task see what happened: far less than the interval.
+        async fn settle() {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        // The connection's part: it ends, and the next one sends a new hello.
+        async fn reconnect(host: &Host) {
+            host.on_disconnect();
+            host.hello().await;
+            welcome(host);
+            settle().await;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let host = node_host(dir.path(), 2, EVERY);
+        host.hello().await;
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(tell_hardening(host.clone(), stop.clone()));
+        settle().await;
+        assert_eq!(host.rehellos(), 0);
+
+        // A gain: not after one check, nor after a check that cannot tell, but after the
+        // second `yes` in a row.
+        note(&host, Some(Yes));
+        settle().await;
+        note(&host, None);
+        settle().await;
+        assert_eq!(host.rehellos(), 0);
+        note(&host, Some(Yes));
+        settle().await;
+        assert_eq!(host.rehellos(), 1);
+        reconnect(&host).await;
+        assert_eq!(*lock(&host.hello_mark), Some(Yes));
+        // More checks that say `yes`, or cannot tell: nothing.
+        note(&host, Some(Yes));
+        note(&host, None);
+        settle().await;
+        assert_eq!(host.rehellos(), 1);
+
+        // A loss: at once once the interval since the last ask is over, here at its end.
+        note(&host, Some(No));
+        settle().await;
+        assert_eq!(host.rehellos(), 1);
+        tokio::time::sleep(EVERY).await;
+        settle().await;
+        assert_eq!(host.rehellos(), 2);
+        reconnect(&host).await;
+        assert_eq!(*lock(&host.hello_mark), Some(No));
+        // A loss a whole interval after the last ask: at once.
+        tokio::time::sleep(EVERY).await;
+        note(&host, Some(Yes));
+        note(&host, Some(Yes));
+        settle().await;
+        assert_eq!(host.rehellos(), 3);
+        reconnect(&host).await;
+        note(&host, Some(No));
+        settle().await;
+        assert_eq!(host.rehellos(), 3, "within the interval of the last ask");
+        tokio::time::sleep(EVERY).await;
+        settle().await;
+        assert_eq!(host.rehellos(), 4);
+        reconnect(&host).await;
+        tokio::time::sleep(EVERY).await;
+
+        // A mark that flaps faster than the interval, while no reconnect answers the asks: at
+        // most one ask per interval, the first at once.
+        let before = host.rehellos();
+        for step in 0..39 {
+            if step % 2 == 0 {
+                note(&host, Some(Yes));
+                note(&host, Some(Yes));
+            } else {
+                note(&host, Some(No));
+            }
+            tokio::time::sleep(EVERY / 10).await;
+        }
+        let asked = host.rehellos() - before;
+        assert!((1..=4).contains(&asked), "{asked} asks in 3.9 intervals");
+        reconnect(&host).await;
+        note(&host, Some(No));
+        reconnect(&host).await;
+        tokio::time::sleep(EVERY).await;
+
+        // While the connection is down: nothing; the next hello carries the value.
+        let before = host.rehellos();
+        host.on_disconnect();
+        note(&host, Some(Yes));
+        note(&host, Some(Yes));
+        tokio::time::sleep(EVERY * 2).await;
+        assert_eq!(host.rehellos(), before);
+        host.hello().await;
+        welcome(&host);
+        settle().await;
+        assert_eq!(host.rehellos(), before);
+        assert_eq!(*lock(&host.hello_mark), Some(Yes));
+
+        stop.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_host_that_reports_the_nodes_mark_asks_for_a_new_hello() {
+        let stop = CancellationToken::new();
+        let ends = |host: Host| {
+            let stop = stop.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), tell_hardening(host, stop))
+                    .await
+                    .is_ok()
+            }
+        };
+        // Protocol 1 carries no mark.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(ends(node_host(dir.path(), 1, Duration::from_secs(1))).await);
+        // An operator's own driver: its operator's statement stands.
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = HostOptions::new(
+            Paths::new(dir.path().join("config"), dir.path().join("data")),
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                crate::vm::DriverCommand::parse("/usr/local/bin/my-driver").unwrap(),
+                "sandbox".into(),
+            ))),
+        );
+        opts.sandbox = crate::sandbox::SandboxSettings::for_vms(None, false, Vec::new()).unwrap();
+        let mut config = crate::config::HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYhosttokenforthehardeningmark00002"),
+        );
+        config.protocol_version = 2;
+        assert!(ends(Shared::new(opts, config)).await);
     }
 
     #[test]
@@ -2880,23 +3964,71 @@ mod tests {
         );
         assert_eq!(
             features(true, &docker, false),
-            ["run.steer", "run.skills", "session.bundle"]
+            [
+                "run.steer",
+                "run.skills",
+                "session.bundle",
+                "run.git.revoke",
+                "run.git.refresh"
+            ]
         );
         // The local test executor has no mounts.
         assert_eq!(
             features(true, &local, false),
-            ["run.steer", "session.bundle"]
+            [
+                "run.steer",
+                "session.bundle",
+                "run.git.revoke",
+                "run.git.refresh"
+            ]
         );
         assert!(features(false, &docker, false).is_empty());
         assert!(features(false, &local, false).is_empty());
-        // A bridged host says so, for the server's licence (ADR-0100).
+        // A bridged host says so (ADR-0095).
         assert_eq!(
             features(true, &docker, true),
             [
                 "run.steer",
                 "run.skills",
                 "session.bundle",
+                "run.git.revoke",
+                "run.git.refresh",
                 "sandbox.bridge"
+            ]
+        );
+        // A VM driver of this binary's paid ones says so, for the server's licence (ADR-0114);
+        // an operator's own driver does not.
+        let vm = |value: &str| {
+            let driver = crate::vm::DriverCommand::parse(value).unwrap();
+            Executor::Vm(crate::vm::Vms::new(crate::vm::VmOptions::new(
+                driver,
+                "sandbox".into(),
+            )))
+        };
+        assert_eq!(
+            features(true, &vm("digitalocean"), true),
+            [
+                "run.steer",
+                "run.skills",
+                "session.bundle",
+                "run.git.revoke",
+                "run.git.refresh",
+                "sandbox.bridge",
+                "sandbox.elastic",
+                "host.health"
+            ]
+        );
+        // A VM per run reports its driver's state (ADR-0117); Docker reports none.
+        assert_eq!(
+            features(true, &vm("/usr/local/bin/my-driver --region x"), true),
+            [
+                "run.steer",
+                "run.skills",
+                "session.bundle",
+                "run.git.revoke",
+                "run.git.refresh",
+                "sandbox.bridge",
+                "host.health"
             ]
         );
 
@@ -2950,6 +4082,37 @@ mod tests {
             parse_finished_retention(Some("3m")),
             Duration::from_secs(180)
         );
+    }
+
+    #[test]
+    fn a_token_that_expires_names_its_credentials_mirror() {
+        let url = "https://github.com/acme/w.git";
+        let with = |expires: bool, key: Option<&str>| {
+            let mut spec = ws(url, "agent/X-1", "main");
+            let mut git = tinfirm_protocol::GitCredentials::new(
+                "x-access-token",
+                tinfirm_protocol::Secret::new("ghs_x"),
+            );
+            git.expires_at = expires.then(Utc::now);
+            git.mirror_key = key.map(str::to_string);
+            spec.git = Some(git);
+            validate_workspace(&spec, false)
+        };
+        let key = "3f".repeat(32);
+        assert!(with(false, None).is_ok());
+        assert!(with(true, Some(&key)).is_ok());
+        assert!(with(true, None).is_err());
+        assert!(with(false, Some(&key)).is_err());
+        assert!(with(true, Some(&"3F".repeat(32))).is_err());
+        assert!(with(true, Some("../x")).is_err());
+        // A token longer than the host takes is refused.
+        let mut spec = ws(url, "agent/X-1", "main");
+        spec.git = Some(tinfirm_protocol::GitCredentials::new(
+            "x-access-token",
+            tinfirm_protocol::Secret::new("t".repeat(MAX_GIT_TOKEN_BYTES + 1)),
+        ));
+        let error = validate_workspace(&spec, false).unwrap_err();
+        assert!(error.contains("git.token is over 16384 bytes"), "{error}");
     }
 
     #[test]

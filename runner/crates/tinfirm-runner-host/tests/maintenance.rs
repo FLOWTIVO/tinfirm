@@ -625,3 +625,46 @@ async fn the_running_host_maintains_mirrors_and_homes_in_the_background() {
     })
     .await;
 }
+
+/// ADR-0116: a mirror named by a credential's key (`git.mirrorKey`) is found, kept while used and
+/// deleted when idle, like a mirror named by a token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credentials_mirror_is_maintained_like_any_other() {
+    with_timeout(120, async {
+        let idle = TestRepo::new();
+        let used = TestRepo::new();
+        let scratch = tempfile::tempdir().unwrap();
+        let mirrors = Mirrors::new(scratch.path().join("mirrors"));
+        let credential = "3f".repeat(32);
+        let token = Secret::new("Basic eC1hY2Nlc3MtdG9rZW46Z2hzX29uZQ==");
+        let mut keys = Vec::new();
+        for repo in [&idle, &used] {
+            let key = mirror::credential_mirror_key(&repo.url, &credential);
+            drop(
+                mirrors
+                    .update_keyed(&key, &repo.url, Some(&token))
+                    .await
+                    .unwrap(),
+            );
+            keys.push(key);
+        }
+        let listed: Vec<String> = mirrors.list().unwrap().into_iter().map(|m| m.key).collect();
+        let mut expected = keys.clone();
+        expected.sort();
+        assert_eq!(listed, expected);
+        let now = Utc::now();
+        edit_state(&mirrors.path_of(&keys[0]), |s| {
+            s.last_used_at = Some(days_before(now, 31));
+        });
+        edit_state(&mirrors.path_of(&keys[1]), |s| {
+            s.last_used_at = Some(days_before(now, 1));
+        });
+        let report = pass(&mirrors, &Policy::default(), now).await;
+        assert_eq!(deleted_keys(&report), vec![keys[0].clone()]);
+        assert!(!mirrors.path_of(&keys[0]).exists());
+        assert!(mirrors.path_of(&keys[1]).exists());
+        // A key that is no mirror's name is refused.
+        assert!(mirrors.update_keyed("../x", &used.url, None).await.is_err());
+    })
+    .await;
+}

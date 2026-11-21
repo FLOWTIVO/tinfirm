@@ -1,7 +1,7 @@
 import { TestBed } from '@angular/core/testing';
 import type { RunRepository } from '../../../api/generated/models';
 import { changeRequestLabel } from '../../../shared/run-status';
-import { gitResult, RunRepositories } from './run-repositories';
+import { gitResult, revokedNote, RunRepositories } from './run-repositories';
 
 const SERVER: RunRepository = {
   repositoryId: 'r1',
@@ -41,6 +41,48 @@ describe('gitResult', () => {
     const pending = { repositoryName: 'x', dir: 'x', readOnly: false };
     expect(gitResult(pending, true)).toBe('Working');
     expect(gitResult(pending, false)).toBe('No result');
+  });
+});
+
+describe('revokedNote', () => {
+  const revoked = {
+    reason: 'RECONNECT_COMPANY',
+    message:
+      "Tinfirm revoked this run's access to shop-web: the shared credential CI bot was disabled.",
+    revokedAt: '2026-11-19T10:00:00Z',
+    delivery: 'SENT' as const,
+  };
+
+  it('says why the git access went, and whether the host could drop it', () => {
+    expect(revokedNote(WEB)).toBeNull();
+    expect(revokedNote({ ...WEB, gitRevoked: revoked })).toBe(
+      `${revoked.message} The runner host was sent this and has not confirmed it yet. It is sent again when the host reconnects.`,
+    );
+    expect(
+      revokedNote({
+        ...WEB,
+        gitRevoked: { ...revoked, delivery: 'CONFIRMED', confirmedAt: '2026-11-19T10:00:01Z' },
+      }),
+    ).toBe(`${revoked.message} The runner host dropped the token.`);
+    expect(revokedNote({ ...WEB, gitRevoked: { ...revoked, delivery: 'PENDING' } })).toContain(
+      'It is told when it reconnects, before it pushes',
+    );
+    expect(revokedNote({ ...WEB, gitRevoked: { ...revoked, delivery: 'UNSUPPORTED' } })).toContain(
+      'cannot drop a token (an older version), so the run keeps its git access until it ends',
+    );
+    expect(gitResult({ ...WEB, commits: 2, gitRevoked: revoked }, false)).toBe(
+      '2 commits, not pushed (access revoked)',
+    );
+  });
+
+  it('shows the revocation on the repository', async () => {
+    const el = await render({ repositories: [{ ...WEB, commits: 1, gitRevoked: revoked }] });
+    const row = el.querySelector('[data-testid=run-repository]')!;
+    expect(row.querySelector('[data-testid=git-revoked]')?.textContent).toBe('Git access revoked');
+    expect(row.querySelector('[data-testid=git-revoked-note]')?.textContent?.trim()).toBe(
+      revokedNote({ ...WEB, gitRevoked: revoked }),
+    );
+    expect(row.textContent).toContain('1 commit, not pushed (access revoked)');
   });
 });
 

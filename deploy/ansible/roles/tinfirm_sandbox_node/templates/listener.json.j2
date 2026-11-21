@@ -1,0 +1,17 @@
+{#- The listener's configuration (runner/crates/tinfirm-node-agent/README.md, "The
+    listener's"): TLS alone. `socket` is the single machine's, which is set aside. -#}
+{{ {
+  'helperSocket': _tinfirm_sandbox_node_helper_socket,
+  'spool': _tinfirm_sandbox_node_spool,
+  'state': '/var/lib/tinfirm-node-agent/listener',
+  'address': tinfirm_sandbox_node_address,
+  'tls': {
+    'listen': tinfirm_sandbox_node_address ~ ':' ~ (tinfirm_sandbox_node_agent_port | int),
+    'controlHost': tinfirm_sandbox_node_control_host,
+    'certificate': _tinfirm_sandbox_node_cert,
+    'key': _tinfirm_sandbox_node_key,
+    'clientSha256': tinfirm_sandbox_node_client_sha256 | lower,
+  },
+  'peerBuild': tinfirm_sandbox_node_peer_build,
+  'watchMs': tinfirm_sandbox_node_watch_ms | int,
+} | to_nice_json(indent=2) }}

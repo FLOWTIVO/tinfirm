@@ -539,8 +539,10 @@ litellm:
 # runner.existingSecret, so nobody registers it in the app. Its sandboxes are VMs that it
 # creates and deletes through its VM driver (`run --executor vm`, ADR-0096), on DigitalOcean a
 # Droplet per run from the VM image you build first (runner/README.md, "A VM per run"): the
-# pod needs no Docker and no privilege. VMs are Pro's and Enterprise's (elastic runners,
-# ADR-0100): without such a key the server refuses the host, which then stops.
+# pod needs no Docker and no privilege. The VM executor is in every edition, but DigitalOcean's
+# driver, the only one the chart runs today, and ready VMs are Pro's and Enterprise's (elastic
+# runners, ADR-0100, ADR-0114): without such a key the server refuses the host, which then
+# stops.
 #
 # One pod, which serves many runs at once (maxConcurrentRuns), each in a VM of its own. It
 # connects to the server's public URL, as any runner host, and keeps its runs' records and
@@ -574,18 +576,37 @@ runner:
   # (TINFIRM_PUBLIC_URL, see publicUrl).
   serverUrl: ""
   # The most runs at once (run --max-concurrent-runs), up to 1000: each run is a VM of its
-  # own, so the provider's quota bounds it. Admins can lower it in the app, never raise it.
+  # own, so the provider's quota, or the nodes' free slots, bound it. Admins can lower it in
+  # the app, never raise it.
   maxConcurrentRuns: 4
   # The log filter (TINFIRM_RUNNER_LOG).
   log: info
   vm:
-    # The VM driver (run --vm-driver): `digitalocean`, the runner host's own.
+    # The VM driver (run --vm-driver), one of the runner host's own (ADR-0114):
+    # - `digitalocean`: a Droplet per run. Pro and Enterprise: a server without elastic
+    #   runners refuses the host. Set vm.digitalocean, never vm.node.nodes.
+    # - `node`: sandbox nodes outside the cluster, each with the node agent (ADR-0112). Every
+    #   edition. Set vm.node, never vm.digitalocean.templates. Not ready for production
+    #   (ADR-0112): the node agent makes VMs, and the role that sets a node up, with the
+    #   node's own firewall, ran on a machine once. The node's hardening has run on no
+    #   machine, and this pod has not run against a node yet. `run` refuses the driver at
+    #   its start when a node's `verify` reports a problem.
+    # - `pod`: a pod per run in a namespace of the runs' own, with Firecracker in it as an
+    #   unprivileged process (ADR-0115, decision 2), on workers with KVM. Pro and Enterprise
+    #   (ADR-0114): a server without elastic runners refuses the host. Set vm.cluster and
+    #   vm.pod. Not ready for production: the driver has run against no cluster yet. `run`
+    #   refuses to start while the driver's check of the runs' namespace (its two network
+    #   policies, its quota, the admission policy's refusals) reports a problem.
     driver: digitalocean
     # The template every VM is created from (run --vm-template): a key of
-    # vm.digitalocean.templates.
+    # vm.digitalocean.templates or vm.pod.templates, or a template that one of vm.node.nodes
+    # offers.
     template: sandbox
     # The port where the sandbox's bridge listens in the VM (run --vm-port), which the
-    # template's firewall opens to this pod alone.
+    # template's firewall opens to this pod alone. With `node`, the template's bridgePort in
+    # the node agents' helper.json; the pod dials the node's published port instead. With
+    # `pod`, the run pod's port, which relays to the VM and which the runs' allow rule opens
+    # to this pod alone.
     port: 7443
     # Seconds from a VM's creation to its bridge's first connection (run --vm-start-timeout).
     startTimeout: 900
@@ -595,8 +616,9 @@ runner:
     # More checks of what a VM must not reach (run --vm-probe): tcp:HOST:PORT, dns:NAME or
     # http://HOST[:PORT]/PATH, e.g. your database.
     probes: []
-    # The DigitalOcean driver (runner/README.md): its API token from a Secret, and its
-    # templates, as its configuration file (TINFIRM_DO_CONFIG) takes them.
+    # The DigitalOcean driver (runner/README.md), with driver `digitalocean`: its API token
+    # from a Secret, and its templates, as its configuration file (TINFIRM_DO_CONFIG) takes
+    # them. Neither required nor rendered with driver `node`.
     digitalocean:
       # Existing Secret with a DigitalOcean API token that may create, read and delete
       # Droplets and read firewalls and VPCs. The driver holds it; the runner host never reads it.
@@ -615,11 +637,147 @@ runner:
       #   vpc: VPC_UUID              # the sandboxes' own VPC
       #   firewall: FIREWALL_ID      # the Cloud Firewall on the tag tinfirm-sandbox
       #   bridgePort: 7443           # optional; vm.port
-  # Ready VMs (ADR-0098): the most that Tinfirm's admins may keep waiting (run
-  # --pool-max-ready; 0 turns them off), and the image they start (`any`: the multi-runtime
-  # image, so that they serve every runtime).
+    # The node driver (runner/README.md, "Sandbox nodes"), with driver `node`: its
+    # configuration file (TINFIRM_NODE_DRIVER_CONFIG) from these values, in a ConfigMap. The
+    # pod reaches each node over TLS, both certificates pinned; a node's local socket (a
+    # single machine) is not for a pod.
+    node:
+      # Existing Secret with this host's client certificate and its key, both DER, as
+      # `tinfirm-node-agent identity --cert client.crt --key client.key` writes them; each
+      # node's listener pins the certificate's SHA-256 (tls.clientSha256):
+      #   kubectl create secret generic tinfirm-node-driver \
+      #     --from-file=client.crt=./client.crt --from-file=client.key=./client.key
+      # The driver reads the key only from a file of the pod's user that no one else may read
+      # (0600). A Secret's files belong to root, so an init container copies the key into a
+      # memory volume as the pod's user, 0600; the certificate stays in the Secret's volume.
+      existingSecret: tinfirm-node-driver
+      secretKeys:
+        certificate: client.crt
+        key: client.key
+      # A node agent of another release: `warn` in the log, or `refuse`.
+      peerBuild: warn
+      # The ports on which the nodes publish the VMs' bridges, the same on every node: the
+      # node agents' helper.json network.firstPort to firstPort + maxVms - 1. Only the pod's
+      # NetworkPolicy uses them; the driver learns each VM's port from its node. The default
+      # is the agent's documented firstPort, 20000, with its most slots, 1024.
+      publishedPorts:
+        first: 20000
+        last: 21023
+      # The nodes, 1 to 64: each one's name (1 to 32 of a-z, 0-9 and -), the address of its
+      # node agent's TLS listener (HOST:PORT, the listener.json's tls.listen as this pod
+      # reaches it), the SHA-256 of its certificate (`tinfirm-node-agent fingerprint`), and
+      # the templates of its helper.json that it offers. A node is outside the cluster, and
+      # admits the published ports from its network.controlHost alone: the pod's connections
+      # must leave the cluster from that one address (a NAT gateway, an egress IP).
+      nodes: []
+      # - name: node-1
+      #   address: 10.0.0.20:7700
+      #   nodeSha256: 64 hex digits
+      #   templates: [sandbox-4c8g]
+    # The runs' namespace, with driver `pod`, and what the chart installs there: the
+    # ServiceAccount of the run pods, a network policy that denies everything and one rule
+    # that admits this pod to the run pods' port (vm.port), a ResourceQuota, which gives the
+    # driver its capacity, the driver's Role, and the admission policy for run pods. The
+    # driver reads the two network policies at its start and at each check, and starts no VM
+    # while one is missing or differs from what it expects. Not rendered with another driver.
+    cluster:
+      # The operator's statement, word for word: "the workers for runs hold nothing else".
+      # Write it only when the workers that run the run pods (vm.pod.nodeSelector) run no
+      # other workload, not this pod either, and their kubelet's credential and cloud identity
+      # open nothing else (ADR-0115, decisions 1 and 6). The host then reports its isolation
+      # as `machine`, stated by the operator. No default: the chart does not render without it.
+      isolationStatement: ""
+      # The runs' namespace: another than the release's, since it may hold no Secret but the
+      # runs' tickets. One release per runs' namespace.
+      namespace: tinfirm-runs
+      # Create it, labelled for Pod Security: `restricted` enforced with vm.pod.tap.mode
+      # `multus`; with `init` no enforce label, since that pod passes neither `restricted` nor
+      # `baseline`, and `warn` and `audit` at `restricted`, which shows the difference. false:
+      # the namespace exists; label it so yourself. Uninstalling the release deletes a
+      # namespace the chart created, with its run pods.
+      createNamespace: true
+      # The ServiceAccount of every run pod: no rights, no token.
+      runServiceAccount: tinfirm-run
+      # Who refuses a run pod that breaks the rules (another ServiceAccount, a token, another
+      # Secret, another image, a capability):
+      # - `validatingAdmissionPolicy`: the chart's ValidatingAdmissionPolicy and its binding
+      #   (admissionregistration.k8s.io/v1, Kubernetes 1.30 and later), one for the pods and
+      #   one for the Secrets of the runs' namespace.
+      # - `external`: the cluster's own engine (Kyverno, Gatekeeper, OKD's), with the same
+      #   rules; the chart renders no policy. The driver's own check, server-side dry runs of
+      #   pods that must be refused, then decides whether it starts.
+      admission: validatingAdmissionPolicy
+      # The ResourceQuota's `hard`. Empty: maxConcurrentRuns + pool.maxReady pods of the
+      # template vm.template, with their CPU, memory, ephemeral storage and devices.
+      quota:
+        hard: {}
+    # The run pod (ADR-0115, decision 2), with driver `pod`: its image, its sizes, its tap
+    # device, its devices and its workers. Rendered into the driver's configuration.
+    pod:
+      # The run pod's image, by digest only: the runner host's binary, Firecracker, the VM's
+      # kernel and its root file system image (built by the operator).
+      image:
+        repository: ""
+        digest: ""
+      # The sizes of VM by name (1 to 32 of a-z, 0-9 and -): vcpus (1 to 32), memoryMib (128
+      # to 262144) and diskMib (1024 to 1048576). The pod requests the VM's memory plus 208
+      # MiB for Firecracker, vm-pod and its memory volume.
+      templates: {}
+      # sandbox-4c8g:
+      #   vcpus: 4
+      #   memoryMib: 8192
+      #   diskMib: 32768
+      tap:
+        # `multus`: the network plugin hands the pod its tap device (Multus with the CNI `tap`
+        # plugin), from the NetworkAttachmentDefinition networkAttachment (`name` or
+        # `namespace/name`); the pod passes `restricted`. `init`: an init container with
+        # NET_ADMIN in the pod's own network namespace makes it.
+        #
+        # With `multus` the cluster's admin installs the attachment; the chart does not. Its
+        # chain makes the tap with the pod's side of cidr (the first address) and turns the
+        # tap's own IPv4 forwarding off, which the pod cannot do: the run pod's program does
+        # not start the VM while the tap forwards. For the default cidr:
+        #   apiVersion: k8s.cni.cncf.io/v1
+        #   kind: NetworkAttachmentDefinition
+        #   metadata: {name: tinfirm-tap, namespace: tinfirm-runs}
+        #   spec:
+        #     config: |
+        #       {"cniVersion": "1.0.0", "name": "tinfirm-tap", "plugins": [
+        #         {"type": "tap", "ipam": {"type": "static", "addresses": [{"address": "172.30.0.1/30"}]}},
+        #         {"type": "tuning", "sysctl": {"net.ipv4.conf.IFNAME.forwarding": "0"}}
+        #       ]}
+        # The `tuning` plugin puts the tap's name, tap0, in place of IFNAME. The `tap` plugin
+        # gets no owner or group. Where the pods have IPv6, add
+        # "net.ipv6.conf.IFNAME.forwarding": "0" to the sysctl object; where they have none,
+        # leave it out, since the attachment then fails on it. On OKD the `tap` plugin also
+        # takes the container's SELinux label (selinuxcontext).
+        mode: multus
+        networkAttachment: ""
+        # The tap's /30: the pod's side has its first address, the guest the second.
+        cidr: 172.30.0.0/30
+      # The device plugin's resource names for /dev/kvm and /dev/net/tun.
+      devices:
+        kvm: ""
+        tun: ""
+      # The workers for runs (at least one label), and the tolerations of their taints. The
+      # driver also keeps every run pod off this pod's worker.
+      nodeSelector: {}
+      tolerations: []
+      disk:
+        # `copy`, the only one built: a sparse copy of the image in the pod's image.
+        variant: copy
+        # Where the root disk lives: `emptyDir`, on the worker's own storage, or `ephemeral`,
+        # a claim made for the pod and deleted with it, of storageClassName (empty: the
+        # cluster's default).
+        volume: emptyDir
+        storageClassName: ""
+  # Ready VMs (ADR-0098), Pro's and Enterprise's with either driver, since each one waits,
+  # and costs, on a provider or in a node's slot: the most that Tinfirm's admins may keep
+  # waiting (run --pool-max-ready). 0, the default, turns them off, and every run starts cold;
+  # above 0 the server needs a key with elastic runners. Keep it 0 in Community. The image
+  # they start (`any`: the multi-runtime image, so that they serve every runtime).
   pool:
-    maxReady: 4
+    maxReady: 0
     runtime: claude
     headroom: 0
     maxAge: 360
@@ -947,7 +1105,9 @@ networkPolicy:
   # to it: it dials the server and the VMs' bridges, whose tunnels carry the sandboxes' traffic.
   # Egress: DNS as above, https (the server's public URL, the VM provider's API, git hosts,
   # model gateways and what runner.extraConfig's TINFIRM_RUNNER_EGRESS_ALLOW allows the
-  # sandboxes), the VMs' bridge port, and runner.egress.extra (not egress.extra).
+  # sandboxes), the VMs' bridge port (driver digitalocean), the nodes' agent and published
+  # ports (driver node) or the run pods' port and the API server (driver pod), and
+  # networkPolicy.runner.egress.extra (not egress.extra).
   runner:
     egress:
       # https anywhere by default, private addresses included: the server's public URL may
@@ -961,12 +1121,29 @@ networkPolicy:
               cidr: ::/0
         ports:
           - 443
-      # The VMs, on runner.vm.port: their VPC (connect: private) or anywhere (public).
+      # Driver digitalocean: the VMs, on runner.vm.port: their VPC (connect: private) or
+      # anywhere (public).
       vms:
         to:
           - ipBlock:
               cidr: 0.0.0.0/0
           - ipBlock:
               cidr: ::/0
+      # Driver node: the nodes, on their agent's port (each address's) and on
+      # runner.vm.node.publishedPorts. Empty, the default: a rule per node, to its address
+      # alone, which must then be an IP address. With host names, name the nodes' peers here
+      # (an ipBlock of their network); every node's ports then go to all of them.
+      nodes:
+        to: []
+      # Driver pod: the Kubernetes API server, which the driver calls. A NetworkPolicy sees
+      # the API server's own addresses and port, not the `kubernetes` Service's: name them
+      # (`kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes`),
+      # e.g. `- ipBlock: {cidr: 10.0.0.10/32}`. Required with driver pod. The run pods' port
+      # needs no value: the rule names the runs' namespace and their label.
+      apiServer:
+        to: []
+        ports:
+          - 443
+          - 6443
       # More raw NetworkPolicyEgressRules, e.g. hosts the sandboxes reach on other ports.
       extra: []

@@ -435,6 +435,40 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- define "tinfirm.runner.digitaloceanConfigDir" -}}
 /etc/tinfirm/digitalocean
 {{- end }}
+{{- define "tinfirm.runner.nodeConfigDir" -}}
+/etc/tinfirm/node-driver
+{{- end }}
+{{- define "tinfirm.runner.nodeCertificateDir" -}}
+/etc/tinfirm/node-driver-certificate
+{{- end }}
+{{/* The key's copy, the pod's user's, 0600 (node.rs refuses any other), in a memory volume. */}}
+{{- define "tinfirm.runner.nodeKeyDir" -}}
+/etc/tinfirm/node-driver-key
+{{- end }}
+{{/* The key in the Secret's volume (root's, 0440), mounted in the init container alone. */}}
+{{- define "tinfirm.runner.nodeKeySourceDir" -}}
+/etc/tinfirm/node-driver-key-source
+{{- end }}
+
+{{/*
+A node's address, split: dict "host" "port" "ip" "cidr"; "ip" is true for an IPv4 address or an
+IPv6 address in brackets, whose "cidr" is the address alone.
+*/}}
+{{- define "tinfirm.runner.nodeAddress" -}}
+{{- $address := toString . }}
+{{- $host := regexReplaceAll ":[0-9]+$" $address "" }}
+{{- $port := regexFind "[0-9]+$" $address | atoi }}
+{{- $ip := false }}
+{{- $cidr := "" }}
+{{- if regexMatch "^\\[[0-9A-Fa-f:.]+\\]$" $host }}
+{{- $ip = true }}
+{{- $cidr = printf "%s/128" (trimPrefix "[" (trimSuffix "]" $host)) }}
+{{- else if regexMatch "^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$" $host }}
+{{- $ip = true }}
+{{- $cidr = printf "%s/32" $host }}
+{{- end }}
+{{- toJson (dict "host" $host "port" $port "ip" $ip "cidr" $cidr) }}
+{{- end }}
 
 {{/*
 Fails the render on a runner the server or the runner host would refuse: a company that
@@ -452,12 +486,268 @@ driver's configuration lacks.
 {{- fail (printf "runner.name: %q must be letters, digits, '.', '_' and '-', starting with a letter or digit, at most 100 characters" (toString $r.name)) }}
 {{- end }}
 {{- $_ := required "runner.existingSecret is required: the Secret with the runner host's token" $r.existingSecret }}
+{{- $nodes := $r.vm.node.nodes | default list }}
+{{- $doTemplates := $r.vm.digitalocean.templates | default dict }}
 {{- if eq $r.vm.driver "digitalocean" }}
+{{- if $nodes }}
+{{- fail "runner.vm.node.nodes is set, but runner.vm.driver is digitalocean: set runner.vm.driver: node to use the sandbox nodes, or remove runner.vm.node.nodes" }}
+{{- end }}
 {{- $_ := required "runner.vm.digitalocean.existingSecret is required: the Secret with the DigitalOcean API token" $r.vm.digitalocean.existingSecret }}
-{{- if not (hasKey ($r.vm.digitalocean.templates | default dict) $r.vm.template) }}
+{{- if not (hasKey $doTemplates $r.vm.template) }}
 {{- fail (printf "runner.vm.template: %q is not a key of runner.vm.digitalocean.templates" (toString $r.vm.template)) }}
 {{- end }}
+{{- else if eq $r.vm.driver "node" }}
+{{- if $doTemplates }}
+{{- fail "runner.vm.digitalocean.templates is set, but runner.vm.driver is node: remove runner.vm.digitalocean.templates, or set runner.vm.driver: digitalocean and remove runner.vm.node.nodes" }}
 {{- end }}
+{{- if not $nodes }}
+{{- fail "runner.vm.driver is node, but runner.vm.node.nodes is empty: name at least one node, with its name, address (HOST:PORT of its agent's TLS listener), nodeSha256 and templates" }}
+{{- end }}
+{{- $_ := required "runner.vm.node.existingSecret is required: the Secret with the runner host's client certificate and key for the nodes" $r.vm.node.existingSecret }}
+{{- if gt (int $r.vm.node.publishedPorts.first) (int $r.vm.node.publishedPorts.last) }}
+{{- fail (printf "runner.vm.node.publishedPorts: first (%v) is above last (%v)" $r.vm.node.publishedPorts.first $r.vm.node.publishedPorts.last) }}
+{{- end }}
+{{- $names := list }}
+{{- $offered := list }}
+{{- $np := .Values.networkPolicy }}
+{{- range $nodes }}
+{{- if has .name $names }}
+{{- fail (printf "runner.vm.node.nodes: the name %q is there twice; each node's name is its own" .name) }}
+{{- end }}
+{{- $names = append $names .name }}
+{{- $offered = concat $offered .templates }}
+{{- $address := include "tinfirm.runner.nodeAddress" .address | fromJson }}
+{{- if gt (int $address.port) 65535 }}
+{{- fail (printf "runner.vm.node.nodes: node %q: the address %q has no port from 1 to 65535" .name .address) }}
+{{- end }}
+{{- if and $np.enabled $np.egress.enabled (not $np.runner.egress.nodes.to) (not $address.ip) }}
+{{- fail (printf "runner.vm.node.nodes: node %q has the host name %q, which a NetworkPolicy cannot name: set networkPolicy.runner.egress.nodes.to to the nodes' peers (an ipBlock of their addresses), or give the node's IP address" .name $address.host) }}
+{{- end }}
+{{- end }}
+{{- if not (has $r.vm.template $offered) }}
+{{- fail (printf "runner.vm.template: %q is offered by none of runner.vm.node.nodes (their templates: %s)" (toString $r.vm.template) (uniq $offered | join ", ")) }}
+{{- end }}
+{{- else if eq $r.vm.driver "pod" }}
+{{- include "tinfirm.runner.validatePod" . }}
+{{- end }}
+{{- end }}
+
+{{/*
+The pod driver's rules that the schema cannot express, as the driver checks its configuration
+(ee/runner/tinfirm-runner-host/src/kubernetes/config.rs): the statement word for word, a runs'
+namespace of their own, the image by digest, the template, the tap's attachment, the devices,
+the workers and the disk's storage class.
+*/}}
+{{- define "tinfirm.runner.validatePod" -}}
+{{- $r := .Values.runner }}
+{{- $c := $r.vm.cluster }}
+{{- $p := $r.vm.pod }}
+{{- if or ($r.vm.digitalocean.templates | default dict) ($r.vm.node.nodes | default list) }}
+{{- fail "runner.vm.driver is pod: remove runner.vm.digitalocean.templates and runner.vm.node.nodes, which only the other drivers use" }}
+{{- end }}
+{{- if ne (toString $c.isolationStatement) (include "tinfirm.runs.isolationStatement" .) }}
+{{- fail (printf "runner.vm.cluster.isolationStatement: set it to %q, word for word, only when the workers that run the run pods (runner.vm.pod.nodeSelector) run no other workload, not the runner pod either, and their kubelet's credential and cloud identity open nothing else (ADR-0115, decisions 1 and 6). The runner host then reports its isolation as `machine`, stated by the operator. Without the statement the driver does not start, and the chart does not render" (include "tinfirm.runs.isolationStatement" .)) }}
+{{- end }}
+{{- if eq $c.namespace .Release.Namespace }}
+{{- fail (printf "runner.vm.cluster.namespace: %q is the release's namespace. The runs' namespace must be another, since it may hold no Secret but the runs' tickets" $c.namespace) }}
+{{- end }}
+{{- if or (has $c.namespace (list "default" "kube-system" "kube-public" "kube-node-lease")) (hasPrefix "openshift" $c.namespace) }}
+{{- fail (printf "runner.vm.cluster.namespace: %q is the cluster's own; the runs' namespace is one of their own" $c.namespace) }}
+{{- end }}
+{{- if not (and $p.image.repository $p.image.digest) }}
+{{- fail "runner.vm.pod.image: set repository and digest, the run pod's image, which the driver names by digest alone" }}
+{{- end }}
+{{- $templates := $p.templates | default dict }}
+{{- if not (hasKey $templates (toString $r.vm.template)) }}
+{{- fail (printf "runner.vm.template: %q is not a key of runner.vm.pod.templates" (toString $r.vm.template)) }}
+{{- end }}
+{{- if eq $p.tap.mode "multus" }}
+{{- if not $p.tap.networkAttachment }}
+{{- fail "runner.vm.pod.tap.networkAttachment: with mode multus, the NetworkAttachmentDefinition that hands the pod its tap device, `name` or `namespace/name`" }}
+{{- end }}
+{{- else if $p.tap.networkAttachment }}
+{{- fail "runner.vm.pod.tap.networkAttachment: only with mode multus" }}
+{{- end }}
+{{- $cidr := splitList "/" $p.tap.cidr }}
+{{- $octets := splitList "." (first $cidr) }}
+{{- range $octets }}
+{{- if gt (atoi .) 255 }}
+{{- fail (printf "runner.vm.pod.tap.cidr: %q is not an IPv4 network" $p.tap.cidr) }}
+{{- end }}
+{{- end }}
+{{- if ne (mod (atoi (last $octets)) 4) 0 }}
+{{- fail (printf "runner.vm.pod.tap.cidr: %q is not the first address of a /30, such as 172.30.0.0/30" $p.tap.cidr) }}
+{{- end }}
+{{- if not (and $p.devices.kvm $p.devices.tun) }}
+{{- fail "runner.vm.pod.devices: set kvm and tun, the device plugin's resource names for /dev/kvm and /dev/net/tun" }}
+{{- end }}
+{{- if eq $p.devices.kvm $p.devices.tun }}
+{{- fail "runner.vm.pod.devices: kvm and tun are the same resource" }}
+{{- end }}
+{{- if not $p.nodeSelector }}
+{{- fail "runner.vm.pod.nodeSelector: at least one label, which selects the workers for runs" }}
+{{- end }}
+{{- if and $p.disk.storageClassName (ne $p.disk.volume "ephemeral") }}
+{{- fail "runner.vm.pod.disk.storageClassName: only with volume ephemeral" }}
+{{- end }}
+{{- $np := .Values.networkPolicy }}
+{{- if and $np.enabled $np.egress.enabled (not $np.runner.egress.apiServer.to) }}
+{{- fail "networkPolicy.runner.egress.apiServer.to: with driver pod, the API server's own addresses (kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes), which the driver calls; a NetworkPolicy cannot name the `kubernetes` Service" }}
+{{- end }}
+{{- end }}
+
+{{/* The operator's statement of the pod driver's configuration (config.rs, ISOLATION_STATEMENT). */}}
+{{- define "tinfirm.runs.isolationStatement" -}}
+the workers for runs hold nothing else
+{{- end }}
+
+{{/* The runner pod's own ServiceAccount, with driver pod only: the driver's Role is bound to it. */}}
+{{- define "tinfirm.runner.serviceAccountName" -}}
+{{- if eq .Values.runner.vm.driver "pod" }}
+{{- include "tinfirm.runner.fullname" . }}
+{{- else }}
+{{- include "tinfirm.serviceAccountName" . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Where the runner pod gets its ServiceAccount token (`token`) and the cluster's CA (`ca.crt`),
+with driver pod: a projected volume, which holds nothing else. The driver reads them here.
+*/}}
+{{- define "tinfirm.runner.kubernetesApiDir" -}}
+/etc/tinfirm/kubernetes-api
+{{- end }}
+{{- define "tinfirm.runner.podConfigDir" -}}
+/etc/tinfirm/pod-driver
+{{- end }}
+
+{{/* The runs' objects, whose names the driver's configuration carries. */}}
+{{- define "tinfirm.runs.defaultDenyName" -}}
+tinfirm-runs-default-deny
+{{- end }}
+{{- define "tinfirm.runs.allowRunnerName" -}}
+tinfirm-runs-allow-runner
+{{- end }}
+{{- define "tinfirm.runs.resourceQuotaName" -}}
+tinfirm-runs
+{{- end }}
+
+{{/* The label of every run pod, which the allow rule selects (spec.rs, SANDBOX_LABEL). */}}
+{{- define "tinfirm.runs.sandboxLabels" -}}
+tinfirm.flowtivo.com/sandbox: vm
+{{- end }}
+
+{{/*
+The `spec` of the runs' default-deny policy, as JSON: every pod, nothing in or out. The driver
+compares it with spec.rs's default_deny_spec(), field by field.
+*/}}
+{{- define "tinfirm.runs.defaultDenySpec" -}}
+{{- toPrettyJson (dict "podSelector" dict "policyTypes" (list "Ingress" "Egress")) }}
+{{- end }}
+
+{{/*
+The `spec` of the one allow rule, as JSON: into run pods, from the runner pod, to the bridge's
+port (spec.rs, allow_runner_spec).
+*/}}
+{{- define "tinfirm.runs.allowRunnerSpec" -}}
+{{- $from := dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Release.Namespace)) "podSelector" (dict "matchLabels" (include "tinfirm.runner.selectorLabels" . | fromYaml)) }}
+{{- $ingress := dict "from" (list $from) "ports" (list (dict "protocol" "TCP" "port" (int .Values.runner.vm.port))) }}
+{{- toPrettyJson (dict "podSelector" (dict "matchLabels" (include "tinfirm.runs.sandboxLabels" . | fromYaml)) "policyTypes" (list "Ingress") "ingress" (list $ingress)) }}
+{{- end }}
+
+{{/* The run pod's image: repository@digest. */}}
+{{- define "tinfirm.runner.podImage" -}}
+{{- printf "%s@%s" .Values.runner.vm.pod.image.repository .Values.runner.vm.pod.image.digest }}
+{{- end }}
+
+{{/*
+The pod driver's configuration file, pod-driver.json, as PodConfig reads it
+(ee/runner/tinfirm-runner-host/src/kubernetes/config.rs): every field, the defaults included.
+*/}}
+{{- define "tinfirm.runner.podConfig" -}}
+{{- $v := .Values.runner.vm }}
+{{- $p := $v.pod }}
+{{- $templates := dict }}
+{{- range $name, $t := $p.templates }}
+{{- $_ := set $templates $name (dict "vcpus" (int $t.vcpus) "memoryMib" (int $t.memoryMib) "diskMib" (int $t.diskMib)) }}
+{{- end }}
+{{- $tap := dict "mode" $p.tap.mode "cidr" $p.tap.cidr }}
+{{- if eq $p.tap.mode "multus" }}
+{{- $_ := set $tap "networkAttachment" $p.tap.networkAttachment }}
+{{- end }}
+{{- $disk := dict "variant" $p.disk.variant "volume" $p.disk.volume }}
+{{- with $p.disk.storageClassName }}
+{{- $_ := set $disk "storageClassName" . }}
+{{- end }}
+{{- $tolerations := list }}
+{{- range $p.tolerations }}
+{{- $toleration := omit . "tolerationSeconds" }}
+{{- if hasKey . "tolerationSeconds" }}
+{{- $_ := set $toleration "tolerationSeconds" (int64 .tolerationSeconds) }}
+{{- end }}
+{{- $tolerations = append $tolerations $toleration }}
+{{- end }}
+{{- $config := dict
+  "isolationStatement" $v.cluster.isolationStatement
+  "namespace" $v.cluster.namespace
+  "runServiceAccount" $v.cluster.runServiceAccount
+  "image" (include "tinfirm.runner.podImage" .)
+  "templates" $templates
+  "tap" $tap
+  "devices" (dict "kvm" $p.devices.kvm "tun" $p.devices.tun)
+  "nodeSelector" $p.nodeSelector
+  "tolerations" $tolerations
+  "disk" $disk
+  "bridgePort" (int $v.port)
+  "runner" (dict "namespace" .Release.Namespace "labels" (include "tinfirm.runner.selectorLabels" . | fromYaml))
+  "policies" (dict "defaultDeny" (include "tinfirm.runs.defaultDenyName" .) "allowRunner" (include "tinfirm.runs.allowRunnerName" .))
+  "resourceQuota" (include "tinfirm.runs.resourceQuotaName" .)
+}}
+{{- toPrettyJson $config }}
+{{- end }}
+
+{{/*
+The runs' ResourceQuota's `hard`: runner.vm.cluster.quota.hard, else maxConcurrentRuns +
+pool.maxReady run pods of the template runner.vm.template, each with what spec.rs's pod
+requests: the VM's vCPUs, its memory plus 208 MiB (VMM_OVERHEAD_MIB, VM_POD_MIB,
+RUN_VOLUME_MIB), 64 MiB of logs plus the disk in an emptyDir (LOGS_MIB), and one of each device.
+*/}}
+{{- define "tinfirm.runs.quotaHard" -}}
+{{- $r := .Values.runner }}
+{{- if $r.vm.cluster.quota.hard }}
+{{- toYaml $r.vm.cluster.quota.hard }}
+{{- else }}
+{{- $p := $r.vm.pod }}
+{{- $t := get $p.templates (toString $r.vm.template) }}
+{{- $n := add (int $r.maxConcurrentRuns) (int $r.pool.maxReady) }}
+{{- $memory := mul $n (add (int $t.memoryMib) 208) }}
+{{- $storage := mul $n (add 64 (ternary (int $t.diskMib) 0 (eq $p.disk.volume "emptyDir"))) }}
+{{- $cpu := mul $n (int $t.vcpus) }}
+{{- $hard := dict
+  "pods" (toString $n)
+  "requests.cpu" (toString $cpu)
+  "limits.cpu" (toString $cpu)
+  "requests.memory" (printf "%dMi" $memory)
+  "limits.memory" (printf "%dMi" $memory)
+  "requests.ephemeral-storage" (printf "%dMi" $storage)
+  "limits.ephemeral-storage" (printf "%dMi" $storage)
+}}
+{{- $_ := set $hard (printf "requests.%s" $p.devices.kvm) (toString $n) }}
+{{- $_ := set $hard (printf "requests.%s" $p.devices.tun) (toString $n) }}
+{{- toYaml $hard }}
+{{- end }}
+{{- end }}
+
+{{/* The node driver's configuration file, node-driver.json: the nodes, with the mounted certificate's and key's files. */}}
+{{- define "tinfirm.runner.nodeConfig" -}}
+{{- $n := .Values.runner.vm.node }}
+{{- $certificate := printf "%s/%s" (include "tinfirm.runner.nodeCertificateDir" .) $n.secretKeys.certificate }}
+{{- $key := printf "%s/%s" (include "tinfirm.runner.nodeKeyDir" .) $n.secretKeys.key }}
+{{- $nodes := list }}
+{{- range $n.nodes }}
+{{- $nodes = append $nodes (dict "name" .name "address" .address "nodeSha256" (lower .nodeSha256) "certificate" $certificate "key" $key "templates" .templates) }}
+{{- end }}
+{{- toPrettyJson (dict "nodes" $nodes "peerBuild" $n.peerBuild) }}
 {{- end }}
 
 {{/* The DigitalOcean driver's configuration file, digitalocean.json, with the mounted token's file. */}}
@@ -465,4 +755,18 @@ driver's configuration lacks.
 {{- $do := .Values.runner.vm.digitalocean }}
 {{- $config := dict "tokenFile" (printf "%s/%s" (include "tinfirm.runner.digitaloceanTokenDir" .) $do.secretKeys.token) "connect" $do.connect "templates" ($do.templates | default dict) }}
 {{- toPrettyJson $config }}
+{{- end }}
+
+{{/*
+The admission policy's test of one toleration `t` (CEL) against one of runner.vm.pod.tolerations:
+each field as configured, an absent one absent (operator: Equal), as spec.rs's pod carries it.
+*/}}
+{{- define "tinfirm.runs.tolerationRule" -}}
+{{- $tests := list }}
+{{- if .key }}{{ $tests = append $tests (printf "has(t.key) && t.key == '%s'" .key) }}{{ else }}{{ $tests = append $tests "!has(t.key)" }}{{ end }}
+{{- if eq (.operator | default "Equal") "Exists" }}{{ $tests = append $tests "has(t.operator) && t.operator == 'Exists'" }}{{ else }}{{ $tests = append $tests "(!has(t.operator) || t.operator == 'Equal')" }}{{ end }}
+{{- if .value }}{{ $tests = append $tests (printf "has(t.value) && t.value == '%s'" .value) }}{{ else }}{{ $tests = append $tests "!has(t.value)" }}{{ end }}
+{{- if .effect }}{{ $tests = append $tests (printf "has(t.effect) && t.effect == '%s'" .effect) }}{{ else }}{{ $tests = append $tests "!has(t.effect)" }}{{ end }}
+{{- if hasKey . "tolerationSeconds" }}{{ $tests = append $tests (printf "has(t.tolerationSeconds) && t.tolerationSeconds == %d" (int64 .tolerationSeconds)) }}{{ else }}{{ $tests = append $tests "!has(t.tolerationSeconds)" }}{{ end }}
+{{- join " && " $tests }}
 {{- end }}

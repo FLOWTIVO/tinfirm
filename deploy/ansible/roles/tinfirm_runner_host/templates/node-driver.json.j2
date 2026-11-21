@@ -1,0 +1,15 @@
+{#- The node driver's configuration (runner/README.md, "Sandbox nodes"): every node that has a
+    pin now, over TLS, with its pinned certificate and this host's client certificate and key.
+    A node without a pin is left out. The driver refuses an unknown field. -#}
+{%- set nodes = [] -%}
+{%- for node in _tinfirm_runner_host_nodes_pinned -%}
+{%-   set _ = nodes.append({
+        'name': node.name,
+        'address': node.address,
+        'nodeSha256': node.nodeSha256 | lower,
+        'certificate': _tinfirm_runner_host_node_cert,
+        'key': _tinfirm_runner_host_node_key,
+        'templates': node.templates | list,
+      }) -%}
+{%- endfor -%}
+{{ {'nodes': nodes, 'peerBuild': tinfirm_runner_host_node_peer_build} | to_nice_json(indent=2) }}

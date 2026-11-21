@@ -71,6 +71,33 @@ public interface ConversationBindings {
      */
     BindingUse use(UUID companyId, UUID bindingId, String purpose);
 
+    /**
+     * {@link #use(UUID, UUID, String)} for a run's git (ADR-0116, decision 8): the same gate, and for a binding on a
+     * credential of kind {@code APP} the run's own tokens in place of the credential's: one per access, limited to
+     * the repositories of {@code scope}, with {@code contents} and {@code pull_requests} at the lower of the binding's
+     * access now and the repository's ({@link BindingUse.AppTokens}); {@link BindingUse.NotCovered} when the
+     * installation does not cover one. Any other binding answers as {@link #use(UUID, UUID, String)} does.
+     */
+    default BindingUse use(UUID companyId, UUID bindingId, String purpose, @Nullable GitScope scope) {
+        return use(companyId, bindingId, purpose);
+    }
+
+    /** The repositories of a run that one binding's account clones, for its tokens (ADR-0116). */
+    record GitScope(List<GitRepository> repositories) {
+
+        public GitScope {
+            repositories = List.copyOf(repositories);
+        }
+    }
+
+    /**
+     * One repository of a {@link GitScope}.
+     *
+     * @param readOnly the run may only read it, whatever the binding's access
+     */
+    record GitRepository(UUID repositoryId, String url, boolean readOnly) {
+    }
+
     Optional<BindingInfo> find(UUID companyId, UUID bindingId);
 
     /** The conversation's binding on the system, if it was resolved. */
@@ -126,6 +153,33 @@ public interface ConversationBindings {
             public String toString() {
                 return "Token[binding=" + binding.id() + ", access=" + access + ", credential=***]";
             }
+        }
+
+        /**
+         * A run's own tokens of an {@code APP} credential (ADR-0116), by repository: each valid until its
+         * {@code expiresAt}, at most an hour. Never log them.
+         *
+         * @param access the binding's access now
+         */
+        record AppTokens(BindingInfo binding, AccountInfo account, GrantInfo.Access access,
+                java.util.Map<UUID, Accounts.RunGitToken.Minted> tokens) implements BindingUse {
+
+            public AppTokens {
+                tokens = java.util.Map.copyOf(tokens);
+            }
+
+            @Override
+            public String toString() {
+                return "AppTokens[binding=" + binding.id() + ", access=" + access + ", repositories="
+                        + tokens.keySet() + "]";
+            }
+        }
+
+        /**
+         * The binding holds, and its installation of the GitHub App does not cover a repository of the scope: an
+         * admin installs the App there (ADR-0116, decision 7). The message names the repository and the installation.
+         */
+        record NotCovered(BindingInfo binding, String message) implements BindingUse {
         }
 
         /**

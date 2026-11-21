@@ -1,0 +1,199 @@
+---
+# A control host (ADR-0112 decisions 3 and 4; runner/README.md, "Sandbox nodes"). Its client
+# certificate is made here and never leaves it; each node pins its SHA-256 (`tls.clientSha256`),
+# and this host pins each node's (`nodeSha256`). The first run makes and shows the
+# certificate; once every node's fingerprint is set, the role writes the driver's
+# configuration, asks every node through the driver, and starts the host.
+- name: Create the node driver's directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - /etc/tinfirm
+    - "{{ _tinfirm_runner_host_node_dir }}"
+
+- name: Look for the client certificate and key
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+    follow: false
+  loop:
+    - "{{ _tinfirm_runner_host_node_cert }}"
+    - "{{ _tinfirm_runner_host_node_key }}"
+  register: _tinfirm_runner_host_identity
+
+- name: Refuse half an identity
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_runner_host_identity.results[0].stat.exists == _tinfirm_runner_host_identity.results[1].stat.exists
+    fail_msg: >-
+      Of {{ _tinfirm_runner_host_node_cert }} and {{ _tinfirm_runner_host_node_key }} only one exists.
+      The role never overwrites an identity: remove the one that is left, run the role again, and
+      give every node the new fingerprint it shows.
+    quiet: true
+
+- name: Make the client certificate and key
+  ansible.builtin.command:
+    argv:
+      - "{{ tinfirm_runner_host_binary_path }}"
+      - node
+      - identity
+      - --cert
+      - "{{ _tinfirm_runner_host_node_cert }}"
+      - --key
+      - "{{ _tinfirm_runner_host_node_key }}"
+  changed_when: true
+  when: not _tinfirm_runner_host_identity.results[1].stat.exists
+  notify: Reload the runner host
+
+# The driver refuses a key that is not its user's alone (0600).
+- name: Give the key to the runner host's user
+  ansible.builtin.file:
+    path: "{{ _tinfirm_runner_host_node_key }}"
+    owner: "{{ tinfirm_runner_host_user }}"
+    mode: "0600"
+  notify: Reload the runner host
+
+- name: Make the certificate root's
+  ansible.builtin.file:
+    path: "{{ _tinfirm_runner_host_node_cert }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Read the client certificate's fingerprint
+  ansible.builtin.command:
+    argv: ["{{ tinfirm_runner_host_binary_path }}", node, fingerprint, --cert, "{{ _tinfirm_runner_host_node_cert }}"]
+  register: _tinfirm_runner_host_fingerprint
+  changed_when: false
+
+- name: Show what the nodes pin
+  ansible.builtin.debug:
+    msg:
+      - "The control host's client fingerprint, each node's tinfirm_sandbox_node_client_sha256: {{ _tinfirm_runner_host_fingerprint.stdout | trim }}"
+      - "Each node's tinfirm_sandbox_node_control_host is this host's address as the node sees it."
+      - >-
+        This role sets no firewall. Yours lets this host reach each node's agent and published
+        ports (below), and admits nothing from the nodes' network (ADR-0112 decision 3).
+
+- name: Show what this host must reach on each node
+  ansible.builtin.debug:
+    msg: >-
+      Node {{ item.name }}: {{ item.address }}{{ (' and ports ' ~ item.publishedPorts.first ~ ' to '
+      ~ item.publishedPorts.last ~ ' of its address') if item.publishedPorts is defined else
+      ', and the ports where it publishes the VMs (its first_port to first_port + max_vms - 1)' }}.
+  loop: "{{ tinfirm_runner_host_nodes }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+# The driver's configuration names exactly the nodes that have a pin now. A node without one
+# (not pinned yet, or whose pin the operator emptied to stop trusting it) is left out; a change
+# of the file reloads the host, which drains: the runs in progress finish, on the node left out
+# too, and the host starts again without it.
+- name: Name the nodes left out
+  ansible.builtin.debug:
+    msg: >-
+      Waiting, left out of the driver's configuration until they have a nodeSha256:
+      {{ _tinfirm_runner_host_nodes_unpinned | join(', ') }}. Run sandbox-node.yml on them with the
+      fingerprint above as tinfirm_sandbox_node_client_sha256, set the fingerprint each shows as
+      its nodeSha256, and run this play again.
+  when: _tinfirm_runner_host_nodes_unpinned | length > 0
+
+# With no node to trust, nothing runs: a host that runs is stopped (SIGTERM: its runs are
+# cancelled and their work in progress pushed), its driver's file removed, and a new host is
+# not started. The first set-up ends here.
+- name: Stop with no pinned node
+  when: _tinfirm_runner_host_nodes_pinned | length == 0
+  block:
+    - name: Look for the runner host's unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/tinfirm-runner-host.service
+        get_checksum: false
+      register: _tinfirm_runner_host_unit_file
+
+    - name: Stop the runner host
+      ansible.builtin.systemd_service:
+        name: tinfirm-runner-host
+        state: stopped
+        enabled: false
+      when: _tinfirm_runner_host_unit_file.stat.exists
+
+    - name: Remove the driver's configuration
+      ansible.builtin.file:
+        path: "{{ _tinfirm_runner_host_node_config }}"
+        state: absent
+
+    - name: Say why the host does not run
+      ansible.builtin.debug:
+        msg: >-
+          No node has a nodeSha256: the runner host is installed and logged in, and does not run
+          (stopped, if it ran). It starts at the first run of this play with a pinned node.
+
+    - name: End this host's play
+      ansible.builtin.meta: end_host
+
+- name: Write the node driver's configuration
+  ansible.builtin.template:
+    src: node-driver.json.j2
+    dest: "{{ _tinfirm_runner_host_node_config }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload the runner host
+
+# The role's proof: what `run` asks at its start, through the driver itself, as the runner
+# host's user (whose key it is): every node of the file that offers the template answers over
+# TLS with the pinned certificates, and names no problem.
+- name: Ask every node through the driver
+  ansible.builtin.command:
+    argv:
+      - "{{ tinfirm_runner_host_binary_path }}"
+      - vm-driver
+      - node
+      - --config
+      - "{{ _tinfirm_runner_host_node_config }}"
+    # The leading space is needed: Ansible turns a templated value that starts with a brace into
+    # a dictionary, and the driver would get Python's writing of it, which is not JSON, and
+    # answer nothing (seen 2026-11-20). The driver skips the space.
+    stdin: " {{ {'jsonrpc': '2.0', 'id': 1, 'method': 'verify', 'params': {'template': tinfirm_runner_host_vm_template}} | to_json }}"
+  become: true
+  become_user: "{{ tinfirm_runner_host_user }}"
+  register: _tinfirm_runner_host_verify
+  changed_when: false
+  failed_when: false
+
+- name: Read the driver's answer
+  ansible.builtin.set_fact:
+    _tinfirm_runner_host_verified: >-
+      {{ (_tinfirm_runner_host_verify.stdout_lines | select('match', '^\{') | last | default('{}') | from_json) }}
+
+- name: Fail when a node is not ready
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_runner_host_verified.result is defined
+      - _tinfirm_runner_host_verified.result.problems | length == 0
+    fail_msg: >-
+      The driver's verify of {{ tinfirm_runner_host_vm_template }} found:
+      {{ ((_tinfirm_runner_host_verified.result | default({})).problems
+          | default([(_tinfirm_runner_host_verified.error | default({})).message
+                     | default(_tinfirm_runner_host_verify.stderr, true)
+                     | default('the driver gave no answer (exit ' ~ _tinfirm_runner_host_verify.rc ~ ')', true)])) | join('; ') }}.
+      `run` refuses to start with this. Checked: {{ (_tinfirm_runner_host_verified.result | default({})).checked | default([]) | join('; ') }}
+    success_msg: >-
+      The nodes have {{ _tinfirm_runner_host_verified.result.maxVms }} free VMs of
+      {{ tinfirm_runner_host_vm_template }}; checked: {{ _tinfirm_runner_host_verified.result.checked | join('; ') }}
+    quiet: false
+
+# `run` refuses to start while the nodes have fewer free VMs than its ceiling. A host whose
+# runs are in progress has fewer free: then this is the count of the moment.
+- name: Warn when the nodes have fewer free VMs than the host's ceiling
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the nodes have {{ _tinfirm_runner_host_verified.result.maxVms }} free VMs and
+      tinfirm_runner_host_max_concurrent_runs is {{ tinfirm_runner_host_max_concurrent_runs }}: `run`
+      refuses to start while there are fewer free VMs than that. Lower it, or give the nodes more
+      (tinfirm_sandbox_node_max_vms).
+  when: (_tinfirm_runner_host_verified.result.maxVms | int) < (tinfirm_runner_host_max_concurrent_runs | int)

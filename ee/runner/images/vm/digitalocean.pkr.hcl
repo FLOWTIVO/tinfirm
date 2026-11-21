@@ -1,6 +1,9 @@
 # The snapshot of DigitalOcean's sandbox Droplets (ADR-0096): a private snapshot of your
 # DigitalOcean team, never a public image. Build it for each release of the runner host,
-# then name its id as `image` in the driver's template (runner/README.md, "A VM per run"):
+# then name its id as `image` in the driver's template (runner/README.md, "A VM per run").
+# This template is part of elastic runners, with DigitalOcean's driver, under the Tinfirm
+# Enterprise licence (ee/LICENSE, ADR-0114); the image's recipe that it runs,
+# runner/images/vm, is in the core. From the repository's root:
 #
 #   export DIGITALOCEAN_TOKEN=...   # a token that may create Droplets and snapshots
 #   packer init ee/runner/images/vm/digitalocean.pkr.hcl
@@ -66,6 +69,11 @@ source "digitalocean" "sandbox" {
   tags             = ["tinfirm-sandbox-build"]
 }
 
+# The VM image's recipe (ADR-0114): runner/images/vm, from this template's directory.
+locals {
+  recipe = "${path.root}/../../../../runner/images/vm"
+}
+
 build {
   sources = ["source.digitalocean.sandbox"]
 
@@ -75,12 +83,12 @@ build {
   }
 
   provisioner "file" {
-    source      = "${path.root}/tinfirm-vm-boot.service"
+    source      = "${local.recipe}/tinfirm-vm-boot.service"
     destination = "/tmp/tinfirm-vm-boot.service"
   }
 
   provisioner "shell" {
-    script           = "${path.root}/setup.sh"
+    script           = "${local.recipe}/setup.sh"
     environment_vars = ["IMAGE_BUILD_ARGS=${var.image_build_args}"]
   }
 }

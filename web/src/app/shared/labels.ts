@@ -106,6 +106,7 @@ export const ACCOUNT_KIND_LABELS: Record<Account['kind'], string> = {
   TOKEN: 'with a token',
   OAUTH: 'by signing in',
   CLIENT: 'with client credentials',
+  APP: 'as a GitHub App installation',
   LINK: 'from a chat',
 };
 

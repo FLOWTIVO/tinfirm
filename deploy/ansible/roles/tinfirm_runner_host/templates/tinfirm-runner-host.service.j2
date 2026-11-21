@@ -5,9 +5,15 @@
 # {{ ansible_managed }}
 # Tinfirm runner host (runner/README.md, deploy/ansible/README.md).
 [Unit]
+{% if _tinfirm_runner_host_vm | bool %}
+Description=Tinfirm runner host: a control host with sandbox nodes (ADR-0112)
+Wants=network-online.target
+After=network-online.target
+{% else %}
 Description=Tinfirm runner host
 Wants=network-online.target docker.service
 After=network-online.target docker.service
+{% endif %}
 
 [Service]
 User={{ tinfirm_runner_host_user }}
@@ -17,15 +23,32 @@ Environment={{ arg('TINFIRM_RUNNER_LOG=' ~ tinfirm_runner_host_log) }}
 {% if tinfirm_runner_host_bridge_binary | length > 0 %}
 Environment={{ arg('TINFIRM_RUNNER_BRIDGE_BINARY=' ~ tinfirm_runner_host_bridge_binary) }}
 {% endif %}
+{% if _tinfirm_runner_host_vm | bool %}
+{#- A VM per run on the sandbox nodes of /etc/tinfirm/node-driver.json: the bridge and the egress
+    proxy are always on, and the host has no Docker runtime (`--sandbox-runtime` is refused). #}
+ExecStart={{ tinfirm_runner_host_binary_path }} run \
+    --max-concurrent-runs {{ tinfirm_runner_host_max_concurrent_runs | int }} \
+    --executor vm \
+    --vm-driver node \
+    --vm-template {{ arg(tinfirm_runner_host_vm_template) }} \
+    --vm-port {{ tinfirm_runner_host_vm_port | int }}{% for check in tinfirm_runner_host_vm_probe %} \
+    --vm-probe {{ arg(check) }}{% endfor %}{% if tinfirm_runner_host_sandbox_docker | bool %} \
+    --sandbox-docker{% endif %}{% for host in _tinfirm_runner_host_egress_allow %} \
+    --egress-allow {{ arg(host) }}{% endfor %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
+    --sandbox-env {{ arg(key ~ '=' ~ value) }}{% endfor %}
+
+{% else %}
 ExecStart={{ tinfirm_runner_host_binary_path }} run \
     --max-concurrent-runs {{ tinfirm_runner_host_max_concurrent_runs | int }} \
     --sandbox-runtime {{ arg(tinfirm_runner_host_kata_runtime_name) }}{% if tinfirm_runner_host_sandbox_docker | bool %} \
     --sandbox-docker{% endif %}{% if tinfirm_runner_host_egress_proxy | bool %} \
     --egress-proxy{% for host in _tinfirm_runner_host_egress_allow %} \
     --egress-allow {{ arg(host) }}{% endfor %}{% endif %}{% if tinfirm_runner_host_sandbox_bridge | bool %} \
-    --sandbox-bridge{% endif %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
+    --sandbox-bridge{% if tinfirm_runner_host_sandbox_bridge_ports | string | trim | length > 0 %} \
+    --sandbox-bridge-ports {{ arg(tinfirm_runner_host_sandbox_bridge_ports | string | trim) }}{% endif %}{% endif %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
     --sandbox-env {{ arg(key ~ '=' ~ value) }}{% endfor %}
 
+{% endif %}
 
 # Drain: the active runs finish, then `run` exits 0 ...
 ExecReload=/bin/kill -HUP $MAINPID
@@ -35,9 +58,15 @@ RestartSec=5
 # SIGTERM cancels the runs and pushes their work in progress; give it time.
 TimeoutStopSec=180
 
+{% if _tinfirm_runner_host_vm | bool %}
+# Hardening (L27 of the security review of 2026-10-27; a control host is a tier-0 asset, R34).
+# The host writes only its home, config and data directories, and reads its node driver's
+# files in /etc/tinfirm. It has no Docker socket.
+{% else %}
 # Hardening (L27 of the security review of 2026-10-27; a company runner host is a tier-0
 # asset beside the server). The host writes only its home, config and data directories; it
 # reaches Docker through its socket, which a read-only file system does not stop.
+{% endif %}
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

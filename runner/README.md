@@ -28,8 +28,19 @@ one of the two protocols per connection ([Protocol versions](#protocol-versions)
 | Path | Contents |
 |---|---|
 | `crates/tinfirm-protocol` | Message types of the runner protocol v1 and v2, with schema tests and samples |
+| `crates/tinfirm-bridge` | The [sandbox bridge](#sandbox-bridge): one pinned TLS stream per run between this host and its sandbox |
 | `crates/tinfirm-runner-host` | The `tinfirm-runner-host` binary (and the library the tests drive) |
-| `images/` | Dockerfiles of the runner images, embedded into the binary; the recipe of the sandbox VMs' image is `ee/runner/images/vm` |
+| `crates/tinfirm-node-agent` | The `tinfirm-node-agent` binary of a [sandbox node](#sandbox-nodes): an unprivileged listener and a root helper that make and delete jailed Firecracker VMs ([its README](crates/tinfirm-node-agent/README.md)). It links no other crate of the workspace |
+| `images/` | Dockerfiles of the runner images, embedded into the binary, and the recipe of the sandbox VMs' image (`images/vm`) |
+
+All of it is MIT. The binary also compiles in the paid code of elastic runners, from
+`ee/runner/` (the Tinfirm Enterprise licence; [ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md),
+[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)): DigitalOcean's VM driver and its
+Packer template, [ready VMs](#ready-vms) and [session bundles](#session-bundles-protocol-v2), with
+their tests.
+
+A maintainer's map of the host's code (its processes, its modules, and the stages of a run from
+its assignment to its report) is [`crates/tinfirm-runner-host/MAP.md`](crates/tinfirm-runner-host/MAP.md).
 
 ## Install
 
@@ -50,7 +61,8 @@ passed CI), carries the runner host binary. Only the runner HOST is published: t
 images, which contain Claude Code, never are;
 `images build` builds them on
 your machine, and `run` rebuilds them when a new binary brings other Dockerfiles
-([Runner images](#rebuilds-after-an-upgrade)).
+([Runner images](#rebuilds-after-an-upgrade)). Nor is the VM image of
+[sandbox nodes](#sandbox-nodes), which holds the runner images: you build it.
 
 | Asset | Host |
 |---|---|
@@ -87,11 +99,26 @@ tinfirm-runner-host --version
 The archive also holds `LICENSE` (MIT), `ee/LICENSE` and `THIRD-PARTY-LICENSES.txt`, the licences
 of the crates the binary is built with ([ADR-0082](../docs/adr/0082-licence-notices-and-dependency-licences.md)).
 The binary holds elastic runners' code too, under the Tinfirm Enterprise licence
-([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md)): the sandbox bridge, a VM per run, ready
-VMs and session bundles. They are Pro's and Enterprise's: a server whose licence does not hold
-them refuses a host started with `--sandbox-bridge` or `--executor vm` (`EDITION_REQUIRED`, and
-the host stops), and hands out no session bundle. A host with Docker, as below, runs in every
-edition.
+([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md),
+[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)): DigitalOcean's VM driver, the
+driver of a pod per run in a Kubernetes cluster, ready VMs and session bundles. They are Pro's and
+Enterprise's: a server whose licence does not hold them refuses a host started with
+`--vm-driver digitalocean`, `--vm-driver pod` or `--pool-max-ready` above 0
+(`EDITION_REQUIRED`, and the host stops), and hands out no session bundle. The sandbox bridge and
+a VM per run with a driver of your own are in every edition, as is a host with Docker, as below.
+
+The same release also carries the node agent of a sandbox node
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)):
+`tinfirm-node-agent-<version>-x86_64-unknown-linux-musl.tar.gz` and
+`tinfirm-node-agent-<version>-aarch64-unknown-linux-musl.tar.gz`, static. It runs on the sandbox
+nodes of a control host whose VMs run on your own machines, not on a runner host; install it from
+the same release as the runner host, which checks the agent's release when it connects. Download
+and verify it as above, with `tinfirm-node-agent` in place of `tinfirm-runner-host` and a Linux
+target; its archive holds the binary, its licence and the licences of its crates. It runs jailed
+Firecracker VMs, and has run them on one KVM node; its service units are in
+`crates/tinfirm-node-agent/units/`, and the role that sets up a node is planned
+([Sandbox nodes](#sandbox-nodes);
+[docs-site, runner hosts](../docs-site/content/operator-guide/runner-hosts.md)).
 
 Then continue with the [Quickstart](#quickstart). To upgrade, install the
 new binary the same way and drain ([Drain and upgrades](#drain-and-upgrades)). A Compose host
@@ -155,7 +182,10 @@ the server sends it differs:
    tinfirm-runner-host credential add codex --label codex-main     # --device-auth without a browser
    ```
    If the Codex CLI is not installed, the command explains how to place an `auth.json`
-   there instead.
+   there instead. A run's sandbox can write to that directory, so the host reads `auth.json`
+   (for the redaction of its tokens, `doctor`, and the check of each run) only as a regular file
+   of at most 256 KiB, never through a link, a FIFO or a device; anything else is a problem that
+   `doctor` and the run name, and adding the login again repairs it.
 5. **Build the runner images** (a few minutes the first time):
    ```sh
    tinfirm-runner-host images build            # --runtime claude|codex|pi|opencode|all|multi, --no-cache
@@ -219,6 +249,20 @@ for the JVM); a tool that ignores them has no network. `--sandbox-env` may not s
 variables, and an upstream corporate proxy is not supported yet. A run's log lists what the proxy refused
 (`403`, header `x-tinfirm-egress: denied`), so you can see what to allow. The proxy does not read
 traffic: it limits where data can go, not what it is.
+
+**Its two halves.** A sandbox speaks HTTP to the proxy: `CONNECT host:port` for a tunnel, or a
+request with an absolute `http://` URL. The part that parses this (the request, the
+`Proxy-Authorization` check and the copying of a tunnel's bytes) is one half; the decision is
+the other: whether the destination is on the run's allowlist, where its name resolves, whether that
+address is refused, the limit of 256 open connections per run (plain requests count too), and
+the connection itself. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), the parsing
+half runs in the sandbox's [front process](#the-reader-and-the-front), confined, which cannot make a
+connection: it asks `run` for each one by name and port, and `run` decides, connects and hands
+it the connected socket, or answers with the refusal (`400`, `403`, `502` or `503`) that the
+front gives the sandbox. `run` logs each refusal, and a front that asks for more than the wire allows
+(more than 512 open connections, a name over 253 bytes or not printable, port 0, an answer it
+did not wait for) is ended, with every listener it serves. Without the bridge both halves run in `run`. A
+destination with a user name (`user@host`) is refused with `400` either way.
 
 **Requirements.** Docker Engine on Linux. With Docker Desktop (or any engine in a VM) `run`
 refuses `--egress-proxy`: the sandboxes would reach this machine as `host.docker.internal`, which an
@@ -307,7 +351,20 @@ nothing answers on its port. For a request to `/<run secret>/<path>` it:
 - drops every credential header of the sandbox (`Authorization`, `x-api-key`, `api-key`, `Proxy-Authorization`, `x-litellm-api-key`, `x-goog-api-key`, cookies, `x-tinfirm-runner-token`), the hop-by-hop and forwarding headers, sets `Authorization: Bearer <key>` and, for this host's server only, `x-tinfirm-runner-token: <host token>`, and keeps the rest (`anthropic-version`, `anthropic-beta`, the query);
 - connects to the base URL's origin itself, over https with the system's root certificates, to an address it resolved and checked as the [egress proxy](#egress-proxy) does: loopback, link-local (cloud metadata), reserved and this machine's own addresses are refused, private ones unless `--egress-allow-private`, and loopback and this machine's addresses only for the gateway of `--model-proxy-local-gateway` ([below](#a-gateway-on-this-machine)). It follows no redirect (`502`);
 - streams the answer back as it arrives (SSE), with no total timeout, only an idle one of 10 minutes between two parts; refuses a WebSocket upgrade (`501`); takes request bodies up to 64 MiB and 64 connections per run at once (more wait);
+- takes a request head of at most 64 headers, each name at most 64 bytes and each value at most 8 KiB, 24 KiB in all (`431` above), and a query of at most 4 KiB (`414`); header values pass byte for byte, UTF-8 text included, and only the bytes HTTP forbids (CR, LF, NUL and the other control bytes) are refused; passes back the first 100 of the answer's headers, byte for byte, and drops the rest;
 - never logs the key or the host's token, and never passes them back: a gateway answer that contains either is cut off (`502` when it is in a header).
+
+**Its two halves.** The part that reads the sandbox's request (the run secret, the path rule,
+the method, `Upgrade`, the bounds of the head) is one half; the other checks the request again
+as it comes (an endpoint of the gateway's format, its method, every header one that HTTP allows,
+the length within 64 MiB), attaches the key and the host's token, makes the request, and scans
+and passes back the answer. With `--sandbox-bridge` or a [VM per run](#a-vm-per-run), the first
+half runs in the sandbox's [front process](#the-reader-and-the-front), which never holds the key or the
+host's token: it hands `run` the request's endpoint, method, query, headers and length, and the
+body on a socket of its own; `run` gives the answer's status and headers back, and its body on
+the same socket, part by part, so an SSE answer still arrives as it comes. A client that leaves,
+before the answer, in its request body or in the answer, ends the request to the gateway too.
+Without the bridge both halves run in `run`, with the same code and the same rules.
 
 With `--egress-proxy` as well, the gateway leaves the run's allowlist (the sandbox no longer needs a
 route to it), and `NO_PROXY` already names the listener's host. A run whose listener cannot start
@@ -371,7 +428,7 @@ Testcontainers, `docker compose` and image builds ([ADR-0025](../docs/adr/0025-k
 
 | Option | Variable | Effect |
 |---|---|---|
-| `run --sandbox-runtime <name>` | `TINFIRM_RUNNER_SANDBOX_RUNTIME` | The Docker runtime of every sandbox, for example `kata`. Default: Docker's default (runc). `run` refuses a runtime that Docker does not know. The tier follows the name: `kata…` is `microvm`, `runsc…` is `gvisor`, anything else is `container` |
+| `run --sandbox-runtime <name>` | `TINFIRM_RUNNER_SANDBOX_RUNTIME` | The Docker runtime of every sandbox, for example `kata`. Default: Docker's default (runc). `run` refuses a runtime that Docker does not know. The host reports `gvisor` for a `runsc…` name and `container` for any other, a `kata…` one included ([Isolation level](#isolation-level)) |
 | `run --sandbox-docker` | `TINFIRM_RUNNER_SANDBOX_DOCKER` (`1`, `true`) | The agent gets its own dockerd in the sandbox (below) |
 | `run --egress-proxy`, `--egress-allow HOST[:PORT]`, `--egress-allow-private` | `TINFIRM_RUNNER_EGRESS_PROXY`, `TINFIRM_RUNNER_EGRESS_ALLOW` (one entry per line), `TINFIRM_RUNNER_EGRESS_ALLOW_PRIVATE` | The sandboxes reach the network only through the host's egress proxy, to the agent's model, the mirrors of `--sandbox-env` and the allowed hosts ([below](#egress-proxy)) |
 | `run --model-proxy-local-gateway ORIGIN`, `--egress-allow-private` | `TINFIRM_RUNNER_MODEL_PROXY_LOCAL_GATEWAY`, `TINFIRM_RUNNER_EGRESS_ALLOW_PRIVATE` | The [model proxy](#model-proxy), which keeps a gateway's key on this host, is always on and has no option of its own. These two only widen where the gateway may be: the one gateway on this machine, or a private address. `--model-proxy` (`TINFIRM_RUNNER_MODEL_PROXY`) is accepted by 0.2.0 and 0.3.0 and does nothing |
@@ -456,37 +513,148 @@ mirror settings, and builds the images. By hand, on a machine with `/dev/kvm`:
 4. `docker run --rm --runtime kata alpine uname -r` prints a kernel other than this
    machine's, and `doctor` lists `kata` under "docker runtimes".
 5. Start `run --sandbox-runtime kata --sandbox-docker --sandbox-env …`. Its log line
-   `runner host starting` shows `sandbox_runtime`, `isolation_tier`, `sandbox_docker` and
-   the names of the extra variables.
+   `runner host starting` shows `sandbox_runtime`, `sandbox_family` (`kata`), `sandbox_docker`
+   and the names of the extra variables; the next line, the level of isolation, is `container`
+   ([Isolation level](#isolation-level)).
+
+## Isolation level
+
+A host reports its level of isolation: the strongest wall between an agent's code and the
+credentials ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md)). With protocol 2 it
+sends it as the one value of `hello.isolationTiers`, with `hello.hardened`, whether the machine that
+runs its VMs is hardened beyond the jail (`yes`, `no`, or `none` when the host runs no machine of its
+own for its VMs; left out for `no`), and `hello.isolationStated: true` when the level rests on your
+statement.
+
+| Level | The wall | Where the credentials are | What an escape from a sandbox reaches |
+|---|---|---|---|
+| `machine` | Another machine | On another machine than the VM | The machine that runs the VM, and the other runs there; with a provider's VM per run, the provider's machine, with nothing of Tinfirm's |
+| `vm-jail` | A jail around each VM | On the same machine, out of a VMM's user's reach | Through the VMM, one jailed user that reads no credential; through a flaw of the kernel under the VMs, the machine with every credential |
+| `container` | The container and the kernel | On the same machine, behind the kernel alone | This machine, which holds the host's token and every run's git token, and the other runs on it |
+
+`gvisor` is a `container` host whose runtime is `runsc…`; the server places it as `container`.
+
+The host derives its level from what it can see, and only takes your word where it cannot:
+
+| This host | `isolationTiers` | `hardened` |
+|---|---|---|
+| Docker with runc, or with a `kata…` `--sandbox-runtime` | `container` | left out (`no`) |
+| Docker with a `runsc…` `--sandbox-runtime` | `gvisor` | left out (`no`) |
+| `--executor vm --vm-driver digitalocean` | `machine` | `none` |
+| `--executor vm --vm-driver node`, every node over its local socket ([Sandbox nodes](#sandbox-nodes)) | `vm-jail` | `yes` when every node that offers `--vm-template` reports it, else left out (`no`) |
+| `--executor vm --vm-driver node`, every node over TLS at an address that is not this host's own | `machine` | `yes` when every node that offers `--vm-template` reports it, else left out (`no`) |
+| `--executor vm --vm-driver pod`, whose configuration states that the workers for runs hold nothing else | `machine`, with `"isolationStated": true` | `no` |
+| `--executor vm` with a driver of your own and `--isolation-level` | What `--isolation-level` states, with `"isolationStated": true` | What `--isolation-hardened` states |
+| `--executor vm` with a driver of your own and no `--isolation-level` | `container` | left out (`no`) |
+| Protocol 1 | `container` | not sent |
+
+- **Kata Containers.** A Kata host reports `container`: its sandboxes are VMs, but the VMM runs as
+  root on the machine that holds the credentials, so an escape through it reaches them. It still
+  runs every sandbox as a Kata VM through Docker, and still takes `--sandbox-docker`
+  ([Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox)); only
+  what it reports is `container`.
+- **A driver of your own.** The host cannot see where your driver runs the VMs. State the level
+  with `--isolation-level machine` (the VMs run on other machines than this host, which hold no
+  credential) or `vm-jail` (each VM's VMM runs in a jail of its own on this machine), and
+  `--isolation-hardened yes|no|none`. Without them the host reports `container`, and says so at
+  its start and in `doctor`, with how to state the level: it is a VM host shown as a container
+  host until you state its level.
+- **A statement never overrides what the host can see:** `run` refuses `--isolation-level` with
+  the Docker executor, with `--vm-driver digitalocean` and with `--vm-driver node`.
+- **The pod per run** ([ADR-0115](../docs/adr/0115-sandbox-vms-in-a-kubernetes-cluster.md),
+  decision 2) keeps every run's pod off the worker of this host's pod, but cannot see what else
+  the workers for runs hold. Its configuration states it (`isolationStatement`, the Helm chart's
+  `runner.vm.cluster.isolationStatement`, word for word "the workers for runs hold nothing
+  else"); without that statement `run` does not start, and `--isolation-level` is refused, since
+  the statement has its one place there. A worker whose pods use user namespaces cannot have the
+  first line of hardening, so such a host reports `hardened: no`.
+- **The node driver's hardening** is what the nodes report
+  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 5): each node
+  agent's helper checks every line of a hardened machine, and its `verify` carries the mark. The
+  driver's `verify` says `yes` when every node that offers `--vm-template` says `yes`; `no` when one
+  of them says `no`, answers without the mark (a node agent older than this host, which the
+  driver's log names), or says `yes` without the lines it checked or beside a line that does not
+  hold; and nothing ("not known") when none says `no` but one does not answer. This
+  host takes the value of the `verify` at its start, where "not known" is `no`: it vouches for no
+  node it did not hear from. Later, "not known" keeps the last value. Its log and `doctor` name each
+  line that does not hold (`node node-1: io-uring: kernel.io_uring_disabled is 0, not 2`). A lower
+  mark stops nothing: the host still starts and its nodes still take VMs. While it runs, the host
+  asks the driver's `verify` every 5 minutes, and at each of its other health checks (a failed
+  create, a run that comes while the driver can make no VM, and the recheck then), never two at
+  once; the scheduled `verify` also counts for whether the driver can make a VM, as any other.
+  Each hello reports the value the host knows when it sends it. A change reaches the server by a
+  new hello, since the hello is the one frame that carries the mark: the host closes its
+  connection (1000) and connects again at once. A loss (`yes` to `no`) is logged as a warning
+  that names the lines and is sent at once; a gain (`no` to `yes`) once it held for two checks
+  in a row, so that a node whose mark flaps does not move the server's placement with it. "Not
+  known" changes nothing, there is at most one such reconnect per 5 minutes, and none while the
+  connection is down: the next hello carries the value. Runs go on through the reconnect as
+  through any other: the server keeps their leases, the new hello lists them, and their events
+  follow on the new connection. A driver of your own is not asked: `--isolation-hardened` states
+  it.
+- **Where it shows.** `run` logs the level at its start, with what an escape from a sandbox reaches
+  on such a host. `doctor` says the same for the settings in its environment
+  (`TINFIRM_RUNNER_EXECUTOR`, `TINFIRM_RUNNER_VM_DRIVER`, `TINFIRM_RUNNER_ISOLATION_*`; it does not
+  see `run`'s flags). The server stores the level and shows it on the host's page as reported,
+  places runs by it, and checks neither value
+  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 4).
+- **Hosts and server take this release together.** `microvm` is no value any more: a server of
+  this release refuses a hello that carries it, and a server of an earlier release refuses a host
+  of this release that reports `machine` or `vm-jail`. A host that reports `container` or
+  `gvisor` works with either; a host with a VM per run, and a Kata host of an earlier release
+  (which sent `microvm`), is upgraded with the server
+  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 2, which amends
+  [ADR-0109](../docs/adr/0109-runner-version-is-the-release-version.md) for this one change).
+
+| Option | Environment | Default | Meaning |
+|---|---|---|---|
+| `--isolation-level machine\|vm-jail` | `TINFIRM_RUNNER_ISOLATION_LEVEL` | | The level this host reports with a VM driver of your own; refused where the host derives its own |
+| `--isolation-hardened yes\|no\|none` | `TINFIRM_RUNNER_ISOLATION_HARDENED` | `no` | Whether the machines that run those VMs are hardened; only with `--isolation-level` |
 
 ## Sandbox bridge
 
 With `run --sandbox-bridge` (`TINFIRM_RUNNER_SANDBOX_BRIDGE`), the agent's adapter runs over the
 sandbox bridge ([ADR-0095](../docs/adr/0095-sandbox-bridge.md)) instead of Docker attach. It is opt-in
-for now, and Pro's and Enterprise's ([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md)): the host
-lists `sandbox.bridge` in its `hello`, which needs protocol 2, and a server whose licence does not
-hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is under `ee/runner/`.
+for now, and in every edition ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)):
+the host lists `sandbox.bridge` in its `hello`, which needs protocol 2. A server from before
+ADR-0114 whose licence does not hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is
+`crates/tinfirm-bridge`, the host's modules `bridge.rs`, `sandbox_files.rs` and `takeback.rs`, and
+the sandbox's [front](#the-reader-and-the-front) (`front/`), a confined process per sandbox that
+holds its bridge.
 
 - **How it runs.** The container runs this host's binary, mounted read-only at
-  `/opt/tinfirm/tinfirm-runner-host`, as `bridge`; the image's entrypoint still runs first. The bridge
-  connects to this host's bridge listener (on the git proxy's address, on a port the system picks)
-  over TLS 1.3, pinned to a certificate that the host creates when it starts. It presents the run's
-  one-time ticket, and starts the image's command when the host sends `start`.
+  `/opt/tinfirm/tinfirm-runner-host`, as `bridge`; the image's entrypoint still runs first. Each
+  sandbox has a bridge listener and a TLS identity of its own, which `run` makes for it and only the
+  sandbox's [front](#the-reader-and-the-front) holds: the listener is on the git proxy's address (the
+  sandbox network's gateway), on a port the system picks or one of `--sandbox-bridge-ports FROM-TO`
+  (`TINFIRM_RUNNER_SANDBOX_BRIDGE_PORTS`, both included; a run that finds no free port in the range
+  fails). The bridge connects there over TLS 1.3, pinned to its sandbox's own certificate, which no
+  other sandbox's bridge pins. It presents the run's one-time ticket, which the front hands to `run`
+  and `run` checks, and starts the image's command when the host sends `start`.
+  - The front takes a connection only from the container's own address on the sandbox network,
+    which `run` reads once the container has started (the local test executor's: loopback); any
+    other is closed before its TLS handshake. Where every sandbox comes from one address (Docker
+    Desktop, `TINFIRM_RUNNER_SANDBOX_NETWORK=host`, a listener address set with
+    `TINFIRM_RUNNER_GIT_PROXY_BIND`), it takes any address, and `run` decides by the run's ticket
+    alone; each front still holds only its own sandbox's key.
 - **The run's credentials are not in the container's settings.** `docker inspect` shows only:
-  - the bridge's own settings (`TINFIRM_BRIDGE_ADDR`, `_RUN`, the one-time `_TICKET`, `_PIN`);
+  - the bridge's own settings (`TINFIRM_BRIDGE_ADDR`, `_RUN`, the one-time `_TICKET`, and `_PIN`,
+    the pin of its sandbox's own certificate);
   - the entrypoint's (`TINFIRM_SANDBOX_*`);
   - the proxy variables of the agent's own dockerd.
 
   Every other variable of the run, the credential among them, reaches the adapter in `start`.
-- **The host's listeners are on loopback, and the sandbox reaches them through the bridge.** The git
-  proxy and the platform tools, the model proxy and the egress proxy listen on 127.0.0.1 of this
-  host, where no sandbox reaches them; only the bridge listener stays on the sandbox network's
-  gateway. Before the agent starts, the bridge listens on the sandbox's own 127.0.0.1 at each
-  listener's port and carries every connection there to that listener over the bridge (a tunnel), so
-  `origin`, the MCP endpoint, the model's base URL and the proxy variables name the sandbox's
-  loopback. The listeners' own checks do not change. With `TINFIRM_RUNNER_SANDBOX_NETWORK=host` the
-  listeners take 127.0.0.2, and `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` set where the bridge
-  listener goes.
+- **The sandbox reaches its proxies only through the bridge.** This host binds no listener for a
+  sandbox's git proxy and platform tools, model proxy or egress proxy; the bridge listener is the
+  only port of this host's that is meant for a sandbox. Before the agent starts, the bridge listens on the sandbox's own
+  127.0.0.1, at port 18761 (the git proxy and the platform tools), 18762 (the model proxy) and 18763
+  (the egress proxy), and carries every connection there over the bridge (a tunnel) to that service
+  in the sandbox's front, never to an address. So `origin`, the MCP endpoint, the model's base URL
+  and the proxy variables name the sandbox's loopback. The front reads each request, and `run`
+  checks it again with the rules it always applied and adds the credentials. A program of the image
+  that holds one of the three ports fails the run at its start, with an error that names the
+  service and the port. `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` set where the bridge listeners
+  go.
   - Each connection has a window of 128 KiB per direction, so one that stalls holds back no other;
     at most 128 are open per run.
   - A container of the agent's own Docker reaches the tunnels only on Docker's `host` network,
@@ -499,15 +667,16 @@ hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is under `ee/r
     the mirrors serve them), the skills, the attachments and an empty `/output`.
   - The platform tools read the agent's files through the bridge.
   - After the agent, the host runs its git steps in the sandbox: the WIP commit, then a bundle of
-    `HEAD`. It fetches the bundle into its own clone, which the agent never reached, with every
-    object checked, and pushes from there with the usual checks. The host never runs git in a `.git`
-    that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
+    `HEAD`. A [reader](#the-reader-and-the-front) fetches the bundle into the host's own clone, which the agent
+    never reached, with every object checked, and the host pushes from there with the usual checks.
+    The host never runs git in a `.git` that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
     `core.packedGitWindowSize` set to 1 TiB, so git maps a whole pack at once: the fetch from a
     bundle of git 2.43 to 2.48 closes a file descriptor twice, and with git's default window of
     1 GiB the fetch of a bundle over 1 GiB could fail with `packfile … cannot be mapped: Bad file
     descriptor`.
-  - The session home and `/output` come back, as directories and regular files only (links and
-    devices are left out), at most 2 GiB and 4 GiB; then the sandbox goes.
+  - The session home and `/output` come back, unpacked by a [reader](#the-reader-and-the-front) as directories
+    and regular files only (links and devices are left out), at most 2 GiB and 4 GiB; then the
+    sandbox goes.
   - The images need `/attachments` and `/output` writable by the agent: the images of this version
     have them, and `run` rebuilds older ones ([Rebuilds after an upgrade](#rebuilds-after-an-upgrade)).
 - **A lost connection resumes without losing output.** The adapter's output, the tunnels'
@@ -515,13 +684,18 @@ hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is under `ee/r
   25 s, it stops the agent (SIGINT, then SIGTERM, then SIGKILL), and keeps the sandbox and its files
   for 15 minutes more, for this host after a restart (below). The host ends the run after 30 s
   without the bridge; a bridge that it no longer knows is refused, and ends at once.
-- **What the host holds for a sandbox is bounded.** Each side of the link acknowledges only
-  what it has handed on to its reader, and reads at most 8 MiB ahead of it; the adapter's
-  output waits for the run's loop in a queue of 256 chunks. A run whose host falls behind, or
-  a sandbox that floods, is held back through the bridge's credit and then TCP: the adapter's
-  writes block in the sandbox, nothing is dropped, and nothing piles up in the host. A bridge
-  that connects again and again while the run's loop has not taken the earlier connections'
-  events (64 at most) is dropped without an answer, and tries again later.
+- **What the host holds for a sandbox is bounded.** Each side of the link (the bridge, and the
+  sandbox's front) acknowledges only what it has handed on to its reader, and reads at most 8 MiB
+  ahead of it; the adapter's output waits for the run's loop in a queue of 256 chunks. A run whose
+  host falls behind, or a sandbox that floods, is held back through the bridge's credit and then
+  TCP: the adapter's writes block in the sandbox, nothing is dropped, and nothing piles up in the
+  host. A front has at most 8 connections in their handshake or waiting for `run`'s decision at
+  once; a bridge that opens more has the others dropped without an answer, and tries again later.
+- **What it costs.** The bridge through a front, against the bridge crate's host side in one
+  process (release build, loopback, one machine): a handshake takes about 1.9 ms (1 ms in one
+  process), a command's round trip about 1.85 ms (1.5 to 1.7 ms), and 1 GiB goes in at about
+  400 MiB/s (440 to 465), comes out at about 375 MiB/s (445) and goes through a tunnel at about
+  450 MiB/s (530). A front starts, with its bridge's listener, in about 3.3 ms, once per sandbox.
 - **A bridge that does not connect** within 180 s, or a container that ends before its bridge does,
   fails the run with `INFRA`. The container's last log lines (the entrypoint's) are in the run's log.
 - **Requirements.**
@@ -529,49 +703,469 @@ hold elastic runners refuses it with `EDITION_REQUIRED`. Its code is under `ee/r
     binaries for Linux are; `run` refuses any other.
   - `TINFIRM_RUNNER_BRIDGE_BINARY` names another binary, for example on macOS with Docker Desktop:
     the Linux release binary of the same version, in a directory that Docker Desktop shares.
-  - A host firewall must admit the bridge's port from the sandbox network, as it must for the model
-    proxy's listeners.
+  - A host firewall between the sandbox network and this host must admit TCP to the bridge ports:
+    a port per sandbox, from `--sandbox-bridge-ports`, or without it from the system's range for
+    local ports (`net.ipv4.ip_local_port_range`). It admits no port of a proxy: the host binds
+    none. The first start after an upgrade from a version before the fronts also opens the shared
+    port that `runs/bridge.json` keeps, only while that version's runs are taken back (below). With
+    a [VM per run](#a-vm-per-run) the control host dials each VM and listens on nothing for it.
 - **A restart of this host loses no work** ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
   threat model R36). While a run's sandbox lives, this host keeps a record of it in its data
   directory (`runs/<run id>.json`, 0600): the assignment, the sandbox, the bridge's session key, the
-  repositories as cloned and the agent's session; the bridge listener keeps its identity and port in
-  `runs/bridge.json`. A `run` that starts after a crash, a `kill -9` or an upgrade finds the records
-  and takes each run back before it connects: the run is in its `hello`, so Tinfirm keeps it; the
-  listener starts with the same identity on the same port, and the sandbox's bridge comes back to
-  it. The agent that the earlier process started stops, its work comes back and is pushed, its
+  repositories as cloned and the agent's session, and the sandbox's bridge (`bridge`: its TLS
+  identity, and on Docker its port and its peer's address; a VM's dial target is the record's
+  sandbox). A `run` that starts after a crash, a `kill -9` or an upgrade finds the records and
+  takes each run back before it connects: the run is in its `hello`, so Tinfirm keeps it; a new
+  front starts for each sandbox with the same identity, listening on the same port (a VM's dials
+  it), and the sandbox's bridge comes back to it with the session's key. A record without `bridge`
+  (one of the version before the fronts) is taken back through one shared listener in `run`,
+  whose identity and port `runs/bridge.json` keeps; that is the only use of the shared listener and
+  of that file. The agent that the earlier process started stops, its work comes back and is pushed, its
   session is saved, and the run ends failed with `INFRA`, saying what was saved; the next message
   goes on from there. A sandbox that does not come back within 2 minutes is removed, and its work
   is lost.
   - The turn does not go on in place: the agent is stopped. Runs without the bridge, and a Docker
     host's runs when the machine itself restarts (Docker stops the containers), are lost.
   - The records hold the run's credentials (the repositories' tokens, a model access key) and the
-    listener's private key while the sandbox lives, as the config directory holds the host token.
+    bridge's private key while the sandbox lives, as the config directory holds the host token.
+    A record's git tokens are those the run holds now: when Tinfirm revokes a repository's token
+    ([Revoked git tokens](#revoked-git-tokens-protocol-v2)), the host writes the record again,
+    whole and 0600, without the token and with the repository in its `revoked` list (the
+    server's reason and message). A host that takes the run back then neither uses that token
+    nor pushes the repository.
+  - **Redaction after a restart.** A token that the record no longer holds (a revoked one, a
+    GitHub App's token that a renewal replaced) must still be redacted and found by the scans
+    once the host restarts. So the record also keeps, in `redaction`, salted hashes of every
+    token the run has held, live ones included: one path for all of them, written whenever a
+    token enters the run. For each form in which the redactor matches a token (the raw value,
+    its URL encoding, its base64 at each of the three byte alignments in both alphabets: 5 to
+    8 forms of a GitHub token), it keeps the form's length, the top 12 bits of a rolling hash
+    of the form (a polynomial hash modulo 2^64 whose base the record's salt gives) and
+    SHA-256 over the record's salt (32 random bytes, one per record) and the form. A run taken
+    back slides a window of each length over what it scans, and hashes a window with the salt
+    only where the 12 bits match. Its events, the host's own log lines of the run, the scan of
+    the outgoing commits before the push (`CREDENTIAL_LEAK`), the session bundle's scan and
+    the `/output` scan find those tokens as they find the live ones. A token's `Basic` header
+    holds its base64, which these forms match, so the headers are not kept. A record without
+    `redaction` (an earlier version's) is read as before, and the previous version reads one
+    with it, ignoring the field.
+  - **A record whose hashes cannot be used** fails closed. Its hashes are read as untrusted
+    and bounded before any work: a salt of 32 bytes in hex, at most 16,384 forms, each of 8 to
+    49,152 bytes (the percent-encoding of the longest git token the host takes, 16,384 bytes,
+    the longest the server keeps; an assignment with a longer one is refused and a renewal
+    with one is ignored), a 12-bit tag and a SHA-256 in
+    lowercase hex. A record that has `redaction` and breaks any of these pushes nothing of the
+    run, stores no session bundle and saves no file of `/output`: the run ends failed with
+    `INFRA`, "its record of the run is damaged", and its work stays on the host as a failed
+    run's does (`keep_failed_workspaces`).
+  - **What a scan costs.** The run's events and the host's log lines are redacted with every
+    run's hashes, since they are small. The bulk scans of a run (its outgoing commits, its
+    session bundle, its `/output`) use every credential by value and that run's own hashes
+    alone, so ten runs taken back do not make each scan ten times as long. With ten runs'
+    hashes loaded, a scan of 200 MiB took 17.6 to 18.3 s with every run's hashes and 1.75 to
+    1.82 s with one run's (release build, 4 CPUs). What bounds a scan when an agent makes its
+    commits large on purpose is the size of what comes back from the sandbox: at most 8 GiB of
+    bundle per repository (the sandbox bridge's `BUNDLE_LIMITS`) and 20 repositories; at about
+    110 MiB/s by hashes and 160 MiB/s by value, 8 GiB takes about 2 minutes to scan. The
+    session bundle is 64 MiB unpacked at most, and an `/output` file 25 MiB by default.
+  - **What the hashes give away.** Someone who reads the record learns, of a token that is no
+    longer in it, its length and at most 12 bits per stored form from the rolling hashes: at
+    most 60 to 96 bits for 5 to 8 forms, if all of them could be used together, which no method
+    known to us does for forms in different encodings. The salted SHA-256 lets them test one
+    guess at a time, for this record only. A GitHub token has 30 random characters (about 178
+    bits; its last 6 are a checksum), so at least about 82 bits stay unknown even in that worst
+    case, beyond any search; a token with less entropy (GitLab's `glpat-` tokens have 20
+    characters, about 119 bits) keeps less in that worst case. The live tokens are in the
+    record in plain text, as before. The cost: a scan of 200 MiB of pack-like bytes for ten
+    tokens took 1.1 to 1.2 s by value and 1.6 to 1.8 s by their hashes alone (release build,
+    4 CPUs), so a run taken back scans its commits about 2.5 times as long as before.
+  - A host that took a run back uses none of the run's git tokens and pushes nothing before this
+    process has been welcomed by the server. A server that lists `run.git.revoke` in
+    `welcome.features` sends `welcome.done` last, after every revocation (and cancel) it keeps for
+    the runs the `hello` listed, which the host has applied by then; the run waits for it, so a
+    revocation that Tinfirm sent while the host was away comes first. A server that lists no such
+    feature (one from before ADR-0116) keeps no revocation, and the run goes on as soon as it is
+    welcomed. There is no time limit: without a connection, or without `welcome.done`, the run
+    waits as long as it takes. Then it renews every token of the run that expires
+    ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)), an expired one included,
+    before the push.
+  - While the run waits, its agent is stopped and its sandbox is gone: the work, the session
+    home and `/output` are on this host, and the record stays, marked `collected`, with how each
+    repository came back. The mark is written before the sandbox is stopped; a host that cannot
+    write it keeps the sandbox until the run ends, says so in the run's log, and a restart
+    meanwhile takes the work from the sandbox again. The run's wall-clock limit no longer matters then, since nothing of the
+    run executes. The host logs one warning when the wait begins ("a run taken back waits for the
+    server's answer to the hello before it pushes"), the run's events say it once, and `doctor`
+    counts such runs under "runs to take back". A cancel from the server is applied after the wait,
+    and still pushes; an abort (a stale epoch) ends the wait and pushes and reports nothing. When
+    the host stops (SIGTERM) during the wait, the run neither pushes nor reports, and the next
+    `run` takes it back from the record and its own disk, without a sandbox; so does a `run` after
+    a second crash. The record keeps a token's latest value and its expiry until the run ends.
   - `run` must start with the same data directory and, for Docker, the same sandbox network, within
     the 15 minutes; `run --sandbox-bridge` must stay on.
+- **A front that ends during a run** (a crash, or a flaw that ended it) is replaced once: a new front
+  takes the session back with the run's key, on the same port (a VM's dials it again), the agent
+  is stopped, its work comes back and is saved, and the run fails with `INFRA`, saying what was
+  saved and what was not. When the new front ends too, the run fails and says that its work is
+  lost. The other runs and the host are not touched.
+
+<a id="the-reader"></a>
+
+### The reader and the front
+
+`run` holds every run's git token, its own token to the server and the one-run model tokens. With
+the bridge, what a hostile sandbox sends is parsed outside it, in processes that hold no credential
+and confine themselves (path C of
+[ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)), so that a flaw in that parsing
+needs a second flaw to reach a credential. Both are this binary, as hidden subcommands that `run`
+starts and nobody runs by hand:
+
+- the **reader** (`tinfirm-runner-host reader`; `reader.rs`, `confine.rs`), one process per
+  archive or git bundle that comes back from a sandbox;
+- the **front** (`tinfirm-runner-host front`; `front/`, `confine.rs`), one process per sandbox,
+  which holds the sandbox's bridge and parses everything the sandbox sends while it runs: the
+  bridge's TLS, frames and tunnels, and the HTTP of its proxies and platform tools.
+
+The reader:
+
+- **What it reads.** The session home and `/output` coming back, each repository's bundle (with
+  the fetch into the host's clone, `fsck` and the checkout of the new `HEAD`), a session bundle
+  being restored (with the bridge), and the one file the platform tools read from a sandbox. One
+  process per archive or bundle, never shared between two runs.
+- **What it is given.** In its argument, only that reading's directories: the incoming session home,
+  the run's `/output`, or one bundle's scratch directory and that run's clone. The sandbox's bytes
+  on its stdin, as they come over the bridge. An empty environment but `PATH`, no descriptor but
+  stdin, stdout and stderr, and no token.
+- **What it cannot do** (Linux 5.19 or later, with Landlock enabled), applied by itself before it
+  reads a byte:
+  - Landlock: it reads and writes only its directories (it executes nothing there), reads and
+    executes the system's directories for git, and nothing else: not this host's config or data
+    directory, its token, the take-back records, another run's directories, or `/proc` (so not
+    `/proc/<pid>/mem` of `run`). Where the kernel has them, TCP (Linux 6.7) and signals and
+    abstract sockets outside the reader (Linux 6.12) are refused too;
+  - a seccomp filter: no socket of any kind, no `ptrace` or `process_vm_*`, no namespaces, no
+    mounts, no `io_uring`, no `bpf`, no new session or process group, and it cannot make itself
+    dumpable again. It also keeps the reader's signals inside its process group on every kernel,
+    before Linux 6.12 too: a signal by pid only to its own group (0 or the group's negative id) or
+    itself, or the signal 0 (a check that a process exists) to any; no `pidfd_open` or
+    `pidfd_send_signal`, no `F_SETOWN` or `FIOSETOWN` (a `SIGIO` sent for it); and no
+    `prlimit64`, `sched_set*`, `setpriority` or `ioprio_set` on another process (Landlock's scope
+    does not cover a limit, and a CPU limit would end `run`). seccomp compares a pid with
+    constants only, so a git in the reader cannot signal its own children by their pids either:
+    its cleanup after an error is left to `run`'s kill of the group;
+  - `no_new_privs`, and not dumpable; `run` itself is not dumpable either, so no process of its
+    user reads its memory;
+  - it runs in a process group of its own, which `run` kills when the reading is over or its time
+    is up, with everything the reader started. An unpacking may write no file larger than its
+    limit and use at most 1 GiB of memory.
+- **What `run` takes back from it.** One line of JSON of a fixed form, at most 1 MiB (and, for the
+  platform tools' file, that file's bytes). `run` treats the answer as hostile too: every field is
+  bounded and checked, and once the reader is gone, `run` walks what it wrote, without following
+  anything: only directories and regular files with one link each, within the limits, and the counts
+  the reader claimed. A link, a hard link, a device or a file over its limit fails the reading and
+  empties the directory. For a bundle, the reader must answer the `HEAD` the sandbox named; `run`
+  then puts back the clone's `.git` configuration and reads `HEAD` again.
+- **git after the import.** The clone then holds objects a sandbox made, so every git command `run`
+  runs on it afterwards (the ahead count, `HEAD`, the credential scan's listings) runs in a reader
+  too, read only. By default the push alone runs in `run`'s process tree, because it needs the run's
+  git token. It reads objects that `fsck` checked, from a clone whose configuration `run` restored,
+  to the run's branch alone. A flaw in git's reading of such objects in the push would still reach
+  that run's token and the files of `run`'s user: this is what is left of path C for the pack. With
+  `run --push-client host` a reader writes the pack too, and the token stays in `run`, which sends
+  the pack unread ([The push](#the-push)); that client has been checked against no code host yet.
+
+The front:
+
+- **What it does.** `run` starts one with each sandbox (a VM's with its create, a ready VM's too),
+  and it ends with the sandbox. It does the bridge's TLS and reads each connection's `hello`, which
+  it hands to `run`; `run` decides with the ticket or the session key it keeps, and the front then
+  holds the link, the adapter's stdio, the files going in and out and the tunnels. The tunnels end
+  in its own services: the HTTP of the [git proxy](#git-in-the-sandbox) and the
+  [platform tools](#platform-tools), of the [model proxy](#model-proxy) and of the
+  [egress proxy](#egress-proxy). For each request it hands `run` a typed head within fixed bounds
+  and the body on a socket of its own; `run` checks it again with the rules it always applied, adds
+  the credential and makes the request. It makes no connection: `run` makes each and passes it the
+  socket.
+- **What it holds.** Only what belongs to its sandbox, which the sandbox holds anyway or which is
+  useless anywhere else: the sandbox's TLS key, which no other sandbox's bridge pins; the bridge's
+  ticket and session key (`run` decides each `hello` with its own copy, and no other front has this
+  run's entry); the `start` environment, which is what the agent gets anyway (a dummy key behind a
+  model gateway; a provider key or a login only where the sandbox holds it by design); the `exec`
+  environment (`GIT_*` settings only); the route secrets of the git proxy, the platform tools and
+  the model proxy, and the egress proxy's credential; and the archives that go into the sandbox
+  (the host's clones, whose `.git/config` holds the route secret and no token, the session home,
+  the skills and the attachments). It holds no git token, no model key, no host token, no other
+  sandbox's identity, ticket or session key, and not the shared listener's key.
+- **What it cannot do** (Linux 5.19 or later, with Landlock enabled), applied by itself before it
+  builds its runtime: limits of 512 MiB of data, 1024 descriptors and no core file; not dumpable;
+  Landlock with no directory at all (only `/dev/null` and `/dev/urandom`), and where the kernel has
+  them no TCP `bind` or `connect` and no signal or abstract socket outside its domain; and the
+  reader's seccomp filter, with on top of it no `execve`, no new process (threads only), no
+  `connect`, `bind` or `listen`, and no signal outside its own process group, the signal 0
+  included. A pair of Unix sockets stays allowed, which reaches no other process. It runs as
+  `run`'s user, in a process group of its own, with an empty environment and no descriptor but its
+  control channel on stdin, `/dev/null` on stdout and a pipe to `run` for its stderr.
+- **How this is tested** (ADR-0112 decision 8, path C: `tests/path_c.rs`). Two runs over the bridge
+  on one host use the git, model and egress proxies, with canaries for the host's token, each run's
+  git token and the gateway's key. A probe that `run`'s own code starts as a sandbox's front, given
+  copies of what `run` gave run 2's front, can read no file of the host's and nothing of `run`'s,
+  run 1's front's or the sandboxes' processes under `/proc`, write nothing, signal, limit or open a
+  pidfd of none of them, make no socket, and connect or bind nowhere (run 1's bridge and tunnels,
+  any port of the test, an abstract socket): Landlock refuses the paths, the seccomp filter the
+  rest. A tap on what `run` writes to its fronts (the frames, and the sockets `run` fills) finds no
+  form of a canary over both runs, and does find one that the test makes `run` send. Stand-in
+  agents, a fake server and fake upstreams on one machine, not real machines; `ptrace` and
+  `process_vm_readv` are not tried themselves (no call without `unsafe` code), `/proc/<pid>/mem` is.
+
+Both:
+
+- **What they do not protect against.** A flaw of the kernel (Landlock, seccomp) from inside a
+  reader or a front; and what `run` still parses itself: the agent's ACP messages (lines of up to
+  8 MiB), the JSON of the platform tools' calls (1 MiB at most), the fronts' messages (closed,
+  bounded types), the readers' answers and the walk of what they wrote, stderr and log text, the
+  answers of the code host and of the model's gateway (not the sandbox's input, but a model's text
+  passes through them), and on a personal Docker host a Codex login's `auth.json`, which the
+  sandbox can write. Those are bounded and tested with a hostile peer; a flaw in one of them still
+  reaches the host's credentials with no second flaw. By default the push, too, runs in `run`'s
+  process tree with the run's token (above); with `--push-client host` it does not, and `run` parses
+  the code host's answers to it instead ([The push](#the-push)).
+- **Where they cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS),
+  every host that uses the bridge refuses to start: `--executor vm` and a Docker host with
+  `--sandbox-bridge` alike, before any image is built. At its start `run` runs a reader's probe
+  and a front's, and one refusal names each that is not confined: "this system cannot confine the
+  reader of what sandboxes send back (…) nor the front process of a sandbox (…)". A front whose
+  probe got through anything it must be refused (a host file, a socket, another process, a
+  program), or that could not signal its own process group or run its runtime, counts as not
+  confined too. `--allow-unconfined-reader` (`TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), one flag
+  for both, starts it anyway, with a warning that names what it gives up:
+  - of the reader: it still runs as a process of its own without a token, but a flaw in its
+    reading of a sandbox's archive or git bundle reaches every file of the host's user (the host's
+    token and stored credentials among them), and can end `run` and its runs with a signal; where
+    seccomp is missing too, it reaches the network as well;
+  - of the fronts: each still runs as a process of its own that holds no credential, but a flaw in
+    its parsing of its sandbox's bridge (the TLS, the frames, the tunnels) or of the HTTP to the
+    sandbox's proxies reaches every file of the host's user, the host's token and stored
+    credentials among them; where seccomp is missing too, it also reaches the network, starts
+    programs and can end `run` and its runs with a signal.
+
+  A Docker host without the bridge uses no reader and no front, and checks neither.
+- **`doctor`** runs a reader, which confines itself and tries to open the config and data
+  directories, its parent's memory and a socket, and says `reader: confined: Landlock ABI 7 (files,
+  TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable`, or why not. It
+  runs a front's probe, which also tries to reach `doctor`'s process and to start a program, and
+  says `front: confined: …`, or why not. Each line has the outcome `run` would give: a failure
+  where `run` would refuse (`TINFIRM_RUNNER_SANDBOX_BRIDGE` or `TINFIRM_RUNNER_EXECUTOR=vm` set,
+  without `TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), a warning where the flag accepts it, and a note
+  where the bridge is off. `host memory` says whether `run` can make itself not dumpable, and
+  `front wire` whether a front starts and answers (below).
+- **The front's messages.** What `run` and a front say to each other:
+  - **Its wire to `run`.** A front's stdin is one end of a pair of Unix sockets, its control
+    channel; `run` holds the other. Each message is its length in 4 bytes, then JSON of one of a
+    closed set of messages with no unknown field: at most 64 KiB from a front (a command's end,
+    which carries its output, 192 KiB), 1 MiB from `run`.
+    The front says it is ready, with its confinement, then answers `run`'s messages in order,
+    and exits when `run` closes its end, so it ends with `run` even after `kill -9`.
+    Descriptors go one way only: `run` sends them with `SCM_RIGHTS`, and reads its end with
+    plain reads, so a descriptor that a front sends back is closed by the kernel. A front that
+    sends anything else (a frame over its bound, bytes that are not one of the messages, a
+    second `ready`, an answer to nothing `run` asked) is ended at once, its process group
+    killed, and only its own handle says why; every other front goes on. So is a channel that
+    ends inside a frame, a front that does not answer a request within 10 s, and one that does
+    not take a message of `run`'s within 10 s: the channel carries small messages only, so a
+    front that stops reading it is stuck or hostile. A sandbox's own bytes never go on this
+    channel but each on a descriptor of its own, where a slow sandbox only slows its stream. A front that is
+    not ready within 10 s, or exits, is reported with its exit status and the start of its
+    stderr. A front's process group is signalled only until the front is reaped, under one lock
+    with the reaping, so a group id given to another process since is never signalled; the host
+    reaps every front, also after its handle is dropped.
+    `doctor` also tries the wire, on a line of its own: `[ ok ] front wire: ready, a round
+    trip, a descriptor passed`, or a failure with the reason when `run` would start fronts
+    (`--sandbox-bridge` or `--executor vm`), since no run starts there without one.
+  - **The bridge messages.** `run` passes the front the sandbox's TLS identity and the bridge's
+    timing (`bridgeInit`), with the listener it bound for that sandbox, or, for a VM, with none:
+    `run` then dials the VM's bridge and passes each connection (`dialed`), and the front says
+    whether the session's link has a connection (`link`), so that `run` dials again only while it
+    is down, at most once per retry interval, and only to the VM's target. `allowPeer` names the
+    one address the front takes connections from. For each connection's `hello` the front sends
+    `hello` (the run, the ticket or the session key, each at most 128 printable bytes, the
+    sequence numbers and the bridge's build), at most 8 at once; `run` answers `admit` with a new
+    session and its key, a resumption, a take-back after a frame number, or a refusal with its
+    code, and the front says whether the link took the connection (`admitted`). Then `run` asks,
+    each with its own id and a typed answer: `openTunnels` (each tunnel's address and the front's
+    service it reaches), `start` with the adapter's stdin, stdout and stderr on three sockets,
+    `signal`, `stop`, `stdinEnd` (`run` ended the adapter's stdin on purpose: a stdin socket that
+    ends without it passes no end on), `exec` (a command and its output, at most 64 KiB each),
+    `put` (a tar archive of `run`'s own on a socket pair, unpacked in the sandbox), `get` (the
+    sandbox's files as a tar archive, written on a pipe whose other end is a reader's stdin, so
+    `run` never holds the archive), `probe` (the network probe), `reclaim` and `close`. The front
+    says when the adapter exited (`exited`) and when the session ended (`sessionEnded`). A front
+    that sends a `hello` out of its bounds or a ninth at once, says `admitted` of a `hello` that
+    `run` has not admitted, says `exited` or `sessionEnded` twice, or says `link` after its
+    session ended, breaks the wire and is ended.
+  - **The egress messages.** `run` tells the front the credential the sandbox's egress proxy must
+    ask for, which the sandbox reaches through its tunnel; the front sends `connect` with a request number that only grows, a host
+    name or address and a port, and `closed` once that connection ends; `run` answers with
+    `connected` and the socket, or `refused` with a status, a message and whether the
+    destination is off the allowlist (only then does the client get `x-tinfirm-egress:
+    denied`). `run` holds a connection's place in the 256 until its `closed` comes, or the
+    front ends; a connection whose client left while `run` connected is closed by the front at
+    once, with its `closed`.
+  - **The model messages.** `run` tells the front the run secret, the format and the base path of
+    the sandbox's model proxy, which the sandbox reaches through its tunnel. For each request the front sends `request` with a request
+    number that only grows (shared with `connect`), the endpoint, method, query, headers and
+    length, within the bounds above (a header value travels as a string whose characters are
+    its bytes, U+0000 to U+00FF, and its bounds count those bytes); `run` answers with `body` and one end of a new pair of
+    Unix sockets, on which the front writes the request's body and then says `bodyEnd`; then
+    `response` with the answer's status and headers, the answer's body on the same socket, and
+    `end`, which says whether that body is whole. The front finishes its client's answer only on
+    a whole `end`, and cuts it off otherwise. A front gives a request up with `abort` when its
+    client leaves or its body breaks, and `run` then ends it and the request to the gateway. At
+    most 64 requests are open at `run` per front (more wait in the front); a front that opens
+    more, sends a head out of its bounds (a header with CR, LF or NUL, more than 64 headers, a
+    query that is not one), reuses a request number, ends a body twice, or aborts a request that
+    never was, is ended. A front that closes a request's socket and does not say within 10 s
+    whether the body is whole has that request ended. When a front ends, `run` ends all its
+    requests. A sandbox has one listener of each proxy in its life, and its front serves each
+    once: `run` refuses a second one itself, so a front never hears of it.
+  - **The git messages.** `run` tells the front the bounds of the sandbox's git proxy and
+    platform tools (open connections, the time for a request's headers, the idle time of a
+    connection), which the sandbox reaches through its tunnel, then the
+    run's routes as they are (`gitRoutes`: each repository route's number, secret, repository
+    path and branch, and the platform tools' number and secret), again whenever they change,
+    each followed by a round trip so that a request after them finds them. For each fetch or
+    tool call the front sends `request` as for the model proxy, with the route's number in
+    place of its path and secret, and the same sockets, answers and ends follow. A route the
+    run does not have, a request its route does not take (another method, another query, a
+    push), a body over its bound or not of its declared length, a header with CR, LF or NUL,
+    and a browser's request to the tools are refused by `run` as by the shared listener of a host
+    without the bridge; a
+    front that opens more than 64 of these requests at once is ended.
+
+### The push
+
+By default `run` pushes a run's work with `git push` (step 8 of [What a run does](#what-a-run-does)):
+git runs in `run`'s process tree with the run's git token in its environment, and its
+`pack-objects` reads the objects that a sandbox made. `run --push-client host`
+(`TINFIRM_RUNNER_PUSH_CLIENT=host`) pushes with the runner host's own receive-pack client instead
+(`git_push.rs`), so that no process that reads a sandbox's objects holds the token. **This client has
+been checked against no code host yet** (GitHub, GitLab, Gitea, Azure DevOps). Until it has, `git
+push` stays the default, and `host` is for testing it. With `--push-client host`, for a repository
+over https:
+
+1. `run` reads the run's token at that request, from the run's holder of git tokens, as the git
+   proxy does ([Revoked git tokens](#revoked-git-tokens-protocol-v2)). It sends
+   `GET <repository>/info/refs?service=git-receive-pack` (protocol v0, as git 2.43 pushes over
+   HTTP) and reads the answer as pkt-lines alone, each bounded and checked: at most 32 MiB,
+   262,144 refs, 65,520 bytes a line and 4096 bytes a ref name. The first line must be
+   `# service=git-receive-pack`. A ref name with a control character, a space or DEL, an HTML page,
+   a dumb server's answer, an encoded answer, a status other than 200, and a redirect each fail the
+   push. The `shallow` lines of a shallow repository, after the refs, are checked (at most
+   65,536) and dropped, as git's own push drops them. No redirect is followed, so the token goes to the repository's own URL alone, as with the
+   [git proxy](#git-in-the-sandbox).
+2. It compares the branch's tip there with the lease (the tip at clone time, or none) before it
+   sends anything. A branch that moved, was created or was deleted during the run is refused as
+   git refuses it, `[rejected] (stale info)`, and nothing reaches the repository. A branch that is
+   at HEAD already is up to date, and nothing is sent.
+3. A process without any credential writes the pack. With the bridge (`--sandbox-bridge`,
+   `--executor vm`) it is a [reader](#the-reader-and-the-front), confined as for its other git
+   commands: it reads the clone, writes nothing, and its stdout is the pack. Without the bridge it is
+   `git pack-objects` as a child of `run` without the token in its environment, like `run`'s other
+   git commands on the workspace. It packs the objects reachable from HEAD and from none of at most
+   257 tips: the lease's, and the first 256 that the repository lists (`HEAD` first, then branches,
+   then tags) and that the clone had at clone time. The pack is a full one, never a thin pack. A
+   repository with more refs still gets a correct pack, only perhaps a larger one.
+4. `run` reads the token again and POSTs `<old> <new> refs/heads/<branch>`, where `old` is the lease
+   (the zero id for a new branch), so that the repository checks it again when it updates the
+   branch. Then follows the pack as the writer writes it: unread, in chunks of 64 KiB, never held
+   whole. A request up to 1 MiB goes with a `Content-Length`, once the writer has ended well; a
+   larger one in chunks (`Transfer-Encoding: chunked`), as git does with its `http.postBuffer`. A
+   receive-pack takes a pack once its checksum, at its end, has come, without waiting for the end
+   of the request, so `run` holds the most recent chunk back and sends the last one only once the
+   writer has ended well. A writer that fails, or does not end within 30 s of its output's end,
+   never has its pack's end sent: the request is broken off, and the repository never has a whole
+   pack to take. The push has one deadline of 60 minutes, from the first reading of the token to
+   the report (the ref discovery, the check of the clone's objects, packing and sending), and the
+   ref discovery 120 s of it; when it passes, the writer's process group is killed and the push
+   fails.
+5. It reads the report-status, out of the side-band when the repository has `side-band-64k`: at
+   most 16 MiB in all, of which 1 MiB of report. The newest 16 KiB of the repository's messages
+   are kept (its errors come last), and of a progress meter only its last state. A fatal message
+   (band 3), an `unpack` line that is not `ok`, an `ng` line, and a status for another ref or for
+   none each fail the push.
+
+The outcome is worded as `git push --porcelain` words it, so a run reports the same reasons as with
+`git push` ("the remote branch changed during the run …", "the push was rejected …", "the
+repository refused the push", "git push failed"), with the repository's own messages as
+`remote: …` lines. A repository of another scheme (`file://`, for tests and local development) is
+pushed by git, which needs no token for it, and the host's log says so at each such push. The runner host makes no shallow clone (the mirror
+fetches every branch and tag, and `run` deletes a `shallow` file that an agent plants), so a pack
+never needs `--shallow`.
+
+Where it differs from `git push`, which an operator can meet:
+
+- **No proxy.** It connects to the repository's host directly: neither `HTTPS_PROXY` nor git's
+  `http.proxy` applies. A host that reaches its code host only through a proxy cannot use it.
+- **Its own trust.** It trusts the system's root certificates, or those of `SSL_CERT_FILE` and
+  `SSL_CERT_DIR` when they are set, as the git proxy does; not git's `http.sslCAInfo` or
+  `http.sslVerify`.
+- **No git configuration.** Nothing of the host user's git configuration applies: no `insteadOf`
+  rewrite, no `http.extraHeader`, no `push.followTags` or other `push.*` setting.
+- **Larger packs.** It never sends a thin pack, so a push can be larger than git's.
+- **Limits that can refuse a push** that `git push` makes: a repository whose ref advertisement
+  is over 32 MiB or 262,144 refs, and a push that takes more than 60 minutes. Switch back to
+  `--push-client git` for such a repository.
+- **The log.** When it fails, the host's log says so in fixed words; what the repository and the
+  pack's writer said reaches only the run's events, redacted as everything there.
+
+What it does not close: `run` parses the code host's answers itself, bounded as above; and a
+`git pack-objects` that a hostile repository took over can send any bytes to the run's repository
+as the pack, under the run's token. That can add objects there; the branch still moves only to the
+HEAD that `run` checked, and only from the lease. Tested in `tests/git_push.rs` (against
+`git http-backend` and hostile fake hosts), `tests/reader.rs` (the reader's pack), the parsers' unit
+tests with seeded random input, and runs in `tests/local_runs.rs`. `TINFIRM_TEST_PUSH_CLIENT=host`
+sets this client on every test host, which uses it for the repositories that a test serves over
+HTTP; most tests use `file://` repositories, which git pushes, and the log says so.
 
 ## A VM per run
 
 With `run --executor vm` (`TINFIRM_RUNNER_EXECUTOR=vm`), every run gets a fresh VM from a template
 of a VM driver, and the VM is deleted when the run ends, never reused
 ([ADR-0096](../docs/adr/0096-a-vm-per-run.md)). This host needs no Docker and holds no cloud
-credential, and a VM costs only while its run runs, or while it waits ready for one
-([Ready VMs](#ready-vms)). Every agent runs over the [sandbox bridge](#sandbox-bridge), so a VM per
-run is Pro's and Enterprise's too ([ADR-0100](../docs/adr/0100-elastic-runners-in-pro.md)).
+credential, and a VM costs only while its run runs, or, with [ready VMs](#ready-vms), while it
+waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
 
-- **How a run goes.**
-  1. The driver creates a VM from the template, for no run in particular: its user data names none.
+- **Editions** ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). The VM executor,
+  the driver protocol and the VM image's recipe are in every edition: with a driver of your own
+  (below), a Community server takes the host. DigitalOcean's driver (`--vm-driver digitalocean`), the
+  pod per run (`--vm-driver pod`) and ready VMs are Pro's and Enterprise's (elastic runners): such a
+  host lists `sandbox.elastic` or `sandbox.pool` in its `hello`, and a server whose licence does not
+  hold elastic runners refuses it with `EDITION_REQUIRED`.
+- **How a run goes.** Without ready VMs, every run starts cold:
+  1. The run asks for a VM, and the driver creates one from the template. Its user data names no
+     run.
   2. Once the driver reports it running, this host dials the sandbox bridge in the VM, which listens
-     on `--vm-port`. The VM's firewall lets in only this host, to that port, and lets nothing out.
-  3. The bridge probes the VM's network from inside (below). The VM is ready now.
-  4. A run takes a ready VM, or the next one that comes up. Its files go in, and the agent starts with
-     its credentials, over the bridge, as in [Sandbox bridge](#sandbox-bridge).
+     on `--vm-port`, and passes the connection to the VM's [front](#the-reader-and-the-front),
+     which holds the VM's bridge from its create; it dials again only while the bridge's link is
+     down. The VM's firewall lets in only this host, to that port, and lets nothing out; this host
+     listens on nothing for its VMs.
+     A driver that names a `port` in `describe` is dialed at that port of the VM's address instead:
+     a sandbox node publishes each VM's bridge on a port of its own address and forwards it to
+     `--vm-port` in the VM ([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)).
+  3. The bridge probes the VM's network from inside (below). The VM is up now.
+  4. The run takes the VM. Its files go in, and the agent starts with its credentials, over the
+     bridge, as in [Sandbox bridge](#sandbox-bridge).
   5. After the agent, the work comes back over the bridge, and the driver deletes the VM.
 - **The user data holds no credential.** It holds the bridge's settings (the VM's id, its one-time
-  ticket, this host's certificate pin), the runner image of a runtime, the sandbox's own settings
-  (`--sandbox-env`), and the URL of the VM's own egress proxy listener. Anything in the VM can read it
-  from the metadata service.
+  ticket, the pin of the VM's own bridge certificate, which its front holds, and the port to listen
+  on), the runner image of a runtime, the sandbox's own settings (`--sandbox-env`), and the URL of
+  the VM's egress proxy, `127.0.0.1:18763` on the VM's loopback, which the bridge's tunnel carries to
+  its front; no address of this host's. Anything in the VM can read it
+  from the metadata service. In the VM, `vm-boot` reads it from the source that the kernel command
+  line names (`tinfirm.user-data=disk:/dev/vdb`: a sandbox node's VM gets it on a small read-only
+  disk, ADR-0112), or else from DigitalOcean's metadata service; one VM image serves both.
 - **Always on:** the sandbox bridge, and the [egress proxy](#egress-proxy), which is the VM's only way
-  to the network (`--egress-allow` works as with Docker). The tier is `microvm`.
+  to the network (`--egress-allow` works as with Docker). The level it reports depends on the
+  driver ([Isolation level](#isolation-level)).
 - **No images on this host**: the VM's image holds the runner images, built when the image is
   built (below), and `run` rebuilds none.
 - **`--sandbox-docker` needs no Kata here**: the VM is the boundary, and the agent is root in it, as
@@ -582,13 +1176,57 @@ run is Pro's and Enterprise's too ([ADR-0100](../docs/adr/0100-elastic-runners-i
   the AWS, GCP and Azure metadata services. A VM that reaches any of them is deleted, and its run fails
   with `INFRA`. `--vm-probe` adds checks of your own: your database, your other networks.
 - **Checked at start.** `run` asks the driver to verify the template against the contract of a sandbox
-  VM, and refuses to start when it finds a problem, or when the account may not have
-  `--max-concurrent-runs` more VMs.
+  VM, and refuses to start when it finds a problem, or when the driver has too little room for
+  `--max-concurrent-runs` VMs. The driver's room (`maxVms`) is what is left: the nodes' free slots
+  with `--vm-driver node`, the account's remaining quota with a cloud's driver. The VMs that already
+  carry this host's `tinfirm-host` label count as this host's own room: after a crash or a restart
+  they are the runs it takes back and the leftovers it deletes, so a host sized to its nodes starts
+  again with them in place. Only when the room is short does `run` list them (`list`), and the
+  refusal says both numbers: "--max-concurrent-runs is 4, but the VM driver `node` has room for 1
+  more VM(s), and this host holds 2 VM(s) of its own". A host that has never been welcomed has no
+  VMs of its own. A driver that names no `maxVms` is not checked. With `--vm-driver node` the
+  count is where the room is: only this host's VMs on the nodes that offer `--vm-template` count,
+  since only those nodes' free slots are in `maxVms` (a VM's id names its node). A node that does
+  not answer is in neither number; a node that reports a problem refuses the start before.
 - **Leftovers.** After each connection to the server, this host lists its VMs and deletes those it does
   not hold: after a crash of this host, or a delete that failed. Each VM has the labels `tinfirm-host`
   (this host's id) and `tinfirm-vm` (the VM's own id); the run that takes it is in this host's log.
+- **A delete that fails** (its node is down or reboots, the driver does not answer) is tried 3 times
+  over a few seconds, and then again on its own, without a restart of this host: after 15 s, then
+  after twice the wait before, up to 5 minutes, and every 5 minutes from then on until the delete
+  succeeds. Only the VMs whose delete this host asked for are tried, never one that a run, a ready
+  VM or a run taken back holds. The log has "the sandbox VM is left; the host tries its delete
+  again later", then "sandbox VM deleted, after a delete that had failed" once the node answers.
+  The first 12 failed tries (about 40 minutes) are warnings; the twelfth says "the sandbox VM is
+  still left; the host keeps trying its delete", and the tries after it are in the debug log only.
+  The cleanup at the next connection or start deletes such a VM too.
+- **A VM that ends during its run** (its VMM dies, its node reboots) ends the run's bridge session
+  without the adapter's exit status once the bridge has been gone for 30 s. This host then asks the
+  driver's `describe` once, for at most 25 s: when the VM is gone or failed, or the driver cannot
+  describe it, the run fails with `INFRA`, "The sandbox VM ended during the run (…)", not as the
+  agent's fault. An adapter that exits by itself is reported as before, without that question.
 - **A VM that does not come up** (connected) within `--vm-start-timeout`, or that the provider fails,
   fails its run with `INFRA` and is deleted.
+- **A driver that can make no VM.** After a `create` that fails, this host asks the driver's
+  `verify`. Only an answer with problems and no room (`maxVms` 0), such as a node whose firewall
+  table is missing, stops it from taking runs: it rejects each new run with `NO_FREE_SLOT` and a
+  reason that names the cause ("the VM driver can make no VM now (…)"). This host asks `verify`
+  again before a rejection (at most every 5 s) and on its own every 30 s, and takes runs again once
+  the answer is clean or a create succeeds. With `--vm-driver node` it also asks every 5 minutes
+  while it takes runs, for the nodes' hardening ([Isolation level](#isolation-level)); such an
+  answer with problems and no room stops it from taking runs too, before a run's create fails. A
+  clean answer after a failed create leaves the host as it was: the failure was the VM's own. A `verify` that fails or does not answer changes nothing.
+  A run's admission, and the report of the run whose create failed, wait at most 5 s for `verify`;
+  a slower answer is used when it comes. Its log has one warning when it stops taking runs and one
+  line when it takes them again. With a server that lists the feature `host.health`
+  ([ADR-0117](../docs/adr/0117-a-host-reports-that-it-can-take-no-run.md)) the host also tells
+  the server: `host.health` with the problem `VM_DRIVER_NO_VM` and the cause when the state
+  begins, again when the cause changes and after each reconnect while it holds, and once without
+  a problem when it ends; at most one frame every 5 s. The server then sends it no run, the host's
+  card says **Takes no runs** and why, and the waiting runs start as soon as the host takes runs
+  again. With an older server the host sends nothing: the runs wait in the server's queue with
+  the rejection's reason, and the server tries each again later, waiting longer after each
+  rejection by the same host (up to 5 minutes by default).
 - **The VM image's build.** The VM image holds its own copy of this binary, which runs the bridge and
   built the runner images there. When a VM's bridge connects, it names that build (the version and a
   digest of the images' definitions, such as `1.0.0+images.1a2b3c4d5e6f`), and this host compares it
@@ -599,18 +1237,24 @@ run is Pro's and Enterprise's too ([ADR-0100](../docs/adr/0100-elastic-runners-i
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
 | `--executor docker\|vm` | `TINFIRM_RUNNER_EXECUTOR` | `docker` | Containers of this machine's Docker, or a VM per run |
-| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver, or the command line of another (split at white space) |
+| `--vm-driver COMMAND` | `TINFIRM_RUNNER_VM_DRIVER` | | `digitalocean`, this binary's own driver (Pro and Enterprise), `node`, its driver for [sandbox nodes](#sandbox-nodes) (every edition), `pod`, its driver of a pod per run in the Kubernetes cluster this host runs in (Pro and Enterprise; its configuration in `TINFIRM_POD_DRIVER_CONFIG`, the Helm chart's `runner.vm.driver: pod`), or the command line of your own (split at white space) |
 | `--vm-template NAME` | `TINFIRM_RUNNER_VM_TEMPLATE` | | The driver's template: image, size, network and firewall |
 | `--vm-port PORT` | `TINFIRM_RUNNER_VM_PORT` | `7443` | Where the bridge listens in the VM |
 | `--vm-start-timeout SECONDS` | `TINFIRM_RUNNER_VM_START_TIMEOUT` | `900` | From the create to the bridge's first connection (30 to 3600) |
 | `--vm-probe CHECK` | `TINFIRM_RUNNER_VM_PROBE` (one per line) | | `tcp:HOST:PORT`, `dns:NAME` or `http://HOST[:PORT]/PATH`, repeatable |
 | `--vm-image-version warn\|refuse` | `TINFIRM_RUNNER_VM_IMAGE_VERSION` | `warn` | What to do with a VM whose image another build of the runner host made |
+| `--isolation-level machine\|vm-jail` | `TINFIRM_RUNNER_ISOLATION_LEVEL` | | With a driver of your own: the level this host reports ([Isolation level](#isolation-level)) |
+| `--isolation-hardened yes\|no\|none` | `TINFIRM_RUNNER_ISOLATION_HARDENED` | `no` | With `--isolation-level`: whether the machines that run the VMs are hardened |
 
 ### Ready VMs
 
 A VM takes the provider's boot, its own start and its dockerd before a run can begin: minutes. Ready
 VMs wait for runs with all of that done, connected and probed, so a run that takes one starts in
-seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
+seconds. They are Pro's and Enterprise's, and off by default: `--pool-max-ready` above 0 turns them
+on, and the host then lists `sandbox.pool`, which a server refuses without elastic runners
+([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). Their code is
+`ee/runner/tinfirm-runner-host/src/ready_vms.rs`; it keeps VMs that the core's pool (`pool.rs`)
+creates, probes, hands to runs and deletes ([ADR-0098](../docs/adr/0098-ready-vms.md); the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#63-ready-sandboxes-a-start-in-seconds),
 §6.3).
 
@@ -621,15 +1265,17 @@ seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
   `host.config.pool`; this host follows the change on time by itself, and starts filling a window
   early by its cold start (the 90th percentile of its last 20, 5 minutes before the first, at most
   `--pool-lead-time-max`). `--pool-headroom N` keeps one ready VM per N busy ones. The operator's
-  `--pool-max-ready` is the ceiling of both, and 0 turns ready VMs off. Ready VMs count against
-  `--max-concurrent-runs` (and the server's lower value, if any): with all slots busy, none waits.
+  `--pool-max-ready` is the ceiling of both, and 0, the default, turns ready VMs off. Ready VMs
+  count against `--max-concurrent-runs` (and the server's lower value, if any): with all slots busy, none waits.
   While this host drains, after 15 minutes without the server, and when it stops, it keeps none.
 - **What Tinfirm sees.** This host reports its ready, starting and busy VMs, its cold start and the
   runs of the last 24 hours that took a ready VM or started cold (`host.pool.status`), at most every 10
   seconds; the card shows them.
-- **What a ready VM holds.** Nothing of a run: no prompt, no file, no credential. Its egress proxy
-  listener, which its container's settings name, refuses every destination until a run takes the VM
-  and binds its rules to it.
+- **What a ready VM holds.** Nothing of a run: no prompt, no file, no credential. Its front holds
+  its bridge's session while it waits. Its egress proxy, which its settings name and its front
+  serves through its tunnel, refuses every destination until a run takes the VM and binds its rules
+  to it. A ready VM has no record: after a restart, this host deletes it as a leftover and makes a
+  new one, with a new front.
 - **One shape.** The ready VMs run the runner image of `--pool-runtime` with this host's sandbox
   settings. A run of another runtime gets a VM created for it (a cold start); when this host's slots
   are full, a ready VM goes to make room. With `--pool-runtime any`, every run starts from the image
@@ -649,7 +1295,7 @@ seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
 
 | Option | Environment | Default | Meaning |
 |---|---|---|---|
-| `--pool-max-ready N` | `TINFIRM_RUNNER_POOL_MAX_READY` | `4` | The most ready VMs Tinfirm may ask for; 0 turns them off |
+| `--pool-max-ready N` | `TINFIRM_RUNNER_POOL_MAX_READY` | `0` | The most ready VMs Tinfirm may ask for; 0 turns them off. Above 0, the server needs elastic runners |
 | `--pool-runtime claude\|codex\|pi\|opencode\|any` | `TINFIRM_RUNNER_POOL_RUNTIME` | `claude` | The runtime whose image the ready VMs run; `any`: the image with every runtime, for every run |
 | `--pool-headroom BUSY` | `TINFIRM_RUNNER_POOL_HEADROOM` | `0` | One more ready VM per this many busy ones; 0 is off |
 | `--pool-max-age MINUTES` | `TINFIRM_RUNNER_POOL_MAX_AGE` | `360` | A ready VM older than this is replaced (10 to 10080) |
@@ -659,16 +1305,140 @@ seconds ([ADR-0098](../docs/adr/0098-ready-vms.md); the
 **A driver** is a program that this host starts and talks to with JSON-RPC 2.0 on stdin and stdout,
 one message per line: `hello`, `verify`, `create`, `describe`, `delete` and `list`
 ([ADR-0096](../docs/adr/0096-a-vm-per-run.md) has the methods). It holds the provider's credential, and
-deletes only VMs that carry this host's label. You can write one for another provider; a driver must
-keep the contract C1 to C7 of the
+deletes only VMs that carry this host's label. The protocol is version 1. `describe` (and each VM of
+`list`) answers `id`, `name`, `state` (`starting`, `running`, `gone` or `failed`), `address`,
+`labels`, and an optional `port`
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md)): with a `port`, this host dials the
+VM's bridge at `address:port`; without one, at `address:--vm-port`. The bridge in the VM listens on
+`--vm-port` either way. A run's take-back record keeps the port, so that a restarted host dials the
+same; a record without one, such as one written before the field existed, means `--vm-port`. A
+request is a JSON object with `jsonrpc` `"2.0"`, a `method` and an `id` (a number or a string); the
+protocol has no notifications and no batches. `verify` answers `problems`, `maxVms` and `checked`,
+and two optional fields that this host reads only from `vm-driver node`: `hardened` (`yes` or `no`,
+left out when the driver cannot tell; any other value reads as `no`) and `notHardened`, a list of
+why, for the log ([Isolation level](#isolation-level)). A driver of your own may leave both out: its
+hardening is what `--isolation-hardened` states. A method that fails is answered with an error of code
+-32000 and a message for this host's log, an unknown method too. A line that is not JSON is
+answered with -32700 and `id` `null`, JSON that is no request with -32600 (with its `id` when it has
+one), and an empty line with nothing. This binary's drivers (`vm-driver digitalocean` and `vm-driver
+node`) do so, and exit non-zero when their input ended after such lines and no request. One whose
+input cannot be read (a broken pipe, not its end) sends the answers already under way and exits
+non-zero with the read error. This host reads only the answers to its own ids. You can write one for another provider or
+your own hypervisor, in any edition: such a host lists no paid feature. A driver must keep the contract C1 to
+C7 of the
 [analysis](../docs/reviews/2026-10-15-kubernetes-runner-analysis.md#62-any-provider-one-contract-a-driver-per-provider).
+
+### Sandbox nodes
+
+`--vm-driver node` is this binary's second built-in driver
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4). This host is then a
+**control host**: it holds the credentials and runs no agent code, and the VMs run on **sandbox
+nodes**, machines that hold nothing, each with the node agent (`crates/tinfirm-node-agent`). The
+driver relays `verify`, `create`, `describe`, `delete` and `list` to each node agent's listener, over
+TLS with pinned certificates both ways, or over the listener's local socket when the agent runs on
+this host's own machine (a single machine, which is set aside and not built: the node agent refuses
+a control host on its own machine).
+
+**Not ready for use yet.** The node agent's execution (its jail, network, disks and VMM) is built.
+VMs were made, described, listed and deleted on one KVM node through this driver over TLS, driven by
+a script in this host's place ([the evidence](../docs/reviews/2026-11-19-node-agent-execution/README.md);
+[the agent's state](crates/tinfirm-node-agent/README.md#what-is-built-and-what-is-planned)). The
+Ansible plays that set up a node and a control host (`deploy/ansible/README.md`) ran on machines
+once, on 2026-11-20 (Ubuntu 24.04), with runs of this host's tests' stand-in agent through a node;
+on the same day, conversations with real runtimes (Claude Code and PI, with a real model) ran
+through a node, in a Firecracker VM, with the sandbox's front confined (Landlock and seccomp).
+The node's hardening is built and has not run on a node: the Ansible role's tasks that set it up,
+the node agent's checks of it, and this host's reading of them. Tinfirm publishes no VM image:
+the image holds Claude Code when built with every runtime, and Tinfirm does not redistribute it,
+so you build the image with `images/vm/local-disk.sh` and this host's own binary
+([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4). A CI job that
+builds and boots the image is planned. The Helm chart's runner pod has not run against a node.
+Here, the driver is tested against node agents with their fake backend.
+
+- **Editions.** In the core, in every edition: the driver lists no paid feature
+  ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)).
+- **Its level of isolation** ([Isolation level](#isolation-level)). This host reads the driver's
+  configuration at its start (the same file: it names it to the driver with `--config`) and reports
+  `vm-jail` when every node is reached over its local socket, and `machine` when every node is reached
+  over TLS at an address that is not this host's own; hardened `yes` when every node that offers
+  `--vm-template` reports it ([Isolation level](#isolation-level)). An agent that leaves its VM
+  through the VMM is then one jailed user that reads no credential, and a flaw of the kernel under the
+  VMs (KVM) reaches the machine with every credential (`vm-jail`), or the node, which holds no
+  credential, and the other runs on it (`machine`). A configuration that cannot be read, that mixes
+  sockets and TLS, or that reaches this host's own address over TLS stops `run` at its start, and
+  `--isolation-level` is refused. Conversations with real runtimes have run through a node once
+  (above): this is what such a host reports at its start, and `vm-jail` waits for the single
+  machine.
+- **Its configuration**, `/etc/tinfirm/node-driver.json` (or `TINFIRM_NODE_DRIVER_CONFIG`):
+
+  ```json
+  {
+    "nodes": [
+      {
+        "name": "node-1",
+        "address": "10.0.0.20:7700",
+        "nodeSha256": "the SHA-256 of the node's certificate, 64 hex digits",
+        "certificate": "/etc/tinfirm/node-driver/client.crt",
+        "key": "/etc/tinfirm/node-driver/client.key",
+        "templates": ["sandbox-4c8g"]
+      }
+    ],
+    "peerBuild": "warn"
+  }
+  ```
+
+  A node is reached either at `address` (`HOST:PORT`, the listener's TLS port) with the node's
+  certificate pinned by `nodeSha256` and this host's client certificate and key (DER; the key must be
+  this host's user's alone, 0600, or the driver refuses to start), or at `socket`, the listener's local
+  socket, with no certificate. All the nodes are reached one way: sockets and TLS at once are refused,
+  since a runner host has one isolation level. `templates` names the templates of the node agent's own
+  configuration that the node offers; `--vm-template` must be one of them.
+- **The certificates.** `tinfirm-runner-host node identity --cert FILE --key FILE` writes a new key
+  (PKCS #8 DER, mode 0600) and its self-signed certificate (DER), and prints the certificate's SHA-256
+  in 64 hex digits: this host's client certificate, whose SHA-256 goes into the node agent's
+  `clientSha256`. Neither file may exist, and neither is followed if it is a symbolic link.
+  `tinfirm-runner-host node fingerprint --cert FILE` prints the SHA-256 of a certificate, such as the
+  node's for `nodeSha256`. `tinfirm-node-agent identity` and `fingerprint` do the same with the same
+  files: a certificate made by either binary works with the other, and the control host needs no node
+  agent's binary for its own.
+- **Placement.** A new VM goes to a node that reports itself hardened before one that does not, then to
+  the node with the most free slots, by each node's `verify`, among the nodes that offer the template,
+  answer and report no problem; the first in the file's order on a tie.
+  When no node can take it, the `create`'s error names each node's cause: its problems (cut to 400
+  bytes), that it did not answer, or that it has no free slot. Only when every such node is healthy
+  and full is it "no node of the driver has a free slot".
+- **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer with no
+  problem. A node that does not answer is not counted and is named in the start's log; a node that
+  reports a problem, or a template that no node offers, refuses the start. The start check adds
+  this host's own VMs on the nodes that answer to that sum ([Checked at start](#a-vm-per-run)).
+- **Ids.** A VM's id is `<node>:<the agent's id>`, so the driver, which this host starts again at will,
+  finds the node of each.
+- **A node that is down.** `describe` and `delete` of its VMs fail (never `gone`), and the run that
+  waits on one ends as `INFRA` when its timeouts expire. `list` lists the VMs of the nodes that answer:
+  this host deletes only leftovers it is shown, so a node that does not answer keeps its VMs until it
+  answers again. A delete that failed while it was down is tried again on its own
+  ([A delete that fails](#a-vm-per-run)), and a run whose VM it took down ends as `INFRA`.
+- **The port.** Each node publishes each VM's bridge on a port of its own address, which `describe`
+  names (above); the VM's bridge listens on `--vm-port` inside it, and its user data comes on a small
+  read-only disk that `vm-boot` reads.
+- **Builds.** The driver and the agent exchange their build ids when they connect; another release
+  is a warning (`peerBuild: warn`) or refused (`refuse`). The images' digest after `+` is not
+  compared. A connection that was lost (an agent that was restarted) is made again at the next call.
+
+```sh
+tinfirm-runner-host run --executor vm --vm-driver node --vm-template sandbox-4c8g
+```
 
 ### In Kubernetes
 
 The Helm chart runs one host as a pod with `runner.enabled` ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
 decision 8; [the operator guide](../docs-site/content/operator-guide/helm.md#the-runner-pod)): a company host
-of one declared company, with `--executor vm --vm-driver digitalocean`, which the server registers
-itself from `TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_NAME` and `_TOKEN`. The pod runs the image
+of one declared company, which the server registers itself from
+`TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_NAME` and `_TOKEN`. It runs `--executor vm` with the driver
+`runner.vm.driver`: `digitalocean` (the default, Pro's and Enterprise's), `node`, or `pod`, a pod
+per run in the same cluster ([the operator guide's page](../docs-site/content/operator-guide/kubernetes-pod-per-run.md);
+its image's recipe is `ee/runner/images/vm/pod-image.sh`), and keeps no ready VMs unless
+`runner.pool.maxReady` is above 0. The pod runs the image
 `ghcr.io/flowtivo/tinfirm-runner-host` (the last stage of `deploy/release/runner-musl.Dockerfile`:
 this binary, git, the CA certificates and `kill`, user 10001), with `run --server <public URL>
 --token-file <the mounted Secret>`, its data directory on a volume, so that a restarted pod takes its
@@ -677,7 +1447,8 @@ the same as below; the firewall lets in the cluster's addresses.
 
 ### DigitalOcean
 
-`--vm-driver digitalocean` creates a Droplet per run.
+`--vm-driver digitalocean` creates a Droplet per run. The driver and its Packer template are Pro's and
+Enterprise's (`ee/runner/`); the VM image's recipe that the template runs is `runner/images/vm`.
 
 1. **A VPC of the sandboxes' own** in the region, not the region's default VPC. Peer it with the VPC
    of this host (for example a DOKS cluster's), so that this host reaches the Droplets on their VPC
@@ -700,7 +1471,7 @@ the same as below; the firewall lets in the cluster's addresses.
    export DIGITALOCEAN_TOKEN=...   # may create Droplets and snapshots; not the driver's token
    packer init ee/runner/images/vm/digitalocean.pkr.hcl
    packer build -var binary=./tinfirm-runner-host -var version=1.0.0 -var region=fra1 \
-     ee/runner/images/vm/digitalocean.pkr.hcl
+     ee/runner/images/vm/digitalocean.pkr.hcl   # from the repository's root
    ```
 
    `region` has no default: build in a region where the sandboxes run. A snapshot is only in the
@@ -756,8 +1527,8 @@ At start the driver checks, and `run` refuses to start on any finding:
 
 Before each create it reads the firewall and the VPC's range again (at most once a minute). It gives
 a Droplet no SSH key, no IPv6, no monitoring, no backups and no DigitalOcean agent, and tags it
-`tinfirm-sandbox`, `tinfirm-host:<this host's id>` and `tinfirm-vm:<the VM's id>` (a VM is created
-for no run: [Ready VMs](#ready-vms)); this host's log names the run that takes it. It deletes a Droplet
+`tinfirm-sandbox`, `tinfirm-host:<this host's id>` and `tinfirm-vm:<the VM's id>` (a VM's user data
+names no run); this host's log names the run that takes it. It deletes a Droplet
 only by its id, after reading it: it must carry `tinfirm-sandbox` and this host's tag, and never a
 cluster's tag (`k8s…`). It never deletes by tag. Every create and delete is in this host's log with
 the Droplet's id.
@@ -780,11 +1551,12 @@ firewall, the probe from a Droplet) and the nightly conformance test.
 | `credential add anthropic-api-key\|openai-api-key --label <l> [--pool 3]` | Stores an API key; the pool (1–16) is a ceiling |
 | `credential list`, `credential remove <label>` | Manage credentials |
 | `images build [--runtime claude\|codex\|pi\|opencode\|all\|multi] [--no-cache] [--build-arg KEY=VALUE]…` | Builds the runner images locally, with the [build arguments](#image-build-arguments) of a host without internet access, and records the arguments and runtimes in `images.json` for [the rebuilds of `run`](#rebuilds-after-an-upgrade) |
-| `doctor` | Checks the setup (directories and their modes, git, Docker, images, credentials, server); shows Docker's runtimes, the names of the recorded image build arguments, each image that `run` would rebuild, and the number of mirrors and their total size |
+| `doctor [--max-concurrent-runs N] [run's sandbox and VM options]` | Checks the setup as `run` would start with the same options and environment (`TINFIRM_RUNNER_*`): the ceiling N (default 2) as `run` takes it for the executor (at most 16 with Docker), directories and their modes, git, credentials, server, [the reader and the front](#the-reader-and-the-front) (their confinement, and the front's wire), and the level of isolation. With the Docker executor, Docker, its runtimes and the runner images: the names of the recorded image build arguments and each image that `run` would rebuild. With `--executor vm`, no Docker (it says "not used"), but what `run --executor vm` checks at its start: the driver's options; with `--vm-driver node`, its configuration and that every client key is this user's alone (0600); then the driver's `hello` and a `verify` of `--vm-template`, with room for N VMs (default 2), this host's own VMs counted as at `run`'s start ([Checked at start](#a-vm-per-run)); with `--vm-driver node`, the nodes' hardening, with each line that does not hold, which the level of isolation then reports. Also the number of mirrors and their total size, and the runs that the next `run` takes back, with those whose work waits on this host for the server |
 | `mirrors list` | Lists the repository mirrors: key, size, last use, last gc, repository URL |
 | `mirrors prune [--older-than-days N] [--dry-run]` | Deletes idle mirrors and collects garbage in the others, like `run` does every 6 hours; refused while `run` is active (`--dry-run` only shows what it would do) |
-| `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |
+| `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--push-client git\|host] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |
 | `drain [--no-wait]` | Asks the `run` of this config directory to [drain](#drain-and-upgrades): sends SIGHUP to the PID in `run.lock` and waits until `run` has exited (`--no-wait` returns after the signal). Exits 0, also when no `run` is active ("Nothing to drain") |
+| `node identity --cert <file> --key <file>`, `node fingerprint --cert <file>` | The TLS identity of a control host for [sandbox nodes](#sandbox-nodes): writes a new key (0600) and certificate, which must not exist, and prints its SHA-256; prints a certificate's SHA-256. The files of `tinfirm-node-agent identity` |
 
 Global options: `--config-dir`, `--data-dir` (or `TINFIRM_RUNNER_CONFIG_DIR`,
 `TINFIRM_RUNNER_DATA_DIR`) and `--log <filter>` (`TINFIRM_RUNNER_LOG`, default `info`).
@@ -798,7 +1570,7 @@ The host speaks one runner protocol version per connection and names it in
 | Version | Schema | What it is |
 |---|---|---|
 | 1 | [`protocol/runner-v1.schema.json`](../protocol/runner-v1.schema.json) | The frames and tools before the restart: `run.ask`, `run.repository_request`, `run.task_create` and their acks; the tools `ask_human`, `finish_run`, `request_repository`, `create_task`, `upload_attachment`, `list_repositories`. For a server from before protocol v2: the current server accepts a v1 host but sends it no runs. |
-| 2 | [`protocol/runner-v2.schema.json`](../protocol/runner-v2.schema.json) | The protocol of the current server ([docs/PLATFORM.md §11.1](../docs/PLATFORM.md#111-the-runner)): one generic `run.request` / `run.request.ack` pair for every platform request (kinds `ASK`, `ACCESS`, `ARTIFACT`, `NETWORK`, `TOOL`), the server-executed tools of `run.assign.tools`, the writable [`/output`](#output-protocol-v2) folder and `run.finished.artifacts`, `run.finished.resumed` and `resumeOutcome`, the cache writes apart from the input in the usage (`cacheWriteTokens`), `run.assign.workItem` and `job` in place of `task` (the current server fills both with the conversation), `microvm` among the isolation tiers, and `welcome.protocolVersion`. The tools are renamed: `ask`, `finish`, `request_access`, `save_artifact`, `list_repositories`; `create_task` is gone. The default. |
+| 2 | [`protocol/runner-v2.schema.json`](../protocol/runner-v2.schema.json) | The protocol of the current server ([docs/PLATFORM.md §11.1](../docs/PLATFORM.md#111-the-runner)): one generic `run.request` / `run.request.ack` pair for every platform request (kinds `ASK`, `ACCESS`, `ARTIFACT`, `NETWORK`, `TOOL`), the server-executed tools of `run.assign.tools`, the writable [`/output`](#output-protocol-v2) folder and `run.finished.artifacts`, `run.finished.resumed` and `resumeOutcome`, the cache writes apart from the input in the usage (`cacheWriteTokens`), `run.assign.workItem` and `job` in place of `task` (the current server fills both with the conversation), the level of isolation in `hello.isolationTiers` (`machine`, `vm-jail`, `container` or `gvisor`) with `hello.hardened` and `hello.isolationStated`, and `welcome.protocolVersion`. The tools are renamed: `ask`, `finish`, `request_access`, `save_artifact`, `list_repositories`; `create_task` is gone. The default. |
 
 - **Choosing.** `config.json` holds `protocolVersion` (2 when the field is missing, as in a
   file written before this version); `run --protocol-version 1` (or
@@ -818,16 +1590,21 @@ The host speaks one runner protocol version per connection and names it in
 - **Frames of the other version** (a `run.ask.ack` for a v2 host, a `run.request.ack` for a
   v1 host) are answered with `error` `UNKNOWN_TYPE`, as the schemas demand. The host reads a
   `run.assign` of either shape (`task` or `workItem`), whatever version it speaks.
-- **Isolation tiers.** With version 2 `hello.isolationTiers` names the tier of the sandbox
-  runtime: `microvm` for a `kata…` runtime, `gvisor` for `runsc…`, else `container`. With
-  version 1 the host reports `container` as before: `microvm` is an additive change of the
-  v1 schema that a server from before protocol v2 refuses.
+- **Isolation tiers.** With version 2 `hello.isolationTiers` holds the host's one level of
+  isolation ([Isolation level](#isolation-level)): `machine`, `vm-jail`, `container`, or
+  `gvisor` for a `runsc…` runtime. With version 1 the host reports `container` as before, and
+  no `hardened` or `isolationStated`. A host of this release never sends `microvm`.
 - **Optional features.** A v2 host lists in `hello.features` what it implements beyond v2, and
   the server sends a feature's frames only to a host that lists it. This host lists `run.steer`
   ([Steering](#steering-protocol-v2)), `session.bundle`
-  ([Session bundles](#session-bundles-protocol-v2)) and, with Docker, `run.skills`
-  ([Skills](#skills-protocol-v2)); a v1 host lists nothing.
-- **Per-kind waits.** A `run.request` of kind `ASK`, `ACCESS`, `NETWORK` or `ARTIFACT` waits 30 s for
+  ([Session bundles](#session-bundles-protocol-v2)), `run.git.revoke`
+  ([Revoked git tokens](#revoked-git-tokens-protocol-v2)), `run.git.refresh`
+  ([Git tokens that expire](#git-tokens-that-expire-protocol-v2)), with Docker or a VM per run,
+  `run.skills` ([Skills](#skills-protocol-v2)), and with a VM per run `host.health`
+  ([A driver that can make no VM](#a-vm-per-run)); a v1 host lists nothing. A feature that the host
+  sends frames for, as `host.health`, is used only with a server that lists it in
+  `welcome.features`.
+- **Per-kind waits.** A `run.request` of kind `ASK`, `ACCESS`, `NETWORK`, `ARTIFACT` or `GIT_TOKEN` waits 30 s for
   its ack (as the v1 pairs do); a `TOOL` request waits 65 s, the server's tool timeout
   (60 s by default) plus 5 s. A request that still waits when the connection is lost is sent
   again, with the same `requestId`, after the next `welcome`; exactly one ack of the
@@ -847,8 +1624,9 @@ Three numbers, each moved by something else
 | The features | `hello.features` | A new optional capability within protocol 2, whatever release ships it | Sends a feature's frames only to a host that lists it |
 
 **This server** accepts protocol versions 1 and 2, and runs conversations on hosts of protocol 2.
-It uses the features `run.steer`, `run.skills`, `session.bundle`, `sandbox.pool` and
-`sandbox.bridge` (the last two only with elastic runners, Pro and Enterprise). A host that lists none of them
+It uses the features `run.steer`, `run.skills`, `session.bundle`, `run.git.revoke`, `run.git.refresh`,
+`host.health`, `sandbox.bridge`, `sandbox.pool` and `sandbox.elastic` (the last two only with elastic runners, Pro and Enterprise,
+[ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)). A host that lists none of them
 still takes turns; it only misses what they add.
 
 **Every host of protocol 2** has the always-on [model proxy](#model-proxy) and sends its own
@@ -857,7 +1635,13 @@ features: the server sends a run paid by a budget to any host of protocol 2, and
 refuses a model request without the host's token.
 
 So **any runner host release that speaks a protocol the server supports works with it**: upgrade
-hosts and server in either order. A build from `main` or the `rolling` prerelease reports the
+hosts and server in either order, with one exception. **The level of isolation** changed the
+values of `hello.isolationTiers` in this release ([Isolation level](#isolation-level)): a server
+of this release refuses `microvm`, which a host of an earlier release with a VM per run or Kata
+sends, and a server of an earlier release refuses `machine` and `vm-jail`, which a host of this
+release with a VM per run sends. Such hosts and the server take this release together
+([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 2, which amends
+ADR-0109 for this one change); a host that reports `container` or `gvisor` works with either. A build from `main` or the `rolling` prerelease reports the
 development version (`0.1.0-SNAPSHOT`) in `hello`; its `--version` adds what it was published
 as, such as `0.1.0-SNAPSHOT (rolling-abc1234)` (`TINFIRM_RUNNER_BUILD` at build time).
 
@@ -1461,7 +2245,8 @@ new session (`resumeOutcome` `NO_SESSION`).
    the old one has stopped): the connection never waits for Docker or for another run.
 2. For each repository, in order (a run can have none):
    - fetches the host's mirror of the repository URL for that repository's credentials
-     (creating it on first use), with that
+     (creating it on first use; a token minted for the run names its credential's mirror,
+     [below](#git-tokens-that-expire-protocol-v2)), with that
      repository's git token passed per command as `http.extraHeader` (through `GIT_CONFIG_*`
      environment variables, so it is neither in any `.git/config` nor in the process list).
      Any fetch failure, a 401 or 403 included, fails the run with `GIT_ERROR` before the
@@ -1550,7 +2335,9 @@ new session (`resumeOutcome` `NO_SESSION`).
    it still does not). So the agent may rebase its branch onto the default branch, but when
    someone else pushed to the branch, created it or deleted it during the run, the push is
    refused: nothing is pushed or overwritten, and the reason is "the remote branch changed
-   during the run". Never a plain force. A read-only repository (`workspaces[].readOnly`,
+   during the run". Never a plain force. `run --push-client host` pushes with the runner host's
+   own client and the same lease, without the token in git's process tree, and has been checked
+   against no code host yet ([The push](#the-push)). A read-only repository (`workspaces[].readOnly`,
    ADR-0017) is never pushed, and its commits are not scanned. A failed push does not stop the
    others; the run then fails with `GIT_ERROR` and a `failureMessage` that names the
    repositories. `run.finished` carries one git result per cloned repository (in
@@ -1632,7 +2419,16 @@ process, with one route and one route secret per repository.
   `[REDACTED]`, but it is not a credential: `git fetch` prints the URL, and that is no
   `CREDENTIAL_LEAK`.
 - One listener serves all runs, and also the [platform tools](#platform-tools), so every run
-  needs it. The first run starts it, on a random port. With Docker Engine on Linux it listens on the gateway IP of the sandbox
+  needs it. The first run starts it, on a random port. With `--sandbox-bridge` or a
+  [VM per run](#a-vm-per-run) this host binds no listener for it: the sandbox reaches it through a
+  tunnel of its bridge, at port 18761 of its own loopback, to its
+  [front process](#the-reader-and-the-front): the front reads the sandbox's requests (the route
+  secret, the path and the method, the headers within the bounds below, the body's framing)
+  and hands `run` the route's number, the request's head and its body; `run` checks it again,
+  reads the route's token, makes the request and passes the answer back. The front never
+  holds a token. The rules and limits are the same either way.
+- A request's head is at most 64 headers, each name at most 64 bytes and each value at most
+  8 KiB, 24 KiB in all (`431` above), with a query of at most 4 KiB (`414`). With Docker Engine on Linux it listens on the gateway IP of the sandbox
   network (`docker0`, usually `172.17.0.1`). With Docker Desktop (and on macOS in general)
   it listens on `127.0.0.1`, which containers reach as `host.docker.internal`.
 - `TINFIRM_RUNNER_GIT_PROXY_BIND` sets the listen address (an IP, optionally with a port)
@@ -1644,9 +2440,93 @@ process, with one route and one route secret per repository.
   must be one of this machine's, and not `0.0.0.0` or `::`, or `run` refuses to start: the
   model proxy, which is always on, listens there. With `TINFIRM_RUNNER_SANDBOX_NETWORK=none`
   there is no proxy, and `run` refuses to start for the same reason.
-- If the proxy cannot start, the run goes on with a warning, without fetch and without the
-  platform tools; a run whose model access is a gateway fails instead, because its model
-  proxy has no address to listen on.
+- If the proxy cannot start, the run goes on with a
+  warning, without fetch and without the platform tools; a run whose model access is a gateway fails instead, because its model
+  proxy has no address to listen on. With the bridge, a sandbox whose front cannot start does not
+  start either, and its run fails.
+- A route reads its repository's token from the run's holder at each request, never a copy
+  taken when the run started. Once Tinfirm has revoked the token
+  ([below](#revoked-git-tokens-protocol-v2)), each new request gets 403 with Tinfirm's message
+  as plain text, which git shows the agent (`fatal: unable to access …: The requested URL
+  returned error: 403`, after the message). A request already forwarded finishes. With the
+  bridge it is `run`, not the front, that reads the token at each request, so a revocation
+  between two requests of the same sandbox refuses the second.
+
+### Revoked git tokens (protocol v2)
+
+Under protocol v2 the host lists the feature `run.git.revoke` in `hello.features`
+([ADR-0116](../docs/adr/0116-short-lived-and-revocable-git-tokens.md)). Tinfirm sends
+`run.git.revoke` when the run may no longer use a repository's git token: the conversation's
+account was disconnected or needs a new sign-in, a credential was disabled, a grant or a lending
+was withdrawn, a holder was suspended, the system was paused or removed, and so on. The frame names
+the repositories (`componentIds`), a reason code and a message; it has no ack, and Tinfirm sends
+it again at every `hello` that lists the run, until the run ends, followed by `welcome.done`,
+which says that every such frame of the runs the `hello` listed has been sent.
+
+One holder per run keeps each repository's token; the host's git, the git proxy's routes and the
+take-back record read it there when they use it. For a frame of the run's current epoch, for each
+repository it names:
+
+| What | After the revocation |
+|---|---|
+| The holder | Drops the token, and keeps the reason and the message |
+| The git proxy | Answers each new fetch with 403 and the message ([Git in the sandbox](#git-in-the-sandbox)). A fetch already under way finishes |
+| A clone not yet made | `cannot clone <repository>: <message>`, `GIT_ERROR` |
+| The mirror fetch before the push | Not attempted: the credential scan compares with the refs at clone time |
+| The push | Not attempted. A repository with commits ahead fails the run with `GIT_ERROR` and `git failed in <repository>: not pushed: <message>`, its git result `pushed: false` with the commits counted; its commits stay only in a kept failed workspace. A repository without commits fails nothing |
+| The take-back record | Written again without the token ([Sandbox bridge](#sandbox-bridge)) |
+| The redaction | The token stays on the run's list until the run ends: what was revealed stays redacted, and the agent printing it is still `CREDENTIAL_LEAK` |
+| The run's events | A `LOG` event at `warn` with the message |
+
+Once the holder has dropped the tokens and the take-back record is written again (a record that
+is being made when the frame comes is made first, then written again without the token), the
+host confirms the frame with `run.git.revoked` (`runId`, `epoch`, `componentIds`): it names every
+repository of the frame that the run has, those revoked already included, so a frame that comes
+twice is confirmed twice. It goes in the run's order with its events, so a confirmation written
+while the host is disconnected, or lost with the connection, goes again after the next
+`welcome`. A record that cannot be written leaves the frame unconfirmed; Tinfirm sends it again at
+the next `hello`. A host that restarts between a revocation and its confirmation takes the run
+back without the token, and confirms the frame that Tinfirm sends again at its `hello`.
+
+The other repositories go on as before, and so does the agent: it works on without git for the
+repositories revoked. A frame for another epoch, for a run the host does not hold, or one that
+names none of the run's repositories, changes nothing, and is confirmed by nothing. A repository
+revoked already keeps its first reason. A
+cancelled run whose token was revoked ends `CANCELLED` as before, with the repository not pushed
+and the reason in the log. A host of protocol 1 knows no such frame (`error` `UNKNOWN_TYPE`), and
+Tinfirm sends it only to a host that lists the feature: such a run keeps its token until it ends.
+
+### Git tokens that expire (protocol v2)
+
+Under protocol v2 the host also lists `run.git.refresh`
+([ADR-0116](../docs/adr/0116-short-lived-and-revocable-git-tokens.md)). A token that Tinfirm mints
+for one run, such as a GitHub App's installation token, comes with `git.expiresAt` (at most an
+hour away) and `git.mirrorKey`; any other token has neither and lives until the run ends.
+
+- **When the host renews.** With a `run.request` of kind `GIT_TOKEN` naming every repository that
+  is due: while the run works, when a token has 10 minutes or less left (the host looks every
+  15 s); before the push at the run's end, when it has 20 minutes or less left; and for a run
+  taken back after a restart, every token that expires, once the server has answered the
+  `hello` whole (after `welcome.done`, however long that takes; a server without
+  `run.git.revoke` in `welcome.features` never sent `expiresAt`, so such a run has none to
+  renew). It asks at most
+  once a minute per repository, and only while connected.
+- **The answer.** DONE: each renewed token goes into the run's holder (so the git proxy's routes,
+  the host's git and the take-back record use it from then on) and onto the run's redaction list,
+  where the old one stays. A repository in `refused` with `GIT_REVOKED`, or a REJECTED
+  `GIT_REVOKED` for the whole request, is revoked with the server's message, as by
+  `run.git.revoke` ([above](#revoked-git-tokens-protocol-v2)). `GIT_HELD` (a kill switch holds the
+  run's systems), `GIT_UNAVAILABLE`, an unknown code, no answer within 30 s or no connection: the
+  token is kept, and the host asks again later.
+- **A token that expires without a new one** cannot be used: the git proxy answers 403 with "the
+  git token expired and Tinfirm could not renew it", which is also logged once as a warning, and
+  the repository is not pushed (`GIT_ERROR`, `not pushed: …`). A renewal that comes later makes
+  it usable again; nothing is revoked.
+- **The mirror.** A token with `mirrorKey` names its mirror by the credential's key, not by the
+  token, so the runs of one credential share a mirror per repository and two credentials still
+  never do. Such a mirror is a `<key>.git` like any other, and maintenance deletes it when idle.
+- `expiresAt` and `mirrorKey` come together; an assignment with one alone, or a key that is not 64
+  lowercase hex characters, is rejected with `INVALID_ASSIGNMENT`.
 
 ### Platform tools
 
@@ -1654,7 +2534,9 @@ Every run gets the Tinfirm platform tools over MCP (docs/archive/v1/CONVENTIONS.
 [protocol v2](#protocol-versions) the renamed set of
 [Platform tools under protocol v2](#platform-tools-under-protocol-v2)). They are served by
 the host process, not by the sandbox, at `http://<proxy host>:<port>/<mcp secret>/mcp` on
-the git proxy's listener, and passed to the agent in ACP `session/new` and `session/load` as
+the git proxy's listener (with the bridge, the sandbox's tunnel to its front, at port 18761
+of its own loopback: the front reads the HTTP and hands `run` the body, at most 1 MiB, whose JSON
+`run` reads and answers), and passed to the agent in ACP `session/new` and `session/load` as
 `mcpServers: [{"type": "http", "name": "tinfirm", "url": …, "headers": []}]`. With protocol
 v1 the six tools are the following; they serve a server from before protocol v2, since the
 current server sends runs only to v2 hosts, and their texts speak of that server's tasks:
@@ -1889,6 +2771,14 @@ cargo fmt --check
   `tinfirm-runner-fake:test` and repeats the key scenarios in real containers, including the
   real binary receiving SIGTERM, SIGHUP and `drain`. The Docker tests skip themselves when
   Docker is not reachable, or with `TINFIRM_SKIP_DOCKER_TESTS=1`.
+- `bridge_runs.rs` runs the agent over the [sandbox bridge](#sandbox-bridge) with the local test
+  executor, and `vm_runs.rs` with the VM executor and the fake driver
+  (`tests/fake-vm-driver/fake-driver.mjs`), whose "VMs" are this binary as `bridge` on a loopback
+  address of their own; every run there starts cold. `TINFIRM_TEST_SANDBOX_BRIDGE=1` or
+  `TINFIRM_TEST_VM_EXECUTOR=1` runs `local_runs.rs` again over the bridge or in such VMs. The paid
+  features' tests are under `ee/runner/tinfirm-runner-host/tests` and run with the rest:
+  `pool_runs.rs` (ready VMs) and `digitalocean_runs.rs` (DigitalOcean's driver and the feature
+  `sandbox.elastic`).
 - The git proxy tests (`tests/git_proxy.rs` and the `fetch` scenario in `local_runs.rs` and
   `docker_runs.rs`), the mirror tests (`tests/mirror.rs`) and the multi-repository runs serve
   repositories over smart HTTP with `git http-backend` and require the host's `Authorization`

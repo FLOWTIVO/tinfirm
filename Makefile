@@ -28,9 +28,9 @@ REVISION := $(shell git rev-parse --verify -q HEAD 2>/dev/null || echo unknown)
 HADOLINT_IMAGE   := hadolint/hadolint:v2.15.1
 ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
-DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile
-SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh ee/runner/images/vm/setup.sh \
-                    .github/check-pins.sh .github/actions/set-version/*.sh
+DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile ee/runner/images/vm/pod.Dockerfile
+SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh runner/images/vm/local-disk.sh ee/runner/images/vm/pod-image.sh \
+                    .github/check-pins.sh .github/actions/set-version/*.sh deploy/helm/check-runner-pod.sh
 
 # `make release-assets`: the Linux release assets of HEAD (runner-artifacts.yml builds them
 # all), with this version in their names.
@@ -95,7 +95,7 @@ smoke-image: build-image ## Build $(IMAGE):$(TAG), start it against PostgreSQL a
 deploy-host: ## Deploy to one host over SSH: make deploy-host HOST=user@host [URL=https://…] [PORT=8080]
 	deploy/compose/deploy-host.sh "$(HOST)" "$(URL)" "$(or $(PORT),8080)"
 
-release-assets: ## Static Linux runner host binaries (x86_64, aarch64) and the Compose tarball of HEAD, in dist/release-assets
+release-assets: ## Static Linux runner host and node agent binaries (x86_64, aarch64) and the Compose tarball of HEAD, in dist/release-assets
 	rm -rf $(ASSETS_DIR)
 	deploy/release/assets.sh runner-linux x86_64-unknown-linux-musl "$(VERSION)" $(ASSETS_DIR)
 	deploy/release/assets.sh runner-linux aarch64-unknown-linux-musl "$(VERSION)" $(ASSETS_DIR)
@@ -138,7 +138,7 @@ docs-build: $(DOCS_VENV)/.installed ## Docs site: strict build into docs-site/si
 docs-lock: ## Docs site: lock requirements.in into requirements.txt with hashes (needs uv)
 	cd $(DOCS_DIR) && uv pip compile --quiet --universal --python-version 3.11 --generate-hashes requirements.in -o requirements.txt
 
-helm-lint: ## Helm: the chart's LICENSE, lint --strict and template, with default values and each ci/*.yaml
+helm-lint: ## Helm: the chart's LICENSE, lint --strict and template, with default values and each ci/*.yaml, and the pod driver's objects
 	cmp LICENSE $(CHART)/LICENSE || { echo "$(CHART)/LICENSE must be a copy of the root LICENSE: cp LICENSE $(CHART)/LICENSE" >&2; exit 1; }
 	helm lint --strict $(CHART)
 	helm template tinfirm $(CHART) > /dev/null
@@ -147,8 +147,9 @@ helm-lint: ## Helm: the chart's LICENSE, lint --strict and template, with defaul
 	  helm lint --strict $(CHART) -f "$$values"; \
 	  helm template tinfirm $(CHART) -f "$$values" > /dev/null; \
 	done
+	deploy/helm/check-runner-pod.sh
 
-deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second-company examples), hadolint, shellcheck, actionlint, the action pins
+deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second-company examples, the HTTPS overlay), hadolint, shellcheck, actionlint, the action pins
 	$(COMPOSE) --env-file $(COMPOSE_DIR)/.env.example config --quiet
 	$(COMPOSE) --env-file $(COMPOSE_DIR)/.env.example --profile oidc config --quiet
 	$(COMPOSE_OIDC) --env-file $(COMPOSE_DIR)/.env.example config --quiet
@@ -158,6 +159,8 @@ deploy-lint: ## Compose config (with and without oidc, SAML, Entra ID and second
 	  $(COMPOSE) -f $(COMPOSE_DIR)/compose.entra.yaml --env-file $(COMPOSE_DIR)/.env.example config --quiet
 	TINFIRM_ACME_ISSUER_URI=https://sso.example.com TINFIRM_ACME_CLIENT_ID=lint TINFIRM_ACME_CLIENT_SECRET=lint \
 	  $(COMPOSE) -f $(COMPOSE_DIR)/compose.companies.example.yaml --env-file $(COMPOSE_DIR)/.env.example config --quiet
+	TINFIRM_TLS_HOST=lint.example.com \
+	  $(COMPOSE) -f $(COMPOSE_DIR)/compose.tls.yaml --env-file $(COMPOSE_DIR)/.env.example config --quiet
 	for file in $(DOCKERFILES); do echo "--- $$file"; docker run --rm -i $(HADOLINT_IMAGE) < "$$file"; done
 	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) $(SHELL_SCRIPTS)
 	docker run --rm -v "$(CURDIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color

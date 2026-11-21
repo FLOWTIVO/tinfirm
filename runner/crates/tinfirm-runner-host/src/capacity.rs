@@ -52,7 +52,7 @@ pub struct Capacity {
     /// The version applied last on the current connection; `None` before the first one.
     applied_version: Option<u64>,
     draining: bool,
-    /// A host with ready sandboxes (crate::pool): the operator's `maxReady`.
+    /// A host with ready sandboxes (crate::ready_vms): the operator's `maxReady`.
     pool_ceiling: Option<u32>,
     /// Tinfirm's count of ready sandboxes, as the last `host.config` gave it.
     desired_pool: Option<PoolConfig>,

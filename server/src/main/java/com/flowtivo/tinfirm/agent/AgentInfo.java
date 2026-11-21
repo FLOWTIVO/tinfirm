@@ -6,6 +6,7 @@ import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
 
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
 
 /**
@@ -19,13 +20,25 @@ import com.flowtivo.tinfirm.runner.RuntimeKind;
  * @param ownerPrincipalId     the member's principal who owns it; null once it passed to the admins
  * @param version              the current version (contract §11)
  * @param deletedAt            set for a deleted agent, which stays for its conversations' history
+ * @param isolationLevel       the level of isolation chosen for its runs (ADR-0113, decision 4); null for automatic,
+ *                             the strongest level the hosts that count for a run report
  */
 public record AgentInfo(UUID id, UUID companyId, String name, String handle, @Nullable String description,
         String instructions, List<RuntimeKind> runtimes, @Nullable Integer turnTimeLimitMinutes,
-        boolean memoryAllowed, AgentStatus status, @Nullable UUID ownerPrincipalId, int version, @Nullable Instant deletedAt) {
+        boolean memoryAllowed, AgentStatus status, @Nullable UUID ownerPrincipalId, int version, @Nullable Instant deletedAt,
+        @Nullable IsolationLevel isolationLevel) {
 
     public AgentInfo {
         runtimes = List.copyOf(runtimes);
+    }
+
+    /** An agent whose isolation is automatic. */
+    public AgentInfo(UUID id, UUID companyId, String name, String handle, @Nullable String description,
+            String instructions, List<RuntimeKind> runtimes, @Nullable Integer turnTimeLimitMinutes,
+            boolean memoryAllowed, AgentStatus status, @Nullable UUID ownerPrincipalId, int version,
+            @Nullable Instant deletedAt) {
+        this(id, companyId, name, handle, description, instructions, runtimes, turnTimeLimitMinutes, memoryAllowed,
+                status, ownerPrincipalId, version, deletedAt, null);
     }
 
     /** An agent whose memory is allowed. */

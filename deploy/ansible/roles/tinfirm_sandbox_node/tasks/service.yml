@@ -1,0 +1,40 @@
+---
+# checks.yml found the modules' unit changed while module loading is off: the new unit is
+# installed now, and no module can be loaded until a reboot. Nothing is restarted.
+- name: Stop for a reboot when the modules changed under disabled module loading
+  ansible.builtin.fail:
+    msg: >-
+      The node's list of kernel modules (tinfirm-node-agent-modules.service) changed while
+      kernel.modules_disabled is 1: no module can be loaded until the next boot. The new unit is
+      installed. Reboot the node: it loads the new list at boot, and the hardening's unit turns
+      module loading off after it. Then run the role again.
+  when: _tinfirm_sandbox_node_modules_locked | default(false) | bool
+
+# The settings are applied by a handler when their file changes. A run that failed between the
+# file and the handler leaves the file in place and the settings unapplied, and a later run
+# sees no change (seen 2026-11-20): so apply them here whenever the node does not have them.
+- name: Read the node's sysctl settings
+  ansible.builtin.command:
+    argv: [sysctl, -n, net.ipv4.ip_forward, user.max_user_namespaces]
+  register: _tinfirm_sandbox_node_sysctl_before
+  changed_when: false
+
+- name: Apply the node's sysctl settings that are not in force
+  ansible.builtin.command:
+    argv: [sysctl, -p, /etc/sysctl.d/60-tinfirm-node-agent.conf]
+  changed_when: true
+  when: _tinfirm_sandbox_node_sysctl_before.stdout_lines != ['1', '0']
+
+# In their order: the modules, the node's firewall, the helper, the listener. A helper that
+# stops or starts again leaves its VMs running: each VMM is in a cgroup of its own.
+- name: Start the node agent's units
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: "{{ _tinfirm_sandbox_node_unit_files is changed or _tinfirm_sandbox_node_dropin is changed }}"
+  loop: "{{ _tinfirm_sandbox_node_units }}"
+
+# A changed binary, configuration or unit: the restarts that were asked for, now.
+- name: Restart what changed
+  ansible.builtin.meta: flush_handlers

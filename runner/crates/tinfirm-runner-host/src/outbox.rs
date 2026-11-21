@@ -1,6 +1,7 @@
 //! Outbound message buffer that survives reconnects (docs/archive/v1/CONVENTIONS.md §15.4 step 11).
 //!
-//! Per run, it keeps `run.accepted`, the run's events and `run.finished` in order. While the
+//! Per run, it keeps `run.accepted`, the run's events, its `run.git.revoked` confirmations
+//! (ADR-0116) and `run.finished` in order. While the
 //! connection is down, events accumulate (at most 10 000 per run; LOG events are dropped
 //! first). After a reconnect the unsent items are flushed, together with a window of the
 //! most recently sent ones, because frames written just before a connection died may never
@@ -21,7 +22,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tinfirm_protocol::{ActiveRun, Message, RunAccepted, RunEvent, RunFinished};
+use tinfirm_protocol::{ActiveRun, Message, RunAccepted, RunEvent, RunFinished, RunGitRevoked};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -36,8 +37,14 @@ pub const DEFAULT_FINISHED_RETENTION: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone)]
 enum Item {
-    Accepted { msg: RunAccepted, sent_once: bool },
+    Accepted {
+        msg: RunAccepted,
+        sent_once: bool,
+    },
     Event(RunEvent),
+    /// A `run.git.revoked`: never dropped by the cap, and written again after a reconnect
+    /// while it is in the window, as an event is.
+    Revoked(RunGitRevoked),
     Finished(RunFinished),
 }
 
@@ -205,6 +212,29 @@ impl Outbox {
         }
         drop(inner);
         self.notify.notify_one();
+    }
+
+    /// Queues a `run.git.revoked` in its execution's order (ADR-0116). `false` when the outbox
+    /// has no queue of that execution yet (the run is still being admitted): the caller keeps
+    /// it until the queue opens. A run whose end is queued already confirms nothing more: the
+    /// frame is dropped, and `true` is returned.
+    pub fn push_revoked(&self, revoked: RunGitRevoked) -> bool {
+        let mut inner = self.lock();
+        let Some(q) = inner
+            .runs
+            .iter_mut()
+            .find(|q| q.run_id == revoked.run_id && q.epoch == revoked.epoch)
+        else {
+            return false;
+        };
+        if q.finished_pushed {
+            tracing::debug!(run_id = %revoked.run_id, epoch = revoked.epoch, "run.git.revoked after the run's end dropped");
+            return true;
+        }
+        q.items.push_back(Item::Revoked(revoked));
+        drop(inner);
+        self.notify.notify_one();
+        true
     }
 
     /// Forgets one execution (stale epoch: the server wants nothing more from it).
@@ -378,6 +408,7 @@ impl RunQueue {
                     }
                 }
                 Item::Event(e) => return Some(Message::RunEvent(e.clone())),
+                Item::Revoked(r) => return Some(Message::RunGitRevoked(r.clone())),
                 Item::Finished(f) => {
                     self.finished_sent_at.get_or_insert(now);
                     return Some(Message::RunFinished(f.clone()));
@@ -750,5 +781,45 @@ mod tests {
         assert_eq!(outbox.dropped(run), 0);
         let unsent = take_all(&outbox);
         assert_eq!(unsent.len(), MAX_BUFFERED_EVENTS_PER_RUN - 5);
+    }
+
+    #[test]
+    fn a_revocations_confirmation_goes_in_its_runs_order_and_again_after_a_reconnect() {
+        let outbox = Outbox::new();
+        let run = Uuid::new_v4();
+        let revoked = |run_id: Uuid, epoch: i64| RunGitRevoked {
+            run_id,
+            epoch,
+            component_ids: vec![Uuid::nil()],
+        };
+        // No queue of that execution yet: the caller keeps it.
+        assert!(!outbox.push_revoked(revoked(run, 1)));
+        outbox.open_run(RunAccepted {
+            run_id: run,
+            epoch: 1,
+        });
+        assert!(!outbox.push_revoked(revoked(run, 2)), "another epoch");
+        outbox.push_event(event(run, 1, true));
+        assert!(outbox.push_revoked(revoked(run, 1)));
+        outbox.push_event(event(run, 2, false));
+        let sent = take_all(&outbox);
+        assert!(matches!(sent[0], Message::RunAccepted(_)));
+        assert!(matches!(&sent[1], Message::RunEvent(e) if e.seq == 1));
+        assert!(matches!(&sent[2], Message::RunGitRevoked(r) if r.run_id == run));
+        assert!(matches!(&sent[3], Message::RunEvent(e) if e.seq == 2));
+        // Lost with the connection: written again after the next welcome, in order.
+        outbox.on_disconnect();
+        outbox.on_reconnect();
+        let again = take_all(&outbox);
+        assert_eq!(again.len(), 3, "{again:?}");
+        assert!(matches!(&again[1], Message::RunGitRevoked(_)));
+        // Once the run's end is queued, nothing more is confirmed.
+        outbox.push_finished(finished(run, 2));
+        assert!(outbox.push_revoked(revoked(run, 1)));
+        let last = take_all(&outbox);
+        assert!(
+            matches!(last.as_slice(), [Message::RunFinished(_)]),
+            "{last:?}"
+        );
     }
 }

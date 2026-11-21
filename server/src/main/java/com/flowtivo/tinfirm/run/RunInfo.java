@@ -8,6 +8,7 @@ import org.jspecify.annotations.Nullable;
 
 import com.flowtivo.tinfirm.model.ModelAccessChoice;
 import com.flowtivo.tinfirm.runner.HostScope;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
 
@@ -27,6 +28,10 @@ import com.flowtivo.tinfirm.runner.RuntimeKind;
  * @param result           the agent's last {@code finish}, or null
  * @param sessionId        the agent's session the host reported at the end; the next turn resumes it
  * @param epoch            the run's current assignment
+ * @param isolationLevel   the level of isolation its host was placed at when it was last assigned (ADR-0113); null
+ *                         before
+ * @param placementNote    why it ran where it did, when its conversation's session was on a host of another level;
+ *                         null otherwise
  */
 public record RunInfo(UUID id, UUID companyId, UUID conversationId, String conversationKey, UUID agentId,
         RuntimeKind runtime, TurnReason turnReason, int turnNumber, UUID actingPrincipalId, UUID payerPrincipalId,
@@ -34,7 +39,22 @@ public record RunInfo(UUID id, UUID companyId, UUID conversationId, String conve
         @Nullable HostScope runnerHostKind, @Nullable QueueReasonCode queueReason, @Nullable Instant retryAt,
         @Nullable String failureClass, @Nullable String failureMessage, @Nullable String summary,
         @Nullable Result result, @Nullable String sessionId, long epoch, Instant createdAt,
-        @Nullable Instant startedAt, @Nullable Instant finishedAt) {
+        @Nullable Instant startedAt, @Nullable Instant finishedAt, @Nullable IsolationLevel isolationLevel,
+        @Nullable PlacementNote placementNote) {
+
+    /** A run not placed by level (tests, and runs from before ADR-0113). */
+    public RunInfo(UUID id, UUID companyId, UUID conversationId, String conversationKey, UUID agentId,
+            RuntimeKind runtime, TurnReason turnReason, int turnNumber, UUID actingPrincipalId, UUID payerPrincipalId,
+            @Nullable ModelAccessChoice modelAccess, RunStatus status, @Nullable UUID runnerHostId,
+            @Nullable HostScope runnerHostKind, @Nullable QueueReasonCode queueReason, @Nullable Instant retryAt,
+            @Nullable String failureClass, @Nullable String failureMessage, @Nullable String summary,
+            @Nullable Result result, @Nullable String sessionId, long epoch, Instant createdAt,
+            @Nullable Instant startedAt, @Nullable Instant finishedAt) {
+        this(id, companyId, conversationId, conversationKey, agentId, runtime, turnReason, turnNumber,
+                actingPrincipalId, payerPrincipalId, modelAccess, status, runnerHostId, runnerHostKind, queueReason,
+                retryAt, failureClass, failureMessage, summary, result, sessionId, epoch, createdAt, startedAt,
+                finishedAt, null, null);
+    }
 
     /** The agent's last {@code finish} call of the run: what it reported, within the protocol's limits. */
     public record Result(RunnerMessages.ResultOutcome outcome, String summary, List<String> nextSteps,

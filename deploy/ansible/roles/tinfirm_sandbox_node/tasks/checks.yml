@@ -1,0 +1,410 @@
+---
+- name: Check the operating system and the architecture
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] in ['Debian', 'RedHat']
+      - ansible_facts['architecture'] in ['x86_64', 'aarch64']
+      - ansible_facts['service_mgr'] == 'systemd'
+    fail_msg: >-
+      The role supports Ubuntu, Debian and the RHEL family with systemd on x86_64 or aarch64,
+      not {{ ansible_facts['distribution'] }} on {{ ansible_facts['architecture'] }}. Only Ubuntu
+      24.04 on x86_64 has run a node.
+    quiet: true
+
+- name: Look for /dev/kvm
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: _tinfirm_sandbox_node_kvm
+
+- name: Check that the node can run VMs
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_kvm.stat.exists
+      - _tinfirm_sandbox_node_kvm.stat.ischr
+    fail_msg: >-
+      /dev/kvm does not exist: this machine cannot run a VM. A node that is itself a VM needs
+      nested virtualisation from its hypervisor (deploy/ansible/README.md).
+    quiet: true
+
+- name: Check the node agent's binary source
+  ansible.builtin.assert:
+    that:
+      - (tinfirm_sandbox_node_binary_src | length > 0) != (tinfirm_sandbox_node_binary_url | length > 0)
+      - >-
+        tinfirm_sandbox_node_binary_checksum | length == 0
+        or tinfirm_sandbox_node_binary_checksum is match('^sha256:[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      Set exactly one of tinfirm_sandbox_node_binary_src and tinfirm_sandbox_node_binary_url;
+      tinfirm_sandbox_node_binary_checksum is "sha256:<hex>" or empty.
+    quiet: true
+
+- name: Check the checksums of Firecracker
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_firecracker[item] | default('') is match('^sha256:[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      No {{ item }} checksum for Firecracker {{ tinfirm_sandbox_node_firecracker_version }} on
+      {{ ansible_facts['architecture'] }}: set tinfirm_sandbox_node_firecracker_checksums to
+      {archive, firecracker, jailer}, each "sha256:<hex>", from the release's assets. The role
+      downloads a release only against them.
+    quiet: true
+  loop: [archive, firecracker, jailer]
+
+- name: Check the checksums of the guest kernel
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_kernel_pins.archive | default('') is match('^sha256:[0-9a-fA-F]{64}$')
+      - _tinfirm_sandbox_node_kernel_pins.kernel | default('') is match('^sha256:[0-9a-fA-F]{64}$')
+      - _tinfirm_sandbox_node_kernel_pins.member | default('') is match('^[A-Za-z0-9._/-]+$')
+    fail_msg: >-
+      No guest kernel is known for Kata Containers {{ tinfirm_sandbox_node_kernel_kata_version }}
+      on {{ _tinfirm_sandbox_node_kata_arch }}: set tinfirm_sandbox_node_kernel_checksums to
+      {archive: "sha256:…", member: <the kernel's path in the archive>, kernel: "sha256:…"}.
+      Only 4.3.1 on x86_64 has run.
+    quiet: true
+
+- name: Check the VM image's source
+  ansible.builtin.assert:
+    that:
+      - (tinfirm_sandbox_node_image_src | length > 0) != (tinfirm_sandbox_node_image_url | length > 0)
+      - tinfirm_sandbox_node_image_checksum is match('^sha256:[0-9a-fA-F]{64}$')
+    fail_msg: >-
+      Set exactly one of tinfirm_sandbox_node_image_src and tinfirm_sandbox_node_image_url, and
+      tinfirm_sandbox_node_image_checksum to its "sha256:<hex>". Tinfirm publishes no VM
+      image for a local disk: build it with runner/images/vm/local-disk.sh.
+    quiet: true
+
+# The helper takes IPv4 addresses for the node and the control host (`network`).
+- name: Check the node's addresses
+  ansible.builtin.assert:
+    that:
+      - item.value is match('^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])$')
+      - item.value is not match('^(127\.|0\.0\.0\.0$)')
+    fail_msg: "{{ item.key }} must be one IPv4 address, not loopback or 0.0.0.0, not \"{{ item.value }}\"."
+    quiet: true
+  loop: "{{ {'tinfirm_sandbox_node_address': tinfirm_sandbox_node_address,
+             'tinfirm_sandbox_node_control_host': tinfirm_sandbox_node_control_host,
+             'tinfirm_sandbox_node_management_address': tinfirm_sandbox_node_management_address} | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Refuse a control host on the node itself
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_control_host != tinfirm_sandbox_node_address
+      - tinfirm_sandbox_node_control_host not in (ansible_facts['all_ipv4_addresses'] | default([]))
+    fail_msg: >-
+      tinfirm_sandbox_node_control_host is an address of this node. A runner host and the node
+      agent on one machine is the single machine of ADR-0112 decision 5, which is set aside and not
+      built: the helper refuses it. Run the control host on another machine.
+    quiet: true
+
+- name: Check the VMs' range
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_vm_range is match('^([0-9]{1,3}\.){3}[0-9]{1,3}/([89]|[12][0-9])$')
+    fail_msg: tinfirm_sandbox_node_vm_range is A.B.C.D/P with P from 8 to 29.
+    quiet: true
+
+- name: Check the ports and the count of VMs
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_max_vms | int >= 1
+      - tinfirm_sandbox_node_max_vms | int <= 1024
+      - tinfirm_sandbox_node_first_port | int >= 1024
+      - _tinfirm_sandbox_node_last_port | int <= 65535
+      - tinfirm_sandbox_node_agent_port | int >= 1
+      - tinfirm_sandbox_node_agent_port | int <= 65535
+      - >-
+        tinfirm_sandbox_node_agent_port | int < tinfirm_sandbox_node_first_port | int
+        or tinfirm_sandbox_node_agent_port | int > _tinfirm_sandbox_node_last_port | int
+      - tinfirm_sandbox_node_ssh_port | int >= 1
+      - tinfirm_sandbox_node_ssh_port | int <= 65535
+      - >-
+        tinfirm_sandbox_node_ssh_port | int < tinfirm_sandbox_node_first_port | int
+        or tinfirm_sandbox_node_ssh_port | int > _tinfirm_sandbox_node_last_port | int
+      - tinfirm_sandbox_node_agent_port | int != tinfirm_sandbox_node_ssh_port | int
+    fail_msg: >-
+      tinfirm_sandbox_node_max_vms is 1 to 1024; the published ports
+      {{ tinfirm_sandbox_node_first_port }} to {{ _tinfirm_sandbox_node_last_port }} lie from 1024
+      to 65535; the SSH port {{ tinfirm_sandbox_node_ssh_port }} is 1 to 65535 and not one of
+      them; the agent's port {{ tinfirm_sandbox_node_agent_port }} is neither one of them nor the
+      SSH port.
+    quiet: true
+
+- name: Check the templates
+  ansible.builtin.assert:
+    that:
+      - item.key is match('^[a-z0-9][a-z0-9-]{0,62}$')
+      - item.value.keys() | difference(['vcpus', 'memoryMib', 'snapshotMib', 'bridgePort', 'pidsMax']) | length == 0
+      - item.value.vcpus is defined and item.value.memoryMib is defined and item.value.snapshotMib is defined
+    fail_msg: >-
+      Template {{ item.key }}: a name of 1 to 63 bytes of a-z, 0-9 and -, with vcpus, memoryMib and
+      snapshotMib, and optionally bridgePort and pidsMax, nothing else. The role adds the image
+      and the kernel.
+    quiet: true
+  loop: "{{ tinfirm_sandbox_node_templates | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Check that there is a template
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_templates | length > 0
+    fail_msg: tinfirm_sandbox_node_templates names no template.
+    quiet: true
+
+- name: Check the control host's certificate and the other settings
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_client_sha256 is match('^[0-9a-fA-F]{64}$')
+      - tinfirm_sandbox_node_peer_build in ['warn', 'refuse']
+      - tinfirm_sandbox_node_vm_uid_base | int >= 100000
+      - tinfirm_sandbox_node_name is match('^[a-z0-9-]{1,32}$')
+    fail_msg: >-
+      tinfirm_sandbox_node_client_sha256 is the fingerprint the control host's play shows (64 hex
+      digits; run that play first); tinfirm_sandbox_node_peer_build is warn or refuse;
+      tinfirm_sandbox_node_vm_uid_base is at least 100000; tinfirm_sandbox_node_name is 1 to 32
+      bytes of a-z, 0-9 and -.
+    quiet: true
+
+# The node's firewall admits SSH from the management address alone, to its SSH port. This
+# play's own connection stays up once the table is loaded (an established connection), but
+# the next one would not: stop before that.
+- name: Read the address and the port of this play's SSH connection
+  ansible.builtin.command:
+    argv: [printenv, SSH_CONNECTION]
+  become: false
+  register: _tinfirm_sandbox_node_ssh
+  changed_when: false
+  failed_when: false
+  when: tinfirm_sandbox_node_check_ssh_source | bool
+
+- name: Check that this play comes from the management address to the SSH port
+  ansible.builtin.assert:
+    that:
+      - (_tinfirm_sandbox_node_ssh.stdout | split(' ') | first) == tinfirm_sandbox_node_management_address
+      - (_tinfirm_sandbox_node_ssh.stdout | split(' ') | last) == (tinfirm_sandbox_node_ssh_port | string)
+    fail_msg: >-
+      This play's SSH connection comes from {{ _tinfirm_sandbox_node_ssh.stdout | split(' ') | first }}
+      to port {{ _tinfirm_sandbox_node_ssh.stdout | split(' ') | last }}, but the node's firewall
+      admits SSH from tinfirm_sandbox_node_management_address
+      ({{ tinfirm_sandbox_node_management_address }}) alone, to tinfirm_sandbox_node_ssh_port
+      ({{ tinfirm_sandbox_node_ssh_port }}): the next connection of this play would be dropped.
+      Run the play from that address, or set the variables to this connection's.
+      tinfirm_sandbox_node_check_ssh_source: false skips this check.
+    quiet: true
+  when:
+    - tinfirm_sandbox_node_check_ssh_source | bool
+    - _tinfirm_sandbox_node_ssh.rc | default(1) == 0
+    - _tinfirm_sandbox_node_ssh.stdout | length > 0
+
+# The agent's README, "What a node needs": no other firewall that drops forwarded packets.
+# Docker's FORWARD policy does, and a node keeps no Docker; nftables.service flushes the whole
+# ruleset when it loads its own file, the VMs' tables with it.
+- name: Read the node's services
+  ansible.builtin.service_facts:
+
+- name: Check that no other firewall or Docker runs on the node
+  ansible.builtin.assert:
+    that:
+      - (ansible_facts.services[item] | default({})).state | default('') != 'running'
+    fail_msg: >-
+      {{ item }} runs on this node. A node runs no Docker (its FORWARD policy drops the published
+      ports' traffic) and no other firewall service: firewalld's and Docker's rules drop forwarded
+      packets, and nftables.service flushes the ruleset, the VMs' tables included. Stop and
+      disable it, or use another machine.
+    quiet: true
+  loop: [docker.service, firewalld.service, nftables.service]
+
+# The node's firewall is loaded before the network and drops the metadata service, so a
+# cloud-init that runs at the next start would keep the node from finishing that start.
+- name: Check the cloud-init setting
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_cloud_init in ['refuse', 'disable']
+    fail_msg: tinfirm_sandbox_node_cloud_init is `refuse` or `disable`.
+    quiet: true
+
+- name: Look for cloud-init
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: [/usr/bin/cloud-init, /etc/cloud/cloud-init.disabled]
+  register: _tinfirm_sandbox_node_cloud_init
+
+- name: Refuse a node whose cloud-init would run at its next start
+  ansible.builtin.assert:
+    that:
+      - >-
+        tinfirm_sandbox_node_cloud_init == 'disable'
+        or not _tinfirm_sandbox_node_cloud_init.results[0].stat.exists
+        or _tinfirm_sandbox_node_cloud_init.results[1].stat.exists
+    fail_msg: >-
+      cloud-init is installed and enabled on this node. It asks the platform's metadata service at
+      every start, which the node's firewall drops, and the node would not finish its next start.
+      Set tinfirm_sandbox_node_cloud_init to `disable` to let this role switch cloud-init off for
+      good (it writes /etc/cloud/cloud-init.disabled; what cloud-init set up at the first start
+      stays), or switch it off in the node's image yourself.
+    quiet: true
+
+- name: Look for ufw's setting
+  ansible.builtin.slurp:
+    src: /etc/ufw/ufw.conf
+  register: _tinfirm_sandbox_node_ufw
+  failed_when: false
+
+- name: Check that ufw is off
+  ansible.builtin.assert:
+    that:
+      - (_tinfirm_sandbox_node_ufw.content | default('') | b64decode) is not search('(?m)^ENABLED=yes')
+    fail_msg: >-
+      ufw is enabled on this node; its forward policy drops what the VMs' published ports need.
+      Disable it (`ufw disable`): the role's own table is the node's firewall.
+    quiet: true
+
+# --- The hardening (ADR-0113 decision 5) ----------------------------------------------------------
+
+- name: Check the hardening's settings
+  ansible.builtin.assert:
+    that:
+      - tinfirm_sandbox_node_kernel_panic | string is match('^[0-9]+$')
+      - tinfirm_sandbox_node_max_uptime_days | string is match('^[0-9]+$')
+      - tinfirm_sandbox_node_max_uptime_days | int >= 1
+      - tinfirm_sandbox_node_max_uptime_days | int <= 3650
+    fail_msg: >-
+      tinfirm_sandbox_node_kernel_panic is a number of seconds, 0 or more (0: a node that
+      panicked stays down); tinfirm_sandbox_node_max_uptime_days is 1 to 3650.
+    quiet: true
+
+# What each switched-on line needs of the machine, looked at before anything changes.
+- name: Look for what the hardening's lines need
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - /proc/sys/kernel/io_uring_disabled
+    - /sys/module/apparmor/parameters/enabled
+    - /sys/kernel/security/lockdown
+    - /proc/sys/kernel/kexec_load_disabled
+    - /proc/sys/kernel/modules_disabled
+  register: _tinfirm_sandbox_node_harden_needs
+
+- name: Refuse io_uring's switch on a kernel without its setting
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_harden_needs.results[0].stat.exists
+    fail_msg: >-
+      This kernel ({{ ansible_facts['kernel'] }}) has no kernel.io_uring_disabled, which came with
+      Linux 6.6 (Debian 12's 6.1 has none). Boot a newer kernel (Debian 13, or Debian 12's
+      backports kernel), or set tinfirm_sandbox_node_harden_io_uring: false, and the node's
+      hardening mark says `no` for io-uring.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.io_uring | bool
+
+# The profile's mode: three values, and the units' profile must carry the flags the role adds
+# `complain` to.
+- name: Check the VMMs' profile's mode
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_mac in ['off', 'complain', 'enforce']
+      - >-
+        _tinfirm_sandbox_node_profile_flags
+        in lookup('ansible.builtin.file', _tinfirm_sandbox_node_profile_src, rstrip=false)
+    fail_msg: >-
+      tinfirm_sandbox_node_harden_mac is off (or false), complain or enforce, not
+      "{{ tinfirm_sandbox_node_harden_mac }}"; and the role's tinfirm-vmm.apparmor must hold
+      {{ _tinfirm_sandbox_node_profile_flags }}, where complain mode is added.
+    quiet: true
+
+- name: Read whether AppArmor is on
+  ansible.builtin.slurp:
+    src: /sys/module/apparmor/parameters/enabled
+  register: _tinfirm_sandbox_node_apparmor
+  failed_when: false
+  when:
+    - _tinfirm_sandbox_node_harden_on.mac | bool
+    - _tinfirm_sandbox_node_harden_needs.results[1].stat.exists
+
+- name: Refuse the AppArmor switch on a machine without AppArmor
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == 'Debian'
+      - (_tinfirm_sandbox_node_apparmor.content | default('') | b64decode | trim) == 'Y'
+    fail_msg: >-
+      {{ 'This is a Red Hat family node: it has SELinux and no AppArmor, and the SELinux form
+      for the VMMs is not built yet.' if ansible_facts['os_family'] != 'Debian'
+      else 'AppArmor is not on in this kernel (/sys/module/apparmor/parameters/enabled is not Y).' }}
+      The profile's complain and enforce modes both need AppArmor. Set
+      tinfirm_sandbox_node_harden_mac: "off", and the node's hardening mark says `no` for vmm-mac.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.mac | bool
+
+- name: Refuse the lockdown switch on a kernel without lockdown
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_harden_needs.results[2].stat.exists
+    fail_msg: >-
+      This kernel ({{ ansible_facts['kernel'] }}) has no lockdown LSM
+      (/sys/kernel/security/lockdown). Boot a kernel with it, or set
+      tinfirm_sandbox_node_harden_lockdown: false, and the node's hardening mark says `no` for
+      lockdown.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.lockdown | bool
+
+- name: Refuse the kexec switch on a kernel without its setting
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_harden_needs.results[3].stat.exists
+    fail_msg: >-
+      This kernel ({{ ansible_facts['kernel'] }}) has no kernel.kexec_load_disabled. Set
+      tinfirm_sandbox_node_harden_kexec: false, and the node's hardening mark says `no` for
+      kexec-disabled.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.kexec | bool
+
+# sudo is cut to the admin group (4750): a play whose user is not root and not in that group
+# would lose its own way to root halfway through.
+- name: Read the groups of this play's user
+  ansible.builtin.command:
+    argv: [id]
+  become: false
+  register: _tinfirm_sandbox_node_play_user
+  changed_when: false
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+- name: Refuse the setuid switch for a play that would lose sudo
+  ansible.builtin.assert:
+    that:
+      - >-
+        _tinfirm_sandbox_node_play_user.stdout is match('uid=0[(]')
+        or _tinfirm_sandbox_node_play_user.stdout is search('groups=(.*,)?[0-9]+[(]' ~ _tinfirm_sandbox_node_admin_group ~ '[)]')
+    fail_msg: >-
+      This play's user ({{ _tinfirm_sandbox_node_play_user.stdout }}) is not in the
+      group {{ _tinfirm_sandbox_node_admin_group }}, to which the role cuts sudo: it would lose
+      sudo, and so would every operator outside that group. Add the operators to
+      {{ _tinfirm_sandbox_node_admin_group }}, or set tinfirm_sandbox_node_harden_setuid: false.
+    quiet: true
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+# Once kernel.modules_disabled is 1, no module loads until a reboot: a changed modules' unit
+# (a module added to it) is installed, and service.yml then stops the play for a reboot.
+- name: Read whether module loading is off
+  ansible.builtin.slurp:
+    src: /proc/sys/kernel/modules_disabled
+  register: _tinfirm_sandbox_node_modules_disabled
+  failed_when: false
+
+- name: Look at the installed modules' unit
+  ansible.builtin.stat:
+    path: /etc/systemd/system/tinfirm-node-agent-modules.service
+    checksum_algorithm: sha256
+  register: _tinfirm_sandbox_node_modules_unit
+
+- name: Note a modules' unit that changed while module loading is off
+  ansible.builtin.set_fact:
+    _tinfirm_sandbox_node_modules_locked: >-
+      {{ (_tinfirm_sandbox_node_modules_disabled.content | default('MA==') | b64decode | trim) == '1'
+         and _tinfirm_sandbox_node_modules_unit.stat.exists
+         and _tinfirm_sandbox_node_modules_unit.stat.checksum
+             != (lookup('ansible.builtin.file', 'tinfirm-node-agent-modules.service', rstrip=false) | hash('sha256')) }}

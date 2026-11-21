@@ -2,6 +2,7 @@ package com.flowtivo.tinfirm.run.internal;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -15,6 +16,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import com.flowtivo.tinfirm.run.ActiveRun;
+import com.flowtivo.tinfirm.run.RunGitRevocations;
+import com.flowtivo.tinfirm.run.RunRequests;
 import com.flowtivo.tinfirm.run.RunStatus;
 import com.flowtivo.tinfirm.runner.ConnectedHost;
 import com.flowtivo.tinfirm.runner.RunnerConnections;
@@ -94,9 +97,22 @@ class RunRequestRouter {
 
     private final RunMetrics metrics;
 
+    private final RunRepositoryStore repositories;
+
+    private final RunCommandStore commands;
+
+    private final RunGitRevocations revocations;
+
+    /** The runs with a GIT_TOKEN request that waits for its answer on this replica: at most one each (ADR-0116). */
+    private final java.util.Set<UUID> gitTokensInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     RunRequestRouter(RunStore runs, RunLocks locks, RunPorts ports, RunnerConnections connections,
             RunWorkers workers, SystemTransactions transactions, RunnerProperties runnerProperties,
-            RunProperties properties, TimeSource time, RunnerFloodControl flood, RunMetrics metrics) {
+            RunProperties properties, TimeSource time, RunnerFloodControl flood, RunMetrics metrics,
+            RunRepositoryStore repositories, RunCommandStore commands, RunGitRevocations revocations) {
+        this.repositories = repositories;
+        this.commands = commands;
+        this.revocations = revocations;
         this.flood = flood;
         this.metrics = metrics;
         this.runs = runs;
@@ -117,8 +133,8 @@ class RunRequestRouter {
             return List.of(rejected(request, INVALID_REQUEST, "Tinfirm does not know the request kind "
                     + request.kind() + "."));
         }
-        if (kind == RunnerMessages.RequestKind.TOOL) {
-            throw new IllegalArgumentException("A TOOL request is called, not requested");
+        if (kind == RunnerMessages.RequestKind.TOOL || kind == RunnerMessages.RequestKind.GIT_TOKEN) {
+            throw new IllegalArgumentException("A " + kind + " request is called, not requested");
         }
         RunStore.RunRow run = activeRun(host, request.runId(), request.epoch(), true);
         if (run == null) {
@@ -170,6 +186,162 @@ class RunRequestRouter {
                 flood.toolCallEnded(request.runId());
             }
         }
+    }
+
+    /**
+     * A {@code GIT_TOKEN} request (ADR-0116, decision 9), outside any transaction: at most one of a run waits for its
+     * answer on this replica (another is {@code TOO_MANY_REQUESTS} at once); the run checked in a short transaction,
+     * with the repositories of its current assignment and those a revocation names; the port called on a virtual
+     * thread, and its {@code GIT_REVOKED} refusals recorded as revocations ({@link RunGitRevocations#ofRun}), whose
+     * frames go after their commit; the answer sent to the host's current connection: DONE with the tokens and the
+     * refused, or REJECTED with the code every repository shares when none got a token.
+     */
+    List<RunnerMessages.Outbound> gitToken(ConnectedHost host, RunnerMessages.RunRequest request) {
+        if (!gitTokensInFlight.add(request.runId())) {
+            metrics.refused(RunMetrics.REQUEST, RunMetrics.IN_FLIGHT);
+            return List.of(rejected(request, RunnerMessages.TOO_MANY_REQUESTS, "One GIT_TOKEN request of a run waits "
+                    + "for its answer at a time. Wait for it before you ask again."));
+        }
+        boolean handedOn = false;
+        try {
+            List<UUID> asked = componentIds(request.payload());
+            if (asked == null) {
+                return List.of(rejected(request, INVALID_REQUEST, "A GIT_TOKEN request names 1 to "
+                        + RunnerMessages.MAX_GIT_REVOKE_COMPONENTS + " distinct repositories in componentIds."));
+            }
+            record Checked(ActiveRun run, List<RunRequests.GitTokenRepository> renew,
+                    Map<UUID, RunRequests.Refusal> refused) {
+            }
+            Checked checked = transactions.inCompany(host.companyId(), () -> {
+                RunStore.RunRow found = activeRun(host, request.runId(), request.epoch(), false);
+                if (found == null) {
+                    return null;
+                }
+                Map<UUID, RunRepositoryStore.RepositoryRow> rows = new java.util.HashMap<>();
+                repositories.ofRun(found.id()).stream()
+                    .filter(row -> row.componentId() != null && row.epoch() != null && row.epoch() == found.epoch())
+                    .forEach(row -> rows.put(row.componentId(), row));
+                java.util.Set<UUID> revoked = commands.revokedComponents(found.id(), found.epoch());
+                List<RunRequests.GitTokenRepository> renew = new java.util.ArrayList<>();
+                Map<UUID, RunRequests.Refusal> refused = new java.util.HashMap<>();
+                for (UUID componentId : asked) {
+                    RunRepositoryStore.RepositoryRow row = rows.get(componentId);
+                    if (row == null || revoked.contains(componentId)) {
+                        refused.put(componentId, new RunRequests.Refusal(RunnerMessages.GIT_REVOKED,
+                                RunGitRevocations.REFRESH_REFUSED, row == null
+                                        ? "it is not a repository of this run" : "Tinfirm revoked it for this run"));
+                    }
+                    else {
+                        renew.add(new RunRequests.GitTokenRepository(componentId, row.bindingId(), row.readOnly()));
+                    }
+                }
+                return new Checked(found.active(), renew, refused);
+            });
+            if (checked == null) {
+                return List.of(rejected(request, RUN_NOT_ACTIVE, "The run is not active."));
+            }
+            handedOn = workers.execute("git tokens " + request.requestId() + " of run " + request.runId(), () -> {
+                try {
+                    connections.send(host.runnerHostId(), gitTokens(checked.run(), request, checked.renew(),
+                            checked.refused()));
+                }
+                catch (RuntimeException ex) {
+                    log.warn("The GIT_TOKEN request {} of run {} failed", request.requestId(), request.runId(), ex);
+                    connections.send(host.runnerHostId(), rejected(request, RunnerMessages.GIT_UNAVAILABLE,
+                            "Tinfirm could not renew the tokens now."));
+                }
+                finally {
+                    gitTokensInFlight.remove(request.runId());
+                }
+            });
+            return List.of();
+        }
+        finally {
+            if (!handedOn) {
+                gitTokensInFlight.remove(request.runId());
+            }
+        }
+    }
+
+    /** The port's answer, its refusals for good recorded as revocations, as one ack. */
+    private RunnerMessages.RunRequestAck gitTokens(ActiveRun run, RunnerMessages.RunRequest request,
+            List<RunRequests.GitTokenRepository> renew, Map<UUID, RunRequests.Refusal> checked) {
+        Map<UUID, RunRequests.Refusal> refused = new java.util.LinkedHashMap<>(checked);
+        Map<UUID, RunnerMessages.GitToken> tokens = new java.util.LinkedHashMap<>();
+        if (!renew.isEmpty()) {
+            RunRequests.GitTokenAnswer answer = SystemContext.callInCompany(run.companyId(),
+                    () -> ports.requests().gitTokens(run, renew));
+            for (RunRequests.GitTokenRepository repository : renew) {
+                RunnerMessages.GitToken token = answer.tokens().get(repository.componentId());
+                RunRequests.Refusal refusal = answer.refused().get(repository.componentId());
+                if (token != null) {
+                    tokens.put(repository.componentId(), token);
+                }
+                else {
+                    refused.put(repository.componentId(), refusal != null ? refusal : new RunRequests.Refusal(
+                            RunnerMessages.GIT_UNAVAILABLE, RunGitRevocations.REFRESH_REFUSED,
+                            "Tinfirm could not renew the token now."));
+                }
+            }
+        }
+        // A refusal for good of a repository the run held is a revocation (decision 9): recorded, audited and sent.
+        record Cause(String reason, String why) {
+        }
+        Map<Cause, List<UUID>> revokedByCause = new java.util.LinkedHashMap<>();
+        renew.forEach(repository -> {
+            RunRequests.Refusal refusal = refused.get(repository.componentId());
+            if (refusal != null && RunnerMessages.GIT_REVOKED.equals(refusal.code())) {
+                revokedByCause.computeIfAbsent(new Cause(refusal.reason(), refusal.message()),
+                        k -> new java.util.ArrayList<>()).add(repository.componentId());
+            }
+        });
+        for (Map.Entry<Cause, List<UUID>> cause : revokedByCause.entrySet()) {
+            String reason = cause.getKey().reason();
+            List<RunGitRevocations.Revoked> recorded = SystemContext.callInCompany(run.companyId(),
+                    () -> transactions.inCompany(run.companyId(), () -> revocations.ofRun(run.companyId(),
+                            run.runId(), cause.getValue(), reason, cause.getKey().why())));
+            for (RunGitRevocations.Revoked revoked : recorded) {
+                revoked.componentIds().forEach(componentId -> refused.put(componentId, new RunRequests.Refusal(
+                        RunnerMessages.GIT_REVOKED, reason, revoked.message())));
+            }
+        }
+        List<RunnerMessages.GitRefused> refusedList = new java.util.ArrayList<>();
+        refused.forEach((componentId, refusal) -> refusedList.add(new RunnerMessages.GitRefused(componentId,
+                refusal.code(), message(refusal))));
+        if (tokens.isEmpty() && refusedList.stream().map(RunnerMessages.GitRefused::code).distinct().count() == 1) {
+            return rejected(request, refusedList.getFirst().code(), refusedList.getFirst().message());
+        }
+        return RunnerMessages.RunRequestAck.done(request.runId(), request.requestId(),
+                new RunnerMessages.GitTokens(List.copyOf(tokens.values()), refusedList), null);
+    }
+
+    /** A refusal's message for the host, within the protocol's length. */
+    private static String message(RunRequests.Refusal refusal) {
+        String text = refusal.message().isBlank() ? refusal.code() : refusal.message();
+        return text.length() <= RunnerMessages.MAX_GIT_REVOKE_MESSAGE ? text
+                : text.substring(0, RunnerMessages.MAX_GIT_REVOKE_MESSAGE);
+    }
+
+    /** The payload's {@code componentIds}: 1 to 20 distinct UUIDs; null otherwise. */
+    static @Nullable List<UUID> componentIds(@Nullable JsonNode payload) {
+        JsonNode ids = payload != null && payload.isObject() ? payload.get("componentIds") : null;
+        if (ids == null || !ids.isArray() || ids.isEmpty() || ids.size() > RunnerMessages.MAX_GIT_REVOKE_COMPONENTS) {
+            return null;
+        }
+        List<UUID> found = new java.util.ArrayList<>();
+        for (JsonNode id : ids) {
+            try {
+                UUID componentId = id.isString() ? UUID.fromString(id.asString()) : null;
+                if (componentId == null || found.contains(componentId)) {
+                    return null;
+                }
+                found.add(componentId);
+            }
+            catch (IllegalArgumentException ex) {
+                return null;
+            }
+        }
+        return found;
     }
 
     /**

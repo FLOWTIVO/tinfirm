@@ -191,9 +191,11 @@ class RunCompletion {
                 run.turnNumber());
 
         hub.changedAfterCommit(run.id());
-        if (lostCause != null && lostCause != LostCause.LEASE_EXPIRED && run.runnerHostId() != null) {
+        if (lostCause == LostCause.HOST_RESTARTED && run.runnerHostId() != null) {
             // Fencing: tell a host that may still run it to stop and discard it. A run lost by lease expiry may be
-            // resumed instead; its host is told when it next reports the run and the run cannot be resumed.
+            // resumed instead; its host is told when it next reports the run and the run cannot be resumed. A run
+            // stale at a reconnect is cancelled by the hello's answer itself, after the revocations its host must
+            // hear first (ADR-0116): a cancel sent here, at the commit, would reach the host before them.
             UUID hostId = run.runnerHostId();
             AfterCommit.run(() -> connections.send(hostId, new RunnerMessages.RunCancel(run.id(), run.epoch())));
         }

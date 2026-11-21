@@ -14,3 +14,8 @@ regexes = ['''static final String [A-Z_]+_SHA256 = "[0-9a-f]{64}";''']
 description = "A GitLab token shape that was never issued: the redaction test's fixture (mapper.rs)"
 regexTarget = "line"
 regexes = ['''const LEAKED: &str = "glpat-TEST-ONLY-0123456789abcdefghij";''']
+
+[[allowlists]]
+description = "A list of icon names for provideIcons: the generic rule reads `lucideKeyRound, lucideTrash2` as a key and its value"
+regexTarget = "line"
+regexes = ['''provideIcons\(\{ (lucide[A-Za-z0-9]+, )*lucide[A-Za-z0-9]+ \}\)''']

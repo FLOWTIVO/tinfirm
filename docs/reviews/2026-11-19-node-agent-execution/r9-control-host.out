@@ -1,0 +1,59 @@
+== 1. all three guards as a node has them: firewall for 10.0.0.4, IPAddressAllow=10.0.0.4, tls.controlHost 10.0.0.4
+from the control host (10.0.0.4), its own key:
+  hello (the driver's own answer, without the node): answered after 2 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 5 ms: {"problems": [], "maxVms": 2, "checked": ["node node-1: 2 free", "node node-1: /dev/kvm", "node node-1: /dev/net/tun", "node node-1: /dev/mapper/control", "node
+  list (needs the node): answered after 1 ms: {"vms": []}
+from the third machine (10.0.0.5), the control host's key copied there:
+  hello (the driver's own answer, without the node): answered after 2 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 20003 ms: {"problems": ["no node of the driver answered"], "maxVms": 0, "checked": ["node node-1: cannot reach the node: no connection in time; not counted"]}
+  list (needs the node): answered after 20003 ms: {"vms": []}
+  the driver's log: node node-1: cannot reach the node: no connection in time; its VMs are not listed this time
+from the node itself (10.0.0.6), the control host's key copied there:
+  hello (the driver's own answer, without the node): answered after 2 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 20003 ms: {"problems": ["no node of the driver answered"], "maxVms": 0, "checked": ["node node-1: cannot reach the node: no connection in time; not counted"]}
+  list (needs the node): answered after 20002 ms: {"vms": []}
+  the driver's log: node node-1: cannot reach the node: no connection in time; its VMs are not listed this time
+the listener's journal since this configuration started:
+the firewall's counter of what it dropped on its way to the node: counter packets 28
+
+== 2. the listener's own check alone (tls.controlHost 10.0.0.4): no firewall table, IPAddressAllow=any
+from the control host (10.0.0.4), its own key:
+  hello (the driver's own answer, without the node): answered after 2 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 6 ms: {"problems": [], "maxVms": 2, "checked": ["node node-1: 2 free", "node node-1: /dev/kvm", "node node-1: /dev/net/tun", "node node-1: /dev/mapper/control", "node
+  list (needs the node): answered after 1 ms: {"vms": []}
+from the third machine (10.0.0.5), the control host's key copied there:
+  hello (the driver's own answer, without the node): answered after 3 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 21 ms: {"problems": ["no node of the driver answered"], "maxVms": 0, "checked": ["node node-1: cannot reach the node: TLS: tls handshake eof; not counted"]}
+  list (needs the node): answered after 8 ms: {"vms": []}
+  the driver's log: node node-1: cannot reach the node: TLS: tls handshake eof; its VMs are not listed this time
+from the node itself (10.0.0.6), the control host's key copied there:
+  hello (the driver's own answer, without the node): answered after 2 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 1 ms: {"problems": ["no node of the driver answered"], "maxVms": 0, "checked": ["node node-1: cannot reach the node: TLS: tls handshake eof; not counted"]}
+  list (needs the node): answered after 0 ms: {"vms": []}
+  the driver's log: node node-1: cannot reach the node: TLS: tls handshake eof; its VMs are not listed this time
+the listener's journal since this configuration started:
+  2026-11-19T22:53:22.194846Z  INFO tinfirm_node_agent::listener: the listener takes TLS listen=10.0.0.6:7700
+  2026-11-19T22:53:24.207284Z  INFO tinfirm_node_agent::listener: the control host connected peer=10.0.0.4:52624
+  2026-11-19T22:53:24.835448Z  WARN tinfirm_node_agent::listener: refused: 1 × a connection from another address than the control host's
+the firewall's counter of what it dropped on its way to the node: 
+
+== 3. the unit's IPAddressAllow=10.0.0.4 alone: no firewall table, tls.controlHost names the third machine
+from the third machine (10.0.0.5), the control host's key copied there:
+  hello (the driver's own answer, without the node): answered after 3 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 20003 ms: {"problems": ["no node of the driver answered"], "maxVms": 0, "checked": ["node node-1: cannot reach the node: no connection in time; not counted"]}
+  list (needs the node): answered after 20002 ms: {"vms": []}
+  the driver's log: node node-1: cannot reach the node: no connection in time; its VMs are not listed this time
+the listener's journal: 0 line(s) about a connection (the packets never reach the listener)
+
+== 4. the firewall table alone (for 10.0.0.4): IPAddressAllow=any, tls.controlHost names the third machine
+from the third machine (10.0.0.5), the control host's key copied there:
+  hello (the driver's own answer, without the node): answered after 3 ms: {"protocol": 1, "driver": "node", "version": "1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0"}
+  verify (needs the node): answered after 20002 ms: {"problems": ["no node of the driver answered"], "maxVms": 0, "checked": ["node node-1: cannot reach the node: no connection in time; not counted"]}
+  list (needs the node): answered after 20003 ms: {"vms": []}
+  the driver's log: node node-1: cannot reach the node: no connection in time; its VMs are not listed this time
+the listener's journal: 0 line(s) about a connection; the firewall's input counter: counter packets 29
+
+== back to a node's own configuration
+create: 137 ms, id node-1:vm-c5282d2413cdecb76523bb85423e650a; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2880 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 1 ms, 1 VM
+delete: 80 ms; then describe says gone; the port answers `nothing`

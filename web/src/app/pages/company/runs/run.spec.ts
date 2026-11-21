@@ -122,6 +122,18 @@ describe('RunPage', () => {
     );
   });
 
+  it('says at which level of isolation it was placed, and why there (ADR-0113)', async () => {
+    await open({ ...RUNNING, isolationLevel: 'CONTAINER', placementNote: 'STAYED_ON_WEAKER_HOST' });
+    expect(el.querySelector('[data-testid=run-placement] dd')?.textContent?.trim()).toBe(
+      'Placed on a host that reports container. It stayed on the host that holds the conversation’s session; the agent’s new conversations go to a stronger level.',
+    );
+  });
+
+  it('says nothing of a level for a run placed before levels', async () => {
+    await open(RUNNING);
+    expect(el.querySelector('[data-testid=run-placement]')).toBeNull();
+  });
+
   it('cancels a running run', async () => {
     await open(RUNNING);
     el.querySelector<HTMLButtonElement>('[data-testid=cancel-run]')!.click();

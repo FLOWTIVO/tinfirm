@@ -1,0 +1,240 @@
+---
+- name: Install the node agent's binary from the control node
+  ansible.builtin.copy:
+    src: "{{ tinfirm_sandbox_node_binary_src }}"
+    dest: "{{ _tinfirm_sandbox_node_binary_path }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: tinfirm_sandbox_node_binary_src | length > 0
+  notify:
+    - Restart the node agent's helper
+    - Restart the node agent's listener
+
+# A node opens no connection once its firewall is loaded (the agent's README, "The node's
+# firewall"), so a later run must download nothing: the role records which archive the binary
+# came from and the binary's SHA-256, and downloads again only when either differs. A new
+# release on a node with its firewall: replace the node's image (deploy/ansible/README.md).
+- name: Read the installed binary
+  ansible.builtin.stat:
+    path: "{{ _tinfirm_sandbox_node_binary_path }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: _tinfirm_sandbox_node_agent_installed
+  when: tinfirm_sandbox_node_binary_url | length > 0
+
+- name: Read the record of the release it came from
+  ansible.builtin.slurp:
+    src: "{{ _tinfirm_sandbox_node_agent_source }}"
+  register: _tinfirm_sandbox_node_agent_recorded
+  failed_when: false
+  when: tinfirm_sandbox_node_binary_url | length > 0
+
+# As the runner host's role does (M13): SHA256SUMS is trusted only once its signature
+# SHA256SUMS.sig verifies against the public key the role ships, and the archive is then
+# checked against its line there. Nothing of the download is kept.
+- name: Install the node agent's binary from a release archive
+  when:
+    - tinfirm_sandbox_node_binary_url | length > 0
+    - >-
+      (_tinfirm_sandbox_node_agent_recorded.content | default('') | b64decode | trim)
+      != (tinfirm_sandbox_node_binary_url | basename) ~ ' ' ~ (_tinfirm_sandbox_node_agent_installed.stat.checksum | default('none'))
+  vars:
+    _archive: "{{ tinfirm_sandbox_node_binary_url | basename }}"
+    _unpacked: "{{ _tinfirm_sandbox_node_cache_dir }}/{{ tinfirm_sandbox_node_binary_url | basename | regex_replace('\\.tar\\.gz$', '') }}"
+    _release: >-
+      {{ tinfirm_sandbox_node_release_url | regex_replace('/+$', '')
+         if tinfirm_sandbox_node_release_url | length > 0
+         else tinfirm_sandbox_node_binary_url | dirname }}
+    _sums: "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _archive }}.SHA256SUMS"
+    _unsigned: "{{ (_tinfirm_sandbox_node_sums_sig.status_code | default(0)) == 404 }}"
+  block:
+    - name: Check the archive's name
+      ansible.builtin.assert:
+        that:
+          - _archive is match('^tinfirm-node-agent-.+-(x86_64|aarch64)-unknown-linux-musl\.tar\.gz$')
+        fail_msg: >-
+          {{ _archive }} is not a node agent's release archive,
+          tinfirm-node-agent-<version>-<target>.tar.gz for a Linux target.
+        quiet: true
+
+    - name: Remove the release's SHA256SUMS and signature of an earlier run
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _sums }}"
+        - "{{ _sums }}.sig"
+        - "{{ _sums }}.der"
+      changed_when: false
+
+    - name: Download the release's SHA256SUMS.sig
+      ansible.builtin.get_url:
+        url: "{{ _release }}/SHA256SUMS.sig"
+        dest: "{{ _sums }}.sig"
+        headers: "{{ tinfirm_sandbox_node_binary_url_headers }}"
+        mode: "0644"
+      register: _tinfirm_sandbox_node_sums_sig
+      changed_when: false
+      failed_when: >-
+        _tinfirm_sandbox_node_sums_sig is failed
+        and not ((tinfirm_sandbox_node_allow_unsigned | bool)
+                 and (_tinfirm_sandbox_node_sums_sig.status_code | default(0)) == 404)
+      no_log: "{{ tinfirm_sandbox_node_binary_url_headers | length > 0 }}"
+
+    - name: Check SHA256SUMS against its signature and take the archive's checksum from it
+      when: not (_unsigned | bool)
+      block:
+        - name: Download the release's SHA256SUMS
+          ansible.builtin.get_url:
+            url: "{{ _release }}/SHA256SUMS"
+            dest: "{{ _sums }}"
+            headers: "{{ tinfirm_sandbox_node_binary_url_headers }}"
+            mode: "0644"
+          changed_when: false
+          no_log: "{{ tinfirm_sandbox_node_binary_url_headers | length > 0 }}"
+
+        - name: Put the public key on the node
+          ansible.builtin.copy:
+            src: "{{ tinfirm_sandbox_node_public_key }}"
+            dest: "{{ _tinfirm_sandbox_node_cache_dir }}/tinfirm-release.pub"
+            mode: "0644"
+
+        # cosign's signature of a blob is the base64 of an ECDSA P-256 signature over its
+        # SHA-256, in DER, which openssl checks against cosign's public key.
+        - name: Decode SHA256SUMS.sig
+          ansible.builtin.command:
+            argv: [openssl, base64, -d, -A, -in, "{{ _sums }}.sig", -out, "{{ _sums }}.der"]
+          changed_when: false
+          failed_when: false
+          register: _tinfirm_sandbox_node_sig_decoded
+
+        - name: Verify SHA256SUMS.sig
+          ansible.builtin.command:
+            argv:
+              - openssl
+              - dgst
+              - -sha256
+              - -verify
+              - "{{ _tinfirm_sandbox_node_cache_dir }}/tinfirm-release.pub"
+              - -signature
+              - "{{ _sums }}.der"
+              - "{{ _sums }}"
+          changed_when: false
+          failed_when: false
+          register: _tinfirm_sandbox_node_sig_verified
+
+        - name: Refuse a SHA256SUMS whose signature does not verify
+          ansible.builtin.assert:
+            that:
+              - _tinfirm_sandbox_node_sig_decoded.rc == 0
+              - _tinfirm_sandbox_node_sig_verified.rc == 0
+            fail_msg: >-
+              SHA256SUMS.sig at {{ _release }} is not a signature of its SHA256SUMS by
+              {{ tinfirm_sandbox_node_public_key }}: nothing of this release is installed. For
+              `rolling`, set tinfirm_sandbox_node_public_key to the rolling key (cosign-rolling.pub).
+            quiet: true
+
+        - name: Read SHA256SUMS
+          ansible.builtin.slurp:
+            src: "{{ _sums }}"
+          register: _tinfirm_sandbox_node_sums_file
+
+        - name: Take the archive's line of SHA256SUMS
+          ansible.builtin.set_fact:
+            _tinfirm_sandbox_node_signed_sum: >-
+              {{ _tinfirm_sandbox_node_sums_file.content | b64decode
+                 | regex_search('^([0-9a-fA-F]{64}) [ *]' ~ (_archive | regex_escape) ~ '$', '\1', multiline=True)
+                 | default([''], true) | first | lower }}
+
+        - name: Check the archive's line of SHA256SUMS
+          ansible.builtin.assert:
+            that:
+              - _tinfirm_sandbox_node_signed_sum | length == 64
+              - >-
+                tinfirm_sandbox_node_binary_checksum | length == 0
+                or (tinfirm_sandbox_node_binary_checksum | lower) == 'sha256:' ~ _tinfirm_sandbox_node_signed_sum
+            fail_msg: >-
+              {{ _archive }} is not listed in the release's signed SHA256SUMS, or
+              tinfirm_sandbox_node_binary_checksum is not its line there.
+            quiet: true
+
+    - name: Warn of a release without a signature
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ _release }} has no SHA256SUMS.sig; installing {{ _archive }} against
+          tinfirm_sandbox_node_binary_checksum only, because tinfirm_sandbox_node_allow_unsigned is true.
+      when: _unsigned | bool
+
+    - name: Check the checksum of an unsigned release
+      ansible.builtin.assert:
+        that:
+          - tinfirm_sandbox_node_binary_checksum | length > 0
+        fail_msg: >-
+          {{ _release }} has no SHA256SUMS.sig: set tinfirm_sandbox_node_binary_checksum to the
+          archive's "sha256:<hex>" to install it unsigned.
+        quiet: true
+      when: _unsigned | bool
+
+    - name: Download the release archive
+      ansible.builtin.get_url:
+        url: "{{ tinfirm_sandbox_node_binary_url }}"
+        dest: "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _archive }}"
+        checksum: >-
+          {{ tinfirm_sandbox_node_binary_checksum if _unsigned | bool
+             else 'sha256:' ~ _tinfirm_sandbox_node_signed_sum }}
+        headers: "{{ tinfirm_sandbox_node_binary_url_headers }}"
+        mode: "0644"
+      no_log: "{{ tinfirm_sandbox_node_binary_url_headers | length > 0 }}"
+
+    - name: Create the directory of the unpacked release
+      ansible.builtin.file:
+        path: "{{ _unpacked }}"
+        state: directory
+        mode: "0755"
+
+    - name: Unpack the release archive
+      ansible.builtin.unarchive:
+        src: "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _archive }}"
+        dest: "{{ _unpacked }}"
+        remote_src: true
+        extra_opts: [--strip-components=1]
+
+    - name: Install the binary from the release
+      ansible.builtin.copy:
+        src: "{{ _unpacked }}/tinfirm-node-agent"
+        dest: "{{ _tinfirm_sandbox_node_binary_path }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      notify:
+        - Restart the node agent's helper
+        - Restart the node agent's listener
+
+    - name: Read the binary as installed
+      ansible.builtin.stat:
+        path: "{{ _tinfirm_sandbox_node_binary_path }}"
+        checksum_algorithm: sha256
+        follow: false
+      register: _tinfirm_sandbox_node_agent_copied
+
+    - name: Record the release the binary came from
+      ansible.builtin.copy:
+        content: "{{ _archive }} {{ _tinfirm_sandbox_node_agent_copied.stat.checksum }}\n"
+        dest: "{{ _tinfirm_sandbox_node_agent_source }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Remove the downloaded release
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ _unpacked }}"
+        - "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _archive }}"
+        - "{{ _sums }}"
+        - "{{ _sums }}.sig"
+        - "{{ _sums }}.der"
+        - "{{ _tinfirm_sandbox_node_cache_dir }}/tinfirm-release.pub"

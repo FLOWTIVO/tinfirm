@@ -1,0 +1,20 @@
+# HTTPS in front of the Compose stack (compose.tls.yaml). Caddy gets the certificate for
+# TINFIRM_TLS_HOST from Let's Encrypt by itself and renews it. Port 80 answers the
+# certificate's challenge and redirects everything else to https.
+#
+# The limits are those of docs-site's Requirements: request bodies up to 64 MiB, answers
+# that pause up to 10 minutes, WebSockets passed. `flush_interval -1` sends every chunk
+# of a streamed answer (the event streams, the model relay) at once.
+{$TINFIRM_TLS_HOST} {
+	request_body {
+		max_size 64MiB
+	}
+	reverse_proxy server:8080 {
+		flush_interval -1
+		transport http {
+			response_header_timeout 600s
+			read_timeout 600s
+			write_timeout 600s
+		}
+	}
+}

@@ -1,6 +1,11 @@
 package com.flowtivo.tinfirm.run;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+
+import org.jspecify.annotations.Nullable;
 
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 
@@ -41,4 +46,43 @@ public interface RunRequests {
      * may have run, and the thread is interrupted) and sends the answer to the host's current connection.
      */
     RunnerMessages.RunRequestAck call(ActiveRun run, UUID requestId, JsonNode payload);
+
+    /**
+     * {@code GIT_TOKEN} (ADR-0116, decision 9): new tokens of the run's repositories whose token a GitHub App minted,
+     * outside any transaction, as actor SYSTEM, on a virtual thread of its own. The run module has checked the run,
+     * the payload, and that each repository is one of the run's current assignment that no revocation names; it hands
+     * over each with the binding its account came from and whether the run may only read it. The implementation checks
+     * each binding again through the gate ({@code ConversationBindings.use}, purpose {@code run:{runId}}) and mints;
+     * every repository is answered, with a token or a refusal. The run module records a {@code GIT_REVOKED} refusal as
+     * a revocation, with its {@code reason}.
+     */
+    default GitTokenAnswer gitTokens(ActiveRun run, List<GitTokenRepository> repositories) {
+        Map<UUID, Refusal> refused = new HashMap<>();
+        repositories.forEach(repository -> refused.put(repository.componentId(), new Refusal(
+                RunnerMessages.GIT_UNAVAILABLE, "REFRESH_REFUSED", "Tinfirm does not renew git tokens on this server.")));
+        return new GitTokenAnswer(Map.of(), refused);
+    }
+
+    /** A repository of a GIT_TOKEN request: the run's, with the binding its token came from. */
+    record GitTokenRepository(UUID componentId, @Nullable UUID bindingId, boolean readOnly) {
+    }
+
+    /** The answer of {@link #gitTokens}: every repository in exactly one of the two. */
+    record GitTokenAnswer(Map<UUID, RunnerMessages.GitToken> tokens, Map<UUID, Refusal> refused) {
+
+        public GitTokenAnswer {
+            tokens = Map.copyOf(tokens);
+            refused = Map.copyOf(refused);
+        }
+    }
+
+    /**
+     * Why a repository was not renewed.
+     *
+     * @param code    {@code GIT_REVOKED}, {@code GIT_HELD} or {@code GIT_UNAVAILABLE}
+     * @param reason  for {@code GIT_REVOKED}, the revocation's reason (the binding's, or {@code REFRESH_REFUSED})
+     * @param message the text: for {@code GIT_REVOKED}, the cause in words, which the revocation's message ends with
+     */
+    record Refusal(String code, String reason, String message) {
+    }
 }

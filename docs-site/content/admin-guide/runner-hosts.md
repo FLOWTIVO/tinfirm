@@ -44,8 +44,28 @@ The page updates every 10 seconds. Each host's card shows:
 | The version, platform and machine name | Such as `v1.0.0 · linux/x86_64 · build-01` |
 | **… of … slots in use** | The turns running now, of the slots it has |
 | **Up to … on this machine** | Its ceiling: the most turns at a time the machine's owner allows |
+| **Isolation**: **Reports machine**, **vm-jail** or **container** | The level of isolation the host reports, with what an escape from a sandbox reaches on a host of that kind. See [Isolation levels](#isolation-levels) |
+| **with gVisor** | A container host whose sandboxes run under gVisor. Its turns are placed as on any container host |
+| **stated by the operator** | The level rests on what the host's operator configured, not on what the host can see |
+| **Hardened**, **Not hardened**, **No machine of its own** | Whether the machine that runs the host's VMs is hardened. **No machine of its own**: a VM per run at a provider, whose hypervisor is the boundary |
 
 The version is the runner host's release, shown for support: any release that speaks runner protocol 2 takes turns ([Runner host reference](../reference/runner-host.md#compatibility)). When hosts are registered but none takes turns, because none is online and not draining, the page warns **No company host takes turns now**.
+
+## Isolation levels
+
+A host reports how well its sandboxes keep an agent's code away from the credentials. Tinfirm shows the report as it is and checks none of it: a company host is trusted with its own report, and a personal host runs only its owner's work.
+
+| Level | The wall between an agent's code and the credentials | What an escape reaches |
+|---|---|---|
+| **machine** | Another machine: the credentials are not on the machine that runs the VM | No credential. Through the VM's monitor, no other run either; through the kernel's hypervisor, the other runs on that machine |
+| **vm-jail** | A jail around each VM, on the machine that holds the credentials | Through the VM's monitor, no credential and no other run; through the kernel's hypervisor, every credential |
+| **container** | The container and the kernel | Every credential and the other runs, after one kernel flaw |
+
+On every level, a flaw in the runner host's code that reads what a sandbox sends reaches the runner host's credentials. A change of a host's level or hardening is recorded in the audit log.
+
+A Kata Containers host reports **container**, as a host with Docker does. A host with a VM driver of the operator's own reports **container** unless its operator states another level. A host that has not connected since the server's upgrade shows no isolation, and its turns are placed as on a container host.
+
+**Where turns run.** The company's hosts set the level: an agent's turns go to the strongest level among the company's hosts that may run them. A member's own host takes their turns too when it reports that level or a stronger one, and comes first while it is free; a member's own host that reports a weaker level takes none of them. No turn waits for a member's own host: while it is busy or offline, the company's hosts take the turn. Only a turn that no company host may run, such as one paid by a member's own subscription, goes by the level of the member's own hosts. Among the free hosts, a stronger one comes first, then a hardened one. When every company host of the level is busy or offline, the turn waits for one: it never goes to a weaker host by itself. A conversation whose session is on a weaker host stays there while that host can take its turns, and says so. Whoever edits an agent can choose a level for it among those the company's hosts report; its turns then run on the company's hosts of that level, and on a member's own host that reports it or a stronger one.
 
 ## Runs at a time
 
@@ -56,6 +76,8 @@ The change saves at once and applies without a restart. While the host has not c
 ## Remove a host
 
 Choose :lucide-trash-2: on the card, then **Remove runner host**. Its token stops working at once, and it takes no more turns. A host cannot be removed while turns are queued for it or running on it: cancel or let them end first. You can register the machine again later, with a new token.
+
+Removing the last host of a level of isolation changes where turns run: agents set to **Automatic** go to the strongest level that is left, and an agent whose level is chosen keeps it, has its new conversations refused and its turns waiting until a host reports that level again. The audit log records the host's level and whether it was the last of it.
 
 ## Why a turn waits for a host
 
@@ -68,6 +90,7 @@ A turn paid by a budget goes to a company host that is online, not draining, new
 | **Host busy** | Every slot of the hosts that may run it is in use | Wait, raise **Runs at a time** up to the ceiling, or add a host |
 | **Host restarting** | The host drains before it restarts | Wait: it takes turns again after the restart |
 | **No host may run it** | Only personal hosts are connected, and they run their owners' work only | Start a company host |
+| **No host of its level** | The agent's level of isolation is chosen, and no runner host that may run it reports that level | Add or upgrade a host that reports it, or choose another level for the agent |
 | **No host for its skills** | The agent has [skills](../user-guide/skills.md), and none of the connected hosts that may run it delivers skills. A host delivers them when it runs with Docker and speaks runner protocol 2, as the current runner host does; it says so when it connects. | Upgrade the runner host, or start one that delivers skills. The turn never runs without its skills. |
 | **Subscription busy** | The subscription that pays already runs as many turns as its owner allows | Wait |
 

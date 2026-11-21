@@ -494,8 +494,14 @@ fn run_takes_protocol_version_1_or_2() {
 /// Like [`run`], with extra environment variables.
 fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BIN);
-    cmd.args(args)
-        .env("TINFIRM_RUNNER_CONFIG_DIR", dir.join("config"))
+    cmd.args(args);
+    host_env(&mut cmd, dir, env).output().unwrap()
+}
+
+/// The environment of [`run_with_env`]: private directories, none of the options a developer's
+/// shell may set, and `env`.
+fn host_env<'a>(cmd: &'a mut Command, dir: &Path, env: &[(&str, &str)]) -> &'a mut Command {
+    cmd.env("TINFIRM_RUNNER_CONFIG_DIR", dir.join("config"))
         .env("TINFIRM_RUNNER_DATA_DIR", dir.join("data"))
         .env("TINFIRM_RUNNER_LOG", "warn")
         .env_remove("TINFIRM_RUNNER_SANDBOX_RUNTIME")
@@ -508,9 +514,13 @@ fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         .env_remove("TINFIRM_RUNNER_VM_DRIVER")
         .env_remove("TINFIRM_RUNNER_VM_TEMPLATE")
         .env_remove("TINFIRM_RUNNER_VM_PROBE")
+        .env_remove("TINFIRM_RUNNER_ISOLATION_LEVEL")
+        .env_remove("TINFIRM_RUNNER_ISOLATION_HARDENED")
+        .env_remove("TINFIRM_NODE_DRIVER_CONFIG")
+        .env_remove("TINFIRM_RUNNER_SANDBOX_BRIDGE")
+        .env_remove("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER")
         .envs(env.iter().copied())
-        .stdin(Stdio::null());
-    cmd.output().unwrap()
+        .stdin(Stdio::null())
 }
 
 #[test]
@@ -983,5 +993,864 @@ fn vm_boot_refuses_user_data_that_is_not_tinfirms() {
         );
         assert!(!out.status.success());
         assert!(text(&out).contains(expected), "{}", text(&out));
+    }
+}
+
+#[test]
+fn a_stated_level_of_isolation_is_only_for_a_driver_of_ones_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let vm = |driver: &'static str| -> Vec<&'static str> {
+        vec![
+            "run",
+            "--executor",
+            "vm",
+            "--vm-driver",
+            driver,
+            "--vm-template",
+            "sandbox-4c8g",
+        ]
+    };
+    let with = |mut args: Vec<&'static str>, more: &[&'static str]| {
+        args.extend_from_slice(more);
+        args
+    };
+    for (args, env, expected) in [
+        (
+            vec!["run", "--isolation-level", "machine"],
+            &[][..],
+            "with the Docker executor this host reports `container` itself",
+        ),
+        (
+            with(vm("digitalocean"), &["--isolation-level", "vm-jail"]),
+            &[][..],
+            "with --vm-driver digitalocean this host reports `machine` itself",
+        ),
+        (
+            vm("/usr/local/bin/my-driver"),
+            &[("TINFIRM_RUNNER_ISOLATION_HARDENED", "yes")][..],
+            "--isolation-level",
+        ),
+        (
+            with(
+                vm("/usr/local/bin/my-driver"),
+                &["--isolation-level", "container"],
+            ),
+            &[][..],
+            "invalid value 'container'",
+        ),
+    ] {
+        let out = run_with_env(dir, &args, env);
+        assert!(!out.status.success(), "{args:?} {env:?}");
+        let message = text(&out);
+        assert!(message.contains(expected), "{args:?}: {message}");
+        // Refused at once, before the login is even read.
+        assert!(!message.contains("not logged in"), "{message}");
+    }
+    // With a driver of one's own, the statement passes the checks; this `run` then stops
+    // because it is not logged in.
+    let out = run_with_env(
+        dir,
+        &with(
+            vm("/usr/local/bin/my-driver"),
+            &[
+                "--isolation-level",
+                "vm-jail",
+                "--isolation-hardened",
+                "yes",
+            ],
+        ),
+        &[],
+    );
+    assert!(!out.status.success());
+    assert!(text(&out).contains("not logged in"), "{}", text(&out));
+}
+
+#[test]
+fn doctor_says_what_an_escape_reaches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let doctor = |env: &[(&str, &str)]| text(&run_with_env(dir, &["doctor"], env));
+    let report = doctor(&[]);
+    assert!(
+        report.contains("[info] isolation: reports container, hardened no"),
+        "{report}"
+    );
+    assert!(
+        report.contains("the host's token and every run's git token"),
+        "{report}"
+    );
+    // Docker's runtime: Kata reports `container` (its VMM is root on this machine), gVisor
+    // `gvisor`; what an escape reaches is a container host's.
+    for (runtime, reports) in [
+        ("kata", "reports container, hardened no"),
+        ("runsc", "reports gvisor, hardened no"),
+    ] {
+        let report = doctor(&[("TINFIRM_RUNNER_SANDBOX_RUNTIME", runtime)]);
+        assert!(
+            report.contains(&format!("[info] isolation: {reports}")),
+            "{report}"
+        );
+        assert!(
+            report.contains("the host's token and every run's git token"),
+            "{report}"
+        );
+    }
+    let report = doctor(&[
+        ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+        ("TINFIRM_RUNNER_VM_DRIVER", "digitalocean"),
+    ]);
+    assert!(
+        report.contains("[info] isolation: reports machine, hardened none"),
+        "{report}"
+    );
+    assert!(report.contains("nothing of Tinfirm's"), "{report}");
+    let own = [
+        ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+        ("TINFIRM_RUNNER_VM_DRIVER", "/usr/local/bin/my-driver"),
+    ];
+    let report = doctor(&own);
+    // A driver of one's own without a statement: `container`, a warning, and how to state
+    // the level.
+    assert!(
+        report.contains("[warn] isolation: reports container, hardened no"),
+        "{report}"
+    );
+    assert!(
+        report.contains("a VM host shown as a container host"),
+        "{report}"
+    );
+    assert!(
+        report.contains("--isolation-level machine|vm-jail"),
+        "{report}"
+    );
+    assert!(report.contains("as on a container host"), "{report}");
+    let report = doctor(&[
+        own[0],
+        own[1],
+        ("TINFIRM_RUNNER_ISOLATION_LEVEL", "vm-jail"),
+    ]);
+    assert!(
+        report.contains("[info] isolation: reports vm-jail, hardened no, stated by the operator"),
+        "{report}"
+    );
+    let report = doctor(&[
+        own[0],
+        own[1],
+        ("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine"),
+        ("TINFIRM_RUNNER_ISOLATION_HARDENED", "none"),
+    ]);
+    assert!(
+        report.contains("[info] isolation: reports machine, hardened none, stated by the operator"),
+        "{report}"
+    );
+    let report = doctor(&[("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine")]);
+    assert!(report.contains("[FAIL] isolation"), "{report}");
+    let report = doctor(&[
+        ("TINFIRM_RUNNER_SANDBOX_RUNTIME", "runsc"),
+        ("TINFIRM_RUNNER_ISOLATION_LEVEL", "machine"),
+    ]);
+    assert!(
+        report.contains("[FAIL] isolation: --isolation-level is for a VM driver of your own: with the Docker executor this host reports `gvisor` itself"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_node_driver_reports_what_its_nodes_configuration_reaches() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let sockets = dir.join("sockets.json");
+    std::fs::write(
+        &sockets,
+        r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox-4c8g"]}]}"#,
+    )
+    .unwrap();
+    let (cert, key) = (dir.join("client.crt"), dir.join("client.key"));
+    std::fs::write(&cert, b"certificate").unwrap();
+    std::fs::write(&key, b"key").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mixed = dir.join("mixed.json");
+    std::fs::write(
+        &mixed,
+        serde_json::json!({"nodes": [
+            {"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox-4c8g"]},
+            {"name": "node-1", "address": "192.0.2.10:7700", "nodeSha256": "ab".repeat(32),
+             "certificate": cert, "key": key, "templates": ["sandbox-4c8g"]}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let node = [
+        "run",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "node",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    let sockets = sockets.to_string_lossy().into_owned();
+    let mixed = mixed.to_string_lossy().into_owned();
+    let stated: Vec<&str> = node
+        .iter()
+        .copied()
+        .chain(["--isolation-level", "machine"])
+        .collect();
+    for (args, config, expected) in [
+        (
+            &stated[..],
+            sockets.as_str(),
+            "with --vm-driver node this host reports `vm-jail` itself",
+        ),
+        (
+            &node[..],
+            mixed.as_str(),
+            "the nodes are reached over sockets and over TLS at once",
+        ),
+        (
+            &node[..],
+            "/nonexistent/node-driver.json",
+            "--vm-driver node: cannot read",
+        ),
+    ] {
+        let out = run_with_env(dir, args, &[("TINFIRM_NODE_DRIVER_CONFIG", config)]);
+        assert!(!out.status.success(), "{args:?} {config}");
+        let message = text(&out);
+        assert!(message.contains(expected), "{config}: {message}");
+        assert!(!message.contains("not logged in"), "{message}");
+    }
+    // A configuration of sockets passes the checks; this `run` then stops: not logged in.
+    let out = run_with_env(dir, &node, &[("TINFIRM_NODE_DRIVER_CONFIG", &sockets)]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("not logged in"), "{}", text(&out));
+    // `doctor` says what such a host reports, and fails on a mixed configuration.
+    let doctor = |config: &str| {
+        text(&run_with_env(
+            dir,
+            &["doctor"],
+            &[
+                ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+                ("TINFIRM_RUNNER_VM_DRIVER", "node"),
+                ("TINFIRM_NODE_DRIVER_CONFIG", config),
+            ],
+        ))
+    };
+    let report = doctor(&sockets);
+    assert!(
+        report.contains("[info] isolation: reports vm-jail, hardened no"),
+        "{report}"
+    );
+    assert!(report.contains("(KVM)"), "{report}");
+    let report = doctor(&mixed);
+    assert!(
+        report.contains("[FAIL] isolation: --vm-driver node:"),
+        "{report}"
+    );
+}
+
+#[test]
+fn doctor_refuses_the_ceiling_that_run_refuses_for_its_executor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let report = text(&run_with_env(
+        dir,
+        &["doctor", "--max-concurrent-runs", "17"],
+        &[no_docker],
+    ));
+    assert!(
+        report.contains(
+            "[FAIL] max concurrent runs: --max-concurrent-runs is at most 16 with Docker"
+        ),
+        "{report}"
+    );
+    // `run` refuses the same, before anything else.
+    let out = run_with_env(dir, &["run", "--max-concurrent-runs", "17"], &[no_docker]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("--max-concurrent-runs is at most 16 with Docker"),
+        "{}",
+        text(&out)
+    );
+    let report = text(&run_with_env(dir, &["doctor"], &[no_docker]));
+    assert!(report.contains("[ ok ] max concurrent runs: 2"), "{report}");
+    // With a VM per run, 17 is a ceiling `run` takes.
+    let report = text(&run_with_env(
+        dir,
+        &[
+            "doctor",
+            "--executor",
+            "vm",
+            "--vm-driver",
+            "digitalocean",
+            "--max-concurrent-runs",
+            "17",
+        ],
+        &[no_docker],
+    ));
+    assert!(
+        report.contains("[ ok ] max concurrent runs: 17"),
+        "{report}"
+    );
+}
+
+#[test]
+fn doctor_on_a_vm_host_checks_the_driver_and_not_docker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let driver = format!(
+        "node {}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fake-vm-driver/fake-driver.mjs")
+            .display()
+    );
+    let vm = [
+        "doctor",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        driver.as_str(),
+        "--vm-template",
+        "sandbox-test",
+    ];
+    // No Docker on this host: a socket that is not there.
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let report = text(&run_with_env(
+        dir,
+        &vm,
+        &[no_docker, ("FAKE_VM_SLOTS", "4")],
+    ));
+    assert!(
+        report.contains("[ ok ] vm driver: `fake` test; the template `sandbox-test` keeps the contract of a sandbox VM; room for 4 more VM(s) and 0 of this host's own, for --max-concurrent-runs 2"),
+        "{report}"
+    );
+    assert!(report.contains("[info] docker: not used"), "{report}");
+    assert!(!report.contains("[FAIL] docker"), "{report}");
+    assert!(!report.contains("image CLAUDE_CODE"), "{report}");
+    assert!(!report.contains("your uid is not 1000"), "{report}");
+    // Without the room `run` would need, or with a template that breaks the contract: it fails
+    // as `run` would refuse to start.
+    let mut more = vm.to_vec();
+    more.extend(["--max-concurrent-runs", "5"]);
+    let report = text(&run_with_env(
+        dir,
+        &more,
+        &[no_docker, ("FAKE_VM_SLOTS", "4")],
+    ));
+    assert!(
+        report.contains("[FAIL] vm driver: --max-concurrent-runs is 5, but the VM driver `fake` has room for 4 more VM(s)"),
+        "{report}"
+    );
+    let problems = r#"["the firewall allows outbound tcp to 0.0.0.0/0"]"#;
+    let report = text(&run_with_env(
+        dir,
+        &vm,
+        &[no_docker, ("FAKE_VM_PROBLEMS", problems)],
+    ));
+    assert!(
+        report.contains("[FAIL] vm driver: the VM template `sandbox-test` breaks the contract"),
+        "{report}"
+    );
+    // The options of the environment, as `run` reads them from a service's environment file.
+    let out = run_with_env(
+        dir,
+        &["doctor"],
+        &[
+            no_docker,
+            ("TINFIRM_RUNNER_EXECUTOR", "vm"),
+            ("TINFIRM_RUNNER_VM_DRIVER", driver.as_str()),
+        ],
+    );
+    let report = text(&out);
+    assert!(!out.status.success());
+    assert!(
+        report.contains("[FAIL] vm driver: --executor vm needs --vm-template"),
+        "{report}"
+    );
+    // The node driver: a client key that others can read fails before any node is asked.
+    use std::os::unix::fs::PermissionsExt;
+    let (cert, key) = (dir.join("client.crt"), dir.join("client.key"));
+    std::fs::write(&cert, b"certificate").unwrap();
+    std::fs::write(&key, b"key").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let config = dir.join("node-driver.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({"nodes": [
+            {"name": "node-1", "address": "192.0.2.10:7700", "nodeSha256": "ab".repeat(32),
+             "certificate": cert, "key": key, "templates": ["sandbox-4c8g"]}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let node = [
+        "doctor",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "node",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    let config = config.to_string_lossy().into_owned();
+    let report = text(&run_with_env(
+        dir,
+        &node,
+        &[no_docker, ("TINFIRM_NODE_DRIVER_CONFIG", config.as_str())],
+    ));
+    assert!(
+        report.contains("[FAIL] node driver configuration: node `node-1`")
+            && report.contains("readable by it alone (0600)"),
+        "{report}"
+    );
+    assert!(!report.contains("vm driver:"), "{report}");
+    // A key of this user's alone: the configuration passes, and the node, which is not there,
+    // gives no room.
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let report = text(&run_with_env(
+        dir,
+        &node,
+        &[no_docker, ("TINFIRM_NODE_DRIVER_CONFIG", config.as_str())],
+    ));
+    assert!(
+        report.contains("[ ok ] node driver configuration:")
+            && report.contains("1 node(s) (node-1); every client key is this user's alone"),
+        "{report}"
+    );
+    assert!(report.contains("[FAIL] vm driver:"), "{report}");
+}
+
+/// Where [`run_without_landlock`] hands the runner host's arguments to
+/// [`launch_without_landlock`]. Linux alone has Landlock and the seccomp filter that stands in
+/// for a kernel without it, so these helpers and their two tests are built there only.
+#[cfg(target_os = "linux")]
+const WITHOUT_LANDLOCK: &str = "TINFIRM_TEST_WITHOUT_LANDLOCK";
+
+/// The system calls that [`launch_without_landlock`] refuses, as JSON numbers; without it,
+/// `landlock_create_ruleset` alone.
+#[cfg(target_os = "linux")]
+const REFUSED_SYSCALLS: &str = "TINFIRM_TEST_REFUSED_SYSCALLS";
+
+/// Like [`run_with_env`], on a system where the reader cannot be confined: this test binary
+/// starts itself again, and [`launch_without_landlock`] runs the host there with Landlock refused
+/// as a kernel without it refuses it. The host and its readers inherit that.
+#[cfg(target_os = "linux")]
+fn run_without_landlock(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    run_refusing(dir, &[libc::SYS_landlock_create_ruleset], args, env)
+}
+
+/// Like [`run_without_landlock`], with `syscalls` refused in its place.
+#[cfg(target_os = "linux")]
+fn run_refusing(
+    dir: &Path,
+    syscalls: &[libc::c_long],
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Output {
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "launch_without_landlock",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(WITHOUT_LANDLOCK, serde_json::to_string(args).unwrap())
+    .env(REFUSED_SYSCALLS, serde_json::to_string(syscalls).unwrap());
+    host_env(&mut cmd, dir, env).output().unwrap()
+}
+
+/// Not a test of its own: does nothing unless [`run_refusing`] started it. Then it installs a
+/// seccomp filter on its thread that answers the system calls it was given (by default
+/// `landlock_create_ruleset`, as a kernel without Landlock does) with `ENOSYS`, and replaces
+/// itself with the runner host.
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_without_landlock() {
+    use std::os::unix::process::CommandExt;
+
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+
+    let Ok(args) = std::env::var(WITHOUT_LANDLOCK) else {
+        return;
+    };
+    let args: Vec<String> = serde_json::from_str(&args).unwrap();
+    let refused: Vec<libc::c_long> = std::env::var(REFUSED_SYSCALLS).map_or_else(
+        |_| vec![libc::SYS_landlock_create_ruleset],
+        |refused| serde_json::from_str(&refused).unwrap(),
+    );
+    let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
+    let filter: BpfProgram = SeccompFilter::new(
+        refused.into_iter().map(|call| (call, Vec::new())).collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        arch,
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    seccompiler::apply_filter(&filter).unwrap();
+    let error = Command::new(BIN)
+        .args(args)
+        .env_remove(WITHOUT_LANDLOCK)
+        .env_remove(REFUSED_SYSCALLS)
+        .exec();
+    panic!("cannot start the runner host: {error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_host_with_the_bridge_refuses_a_reader_and_a_front_it_cannot_confine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let out = run(
+        dir,
+        &["login", "--server", "http://127.0.0.1:9/"],
+        Some(&format!("{HOST_TOKEN}\n")),
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    // No Docker: a host that gets past the reader stops there.
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let vm = [
+        "run",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "digitalocean",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    for (args, env) in [
+        (&["run", "--sandbox-bridge"][..], &[no_docker][..]),
+        (
+            &["run"][..],
+            &[no_docker, ("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1")][..],
+        ),
+        (&vm[..], &[][..]),
+    ] {
+        let out = run_without_landlock(dir, args, env);
+        assert!(!out.status.success(), "{args:?} {env:?}");
+        let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            message.contains("cannot confine the reader")
+                && message.contains("no Landlock 2")
+                && message.contains("refuses to start here")
+                && message.contains("--allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up the reader's confinement")
+                && message.contains("the host's token and stored credentials"),
+            "{args:?} {env:?}: {message}"
+        );
+        // The front's probe cannot be confined either, and one refusal names both.
+        assert!(
+            message.contains("nor the front process of a sandbox (no Landlock")
+                && message.contains(
+                    "and the fronts' confinement: each front still runs as a process of its own"
+                )
+                && message.contains("its sandbox's bridge"),
+            "{args:?} {env:?}: {message}"
+        );
+        // Refused before Docker is asked for anything.
+        assert!(!message.contains("DOCKER_HOST"), "{message}");
+    }
+    // With the flag, a Docker host starts with a warning that says what it gave up, and stops
+    // at Docker here.
+    for (args, env) in [
+        (
+            &["run", "--sandbox-bridge", "--allow-unconfined-reader"][..],
+            &[no_docker][..],
+        ),
+        (
+            &["run", "--sandbox-bridge"][..],
+            &[no_docker, ("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER", "1")][..],
+        ),
+    ] {
+        let out = run_without_landlock(dir, args, env);
+        assert!(!out.status.success(), "{args:?} {env:?}");
+        let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            message.contains("cannot confine the reader")
+                && message.contains("--allow-unconfined-reader accepts this")
+                && message.contains("can end `run` and its runs with a signal")
+                && message.contains("nor the front process of a sandbox")
+                && message.contains("and the fronts' confinement"),
+            "{args:?} {env:?}: {message}"
+        );
+        assert!(!message.contains("refuses to start"), "{message}");
+        assert!(message.contains("DOCKER_HOST"), "{message}");
+    }
+    // A Docker host without the bridge uses no reader and no front, and checks neither.
+    let out = run_without_landlock(dir, &["run"], &[no_docker]);
+    assert!(!out.status.success());
+    let message = text(&out);
+    assert!(!message.contains("reader"), "{message}");
+    assert!(!message.contains("front"), "{message}");
+    assert!(message.contains("DOCKER_HOST"), "{message}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_with_the_bridge_refuses_a_front_it_cannot_confine_beside_a_confined_reader() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let out = run(
+        dir,
+        &["login", "--server", "http://127.0.0.1:9/"],
+        Some(&format!("{HOST_TOKEN}\n")),
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    // `kill` refused: the reader still confines itself, but a front cannot signal its own
+    // process group, which it must be able to, so its probe does not count as confined.
+    let refused = [libc::SYS_kill];
+    let no_docker = ("DOCKER_HOST", "unix:///nonexistent/docker.sock");
+    let vm = [
+        "run",
+        "--executor",
+        "vm",
+        "--vm-driver",
+        "digitalocean",
+        "--vm-template",
+        "sandbox-4c8g",
+    ];
+    for (args, env) in [
+        (&["run", "--sandbox-bridge"][..], &[no_docker][..]),
+        (&vm[..], &[][..]),
+    ] {
+        let out = run_refusing(dir, &refused, args, env);
+        assert!(!out.status.success(), "{args:?}");
+        let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            message.contains("this system cannot confine the front process of a sandbox (Landlock ABI")
+                && message.contains("but it could not signal its own process group")
+                && message.contains("refuses to start here")
+                && message.contains("--allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up the fronts' confinement: each front still runs as a process of its own")
+                && message.contains("the host's token and stored credentials"),
+            "{args:?}: {message}"
+        );
+        // The reader is confined, and the refusal does not name it.
+        assert!(!message.contains("cannot confine the reader"), "{message}");
+        assert!(!message.contains("the reader's confinement"), "{message}");
+        assert!(!message.contains("DOCKER_HOST"), "{message}");
+    }
+    // With the flag, a warning that names what is given up, and the host goes on to Docker.
+    let out = run_refusing(
+        dir,
+        &refused,
+        &["run", "--sandbox-bridge", "--allow-unconfined-reader"],
+        &[no_docker],
+    );
+    assert!(!out.status.success());
+    let message = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        message.contains("this system cannot confine the front process of a sandbox")
+            && message.contains(
+                "--allow-unconfined-reader accepts this and gives up the fronts' confinement"
+            ),
+        "{message}"
+    );
+    assert!(!message.contains("refuses to start"), "{message}");
+    assert!(message.contains("DOCKER_HOST"), "{message}");
+    // `doctor` gives the same outcome: the reader passes, the front fails, or is a warning
+    // with the flag.
+    let doctor = |env: &[(&str, &str)]| {
+        text(&run_refusing(dir, &refused, &["doctor"], env))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let report = doctor(&[("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1")]);
+    assert!(report.contains("[ ok ] reader: confined"), "{report}");
+    assert!(
+        report.contains("[FAIL] front: cannot be confined here: Landlock ABI")
+            && report.contains("but it could not signal its own process group")
+            && report.contains("refuses to start without --allow-unconfined-reader, which gives up the fronts' confinement"),
+        "{report}"
+    );
+    let report = doctor(&[
+        ("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1"),
+        ("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER", "1"),
+    ]);
+    assert!(
+        report.contains("[warn] front: cannot be confined here")
+            && report.contains("--allow-unconfined-reader accepts this: each front still runs"),
+        "{report}"
+    );
+    assert!(!report.contains("[FAIL] front"), "{report}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_fails_where_run_would_refuse_an_unconfined_reader_or_front() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let doctor = |env: &[(&str, &str)]| {
+        text(&run_without_landlock(dir, &["doctor"], env))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for env in [
+        &[("TINFIRM_RUNNER_SANDBOX_BRIDGE", "1")][..],
+        &[("TINFIRM_RUNNER_EXECUTOR", "vm")][..],
+    ] {
+        let report = doctor(env);
+        assert!(
+            report.contains("[FAIL] reader: cannot be confined here")
+                && report.contains("refuses to start without --allow-unconfined-reader, which gives up the reader's confinement"),
+            "{env:?}: {report}"
+        );
+        // `run` refuses a front it cannot confine as it refuses the reader.
+        assert!(
+            report.contains("[FAIL] front: cannot be confined here")
+                && report.contains("refuses to start without --allow-unconfined-reader, which gives up the fronts' confinement"),
+            "{env:?}: {report}"
+        );
+        let mut allowed = env.to_vec();
+        allowed.push(("TINFIRM_RUNNER_ALLOW_UNCONFINED_READER", "1"));
+        let report = doctor(&allowed);
+        assert!(
+            report.contains("[warn] reader: cannot be confined here")
+                && report.contains("--allow-unconfined-reader accepts this"),
+            "{allowed:?}: {report}"
+        );
+        assert!(
+            report.contains("[warn] front: cannot be confined here")
+                && report.contains("--allow-unconfined-reader accepts this: each front still runs"),
+            "{allowed:?}: {report}"
+        );
+    }
+    let report = doctor(&[]);
+    // Without the bridge, `run` starts no front: a note.
+    assert!(
+        report.contains("[info] front: cannot be confined here")
+            && report.contains(
+                "`run` starts one per sandbox, for its bridge and the HTTP of its git proxy"
+            ),
+        "{report}"
+    );
+    assert!(
+        report.contains("[info] reader: cannot be confined here")
+            && report.contains("only used with --sandbox-bridge or --executor vm"),
+        "{report}"
+    );
+}
+
+#[test]
+fn node_identity_writes_a_key_and_certificate_once_and_fingerprint_prints_its_pin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let cert = dir.join("client.crt");
+    let key = dir.join("client.key");
+    let (cert_arg, key_arg) = (cert.to_str().unwrap(), key.to_str().unwrap());
+    let out = run(
+        dir,
+        &["node", "identity", "--cert", cert_arg, "--key", key_arg],
+        None,
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let pin = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(pin.len(), 65, "{pin}");
+    assert!(
+        pin.trim()
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    assert_eq!(mode(&key), 0o600);
+    let out = run(
+        dir,
+        &["node", "fingerprint", "--cert", cert_arg],
+        None,
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), pin);
+    // A second identity on the same files is refused, and the first stays.
+    let out = run(
+        dir,
+        &["node", "identity", "--cert", cert_arg, "--key", key_arg],
+        None,
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(text(&out).contains("exists"), "{}", text(&out));
+    let out = run(
+        dir,
+        &["node", "fingerprint", "--cert", cert_arg],
+        None,
+        None,
+    );
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), pin);
+    // A certificate that is not there has no pin.
+    let missing = dir.join("missing.crt");
+    let out = run(
+        dir,
+        &["node", "fingerprint", "--cert", missing.to_str().unwrap()],
+        None,
+        None,
+    );
+    assert!(!out.status.success());
+}
+
+/// `vm-driver node` answers a line that is not JSON, and JSON that is no request, with a
+/// JSON-RPC error, and exits non-zero when its input held no request besides; a request is
+/// answered, and an input with no line, or empty lines only, ends with success.
+#[test]
+fn the_node_driver_answers_a_line_that_is_no_request_with_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let config = dir.join("node-driver.json");
+    std::fs::write(
+        &config,
+        r#"{"nodes": [{"name": "local", "socket": "/run/tinfirm-node-agent/agent.sock", "templates": ["sandbox-4c8g"]}]}"#,
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let driver = |input: &str| {
+        run(
+            dir,
+            &["vm-driver", "node", "--config", config],
+            Some(input),
+            None,
+        )
+    };
+    let answers = |out: &Output| -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+
+    // A line that is not JSON: a parse error with a null id, and a failure.
+    let out = driver("{'jsonrpc': '2.0'}\n");
+    assert!(!out.status.success(), "{}", text(&out));
+    let got = answers(&out);
+    assert_eq!(got.len(), 1, "{}", text(&out));
+    assert_eq!(got[0]["jsonrpc"], "2.0");
+    assert_eq!(got[0]["id"], serde_json::Value::Null);
+    assert_eq!(got[0]["error"]["code"], -32700);
+
+    // JSON that is no request: an invalid request.
+    let out = driver("{\"jsonrpc\": \"2.0\", \"id\": 3}\n");
+    assert!(!out.status.success(), "{}", text(&out));
+    let got = answers(&out);
+    assert_eq!(got[0]["error"]["code"], -32600, "{}", text(&out));
+    assert_eq!(got[0]["id"], 3);
+
+    // With a request besides: both answered, and success.
+    let out = driver("not json\n{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"hello\"}\n");
+    assert!(out.status.success(), "{}", text(&out));
+    let got = answers(&out);
+    assert_eq!(got.len(), 2, "{}", text(&out));
+    let hello = got.iter().find(|a| a["id"] == 1).unwrap();
+    assert_eq!(hello["result"]["driver"], "node");
+    assert_eq!(hello["result"]["protocol"], 1);
+
+    // No line, or an empty one: nothing, and success, as before.
+    for input in ["", "\n"] {
+        let out = driver(input);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(out.stdout.is_empty(), "{}", text(&out));
     }
 }

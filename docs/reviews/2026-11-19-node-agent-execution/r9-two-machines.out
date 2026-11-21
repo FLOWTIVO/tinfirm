@@ -1,0 +1,23 @@
+== the node: firewall table loaded; user.max_user_namespaces = 0; tinfirm-node-agent 1.0.0-rc.2-SNAPSHOT
+== six cycles through the runner host's node driver
+hello: 2 ms, {'protocol': 1, 'driver': 'node', 'version': '1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0'}
+verify: 11 ms, problems [], maxVms 2
+create: 133 ms, id node-1:vm-afcb72db1f4da1d725ffa35da18b91b8; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2851 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 2 ms, 1 VM
+delete: 81 ms; then describe says gone; the port answers `nothing`
+create: 141 ms, id node-1:vm-b32fd638e688deea58ec813ee5929485; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2850 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 2 ms, 1 VM
+delete: 64 ms; then describe says gone; the port answers `nothing`
+create: 138 ms, id node-1:vm-8a2d247771265bc07b532fcade0aa2ea; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2907 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 2 ms, 1 VM
+delete: 65 ms; then describe says gone; the port answers `nothing`
+create: 140 ms, id node-1:vm-04ef938f31628d78301bf131f9a257be; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2826 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 2 ms, 1 VM
+delete: 86 ms; then describe says gone; the port answers `nothing`
+create: 136 ms, id node-1:vm-15b1bf5880b5f52351e23a34081c845f; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2764 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 2 ms, 1 VM
+delete: 81 ms; then describe says gone; the port answers `nothing`
+create: 139 ms, id node-1:vm-b297c349d729c8bae50b57cb33cc9635; describe: 1 ms, running at 10.0.0.6:20000
+guest ready: 2729 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 2 ms, 1 VM
+delete: 71 ms; then describe says gone; the port answers `nothing`
+left: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, work files 0, spool files 0

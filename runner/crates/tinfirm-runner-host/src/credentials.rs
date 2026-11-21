@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -336,9 +336,37 @@ pub fn claude_login_mount_point(home: &std::path::Path) -> std::result::Result<(
     }
 }
 
+/// The most a Codex `auth.json` may hold. It holds a few tokens: a few KiB.
+pub const CODEX_AUTH_MAX_BYTES: u64 = 256 * 1024;
+
+/// Reads `<codex_home>/auth.json`, with its metadata. The sandbox of a run with this login
+/// writes to that directory (it is mounted read-write, ADR-0085), so the file may be anything
+/// the agent left there: it is read only if it is a regular file in that directory, never
+/// through a symbolic link, never a FIFO or a device, and at most [`CODEX_AUTH_MAX_BYTES`].
+pub fn read_codex_auth(codex_home: &Path) -> std::io::Result<(Vec<u8>, fs::Metadata)> {
+    use std::io::{Error, ErrorKind, Read};
+    let (file, meta) = secure_fs::open_beneath(codex_home, Path::new("auth.json"))?;
+    let too_large = || {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("over {} KiB", CODEX_AUTH_MAX_BYTES / 1024),
+        )
+    };
+    if meta.len() > CODEX_AUTH_MAX_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(CODEX_AUTH_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > CODEX_AUTH_MAX_BYTES {
+        return Err(too_large());
+    }
+    Ok((bytes, meta))
+}
+
 /// Token values inside `<codex_home>/auth.json`.
-pub fn codex_auth_secrets(codex_home: &std::path::Path) -> Vec<String> {
-    let Ok(bytes) = fs::read(codex_home.join("auth.json")) else {
+pub fn codex_auth_secrets(codex_home: &Path) -> Vec<String> {
+    let Ok((bytes, _)) = read_codex_auth(codex_home) else {
         return Vec::new();
     };
     let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -366,26 +394,29 @@ pub fn codex_auth_secrets(codex_home: &std::path::Path) -> Vec<String> {
 pub type FileStamp = Option<(std::time::SystemTime, u64, u64)>;
 
 /// The stamp of a Codex home's `auth.json` as it is now.
-pub fn codex_auth_stamp(codex_home: &std::path::Path) -> FileStamp {
+pub fn codex_auth_stamp(codex_home: &Path) -> FileStamp {
     use std::hash::{Hash, Hasher};
-    let auth = codex_home.join("auth.json");
-    let meta = fs::metadata(&auth).ok()?;
-    let bytes = fs::read(&auth).ok()?;
+    let (bytes, meta) = read_codex_auth(codex_home).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     Some((meta.modified().ok()?, meta.len(), hasher.finish()))
 }
 
 /// Presence and format problems of a Codex home (for `doctor` and run acceptance).
-pub fn check_codex_home(codex_home: &std::path::Path) -> Vec<String> {
+pub fn check_codex_home(codex_home: &Path) -> Vec<String> {
     let auth = codex_home.join("auth.json");
     let mut problems = Vec::new();
-    match fs::read(&auth) {
-        Err(_) => problems.push(format!(
+    match read_codex_auth(codex_home) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => problems.push(format!(
             "{} is missing; run `credential add codex` again",
             auth.display()
         )),
-        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Err(e) => problems.push(format!(
+            "{} cannot be read ({e}): it must be a regular file of at most {} KiB, not a link; run `credential add codex` again",
+            auth.display(),
+            CODEX_AUTH_MAX_BYTES / 1024
+        )),
+        Ok((bytes, _)) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Err(_) => problems.push(format!("{} is not valid JSON", auth.display())),
             Ok(json) => {
                 let has_tokens = json
@@ -433,6 +464,63 @@ mod tests {
         // The same size in the same instant: the content tells them apart.
         fs::write(dir.path().join("auth.json"), b"{\"tokens\":{\"x\":2}}").unwrap();
         assert_ne!(codex_auth_stamp(dir.path()), second, "same size, another");
+    }
+
+    #[test]
+    fn a_codex_auth_json_that_a_sandbox_replaced_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex");
+        fs::create_dir_all(&home).unwrap();
+        let auth = home.join("auth.json");
+        let good = br#"{"tokens":{"refresh_token":"test-refresh-token-value"}}"#;
+        // A file of this host's that the agent points auth.json at: not read through the link.
+        let host_file = tmp.path().join("host-secret.json");
+        fs::write(
+            &host_file,
+            br#"{"OPENAI_API_KEY":"host-file-secret-value"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&host_file, &auth).unwrap();
+        assert!(codex_auth_secrets(&home).is_empty());
+        assert_eq!(codex_auth_stamp(&home), None);
+        let problems = check_codex_home(&home).join("; ");
+        assert!(problems.contains("not a link"), "{problems}");
+        // A link to an endless device: refused without a read.
+        fs::remove_file(&auth).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &auth).unwrap();
+        assert!(codex_auth_secrets(&home).is_empty());
+        assert_eq!(codex_auth_stamp(&home), None);
+        // A FIFO with no writer: refused, and nothing blocks.
+        fs::remove_file(&auth).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&auth)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(codex_auth_secrets(&home).is_empty());
+        assert!(!check_codex_home(&home).is_empty());
+        // A file over the bound: not read, and said so.
+        fs::remove_file(&auth).unwrap();
+        let mut large = good.to_vec();
+        large.resize(CODEX_AUTH_MAX_BYTES as usize + 1, b' ');
+        fs::write(&auth, &large).unwrap();
+        assert!(codex_auth_secrets(&home).is_empty());
+        assert_eq!(codex_auth_stamp(&home), None);
+        let problems = check_codex_home(&home).join("; ");
+        assert!(problems.contains("256 KiB"), "{problems}");
+        // A home that is itself a link is refused as well.
+        let linked = tmp.path().join("linked-home");
+        std::os::unix::fs::symlink(&home, &linked).unwrap();
+        fs::write(&auth, good).unwrap();
+        assert!(codex_auth_secrets(&linked).is_empty());
+        // The real file, at the bound, is read.
+        let mut at_bound = good.to_vec();
+        at_bound.resize(CODEX_AUTH_MAX_BYTES as usize, b' ');
+        fs::write(&auth, &at_bound).unwrap();
+        assert_eq!(codex_auth_secrets(&home), vec!["test-refresh-token-value"]);
+        assert!(codex_auth_stamp(&home).is_some());
     }
 
     #[test]

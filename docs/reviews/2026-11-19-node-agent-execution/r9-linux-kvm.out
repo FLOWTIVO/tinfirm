@@ -1,0 +1,25 @@
+
+running 6 tests
+test a_guest_without_the_console_setting_writes_nothing_to_the_node ... ok
+test a_helper_started_over_what_a_crash_left_removes_it_or_keeps_its_slot ... ok
+test a_killed_vmm_is_listed_as_not_alive_and_its_delete_cleans_up ... ok
+test a_made_vm_runs_jailed_answers_only_its_control_host_and_a_delete_leaves_nothing ... the VMM, pid 19448: Name firecracker; Uid 1300001 1300001 1300001 1300001; Gid 1300001 1300001 1300001 1300001; CapEff 0000000000000000; CapPrm 0000000000000000; CapBnd 00000000082000c3; NoNewPrivs 1; Seccomp 2
+the control host, the published port: tls alert
+the control host, the next port: refused
+the control host, the guest's own address: nothing
+the control host, the namespace's address: nothing
+another machine, the published port: refused
+another machine, the guest's own address: nothing
+another machine, the namespace's address: nothing
+the node itself, the published port: refused
+the node itself, the namespace's address: nothing
+console: [    1.896445] systemd[1]: Starting tinfirm-vm-boot.service - Tinfirm sandbox: the run's container and its bridge...
+console: [    1.927207] systemd[1]: Started tinfirm-vm-boot.service - Tinfirm sandbox: the run's container and its bridge.
+console: [    2.086182] tinfirm-runner-host[462]: vm-boot: starting tinfirm-sandbox from tinfirm-runner-pi:local for run run-of-the-kvm-test
+timings: make 120 ms, guest ready 2766 ms after the make, delete 83 ms
+ok
+test a_make_that_fails_at_any_step_leaves_nothing ... ok
+test two_vms_at_once_share_nothing_and_the_node_holds_no_more_than_max_vms ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 76.86s
+

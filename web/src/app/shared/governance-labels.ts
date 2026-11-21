@@ -231,6 +231,7 @@ export const DEPARTURE_CREDENTIAL_FIXES: Record<DepartureCredential['kind'], str
   TOKEN: 'store a new token',
   OAUTH: 'sign it in again',
   CLIENT: 'store new client credentials',
+  APP: 'add the GitHub App’s installation again',
 };
 
 // --- Retention, holds and erasure ----------------------------------------------------------------

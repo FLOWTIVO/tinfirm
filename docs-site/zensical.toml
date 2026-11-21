@@ -96,6 +96,8 @@ nav = [
       "operator-guide/scim.md",
       "operator-guide/model-gateway.md",
       "operator-guide/runner-hosts.md",
+      "operator-guide/sandbox-nodes.md",
+      "operator-guide/kubernetes-pod-per-run.md",
     ] },
     { "Run" = [
       "operator-guide/maintenance.md",

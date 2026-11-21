@@ -160,6 +160,21 @@ public enum ProblemCode {
     DUPLICATE_GRANT,
     /** 409: the system has a credential of this name, ignoring case (ADR-0072). */
     DUPLICATE_CREDENTIAL_NAME,
+    /** 400: GitHub refused the App's id and key, or does not know the installation for the App (ADR-0116). */
+    GITHUB_APP_REFUSED,
+    /** 409: credentials of kind {@code APP} remain on the system, whose App cannot go before them (ADR-0116). */
+    GITHUB_APP_IN_USE,
+    /** 409: the {@code GITHUB} system has no GitHub App, which an installation's credential needs (ADR-0116). */
+    GITHUB_APP_REQUIRED,
+    /**
+     * 409: the system's GitHub App was replaced while Tinfirm asked GitHub for an installation, which is not stored as
+     * the new App's (ADR-0116).
+     */
+    GITHUB_APP_CHANGED,
+    /** 409: a credential of the system is that installation of its GitHub App already (ADR-0116). */
+    DUPLICATE_INSTALLATION,
+    /** 502: Tinfirm could not ask GitHub for the App's installations (ADR-0116). */
+    GITHUB_UNREACHABLE,
     /**
      * 409: the conversation can never run as its person's settings stand: no gateway, an inactive payer, a subscription
      * gone ({@code details.reason}, package 2's refusal; the package 3 contract, §5.7).
@@ -167,7 +182,8 @@ public enum ProblemCode {
     MODEL_ACCESS_UNAVAILABLE,
     /**
      * 409: no registered runner host, connected or not, may run the conversation's credentials ({@code details.reason}:
-     * {@code NO_RUNNER_HOST}, {@code NO_HOST_FOR_CREDENTIALS}, {@code CANNOT_RUN_ANYWHERE}; contract §5.7).
+     * {@code NO_RUNNER_HOST}, {@code NO_HOST_FOR_CREDENTIALS}, {@code CANNOT_RUN_ANYWHERE}, and from ADR-0113
+     * {@code NO_HOST_OF_LEVEL}; contract §5.7).
      */
     NO_HOST_FOR_CONVERSATION,
     /** 409: more than 20 repositories would start the workspace without a choice of them (contract §5.6). */

@@ -1,0 +1,16 @@
+{{- if and .Values.runner.enabled (eq .Values.runner.vm.driver "pod") }}
+{{- include "tinfirm.runner.validate" . }}
+# The runs' quota (ADR-0115, decision 2), which gives the driver its capacity: the fewest run
+# pods that any of its resources still admits. The scheduler and the kubelet hold every run
+# pod to its share.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "tinfirm.runs.resourceQuotaName" . }}
+  namespace: {{ .Values.runner.vm.cluster.namespace }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+spec:
+  hard:
+    {{- include "tinfirm.runs.quotaHard" . | nindent 4 }}
+{{- end }}

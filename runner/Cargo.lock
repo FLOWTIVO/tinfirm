@@ -662,6 +662,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1368,6 +1388,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2024,6 +2055,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2403,6 +2443,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinfirm-node-agent"
+version = "1.0.0-rc.2-SNAPSHOT"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "rcgen",
+ "ring",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "zeroizing-alloc",
+]
+
+[[package]]
 name = "tinfirm-protocol"
 version = "1.0.0-rc.2-SNAPSHOT"
 dependencies = [
@@ -2433,18 +2494,23 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonschema",
+ "landlock",
  "libc",
  "percent-encoding",
+ "rcgen",
  "ring",
  "rpassword",
+ "rustix",
  "rustls",
  "rustls-native-certs",
+ "seccompiler",
  "serde",
  "serde_json",
  "tar",
  "tempfile",
  "thiserror",
  "tinfirm-bridge",
+ "tinfirm-node-agent",
  "tinfirm-protocol",
  "tokio",
  "tokio-rustls",
@@ -3117,6 +3183,12 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "zeroizing-alloc"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b5564c80013ee0edbfc4e4d7d66d1a5a44b8adaffbf0103069f51ce0efc5031"
 
 [[package]]
 name = "zerotrie"

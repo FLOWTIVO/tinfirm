@@ -47,6 +47,7 @@ export const CREDENTIAL_KIND_LABELS: Record<SystemCredential['kind'], string> = 
   TOKEN: 'Token',
   OAUTH: 'Sign-in',
   CLIENT: 'Client credentials',
+  APP: 'GitHub App installation',
 };
 
 /** What an admin does to a credential the system refused, by how it was connected. */
@@ -54,6 +55,7 @@ export const CREDENTIAL_RECONNECT_LABELS: Record<SystemCredential['kind'], strin
   TOKEN: 'Store a new token',
   OAUTH: 'Sign in again',
   CLIENT: 'Store new client credentials',
+  APP: 'Add the installation again',
 };
 
 export type CredentialTone = 'neutral' | 'success' | 'human' | 'destructive';

@@ -500,11 +500,26 @@ pub(crate) fn authority(url: &url::Url) -> String {
     }
 }
 
-/// Sends one request to the server, over HTTP/1.1 (TLS for `https`).
+/// Sends one request to the server, over HTTP/1.1 (TLS for `https`, with the system's roots).
 pub(crate) async fn send<B>(
     url: &url::Url,
     request: Request<B>,
     timeout: Duration,
+) -> Result<Response<Incoming>>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    send_with(url, request, timeout, None).await
+}
+
+/// [`send`], with `tls` for `https` when given: its roots replace the system's.
+pub(crate) async fn send_with<B>(
+    url: &url::Url,
+    request: Request<B>,
+    timeout: Duration,
+    tls: Option<std::sync::Arc<rustls::ClientConfig>>,
 ) -> Result<Response<Incoming>>
 where
     B: hyper::body::Body + Send + 'static,
@@ -526,7 +541,8 @@ where
     let _ = tcp.set_nodelay(true);
     if https {
         let name = rustls::pki_types::ServerName::try_from(host)?;
-        let tls = tokio_rustls::TlsConnector::from(crate::git_proxy::tls_config())
+        let config = tls.unwrap_or_else(crate::git_proxy::tls_config);
+        let tls = tokio_rustls::TlsConnector::from(config)
             .connect(name, tcp)
             .await?;
         exchange(TokioIo::new(tls), request, timeout).await

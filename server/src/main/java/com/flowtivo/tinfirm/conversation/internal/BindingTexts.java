@@ -110,6 +110,8 @@ class BindingTexts {
         return switch (credential.kind()) {
             case OAUTH -> "an admin must sign the shared credential " + credential.name() + " in again";
             case CLIENT -> "an admin must store new client credentials for the shared credential " + credential.name();
+            case APP -> "an admin must check the GitHub App's installation " + credential.name()
+                    + " on the system's page";
             default -> "an admin must store a new token for the shared credential " + credential.name();
         };
     }
@@ -182,6 +184,35 @@ class BindingTexts {
                     + ", or it no longer borrows the credential; it goes on once they may again, or the trigger is "
                     + "changed.";
             default -> gone(binding);
+        };
+    }
+
+    /**
+     * Why a run's git token was revoked (ADR-0116), in the words of the message its host gets: "the shared credential
+     * CI bot was disabled", "the account needs signing in again".
+     */
+    String revoked(BindingInfo binding) {
+        String system = systemName(binding.companyId(), binding.systemId());
+        AccountInfo account = binding.accountId() != null
+                ? accounts.find(binding.companyId(), binding.accountId()).orElse(null) : null;
+        BindingInfo.Reason reason = binding.reason() != null ? binding.reason() : BindingInfo.Reason.NONE;
+        return switch (reason) {
+            case RECONNECT_YOURS, CHOOSE -> "the account on " + system + " needs signing in again";
+            case RECONNECT_COMPANY -> account != null && account.credential() && !account.enabled()
+                    ? "the shared credential " + account.name() + " on " + system + " was disabled"
+                    : "the shared credential" + (account != null ? " " + account.name() : "") + " on " + system
+                            + " needs signing in again";
+            case SUSPENDED -> "the account's holder was suspended";
+            case SYSTEM_OFF -> "the company switched personal MCP servers off";
+            case NOT_ENTITLED -> "the trigger's author may no longer use " + holderName(binding)
+                    + ", or it no longer borrows the credential";
+            case GRANT_REMOVED -> "the shared credential's grant was withdrawn";
+            case LEFT_GROUP -> "the person is no longer in the group the credential is shared with";
+            case IDENTITY_CHANGED -> "the account is another identity on " + system + " now";
+            case HOLDER_LEFT -> "the account's holder left the company";
+            case SYSTEM_REMOVED -> system + " was removed";
+            case ACCOUNT_REMOVED -> "the trigger's new author's choices name no account on " + system;
+            case NONE, PICK_GRANT -> "the account on " + system + " can no longer be used";
         };
     }
 

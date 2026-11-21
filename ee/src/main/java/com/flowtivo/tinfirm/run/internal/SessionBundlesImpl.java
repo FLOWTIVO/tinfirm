@@ -141,6 +141,17 @@ class SessionBundlesImpl implements SessionBundles {
             .orElseGet(RunnerMessages.SessionBundle::uploadOnly);
     }
 
+    @Override
+    public boolean carries(UUID conversationId, UUID agentId, String runtime, @Nullable String sessionId) {
+        if (sessionId == null || !enabled()) {
+            return false;
+        }
+        return rows.find(conversationId, agentId)
+            .filter(bundle -> bundle.runtime().equals(runtime))
+            .filter(bundle -> bundle.sessionId().equals(sessionId))
+            .isPresent();
+    }
+
     // ---- the runner host's upload ---------------------------------------------------------------------------------
 
     /** The answer to an upload, for the runner host: {@code STORED} or {@code REFUSED}, and why. */

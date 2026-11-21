@@ -58,6 +58,9 @@ const COMPONENT: &AsciiSet = &CONTROLS
 pub struct Redactor {
     credentials: Patterns,
     masked: Patterns,
+    /// Credentials known by their salted hashes alone: the tokens of runs taken back that
+    /// their take-back records no longer hold (crate::secret_hashes).
+    hashed: Vec<std::sync::Arc<crate::secret_hashes::HashedMatcher>>,
 }
 
 /// The start of a Claude login's tokens: the access token and the refresh token, as Claude Code
@@ -185,6 +188,7 @@ impl std::fmt::Debug for Redactor {
         f.debug_struct("Redactor")
             .field("patterns", &self.credentials.count)
             .field("masked", &self.masked.count)
+            .field("hashed", &self.hashed.len())
             .finish()
     }
 }
@@ -266,7 +270,59 @@ impl Redactor {
         Redactor {
             credentials: Patterns::new(secrets),
             masked: Patterns::new(masked),
+            hashed: Vec::new(),
         }
+    }
+
+    /// Also the credentials of `hashed`, known by their salted hashes alone: matched, redacted
+    /// and counted as credentials as the values are.
+    pub fn with_hashed(
+        mut self,
+        hashed: Vec<std::sync::Arc<crate::secret_hashes::HashedMatcher>>,
+    ) -> Redactor {
+        self.hashed = hashed;
+        self
+    }
+
+    /// This redactor's credentials by value, and of the hashed ones `hashed` alone: for a run's
+    /// bulk scans, which need not pay for every other run's hashes.
+    pub fn with_only_hashed(
+        &self,
+        hashed: Option<std::sync::Arc<crate::secret_hashes::HashedMatcher>>,
+    ) -> Redactor {
+        let mut redactor = self.clone();
+        redactor.hashed = hashed.into_iter().collect();
+        redactor
+    }
+
+    fn hashed_contains(&self, bytes: &[u8]) -> bool {
+        self.hashed.iter().any(|m| m.contains(bytes))
+    }
+
+    /// Replaces every form that a hashed credential has.
+    fn replace_hashed<'a>(&self, text: Cow<'a, str>) -> (Cow<'a, str>, bool) {
+        if self.hashed.is_empty() {
+            return (text, false);
+        }
+        let ranges = crate::secret_hashes::merge(
+            self.hashed
+                .iter()
+                .flat_map(|m| m.ranges(text.as_bytes()))
+                .collect(),
+        );
+        if ranges.is_empty() {
+            return (text, false);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0;
+        for (start, end) in ranges {
+            // Every form is ASCII, so a match falls on character boundaries.
+            out.push_str(&text[copied..start]);
+            out.push_str(REDACTED);
+            copied = end;
+        }
+        out.push_str(&text[copied..]);
+        (Cow::Owned(out), true)
     }
 
     /// How many bytes at the end of a text stream that goes out in pieces must wait for the
@@ -277,6 +333,7 @@ impl Redactor {
         self.credentials
             .max_len()
             .max(self.masked.max_len())
+            .max(self.hashed.iter().map(|m| m.max_len()).max().unwrap_or(0))
             .max(CLAUDE_TOKEN_MAX_LEN)
             - 1
     }
@@ -290,7 +347,9 @@ impl Redactor {
     /// `true` when `text` contains a credential value in any encoding, or a Claude OAuth
     /// token shape.
     pub fn contains(&self, text: &str) -> bool {
-        self.credentials.contains(text) || !claude_token_ranges(text.as_bytes()).is_empty()
+        self.credentials.contains(text)
+            || !claude_token_ranges(text.as_bytes()).is_empty()
+            || self.hashed_contains(text.as_bytes())
     }
 
     /// `true` when `bytes` (any content, not only text) contain a credential or a masked
@@ -301,6 +360,7 @@ impl Redactor {
             .iter()
             .any(|p| p.matcher.as_ref().is_some_and(|m| m.is_match(bytes)))
             || !claude_token_ranges(bytes).is_empty()
+            || self.hashed_contains(bytes)
     }
 
     /// `true` when `bytes` contain a credential value in any encoding; masked values (a run's
@@ -310,12 +370,14 @@ impl Redactor {
             .matcher
             .as_ref()
             .is_some_and(|m| m.is_match(bytes))
+            || self.hashed_contains(bytes)
     }
 
     /// Replaces every credential and masked value, and every Claude OAuth token shape, with
     /// `[REDACTED]`.
     pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
         let (text, _) = self.credentials.replace(Cow::Borrowed(text));
+        let (text, _) = self.replace_hashed(text);
         let (text, _) = replace_claude_tokens(text);
         self.masked.replace(text).0
     }
@@ -323,6 +385,8 @@ impl Redactor {
     /// Redacts in place; says what was replaced.
     pub fn redact_string(&self, text: &mut String) -> Redacted {
         let (replaced, credential) = self.credentials.replace(Cow::Borrowed(text.as_str()));
+        let (replaced, hashed) = self.replace_hashed(replaced);
+        let credential = credential || hashed;
         let (replaced, shaped) = replace_claude_tokens(replaced);
         let (replaced, masked) = self.masked.replace(replaced);
         if let Cow::Owned(replaced) = replaced {
@@ -362,8 +426,9 @@ impl Redactor {
     }
 }
 
-/// All encodings of one secret that we look for.
-fn variants(secret: &str) -> Vec<String> {
+/// All encodings of one secret that we look for (also those whose salted hashes a take-back
+/// record keeps, crate::secret_hashes).
+pub(crate) fn variants(secret: &str) -> Vec<String> {
     let mut out = vec![secret.to_string()];
     out.push(utf8_percent_encode(secret, NON_ALPHANUMERIC).to_string());
     out.push(utf8_percent_encode(secret, COMPONENT).to_string());
@@ -392,6 +457,34 @@ mod tests {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE};
 
     const SECRET: &str = "sk-ant-oat01-TEST/ONLY+NOT=A-REAL_TOKEN";
+
+    #[test]
+    fn a_credential_known_by_its_hashes_alone_is_redacted_and_counts_as_a_credential() {
+        let token = "github_pat_TEST_ONLY_revoked_0123_abcdef";
+        let mut hashes = crate::secret_hashes::SecretHashes::new();
+        hashes.add(token);
+        let matcher =
+            std::sync::Arc::new(crate::secret_hashes::HashedMatcher::new(&hashes).unwrap());
+        let plain = Redactor::new(["a-live-token-0123456789"]);
+        let redactor = plain.clone().with_hashed(vec![matcher]);
+        let text = format!("pushed with {token} and a-live-token-0123456789");
+        assert!(!plain.contains(&format!("pushed with {token}")));
+        assert!(redactor.contains(&text));
+        assert!(redactor.contains_credential(text.as_bytes()));
+        assert!(redactor.contains_any(text.as_bytes()));
+        assert_eq!(
+            redactor.redact(&text),
+            "pushed with [REDACTED] and [REDACTED]"
+        );
+        let mut json = serde_json::json!({"message": format!("git said: {token}")});
+        let hit = redactor.redact_json(&mut json);
+        assert!(hit.credential && !hit.masked);
+        assert_eq!(json["message"], "git said: [REDACTED]");
+        // A stream cut in pieces holds back enough for the longest hashed form.
+        assert!(redactor.hold_back() >= token.len() - 1);
+        // A text with none of them goes as it is.
+        assert_eq!(redactor.redact("nothing here"), "nothing here");
+    }
 
     #[test]
     fn redacts_claude_token_shapes_it_was_never_told() {

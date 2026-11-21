@@ -1,0 +1,67 @@
+#### after the fixes
+== finding 1: a tool that hangs (systemd-udevd stopped with SIGSTOP, so that a dmsetup that waits for udev never returns)
+systemd-udevd: Ts 
+a list, 4 s into that create:
+list: {"vms": [{"address": "10.0.0.6", "id": "node-1:vm-a795e3ee545171d14dfda23721a57ebf", "labels": {"tinfirm-host": "two-machine-run"}, "name": "udev-frozen", "port": 20000, "state": "running"}]}
+    (53 ms)
+the create: created node-1:vm-a795e3ee545171d14dfda23721a57ebf (udev-frozen) from the template sandbox-2c2g create: 128 ms, id node-1:vm-a795e3ee545171d14dfda23721a57ebf; describe: 5 ms, running at 10.0.0.6:20000 create ended: status 0 
+on the node meanwhile: 
+left afterwards: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0
+
+== finding 3: the helper killed (SIGKILL to the unit, which the service manager then starts again) four times while VMs are being made
+KillMode of the unit: control-group
+      1      33     create: ERROR after N ms: {'code': -32000, 'message': 'no node of the driver has a free slot for the template `sandbox-2c2g`'}
+      1       5     create: ERROR after N ms: {'code': -32000, 'message': 'no node of the driver has a free slot for the template `sandbox-2c2g`'}
+      1       1     create: N ms, id node-1:vm-<id>; describe: N ms, running at 10.0.0.6:20001
+      1       1     create: ERROR after N ms: {'code': -32000, 'message': 'no node of the driver has a free slot for the template `sandbox-2c2g`'}
+    killed at 29.383, with 0 tool(s) of a make running
+    killed at 42.248, with 0 tool(s) of a make running
+    killed at 55.284, with 0 tool(s) of a make running
+    killed at 08.150, with 0 tool(s) of a make running
+    the helper: active, started again 4 times
+    listed by the agent: 2 VM(s); on the node: jails 2, VMMs 2, device-mapper 2, loop devices of snapshots 2, veths 2, VM tables 2, cgroups 0, named namespaces 2, work files 4, stray tools 0
+    things that no jail names: cgroups 0, device-mapper devices 0, snapshot files 0, namespaces 0
+left afterwards: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0
+
+== finding 5: `nft flush ruleset` under a running VM
+before: the port answers ` tls alert`; "state": "running"
+after the flush, tables on the node: 
+after: the port answers ` refused`; "state": "failed"
+the delete: deleted node-1:vm-b679d49691006b33ae4a76a4a6568a5d
+delete: ({}, 70)
+table inet tinfirm_node;
+left afterwards: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0
+
+== finding 6: a tree 5000 directories deep, made by the VM's user in its chroot, then the delete
+sh: cd: line 0: can't cd to d: File name too long
+mkdir: can't create directory 'd': File exists
+made 2046 levels as uid 1100000
+the delete:
+deleted node-1:vm-dad3169f363723a45d4615e9b60e9a28
+delete: ({}, 141)
+    (187 ms)
+the helper: active, restarts 4
+a list after it:
+list: {"vms": []}
+    (42 ms)
+left: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, stray tools 0
+
+== finding 3, once more: the helper killed four times while VMs are made and deleted in a loop (30 cycles)
+    killed with 0 process(es) of a make running
+    killed with 0 process(es) of a make running
+    killed with 0 process(es) of a make running
+    killed with 0 process(es) of a make running
+      6 create: N ms, id node-1:vm-<id>; describe: N ms, running at 10.0.0.6:20000
+      5 deleted node-1:vm-<id>
+      5 delete: N ms; then describe says gone; the port answers `nothing`
+      1 describe: ERROR after N ms: {'code': -32000, 'message': 'node node-1: cannot reach the helper: connection refused'}
+      1 delete: ERROR after N ms: {'code': -32000, 'message': 'node node-1: cannot reach the helper: connection refused'}
+      1 delete failed: node node-1: cannot reach the helper: connection refused
+    the helper: active, started again 4 times in all
+    on the node afterwards: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, named namespaces 0, work files 0, network namespaces 1
+
+== finding 6, with the new build: the jail that the build before could not remove (a tree 2046 directories deep under its chroot, made by the VM's user)
+list: {"vms": [{"address": "10.0.0.6", "id": "node-1:vm-efb1bb83a91ac5fdf2407bc0cb5bd0ea", "labels": {"tinfirm-host": "two-machine-run"}, "name": "deep-tree", "port": 20000, "state": "failed"}]}
+deleted node-1:vm-efb1bb83a91ac5fdf2407bc0cb5bd0ea
+delete: ({}, 68)
+on the node: jails 0, helper active

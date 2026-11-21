@@ -16,6 +16,7 @@ use tinfirm_runner_host::credentials::{
 };
 use tinfirm_runner_host::egress_proxy::EgressSettings;
 use tinfirm_runner_host::host::{self, Host, HostOptions, Shared};
+use tinfirm_runner_host::isolation::{self, Sandboxes};
 use tinfirm_runner_host::maintenance::{self, DeleteReason, MirrorReport, Policy};
 use tinfirm_runner_host::mirror::Mirrors;
 use tinfirm_runner_host::model_proxy::ModelProxySettings;
@@ -68,8 +69,22 @@ enum Command {
     /// Build the runner images locally.
     #[command(subcommand)]
     Images(ImagesCommand),
-    /// Check Docker, images, credentials and the server connection.
-    Doctor,
+    /// Check this host's setup as `run` would start it, with the same options and environment:
+    /// its directories, the reader's and the front's confinement, git, the credentials and the
+    /// server connection; Docker and its images with the Docker executor, and the VM driver
+    /// (its configuration, a `verify` of the template and its room) with `--executor vm`,
+    /// which needs no Docker.
+    Doctor {
+        /// The ceiling `run` starts with: with --executor vm, the driver must have room for it,
+        /// as at `run`'s start.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_HOST_CAPACITY)))]
+        max_concurrent_runs: u32,
+        #[command(flatten)]
+        sandbox: SandboxArgs,
+        // Boxed: the variant would be far larger than the enum's others.
+        #[command(flatten)]
+        vm: Box<VmArgs>,
+    },
     /// Inspect and prune the host's repository mirrors.
     #[command(subcommand)]
     Mirrors(MirrorsCommand),
@@ -125,6 +140,19 @@ enum Command {
             value_parser = clap::value_parser!(u64).range(1..=tinfirm_runner_host::mcp::MAX_UPLOAD_BYTES)
         )]
         upload_max_bytes: u64,
+        /// Which client pushes a run's work: `git` (the default), `git push` with the run's git
+        /// token in its environment; or `host`, the runner host's own receive-pack client, which
+        /// has the objects packed by a process without the token (a reader, with
+        /// --sandbox-bridge or --executor vm) and sends them itself, so that the token is in no
+        /// process that reads a sandbox's objects. `host` has been checked against no code host
+        /// yet (GitHub, GitLab, Gitea, Azure DevOps): turn it on only to test it.
+        #[arg(
+            long,
+            env = "TINFIRM_RUNNER_PUSH_CLIENT",
+            value_enum,
+            default_value_t = PushClientChoice::Git
+        )]
+        push_client: PushClientChoice,
         #[command(flatten)]
         sandbox: SandboxArgs,
         // Boxed: the variant would be far larger than the enum's others.
@@ -138,6 +166,11 @@ enum Command {
         #[arg(long)]
         no_wait: bool,
     },
+    /// The TLS identities of sandbox nodes (ADR-0112): the certificate and key this host
+    /// presents to a node agent, and the pins that each side names. The files are those of
+    /// `tinfirm-node-agent identity` and `fingerprint`: either binary reads the other's.
+    #[command(subcommand)]
+    Node(NodeCommand),
     /// The sandbox's side of the sandbox bridge (ADR-0095). `run --sandbox-bridge` starts it in
     /// each sandbox, with its settings in the TINFIRM_BRIDGE_* variables; it is not run by hand.
     #[command(hide = true)]
@@ -149,16 +182,45 @@ enum Command {
         #[command(subcommand)]
         driver: VmDriverCommand,
     },
+    /// In a run's pod of the `pod` driver (ADR-0115 decision 2): runs the run's VM with
+    /// Firecracker as the pod's unprivileged user, and relays the pod's bridge port to it. The
+    /// pod's specification starts it, `vm-pod ready` as its readiness probe and `vm-pod
+    /// tap-setup` as its init container; it is not run by hand.
+    #[command(hide = true)]
+    VmPod {
+        #[command(subcommand)]
+        step: Option<VmPodStep>,
+    },
     /// In a sandbox VM (ADR-0096): reads the VM's user data and runs the run's container with
     /// the sandbox bridge. The VM's image starts it at boot; it is not run by hand.
     #[command(hide = true)]
     VmBoot {
-        /// Where the user data is: the metadata service's URL (http://), or a file.
-        #[arg(long, default_value = tinfirm_runner_host::vm_boot::DIGITALOCEAN_USER_DATA)]
+        /// Where the user data is: the metadata service's URL (http://), a user-data disk
+        /// (`disk:/dev/vdb`), a file, or `auto`: the source that the kernel command line names
+        /// (`tinfirm.user-data=`, a sandbox node's VM) or else DigitalOcean's metadata service.
+        #[arg(long, default_value = tinfirm_runner_host::vm_boot::AUTO)]
         user_data: String,
         /// The bridge binary to mount into the container (default: this one).
         #[arg(long)]
         bridge: Option<PathBuf>,
+    },
+    /// The front process of a sandbox (ADR-0112, path C): confined, it parses what the sandbox
+    /// sends in `run`'s place. `run` starts one per sandbox with --sandbox-bridge or --executor
+    /// vm, and its probe at its start; `doctor` starts its probe. It is not run by hand.
+    #[command(hide = true)]
+    Front {
+        /// Confine as a front does, try what a front must be refused, and answer on stdout.
+        #[arg(long, allow_hyphen_values = true)]
+        probe: Option<String>,
+    },
+    /// The reader of what a sandbox sends back (ADR-0112, open question 1): `run` starts one
+    /// for each archive and git bundle of a run, with no credential, confined to that run's
+    /// directories, and reads its answer on stdout; it is not run by hand.
+    #[command(hide = true)]
+    Reader {
+        /// The job, as JSON.
+        #[arg(allow_hyphen_values = true)]
+        job: String,
     },
 }
 
@@ -175,6 +237,48 @@ enum VmDriverCommand {
         )]
         config: PathBuf,
     },
+    /// Sandbox nodes (ADR-0112): relays to the node agent of each node, over TLS with a pinned
+    /// certificate or over a local socket.
+    Node {
+        /// The driver's configuration: its nodes and their templates (runner/README.md).
+        #[arg(
+            long,
+            env = "TINFIRM_NODE_DRIVER_CONFIG",
+            default_value = tinfirm_runner_host::node::DEFAULT_CONFIG
+        )]
+        config: PathBuf,
+    },
+    /// A pod per run in a Kubernetes cluster (ADR-0115 decision 2), in a namespace of the runs'
+    /// own, with Firecracker in each pod as an unprivileged user; from the Helm chart's runner
+    /// pod, with its ServiceAccount's token.
+    Pod {
+        /// The driver's configuration: the runs' namespace, the run pod's image, sizes, tap,
+        /// devices and workers (ee/runner/tinfirm-runner-host/src/kubernetes/config.rs).
+        #[arg(
+            long,
+            env = tinfirm_runner_host::kubernetes::CONFIG_ENV,
+            default_value = tinfirm_runner_host::kubernetes::DEFAULT_CONFIG
+        )]
+        config: PathBuf,
+        /// The directory of the API server's credential: `token`, the runner pod's
+        /// ServiceAccount token, which is read for each request, and `ca.crt`, the cluster's CA.
+        #[arg(
+            long,
+            env = "TINFIRM_KUBERNETES_API_DIR",
+            default_value = tinfirm_runner_host::kubernetes::DEFAULT_API_DIR
+        )]
+        kubernetes_api: PathBuf,
+    },
+}
+
+/// The steps of a run's pod after `vm-pod` (crate::kubernetes::spec::vm_pod); without one,
+/// `vm-pod` runs the VM.
+#[derive(Subcommand)]
+enum VmPodStep {
+    /// The readiness probe: succeeds once the guest's bridge has accepted.
+    Ready,
+    /// The init container of the variant without Multus: makes the VM's tap.
+    TapSetup,
 }
 
 /// How `run` creates the sandboxes (docs/archive/v1/CONVENTIONS.md §15.3, ADR-0025).
@@ -276,6 +380,51 @@ struct SandboxArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     sandbox_bridge: bool,
+    /// With --sandbox-bridge, the ports from which each sandbox's bridge listener takes one,
+    /// as FROM-TO (both included), on the sandbox network's gateway: what a host firewall
+    /// between the sandboxes and this host must admit. Without it the system picks each port
+    /// from its range for local ports (net.ipv4.ip_local_port_range). A range with no free
+    /// port fails the run that needs one.
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_SANDBOX_BRIDGE_PORTS",
+        value_name = "FROM-TO",
+        value_parser = tinfirm_runner_host::bridge::parse_port_range
+    )]
+    sandbox_bridge_ports: Option<(u16, u16)>,
+    /// Run sandboxes over the bridge although this system cannot confine the reader of what
+    /// they send back or the front process of each sandbox (Landlock 2 and seccomp: Linux 5.19
+    /// or later). Without it, a host with --sandbox-bridge or --executor vm refuses to start on
+    /// such a system. With it, the reader and the fronts still run as processes of their own
+    /// without a token, but a flaw in the reader's reading of a sandbox's archive or git bundle,
+    /// or in a front's parsing of its sandbox's bridge or of the HTTP to its proxies, reaches
+    /// every file of this host's user, the host's token and stored credentials among them, and
+    /// can end `run` with a signal.
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_ALLOW_UNCONFINED_READER",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_unconfined_reader: bool,
+}
+
+/// `run --push-client`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PushClientChoice {
+    /// `git push`, with the run's git token in its environment.
+    Git,
+    /// The runner host's own receive-pack client: the token stays in `run`, and a process
+    /// without it packs the objects. Checked against no code host yet.
+    Host,
+}
+
+impl From<PushClientChoice> for tinfirm_runner_host::git_push::PushClient {
+    fn from(choice: PushClientChoice) -> Self {
+        match choice {
+            PushClientChoice::Git => tinfirm_runner_host::git_push::PushClient::Git,
+            PushClientChoice::Host => tinfirm_runner_host::git_push::PushClient::Host,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -294,6 +443,56 @@ enum ImageVersionChoice {
     Refuse,
 }
 
+/// `--isolation-level`: the levels an operator may state (ADR-0113); `container` is what a
+/// host of a driver of the operator's own reports without a statement, and the Docker
+/// executor's, which the host derives itself.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StatedLevel {
+    /// The VMs run on other machines than this host, which hold no credential.
+    Machine,
+    /// Each VM's VMM runs in a jail of its own on this machine.
+    VmJail,
+}
+
+/// `--isolation-hardened`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HardenedChoice {
+    Yes,
+    No,
+    /// No machine of yours runs the VMs.
+    None,
+}
+
+impl StatedLevel {
+    fn level(self) -> tinfirm_protocol::IsolationTier {
+        match self {
+            StatedLevel::Machine => tinfirm_protocol::IsolationTier::Machine,
+            StatedLevel::VmJail => tinfirm_protocol::IsolationTier::VmJail,
+        }
+    }
+}
+
+impl HardenedChoice {
+    fn hardened(self) -> tinfirm_protocol::Hardened {
+        match self {
+            HardenedChoice::Yes => tinfirm_protocol::Hardened::Yes,
+            HardenedChoice::No => tinfirm_protocol::Hardened::No,
+            HardenedChoice::None => tinfirm_protocol::Hardened::None,
+        }
+    }
+}
+
+/// The operator's statement of the level, from `level` and `hardened` (`no` by default).
+fn stated_isolation(
+    level: Option<StatedLevel>,
+    hardened: Option<HardenedChoice>,
+) -> Option<isolation::Stated> {
+    level.map(|level| isolation::Stated {
+        level: level.level(),
+        hardened: hardened.unwrap_or(HardenedChoice::No).hardened(),
+    })
+}
+
 /// Where `run` creates the sandboxes: Docker on this machine, or a VM per run (ADR-0096).
 #[derive(Args)]
 struct VmArgs {
@@ -308,9 +507,12 @@ struct VmArgs {
         default_value_t = ExecutorChoice::Docker
     )]
     executor: ExecutorChoice,
-    /// The VM driver (--executor vm): `digitalocean`, this binary's own driver, or the command
-    /// line of another (split at white space). It holds the provider's credential; this host
-    /// holds none.
+    /// The VM driver (--executor vm): `digitalocean`, `node` or `pod`, this binary's own
+    /// drivers, or the command line of another (split at white space). It holds the provider's
+    /// credential; this host holds none. DigitalOcean's driver and `pod` (a pod per run in the
+    /// Kubernetes cluster this host runs in, ADR-0115) are part of elastic runners (Pro and
+    /// Enterprise): the server refuses a host with one unless its licence holds them. The `node`
+    /// driver (sandbox nodes, ADR-0112) and your own driver need no licence.
     #[arg(long, env = "TINFIRM_RUNNER_VM_DRIVER", value_name = "COMMAND")]
     vm_driver: Option<String>,
     /// The driver's template that every VM is created from (--executor vm): image, size,
@@ -352,14 +554,40 @@ struct VmArgs {
         default_value_t = ImageVersionChoice::Warn
     )]
     vm_image_version: ImageVersionChoice,
+    /// The level of isolation this host reports with a VM driver of your own, which it cannot
+    /// see itself (ADR-0113): `machine` when the VMs run on other machines than this host,
+    /// which hold no credential; `vm-jail` when each VM's VMM runs in a jail of its own on this
+    /// machine. Without it such a host reports `container`, and the server places its runs as
+    /// on a container host. Refused with the Docker executor, `--vm-driver digitalocean` and
+    /// `--vm-driver node`, whose level this host derives itself, and `--vm-driver pod`, whose
+    /// configuration states it.
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_ISOLATION_LEVEL",
+        value_enum,
+        value_name = "LEVEL"
+    )]
+    isolation_level: Option<StatedLevel>,
+    /// Whether the machines that run those VMs are hardened beyond the jail (ADR-0113): `yes`,
+    /// `no`, or `none` when no machine of yours runs them. Only with --isolation-level
+    /// [default: no].
+    #[arg(
+        long,
+        env = "TINFIRM_RUNNER_ISOLATION_HARDENED",
+        value_enum,
+        requires = "isolation_level"
+    )]
+    isolation_hardened: Option<HardenedChoice>,
     /// The most ready VMs that Tinfirm may ask this host to keep (--executor vm, ADR-0098):
     /// each is created, booted and probed before a run comes, which then starts in seconds,
-    /// and each costs while it waits. Tinfirm's admins set how many, never more than this; 0
-    /// turns the ready VMs off. They count against --max-concurrent-runs.
+    /// and each costs while it waits. Tinfirm's admins set how many, never more than this.
+    /// They count against --max-concurrent-runs. 0, the default, turns them off: every run
+    /// starts cold. Ready VMs are part of elastic runners (Pro and Enterprise): above 0, the
+    /// server refuses this host unless its licence holds them.
     #[arg(
         long,
         env = "TINFIRM_RUNNER_POOL_MAX_READY",
-        default_value_t = 4,
+        default_value_t = 0,
         value_parser = clap::value_parser!(u32).range(0..=1000)
     )]
     pool_max_ready: u32,
@@ -436,13 +664,13 @@ impl PoolRuntime {
 }
 
 impl VmArgs {
-    /// The VM executor's options and its pool's, with `--executor vm`.
+    /// The VM executor's options and its ready VMs', with `--executor vm`.
     fn options(
         &self,
     ) -> Result<
         Option<(
             tinfirm_runner_host::vm::VmOptions,
-            tinfirm_runner_host::pool::PoolOptions,
+            tinfirm_runner_host::ready_vms::ReadyVmOptions,
         )>,
     > {
         use tinfirm_runner_host::vm::{DriverCommand, VmOptions, parse_probe};
@@ -481,7 +709,16 @@ impl VmArgs {
                 .probe
                 .push(parse_probe(check).map_err(|e| anyhow::anyhow!("--vm-probe: {e}"))?);
         }
-        let pool = tinfirm_runner_host::pool::PoolOptions {
+        // A run pod must not reach the cluster's API server, which this pod reaches.
+        if matches!(
+            options.driver.builtin,
+            Some(tinfirm_runner_host::vm::Builtin::Pod { .. })
+        ) {
+            options
+                .probe
+                .extend(tinfirm_runner_host::kubernetes::probe());
+        }
+        let pool = tinfirm_runner_host::ready_vms::ReadyVmOptions {
             max_ready: self.pool_max_ready,
             headroom: self.pool_headroom,
             max_age: std::time::Duration::from_secs(self.pool_max_age * 60),
@@ -489,7 +726,6 @@ impl VmArgs {
             runtime: self.pool_runtime.runtime().unwrap_or(Runtime::ClaudeCode),
             multi_runtime: self.pool_runtime.runtime().is_none(),
             lead_time_max: std::time::Duration::from_secs(self.pool_lead_time_max * 60),
-            ..tinfirm_runner_host::pool::PoolOptions::default()
         };
         Ok(Some((options, pool)))
     }
@@ -571,6 +807,28 @@ enum AddCredential {
 }
 
 #[derive(Subcommand)]
+enum NodeCommand {
+    /// Write a new key (PKCS #8 DER, mode 0600) and its self-signed certificate (DER), and print
+    /// the certificate's SHA-256: the pin that the node agent's `clientSha256` names. Neither
+    /// file may exist.
+    Identity {
+        /// The certificate file to write.
+        #[arg(long)]
+        cert: PathBuf,
+        /// The key file to write.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Print the SHA-256 of a certificate (DER): its pin, as `nodeSha256` and `clientSha256`
+    /// name it.
+    Fingerprint {
+        /// The certificate file.
+        #[arg(long)]
+        cert: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum MirrorsCommand {
     /// List the mirrors: key, size, last use, last gc and repository.
     List,
@@ -620,17 +878,54 @@ enum RuntimeChoice {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // The reader confines itself before anything else happens in it: no logging, no runtime.
+    if let Command::Reader { job } = &cli.command {
+        return tinfirm_runner_host::reader::child_main(job);
+    }
+    // So does a front.
+    if let Command::Front { probe } = &cli.command {
+        return tinfirm_runner_host::front::child_main(probe.as_deref());
+    }
+    // A run pod's program writes its own lines, and its readiness probe runs every second.
+    if let Command::VmPod { step } = &cli.command {
+        use tinfirm_runner_host::kubernetes::vm_pod;
+        return match step {
+            None => in_runtime(async { Ok(vm_pod::run().await) }),
+            Some(VmPodStep::Ready) => exit_code(vm_pod::ready()),
+            Some(VmPodStep::TapSetup) => exit_code(vm_pod::tap_setup()),
+        };
+    }
     init_tracing(&cli.log);
     if matches!(cli.command, Command::Bridge) {
         return bridge();
     }
     if let Command::VmDriver { driver } = &cli.command {
-        let VmDriverCommand::Digitalocean { config } = driver;
-        let config = config.clone();
-        return in_runtime(async move {
-            tinfirm_runner_host::digitalocean::run(&config).await?;
-            Ok(0)
-        });
+        return match driver {
+            VmDriverCommand::Digitalocean { config } => {
+                let config = config.clone();
+                in_runtime(async move {
+                    tinfirm_runner_host::digitalocean::run(&config).await?;
+                    Ok(0)
+                })
+            }
+            VmDriverCommand::Node { config } => {
+                let config = config.clone();
+                in_runtime(async move {
+                    tinfirm_runner_host::node::run(&config).await?;
+                    Ok(0)
+                })
+            }
+            VmDriverCommand::Pod {
+                config,
+                kubernetes_api,
+            } => {
+                let (config, api) = (config.clone(), kubernetes_api.clone());
+                in_runtime(async move {
+                    tinfirm_runner_host::kubernetes::pod_driver::run(&config, &api).await?;
+                    Ok(0)
+                })
+            }
+        };
     }
     if let Command::VmBoot { user_data, bridge } = &cli.command {
         let (source, bridge) = (user_data.clone(), bridge.clone());
@@ -653,6 +948,11 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A program's exit code as the process's: 1 for one outside 0 to 255.
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
 /// Runs `task` to its end on a runtime of its own; its exit code, or 1 with its error.
@@ -746,7 +1046,11 @@ async fn dispatch(cli: Cli) -> Result<()> {
             no_cache,
             build_args,
         }) => build_images(&paths, runtime, no_cache, &build_args).await,
-        Command::Doctor => doctor(&paths).await,
+        Command::Doctor {
+            max_concurrent_runs,
+            sandbox,
+            vm,
+        } => doctor(&paths, max_concurrent_runs, &sandbox, &vm).await,
         Command::Mirrors(MirrorsCommand::List) => list_mirrors(&paths),
         Command::Mirrors(MirrorsCommand::Prune {
             older_than_days,
@@ -759,6 +1063,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             token_file,
             no_image_rebuild,
             upload_max_bytes,
+            push_client,
             sandbox,
             vm,
         } => {
@@ -770,14 +1075,30 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 login,
                 no_image_rebuild,
                 upload_max_bytes,
+                push_client.into(),
                 sandbox,
                 *vm,
             )
             .await
         }
         Command::Drain { no_wait } => drain(&paths, no_wait).await,
+        Command::Node(NodeCommand::Identity { cert, key }) => {
+            println!(
+                "{}",
+                tinfirm_runner_host::node::write_identity(&cert, &key)?
+            );
+            Ok(())
+        }
+        Command::Node(NodeCommand::Fingerprint { cert }) => {
+            println!("{}", tinfirm_runner_host::node::fingerprint(&cert)?);
+            Ok(())
+        }
         Command::Bridge => bail!("`bridge` runs in a sandbox, started by `run --sandbox-bridge`"),
-        Command::VmDriver { .. } | Command::VmBoot { .. } => {
+        Command::VmDriver { .. }
+        | Command::VmPod { .. }
+        | Command::VmBoot { .. }
+        | Command::Reader { .. }
+        | Command::Front { .. } => {
             unreachable!("handled before the dispatch")
         }
     }
@@ -1089,11 +1410,17 @@ async fn add_codex(paths: &Paths, label: &str, device_auth: bool, pool: u32) -> 
         }
     }
     let auth = codex_home.join("auth.json");
-    if !auth.exists() {
-        bail!(
+    match std::fs::symlink_metadata(&auth) {
+        Err(_) => bail!(
             "{} does not exist yet; the credential was not added",
             auth.display()
-        );
+        ),
+        // A sandbox of an earlier login may have left a link there: its mode is not changed.
+        Ok(meta) if !meta.is_file() => bail!(
+            "{} is not a regular file (a link?); remove it and add the credential again",
+            auth.display()
+        ),
+        Ok(_) => {}
     }
     std::fs::set_permissions(&auth, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let problems = credentials::check_codex_home(&codex_home);
@@ -1251,8 +1578,23 @@ impl Checks {
     }
 }
 
-async fn doctor(paths: &Paths) -> Result<()> {
+async fn doctor(
+    paths: &Paths,
+    max_concurrent_runs: u32,
+    sandbox_args: &SandboxArgs,
+    vm_args: &VmArgs,
+) -> Result<()> {
     let mut checks = Checks { failed: 0 };
+    let vm_host = vm_args.executor == ExecutorChoice::Vm;
+    let bridged = vm_host || sandbox_args.sandbox_bridge;
+    // The ceiling, as `run` refuses it for this executor.
+    match check_ceiling(max_concurrent_runs, vm_host) {
+        Ok(()) => checks.ok(
+            "max concurrent runs",
+            format!("{max_concurrent_runs} (the ceiling `run` would start with)"),
+        ),
+        Err(e) => checks.fail("max concurrent runs", format!("{e:#}")),
+    }
     // Directories.
     for (what, dir) in [
         ("config dir", &paths.config_dir),
@@ -1294,6 +1636,37 @@ async fn doctor(paths: &Paths) -> Result<()> {
         ),
         Err(e) => checks.warn("mirrors", format!("{e:#}")),
     }
+    // The runs that the next start of `run` takes back (ADR-0101), and those of them whose work
+    // is on this host and waits for the server before it is pushed (ADR-0116, decision 10).
+    match tinfirm_runner_host::takeback::Records::new(paths).census() {
+        (0, _) => checks.ok("runs to take back", "none"),
+        (runs, 0) => checks.info(
+            "runs to take back",
+            format!("{runs}; `run` takes them back when it starts"),
+        ),
+        (runs, waiting) => checks.warn(
+            "runs to take back",
+            format!(
+                "{runs}; {waiting} of them hold work that waits on this host for the server: `run` pushes it once the server has answered its hello"
+            ),
+        ),
+    }
+    // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1);
+    // then the front of each sandbox (path C, part 2), as `run` checks both at its start.
+    doctor_reader(
+        &mut checks,
+        paths,
+        bridged,
+        sandbox_args.allow_unconfined_reader,
+    )
+    .await;
+    doctor_front(
+        &mut checks,
+        paths,
+        bridged,
+        sandbox_args.allow_unconfined_reader,
+    )
+    .await;
     // git.
     match git::git_version().await {
         Some(v) => checks.ok("git", v),
@@ -1302,6 +1675,154 @@ async fn doctor(paths: &Paths) -> Result<()> {
             "not found on PATH (the host clones and pushes with git)",
         ),
     }
+    // With `--vm-driver node`, the hardening of its nodes, as the driver's `verify` said it.
+    let mut hardening = None;
+    if vm_host {
+        // A VM per run: the driver in Docker's place, and no Docker at all on this host.
+        hardening = doctor_vm(&mut checks, paths, max_concurrent_runs, vm_args).await;
+        checks.info(
+            "docker",
+            "not used: --executor vm creates a VM per run, and its images are the VM image's",
+        );
+    } else {
+        doctor_docker(&mut checks, paths).await;
+    }
+    // The level of isolation that `run` reports with these settings (ADR-0113): after the VM
+    // driver's check, whose `verify` says whether the nodes are hardened.
+    doctor_isolation(&mut checks, sandbox_args, vm_args, hardening.as_ref());
+    doctor_credentials(&mut checks, paths).await;
+    if checks.failed > 0 {
+        bail!("{} check(s) failed", checks.failed);
+    }
+    println!("All checks passed.");
+    Ok(())
+}
+
+/// With `--executor vm`: what `run --executor vm` checks at its start. The driver's options;
+/// with `--vm-driver node`, its configuration and client keys, with `--vm-driver pod` its
+/// configuration; then the driver's `hello` and a `verify` of the template, with room for
+/// `max_concurrent_runs` VMs, this host's own counted as at `run`'s start
+/// ([`tinfirm_runner_host::vm::Vms::check`]). With `--vm-driver node`, the hardening of its
+/// nodes too, each line that does not hold named; that hardening is returned for the
+/// isolation's check. `None` where the driver was not asked.
+async fn doctor_vm(
+    checks: &mut Checks,
+    paths: &Paths,
+    max_concurrent_runs: u32,
+    vm_args: &VmArgs,
+) -> Option<tinfirm_runner_host::vm::Hardening> {
+    let options = match vm_args.options() {
+        Ok(Some((options, _))) => options,
+        Ok(None) => return None,
+        Err(e) => {
+            checks.fail("vm driver", format!("{e:#}"));
+            return None;
+        }
+    };
+    let nodes = matches!(
+        options.driver.builtin,
+        Some(tinfirm_runner_host::vm::Builtin::Node { .. })
+    );
+    if let Some(tinfirm_runner_host::vm::Builtin::Pod { config }) = &options.driver.builtin {
+        match tinfirm_runner_host::kubernetes::config::PodConfig::load(config) {
+            Ok(loaded) => checks.ok(
+                "pod driver configuration",
+                format!(
+                    "{}: the runs' namespace {}, template(s) {}, tap {}",
+                    config.display(),
+                    loaded.namespace,
+                    loaded
+                        .templates
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    match loaded.tap.mode {
+                        tinfirm_runner_host::kubernetes::config::TapMode::Multus => "multus",
+                        tinfirm_runner_host::kubernetes::config::TapMode::Init => "init",
+                    }
+                ),
+            ),
+            Err(e) => {
+                checks.fail("pod driver configuration", format!("{e:#}"));
+                return None;
+            }
+        }
+    }
+    if let Some(tinfirm_runner_host::vm::Builtin::Node { config }) = &options.driver.builtin {
+        match tinfirm_runner_host::node::NodeConfig::load(config) {
+            Ok(loaded) => checks.ok(
+                "node driver configuration",
+                format!(
+                    "{}: {} node(s) ({}); every client key is this user's alone",
+                    config.display(),
+                    loaded.nodes.len(),
+                    loaded
+                        .nodes
+                        .iter()
+                        .map(|node| node.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
+            Err(e) => {
+                checks.fail("node driver configuration", format!("{e:#}"));
+                return None;
+            }
+        }
+    }
+    let template = options.template.clone();
+    let vms = tinfirm_runner_host::vm::Vms::new(options);
+    let (_, state) = tinfirm_runner_host::config::HostStateFile::load(paths);
+    let own = state.runner_host_id.map(|id| id.to_string());
+    match vms.check(max_concurrent_runs, own.as_deref()).await {
+        Ok((hello, verified, held)) => {
+            let room = match verified.max_vms {
+                Some(room) => format!(
+                    "room for {room} more VM(s) and {held} of this host's own, for --max-concurrent-runs {max_concurrent_runs}"
+                ),
+                None => "the driver names no limit".to_string(),
+            };
+            let checked = if verified.checked.is_empty() {
+                String::new()
+            } else {
+                format!("; checked: {}", verified.checked.join("; "))
+            };
+            checks.ok(
+                "vm driver",
+                format!(
+                    "`{}` {}; the template `{template}` keeps the contract of a sandbox VM; {room}{checked}",
+                    hello.driver,
+                    hello.version.as_deref().unwrap_or("(no version)"),
+                ),
+            );
+        }
+        Err(e) => checks.fail("vm driver", format!("{e:#}")),
+    }
+    let hardening = vms.hardening();
+    if nodes {
+        // A lower mark stops nothing (ADR-0113, decision 5): information, not a failure.
+        checks.info("node hardening", describe_hardening(&hardening, &template));
+    }
+    Some(hardening)
+}
+
+/// The node driver's hardening for `template`, in a sentence: `yes`, or `no` with each line
+/// that does not hold, as the driver named it (`node <name>: <line>: <what it found>`).
+fn describe_hardening(hardening: &tinfirm_runner_host::vm::Hardening, template: &str) -> String {
+    match hardening.hardened {
+        tinfirm_runner_host::vm::Mark::Yes => format!(
+            "yes: every node that offers the template `{template}` reports each line of the hardening as holding"
+        ),
+        tinfirm_runner_host::vm::Mark::No if hardening.not_hardened.is_empty() => "no".to_string(),
+        tinfirm_runner_host::vm::Mark::No => {
+            format!("no: {}", hardening.not_hardened.join("; "))
+        }
+    }
+}
+
+/// With the Docker executor: Docker, its runtimes and the runner images.
+async fn doctor_docker(checks: &mut Checks, paths: &Paths) {
     // Docker and images.
     let docker = match docker::connect() {
         Ok(d) => match d.version().await {
@@ -1465,7 +1986,10 @@ async fn doctor(paths: &Paths) -> Result<()> {
             );
         }
     }
-    // Credentials (presence and format only; no network calls).
+}
+
+/// The model credentials (presence and format only; no network call), and the server.
+async fn doctor_credentials(checks: &mut Checks, paths: &Paths) {
     let store = CredentialStore::new(paths);
     match store.list() {
         Ok(list) if list.is_empty() => {
@@ -1540,11 +2064,72 @@ async fn doctor(paths: &Paths) -> Result<()> {
             }
         }
     }
-    if checks.failed > 0 {
-        bail!("{} check(s) failed", checks.failed);
+}
+
+/// The level of isolation that `run` would report with these options and environment
+/// (`--executor`, `--sandbox-runtime`, `--vm-driver`, with `node` its configuration and the
+/// `hardening` its `verify` reported in [`doctor_vm`], and `--isolation-*`), and what an escape
+/// from a sandbox reaches on such a host (ADR-0112, decision 7).
+fn doctor_isolation(
+    checks: &mut Checks,
+    sandbox_args: &SandboxArgs,
+    vm_args: &VmArgs,
+    hardening: Option<&tinfirm_runner_host::vm::Hardening>,
+) {
+    let sandboxes = match vm_args.executor {
+        ExecutorChoice::Vm => match vm_args
+            .vm_driver
+            .as_deref()
+            .map(tinfirm_runner_host::vm::DriverCommand::parse)
+        {
+            Some(Ok(driver)) => Sandboxes::of_driver(&driver),
+            _ => Ok(Sandboxes::OwnDriverVms),
+        },
+        // Docker's runtime by its name, as `run` reads it; a name that `run` would refuse
+        // reads as runc here.
+        ExecutorChoice::Docker => Ok(Sandboxes::docker(
+            &SandboxSettings::new(sandbox_args.sandbox_runtime.clone(), false, Vec::new())
+                .unwrap_or_default(),
+        )),
+    };
+    let sandboxes = match sandboxes {
+        // Only the node driver's mark is read; `no` where its `verify` was not asked.
+        Ok(sandboxes) => match hardening {
+            Some(hardening) => sandboxes.hardened(hardening.hardened),
+            None => sandboxes,
+        },
+        Err(e) => {
+            checks.fail("isolation", e);
+            return;
+        }
+    };
+    let stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);
+    match isolation::derive(sandboxes, stated) {
+        Ok(reported) => {
+            let escape = isolation::what_an_escape_reaches(sandboxes, &reported);
+            // Why the node driver's host is not hardened: each line that does not hold.
+            let why = match (sandboxes, hardening) {
+                (Sandboxes::Nodes(_, tinfirm_runner_host::vm::Mark::No), Some(hardening))
+                    if !hardening.not_hardened.is_empty() =>
+                {
+                    format!(" Not hardened: {}.", hardening.not_hardened.join("; "))
+                }
+                _ => String::new(),
+            };
+            let detail = format!(
+                "reports {} (as `run` with these options and this environment).{why} {escape}",
+                isolation::describe(&reported)
+            );
+            // A VM host of a driver of your own, shown as a container host until you state its
+            // level.
+            if isolation::unstated(sandboxes, &reported) {
+                checks.warn("isolation", detail);
+            } else {
+                checks.info("isolation", detail);
+            }
+        }
+        Err(e) => checks.fail("isolation", e),
     }
-    println!("All checks passed.");
-    Ok(())
 }
 
 /// `2026-09-26 10:00 UTC`, or `fallback`.
@@ -1794,16 +2379,20 @@ async fn run(
     login: Option<(String, PathBuf)>,
     no_image_rebuild: bool,
     upload_max_bytes: u64,
+    push_client: tinfirm_runner_host::git_push::PushClient,
     sandbox_args: SandboxArgs,
     vm_args: VmArgs,
 ) -> Result<()> {
-    // First: a forbidden combination is refused before anything else happens.
-    let vm_options = vm_args.options()?;
-    if vm_options.is_none() && max_concurrent_runs > MAX_CAPACITY {
-        bail!(
-            "--max-concurrent-runs is at most {MAX_CAPACITY} with Docker: the machine runs every sandbox; more need --executor vm, a VM per run"
+    // No other process of this user reads this one's memory, where it holds the tokens
+    // (ADR-0112, open question 1).
+    if let Err(e) = tinfirm_runner_host::confine::protect_host_process() {
+        tracing::warn!(
+            "this host's memory can be read by any process of its user ({e}): the tokens it holds are no better protected than its files"
         );
     }
+    // First: a forbidden combination is refused before anything else happens.
+    let vm_options = vm_args.options()?;
+    check_ceiling(max_concurrent_runs, vm_options.is_some())?;
     let sandbox_env = parse_entries(
         "--sandbox-env",
         &sandbox_args.sandbox_env,
@@ -1822,6 +2411,14 @@ async fn run(
             sandbox_env,
         )?
     };
+    // The level of isolation (ADR-0113): a statement never overrides what the host sees.
+    let sandboxes = match &vm_options {
+        Some((options, _)) => Sandboxes::of_driver(&options.driver).map_err(anyhow::Error::msg)?,
+        None => Sandboxes::docker(&settings),
+    };
+    let isolation_stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);
+    // Refused here, before any check: a statement where the host derives its own level.
+    isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
     // A VM's firewall lets nothing out: the egress proxy is its only way to the network.
     let egress_on = sandbox_args.egress_proxy || vm_options.is_some();
     // `--egress-allow-private` lets the model proxy, which is always on, reach a gateway inside
@@ -1867,6 +2464,13 @@ async fn run(
     }
     secure_fs::ensure_private_dir(&paths.data_dir)?;
     secure_fs::ensure_private_dir(&paths.config_dir)?;
+    // The reader of what the sandboxes send back and a probe of their front, before any image
+    // is built: a host that cannot confine either is refused at once.
+    let reader = if sandbox_args.sandbox_bridge || vm_options.is_some() {
+        Some(check_reader_and_front(paths, sandbox_args.allow_unconfined_reader).await?)
+    } else {
+        None
+    };
     // One `run` per config: two would replace each other's connection (4409) forever.
     let Some(mut lock) = run_lock(paths, true)? else {
         bail!(
@@ -1903,6 +2507,7 @@ async fn run(
                 max_concurrent_runs,
                 no_image_rebuild,
                 sandbox_args.sandbox_bridge,
+                sandbox_args.sandbox_bridge_ports,
                 &settings,
                 &egress,
                 &mut signals,
@@ -1915,6 +2520,10 @@ async fn run(
         }
     };
     let (mut opts, endpoint) = started;
+    if let Some(bridge) = opts.bridge.as_mut() {
+        bridge.reader = reader.context("a host with the bridge has a reader")?;
+        bridge.front = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
+    }
     opts.egress = egress;
     // The model proxy is always on: a setup where its listeners could never serve a sandbox is
     // refused now, rather than every run with a model gateway later.
@@ -1932,7 +2541,19 @@ async fn run(
     opts.model_proxy = model_proxy;
     opts.max_concurrent_runs = max_concurrent_runs;
     opts.upload_max_bytes = upload_max_bytes;
+    opts.push_client = push_client;
+    if push_client == tinfirm_runner_host::git_push::PushClient::Host {
+        tracing::warn!(
+            "--push-client host: the runner host's own receive-pack client pushes the runs' work, and the git tokens stay out of git's process tree. It has been checked against no code host yet (GitHub, GitLab, Gitea, Azure DevOps); without the option, `git push` pushes"
+        );
+    }
     opts.sandbox = settings;
+    opts.isolation_stated = isolation_stated;
+    // What the host reports, as `Host::new` derives it: with the node driver, with the
+    // hardening its nodes reported in the start's `verify`.
+    let sandboxes = Sandboxes::of(&opts.executor, &opts.sandbox).map_err(anyhow::Error::msg)?;
+    let reported = isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
+    log_isolation(sandboxes, &reported, cfg.protocol_version);
     let host = Shared::new(opts, cfg);
     host.warn_operator_public_suffix_wildcards();
     let shutdown = CancellationToken::new();
@@ -1940,6 +2561,255 @@ async fn run(
     let result = host::serve(host, shutdown).await;
     lock.hold_until_exit();
     result
+}
+
+/// The host's ceiling for its executor, as `run` and `doctor` both check it: at most
+/// [`MAX_CAPACITY`] with Docker, whose machine runs every sandbox; up to the flag's own limit
+/// with a VM per run (`vm`).
+fn check_ceiling(max_concurrent_runs: u32, vm: bool) -> Result<()> {
+    if !vm && max_concurrent_runs > MAX_CAPACITY {
+        bail!(
+            "--max-concurrent-runs is at most {MAX_CAPACITY} with Docker: the machine runs every sandbox; more need --executor vm, a VM per run"
+        );
+    }
+    Ok(())
+}
+
+/// The reader of what the sandboxes send back (ADR-0112, open question 1) and the front process
+/// of each sandbox (path C, part 2): this binary, confined. A reader's probe confines itself as
+/// a reader does and tries to open this host's directories, its own memory and a socket; a
+/// front's probe confines itself as a front does and tries those and to reach this process and
+/// to start a program ([`probe_front`]). Where either cannot be confined, every host that uses
+/// the bridge (`--sandbox-bridge`, `--executor vm`) is refused unless `allow`
+/// (`--allow-unconfined-reader`, whose one policy covers both); with it, a warning says what
+/// is given up.
+async fn check_reader_and_front(
+    paths: &Paths,
+    allow: bool,
+) -> Result<tinfirm_runner_host::reader::Reader> {
+    let reader = tinfirm_runner_host::reader::Reader::from_current_exe()?;
+    let reader_probe = probe_reader(paths, &reader).await?;
+    let front_probe = probe_front(paths)
+        .await
+        .context("the probe of a sandbox's front failed")?;
+    let mut cannot = Vec::new();
+    let mut cost = Vec::new();
+    if reader_probe.confined() {
+        tracing::info!(
+            reader = %reader_probe.describe(),
+            "the reader of what sandboxes send back is confined: archives and git bundles are parsed in a process per reading that holds no credential"
+        );
+    } else {
+        cannot.push(format!(
+            "the reader of what sandboxes send back ({})",
+            reader_probe.describe()
+        ));
+        cost.push(format!(
+            "the reader's confinement: {UNCONFINED_READER_COST}"
+        ));
+    }
+    if front_probe.confined() {
+        tracing::info!(
+            front = %front_probe.describe(),
+            "the front process of a sandbox is confined: each sandbox's bridge and the HTTP to its proxies are parsed in a process of its own that holds no credential"
+        );
+    } else {
+        cannot.push(format!(
+            "the front process of a sandbox ({})",
+            front_probe.describe()
+        ));
+        cost.push(format!("the fronts' confinement: {UNCONFINED_FRONT_COST}"));
+    }
+    if cannot.is_empty() {
+        return Ok(reader);
+    }
+    let cannot = format!("this system cannot confine {}", cannot.join(" nor "));
+    let cost = cost.join("; and ");
+    if !allow {
+        bail!(
+            "{cannot}. A host that runs its sandboxes over the bridge (--sandbox-bridge, --executor vm) refuses to start here: run it on Linux 5.19 or later with Landlock enabled at boot. --allow-unconfined-reader (TINFIRM_RUNNER_ALLOW_UNCONFINED_READER) starts it anyway and gives up {cost}"
+        );
+    }
+    tracing::warn!("{cannot}. --allow-unconfined-reader accepts this and gives up {cost}");
+    Ok(reader.allowing_unconfined(!reader_probe.confined()))
+}
+
+/// What `--allow-unconfined-reader` gives up, for the refusal, the warning and `doctor`.
+const UNCONFINED_READER_COST: &str = "the reader still runs as a process of its own without a token, but a flaw in its reading of a sandbox's archive or git bundle reaches every file of this host's user, the host's token and stored credentials among them, and can end `run` and its runs with a signal; where seccomp is missing too, it reaches the network as well";
+
+/// What `--allow-unconfined-reader` gives up of the fronts, for the refusal, the warning and
+/// `doctor`. With seccomp alone, a front still makes no socket, starts no program and signals
+/// nothing outside its own process group.
+const UNCONFINED_FRONT_COST: &str = "each front still runs as a process of its own that holds no credential, but a flaw in its parsing of its sandbox's bridge (the TLS, the frames, the tunnels) or of the HTTP to the sandbox's proxies reaches every file of this host's user, the host's token and stored credentials among them; where seccomp is missing too, it also reaches the network, starts programs and can end `run` and its runs with a signal";
+
+/// A reader's probe, with this host's directories and its memory to be refused.
+async fn probe_reader(
+    paths: &Paths,
+    reader: &tinfirm_runner_host::reader::Reader,
+) -> Result<tinfirm_runner_host::reader::Probe> {
+    let deny = vec![
+        paths.config_dir.clone(),
+        paths.data_dir.clone(),
+        PathBuf::from(format!("/proc/{}/mem", std::process::id())),
+    ];
+    let reader = reader.clone();
+    tokio::task::spawn_blocking(move || {
+        reader.probe(&deny, None, std::time::Duration::from_secs(30))
+    })
+    .await
+    .context("the reader's probe did not end")?
+    .context("the reader's probe failed")
+}
+
+/// A front's probe (ADR-0112, path C, part 2), started as `run` starts a front: it confines
+/// itself as a front does and tries to open this host's directories and memory, to make a
+/// socket, to reach this process and to start a program.
+async fn probe_front(paths: &Paths) -> Result<tinfirm_runner_host::front::Probe> {
+    let job = tinfirm_runner_host::front::ProbeJob {
+        deny_read: vec![
+            paths.config_dir.clone(),
+            paths.data_dir.clone(),
+            PathBuf::from(format!("/proc/{}/mem", std::process::id())),
+        ],
+        signal: vec![std::process::id()],
+        linger: false,
+        inside: None,
+    };
+    let binary = std::env::current_exe().context("cannot find this executable")?;
+    tokio::task::spawn_blocking(move || {
+        tinfirm_runner_host::front::probe(&binary, &job, std::time::Duration::from_secs(30))
+    })
+    .await
+    .context("the front's probe did not end")?
+}
+
+/// What `doctor` says of the front process of a sandbox (ADR-0112, path C, part 2), which `run`
+/// starts for each sandbox with --sandbox-bridge or --executor vm: its wire to `run`, and its
+/// probe ([`probe_front`]) with the outcome `run` gives it at its start
+/// ([`check_reader_and_front`]).
+async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool, allow: bool) {
+    const USED: &str = "`run` starts one per sandbox, for its bridge and the HTTP of its git proxy, platform tools, model and egress proxies, with --sandbox-bridge or --executor vm";
+    // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed.
+    let wire = async {
+        let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
+        let front =
+            tinfirm_runner_host::front::handle::FrontHandle::spawn(&command, uuid::Uuid::new_v4())
+                .await?;
+        front.ping().await?;
+        front.check_descriptor().await?;
+        anyhow::Ok(())
+    }
+    .await;
+    // With the bridge, a front that cannot start is a run that cannot start: its sandbox's
+    // bridge and proxies are served by it. Without it, `run` starts no front.
+    match wire {
+        Ok(()) => checks.ok("front wire", "ready, a round trip, a descriptor passed"),
+        Err(e) if bridged => checks.fail(
+            "front wire",
+            format!("{e:#} (no run can start: each sandbox's bridge and proxies are served by its front)"),
+        ),
+        Err(e) => checks.info(
+            "front wire",
+            format!("{e:#} (only used with --sandbox-bridge or --executor vm)"),
+        ),
+    }
+    match probe_front(paths).await {
+        Ok(probe) if probe.confined() => {
+            checks.ok("front", format!("confined: {} ({USED})", probe.describe()))
+        }
+        Ok(probe) => {
+            let detail = format!("cannot be confined here: {}", probe.describe());
+            if bridged && !allow {
+                checks.fail(
+                    "front",
+                    format!(
+                        "{detail}. `run` with --sandbox-bridge or --executor vm refuses to start without --allow-unconfined-reader, which gives up the fronts' confinement: {UNCONFINED_FRONT_COST}"
+                    ),
+                );
+            } else if bridged {
+                checks.warn(
+                    "front",
+                    format!(
+                        "{detail}. --allow-unconfined-reader accepts this: {UNCONFINED_FRONT_COST}"
+                    ),
+                );
+            } else {
+                checks.info("front", format!("{detail} ({USED})"));
+            }
+        }
+        Err(e) if bridged => checks.fail("front", format!("{e:#} ({USED})")),
+        Err(e) => checks.info("front", format!("{e:#} ({USED})")),
+    }
+}
+
+/// What `doctor` says of the reader (ADR-0112, open question 1) and of this process's memory.
+async fn doctor_reader(checks: &mut Checks, paths: &Paths, bridged: bool, allow: bool) {
+    match tinfirm_runner_host::confine::protect_host_process() {
+        Ok(()) => checks.ok(
+            "host memory",
+            "`run` makes itself not dumpable: no other process of its user reads its memory",
+        ),
+        Err(e) => checks.warn(
+            "host memory",
+            format!("any process of this host's user can read `run`'s memory: {e}"),
+        ),
+    }
+    let probe = match tinfirm_runner_host::reader::Reader::from_current_exe() {
+        Ok(reader) => probe_reader(paths, &reader).await,
+        Err(e) => Err(e),
+    };
+    match probe {
+        Ok(probe) if probe.confined() => checks.ok(
+            "reader",
+            format!(
+                "confined: {} (the sandboxes' archives and git bundles are read in a process per reading with no credential)",
+                probe.describe()
+            ),
+        ),
+        Ok(probe) => {
+            let detail = format!("cannot be confined here: {}", probe.describe());
+            if bridged && !allow {
+                checks.fail(
+                    "reader",
+                    format!(
+                        "{detail}. `run` with --sandbox-bridge or --executor vm refuses to start without --allow-unconfined-reader, which gives up the reader's confinement: {UNCONFINED_READER_COST}"
+                    ),
+                );
+            } else if bridged {
+                checks.warn(
+                    "reader",
+                    format!(
+                        "{detail}. --allow-unconfined-reader accepts this: {UNCONFINED_READER_COST}"
+                    ),
+                );
+            } else {
+                checks.info(
+                    "reader",
+                    format!("{detail} (only used with --sandbox-bridge or --executor vm)"),
+                );
+            }
+        }
+        Err(e) if bridged => checks.fail("reader", format!("{e:#}")),
+        Err(e) => checks.warn("reader", format!("{e:#}")),
+    }
+}
+
+/// The level of isolation the host reports, and what an escape from a sandbox reaches on a
+/// host of that level (ADR-0112, decision 7; ADR-0113).
+fn log_isolation(sandboxes: Sandboxes, reported: &isolation::Reported, protocol_version: u32) {
+    let escape = isolation::what_an_escape_reaches(sandboxes, reported);
+    if protocol_version < tinfirm_protocol::PROTOCOL_VERSION_V2 {
+        tracing::info!(
+            isolation = "container",
+            "runner protocol 1 reports `container`, whatever the host (protocol 2 reports its level). {escape}"
+        );
+    } else if isolation::unstated(sandboxes, reported) {
+        // A VM host of a driver of your own, shown as a container host until you state its
+        // level.
+        tracing::warn!(isolation = %isolation::describe(reported), "{escape}");
+    } else {
+        tracing::info!(isolation = %isolation::describe(reported), "{escape}");
+    }
 }
 
 /// The host's options and its sandboxes' endpoint with this machine's Docker: Docker and its
@@ -1953,6 +2823,7 @@ async fn docker_executor(
     max_concurrent_runs: u32,
     no_image_rebuild: bool,
     sandbox_bridge: bool,
+    sandbox_bridge_ports: Option<(u16, u16)>,
     settings: &SandboxSettings,
     egress: &Option<EgressSettings>,
     signals: &mut Signals,
@@ -1972,7 +2843,9 @@ async fn docker_executor(
         let arch = info.architecture.unwrap_or_default();
         tinfirm_runner_host::bridge::check_static_linux(&binary, &arch)
             .context("--sandbox-bridge needs a bridge binary that runs in the sandboxes")?;
-        Some(BridgeOptions::new(binary))
+        let mut bridge = BridgeOptions::new(binary);
+        bridge.ports = sandbox_bridge_ports;
+        Some(bridge)
     } else {
         None
     };
@@ -1982,7 +2855,7 @@ async fn docker_executor(
         max_concurrent_runs,
         executor = "docker",
         sandbox_runtime = %runtime,
-        isolation_tier = settings.tier().as_str(),
+        sandbox_family = settings.family().as_str(),
         sandbox_docker = settings.docker,
         sandbox_bridge = bridge.is_some(),
         sandbox_env = ?settings.env_keys(),
@@ -2046,7 +2919,7 @@ async fn docker_executor(
 async fn vm_executor(
     paths: &Paths,
     options: tinfirm_runner_host::vm::VmOptions,
-    pool: tinfirm_runner_host::pool::PoolOptions,
+    pool: tinfirm_runner_host::ready_vms::ReadyVmOptions,
     cfg: &HostConfig,
     max_concurrent_runs: u32,
     settings: &SandboxSettings,
@@ -2060,8 +2933,11 @@ async fn vm_executor(
     let refuse_other_images =
         options.image_version == tinfirm_runner_host::vm::ImageVersion::Refuse;
     let vms = tinfirm_runner_host::vm::Vms::new(options);
-    let (hello, verified) = vms
-        .check(max_concurrent_runs)
+    // The VMs this host already holds count as its own room (a restart with runs to take back).
+    let (_, state) = tinfirm_runner_host::config::HostStateFile::load(paths);
+    let own = state.runner_host_id.map(|id| id.to_string());
+    let (hello, verified, own_vms) = vms
+        .check(max_concurrent_runs, own.as_deref())
         .await
         .context("--executor vm: the VM driver's checks failed")?;
     tracing::info!(
@@ -2076,10 +2952,13 @@ async fn vm_executor(
         vm_driver_version = hello.version.as_deref().unwrap_or("-"),
         vm_template = %template,
         vm_limit = ?verified.max_vms,
+        vm_own = own_vms,
         pool_max_ready = pool.max_ready,
         pool_runtime = if pool.multi_runtime { "any" } else { pool.runtime.as_str() },
         vm_checked = ?verified.checked,
-        isolation_tier = settings.tier().as_str(),
+        vm_hardened = verified.hardened.map_or("-", |mark| mark.as_str()),
+        vm_not_hardened = ?verified.not_hardened,
+        sandbox_family = settings.family().as_str(),
         sandbox_docker = settings.docker,
         sandbox_env = ?settings.env_keys(),
         "runner host starting"
@@ -2097,7 +2976,7 @@ async fn vm_executor(
     let mut bridge = BridgeOptions::new(BridgeOptions::binary_from_env()?);
     bridge.connect_timeout = start_timeout;
     opts.bridge = Some(bridge);
-    opts.pool = pool;
+    opts.ready_vms = pool;
     let endpoint = tinfirm_runner_host::git_proxy::endpoint(
         &opts.executor,
         opts.sandbox_network.as_deref(),
@@ -2322,4 +3201,110 @@ fn read_pid(path: &std::path::Path) -> Option<u32> {
         .parse::<u32>()
         .ok()
         .filter(|pid| *pid > 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tinfirm_runner_host::kubernetes::{config, spec};
+
+    /// The pod driver's configuration that the chart renders for its CI values.
+    const POD_CONFIG: &str =
+        include_str!("../../../../deploy/helm/tinfirm/ci/expected/pod-driver.json");
+
+    /// Each command line that a run pod's specification gives this binary, without the binary.
+    fn command_lines(config: &config::PodConfig) -> Vec<Vec<String>> {
+        let id = spec::VmId::random();
+        let labels = std::collections::BTreeMap::from([(
+            tinfirm_runner_host::vm::HOST_LABEL.to_string(),
+            "host-1".to_string(),
+        )]);
+        let pod = spec::pod(config, "sandbox-4c8g", &id, &labels, "worker-1").unwrap();
+        let mut lines = Vec::new();
+        for kind in ["containers", "initContainers"] {
+            for container in pod["spec"][kind].as_array().into_iter().flatten() {
+                lines.push(container["command"].clone());
+                if let Some(probe) = container["readinessProbe"]["exec"].get("command") {
+                    lines.push(probe.clone());
+                }
+            }
+        }
+        lines
+            .into_iter()
+            .map(|line| serde_json::from_value::<Vec<String>>(line).unwrap())
+            .inspect(|line| assert_eq!(line[0], spec::vm_pod::BINARY, "{line:?}"))
+            .collect()
+    }
+
+    /// What this binary's parser makes of a command line: the step of `vm-pod` it names.
+    fn vm_pod_step(line: &[String]) -> Option<&'static str> {
+        match Cli::try_parse_from(line).map(|cli| cli.command) {
+            Ok(Command::VmPod { step: None }) => Some("vm-pod"),
+            Ok(Command::VmPod {
+                step: Some(VmPodStep::Ready),
+            }) => Some("ready"),
+            Ok(Command::VmPod {
+                step: Some(VmPodStep::TapSetup),
+            }) => Some("tap-setup"),
+            Ok(_) => None,
+            Err(e) => panic!("{line:?}: {e}"),
+        }
+    }
+
+    #[test]
+    fn the_run_pods_command_lines_are_this_binarys_vm_pod_steps() {
+        let multus = config::PodConfig::from_json(POD_CONFIG).unwrap();
+        let steps: Vec<_> = command_lines(&multus)
+            .iter()
+            .map(|line| vm_pod_step(line))
+            .collect();
+        assert_eq!(steps, [Some("vm-pod"), Some("ready")]);
+        let mut value: serde_json::Value = serde_json::from_str(POD_CONFIG).unwrap();
+        value["tap"] = serde_json::json!({"mode": "init", "cidr": "172.30.0.0/30"});
+        let init = config::PodConfig::from_json(&value.to_string()).unwrap();
+        let steps: Vec<_> = command_lines(&init)
+            .iter()
+            .map(|line| vm_pod_step(line))
+            .collect();
+        assert_eq!(steps, [Some("vm-pod"), Some("ready"), Some("tap-setup")]);
+        // A step the pod does not name is refused, not taken as the VM's run.
+        assert!(Cli::try_parse_from([spec::vm_pod::BINARY, "vm-pod", "start"]).is_err());
+    }
+
+    #[test]
+    fn the_pod_driver_is_a_subcommand_with_the_charts_paths() {
+        let cli = Cli::try_parse_from(["tinfirm-runner-host", "vm-driver", "pod"]).unwrap();
+        let Command::VmDriver {
+            driver:
+                VmDriverCommand::Pod {
+                    config,
+                    kubernetes_api,
+                },
+        } = cli.command
+        else {
+            panic!("not the pod driver");
+        };
+        // The defaults, unless the environment of this test names others.
+        if std::env::var_os(tinfirm_runner_host::kubernetes::CONFIG_ENV).is_none() {
+            assert_eq!(
+                config,
+                PathBuf::from("/etc/tinfirm/pod-driver/pod-driver.json")
+            );
+        }
+        if std::env::var_os("TINFIRM_KUBERNETES_API_DIR").is_none() {
+            assert_eq!(kubernetes_api, PathBuf::from("/etc/tinfirm/kubernetes-api"));
+        }
+        // The command line that `--vm-driver pod` starts.
+        let driver = tinfirm_runner_host::vm::DriverCommand::parse("pod").unwrap();
+        let line: Vec<String> = std::iter::once("tinfirm-runner-host".to_string())
+            .chain(driver.args.iter().cloned())
+            .collect();
+        let cli = Cli::try_parse_from(&line).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::VmDriver {
+                driver: VmDriverCommand::Pod { .. }
+            }
+        ));
+    }
 }

@@ -108,6 +108,39 @@ For agents that only read, narrow the scopes at the provider and on the app: `re
 
 A Jira Cloud sign-in must include the system's site: Atlassian asks which sites to allow. Jira and GitHub offer Tinfirm no way to revoke a grant. When you remove a credential there, or a member disconnects their account, revoke the grant at the provider too. On GitLab, Tinfirm revokes it for you.
 
+## Set up the GitHub App
+
+A GitHub system can hold one GitHub App: your company's own, registered at GitHub by you. Each installation of the App becomes a credential, and every agent run that acts through it gets a token of its own: only for the run's repositories, only to read and write code and pull requests, and valid for one hour. Tinfirm renews it while the run works and checks, each time, that the conversation may still use the credential. A stolen copy of such a token is worth an hour of the run's repositories, never your other repositories, and never your workflows.
+
+Before you start, ask your operator to upgrade the runner hosts: a run on an App's installation runs only on a host that can renew its tokens. Until one is connected, it waits with *No host for its GitHub App*. The App's section counts the hosts that cannot yet.
+
+1. At GitHub, in your organisation's **Settings**, **Developer settings**, **GitHub Apps**, choose **New GitHub App**. Give it a name, any homepage URL, and turn **Webhook** off.
+2. Under **Repository permissions** give it:
+
+    | Permission | Access |
+    |---|---|
+    | Contents | Read and write |
+    | Pull requests | Read and write |
+    | Metadata | Read-only |
+    | Issues | Read and write, when agents use the system's issue tools |
+    | Workflows | **No access** |
+
+    Never give it Workflows: Tinfirm never asks for it, so an agent cannot change your CI.
+3. Create the App, note its **App ID**, and under **Private keys** choose **Generate a private key**. GitHub downloads a `.pem` file.
+4. **Install App** on your organisation, with all repositories or the ones agents work in.
+5. In Tinfirm, on the GitHub system's page, under **GitHub App**, choose **Set up the App**, enter the App ID, paste the whole `.pem` file, and choose **Check and save**. Tinfirm asks GitHub for the App with the key. The key goes to the vault; nobody sees it again.
+6. Under **Credentials**, choose **Add credential**, then **GitHub App installation**, and pick the installation. Lend the new credential to groups or service accounts like any other.
+
+To rotate the key, generate a new one at GitHub, choose **Replace the key** and paste it, then delete the old key at GitHub. To remove the App, or to set another App in its place, remove its installations' credentials first: each one stands for an installation of the App it was added for, so Tinfirm refuses another App ID while one remains. If the App is replaced while you add an installation, Tinfirm does not add it: pick the installation again from the new App's list.
+
+A revoked run loses the App's token on its runner host at once, but the token itself stays valid at GitHub until its hour ends: Tinfirm keeps no run's token, and does not ask GitHub to revoke it.
+
+A repository on another GitHub account, or one the installation does not include, cannot be worked on through it: the turn ends with a message that names the repository. Install the App there, and retry.
+
+GitHub Enterprise Server works the same way, with the system's address `https://<your host>/api/v3`. That setup has not yet been tested against a real GitHub Enterprise Server.
+
+Members who connect their own GitHub accounts keep doing so: their tokens are not shortened, but a running turn still loses its access when their account can no longer be used ([Revoked git access](#revoked-git-access)).
+
 ## Test a system
 
 **Test** reaches the system and says as whom. It uses, in this order:
@@ -135,7 +168,7 @@ A credential is the company's token or sign-in on a system. A system can hold an
 
 1. On the system's **Overview**, under **Credentials**, choose **Add credential**. The dialog is **Add a credential to** the system's name, such as **Add a credential to GitHub**.
 2. **Name**: what it is for, as the system's page and the trigger editor name it. 1 to 100 characters, unique on the system, ignoring case.
-3. **How**: **Paste a token**, or **Sign in to GitHub** (or the system's name) where its Sign-in app is set up. Git takes tokens only. Jira Cloud also takes **Service account (OAuth 2.0)** ([below](#add-a-jira-cloud-service-account)).
+3. **How**: **Paste a token**, or **Sign in to GitHub** (or the system's name) where its Sign-in app is set up. Git takes tokens only. Jira Cloud also takes **Service account (OAuth 2.0)** ([below](#add-a-jira-cloud-service-account)). GitHub, once its GitHub App is set up, also takes **GitHub App installation** ([below](#set-up-the-github-app)).
 4. With a token, paste it under **Token** and choose **Check and add**. Tinfirm checks it with the system and keeps it in the vault: nobody sees it again. With a sign-in, choose the sign-in button, sign in at the system as the user the credential should be, and come back. The page says: *The credential is connected. Lend it to a group or a service account.*
 
 A new credential is lent to nobody. Lend it next ([Lend a credential](#lend-a-credential)).
@@ -171,7 +204,7 @@ Its **⋯** menu:
 
 - **Store a new token…** or **Sign in again…** keeps its name, its id and what it is lent to, so the triggers and conversations that act with it go on. To rotate a token, create the new one at the system, store it here, then revoke the old one at the system.
 - **Rename…** keeps its grants, lendings and triggers.
-- **Disable** stops every use of it, by groups and service accounts, at its next check, until you **Enable** it. Conversations that act with it wait for an admin and go on once you enable it. Triggers that act with it pause, and stay paused until their author or an admin resumes them.
+- **Disable** stops every use of it, by groups and service accounts, at its next check, until you **Enable** it. Conversations that act with it wait for an admin and go on once you enable it. Triggers that act with it pause, and stay paused until their author or an admin resumes them. A turn running now with it loses its git access at once: its next fetch fails, and Tinfirm does not push its repositories on that system when it ends (see [Revoked git access](#revoked-git-access)).
 - **Remove…** removes its grants, then its lendings to service accounts (their triggers that act with it pause until their authors name another account), then the credential and its token. A sign-in is revoked at the system where the system allows that. Conversations that act with it stop at their next use of it.
 
 **Credentials** also counts the members who connect their own account on the system, for example *3 members connect their own account on GitHub (1 needs signing in again).* Their accounts are theirs: you see whether they hold one and its state on [Members](members.md), never the login or the token.
@@ -251,6 +284,29 @@ Tinfirm reads Jira, GitHub and GitLab for the triggers that watch them. Each rea
 - **Triggers**, **How it is read**, lists each read, such as *With the credential CI bot* or *With Alex Rivera's own account*, with its state (**Read**, **Idle: no active trigger**, **Waiting**), **Last read**, the requests left of the system's rate limit, and its last error.
 
 When less than a tenth of the system's rate limit is left, Tinfirm reads it half as often. When the system refuses the account, the account turns **Sign in again** or **Store a new token**, and the read waits until it works again. When the system answers that one project or repository is forbidden or not found, only the triggers that watch it wait; the others are read. On a rate limit, Tinfirm backs off until the limit resets, at most an hour. When the system cannot be reached, it backs off up to 30 minutes, and after an hour of failures its triggers wait. Changes are not lost while a read waits: they are read later. A system takes at most 100 live triggers.
+
+## Revoked git access
+
+When the account a running turn cloned a repository with can no longer be used, Tinfirm tells the turn's runner host to drop that repository's git token at once. This happens when:
+
+- a credential is disabled, removed, or needs a new token or sign-in;
+- a grant or a lending is withdrawn, or the person leaves the grant's group;
+- a member's own account is disconnected or needs signing in again;
+- an account's holder is suspended or leaves;
+- the system is paused or removed;
+- a trigger's service account borrows another credential on the system.
+
+The agent's next fetch from that repository fails, and Tinfirm does not push it when the turn ends. A turn with unpushed commits there ends failed; its run page shows **Git access revoked** on the repository with the reason, and the commits stay only on the runner host, if its operator keeps failed workspaces. The turn's other repositories go on as usual. Under the reason, the run page says whether the runner host has heard: "The runner host dropped the token." once the host confirms it, that it was sent and not confirmed yet, that the host is told when it reconnects, or that the host is too old to drop a token. The audit log records each revocation as `run.git_revoked`, and the host's confirmation as `run.git_revoke_confirmed`.
+
+What a revocation does not stop:
+
+- a fetch or push already under way;
+- what the agent's sandbox has already cloned or read;
+- the token itself at the code host. Tinfirm cannot rotate a member's personal access token: when it may have been copied, rotate it at GitHub or GitLab. A GitHub App's token stays valid at GitHub until its hour ends.
+
+When the runner host is not connected, it is told when it reconnects, before it can push the turn's work, and the run page says so until then. This holds also for a turn that ended, or was lost, while the host was away: a host that comes back with such a turn is told before it is told to cancel it.
+
+A runner host of an older release cannot drop a token. Its turns keep their access until they end, the conversation says so, and the run page says that the host cannot drop a token. Ask your operator to upgrade the runner hosts.
 
 ## The three switches
 

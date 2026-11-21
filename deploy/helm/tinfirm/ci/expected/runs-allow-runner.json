@@ -1,0 +1,36 @@
+{
+  "ingress": [
+    {
+      "from": [
+        {
+          "namespaceSelector": {
+            "matchLabels": {
+              "kubernetes.io/metadata.name": "tinfirm"
+            }
+          },
+          "podSelector": {
+            "matchLabels": {
+              "app.kubernetes.io/component": "runner",
+              "app.kubernetes.io/instance": "tinfirm",
+              "app.kubernetes.io/name": "tinfirm"
+            }
+          }
+        }
+      ],
+      "ports": [
+        {
+          "port": 7443,
+          "protocol": "TCP"
+        }
+      ]
+    }
+  ],
+  "podSelector": {
+    "matchLabels": {
+      "tinfirm.flowtivo.com/sandbox": "vm"
+    }
+  },
+  "policyTypes": [
+    "Ingress"
+  ]
+}

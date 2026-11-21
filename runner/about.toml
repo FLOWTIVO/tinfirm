@@ -45,7 +45,7 @@ targets = [
 ignore-dev-dependencies = true
 
 # The workspace's own crates (publish = false) are the binary, under the root LICENSE and, for
-# the code under ee/runner/, ee/LICENSE (ADR-0100).
+# the code under ee/runner/, ee/LICENSE (ADR-0100, ADR-0114).
 private = { ignore = true }
 
 # Crates whose licence files cargo-about reads with built-in corrections.

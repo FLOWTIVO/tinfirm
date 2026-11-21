@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  role_name: tinfirm_sandbox_node
+  author: FLOWTIVO
+  description: >-
+    Tinfirm sandbox node (ADR-0112): the node agent with its two services, Firecracker and its
+    jailer, the guest kernel and the VM image, and the node's own firewall. It holds no
+    credential. Not ready for production.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Ubuntu
+      versions: [jammy, noble]
+    - name: Debian
+      versions: [bookworm, trixie]
+    - name: EL
+      versions: ["9", "10"]
+dependencies: []

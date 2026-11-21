@@ -41,6 +41,7 @@ import com.flowtivo.tinfirm.shared.api.model.CredentialOpenTrigger;
 import com.flowtivo.tinfirm.shared.api.model.MemberAccountCount;
 import com.flowtivo.tinfirm.shared.api.model.SignInStart;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredential;
+import com.flowtivo.tinfirm.shared.api.model.SystemCredentialAppCreateRequest;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredentialClientCreateRequest;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredentialCreateRequest;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredentialList;
@@ -190,6 +191,14 @@ class Credentials {
         AccountStore.AccountRow row = accounts.storeClient(
                 () -> accounts.credential(companyId, systemId, null, input.getName()), input.getClientId(),
                 input.getClientSecret());
+        return view(row);
+    }
+
+    /** An installation of the system's GitHub App as a new credential (ADR-0116), once GitHub named it. */
+    public SystemCredential addApp(UUID companyId, UUID systemId, SystemCredentialAppCreateRequest input) {
+        AccountStore.AccountRow row = accounts.storeApp(
+                () -> accounts.credential(companyId, systemId, null, input.getName()),
+                input.getInstallationId() != null ? input.getInstallationId() : 0);
         return view(row);
     }
 

@@ -141,6 +141,43 @@ describe('AgentPage', () => {
     expect(sharing?.textContent).toContain('Shared with Analysts and Carol Dvořák.');
   });
 
+  it('warns where runs that start from outside the company would run in a container (ADR-0113)', async () => {
+    await open(
+      anAgent({
+        isolation: {
+          setting: 'AUTOMATIC',
+          level: 'CONTAINER',
+          offered: ['CONTAINER'],
+          chosenUnavailable: false,
+          outsideStarts: true,
+          containerWarning: true,
+        },
+      }),
+    );
+    expect(el.querySelector('[data-testid=container-warning]')?.textContent).toContain(
+      'can start from outside the company',
+    );
+    expect(el.querySelector('[data-testid=isolation-unavailable]')).toBeNull();
+  });
+
+  it('says when no runner host reports the level chosen for it', async () => {
+    await open(
+      anAgent({
+        isolation: {
+          setting: 'VM_JAIL',
+          offered: ['CONTAINER'],
+          chosenUnavailable: true,
+          outsideStarts: false,
+          containerWarning: false,
+        },
+      }),
+    );
+    expect(el.querySelector('[data-testid=isolation-unavailable]')?.textContent).toContain(
+      'No company runner host reports vm-jail any more',
+    );
+    expect(el.querySelector('[data-testid=container-warning]')).toBeNull();
+  });
+
   it('tells a reader who may not use it whom to ask, and reads no readiness', async () => {
     await open(anAgent({ usableByMe: false, acceptedVersion: null }), 'ADMIN');
     expect(el.querySelector('[data-testid=not-usable]')?.textContent).toContain(

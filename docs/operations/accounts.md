@@ -37,6 +37,16 @@ Adding, lending, storing again, disabling and removing credentials are in the pu
 - **Test** and **Refresh tools** take a `credentialId`; without one they use the caller's own working account, else the system's only working credential, else none.
 - On Jira Cloud a credential may be an Atlassian service account's OAuth 2.0 credential (kind `CLIENT`, [ADR-0093](../adr/0093-jira-cloud-service-accounts-by-client-credentials.md)): `POST …/credentials/client` and `PUT …/credentials/{credentialId}/client`. Its secret holds the client's id and secret and the access token it minted last; a reveal mints the next one (`client_credentials` at `https://auth.atlassian.com/oauth/token`) once that one expires within a minute, under the refresh lock a sign-in's refresh takes. A refused mint (`invalid_client`, `access_denied`, `unauthorized_client`) turns it `RECONNECT`, audited as `account.refused`; another failure keeps it `OK`. It calls Jira at the gateway it connected with, `https://api.atlassian.com/ex/jira/{cloudId}`, and **Test** asks `myself` there. Nothing is revoked when it is removed: revoke the credential in Atlassian Administration.
 
+- On a GitHub system with a GitHub App, a credential may be one of the App's installations (kind
+  `APP`, [ADR-0116](../adr/0116-short-lived-and-revocable-git-tokens.md); `POST
+  …/credentials/app`, [systems.md, section 3.1](systems.md#31-the-github-app)). Its login is the
+  account the App is installed on; its identity `installation:{id}`, one credential per
+  installation. It takes no token or sign-in. Tinfirm mints its tokens itself: for its own calls
+  with the installation's permissions less `workflows`, and for each run one of its own, limited to
+  the run's repositories and to `contents` and `pull_requests`, valid an hour. Members' own accounts
+  on GitHub and GitLab keep their tokens: revocation of a run's token reaches them too
+  ([runner-protocol-v2.md](runner-protocol-v2.md)), a shorter life does not.
+
 ## 4. Service accounts
 
 Creating one, its page, who may use it, its budget, suspending and deleting it are in [Service accounts](../../docs-site/content/admin-guide/service-accounts.md). Inside:
@@ -143,7 +153,10 @@ Nothing in the audit log holds a token.
 | `trigger.accounts_changed` | A trigger's table changed, with `why` `lending.replaced` when it followed a service account |
 | `conversation.binding.bound`, `.waiting`, `.gone` | A conversation's binding bound (with the credential it `followed`, for a trigger's), waits, or ended |
 | `tool.called` | Each call that reached a system, with the account, its holder and the grant it went through |
-| `secret.accessed` | Each reveal of a credential, with its purpose |
+| `secret.accessed` | Each reveal of a credential, with its purpose; for a run's GitHub App token both the credential's secret and the App's key, with `run:{runId}` |
+| `run.git_revoked` | A run's git token of some repositories revoked on its host (a binding that failed, a paused system, a followed credential, a renewal refused for good), with whether the host was told |
+| `run.git_revoke_confirmed` | The run's host confirmed that it dropped those tokens and rewrote its take-back record: the run, the repositories, the host |
+| `system.github_app_set`, `system.github_app_removed` | A GitHub system's App set, its key replaced, or removed |
 
 ## 11. Troubleshooting
 

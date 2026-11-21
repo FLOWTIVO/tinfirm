@@ -1,0 +1,67 @@
+listener: pid 59444, Uid: 995 995 995 995;Gid: 987 987 987 987;CapEff: 0000000000000000;CapBnd: 0000000000000000;NoNewPrivs: 1;Seccomp: 2;Seccomp_filters: 31;
+helper:   pid 59436, Uid: 0 0 0 0;Gid: 0 0 0 0;CapEff: 00000000082011c3;CapBnd: 00000000082011c3;NoNewPrivs: 1;Seccomp: 2;Seccomp_filters: 26;
+a VMM:    pid 60066 in tfvm-000000000036-0000, Uid: 1100000 1100000 1100000 1100000;Gid: 1100000 1100000 1100000 1100000;CapEff: 0000000000000000;CapBnd: 00000000082000c3;NoNewPrivs: 1;Seccomp: 2;Seccomp_filters: 27;
+systemd-analyze security: → Overall exposure level for tinfirm-node-agent-listener.service: 1.2 OK 🙂 ; → Overall exposure level for tinfirm-node-agent-helper.service: 3.4 OK 🙂
+
+== A. as the listener's user (uid 995), directly, on the node at large
+a tap device: refused (ioctl(TUNSETIFF): Operation not permitted) ; a firewall table: refused (^^^^^^^^^^^^^^^^^) ; read the firewall: refused (netlink: Error: cache initialization failed: Operation not permitted) ; list the device-mapper: refused (Command failed.) ; map a device: refused (Command failed.) ; a loop device: refused (losetup: /etc/hostname: failed to set up loop device: Permission denie) ; a cgroup: refused (mkdir: cannot create directory ‘/sys/fs/cgroup/tinfirm-vms/x’: Per) ; kill a VM by its cgroup: refused (sh: 1: cannot create /sys/fs/cgroup/tinfirm-vms/tfvm-000000000036-0000) ; a network namespace: refused (mount --make-shared /run/netns failed: Operation not permitted)
+a VM's jail: refused (ls: cannot open directory '/srv/tinfirm-jails/firecracker/tfvm-0000000) ; its disk's node: refused (head: cannot open '/srv/tinfirm-jails/firecracker/tfvm-000000000036-00) ; its user-data disk: refused (head: cannot open '/srv/tinfirm-jails/firecracker/tfvm-000000000036-00) ; its snapshot file: refused (head: cannot open '/var/lib/tinfirm-node-agent/work/tfvm-000000000036-) ; its snapshot device: refused (head: cannot open '/dev/mapper/tinfirm-tfvm-000000000036-0000' for rea) ; its console: refused (head: cannot open '/var/lib/tinfirm-node-agent/work/tfvm-000000000036-) ; its API socket: refused (PermissionError: [Errno 13] Permission denied)
+the helper's record: refused (ls: cannot open directory '/var/lib/tinfirm-node-agent/helper': Permis) ; the work directory: refused (ls: cannot open directory '/var/lib/tinfirm-node-agent/work': Permissi) ; change the agent's program: refused (sh: 1: cannot create /usr/local/bin/tinfirm-node-agent: Permission den) ; the helper's configuration, read: ALLOWED (no secret) ; written: refused (sh: 1: cannot create /etc/tinfirm/node-agent/helper.json: Permission d) ; its own configuration, written: refused (sh: 1: cannot create /etc/tinfirm/node-agent/listener.json: Permission) ; the jailer, written: refused (sh: 1: cannot create /usr/local/bin/jailer: Permission denied) ; the shared image, written: refused (sh: 1: cannot create /var/lib/tinfirm-node-agent/images/tinfirm-vm.img)
+signal 0 to a VMM: refused (kill: (60066): Operation not permitted) ; SIGKILL to it: refused (kill: (60066): Operation not permitted) ; signal 0 to the helper: refused (kill: (59436): Operation not permitted) ; the helper's memory: refused (sh: 1: cannot open /proc/59436/mem: Permission denied) ; its environment: refused (head: cannot open '/proc/59436/environ' for reading: Permission denied) ; a VMM's memory: refused (sh: 1: cannot open /proc/60066/mem: Permission denied)
+its own things, which it holds by design: the node's key: ALLOWED ; its spool: ALLOWED ; its records: ALLOWED ; the helper's socket: ALLOWED
+another user (nobody) at the helper's socket: refused (PermissionError: [Errno 13] Permission denied) ; a user of the listener's group that is not the listener (uid 65534, gid 987): connected, then closed by the helper before it read a byte (ConnectionResetError)
+
+== B. inside the listener service's namespaces (its unit's view)
+/home: refused (ls: cannot access '/home/<the administrator>': Permission denied) ; write /etc: refused (touch: cannot touch '/etc/x': Read-only file system) ; write /usr: refused (touch: cannot touch '/usr/local/bin/x': Read-only file system) ; /dev/kvm: refused (head: cannot open '/dev/kvm' for reading: No such file or directory) ; /dev/mapper/control: refused (head: cannot open '/dev/mapper/control' for reading: No such file or d) ; block devices it sees: 0 ; the jails: refused (ls: cannot open directory '/srv/tinfirm-jails/firecracker/tfvm-0000000) ; the work directory: refused (ls: cannot open directory '/var/lib/tinfirm-node-agent/work': Permissi) ; /proc of others: 4 process(es) visible
+its own: the spool, written: ALLOWED ; the helper's socket: ALLOWED
+
+== C. misuse of the helper's socket, as the listener's user
+  not JSON: {"error":{"code":"bad-request","message":"the request is not one JSON object with each key once"}}
+  a JSON list: {"error":{"code":"bad-request","message":"the request is not one JSON object with each key once"}}
+  no version: {"error":{"code":"bad-request","message":"the request has no `v`"}}
+  another version: {"error":{"code":"bad-request","message":"the helper speaks wire 1"}}
+  an unknown operation: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  a key twice (the second a list): {"error":{"code":"bad-request","message":"the request is not one JSON object with each key once"}}
+  list with an extra field: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  a line of 100,000 bytes: {"error":{"code":"bad-request","message":"the request is over 4096 bytes"}}
+  5,000 bytes without a newline: {"error":{"code":"bad-request","message":"the request is over 4096 bytes"}}
+  a connection that sends nothing: {"error":{"code":"bad-request","message":"no request in time"}} after 5.0 s
+  check with an unknown template: {"error":{"code":"unknown-template","message":"no template `no-such` in the helper's configuration"}}
+  check with a path as template: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with an unknown template: {"error":{"code":"unknown-template","message":"no template `no-such` in the helper's configuration"}}
+  make with a memory size: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with a path: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 7: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id '../../../etc/x': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-../../x': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-0000000000000000000000000000000/': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'VM-00000000000000000000000000000000': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-0000000000000000000000000000000g': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-00000000000000000000000000000000\n': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-00000000000000000000000000000000; id': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-000000000000000000000000000000000': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-0000000000000000000000000000000': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id 'vm-0000000000000000000000000000000é': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with id '': {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  make with no user data file: {"error":{"code":"user-data","message":"the user data file is missing"}}
+  make, user data a link to /etc/shadow: {"error":{"code":"user-data","message":"the user data file is a symbolic link"}}
+  make, user data a link to a readable file: {"error":{"code":"user-data","message":"the user data file is a symbolic link"}}
+  make, user data a FIFO: {"error":{"code":"user-data","message":"the user data file is not a regular file (Fifo)"}}
+  make, user data a directory: {"error":{"code":"user-data","message":"the user data file is not a regular file (Directory)"}}
+  make, user data empty: {"error":{"code":"user-data","message":"the user data file is empty"}}
+  make, user data of 65,537 bytes: {"error":{"code":"user-data","message":"the user data file is over 65536 bytes"}}
+  make, user data a sparse file of 1 TiB: {"error":{"code":"user-data","message":"the user data file is over 65536 bytes"}}
+  make, user data with a second name: {"error":{"code":"user-data","message":"the user data file has 2 names, not one"}}
+  30 makes while the file is swapped with a link to /etc/shadow: {"user-data: the user data file is missing": 17, "user-data: the user data file is empty": 3, "user-data: the user data file is a symbolic link": 4, "
+  list, as the helper gives it: {"free": 1, "vms": [{"id": "vm-20a79ee56cbe82696f0d388ef6765af7", "port": 20000, "state": "running", "template": "sandbox-2c2g"}]}
+  make with the id of a VM that runs: {"error":{"code":"exists","message":"the VM vm-20a79ee56cbe82696f0d388ef6765af7 exists"}}
+  delete of an id that is not there: {"ok":{}}
+  delete with a path as id: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  delete with a jail's name as id: {"error":{"code":"bad-request","message":"the request is not one of check, make, delete and list with exactly its fields"}}
+  2000 makes without a user data file in 0.3 s: {"user-data": 2000}
+  5 makes with a valid file, beside the VMs that run: ['made', 'full', 'full', 'full', 'full']
+  list beside 40 idle connections: after 0.0 s: (ConnectionResetError)
+  list once the idle connections timed out: after 0.000 s: {"ok":{"free":1,"vms":[{"id":"vm-20a79ee56cbe82696f0d388ef6765af7","port":20000,"state":"running","template":"sandbox-2c2g"}]}}
+  (not done to the VMs that run: `delete` of ['vm-20a79ee56cbe82696f0d388ef6765af7'], which the helper's rules allow the listener)
+
+== after: helper active, listener active, the VMM still runs, VMMs 1, jails 1, device-mapper devices 1, veths 1, tables 1, files in the spool 0

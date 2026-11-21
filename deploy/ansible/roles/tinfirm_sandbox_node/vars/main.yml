@@ -1,0 +1,233 @@
+---
+# Values the role derives from defaults/main.yml and the facts. Sites set defaults/main.yml.
+#
+# The paths are the node agent's defaults (runner/crates/tinfirm-node-agent/README.md, "Files
+# and directories"), which its service units name: files/ holds copies of those units, so the
+# paths are fixed here and not variables.
+
+_tinfirm_sandbox_node_kata_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
+_tinfirm_sandbox_node_cache_dir: /var/cache/tinfirm-node-agent
+
+_tinfirm_sandbox_node_binary_path: /usr/local/bin/tinfirm-node-agent
+_tinfirm_sandbox_node_firecracker_path: /usr/local/bin/firecracker
+_tinfirm_sandbox_node_jailer_path: /usr/local/bin/jailer
+_tinfirm_sandbox_node_listener_user: tinfirm-node-listener
+_tinfirm_sandbox_node_etc: /etc/tinfirm/node-agent
+_tinfirm_sandbox_node_helper_config: /etc/tinfirm/node-agent/helper.json
+_tinfirm_sandbox_node_listener_config: /etc/tinfirm/node-agent/listener.json
+_tinfirm_sandbox_node_firewall: /etc/tinfirm/node-agent/firewall.nft
+_tinfirm_sandbox_node_cert: /etc/tinfirm/node-agent/node.crt
+_tinfirm_sandbox_node_key: /etc/tinfirm/node-agent/node.key
+_tinfirm_sandbox_node_helper_socket: /run/tinfirm-node-agent-helper/helper.sock
+_tinfirm_sandbox_node_spool: /var/lib/tinfirm-node-agent/spool
+_tinfirm_sandbox_node_images: /var/lib/tinfirm-node-agent/images
+_tinfirm_sandbox_node_image: /var/lib/tinfirm-node-agent/images/tinfirm-vm.img
+# The checksum of the file the image was installed from, written once the image is in place:
+# a second run with the same checksum leaves the image alone.
+_tinfirm_sandbox_node_image_source: /var/lib/tinfirm-node-agent/images/tinfirm-vm.img.source
+_tinfirm_sandbox_node_kernel: /var/lib/tinfirm-node-agent/images/vmlinux
+# The release archive the binary came from and the binary's SHA-256, written once it is in
+# place: a second run that finds both downloads nothing.
+_tinfirm_sandbox_node_agent_source: /etc/tinfirm/node-agent/agent.source
+
+# The node's packages. They are installed only while one is missing: once the node's firewall
+# is loaded, the node reaches no package mirror.
+_tinfirm_sandbox_node_packages_apt:
+  [ca-certificates, coreutils, dmsetup, iproute2, kmod, nftables, openssl, procps, python3, tar, util-linux, zstd]
+_tinfirm_sandbox_node_packages_dnf:
+  [ca-certificates, coreutils, device-mapper, iproute, kmod, nftables, openssl, procps-ng, python3, tar, util-linux, zstd]
+# With the AppArmor switch on, AppArmor's parser (the RHEL family has none: checks.yml refuses
+# the switch there).
+_tinfirm_sandbox_node_packages: >-
+  {{ (_tinfirm_sandbox_node_packages_apt + (['apparmor'] if _tinfirm_sandbox_node_harden_on.mac | bool else []))
+     if ansible_facts['os_family'] == 'Debian'
+     else _tinfirm_sandbox_node_packages_dnf }}
+
+# The units, in the order they start. The modules' unit loads what the helper may not load,
+# the firewall's loads the node's table before the agent starts, the hardening's sets what lasts
+# until a reboot once both are done, and the listener needs the helper's socket.
+_tinfirm_sandbox_node_units:
+  - tinfirm-node-agent-modules.service
+  - tinfirm-node-agent-firewall.service
+  - tinfirm-node-agent-hardening.service
+  - tinfirm-node-agent-helper.service
+  - tinfirm-node-agent-listener.service
+
+# --- The hardening (ADR-0113 decision 5) ----------------------------------------------------------
+
+_tinfirm_sandbox_node_hardening_config: /etc/tinfirm/node-agent/hardening.json
+_tinfirm_sandbox_node_hardening_sysctl: /etc/sysctl.d/61-tinfirm-node-hardening.conf
+_tinfirm_sandbox_node_profile: /etc/apparmor.d/tinfirm-vmm
+# The profile's mode as it takes effect: off, complain or enforce. false (YAML reads an unquoted
+# off as false) is off, and so is anything with the master switch off; checks.yml refuses any
+# other value.
+_tinfirm_sandbox_node_mac: >-
+  {{ 'off' if not tinfirm_sandbox_node_harden | bool
+     or (tinfirm_sandbox_node_harden_mac is boolean and not tinfirm_sandbox_node_harden_mac)
+     else tinfirm_sandbox_node_harden_mac | string }}
+# The profile as it is installed: the units' file, with `complain` added to its flags in complain
+# mode. The mode lives in the file, so that apparmor.service loads it in that mode at each boot.
+_tinfirm_sandbox_node_profile_flags: flags=(attach_disconnected)
+# The role's copy of the profile, as a lookup finds it from the role (files/); the render tests
+# name it by its path.
+_tinfirm_sandbox_node_profile_src: tinfirm-vmm.apparmor
+_tinfirm_sandbox_node_profile_text: >-
+  {{ lookup('ansible.builtin.file', _tinfirm_sandbox_node_profile_src, rstrip=false)
+     | replace(_tinfirm_sandbox_node_profile_flags,
+               'flags=(attach_disconnected, complain)' if _tinfirm_sandbox_node_mac == 'complain'
+               else _tinfirm_sandbox_node_profile_flags) }}
+# The line AppArmor's list of loaded profiles shows for it in that mode.
+_tinfirm_sandbox_node_profile_loaded: "tinfirm-vmm ({{ _tinfirm_sandbox_node_mac }})"
+# The group whose members keep sudo once its setuid bit is cut to the group (4750).
+_tinfirm_sandbox_node_admin_group: "{{ 'sudo' if ansible_facts['os_family'] == 'Debian' else 'wheel' }}"
+# Where the setuid scan looks, as the helper's line `no-setuid` does.
+_tinfirm_sandbox_node_setuid_dirs: [/usr, /opt, /bin, /sbin]
+
+# Each line's switch as it takes effect: its own, and the master switch. `mac`: the profile is
+# installed, in complain or enforce mode.
+_tinfirm_sandbox_node_harden_on:
+  bpf: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_bpf | bool }}"
+  io_uring: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_io_uring | bool }}"
+  mac: "{{ _tinfirm_sandbox_node_mac in ['complain', 'enforce'] }}"
+  panic_on_oops: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_panic_on_oops | bool }}"
+  modules: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_modules | bool }}"
+  kexec: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_kexec | bool }}"
+  lockdown: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_lockdown | bool }}"
+  setuid: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_setuid | bool }}"
+  distribution: "{{ tinfirm_sandbox_node_harden | bool and tinfirm_sandbox_node_harden_distribution | bool }}"
+
+# Each line of the mark, and whether the role sets it up: what the proof requires to hold
+# (vmm-mac in enforce mode alone: in complain mode it cannot hold). A
+# line of no switch of its own follows the master switch; user-namespaces always holds, since the
+# role always sets it (60-tinfirm-node-agent.conf).
+_tinfirm_sandbox_node_mark_lines:
+  user-namespaces: true
+  unprivileged-bpf: "{{ _tinfirm_sandbox_node_harden_on.bpf | bool }}"
+  io-uring: "{{ _tinfirm_sandbox_node_harden_on.io_uring | bool }}"
+  vmm-mac: "{{ _tinfirm_sandbox_node_mac == 'enforce' }}"
+  panic-on-oops: "{{ _tinfirm_sandbox_node_harden_on.panic_on_oops | bool }}"
+  modules-disabled: "{{ _tinfirm_sandbox_node_harden_on.modules | bool }}"
+  kexec-disabled: "{{ _tinfirm_sandbox_node_harden_on.kexec | bool }}"
+  lockdown: "{{ _tinfirm_sandbox_node_harden_on.lockdown | bool }}"
+  distribution-hardening: "{{ _tinfirm_sandbox_node_harden_on.distribution | bool }}"
+  no-docker: "{{ tinfirm_sandbox_node_harden | bool }}"
+  no-setuid: "{{ _tinfirm_sandbox_node_harden_on.setuid | bool }}"
+  listening-sockets: "{{ tinfirm_sandbox_node_harden | bool }}"
+  max-uptime: "{{ tinfirm_sandbox_node_harden | bool }}"
+
+# The settings the role reads before it writes the hardening's sysctl file.
+_tinfirm_sandbox_node_hardening_keys:
+  - kernel.unprivileged_bpf_disabled
+  - kernel.io_uring_disabled
+  - kernel.panic_on_oops
+  - kernel.panic
+  - kernel.kptr_restrict
+  - kernel.dmesg_restrict
+  - kernel.perf_event_paranoid
+  - kernel.randomize_va_space
+  - fs.protected_symlinks
+  - fs.protected_hardlinks
+
+# The hardening's sysctl settings, by the switches and the values the node has now
+# (_tinfirm_sandbox_node_sysctl_current, read by tasks/hardening.yml). Where a line asks for "at
+# least", a value the node has higher already is left out, so the role never lowers it (Ubuntu
+# ships kernel.perf_event_paranoid = 4); once written, the value read back is the one written, so
+# a second run writes the same file.
+_tinfirm_sandbox_node_hardening_sysctls: >-
+  {%- set on = _tinfirm_sandbox_node_harden_on -%}
+  {%- set now = _tinfirm_sandbox_node_sysctl_current | default({}) -%}
+  {%- set s = {} -%}
+  {%- if on.bpf | bool -%}{%- set _ = s.update({'kernel.unprivileged_bpf_disabled': 1}) -%}{%- endif -%}
+  {%- if on.io_uring | bool -%}{%- set _ = s.update({'kernel.io_uring_disabled': 2}) -%}{%- endif -%}
+  {%- if on.panic_on_oops | bool -%}
+  {%-   set _ = s.update({'kernel.panic_on_oops': 1, 'kernel.panic': tinfirm_sandbox_node_kernel_panic | int}) -%}
+  {%- endif -%}
+  {%- if on.distribution | bool -%}
+  {%-   for key, least, exact in [('kernel.kptr_restrict', 1, false), ('kernel.dmesg_restrict', 1, true),
+                                  ('kernel.perf_event_paranoid', 2, false), ('kernel.randomize_va_space', 2, true),
+                                  ('fs.protected_symlinks', 1, true), ('fs.protected_hardlinks', 1, true)] -%}
+  {%-     if exact or (now[key] | default(-1) | int) <= least -%}{%- set _ = s.update({key: least}) -%}{%- endif -%}
+  {%-   endfor -%}
+  {%- endif -%}
+  {{ s }}
+# The settings of that file that the node does not have now: the role applies the file when
+# there is one.
+_tinfirm_sandbox_node_hardening_pending: >-
+  {%- set now = _tinfirm_sandbox_node_sysctl_current | default({}) -%}
+  {%- set p = [] -%}
+  {%- for key, value in _tinfirm_sandbox_node_hardening_sysctls.items() -%}
+  {%-   if (now[key] | default(none)) != value -%}{%- set _ = p.append(key) -%}{%- endif -%}
+  {%- endfor -%}
+  {{ p }}
+
+# The SHA-256 of each pinned Firecracker release, by version and architecture: the archive's
+# from the release's firecracker-v<version>-<arch>.tgz.sha256.txt, and the two binaries' from
+# the SHA256SUMS inside it, each compared with the downloaded files (1.14.2: on 2026-11-20).
+_tinfirm_sandbox_node_firecracker_known:
+  "1.14.2":
+    x86_64:
+      archive: "sha256:c9f112a983783f3cf50feea9e69b8ea9eb7475e52159a9585ca9555be630f5a3"
+      firecracker: "sha256:36bccbe85a347307edfce2148f23191e8be55d08d287d9d3a6dccf037bed087e"
+      jailer: "sha256:078705c4b807057b5f9a222c5b81f34efcac83fd2b6226d87ca2251949e88809"
+    aarch64:
+      archive: "sha256:7418f619e7262b24431cf955d2346e5de4d950302ea1a0ff1af50a15fdea22f4"
+      firecracker: "sha256:c1c35bbf2c1dfd215ef470211f70b0c722c4e8d4b2d7cf7e891f4d1603abaeb1"
+      jailer: "sha256:169410fcd889fa41a462ee419e2bfe2ee88fabb03ed1c60155edbb26cabaf5b8"
+_tinfirm_sandbox_node_firecracker: >-
+  {{ ((_tinfirm_sandbox_node_firecracker_known[tinfirm_sandbox_node_firecracker_version] | default({}))
+       [ansible_facts['architecture']] | default({}))
+     | combine(tinfirm_sandbox_node_firecracker_checksums) }}
+_tinfirm_sandbox_node_firecracker_sha256: "{{ _tinfirm_sandbox_node_firecracker.firecracker | default('') | regex_replace('^sha256:', '') | lower }}"
+_tinfirm_sandbox_node_jailer_sha256: "{{ _tinfirm_sandbox_node_firecracker.jailer | default('') | regex_replace('^sha256:', '') | lower }}"
+# The release's directory, and the suffix of each binary's name in it.
+_tinfirm_sandbox_node_firecracker_suffix: "-v{{ tinfirm_sandbox_node_firecracker_version }}-{{ ansible_facts['architecture'] }}"
+_tinfirm_sandbox_node_firecracker_url: >-
+  {{ tinfirm_sandbox_node_firecracker_download_url | regex_replace('/+$', '') }}/v{{ tinfirm_sandbox_node_firecracker_version
+  }}/{{ _tinfirm_sandbox_node_firecracker_archive }}
+_tinfirm_sandbox_node_firecracker_archive: "firecracker-v{{ tinfirm_sandbox_node_firecracker_version }}-{{ ansible_facts['architecture'] }}.tgz"
+_tinfirm_sandbox_node_firecracker_dir: "release-v{{ tinfirm_sandbox_node_firecracker_version }}-{{ ansible_facts['architecture'] }}"
+
+# The guest kernel that ran: Kata Containers 4.3.1's vmlinux-6.18.56-208, whose archive's and
+# member's SHA-256 the node agent's README records (both compared again with a download on
+# 2026-11-20). No arm64 kernel has run.
+_tinfirm_sandbox_node_kernel_known:
+  "4.3.1":
+    amd64:
+      archive: "sha256:1463a2b86845f4d3d8e87f2f764ec59856fc0fee3520967a79ade32762be2e97"
+      member: opt/kata/share/kata-containers/vmlinux-6.18.56-208
+      kernel: "sha256:f87d8359035cb7557b16a319e6431ea09b183e62268aef436bf8dc6530d786b6"
+_tinfirm_sandbox_node_kernel_pins: >-
+  {{ ((_tinfirm_sandbox_node_kernel_known[tinfirm_sandbox_node_kernel_kata_version] | default({}))
+       [_tinfirm_sandbox_node_kata_arch] | default({}))
+     | combine(tinfirm_sandbox_node_kernel_checksums) }}
+_tinfirm_sandbox_node_kernel_sha256: "{{ _tinfirm_sandbox_node_kernel_pins.kernel | default('') | regex_replace('^sha256:', '') | lower }}"
+_tinfirm_sandbox_node_kernel_url: >-
+  {{ tinfirm_sandbox_node_kernel_download_url | regex_replace('/+$', '') }}/{{ tinfirm_sandbox_node_kernel_kata_version
+  }}/{{ tinfirm_sandbox_node_kernel_archive }}
+
+# The image as given: its name, and whether it is compressed with zstd.
+_tinfirm_sandbox_node_image_given: "{{ (tinfirm_sandbox_node_image_src or tinfirm_sandbox_node_image_url) | basename }}"
+_tinfirm_sandbox_node_image_zst: "{{ _tinfirm_sandbox_node_image_given is match('.*\\.zst$') }}"
+
+# The VMs' published ports, as the node's firewall names them.
+_tinfirm_sandbox_node_last_port: "{{ tinfirm_sandbox_node_first_port | int + tinfirm_sandbox_node_max_vms | int - 1 }}"
+_tinfirm_sandbox_node_published_ports: >-
+  {{ tinfirm_sandbox_node_first_port | int
+     if tinfirm_sandbox_node_max_vms | int == 1
+     else (tinfirm_sandbox_node_first_port | int | string) ~ '-' ~ _tinfirm_sandbox_node_last_port }}
+
+# Asks the helper for its `check` of one template over its socket, as the listener does (the
+# agent's README, "The helper's wire"), and prints the answer line.
+_tinfirm_sandbox_node_check_script: |
+  import json, socket, sys
+  s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+  s.settimeout(120)
+  s.connect(sys.argv[1])
+  s.sendall((json.dumps({"v": 1, "op": "check", "template": sys.argv[2]}) + "\n").encode())
+  answer = b""
+  while True:
+      chunk = s.recv(65536)
+      if not chunk:
+          break
+      answer += chunk
+  print(answer.decode().strip())

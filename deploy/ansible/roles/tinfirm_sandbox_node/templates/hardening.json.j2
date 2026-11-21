@@ -1,0 +1,8 @@
+{#- What `tinfirm-node-agent harden` sets at each boot (runner/crates/tinfirm-node-agent/README.md,
+    "Hardening at each boot"): exactly these three fields, which `harden` refuses to read with
+    any other. A switch that is off leaves its setting as the kernel has it. -#}
+{{ {
+  'modulesDisabled': _tinfirm_sandbox_node_harden_on.modules | bool,
+  'kexecDisabled': _tinfirm_sandbox_node_harden_on.kexec | bool,
+  'lockdown': 'integrity' if _tinfirm_sandbox_node_harden_on.lockdown | bool else 'none',
+} | to_nice_json(indent=2) }}

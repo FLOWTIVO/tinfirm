@@ -38,6 +38,8 @@ COPY protocol/ protocol/
 COPY server/src/main/resources/psl/public_suffix_list.dat server/src/main/resources/psl/
 COPY runner/ runner/
 COPY ee/runner/ ee/runner/
+# The chart's files of the pod driver's objects, which its tests compare (spec.rs).
+COPY deploy/helm/tinfirm/ci/expected/ deploy/helm/tinfirm/ci/expected/
 WORKDIR /src/runner
 
 # ---- 3. The checks ---------------------------------------------------------------------

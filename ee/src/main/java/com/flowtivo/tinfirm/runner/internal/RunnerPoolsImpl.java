@@ -35,8 +35,7 @@ import com.flowtivo.tinfirm.shared.web.ProblemCode;
  * rules.
  * <ul>
  * <li>{@link #update} sets or clears a pool's settings while the licence in force holds the feature, else
- * {@code 403 EDITION_REQUIRED}. A host with the sandbox bridge, as every pool host has, connects only while it
- * does.</li>
+ * {@code 403 EDITION_REQUIRED}. A host that lists {@code sandbox.pool} connects only while it does (ADR-0114).</li>
  * <li>{@link #refresh} stores the count and its next change as the schedule gives them now, and moves
  * {@code config_version} on when they changed: at the host's {@code hello}, after a change of its settings, and every
  * minute ({@link #tick}).</li>

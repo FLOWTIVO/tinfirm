@@ -39,6 +39,8 @@ Both run the same server image. Agents also need at least one [runner host](runn
 - [Declare companies and how their people sign in](sign-in.md): companies, local sign-in and OIDC with Keycloak, Okta or Microsoft Entra ID.
 - [Run the model gateway](model-gateway.md): add model providers and models to LiteLLM, or bring your own.
 - [Install and run runner hosts](runner-hosts.md): install, sandboxes, Kata Containers, the egress proxy, capacity and upgrades.
+- [Sandbox nodes on your own machines](sandbox-nodes.md): the sandbox VMs on machines outside the cluster, which hold no credential.
+- [Sandbox VMs in your Kubernetes cluster](kubernetes-pod-per-run.md): a pod per run, with Firecracker in it as an unprivileged user, on workers with KVM. Not ready for production.
 
 ### Run
 

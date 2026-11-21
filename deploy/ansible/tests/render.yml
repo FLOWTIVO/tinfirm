@@ -1,0 +1,253 @@
+---
+# Renders every template of the two roles with example-vars.yml into render_dir, without a
+# target machine, for check-rendered.py (deploy/ansible/README.md, "Checks"):
+#
+#   ansible-playbook -i localhost, deploy/ansible/tests/render.yml -e render_dir=/tmp/rendered
+#   python3 -I deploy/ansible/tests/check-rendered.py /tmp/rendered
+
+- name: Render the roles' templates with example values
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  # vars_files, not include_vars: a task's own vars then override them, as in the role.
+  vars_files:
+    - ../roles/tinfirm_sandbox_node/defaults/main.yml
+    - ../roles/tinfirm_sandbox_node/vars/main.yml
+    - ../roles/tinfirm_runner_host/defaults/main.yml
+    - ../roles/tinfirm_runner_host/vars/main.yml
+    - example-vars.yml
+  vars:
+    _node: "{{ playbook_dir }}/../roles/tinfirm_sandbox_node"
+    _host: "{{ playbook_dir }}/../roles/tinfirm_runner_host"
+  tasks:
+    - name: Check the output directory
+      ansible.builtin.assert:
+        that:
+          - render_dir is defined
+          - render_dir is match('^/')
+        fail_msg: Give -e render_dir=<an absolute directory>.
+        quiet: true
+
+    - name: Create the output directory
+      ansible.builtin.file:
+        path: "{{ render_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render the sandbox node's templates
+      ansible.builtin.template:
+        src: "{{ _node }}/templates/{{ item }}.j2"
+        dest: "{{ render_dir }}/{{ item }}"
+        mode: "0644"
+      loop: [helper.json, listener.json, firewall.nft, listener-control-host.conf]
+
+    # The hardening: every switch on (the node's settings as example-vars.yml reads them), each
+    # switch off in turn, the master switch off, and a node whose settings are below the
+    # hardening's (check-rendered.py, "hardening").
+    - name: Render the hardening with every switch on
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: all-on
+
+    - name: Render the hardening with the master switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: master-off
+        tinfirm_sandbox_node_harden: false
+
+    - name: Render the hardening with eBPF's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: bpf-off
+        tinfirm_sandbox_node_harden_bpf: false
+
+    - name: Render the hardening with io_uring's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: io_uring-off
+        tinfirm_sandbox_node_harden_io_uring: false
+
+    - name: Render the hardening with AppArmor's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: mac-off
+        tinfirm_sandbox_node_harden_mac: false
+
+    - name: Render the hardening with AppArmor's switch off, spelt as a string
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: mac-off-string
+        tinfirm_sandbox_node_harden_mac: "off"
+
+    - name: Render the hardening with the VMMs' profile in enforce mode
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: mac-enforce
+        tinfirm_sandbox_node_harden_mac: enforce
+
+    - name: Render the hardening with panic on oops off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: panic_on_oops-off
+        tinfirm_sandbox_node_harden_panic_on_oops: false
+
+    - name: Render the hardening with module loading's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: modules-off
+        tinfirm_sandbox_node_harden_modules: false
+
+    - name: Render the hardening with kexec's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: kexec-off
+        tinfirm_sandbox_node_harden_kexec: false
+
+    - name: Render the hardening with lockdown's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: lockdown-off
+        tinfirm_sandbox_node_harden_lockdown: false
+
+    - name: Render the hardening with the setuid switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: setuid-off
+        tinfirm_sandbox_node_harden_setuid: false
+
+    - name: Render the hardening with the distribution's switch off
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: distribution-off
+        tinfirm_sandbox_node_harden_distribution: false
+
+    - name: Render the hardening on a node below every setting, with a panic's reboot and other bounds
+      ansible.builtin.include_tasks: render-hardening.yml
+      vars:
+        _case: below
+        tinfirm_sandbox_node_kernel_panic: 10
+        tinfirm_sandbox_node_max_uptime_days: 7
+        tinfirm_sandbox_node_ssh_port: 2222
+        _tinfirm_sandbox_node_sysctl_current:
+          kernel.unprivileged_bpf_disabled: 0
+          kernel.io_uring_disabled: 0
+          kernel.panic_on_oops: 0
+          kernel.panic: 0
+          kernel.kptr_restrict: 0
+          kernel.dmesg_restrict: 0
+          kernel.perf_event_paranoid: 1
+          kernel.randomize_va_space: 1
+          fs.protected_symlinks: 0
+          fs.protected_hardlinks: 0
+
+    - name: Render the node's firewall for one VM, a static address and SSH on another port
+      ansible.builtin.template:
+        src: "{{ _node }}/templates/firewall.nft.j2"
+        dest: "{{ render_dir }}/firewall-one-vm-static.nft"
+        mode: "0644"
+      vars:
+        tinfirm_sandbox_node_max_vms: 1
+        tinfirm_sandbox_node_dhcp: false
+        tinfirm_sandbox_node_ssh_port: 2222
+
+    - name: Render the control host's driver configuration
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/node-driver.json.j2"
+        dest: "{{ render_dir }}/node-driver.json"
+        mode: "0644"
+
+    - name: Render the runner host's unit with Docker and Kata
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+
+    - name: Render the runner host's unit with the sandbox bridge's ports
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker-ports.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+        # With blanks around it: the unit gets the range without them.
+        tinfirm_runner_host_sandbox_bridge_ports: " 41000-41063 "
+
+    - name: Render the runner host's unit with a blank range
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker-blank-ports.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+        tinfirm_runner_host_sandbox_bridge_ports: "  "
+
+    - name: Render the runner host's unit with ports but without the sandbox bridge
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.docker-nobridge.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: docker
+        tinfirm_runner_host_sandbox_bridge: false
+        tinfirm_runner_host_sandbox_bridge_ports: 41000-41063
+
+    # What checks.yml takes of tinfirm_runner_host_sandbox_bridge_ports, for each value, with
+    # tinfirm_runner_host_max_concurrent_runs 8 (example-vars.yml).
+    - name: Judge the sandbox bridge's ports
+      ansible.builtin.set_fact:
+        _bridge_ports: "{{ _bridge_ports | default({}) | combine({item.case: _tinfirm_runner_host_bridge_ports_ok | bool}) }}"
+      loop:
+        - {case: empty, ports: "", bridge: true, executor: docker}
+        - {case: range, ports: 41000-41063, bridge: true, executor: docker}
+        - {case: exactly-8, ports: 41000-41007, bridge: true, executor: docker}
+        - {case: too-small, ports: 41000-41006, bridge: true, executor: docker}
+        - {case: one-port, ports: "41000", bridge: true, executor: docker}
+        - {case: reversed, ports: 41063-41000, bridge: true, executor: docker}
+        - {case: zero, ports: 0-100, bridge: true, executor: docker}
+        - {case: too-high, ports: 65530-65540, bridge: true, executor: docker}
+        - {case: malformed, ports: "41000:41063", bridge: true, executor: docker}
+        - {case: no-bridge, ports: 41000-41063, bridge: false, executor: docker}
+        - {case: vm, ports: 41000-41063, bridge: true, executor: vm}
+      loop_control:
+        label: "{{ item.case }}"
+      vars:
+        tinfirm_runner_host_sandbox_bridge_ports: "{{ item.ports }}"
+        tinfirm_runner_host_sandbox_bridge: "{{ item.bridge }}"
+        tinfirm_runner_host_executor: "{{ item.executor }}"
+
+    - name: Write what checks.yml takes
+      ansible.builtin.copy:
+        content: "{{ _bridge_ports | to_nice_json }}\n"
+        dest: "{{ render_dir }}/bridge-ports.json"
+        mode: "0644"
+
+    - name: Render the control host's unit
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.vm.service"
+        mode: "0644"
+      vars:
+        tinfirm_runner_host_executor: vm
+
+    - name: Show the derived values the tasks use
+      ansible.builtin.copy:
+        content: "{{ _derived | to_nice_json }}\n"
+        dest: "{{ render_dir }}/derived.json"
+        mode: "0644"
+      vars:
+        _derived:
+          firecracker_url: "{{ _tinfirm_sandbox_node_firecracker_url }}"
+          firecracker: "{{ _tinfirm_sandbox_node_firecracker }}"
+          firecracker_sha256: "{{ _tinfirm_sandbox_node_firecracker_sha256 }}"
+          jailer_sha256: "{{ _tinfirm_sandbox_node_jailer_sha256 }}"
+          kernel_url: "{{ _tinfirm_sandbox_node_kernel_url }}"
+          kernel_pins: "{{ _tinfirm_sandbox_node_kernel_pins }}"
+          kernel_sha256: "{{ _tinfirm_sandbox_node_kernel_sha256 }}"
+          published_ports: "{{ _tinfirm_sandbox_node_published_ports }}"
+          node_name: "{{ tinfirm_sandbox_node_name }}"
+          nodes_unpinned: "{{ _tinfirm_runner_host_nodes_unpinned }}"
+          nodes_pinned: "{{ _tinfirm_runner_host_nodes_pinned | map(attribute='name') | list }}"
+          packages: "{{ _tinfirm_sandbox_node_packages }}"
+          units: "{{ _tinfirm_sandbox_node_units }}"

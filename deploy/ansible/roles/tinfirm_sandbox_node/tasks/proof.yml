@@ -1,0 +1,160 @@
+---
+# The role's proof: the node as the agent itself sees it. The helper's `check` (the wire's
+# `verify`) names everything of the agent's README, "What a node needs", that is missing; a
+# control host does not use a node with a problem, and neither does this play.
+- name: Check that the node agent's units run
+  ansible.builtin.command:
+    argv: "{{ ['systemctl', 'is-active'] + _tinfirm_sandbox_node_units }}"
+  register: _tinfirm_sandbox_node_active
+  changed_when: false
+  failed_when: false
+
+- name: Read the agent's log where a unit does not run
+  ansible.builtin.command:
+    argv:
+      [journalctl, --no-pager, -n, "30", -u, tinfirm-node-agent-hardening.service, -u, tinfirm-node-agent-helper.service,
+       -u, tinfirm-node-agent-listener.service]
+  register: _tinfirm_sandbox_node_journal
+  changed_when: false
+  when: _tinfirm_sandbox_node_active.rc != 0
+
+- name: Fail when a unit does not run
+  ansible.builtin.fail:
+    msg: >-
+      Not every unit of the node agent is active
+      ({{ _tinfirm_sandbox_node_units | zip(_tinfirm_sandbox_node_active.stdout_lines) | map('join', ': ') | join(', ') }}).
+      The log: {{ _tinfirm_sandbox_node_journal.stdout_lines | default([]) }}
+  when: _tinfirm_sandbox_node_active.rc != 0
+
+- name: Read the node's settings back
+  ansible.builtin.command:
+    argv: [sysctl, -n, net.ipv4.ip_forward, user.max_user_namespaces]
+  register: _tinfirm_sandbox_node_sysctl_now
+  changed_when: false
+
+- name: Check the node's settings
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_sysctl_now.stdout_lines == ['1', '0']
+    fail_msg: >-
+      net.ipv4.ip_forward and user.max_user_namespaces read {{ _tinfirm_sandbox_node_sysctl_now.stdout_lines }},
+      not 1 and 0: something else on the node sets them (another file of /etc/sysctl.d).
+    quiet: true
+
+- name: Check that the node's firewall table is loaded
+  ansible.builtin.command:
+    argv: [nft, list, table, inet, tinfirm_node]
+  changed_when: false
+
+# The helper serves its socket to the listener's uid alone, so the check is asked as that user,
+# exactly as the listener asks it. Right after a restart the socket may not be there yet.
+- name: Ask the helper for its check of each template
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - "{{ _tinfirm_sandbox_node_listener_user }}"
+      - --
+      - python3
+      - -I
+      - -c
+      - "{{ _tinfirm_sandbox_node_check_script }}"
+      - "{{ _tinfirm_sandbox_node_helper_socket }}"
+      - "{{ item }}"
+  loop: "{{ tinfirm_sandbox_node_templates.keys() | list }}"
+  register: _tinfirm_sandbox_node_checks
+  changed_when: false
+  retries: 10
+  delay: 2
+  until: _tinfirm_sandbox_node_checks.rc == 0 and (_tinfirm_sandbox_node_checks.stdout | length > 0)
+
+- name: Fail when the helper names a problem
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | from_json).ok is defined
+      - (item.stdout | from_json).ok.problems | length == 0
+    fail_msg: >-
+      The helper's check of template {{ item.item }} found:
+      {{ ((item.stdout | from_json).ok.problems | default([(item.stdout | from_json).error | default(item.stdout)])) | join('; ') }}.
+      A control host does not use a node with a problem.
+    success_msg: >-
+      Template {{ item.item }}: no problem; {{ (item.stdout | from_json).ok.free }} of
+      {{ tinfirm_sandbox_node_max_vms }} VMs free; checked: {{ (item.stdout | from_json).ok.checked | join(', ') }}.
+  loop: "{{ _tinfirm_sandbox_node_checks.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read the node's certificate's fingerprint
+  ansible.builtin.command:
+    argv: ["{{ _tinfirm_sandbox_node_binary_path }}", fingerprint, --cert, "{{ _tinfirm_sandbox_node_cert }}"]
+  register: _tinfirm_sandbox_node_fingerprint
+  changed_when: false
+
+- name: Show what the control host pins
+  ansible.builtin.debug:
+    msg:
+      - "The node's fingerprint, which the control host pins: {{ _tinfirm_sandbox_node_fingerprint.stdout | trim }}"
+      - "Its entry in the control host's tinfirm_runner_host_nodes:"
+      - name: "{{ tinfirm_sandbox_node_name }}"
+        address: "{{ tinfirm_sandbox_node_address }}:{{ tinfirm_sandbox_node_agent_port }}"
+        nodeSha256: "{{ _tinfirm_sandbox_node_fingerprint.stdout | trim }}"
+        templates: "{{ tinfirm_sandbox_node_templates.keys() | list }}"
+        publishedPorts:
+          first: "{{ tinfirm_sandbox_node_first_port | int }}"
+          last: "{{ _tinfirm_sandbox_node_last_port | int }}"
+      - >-
+        The agent's verify tries the node's own egress towards the control host alone, and
+        not as root. The network outside the node is yours to close: the node reaches
+        nothing, and only the control host reaches the node's ports {{ tinfirm_sandbox_node_agent_port }} and
+        {{ tinfirm_sandbox_node_first_port }} to {{ _tinfirm_sandbox_node_last_port }}.
+
+# The hardening mark, as the helper's check found it (the same for every template). A line whose
+# switch is off is shown as off; one whose switch is on must hold. Last, so that the node's
+# fingerprint above is shown either way.
+- name: Show each line of the node's hardening mark
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.line }}: {{ 'holds' if item.holds
+        else ('DOES NOT HOLD' if _tinfirm_sandbox_node_mark_lines[item.line] | default(false) | bool
+        else ('complain mode: the profile refuses nothing yet' if item.line == 'vmm-mac' and _tinfirm_sandbox_node_mac == 'complain'
+        else 'does not hold, and its switch is off')) }} ({{ item.found }})
+  loop: "{{ _tinfirm_sandbox_node_mark.lines | default([]) }}"
+  loop_control:
+    label: "{{ item.line }}"
+  vars:
+    _tinfirm_sandbox_node_mark: "{{ (_tinfirm_sandbox_node_checks.results[0].stdout | from_json).ok.hardening | default({}) }}"
+
+- name: Fail when a line of the hardening whose switch is on does not hold
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_mark.lines is defined
+      - _failing | length == 0
+    fail_msg: >-
+      {{ 'The helper sent no hardening mark: the node agent is older than this role.'
+         if _tinfirm_sandbox_node_mark.lines is not defined
+         else 'Lines of the hardening whose switch is on do not hold: ' ~ (_failing | join('; ')) ~ '.' }}
+      Each line's switch is in the role's defaults ("The hardening"). VMMs that ran before the
+      AppArmor profile was loaded keep vmm-mac failing until they are deleted.
+    success_msg: "The hardening mark: {{ _tinfirm_sandbox_node_mark.hardened }}."
+  vars:
+    _tinfirm_sandbox_node_mark: "{{ (_tinfirm_sandbox_node_checks.results[0].stdout | from_json).ok.hardening | default({}) }}"
+    _failing: >-
+      {%- set failing = [] -%}
+      {%- for line in _tinfirm_sandbox_node_mark.lines | default([]) -%}
+      {%-   if not line.holds and (_tinfirm_sandbox_node_mark_lines[line.line] | default(false) | bool) -%}
+      {%-     set _ = failing.append(line.line ~ ': ' ~ line.found) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ failing }}
+
+# Complain mode: what the profile would have refused is in the kernel's log. Read it before the
+# mode becomes enforce (the role's defaults, tinfirm_sandbox_node_harden_mac).
+- name: Say where complain mode logs
+  ansible.builtin.debug:
+    msg: >-
+      The VMMs' AppArmor profile is in complain mode: it refuses nothing, and vmm-mac does not
+      hold, so the node's mark is `no`. What it would have refused, the kernel logs as lines with
+      apparmor="ALLOWED" and profile="tinfirm-vmm": `journalctl -k --grep 'apparmor="ALLOWED"'`
+      on the node, or /var/log/audit/audit.log where auditd runs. Run VMs, read those lines, and
+      set tinfirm_sandbox_node_harden_mac: enforce once there are none that a VMM needs.
+  when: _tinfirm_sandbox_node_mac == 'complain'

@@ -1,0 +1,60 @@
+{{- if and .Values.runner.enabled (eq .Values.runner.vm.driver "pod") }}
+{{- include "tinfirm.runner.validate" . }}
+{{- $ns := .Values.runner.vm.cluster.namespace }}
+# The runner pod's own ServiceAccount, with driver pod alone: the driver's Role is bound to it,
+# and the pod gets its token through a projected volume (runner-deployment.yaml), never by the
+# automatic mount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "tinfirm.runner.serviceAccountName" . }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+# The pod driver's rights (ADR-0115, decision 2), in the runs' namespace alone, and none
+# anywhere else: no ClusterRole. Pods: create (the dry runs of the admission check too), read
+# and delete. Secrets: create and delete the tickets, never read or list them. Network
+# policies: list, all of them at once. The quota: read, by name. No pods/log, pods/exec or
+# pods/ephemeralcontainers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "tinfirm.runner.fullname" . }}-driver
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, delete, get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create, delete]
+  # Every policy of the namespace, not by name: the driver reports any third one, since
+  # network policies add up.
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [resourcequotas]
+    resourceNames:
+      - {{ include "tinfirm.runs.resourceQuotaName" . }}
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "tinfirm.runner.fullname" . }}-driver
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "tinfirm.runner.fullname" . }}-driver
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tinfirm.runner.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

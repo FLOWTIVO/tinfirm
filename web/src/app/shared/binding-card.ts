@@ -103,6 +103,9 @@ function adminFix(b: ConversationBinding): string {
   if (b.credentialKind === 'CLIENT') {
     return `An admin must store new client credentials for ${credential}.`;
   }
+  if (b.credentialKind === 'APP') {
+    return `An admin must check the GitHub App’s installation ${credential} on the system’s page.`;
+  }
   return `An admin must sign ${credential} in again, or store a new token for it.`;
 }
 

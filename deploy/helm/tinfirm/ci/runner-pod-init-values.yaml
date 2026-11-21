@@ -1,0 +1,61 @@
+# The runner pod with the pod driver (ADR-0115, decision 2) in its other branches: the tap made
+# by an init container, the disk an ephemeral volume of a storage class, a runs' namespace
+# that exists already, a quota of the operator's, and the cluster's own admission engine.
+publicUrl: https://tinfirm.example.com
+companies:
+  - key: main
+    name: My Company
+runner:
+  enabled: true
+  name: k8s-pods
+  vm:
+    driver: pod
+    template: small
+    port: 7444
+    cluster:
+      isolationStatement: the workers for runs hold nothing else
+      namespace: sandboxes
+      createNamespace: false
+      runServiceAccount: sandbox
+      admission: external
+      quota:
+        hard:
+          pods: "4"
+          requests.cpu: "8"
+          requests.memory: 9000Mi
+    pod:
+      image:
+        repository: vm-pod
+        digest: sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+      templates:
+        small:
+          vcpus: 2
+          memoryMib: 2048
+          diskMib: 8192
+      tap:
+        mode: init
+        cidr: 10.255.255.252/30
+      devices:
+        kvm: devices.example.com/kvm
+        tun: devices.example.com/tun
+      nodeSelector:
+        tinfirm.flowtivo.com/kvm: "true"
+      tolerations:
+        - key: tinfirm.flowtivo.com/kvm
+          operator: Equal
+          value: "true"
+          effect: NoExecute
+          tolerationSeconds: 30
+      disk:
+        volume: ephemeral
+        storageClassName: local-xfs
+  extraEnv:
+    - name: RUST_BACKTRACE
+      value: "1"
+networkPolicy:
+  runner:
+    egress:
+      apiServer:
+        to:
+          - ipBlock:
+              cidr: 10.96.0.0/12

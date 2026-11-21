@@ -30,6 +30,15 @@ public final class ConversationEvents {
     public record BindingBound(UUID companyId, UUID conversationId, UUID bindingId, UUID systemId) {
     }
 
+    /**
+     * A trigger's binding followed its service account to the credential it borrows now (ADR-0072), in place of
+     * {@code previousAccountId}; published after its {@link BindingBound}. The runs that hold the previous credential's
+     * git tokens lose them (ADR-0116, {@code CREDENTIAL_REPLACED}).
+     */
+    public record BindingFollowed(UUID companyId, UUID conversationId, UUID bindingId, UUID systemId,
+            UUID previousAccountId, UUID accountId) {
+    }
+
     /** A binding of the conversation waits for the person or an admin, with its reason. */
     public record BindingWaiting(UUID companyId, UUID conversationId, UUID bindingId, UUID systemId,
             BindingInfo.Reason reason) {

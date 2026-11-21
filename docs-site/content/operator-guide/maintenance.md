@@ -83,6 +83,7 @@ kubectl -n tinfirm rollout restart deployment/tinfirm
 | Error reports DSN | Change it in its Secret, then restart the server: it reads the DSN when it starts |
 | Runner pod token | Put a new `tfr_…` token into the runner Secret, restart the server, which replaces the old token at its start and closes the pod's connection, then the pod: `kubectl -n tinfirm rollout restart deployment/tinfirm-runner` |
 | DigitalOcean API token | Create a new token, put it into its Secret, restart the runner pod, then revoke the old one |
+| Client certificate and key of the `node` driver | The `node` form is not ready for production ([With sandbox nodes](helm.md#with-sandbox-nodes)). Write a new pair with `tinfirm-runner-host node identity --cert client.crt --key client.key` (or `tinfirm-node-agent identity`, which makes the same files) in an empty directory (it refuses files that exist) and note the SHA-256 it prints. Put the pair into the Secret `runner.vm.node.existingSecret`. On each node, set that SHA-256 as `tls.clientSha256` in the listener's configuration and restart the listener, which reads it at its start. Then restart the runner pod: `kubectl -n tinfirm rollout restart deployment/tinfirm-runner`. A listener accepts one client certificate, so runs cannot start on a node between its listener's restart and the pod's restart. The certificate has no expiry that Tinfirm checks: rotate it when you want to, and at once if the key leaked |
 | Audit anchor key | Add the next key, make it active and restart, then keep the old one's public key only: [Rotate the key](audit-anchor.md#rotate-the-key) |
 | Audit anchor bucket key | Create a new key for the bucket, put it into `auditAnchor.s3.existingSecret`, restart the server, then revoke the old one |
 
@@ -162,7 +163,7 @@ Keep the old host name pointing at Tinfirm, redirecting to the new one, for as l
 
 ## Upgrade runner hosts
 
-Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
+Upgrade the server first, then its runner hosts: a runner host must not run ahead of its server. For the release that reports levels of isolation, upgrade every host with a VM per run or Kata Containers right after the server: the new server refuses a host of an older release of those kinds, which stops with the error `UPGRADE_REQUIRED` and the server's version, and turns that only those hosts may run wait until then. Hosts with Docker keep working and can follow at any time. A runner host drains before it upgrades, so that running turns finish, and rebuilds its runner images whose Dockerfiles changed when it starts again. [Install and run runner hosts](runner-hosts.md) has the procedure.
 
 ## The Compose stack
 
@@ -178,6 +179,36 @@ docker exec tinfirm-postgres-1 pg_dump -U postgres -Fc litellm > litellm-$(date 
 ```
 
 A dump is a backup of one moment, unlike point-in-time recovery: take one before every upgrade, and on a schedule.
+
+To check that a dump restores, restore it into a database of its own and drop it afterwards. The running stack is not touched:
+
+```sh
+docker exec tinfirm-postgres-1 createdb -U postgres -O tinfirm_owner restore_check
+docker exec -i tinfirm-postgres-1 pg_restore -U postgres -d restore_check < tinfirm-<time>.dump
+docker exec tinfirm-postgres-1 psql -U postgres -d restore_check -c "SELECT count(*), max(version) FROM flyway_schema_history WHERE success"
+docker exec tinfirm-postgres-1 dropdb -U postgres restore_check
+```
+
+The count and the highest version are those of the running database.
+
+### HTTPS on a Compose host
+
+The stack itself speaks plain HTTP on `127.0.0.1:8080`. Where your own reverse proxy or tunnel ends TLS, point it at that port and keep to the limits of [Requirements](requirements.md#network). Where the internet reaches the host directly, the overlay `compose.tls.yaml` adds Caddy on ports 80 and 443, which gets a certificate from Let's Encrypt for one host name and renews it:
+
+```sh title=".env"
+TINFIRM_TLS_HOST=tinfirm.example.com
+TINFIRM_PUBLIC_URL=https://tinfirm.example.com
+TINFIRM_HTTP_BIND=127.0.0.1
+```
+
+```sh
+dig +short tinfirm.example.com          # must be this host's public address
+docker compose -f compose.yaml -f compose.tls.yaml up -d --no-build
+```
+
+Before the first start, the name must resolve to the host and ports 80 and 443 must be open from the internet: Let's Encrypt limits failed attempts for a name. Open no other port: PostgreSQL, LiteLLM and the server's own port stay on `127.0.0.1`. Name `compose.tls.yaml` in every later `docker compose` command too, or Compose removes Caddy as an orphan with `--remove-orphans`. The certificate and its account key are in the volume `tinfirm_caddy-data`. `.env.example`'s values are public: generate every secret before a host is on the internet, as `deploy/compose/deploy-host.sh` does.
+
+The overlay was tried once: the certificate came at the first start, and a runner host's WebSocket and a conversation's event stream passed through Caddy. Not tried through it: a model request's long stream, an upload of 25 MB, and a renewal.
 
 ### Upgrade the stack
 

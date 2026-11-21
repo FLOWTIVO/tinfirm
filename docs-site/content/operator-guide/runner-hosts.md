@@ -31,8 +31,12 @@ Each Tinfirm release carries the binary for these platforms on its [GitHub Relea
 | `tinfirm-runner-host-<version>-aarch64-unknown-linux-musl.tar.gz` | Linux arm64, static |
 | `tinfirm-runner-host-<version>-aarch64-apple-darwin.tar.gz` | macOS on Apple silicon |
 | `tinfirm-runner-host-<version>-x86_64-pc-windows-msvc.zip` | Windows: planned |
+| `tinfirm-node-agent-<version>-x86_64-unknown-linux-musl.tar.gz` | The node agent of a sandbox node, Linux x86_64, static |
+| `tinfirm-node-agent-<version>-aarch64-unknown-linux-musl.tar.gz` | The node agent of a sandbox node, Linux arm64, static |
 
-`<version>` is `x.y.z` for a release `vx.y.z`, such as `1.0.0`, and `rolling-<short sha>` for `rolling`. Only the runner host is published, as these archives and as the image `ghcr.io/flowtivo/tinfirm-runner-host` (`:v1.0.0` for v1.0.0); the runner images, which contain Claude Code, are built on your machine and never pushed to a registry.
+`<version>` is `x.y.z` for a release `vx.y.z`, such as `1.0.0`, and `rolling-<short sha>` for `rolling`. Only the runner host and the node agent are published: the runner host as these archives and as the image `ghcr.io/flowtivo/tinfirm-runner-host` (`:v1.0.0` for v1.0.0), the node agent as its archives alone. The runner images, which contain Claude Code, are built on your machine and never pushed to a registry.
+
+The node agent runs on the sandbox nodes of a control host whose VMs run on your own machines ([With sandbox nodes](helm.md#with-sandbox-nodes)), not on a runner host. Install it from the same release as the runner host, which checks the agent's release when it connects. Download and check its archive as the runner host's below, with `tinfirm-node-agent` in place of `tinfirm-runner-host` and a Linux target; its archive holds the binary, its licence and the licences of the crates it is built with. The Ansible role in `deploy/ansible` installs it with its service units, the node's own firewall and the guest's kernel and image, and a control host beside it ([Sandbox nodes on your own machines](sandbox-nodes.md)). The node's hardening, which the role sets up by default, has run on no machine yet, and sandbox nodes are not ready for production: the role ran on a machine once, with ten conversations with real runtimes through that node.
 
 On Kubernetes, the Helm chart can run a company host for you, as a pod whose sandboxes are VMs, with no machine of its own and no registration in the app: [The runner pod](helm.md#the-runner-pod).
 
@@ -113,7 +117,7 @@ TimeoutStopSec=180
 WantedBy=multi-user.target
 ```
 
-Settings that are not options of the unit's command go in its environment (`Environment=` or an `EnvironmentFile=`): the reference lists every `TINFIRM_RUNNER_*` variable. For Linux VMs with Kata Containers, the Ansible role in `deploy/ansible` of Tinfirm's source installs Docker, Kata, the binary and this unit, logs in and builds the images.
+Settings that are not options of the unit's command go in its environment (`Environment=` or an `EnvironmentFile=`): the reference lists every `TINFIRM_RUNNER_*` variable. For Linux VMs with Kata Containers, the Ansible role in `deploy/ansible` of Tinfirm's source installs Docker, Kata, the binary and this unit, logs in and builds the images. For a control host whose VMs run on sandbox nodes, its play `control-host.yml` installs the binary and this unit with `run --executor vm --vm-driver node`, and no Docker, Kata or image ([Sandbox nodes on your own machines](sandbox-nodes.md)).
 
 **A company host is a tier-0 asset.** It receives the git token and the prompt of every conversation it runs, so harden it like the server. The Ansible role does by default, and a unit you write yourself should too:
 
@@ -123,6 +127,8 @@ Settings that are not options of the unit's command go in its environment (`Envi
 - every download checked: the release's `SHA256SUMS` against its signature `SHA256SUMS.sig` and FLOWTIVO's public key (`tinfirm_runner_host_public_key`, the key shipped with the role; `tinfirm_runner_host_allow_unsigned` admits a release without a signature), then the archive against `SHA256SUMS`, Kata's tarball against its SHA-256, Docker's repository key by its fingerprint.
 
 The role's variables turn each of them off (`tinfirm_runner_host_egress_proxy`, `tinfirm_runner_host_sandbox_bridge`, `tinfirm_runner_host_uid`); `deploy/ansible/README.md` lists them.
+
+**A sandbox node is a tier-1 asset.** A node runs the VMs of a control host and holds no credential: no git token, no host token and no model token. Whoever takes a node over reads the files and prompts of the runs on it and can change the work they hand back, which the control host then pushes to each run's own branch. So a node is a lower tier than the control host, with the same administrators: give its administration only to the people who administer the control host, admit nothing to it but the control host and your one management address, and replace its image on a schedule. The node's role does the second and makes the third easy ([Sandbox nodes on your own machines](sandbox-nodes.md#who-administers-a-node)). Sandbox nodes are not ready for production yet ([With sandbox nodes](helm.md#with-sandbox-nodes)).
 
 ## What a run does
 
@@ -150,15 +156,17 @@ Each run gets a container `tinfirm-run-<run id>` with these limits, which are fi
 
 It mounts the workspace at `/workspace`, the agent's home at `/home/agent` (kept per conversation, so that the next turn resumes the session), the conversation's files read-only at `/attachments`, an empty writable `/output`, and the agent's skills read-only. It never mounts a mirror, and a sandbox is never `--privileged`.
 
+**The sandbox bridge.** With `--sandbox-bridge`, each sandbox's bridge has a listener of its own on the sandbox network's gateway address, on a port the system picks, or one of `--sandbox-bridge-ports FROM-TO` (`TINFIRM_RUNNER_SANDBOX_BRIDGE_PORTS`) for a firewall ([Firewalls](#firewalls)). The range must hold a port for each run the host runs at once: a run that finds none free fails. Inside the sandbox, the bridge listens on 127.0.0.1 port 18761 for the git proxy and the platform tools, 18762 for the model proxy and 18763 for the egress proxy, and the host opens no listener for them. **An image must leave those three ports free:** a program of the image that holds one of them fails the run at its start, with an error that names the service and the port. A run's record (`runs/<run>.json` in the data directory, mode 0600) keeps its bridge's TLS identity, port and peer, so that a host that restarts takes the run back on the same port. A host with VMs, on sandbox nodes or a provider's, keeps one bridge port for all its VMs for now.
+
 ### Isolation
 
-By default a sandbox is a container under Docker's default runtime, runc, which shares the machine's kernel. `--sandbox-runtime <name>` picks another runtime that Docker knows; the host reports the tier by the runtime's name:
+By default a sandbox is a container under Docker's default runtime, runc, which shares the machine's kernel. `--sandbox-runtime <name>` picks another runtime that Docker knows. Every host with Docker reports the level of isolation `container`, since its credentials are on the machine that runs the sandboxes; the runtime changes what an escape must get through first:
 
-| Tier | Runtime | What it is |
+| Runtime | What it is | The host reports |
 |---|---|---|
-| `container` | runc, Docker's default | A container on the machine's kernel |
-| `gvisor` | a runtime whose name starts with `runsc` | gVisor's user-space kernel |
-| `microvm` | a runtime whose name starts with `kata` | A Kata Containers microVM with its own kernel; needs Linux with KVM |
+| runc, Docker's default | A container on the machine's kernel | `container` |
+| a runtime whose name starts with `runsc` | gVisor's user-space kernel | `gvisor`, shown as **container with gVisor** and placed as `container` |
+| a runtime whose name starts with `kata` | A Kata Containers microVM with its own kernel; needs Linux with KVM | `container` |
 
 **Docker in the sandbox.** With `--sandbox-docker`, the agent gets its own Docker daemon in its sandbox, for Testcontainers, `docker compose` and image builds. That needs a container that is root with every capability, so `run` refuses it unless the runtime's name starts with `kata`: root then reaches the microVM, not the machine. The agent's Docker keeps its data on a sparse disk of 40 GB by default, and the sandbox's limits cover it and its containers.
 
@@ -210,7 +218,7 @@ Loopback and link-local addresses, cloud metadata among them, are always refused
 
 A run paid by a budget gets the address of the server's model relay and a token for that run alone. The host never puts that token into the sandbox: it starts a listener for the run that holds it, and the agent gets the listener's address and a dummy key. The listener forwards only the model API's paths, adds the token and the host's own token, and refuses everything else. This is always on in every runner host that speaks runner protocol 2, so the server sends runs paid by a budget to any of them. `--model-proxy` is a former option that does nothing; remove it from service files.
 
-The listeners bind the address of the host's git proxy, each on a port the system picks:
+With `--sandbox-bridge` the host opens no listener for it: the sandbox reaches it through its bridge ([The sandbox](#the-sandbox)). Without the bridge, the listeners bind the address of the host's git proxy, each on a port the system picks:
 
 | Setup | Listeners on | Sandboxes connect to |
 |---|---|---|
@@ -250,6 +258,14 @@ Two limits must each have a free slot before a run starts: the host's slots and,
 
 The host uses the lower of **Runs at a time** and its ceiling, or the ceiling when nothing is set: Tinfirm can lower use, never raise it. A change in Tinfirm applies at once, without a restart, and fewer slots never stop a running turn: the host takes no new one until fewer run. A new ceiling needs a new start of `run`. Start hosts with generous ceilings, such as `--max-concurrent-runs 8`, and lower the number in Tinfirm. Size the machine for its ceiling: each run may use 4 GiB of memory and 2 CPUs.
 
+## A host that takes no runs
+
+A host with a VM per run whose driver can make no VM (its `verify` reports problems and no free room, for example a sandbox node whose firewall table is missing) takes no runs until the driver can again. It says so to the server, and its card shows **Takes no runs** beside **Online**, with a section **Why it takes no runs**: what the problem means ("Its VM driver can make no VM"), the host's own words, and since when. Turns that only this host may run wait, and their reason names the host and its problem. Tinfirm sends the host no run, and spends no audit event, token or new epoch on them, until it reports that it takes runs again; then they start at once. The company's audit has one `runner_host.health_failed` event when the host stops taking runs and one `runner_host.health_restored` when it starts again.
+
+Fix the cause on the host's side (the driver's log, `tinfirm-runner-host doctor`, the node). The host checks its driver again every 30 seconds by itself. A disconnect, or a restart of the server, clears the card: the host says it again after it reconnects, as long as the problem holds.
+
+A host of an older release does not report this: it rejects each run instead, and the run waits **Tries again** in its reason. Each further rejection of a run by the same host doubles the wait, up to five minutes (`TINFIRM_RUN_REJECT_BACKOFF_MAX`), so such a host costs one attempt per run every five minutes.
+
 ## Drain and upgrade
 
 A **drain** lets the active runs finish instead of cancelling them:
@@ -260,7 +276,7 @@ A **drain** lets the active runs finish instead of cancelling them:
 
 A drain can last as long as the longest turn. SIGTERM or `Ctrl-C` during a drain cancels what is still running. Closing the terminal of a foreground `run` drains it too.
 
-To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts.
+To **upgrade**, install the new binary in place of the old, then drain: `systemctl reload tinfirm-runner-host`, or by hand `tinfirm-runner-host drain && tinfirm-runner-host run`. The new `run` rebuilds the images whose Dockerfiles the new binary changed, with the build arguments `images build` recorded, before it connects: a rebuild from Docker's cache takes seconds, a new base image minutes, during which the host is offline. An image that cannot be built is logged, and `run` goes on with the one it has. `run --no-image-rebuild` keeps the images as they are. Upgrade the server before its hosts. A host with a VM per run or Kata Containers of a release before the levels of isolation stops when the upgraded server refuses it (`UPGRADE_REQUIRED`): upgrade it right after the server.
 
 ## Disk maintenance
 
@@ -278,6 +294,7 @@ Mirrors in use are never deleted; the others are garbage-collected when due. `mi
 ## Firewalls
 
 - **Inbound:** a host needs no inbound port.
-- **From the sandboxes:** they reach the host's git proxy, its platform tools and, for runs paid by a budget, the model proxy's listeners on the gateway address of the sandbox network, the latter on ports the system picks. With ufw or firewalld, allow traffic from `docker0` (and `tinfirm-sandbox-egress` with the egress proxy) to that address on every port. A rule for one fixed port leaves the model proxy closed, and runs paid by a budget fail.
+- **From the sandboxes, with `--sandbox-bridge`:** they reach only their bridges' ports on the gateway address of the sandbox network; the git proxy, the platform tools, the model proxy and the egress proxy come through the bridge and need no rule. With ufw or firewalld, allow TCP from `docker0` (and `tinfirm-sandbox-egress` with the egress proxy) to that address on the range of `--sandbox-bridge-ports`, or, without it, on the system's range for local ports (`net.ipv4.ip_local_port_range`). During the first start after an upgrade from a release with one shared bridge port, that port (kept in `runs/bridge.json` in the data directory) is opened once more while the runs of the release before are taken back: keep it allowed until they have ended.
+- **From the sandboxes, without the bridge:** they reach the host's git proxy, its platform tools and, for runs paid by a budget, the model proxy's listeners on the gateway address of the sandbox network, the latter on ports the system picks. Allow traffic from those networks to that address on every port. A rule for one fixed port leaves the model proxy closed, and runs paid by a budget fail.
 - **Other services of the machine**, such as SSH or a metrics exporter, answer a sandbox when they listen on all interfaces. Bind them to other interfaces, or drop input from the sandbox bridges except for the runner host's own listeners.
 - **Outbound:** the server's public URL over https, the git hosts of the company's repositories, and, for building images, Docker Hub and the package registries, or your mirrors of them ([Image build arguments](../reference/runner-host.md#image-build-arguments)).

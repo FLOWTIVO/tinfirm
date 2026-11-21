@@ -18,6 +18,9 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 
 import com.flowtivo.tinfirm.runner.EffortLevel;
+import com.flowtivo.tinfirm.runner.Hardening;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
+import com.flowtivo.tinfirm.runner.IsolationTier;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
 import com.flowtivo.tinfirm.support.ProtocolSchema;
@@ -39,7 +42,7 @@ class RunnerProtocolSchemaTest {
     /** The runner host's samples of protocol v2: the frames it sends and expects. */
     private static final Path V2_SAMPLES = Path.of("../runner/crates/tinfirm-protocol/tests/samples/v2");
 
-    private static final Set<String> SERVER_TYPES = Set.of("welcome", "run.assign", "run.cancel",
+    private static final Set<String> SERVER_TYPES = Set.of("welcome", "run.assign", "run.cancel", "run.git.revoke", "welcome.done",
             "run.repository_request.ack", "run.task_create.ack", "run.ask.ack", "run.request.ack", "run.steer",
             "host.config", "psl.update");
 
@@ -444,7 +447,8 @@ class RunnerProtocolSchemaTest {
         RunnerMessages.Hello hello = (RunnerMessages.Hello) codec
             .decode(Files.readString(V2_SAMPLES.resolve("hello.json")), RunnerMessageCodec.ANY_VERSION);
         assertThat(hello.protocolVersion()).isEqualTo(2);
-        assertThat(hello.isolationTiers()).containsExactly("microvm");
+        assertThat(hello.isolationTiers()).isNotEmpty();
+        assertThat(hello.carriesMicrovm()).as("a host of this release never sends microvm").isFalse();
         RunnerMessages.RunRequest tool = (RunnerMessages.RunRequest) codec
             .decode(Files.readString(V2_SAMPLES.resolve("run.request-tool.json")), 2);
         assertThat(tool.kind()).isEqualTo("TOOL");
@@ -468,6 +472,116 @@ class RunnerProtocolSchemaTest {
             .decode(Files.readString(V2_SAMPLES.resolve("run.finished-failed.json")), 2);
         assertThat(failed.resumed()).isFalse();
         assertThat(failed.resumeOutcome()).isEqualTo(RunnerMessages.ResumeOutcome.NO_SESSION);
+    }
+
+    /** A hello of this version with these tiers and these extra fields (raw JSON after a comma, or nothing). */
+    private static String isolationHello(int version, String tiers, String extra) {
+        return """
+                {"type":"hello","protocolVersion":%d,"runnerVersion":"1.0.0","executors":["docker"],
+                 "isolationTiers":%s,"maxConcurrentRuns":2,"runtimes":[],"credentials":[]%s}"""
+            .formatted(version, tiers, extra.isEmpty() ? "" : "," + extra);
+    }
+
+    /** What the server stores of a hello of protocol 2 with these tiers and extra fields. */
+    private RunnerHostStore.Isolation stored(String tiers, String extra) {
+        return RunnerHostSessions.isolation((RunnerMessages.Hello) codec.decode(isolationHello(2, tiers, extra), 2));
+    }
+
+    /**
+     * ADR-0113, decision 1 as the owner settled it on 2026-11-14: {@code hello.isolationTiers} carries the level,
+     * {@code hello.hardened} the hardening (absent {@code no}) and {@code hello.isolationStated} the operator's
+     * statement (absent false). The server stores them as reported and refuses none for its content.
+     */
+    @Test
+    void theLevelIsTheTierWithTheHardeningAndTheStatementBesideIt() {
+        for (String allowed : List.of(
+                isolationHello(2, "[\"machine\"]", "\"hardened\":\"none\""),
+                isolationHello(2, "[\"vm-jail\"]", "\"hardened\":\"no\",\"isolationStated\":true"),
+                isolationHello(2, "[\"container\"]", ""),
+                isolationHello(2, "[\"gvisor\"]", "\"hardened\":\"yes\""))) {
+            assertThat(ProtocolSchema.violations(2, allowed)).as(allowed).isEmpty();
+            RunnerMessages.Hello hello = (RunnerMessages.Hello) codec.decode(allowed, 2);
+            assertThat(hello.carriesMicrovm()).as(allowed).isFalse();
+            assertThat(RunnerHostSessions.helloProblem(hello)).as(allowed).isNull();
+        }
+        assertThat(stored("[\"machine\"]", "\"hardened\":\"none\""))
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.MACHINE, false, Hardening.NONE, false));
+        assertThat(stored("[\"vm-jail\"]", "\"hardened\":\"no\",\"isolationStated\":true"))
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.VM_JAIL, false, Hardening.NO, true));
+        assertThat(stored("[\"container\"]", ""))
+            .as("absent hardening is no, absent statement false")
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, false, Hardening.NO, false));
+        assertThat(stored("[\"gvisor\"]", "\"hardened\":\"yes\""))
+            .as("gVisor is placed as container")
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, true, Hardening.YES, false));
+        assertThat(stored("[\"container\"]", "\"hardened\":null,\"isolationStated\":null"))
+            .as("an explicit null is read as absent")
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, false, Hardening.NO, false));
+
+        // A host sends one value; one that sends several is placed by the weakest wall it reports.
+        assertThat(ProtocolSchema.violations(2, isolationHello(2, "[\"machine\",\"container\"]", ""))).isEmpty();
+        assertThat(stored("[\"machine\",\"container\"]", "").level()).isEqualTo(IsolationLevel.CONTAINER);
+        assertThat(stored("[\"machine\",\"vm-jail\"]", "").level()).isEqualTo(IsolationLevel.VM_JAIL);
+        assertThat(stored("[\"vm-jail\",\"gvisor\"]", ""))
+            .isEqualTo(new RunnerHostStore.Isolation(IsolationLevel.CONTAINER, true, Hardening.NO, false));
+        assertThat(stored("[\"gvisor\",\"container\"]", "").gvisor()).as("runc is the weaker wall").isFalse();
+
+        // The draft's feature host.isolation and object hello.isolation are an unknown feature and field: ignored.
+        RunnerMessages.Hello draft = (RunnerMessages.Hello) codec.decode(isolationHello(2, "[\"container\"]",
+                "\"features\":[\"host.isolation\"],\"isolation\":{\"level\":\"machine\",\"hardened\":\"none\"}"), 2);
+        assertThat(RunnerHostSessions.helloProblem(draft)).isNull();
+        assertThat(RunnerHostSessions.isolation(draft).level()).isEqualTo(IsolationLevel.CONTAINER);
+
+        // A level or a hardening the protocol does not name is a bad frame.
+        String cloud = isolationHello(2, "[\"cloud\"]", "");
+        assertThat(ProtocolSchema.violations(2, cloud)).isNotEmpty();
+        assertThat(code(cloud, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        String maybe = isolationHello(2, "[\"machine\"]", "\"hardened\":\"maybe\"");
+        assertThat(ProtocolSchema.violations(2, maybe)).isNotEmpty();
+        assertThat(code(maybe, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+    }
+
+    /**
+     * ADR-0113, decision 2: {@code microvm} is no value of protocol 2. The schema refuses it, and the server decodes
+     * it only to refuse the hello by name ({@code UPGRADE_REQUIRED}), with a message that names what to install.
+     */
+    @Test
+    void microvmIsNoTierOfProtocol2AndItsHostIsToldToUpgrade() {
+        for (String tiers : List.of("[\"microvm\"]", "[\"container\",\"microvm\"]")) {
+            String hello = isolationHello(2, tiers, "\"features\":[\"sandbox.bridge\"]");
+            assertThat(ProtocolSchema.violations(2, hello)).as(hello).isNotEmpty();
+            assertThat(((RunnerMessages.Hello) codec.decode(hello, 2)).carriesMicrovm()).as(hello).isTrue();
+        }
+        assertThat(RunnerWebSocketHandler.microvmRefusal("0.42.0"))
+            .contains("microvm", "version 0.42.0", "Upgrade tinfirm-runner-host on this host to version 0.42.0",
+                    "container for Kata Containers", "machine or vm-jail for a VM per run");
+        assertThat(RunnerWebSocketHandler.microvmRefusal(null))
+            .contains("Upgrade tinfirm-runner-host on this host to this server's version");
+    }
+
+    /**
+     * Protocol 1 does not change: its tiers ({@code container}, {@code gvisor}, {@code microvm}) are what its schema
+     * allows. They are read as the level {@code container} ({@code microvm}, which no host of protocol 1 sent, is the
+     * level of a Kata host), and protocol 2's fields and levels are not protocol 1's.
+     */
+    @Test
+    void protocol1KeepsItsTiersAndReportsContainer() {
+        for (String tiers : List.of("[\"container\"]", "[\"gvisor\"]", "[\"microvm\"]")) {
+            String hello = isolationHello(1, tiers, "\"hardened\":\"yes\",\"isolationStated\":true");
+            RunnerMessages.Hello decoded = (RunnerMessages.Hello) codec.decode(hello, RunnerMessageCodec.ANY_VERSION);
+            assertThat(decoded.carriesMicrovm()).as(hello).isFalse();
+            RunnerHostStore.Isolation isolation = RunnerHostSessions.isolation(decoded);
+            assertThat(isolation.level()).as(hello).isEqualTo(IsolationLevel.CONTAINER);
+            assertThat(isolation.hardened()).as(hello).isEqualTo(Hardening.NO);
+            assertThat(isolation.stated()).as(hello).isFalse();
+        }
+        assertThat(ProtocolSchema.violations(isolationHello(1, "[\"microvm\"]", ""))).isEmpty();
+        for (String tiers : List.of("[\"machine\"]", "[\"vm-jail\",\"container\"]")) {
+            String hello = isolationHello(1, tiers, "");
+            assertThat(ProtocolSchema.violations(hello)).as(hello).isNotEmpty();
+            assertThat(code(hello)).as(hello).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        }
+        assertThat(IsolationTier.ofWire("vm-jail")).isEqualTo(IsolationTier.VM_JAIL);
     }
 
     @Test
@@ -531,6 +645,9 @@ class RunnerProtocolSchemaTest {
                 "resume", null, List.of(), List.of());
         List<RunnerMessages.Outbound> frames = List.of(
                 new RunnerMessages.Welcome(2, UUID.randomUUID(), UUID.randomUUID(), "0.1.0", 10, 30),
+                // ADR-0116: a server of this release names the features it implements.
+                new RunnerMessages.Welcome(2, UUID.randomUUID(), UUID.randomUUID(), "0.1.0", 10, 30,
+                        RunnerMessages.SERVER_FEATURES),
                 withTools, withoutTools, new RunnerMessages.RunCancel(runId, 1),
                 RunnerMessages.RunRequestAck.pending(runId, UUID.randomUUID(), UUID.randomUUID(), "posted"),
                 RunnerMessages.RunRequestAck.pending(runId, UUID.randomUUID(), UUID.randomUUID(), null),
@@ -546,11 +663,32 @@ class RunnerProtocolSchemaTest {
                         "The call of `jira_comment` on Jira was interrupted (TOOL_INTERRUPTED): …",
                         JSON.readTree("{\"code\":\"TOOL_INTERRUPTED\",\"cause\":\"TIMEOUT\"}"), true), null),
                 RunnerMessages.ProtocolError.of(RunnerMessages.UNKNOWN_TYPE, "run.ask is not a message of v2"),
-                new RunnerMessages.HostConfig(1, 2, List.of()));
+                new RunnerMessages.HostConfig(1, 2, List.of()),
+                // ADR-0116: the end of a hello's answer, then the revocation of a repository's git token.
+                new RunnerMessages.WelcomeDone(),
+                new RunnerMessages.RunGitRevoke(runId, 1, List.of(UUID.randomUUID()), "RECONNECT_COMPANY",
+                        "Tinfirm revoked this run's access to acme/shop: the shared credential CI bot was disabled."));
         for (RunnerMessages.Outbound frame : frames) {
             String json = codec.encode(frame);
             assertThat(ProtocolSchema.violations(2, json)).as(json).isEmpty();
         }
+        assertThat(codec.encode(new RunnerMessages.WelcomeDone())).isEqualTo("{\"type\":\"welcome.done\"}");
+        JsonNode welcome = JSON.readTree(codec.encode(frames.get(1)));
+        assertThat(welcome.get("features")).extracting(JsonNode::asString)
+            .contains("run.git.revoke", "run.git.refresh", "run.steer");
+        assertThat(JSON.readTree(codec.encode(frames.getFirst())).has("features")).isFalse();
+        JsonNode revoke = JSON.readTree(codec.encode(frames.getLast()));
+        assertThat(revoke.get("type").asString()).isEqualTo("run.git.revoke");
+        assertThat(revoke.get("componentIds")).hasSize(1);
+        // Never "every repository": a frame names one to 20, with a message of 1 to 1000 characters.
+        assertThatThrownBy(() -> new RunnerMessages.RunGitRevoke(runId, 1, List.of(), "X", "m"))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new RunnerMessages.RunGitRevoke(runId, 1, List.of(UUID.randomUUID()), "X",
+                "m".repeat(1001))).isInstanceOf(IllegalArgumentException.class);
+        // The schema refuses what the record refuses.
+        assertThat(ProtocolSchema.violations(2, """
+                {"type":"run.git.revoke","runId":"%s","epoch":1,"componentIds":[],"reason":"X","message":"m"}"""
+            .formatted(runId))).isNotEmpty();
         JsonNode assign = JSON.readTree(codec.encode(withTools));
         assertThat(assign.has("task")).isFalse();
         assertThat(assign.get("workItem").get("key").asString()).isEqualTo("SHOP-1");
@@ -564,13 +702,13 @@ class RunnerProtocolSchemaTest {
         JsonNode noHosts = JSON.readTree(codec.encode(withoutTools)).get("allowedHosts");
         assertThat(noHosts.isArray()).isTrue();
         assertThat(noHosts).isEmpty();
-        JsonNode toolAck = JSON.readTree(codec.encode(frames.get(7)));
+        JsonNode toolAck = JSON.readTree(codec.encode(frames.get(8)));
         assertThat(toolAck.get("payload").get("isError").asBoolean()).isFalse();
         assertThat(toolAck.get("payload").get("content").get(0).get("type").asString()).isEqualTo("text");
         assertThat(toolAck.get("payload").get("structuredContent").get("count").asInt()).isEqualTo(1);
         // A v2 frame is no v1 frame: the welcome's version and the assignment's shape differ.
         assertThat(ProtocolSchema.violations(1, codec.encode(withTools))).isNotEmpty();
-        assertThat(ProtocolSchema.violations(1, codec.encode(frames.get(4)))).isNotEmpty();
+        assertThat(ProtocolSchema.violations(1, codec.encode(frames.get(5)))).isNotEmpty();
         // A v1 host is sent protocolVersion 1, which its schema allows (and the host ignores).
         assertThat(ProtocolSchema.violations(1, codec.encode(new RunnerMessages.Welcome(1, UUID.randomUUID(),
                 UUID.randomUUID(), null, 10, 30)))).isEmpty();
@@ -696,11 +834,34 @@ class RunnerProtocolSchemaTest {
         assertThat(hello.featureSet()).containsExactly(RunnerMessages.FEATURE_RUN_STEER);
         String plain = """
                 {"type":"hello","protocolVersion":2,"runnerVersion":"1","executors":["docker"],
-                 "isolationTiers":["microvm"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]%s}""";
+                 "isolationTiers":["container"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]%s}""";
         assertThat(((RunnerMessages.Hello) codec.decode(plain.formatted(""))).featureSet()).isEmpty();
         assertThat(((RunnerMessages.Hello) codec.decode(plain.formatted(",\"features\":[\"run.steer\",\"later.x\"]")))
             .featureSet()).containsExactlyInAnyOrder("run.steer", "later.x");
         assertThat(code(plain.formatted(",\"features\":[\"Run Steer\"]"))).isEqualTo(RunnerMessages.BAD_MESSAGE);
+    }
+
+    @Test
+    void theConfirmationOfARevocationMatchesTheV2Schema() {
+        UUID runId = UUID.randomUUID();
+        UUID first = UUID.randomUUID();
+        UUID second = UUID.randomUUID();
+        String frame = """
+                {"type":"run.git.revoked","runId":"%s","epoch":4,"componentIds":[%s]}""";
+        String valid = frame.formatted(runId, "\"" + first + "\",\"" + second + "\"");
+        assertThat(ProtocolSchema.violations(2, valid)).isEmpty();
+        RunnerMessages.RunGitRevoked revoked = (RunnerMessages.RunGitRevoked) codec.decode(valid, 2);
+        assertThat(revoked.runId()).isEqualTo(runId);
+        assertThat(revoked.epoch()).isEqualTo(4L);
+        assertThat(revoked.componentIds()).containsExactly(first, second);
+        // One to 20 repositories, each once, as the schema says; a frame of protocol 2 only.
+        String none = frame.formatted(runId, "");
+        String twice = frame.formatted(runId, "\"" + first + "\",\"" + first + "\"");
+        assertThat(ProtocolSchema.violations(2, none)).isNotEmpty();
+        assertThat(ProtocolSchema.violations(2, twice)).isNotEmpty();
+        assertThat(code(none, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        assertThat(code(twice, 2)).isEqualTo(RunnerMessages.BAD_MESSAGE);
+        assertThat(code(valid, 1)).isEqualTo(RunnerMessages.UNKNOWN_TYPE);
     }
 
     @Test
@@ -718,14 +879,14 @@ class RunnerProtocolSchemaTest {
 
         String hello = """
                 {"type":"hello","protocolVersion":2,"runnerVersion":"1","executors":["docker"],
-                 "isolationTiers":["microvm"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[],
+                 "isolationTiers":["container"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[],
                  "publicSuffixList":{"sha256":"%s"}}""".formatted(sha);
         assertThat(ProtocolSchema.violations(2, hello)).isEmpty();
         RunnerMessages.Hello decoded = (RunnerMessages.Hello) codec.decode(hello);
         assertThat(decoded.publicSuffixList().sha256()).isEqualTo(sha);
         assertThat(((RunnerMessages.Hello) codec.decode("""
                 {"type":"hello","protocolVersion":2,"runnerVersion":"1","executors":["docker"],
-                 "isolationTiers":["microvm"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]}""")).publicSuffixList())
+                 "isolationTiers":["container"],"maxConcurrentRuns":2,"runtimes":[],"credentials":[]}""")).publicSuffixList())
             .isNull();
         assertThat(code(hello.replace(sha, "XYZ"))).isEqualTo(RunnerMessages.BAD_MESSAGE);
     }

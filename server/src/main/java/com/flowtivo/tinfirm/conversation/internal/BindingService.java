@@ -315,6 +315,8 @@ class BindingService implements ConversationBindings {
         messages.system(binding.companyId(), binding.conversationId(), texts.followed(binding, replaced) + ".", null);
         events.publishEvent(new ConversationEvents.BindingBound(binding.companyId(), binding.conversationId(),
                 binding.id(), binding.systemId()));
+        events.publishEvent(new ConversationEvents.BindingFollowed(binding.companyId(), binding.conversationId(),
+                binding.id(), binding.systemId(), before.accountId(), credential.id()));
         hooks.forEach(hook -> hook.bound(binding));
         refresh(binding);
         return store.lock(binding.companyId(), binding.id()).orElseThrow();
@@ -382,6 +384,11 @@ class BindingService implements ConversationBindings {
 
     @Override
     public BindingUse use(UUID companyId, UUID bindingId, String purpose) {
+        return use(companyId, bindingId, purpose, null);
+    }
+
+    @Override
+    public BindingUse use(UUID companyId, UUID bindingId, String purpose, @Nullable GitScope scope) {
         NoTransaction.require("Using a conversation's binding");
         Checked checked = transactions.inCompany(companyId, () -> {
             lockConversationOf(companyId, bindingId);
@@ -408,6 +415,9 @@ class BindingService implements ConversationBindings {
         if (!(checked.check() instanceof BindingCheck.Usable usable)) {
             return new BindingUse.Unavailable(checked.check().binding());
         }
+        if (scope != null && usable.account().kind() == AccountInfo.Kind.APP) {
+            return appTokens(companyId, bindingId, usable, checked.personPrincipalId(), purpose, scope);
+        }
         Optional<Accounts.RevealedCredential> credential = accounts.reveal(companyId, usable.account().id(),
                 checked.personPrincipalId(), purpose);
         if (credential.isEmpty()) {
@@ -426,6 +436,49 @@ class BindingService implements ConversationBindings {
                     : new BindingUse.Unavailable(again.binding());
         }
         return new BindingUse.Token(usable.binding(), usable.account(), usable.access(), credential.get());
+    }
+
+    /**
+     * ADR-0116, decision 8: a run's own tokens of an {@code APP} credential, one per access (a read-only repository,
+     * or every repository of a binding whose access is {@code READ} now, gets a read token), each limited to its
+     * repositories. A credential that cannot mint any more is checked again, as a reveal that failed is.
+     */
+    private BindingUse appTokens(UUID companyId, UUID bindingId, BindingCheck.Usable usable, UUID actingPrincipalId,
+            String purpose, GitScope scope) {
+        java.util.Map<GrantInfo.Access, List<GitRepository>> byAccess = new java.util.EnumMap<>(GrantInfo.Access.class);
+        for (GitRepository repository : scope.repositories()) {
+            GrantInfo.Access access = repository.readOnly() || usable.access() == GrantInfo.Access.READ
+                    ? GrantInfo.Access.READ : GrantInfo.Access.WRITE;
+            byAccess.computeIfAbsent(access, key -> new java.util.ArrayList<>()).add(repository);
+        }
+        java.util.Map<UUID, Accounts.RunGitToken.Minted> tokens = new java.util.HashMap<>();
+        for (java.util.Map.Entry<GrantInfo.Access, List<GitRepository>> group : byAccess.entrySet()) {
+            Accounts.RunGitToken minted = accounts.mintForRun(companyId, usable.account().id(), actingPrincipalId,
+                    purpose, group.getValue().stream().map(GitRepository::url).toList(), group.getKey());
+            switch (minted) {
+                case Accounts.RunGitToken.Minted token -> group.getValue()
+                    .forEach(repository -> tokens.put(repository.repositoryId(), token));
+                case Accounts.RunGitToken.NotCovered notCovered -> {
+                    return new BindingUse.NotCovered(usable.binding(), notCovered.message());
+                }
+                case Accounts.RunGitToken.Unavailable unavailable -> {
+                    return new BindingUse.Failed(usable.binding());
+                }
+                case Accounts.RunGitToken.Refused refused -> {
+                    BindingCheck again = transactions.inCompany(companyId, () -> {
+                        lockConversationOf(companyId, bindingId);
+                        BindingStore.BindingRow row = store.lock(companyId, bindingId).orElseThrow();
+                        ConversationInfo conversation = conversations.find(companyId, row.info().conversationId())
+                            .orElseThrow()
+                            .info();
+                        return checked(row, conversation);
+                    });
+                    return again instanceof BindingCheck.Usable holds ? new BindingUse.Failed(holds.binding())
+                            : new BindingUse.Unavailable(again.binding());
+                }
+            }
+        }
+        return new BindingUse.AppTokens(usable.binding(), usable.account(), usable.access(), tokens);
     }
 
     /**
