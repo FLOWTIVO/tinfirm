@@ -3040,21 +3040,27 @@ async fn end_input(
     }
 }
 
-async fn run_agent(
-    shared: &Arc<Shared>,
-    assign: &RunAssign,
-    sink: &mut EventSink,
-    io: SandboxIo,
-    params: AcpParams,
-    stop_rx: &mut watch::Receiver<Option<StopRequest>>,
-    deadline: Instant,
-) -> AgentPhase {
+/// The agent's stdio as the run loop takes it ([`connect_the_agent`]).
+struct AgentIo {
+    /// The agent's stdin as a sink of lines, and its stdout's ACP lines.
+    transport: AcpTransport,
+    /// The agent's stderr, and the lines of its stdout that are no ACP message.
+    logs: mpsc::Receiver<String>,
+    activity: Activity,
+    /// The agent's stdin, which the transport writes to as well: the phase ends it on purpose
+    /// ([`end_input`]).
+    stdin: Arc<tokio::sync::Mutex<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>>,
+}
+
+/// The agent's ACP transport over the sandbox's stdio: its output split into ACP lines and log
+/// lines ([`spawn_output_splitter`]), and its stdin as a sink of lines.
+fn connect_the_agent(io: SandboxIo) -> AgentIo {
     // Bounded like the sandbox's output, the ACP lines by the run's budget of lines in flight
     // as well: a run loop that falls behind holds the agent's output back in the sandbox,
     // never in this process without bound.
     let (line_tx, line_rx) = mpsc::channel::<std::io::Result<AcpLine>>(acp::ACP_LINE_QUEUE);
     let budget = acp::inbound_budget();
-    let (log_tx, mut log_rx) = mpsc::channel::<String>(crate::sandbox::OUTPUT_QUEUE);
+    let (log_tx, log_rx) = mpsc::channel::<String>(crate::sandbox::OUTPUT_QUEUE);
     let activity: Activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
     spawn_output_splitter(io.output, line_tx, budget.clone(), log_tx, activity.clone());
     // The agent's stdin stays here as well as in the transport: the phase ends it on purpose
@@ -3074,37 +3080,65 @@ async fn run_agent(
         lines: line_rx,
         budget,
     };
+    AgentIo {
+        transport,
+        logs: log_rx,
+        activity,
+        stdin,
+    }
+}
 
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let mut acp_future = Box::pin(acp::run_session(transport, params, inbound_tx, control_rx));
+/// The run loop's state of the agent's turn ([`run_agent`]).
+struct AgentTurn {
+    mapper: EventMapper,
+    /// Events that the mapper made and the sink has not taken yet.
+    out: Vec<EventPayload>,
+    session_id: Option<String>,
+    not_resumed: Option<Option<NotResumed>>,
+    /// Why the run stopped the agent: the first cause, or an abort, which overrides it.
+    stop: Option<StopCause>,
+    /// When the agent has to have ended its turn after `session/cancel`.
+    cancel_deadline: Option<tokio::time::Instant>,
+    stderr_events: usize,
+    stderr_tail: Vec<String>,
+    /// To the ACP session: `session/cancel`.
+    control_tx: mpsc::UnboundedSender<AcpControl>,
+    /// How long the agent has to end its turn after `session/cancel`.
+    grace: Duration,
+}
 
-    let mut mapper = EventMapper::new(
-        assign.limits.max_turns,
-        UsageMode::for_runtime(assign.agent.runtime),
-    )
-    .with_redactor({
-        let shared = shared.clone();
-        Arc::new(move || shared.redactor())
-    });
-    let mut session_id: Option<String> = None;
-    let mut not_resumed: Option<Option<NotResumed>> = None;
-    let mut stop: Option<StopCause> = None;
-    let mut cancel_deadline: Option<tokio::time::Instant> = None;
-    let mut stderr_events = 0usize;
-    let mut stderr_tail: Vec<String> = Vec::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(50));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let wall_clock = tokio::time::Instant::from_std(deadline);
-    let inactivity = shared.opts.inactivity_timeout;
-    let grace = shared.opts.cancel_grace;
-    let mut out: Vec<EventPayload> = Vec::new();
+impl AgentTurn {
+    fn new(
+        shared: &Arc<Shared>,
+        assign: &RunAssign,
+        control_tx: mpsc::UnboundedSender<AcpControl>,
+    ) -> AgentTurn {
+        let mapper = EventMapper::new(
+            assign.limits.max_turns,
+            UsageMode::for_runtime(assign.agent.runtime),
+        )
+        .with_redactor({
+            let shared = shared.clone();
+            Arc::new(move || shared.redactor())
+        });
+        AgentTurn {
+            mapper,
+            out: Vec::new(),
+            session_id: None,
+            not_resumed: None,
+            stop: None,
+            cancel_deadline: None,
+            stderr_events: 0,
+            stderr_tail: Vec::new(),
+            control_tx,
+            grace: shared.opts.cancel_grace,
+        }
+    }
 
-    let request_stop = |cause: StopCause,
-                        stop: &mut Option<StopCause>,
-                        cancel_deadline: &mut Option<tokio::time::Instant>,
-                        sink: &mut EventSink| {
-        if stop.is_some() {
+    /// Asks the agent to end its turn (`session/cancel`), once: a later cause does not replace
+    /// the first.
+    fn request_stop(&mut self, cause: StopCause, sink: &mut EventSink) {
+        if self.stop.is_some() {
             return;
         }
         let message = match &cause {
@@ -3118,24 +3152,205 @@ async fn run_agent(
         if cause != StopCause::Abort {
             sink.status(Phase::Cancelling, Some(message));
         }
-        *stop = Some(cause);
-        let _ = control_tx.send(AcpControl::Cancel);
-        *cancel_deadline = Some(tokio::time::Instant::now() + grace);
-    };
+        self.stop = Some(cause);
+        let _ = self.control_tx.send(AcpControl::Cancel);
+        self.cancel_deadline = Some(tokio::time::Instant::now() + self.grace);
+    }
 
-    // Emits mapped events; a redaction hit in agent output is a credential leak, whether the
-    // mapper (which redacts before it truncates) or the sink found it.
-    fn emit_all(
-        sink: &mut EventSink,
-        mapper: &mut EventMapper,
-        out: &mut Vec<EventPayload>,
-    ) -> bool {
-        let mut leak = mapper.take_leak();
-        for event in out.drain(..) {
+    /// Emits mapped events; a redaction hit in agent output is a credential leak, whether the
+    /// mapper (which redacts before it truncates) or the sink found it.
+    fn emit_all(&mut self, sink: &mut EventSink) -> bool {
+        let mut leak = self.mapper.take_leak();
+        for event in self.out.drain(..) {
             leak |= sink.emit(event);
         }
         leak
     }
+
+    /// A message of the agent's session while its turn runs.
+    fn inbound(&mut self, item: AcpInbound, sink: &mut EventSink, assign: &RunAssign) {
+        let now = Instant::now();
+        match item {
+            AcpInbound::Update { params, permit } => {
+                let signals = self.mapper.handle_update(&params, now, &mut self.out);
+                // Mapped: the line's share of the budget goes back to the splitter.
+                drop((params, permit));
+                if self.emit_all(sink) {
+                    self.request_stop(StopCause::Leak, sink);
+                }
+                for signal in signals {
+                    match signal {
+                        Signal::Guard(message) => {
+                            self.request_stop(StopCause::Guard(message), sink)
+                        }
+                        Signal::UsageLimit { resets_at, window } => {
+                            self.request_stop(StopCause::UsageLimit { resets_at, window }, sink)
+                        }
+                    }
+                }
+            }
+            AcpInbound::Prompting {
+                session_id: id,
+                not_resumed: why,
+                agent_version,
+            } => {
+                self.mapper.set_usage_mode(UsageMode::for_agent(
+                    assign.agent.runtime,
+                    agent_version.as_deref(),
+                ));
+                open_session(&mut self.mapper, sink, &id, why.as_ref());
+                sink.session_opened(&id);
+                self.session_id = Some(id);
+                self.not_resumed = Some(why);
+            }
+            AcpInbound::PermissionGranted { title, option } => {
+                sink.log(
+                    LogLevel::Debug,
+                    format!("auto-approved permission ({option}): {title}"),
+                );
+            }
+            AcpInbound::Warning(message) => {
+                tracing::warn!(run_id = %assign.run_id, %message, "agent session");
+                sink.log(LogLevel::Warn, message);
+            }
+            AcpInbound::Info(message) => {
+                sink.log(LogLevel::Info, message);
+            }
+        }
+    }
+
+    /// A log line of the agent while its turn runs: kept in its stderr tail, and the first
+    /// [`MAX_STDERR_EVENTS`] lines in the run's events.
+    fn log_line(&mut self, line: String, sink: &mut EventSink) {
+        if self.stderr_tail.len() >= STDERR_TAIL {
+            self.stderr_tail.remove(0);
+        }
+        self.stderr_tail.push(line.clone());
+        if self.stderr_events < MAX_STDERR_EVENTS {
+            self.stderr_events += 1;
+            sink.log(LogLevel::Debug, line);
+        }
+    }
+
+    /// Drains what arrived before the prompt response: the session, the last updates (a leak
+    /// or a usage limit in them stops the run, unless it stopped already), and the last log
+    /// lines.
+    fn drain(
+        &mut self,
+        inbound_rx: &mut mpsc::UnboundedReceiver<AcpInbound>,
+        log_rx: &mut mpsc::Receiver<String>,
+        sink: &mut EventSink,
+        assign: &RunAssign,
+    ) {
+        while let Ok(item) = inbound_rx.try_recv() {
+            if let AcpInbound::Prompting {
+                session_id: id,
+                not_resumed: why,
+                agent_version,
+            } = item
+            {
+                self.mapper.set_usage_mode(UsageMode::for_agent(
+                    assign.agent.runtime,
+                    agent_version.as_deref(),
+                ));
+                open_session(&mut self.mapper, sink, &id, why.as_ref());
+                self.session_id = Some(id);
+                self.not_resumed = Some(why);
+            } else if let AcpInbound::Update { params, .. } = item {
+                let signals = self
+                    .mapper
+                    .handle_update(&params, Instant::now(), &mut self.out);
+                if self.emit_all(sink) && self.stop.is_none() {
+                    self.stop = Some(StopCause::Leak);
+                }
+                for signal in signals {
+                    if self.stop.is_none()
+                        && let Signal::UsageLimit { resets_at, window } = signal
+                    {
+                        self.stop = Some(StopCause::UsageLimit { resets_at, window });
+                    }
+                }
+            }
+        }
+        while let Ok(line) = log_rx.try_recv() {
+            if self.stderr_events < MAX_STDERR_EVENTS {
+                self.stderr_events += 1;
+                sink.log(LogLevel::Debug, line.clone());
+            }
+            if self.stderr_tail.len() >= STDERR_TAIL {
+                self.stderr_tail.remove(0);
+            }
+            self.stderr_tail.push(line);
+        }
+    }
+
+    /// The end of the turn: the prompt's usage and the last events, the agent's summary, and
+    /// the reset of a usage limit that the agent reported earlier when its stop named none.
+    fn end(mut self, result: Option<AcpResult>, sink: &mut EventSink) -> AgentPhase {
+        let usage_value = result
+            .as_ref()
+            .and_then(|r| r.outcome.as_ref().ok())
+            .and_then(|o| prompt_usage(o.usage.as_ref(), o.meta.as_ref()).cloned());
+        self.mapper
+            .finish_prompt(usage_value.as_ref(), &mut self.out);
+        if self.emit_all(sink) && self.stop.is_none() {
+            self.stop = Some(StopCause::Leak);
+        }
+        let summary = self.mapper.summary().map(|s| sink.redact(&s));
+        let (known_reset, known_window) = self.mapper.last_rate_limit_reset();
+        if let Some(StopCause::UsageLimit { resets_at, window }) = &mut self.stop {
+            if resets_at.is_none() {
+                *resets_at = known_reset;
+            }
+            if window.is_none() {
+                *window = known_window;
+            }
+        }
+        AgentPhase {
+            session_id: self
+                .session_id
+                .or_else(|| result.as_ref().and_then(|r| r.session_id.clone())),
+            not_resumed: self.not_resumed,
+            stop: self.stop,
+            result,
+            summary,
+            usage: self.mapper.usage(),
+            stderr_tail: self.stderr_tail,
+        }
+    }
+}
+
+/// The agent's turn (README "What a run does", steps 5 and 6): its ACP session over the
+/// sandbox's stdio ([`connect_the_agent`], [`acp::run_session`]), whose updates become the
+/// run's events, until the turn ends or the run stops it: a cancel or an abort from the server,
+/// a guard, the inactivity timeout, the wall clock (`deadline`), a credential in the agent's
+/// output, or a usage limit. An agent that does not end its turn within the cancel grace is
+/// left; the caller stops its sandbox.
+async fn run_agent(
+    shared: &Arc<Shared>,
+    assign: &RunAssign,
+    sink: &mut EventSink,
+    io: SandboxIo,
+    params: AcpParams,
+    stop_rx: &mut watch::Receiver<Option<StopRequest>>,
+    deadline: Instant,
+) -> AgentPhase {
+    let AgentIo {
+        transport,
+        mut logs,
+        activity,
+        stdin,
+    } = connect_the_agent(io);
+
+    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let mut acp_future = Box::pin(acp::run_session(transport, params, inbound_tx, control_rx));
+
+    let mut turn = AgentTurn::new(shared, assign, control_tx);
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let wall_clock = tokio::time::Instant::from_std(deadline);
+    let inactivity = shared.opts.inactivity_timeout;
 
     // An initial stop (cancel before the agent started) is honoured right away.
     if let Some(request) = *stop_rx.borrow() {
@@ -3144,63 +3359,19 @@ async fn run_agent(
         } else {
             StopCause::Cancel
         };
-        request_stop(cause, &mut stop, &mut cancel_deadline, sink);
+        turn.request_stop(cause, sink);
     }
 
     let result = loop {
         tokio::select! {
             biased;
             result = &mut acp_future => break Some(result),
-            Some(item) = inbound_rx.recv() => {
-                let now = Instant::now();
-                match item {
-                    AcpInbound::Update { params, permit } => {
-                        let signals = mapper.handle_update(&params, now, &mut out);
-                        // Mapped: the line's share of the budget goes back to the splitter.
-                        drop((params, permit));
-                        if emit_all(sink, &mut mapper, &mut out) {
-                            request_stop(StopCause::Leak, &mut stop, &mut cancel_deadline, sink);
-                        }
-                        for signal in signals {
-                            match signal {
-                                Signal::Guard(message) => request_stop(StopCause::Guard(message), &mut stop, &mut cancel_deadline, sink),
-                                Signal::UsageLimit { resets_at, window } => request_stop(StopCause::UsageLimit { resets_at, window }, &mut stop, &mut cancel_deadline, sink),
-                            }
-                        }
-                    }
-                    AcpInbound::Prompting { session_id: id, not_resumed: why, agent_version } => {
-                        mapper.set_usage_mode(UsageMode::for_agent(assign.agent.runtime, agent_version.as_deref()));
-                        open_session(&mut mapper, sink, &id, why.as_ref());
-                        sink.session_opened(&id);
-                        session_id = Some(id);
-                        not_resumed = Some(why);
-                    }
-                    AcpInbound::PermissionGranted { title, option } => {
-                        sink.log(LogLevel::Debug, format!("auto-approved permission ({option}): {title}"));
-                    }
-                    AcpInbound::Warning(message) => {
-                        tracing::warn!(run_id = %assign.run_id, %message, "agent session");
-                        sink.log(LogLevel::Warn, message);
-                    }
-                    AcpInbound::Info(message) => {
-                        sink.log(LogLevel::Info, message);
-                    }
-                }
-            }
-            Some(line) = log_rx.recv() => {
-                if stderr_tail.len() >= STDERR_TAIL {
-                    stderr_tail.remove(0);
-                }
-                stderr_tail.push(line.clone());
-                if stderr_events < MAX_STDERR_EVENTS {
-                    stderr_events += 1;
-                    sink.log(LogLevel::Debug, line);
-                }
-            }
+            Some(item) = inbound_rx.recv() => turn.inbound(item, sink, assign),
+            Some(line) = logs.recv() => turn.log_line(line, sink),
             _ = tick.tick() => {
-                mapper.flush_due(Instant::now(), &mut out);
-                if emit_all(sink, &mut mapper, &mut out) {
-                    request_stop(StopCause::Leak, &mut stop, &mut cancel_deadline, sink);
+                turn.mapper.flush_due(Instant::now(), &mut turn.out);
+                if turn.emit_all(sink) {
+                    turn.request_stop(StopCause::Leak, sink);
                 }
             }
             _ = async {
@@ -3213,30 +3384,26 @@ async fn run_agent(
                     }
                     tokio::time::sleep_until(due).await;
                 }
-            }, if stop.is_none() => {
-                request_stop(
+            }, if turn.stop.is_none() => {
+                turn.request_stop(
                     StopCause::Guard(format!(
                         "the agent sent no ACP message for {} s (inactivity timeout) and seems hung",
                         inactivity.as_secs()
                     )),
-                    &mut stop,
-                    &mut cancel_deadline,
                     sink,
                 );
             }
-            _ = tokio::time::sleep_until(wall_clock), if stop.is_none() => {
+            _ = tokio::time::sleep_until(wall_clock), if turn.stop.is_none() => {
                 let limit = shared
                     .opts
                     .max_wall_clock_cap
                     .map(|cap| cap.as_secs().min(assign.limits.max_wall_clock_seconds))
                     .unwrap_or(assign.limits.max_wall_clock_seconds);
-                request_stop(
+                turn.request_stop(
                     StopCause::TimeLimit(format!(
                         "the run reached its time limit ({})",
                         duration_words(limit)
                     )),
-                    &mut stop,
-                    &mut cancel_deadline,
                     sink,
                 );
             }
@@ -3246,17 +3413,17 @@ async fn run_agent(
                     match request {
                         Some(StopRequest::Abort) => {
                             // Abort overrides any earlier cause.
-                            stop = None;
-                            request_stop(StopCause::Abort, &mut stop, &mut cancel_deadline, sink);
+                            turn.stop = None;
+                            turn.request_stop(StopCause::Abort, sink);
                             break None;
                         }
-                        Some(StopRequest::Cancel) => request_stop(StopCause::Cancel, &mut stop, &mut cancel_deadline, sink),
+                        Some(StopRequest::Cancel) => turn.request_stop(StopCause::Cancel, sink),
                         None => {}
                     }
                 }
             }
             _ = async {
-                match cancel_deadline {
+                match turn.cancel_deadline {
                     Some(t) => tokio::time::sleep_until(t).await,
                     None => std::future::pending().await,
                 }
@@ -3269,72 +3436,8 @@ async fn run_agent(
     drop(acp_future);
     end_input(&stdin).await;
 
-    // Drain what arrived before the prompt response.
-    while let Ok(item) = inbound_rx.try_recv() {
-        if let AcpInbound::Prompting {
-            session_id: id,
-            not_resumed: why,
-            agent_version,
-        } = item
-        {
-            mapper.set_usage_mode(UsageMode::for_agent(
-                assign.agent.runtime,
-                agent_version.as_deref(),
-            ));
-            open_session(&mut mapper, sink, &id, why.as_ref());
-            session_id = Some(id);
-            not_resumed = Some(why);
-        } else if let AcpInbound::Update { params, .. } = item {
-            let signals = mapper.handle_update(&params, Instant::now(), &mut out);
-            if emit_all(sink, &mut mapper, &mut out) && stop.is_none() {
-                stop = Some(StopCause::Leak);
-            }
-            for signal in signals {
-                if stop.is_none()
-                    && let Signal::UsageLimit { resets_at, window } = signal
-                {
-                    stop = Some(StopCause::UsageLimit { resets_at, window });
-                }
-            }
-        }
-    }
-    while let Ok(line) = log_rx.try_recv() {
-        if stderr_events < MAX_STDERR_EVENTS {
-            stderr_events += 1;
-            sink.log(LogLevel::Debug, line.clone());
-        }
-        if stderr_tail.len() >= STDERR_TAIL {
-            stderr_tail.remove(0);
-        }
-        stderr_tail.push(line);
-    }
-    let usage_value = result
-        .as_ref()
-        .and_then(|r| r.outcome.as_ref().ok())
-        .and_then(|o| prompt_usage(o.usage.as_ref(), o.meta.as_ref()).cloned());
-    mapper.finish_prompt(usage_value.as_ref(), &mut out);
-    if emit_all(sink, &mut mapper, &mut out) && stop.is_none() {
-        stop = Some(StopCause::Leak);
-    }
-    let summary = mapper.summary().map(|s| sink.redact(&s));
-    let (known_reset, known_window) = mapper.last_rate_limit_reset();
-    if let Some(StopCause::UsageLimit { resets_at, window }) = &mut stop {
-        if resets_at.is_none() {
-            *resets_at = known_reset;
-        }
-        if window.is_none() {
-            *window = known_window;
-        }
-    }
-    AgentPhase {
-        session_id: session_id.or_else(|| result.as_ref().and_then(|r| r.session_id.clone())),
-        not_resumed,
-        stop,
-        result,
-        summary,
-        usage: mapper.usage(),
-        stderr_tail,
-    }
+    turn.drain(&mut inbound_rx, &mut logs, sink, assign);
+    turn.end(result, sink)
 }
 
 /// The session is open and the prompt about to be sent: logs the session the agent got, and
