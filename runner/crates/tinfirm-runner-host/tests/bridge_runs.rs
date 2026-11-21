@@ -528,20 +528,82 @@ fn restart_test_host_a() {
         });
 }
 
+/// Whether process `pid` has ended: gone, or a zombie that nobody reaps.
+fn ended(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    stat.rfind(')')
+        .and_then(|at| stat[at + 1..].split_whitespace().next())
+        .is_none_or(|state| state == "Z" || state == "X")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_process_that_its_test_did_not_crash_leaves_nothing_behind() {
+    with_timeout(60, async {
+        let dir = tempfile::tempdir().unwrap();
+        // A "host" that starts a process of its own, as host A starts a local sandbox's bridge,
+        // and then stays, as host A does when its test fails before it kills it.
+        let started = |name: &str| {
+            let pids = dir.path().join(name);
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!(
+                    "sleep 600 & echo $$ $! > {}.tmp && mv {0}.tmp {0}; exec sleep 600",
+                    pids.display()
+                ))
+                .stdout(std::process::Stdio::null());
+            (HostProcess::spawn(command), pids)
+        };
+        let pids_of = |pids: &std::path::Path| loop {
+            if let Ok(text) = std::fs::read_to_string(pids) {
+                let pids: Vec<u32> = text
+                    .split_whitespace()
+                    .map(|pid| pid.parse().unwrap())
+                    .collect();
+                break (pids[0], pids[1]);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (host, pids) = started("dropped");
+        let (leader, child) = pids_of(&pids);
+        assert_eq!(leader, host.id());
+        assert!(!ended(leader) && !ended(child));
+        // A test that panics drops it while it unwinds, as one that ends does.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _host = host;
+            panic!("the test failed");
+        }));
+        assert!(unwound.is_err());
+        while !(ended(leader) && ended(child)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // After a crash, what it started lives on for the next host, as after a real crash.
+        let (mut host, pids) = started("crashed");
+        let (leader, child) = pids_of(&pids);
+        host.crash();
+        drop(host);
+        assert!(ended(leader));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!ended(child), "a crash ended what the host started");
+        std::process::Command::new("kill")
+            .args(["-KILL", &child.to_string()])
+            .status()
+            .unwrap();
+    })
+    .await;
+}
+
 /// A host on the directories under `dir`, in a process of its own ([`restart_test_host_a`]),
 /// which the test kills as a crash would.
-fn host_process(dir: &std::path::Path, url: &str, v2: bool) -> std::process::Child {
+fn host_process(dir: &std::path::Path, url: &str, v2: bool) -> HostProcess {
     host_process_with(dir, url, v2, false)
 }
 
 /// [`host_process`]; with `legacy`, a host that registers its runs' bridges with its shared
 /// listener, as hosts did before each sandbox's bridge was its front's.
-fn host_process_with(
-    dir: &std::path::Path,
-    url: &str,
-    v2: bool,
-    legacy: bool,
-) -> std::process::Child {
+fn host_process_with(dir: &std::path::Path, url: &str, v2: bool, legacy: bool) -> HostProcess {
     host_process_reading(dir, url, v2, legacy, None)
 }
 
@@ -552,7 +614,7 @@ fn host_process_reading(
     v2: bool,
     legacy: bool,
     reader: Option<&std::path::Path>,
-) -> std::process::Child {
+) -> HostProcess {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["restart_test_host_a", "--exact", "--ignored", "--nocapture"])
@@ -568,7 +630,7 @@ fn host_process_reading(
     if let Some(reader) = reader {
         command.env(RESTART_READER, reader);
     }
-    command.spawn().unwrap()
+    HostProcess::spawn(command)
 }
 
 /// Host A, in a process of its own, runs the `slow` scenario until the agent has written its
@@ -661,8 +723,7 @@ async fn a_host_killed_when(
     } else {
         conn.until_seq(spec.run_id, 3).await
     };
-    host_a.kill().unwrap();
-    host_a.wait().unwrap();
+    host_a.crash();
     (dir, spec, record, before)
 }
 
@@ -986,8 +1047,7 @@ async fn a_host_that_restarts_again_while_a_run_taken_back_waits_keeps_the_run()
         server.set_refusing(true);
         let mut host_b = host_process(dir.path(), &server.url, true);
         until_collected(&record).await;
-        host_b.kill().unwrap();
-        host_b.wait().unwrap();
+        host_b.crash();
         assert!(record.exists(), "a second restart lost the run");
         assert!(repo.branch_head("agent/TEST-1").is_none());
 
@@ -1086,8 +1146,7 @@ async fn a_run_taken_back_whose_record_cannot_be_marked_keeps_its_sandbox_for_th
         let kept: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
         assert!(kept.get("collected").is_none(), "{kept:#}");
-        host_b.kill().unwrap();
-        host_b.wait().unwrap();
+        host_b.crash();
         assert!(repo.branch_head("agent/TEST-1").is_none());
 
         // The next start takes the work from the sandbox again, and pushes it.
@@ -1183,8 +1242,7 @@ async fn a_token_the_record_no_longer_holds_is_caught_after_a_restart(leaked: &s
         assert!(started.elapsed() < Duration::from_secs(30), "{text}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    host_a.kill().unwrap();
-    host_a.wait().unwrap();
+    host_a.crash();
     // The agent's work in `docs` holds the token, uncommitted: the sandbox commits it.
     let paths =
         tinfirm_runner_host::paths::Paths::new(dir.path().join("config"), dir.path().join("data"));
@@ -1586,7 +1644,7 @@ async fn a_front_killed_mid_run(
     repo: &TestRepo,
 ) -> (
     tempfile::TempDir,
-    std::process::Child,
+    HostProcess,
     Conn,
     AssignSpec<'static>,
     u32,
@@ -1604,7 +1662,7 @@ async fn a_front_killed_mid_run_in(
     held: bool,
 ) -> (
     tempfile::TempDir,
-    std::process::Child,
+    HostProcess,
     Conn,
     AssignSpec<'static>,
     u32,
@@ -1664,8 +1722,7 @@ async fn a_front_that_ends_during_a_run_is_replaced_once_and_the_work_is_saved()
         conn.send(next.to_json());
         let t = conn.until_finished(next.run_id).await;
         assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
+        host_a.crash();
     })
     .await;
 }
@@ -1700,8 +1757,7 @@ async fn a_second_front_that_ends_too_is_not_replaced_and_the_run_says_its_work_
         // No third front was started for the run.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(fronts_of(host_a.id()).is_empty());
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
+        host_a.crash();
     })
     .await;
 }
@@ -1790,8 +1846,7 @@ async fn a_new_front_that_ends_after_the_repositories_came_back_says_what_was_sa
             repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
             Some("work in progress\n")
         );
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
+        host_a.crash();
     })
     .await;
 }
@@ -1816,8 +1871,7 @@ async fn a_run_without_a_repository_whose_new_front_ends_too_says_its_work_is_lo
                 && !message.contains("its work so far was saved"),
             "{message}"
         );
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
+        host_a.crash();
     })
     .await;
 }
@@ -1841,8 +1895,7 @@ async fn a_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener
             serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
         assert!(kept.get("bridge").is_none(), "{kept}");
         assert!(dir.path().join("data/runs/bridge.json").exists());
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
+        host_a.crash();
 
         // Host B, of this version, takes the run back through its shared listener.
         let host = start_host_at(dir.path(), &server.url, HostSetup::bridged()).await;

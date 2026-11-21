@@ -729,7 +729,7 @@ fn vm_restart_test_host_a() {
 }
 
 /// Host A of the VM restart tests ([`vm_restart_test_host_a`]), on `dir`, connecting to `url`.
-fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool, legacy: bool) -> std::process::Child {
+fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool, legacy: bool) -> HostProcess {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -747,7 +747,7 @@ fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool, legacy: bool) -> s
     if legacy {
         command.env(RESTART_LEGACY, "1");
     }
-    command.spawn().unwrap()
+    HostProcess::spawn(command)
 }
 
 /// A run in a VM whose host is killed and started again: host B takes it back. With `publish`,
@@ -774,8 +774,7 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
     // One front for the VM: it holds the VM's bridge, or, on a host of the version before,
     // only serves its listeners' HTTP.
     assert_eq!(fronts_of(host_a.id()).len(), 1);
-    host_a.kill().unwrap();
-    host_a.wait().unwrap();
+    host_a.crash();
     let log = dir.path().join("driver.log");
     let creates = calls_of(&vm_driver_calls(&log), "create").len();
     let vm_id = {
@@ -949,8 +948,7 @@ async fn a_vms_front_that_ends_during_its_run_is_replaced_once_and_the_work_is_s
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
+        host_a.crash();
     })
     .await;
 }

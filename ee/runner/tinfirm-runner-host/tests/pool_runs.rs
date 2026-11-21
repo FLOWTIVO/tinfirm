@@ -193,7 +193,8 @@ async fn after_a_host_restart_its_ready_vms_go_and_a_run_takes_a_new_one_through
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("driver.log");
         let mut server = FakeServer::start().await;
-        let mut host_a = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "pool_restart_test_host_a",
                 "--exact",
@@ -202,9 +203,8 @@ async fn after_a_host_restart_its_ready_vms_go_and_a_run_takes_a_new_one_through
             ])
             .env(RESTART_DIR, dir.path())
             .env(RESTART_URL, &server.url)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+            .stdout(std::process::Stdio::null());
+        let mut host_a = HostProcess::spawn(command);
         let mut conn = server.accept().await;
         conn.handshake(1).await;
         // Host A's ready VM, with its front, which holds its bridge.
@@ -213,8 +213,7 @@ async fn after_a_host_restart_its_ready_vms_go_and_a_run_takes_a_new_one_through
         })
         .await;
         let old = running_vms(dir.path()).remove(0);
-        host_a.kill().unwrap();
-        host_a.wait().unwrap();
+        host_a.crash();
         drop(conn);
 
         // Host B holds no record of the ready VM, which no run had: it deletes it, and makes a

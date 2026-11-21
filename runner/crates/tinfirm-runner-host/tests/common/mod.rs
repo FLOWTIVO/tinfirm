@@ -1931,3 +1931,55 @@ pub fn kill_front(pid: u32) {
         .unwrap();
     assert!(status.success(), "cannot kill the front {pid}");
 }
+
+/// A runner host in a process of its own, as the restart tests start one (host A, which the
+/// test kills as a crash would). It runs in a process group of its own. A test that ends
+/// without [`HostProcess::crash`], a failed one among them, kills that group when this is
+/// dropped, also while it unwinds from a panic: the host and what it started there (a local
+/// sandbox's bridge, a fake driver's VMs) do not outlive the test and keep its output open.
+/// After a crash, what the host started lives on, as after a real one, for the next host.
+pub struct HostProcess {
+    child: std::process::Child,
+    crashed: bool,
+}
+
+impl HostProcess {
+    /// Starts `command` in a process group of its own.
+    pub fn spawn(mut command: Command) -> HostProcess {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        HostProcess {
+            child: command.spawn().unwrap(),
+            crashed: false,
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Kills the host alone as a crash would (SIGKILL) and waits until it has ended.
+    pub fn crash(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.crashed = true;
+    }
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        if self.crashed {
+            return;
+        }
+        // Its group's id is the host's pid, which is not reaped yet: it names no other group.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.child.id())])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
