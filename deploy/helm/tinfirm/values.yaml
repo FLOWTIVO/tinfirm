@@ -587,10 +587,10 @@ runner:
     #   runners refuses the host. Set vm.digitalocean, never vm.node.nodes.
     # - `node`: sandbox nodes outside the cluster, each with the node agent (ADR-0112). Every
     #   edition. Set vm.node, never vm.digitalocean.templates. Not ready for production
-    #   (ADR-0112): the node agent makes VMs, shown on one node, but the role that sets a
-    #   node up, the node's own firewall and its hardening are planned, and this pod has
-    #   not run against a node yet. `run` refuses the driver at its start when a node's
-    #   `verify` reports a problem.
+    #   (ADR-0112): the node agent makes VMs, and the role that sets a node up, with the
+    #   node's own firewall, ran on a machine once. The node's hardening has run on no
+    #   machine, and this pod has not run against a node yet. `run` refuses the driver at
+    #   its start when a node's `verify` reports a problem.
     # - `pod`: a pod per run in a namespace of the runs' own, with Firecracker in it as an
     #   unprivileged process (ADR-0115, decision 2), on workers with KVM. Pro and Enterprise
     #   (ADR-0114): a server without elastic runners refuses the host. Set vm.cluster and

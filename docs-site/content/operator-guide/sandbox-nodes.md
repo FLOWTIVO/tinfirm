@@ -4,7 +4,7 @@ This page is for the people who run a company's runner hosts on plain Linux mach
 
 !!! warning "Not ready for production"
 
-    The two plays ran on machines once, on 2026-11-20 (Ubuntu 24.04), and ten conversations with real runtimes ran through the node they set up. The node's hardening is planned ([ADR-0112](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0112-no-credential-on-a-sandbox-machine.md)). Tinfirm publishes no VM image: you build it ([What you need](#what-you-need)). Use this form to prepare and to test, and a runner host of its own or DigitalOcean's driver for production until then.
+    The two plays ran on machines once, on 2026-11-20 (Ubuntu 24.04), and ten conversations with real runtimes ran through the node they set up. The role hardens a node by default, and that hardening has run on no machine yet ([The node's hardening](#the-nodes-hardening)). Tinfirm publishes no VM image: you build it ([What you need](#what-you-need)). Use this form to prepare and to test, and a runner host of its own or DigitalOcean's driver for production until then.
 
 ## How it works
 
@@ -129,9 +129,21 @@ A control host runs no Docker socket and no hypervisor: its user would otherwise
 - **On the control host**, the role sets no firewall. Let it reach each node's agent port (7700) and published ports, and admit nothing from the nodes' network.
 - **Around the nodes**, your network keeps them from reaching the server, the model gateway, the code hosts, the control host, the other nodes and a cloud's metadata service. That is the guard against root on a node.
 
+## The node's hardening
+
+The nodes' play hardens a node beyond the jail ([ADR-0113](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0113-levels-of-isolation-and-placement.md), decision 5). Each line has a switch of the role, and all are on by default. **This hardening has run on no machine yet.** Three of its settings last until a reboot, so try it first on a node that you can reach without SSH, or leave it out.
+
+- **What it sets:** kernel settings that take BPF and io_uring from the node's users and stop the node at a kernel oops; kexec off, kernel lockdown at `integrity`, and no kernel module loaded after the boot; no set-user-ID program that others may run, except `sudo` for its group; and an AppArmor profile for the VMMs.
+- **What it costs:** an oops ends every run on the node. After the boot no module loads, so a firewall rule or a tool that needs a new one fails until a reboot.
+- **The mark:** the node agent checks each line. The control host reports `hardened: yes` to the server only while every node that offers the template reports it, and a new VM goes to a hardened node first. A line that does not hold lowers the mark and stops nothing: `tinfirm-runner-host doctor` and the host's log name it.
+- **With the defaults, a node reports `hardened: no`**, for one line. The VMMs' AppArmor profile is loaded in complain mode, in which it refuses nothing and logs what it would refuse. Set `tinfirm_sandbox_node_harden_mac: enforce` once that log is clean.
+- **To leave it out,** set `tinfirm_sandbox_node_harden: false`. Each line also has a switch of its own.
+
+What each switch does and what it costs is in the role's [README](https://github.com/flowtivo/tinfirm/blob/main/deploy/ansible/README.md#the-hardening).
+
 ## What the roles do not do yet
 
-- The hardening of a node beyond the jail ([ADR-0113](https://github.com/flowtivo/tinfirm/blob/main/docs/adr/0113-levels-of-isolation-and-placement.md), decision 5): kernel lockdown, kernel modules disabled after boot, an AppArmor profile for the VMMs. It is not specified yet, and the host reports its nodes as not hardened.
+- SELinux for the VMMs on a node of the Red Hat family: such a node reports `hardened: no`.
 - A runner host and the node agent on one machine. That form is set aside and not built: the node agent refuses a control host on its own machine, so the control host runs on another machine.
 - A check from the node itself that it reaches nothing. Try it yourself after the play, as root on the node: a connection to the control host, to `1.1.1.1:443` and to `169.254.169.254:80` must each time out.
 - An upgrade of a node in place while VMs run. Replace its image instead.

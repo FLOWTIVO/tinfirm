@@ -511,7 +511,9 @@ level, `yes` when every line holds on the node. The node agent's helper checks e
 `check`, and writes none (the agent's README, "The hardening mark"); the role sets them up, each
 by a switch, all on by default, and `tinfirm_sandbox_node_harden: false` turns every one off. A
 switch that is off leaves the machine's setting as it is: the line may then fail, the mark says
-`no`, and the node runs on. The control host does not report the mark to the server yet (planned).
+`no`, and the node runs on. The control host reports the mark to the server in its hello: `yes`
+only while every node that offers the template reports `yes`
+([runner/README.md](../../runner/README.md#isolation-level)).
 
 **With the defaults, a node reports `hardened: no`, for the line `vmm-mac` alone.** The VMMs'
 AppArmor profile has not run on a real machine yet, so its default mode is `complain`: loaded,
