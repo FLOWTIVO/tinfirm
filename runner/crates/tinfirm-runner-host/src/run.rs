@@ -1534,51 +1534,159 @@ pub enum TakenBackEnd {
 /// server has answered the hello (ADR-0116, decision 10), the session's bundle is stored, and
 /// the run is reported failed with `INFRA`, or cancelled when the server cancels it meanwhile.
 /// The record stays until the run ends, so a restart while the run waits takes it back again.
+///
+/// The stages: the run's redaction from its record, its directories and repositories as the
+/// earlier process left them, the sandbox's bridge coming back with the work, the wait for the
+/// server, the stop, and what the run leaves (`save_the_work`, `say_what_was_saved`).
 pub async fn take_back(
     shared: &Arc<Shared>,
     record: RunRecord,
     kept: Arc<RecordHandle>,
     tokens: &Arc<RunGitTokens>,
     sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
-    mut stop_rx: watch::Receiver<Option<StopRequest>>,
+    stop_rx: watch::Receiver<Option<StopRequest>>,
 ) -> TakenBackEnd {
     let assign = &record.assign;
-    let paths = shared.opts.paths.clone();
-    let mut sink = EventSink::after(
-        shared.clone(),
-        assign.run_id,
-        assign.epoch,
-        record.seq_floor,
-    );
+    let paths = &shared.opts.paths;
+    let mut run = Run {
+        shared,
+        assign,
+        tokens,
+        sink: EventSink::after(
+            shared.clone(),
+            assign.run_id,
+            assign.epoch,
+            record.seq_floor,
+        ),
+        failure: Failure::default(),
+        stop_rx,
+    };
     // The holder keeps `kept` in step since the run was registered: a revocation that the
     // server sends again at the hello writes the record again.
-    sink.keep_record(kept.clone());
-    tokens.attach_log(sink.side());
+    run.sink.keep_record(kept.clone());
+    tokens.attach_log(run.sink.side());
     let mut secrets = Vec::new();
     if let Some(tinfirm_protocol::AssignedCredential::Model(access)) = assign.credential() {
         secrets.push(access.api_key.expose().to_string());
     }
-    for ws in &assign.workspaces {
-        if let Some(creds) = &ws.git {
-            secrets.push(creds.token.expose().to_string());
+    redact_the_runs_secrets(shared, assign, secrets);
+    let unsafe_record = redact_the_earlier_tokens(&run, &record);
+    run.sink.log(
+        LogLevel::Warn,
+        if record.collected {
+            "the runner host restarted again before it pushed the run's work: the work it took from the sandbox is pushed from this host"
+        } else {
+            "the runner host restarted during the run and takes it back: the agent stops, and its work and its session are saved"
+        },
+    );
+    run.sink.status(Phase::Finalizing, None);
+
+    let dirs = taken_back_dirs(&mut run);
+    let mut repos = restore_repositories(&run, &record, &dirs);
+
+    // --- the sandbox's bridge comes back --------------------------------------------------
+    let CameBack {
+        work: came_back,
+        mut held,
+    } = bring_the_sandbox_back(&mut run, &record, &kept, sandbox, &dirs, &mut repos).await;
+
+    // The push waits for the server (ADR-0116, decision 10): this process pushes nothing and
+    // uses no git token of the run before the server has welcomed it, and, from a server that
+    // lists `run.git.revoke`, before `welcome.done`, which comes after every revocation it
+    // held for the run. There is no cap: the work and the record stay on this host while it
+    // waits. Then every token of the run that expires is renewed, an expired one included
+    // (an older server never sent `expiresAt`, so `git_refresh::renew` asks for nothing then).
+    // The stop is looked at after this, so that an abort meanwhile pushes and reports nothing.
+    if came_back && !repos.is_empty() {
+        match wait_for_the_server(shared, &mut run.sink, &mut run.stop_rx).await {
+            Waited::Answered | Waited::Aborted => {}
+            Waited::Left => {
+                tracing::info!(run_id = %assign.run_id, epoch = assign.epoch, "the host stops while a run taken back waits for the server; the next start takes it back");
+                // The record stays, and so does the work: neither is removed here. A sandbox
+                // kept for want of the mark is left too: its bridge waits for the next start.
+                tokens.drop_record();
+                return TakenBackEnd::Left(held.map(Box::new));
+            }
         }
-        if let Some(authorization) = git::authorization_for(ws) {
-            secrets.push(authorization.expose().to_string());
+        if *run.stop_rx.borrow() != Some(StopRequest::Abort) && shared.speaks_v2() {
+            crate::git_refresh::renew(shared, tokens, None).await;
         }
     }
-    if !secrets.is_empty() {
-        shared.add_run_secrets(assign.run_id, assign.epoch, secrets);
+
+    let stop = *run.stop_rx.borrow();
+    let cancelled = match stop {
+        Some(StopRequest::Abort) => {
+            if let Some(mut sandbox) = held.take() {
+                sandbox.stop(Duration::from_secs(5)).await;
+            }
+            tokens.drop_record();
+            run.sink.drop_record();
+            let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
+            cleanup_workspace(shared, &dirs.workspace, false);
+            return TakenBackEnd::Aborted;
+        }
+        Some(StopRequest::Cancel) => true,
+        None => false,
+    };
+
+    // --- what the run leaves ---------------------------------------------------------------
+    let saved = save_the_work(
+        &mut run,
+        &record,
+        came_back,
+        unsafe_record.as_deref(),
+        &repos,
+        &dirs,
+    )
+    .await;
+    let failed_git = saved
+        .results
+        .iter()
+        .any(|g| !g.pushed && g.commits.unwrap_or(0) > 0);
+    let cancelled = say_what_was_saved(
+        &mut run,
+        &record,
+        cancelled,
+        unsafe_record.as_deref(),
+        &saved,
+        failed_git,
+    );
+    let report = Report {
+        session_id: record.session_id.clone(),
+        git: Some(saved.results),
+        artifacts: saved.artifacts,
+        session_bundle: saved.session_bundle,
+        ..Report::default()
+    };
+    let finished = run.finish(cancelled, report);
+    // The run has ended: nothing is left to take back, and a sandbox kept so far goes.
+    if let Some(mut sandbox) = held.take() {
+        sandbox.stop(Duration::from_secs(5)).await;
     }
-    // Every token the run has held, those the record no longer holds included (a revoked one,
-    // a GitHub App's earlier ones), by the salted hashes the record keeps: the events, the
-    // host's log lines of the run, and the scans before the push, of the session bundle and
-    // of `/output` find them as they find the live ones.
-    // A record without hashes (an earlier version's) reads as before. A record whose hashes
-    // are there but cannot be used is unsafe: an earlier token could then leave in a commit,
-    // the session bundle or `/output`, so nothing of the run's work leaves the host.
+    tokens.drop_record();
+    run.sink.drop_record();
+    let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
+    cleanup_workspace(
+        shared,
+        &dirs.workspace,
+        finished.outcome == Outcome::Failed || failed_git,
+    );
+    TakenBackEnd::Finished(Box::new(finished))
+}
+
+/// Every token the run has held, those the record no longer holds included (a revoked one,
+/// a GitHub App's earlier ones), by the salted hashes the record keeps: the events, the
+/// host's log lines of the run, and the scans before the push, of the session bundle and
+/// of `/output` find them as they find the live ones.
+/// A record without hashes (an earlier version's) reads as before. A record whose hashes
+/// are there but cannot be used is unsafe: an earlier token could then leave in a commit,
+/// the session bundle or `/output`, so nothing of the run's work leaves the host. `Some` with
+/// why for such a record.
+fn redact_the_earlier_tokens(run: &Run<'_>, record: &RunRecord) -> Option<String> {
+    let (shared, assign) = (run.shared, run.assign);
     let mut unsafe_record = None;
     if record.redaction.is_some() {
-        match crate::secret_hashes::HashedMatcher::new(&tokens.hashes()) {
+        match crate::secret_hashes::HashedMatcher::new(&run.tokens.hashes()) {
             Ok(matcher) => {
                 shared.add_run_hashed(assign.run_id, assign.epoch, Arc::new(matcher));
             }
@@ -1588,16 +1696,27 @@ pub async fn take_back(
             }
         }
     }
-    sink.log(
-        LogLevel::Warn,
-        if record.collected {
-            "the runner host restarted again before it pushed the run's work: the work it took from the sandbox is pushed from this host"
-        } else {
-            "the runner host restarted during the run and takes it back: the agent stops, and its work and its session are saved"
-        },
-    );
-    sink.status(Phase::Finalizing, None);
+    unsafe_record
+}
 
+/// The directories of a run taken back, as the earlier process left them
+/// ([`taken_back_dirs`]).
+struct TakenBackDirs {
+    workspace: PathBuf,
+    /// The run's `/output`, when the earlier process made it. It goes before the home's lease:
+    /// the fields drop in this order.
+    output_root: Option<OutputRoot>,
+    /// Held until the run ends, so maintenance never deletes the home under it.
+    _home_lease: crate::homes::HomeLease,
+    home: PathBuf,
+    layout: Layout,
+}
+
+/// The workspace, the leased home and the `/output` of a run taken back, and where its
+/// sandbox has them. An `/output` that cannot be anchored is a warning.
+fn taken_back_dirs(run: &mut Run<'_>) -> TakenBackDirs {
+    let (shared, assign) = (run.shared, run.assign);
+    let paths = &shared.opts.paths;
     let workspace_dir = paths.workspace(assign.run_id);
     let home_lease = shared.homes.lease(assign.agent.id, assign.work_item().id);
     let home_dir = home_lease.path().to_path_buf();
@@ -1606,7 +1725,7 @@ pub async fn take_back(
         match OutputRoot::create(&output_path) {
             Ok(root) => Some(root),
             Err(e) => {
-                sink.log(
+                run.sink.log(
                     LogLevel::Warn,
                     format!("cannot prepare the run's {}: {e:#}", crate::sandbox::OUTPUT),
                 );
@@ -1621,7 +1740,24 @@ pub async fn take_back(
         crate::sandbox::Executor::Vm(vms) if !vms.options.on_this_machine => Layout::container(),
         _ => Layout::local(&workspace_dir),
     };
-    let mut repos: Vec<Repo> = record
+    TakenBackDirs {
+        workspace: workspace_dir,
+        _home_lease: home_lease,
+        home: home_dir,
+        output_root,
+        layout,
+    }
+}
+
+/// The repositories of a run taken back, as its record keeps them: as cloned, with the
+/// holder's tokens, and how each came back from the sandbox when it did.
+fn restore_repositories<'a>(
+    run: &Run<'a>,
+    record: &'a RunRecord,
+    dirs: &TakenBackDirs,
+) -> Vec<Repo<'a>> {
+    let assign = &record.assign;
+    record
         .repos
         .iter()
         .filter_map(|kept| {
@@ -1629,101 +1765,63 @@ pub async fn take_back(
             Some(Repo {
                 ws,
                 git: Git::restored(
-                    workspace_dir.join(&ws.dir),
+                    dirs.workspace.join(&ws.dir),
                     ws,
                     git_identity(assign, Some(ws)),
                     kept.base_refs(),
                     kept.config_snapshot(),
                 )
-                .with_tokens(tokens.repo(ws.component_id)),
+                .with_tokens(run.tokens.repo(ws.component_id)),
                 cloned_head: kept.cloned_head.clone(),
                 cloned_commits: kept.cloned_commits,
                 collected: kept.collected.as_ref().map(CollectedRecord::restore),
             })
         })
-        .collect();
+        .collect()
+}
 
-    // --- the sandbox's bridge comes back --------------------------------------------------
-    // A cancel meanwhile still saves the work, as a run's cancel does; only an abort (a stale
-    // epoch) stops the wait.
-    let mut failure = Failure::default();
+/// What came back of a run taken back ([`bring_the_sandbox_back`]).
+struct CameBack {
+    /// The run's work is on this host: it came back now, or before an earlier restart.
+    work: bool,
+    /// A sandbox whose work came back but that the record cannot yet call collected: it lives
+    /// until the run ends.
+    held: Option<crate::sandbox::Sandbox>,
+}
+
+/// The sandbox's bridge comes back, and with it the run's work
+/// ([`collect_the_work_taken_back`]). A cancel meanwhile still saves the work, as a run's
+/// cancel does; only an abort (a stale epoch) stops the wait. A sandbox that does not come
+/// back is removed, and its work is lost. When nothing came back, nothing is left to take back
+/// either: the record goes.
+async fn bring_the_sandbox_back(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    kept: &RecordHandle,
+    sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
+    dirs: &TakenBackDirs,
+    repos: &mut [Repo<'_>],
+) -> CameBack {
     let mut came_back = record.collected;
-    // A sandbox whose work came back but that the record cannot yet call collected: it lives
-    // until the run ends.
     let mut held: Option<crate::sandbox::Sandbox> = None;
     if let Some((sandbox, registration)) = sandbox {
         let connected = tokio::select! {
             session = registration.connected(TAKE_BACK_WAIT) => Some(session),
-            _ = wait_for_abort(&mut stop_rx) => None,
+            _ = wait_for_abort(&mut run.stop_rx) => None,
         };
         match connected {
             Some(Ok(session)) => {
                 came_back = true;
-                let keep = shared.kept_bridge(&record).and_then(Result::ok);
-                let mut sandbox = sandbox.connected(session, keep);
-                match sandbox.reclaim(RECLAIM_TIMEOUT).await {
-                    Ok(true) => sink.log(
-                        LogLevel::Info,
-                        "the agent of the host before its restart was stopped",
-                    ),
-                    Ok(false) => sink.log(
-                        LogLevel::Info,
-                        "the agent had stopped already: its host was gone for too long",
-                    ),
-                    Err(e) => sink.log(
-                        LogLevel::Warn,
-                        format!(
-                            "the agent did not stop as asked: {}",
-                            sink.redact(&format!("{e:#}"))
-                        ),
-                    ),
-                }
-                if let Some(files) = sandbox.files()
-                    && *stop_rx.borrow() != Some(StopRequest::Abort)
-                {
-                    collect_from_sandbox(
-                        &mut sink,
-                        assign,
-                        &files,
-                        &reader_of(shared),
-                        &layout,
-                        &mut repos,
-                        &home_dir,
-                        record.home_exclude.clone(),
-                        output_root.as_ref().map(OutputRoot::path),
-                    )
-                    .await;
-                }
-                if *stop_rx.borrow() == Some(StopRequest::Abort) {
-                    sandbox.stop(Duration::from_secs(5)).await;
-                } else {
-                    // The work is on this host now. The record says so before the sandbox
-                    // goes, so that a restart at any moment finds the work where the record
-                    // says it is: in the sandbox until the mark is on disk, here after it.
-                    let collected: Vec<(String, CollectedRecord)> = repos
-                        .iter()
-                        .filter_map(|repo| {
-                            let collected = repo.collected.as_ref()?;
-                            Some((repo.ws.dir.clone(), CollectedRecord::of(collected)))
-                        })
-                        .collect();
-                    if kept.collected(&collected) {
-                        sandbox.stop(Duration::from_secs(5)).await;
-                    } else {
-                        sink.log(
-                            LogLevel::Warn,
-                            "the runner host cannot write in its record that the run's work came back from the sandbox, so it keeps the sandbox until the run ends: a restart meanwhile takes the work from the sandbox again",
-                        );
-                        held = Some(sandbox);
-                    }
-                }
+                let keep = run.shared.kept_bridge(record).and_then(Result::ok);
+                let sandbox = sandbox.connected(session, keep);
+                held = collect_the_work_taken_back(run, record, kept, sandbox, dirs, repos).await;
             }
             Some(Err(e)) => {
-                failure.set(
+                run.failure.set(
                     FailureClass::Infra,
                     format!(
                         "The runner host restarted during the run, and the run's sandbox did not come back to it ({}); the work of the run is lost.",
-                        sink.redact(&format!("{e:#}"))
+                        run.sink.redact(&format!("{e:#}"))
                     ),
                 );
                 sandbox.discard(Duration::from_secs(5)).await;
@@ -1733,52 +1831,108 @@ pub async fn take_back(
     }
     if !came_back {
         // Nothing came back: there is nothing left to take back either.
-        tokens.drop_record();
-        sink.drop_record();
+        run.tokens.drop_record();
+        run.sink.drop_record();
     }
-
-    // The push waits for the server (ADR-0116, decision 10): this process pushes nothing and
-    // uses no git token of the run before the server has welcomed it, and, from a server that
-    // lists `run.git.revoke`, before `welcome.done`, which comes after every revocation it
-    // held for the run. There is no cap: the work and the record stay on this host while it
-    // waits. Then every token of the run that expires is renewed, an expired one included
-    // (an older server never sent `expiresAt`, so `git_refresh::renew` asks for nothing then).
-    // The stop is looked at after this, so that an abort meanwhile pushes and reports nothing.
-    if came_back && !repos.is_empty() {
-        match wait_for_the_server(shared, &mut sink, &mut stop_rx).await {
-            Waited::Answered | Waited::Aborted => {}
-            Waited::Left => {
-                tracing::info!(run_id = %assign.run_id, epoch = assign.epoch, "the host stops while a run taken back waits for the server; the next start takes it back");
-                // The record stays, and so does the work: neither is removed here. A sandbox
-                // kept for want of the mark is left too: its bridge waits for the next start.
-                tokens.drop_record();
-                return TakenBackEnd::Left(held.map(Box::new));
-            }
-        }
-        if *stop_rx.borrow() != Some(StopRequest::Abort) && shared.speaks_v2() {
-            crate::git_refresh::renew(shared, tokens, None).await;
-        }
+    CameBack {
+        work: came_back,
+        held,
     }
+}
 
-    let stop = *stop_rx.borrow();
-    let cancelled = match stop {
-        Some(StopRequest::Abort) => {
-            if let Some(mut sandbox) = held.take() {
-                sandbox.stop(Duration::from_secs(5)).await;
-            }
-            tokens.drop_record();
-            sink.drop_record();
-            let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
-            cleanup_workspace(shared, &workspace_dir, false);
-            return TakenBackEnd::Aborted;
-        }
-        Some(StopRequest::Cancel) => true,
-        None => false,
-    };
+/// The sandbox of a run taken back is connected: the agent of the earlier process stops, the
+/// work comes back from the sandbox, and the record says so before the sandbox goes. The
+/// sandbox when it must stay until the run ends, because the record cannot say so.
+async fn collect_the_work_taken_back(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    kept: &RecordHandle,
+    mut sandbox: crate::sandbox::Sandbox,
+    dirs: &TakenBackDirs,
+    repos: &mut [Repo<'_>],
+) -> Option<crate::sandbox::Sandbox> {
+    let (shared, assign) = (run.shared, run.assign);
+    match sandbox.reclaim(RECLAIM_TIMEOUT).await {
+        Ok(true) => run.sink.log(
+            LogLevel::Info,
+            "the agent of the host before its restart was stopped",
+        ),
+        Ok(false) => run.sink.log(
+            LogLevel::Info,
+            "the agent had stopped already: its host was gone for too long",
+        ),
+        Err(e) => run.sink.log(
+            LogLevel::Warn,
+            format!(
+                "the agent did not stop as asked: {}",
+                run.sink.redact(&format!("{e:#}"))
+            ),
+        ),
+    }
+    if let Some(files) = sandbox.files()
+        && *run.stop_rx.borrow() != Some(StopRequest::Abort)
+    {
+        collect_from_sandbox(
+            &mut run.sink,
+            assign,
+            &files,
+            &reader_of(shared),
+            &dirs.layout,
+            repos,
+            &dirs.home,
+            record.home_exclude.clone(),
+            dirs.output_root.as_ref().map(OutputRoot::path),
+        )
+        .await;
+    }
+    if *run.stop_rx.borrow() == Some(StopRequest::Abort) {
+        sandbox.stop(Duration::from_secs(5)).await;
+        return None;
+    }
+    // The work is on this host now. The record says so before the sandbox goes, so that a
+    // restart at any moment finds the work where the record says it is: in the sandbox until
+    // the mark is on disk, here after it.
+    let collected: Vec<(String, CollectedRecord)> = repos
+        .iter()
+        .filter_map(|repo| {
+            let collected = repo.collected.as_ref()?;
+            Some((repo.ws.dir.clone(), CollectedRecord::of(collected)))
+        })
+        .collect();
+    if kept.collected(&collected) {
+        sandbox.stop(Duration::from_secs(5)).await;
+        None
+    } else {
+        run.sink.log(
+            LogLevel::Warn,
+            "the runner host cannot write in its record that the run's work came back from the sandbox, so it keeps the sandbox until the run ends: a restart meanwhile takes the work from the sandbox again",
+        );
+        Some(sandbox)
+    }
+}
 
-    // --- what the run leaves ---------------------------------------------------------------
+/// What a run taken back leaves ([`save_the_work`]).
+struct Saved {
+    artifacts: Vec<ArtifactResult>,
+    /// One per repository: pushed, or as it was cloned when it was not finalized.
+    results: Vec<GitResult>,
+    session_bundle: Option<tinfirm_protocol::SessionBundleOutcome>,
+}
+
+/// What a run taken back leaves, once its work came back: the files of `/output`, the push of
+/// its repositories and its session bundle. After a leak in a commit the session bundle is not
+/// stored; from a damaged record (`unsafe_record`, with why) nothing leaves the host.
+async fn save_the_work(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    came_back: bool,
+    unsafe_record: Option<&str>,
+    repos: &[Repo<'_>],
+    dirs: &TakenBackDirs,
+) -> Saved {
+    let (shared, assign) = (run.shared, run.assign);
     if unsafe_record.is_some() {
-        sink.log(
+        run.sink.log(
             LogLevel::Error,
             "the runner host's record of the run cannot say which earlier git tokens to look for, so nothing of the run's work leaves the host: no push, no session bundle, no files of /output",
         );
@@ -1786,24 +1940,32 @@ pub async fn take_back(
     let mut artifacts = Vec::new();
     if came_back
         && unsafe_record.is_none()
-        && let Some(output_root) = &output_root
+        && let Some(output_root) = &dirs.output_root
     {
-        artifacts = collect_output(shared, &mut sink, assign, output_root).await;
+        artifacts = collect_output(shared, &mut run.sink, assign, output_root).await;
     }
     // A damaged record refuses the session bundle as a leak does.
     let mut leak = unsafe_record.is_some();
     let results = if came_back && !repos.is_empty() && unsafe_record.is_none() {
-        sink.status(Phase::Finalizing, None);
-        let finalized = finalize_git(shared, &mut sink, &repos, tokens, assign.run_id, false).await;
+        run.sink.status(Phase::Finalizing, None);
+        let finalized = finalize_git(
+            shared,
+            &mut run.sink,
+            repos,
+            run.tokens,
+            assign.run_id,
+            false,
+        )
+        .await;
         if finalized.outgoing_leak {
             leak = true;
-            failure.force(
+            run.failure.force(
                 FailureClass::CredentialLeak,
                 "a commit contains a credential value; no repository was pushed",
             );
         }
         if !finalized.errors.is_empty() {
-            sink.log(
+            run.sink.log(
                 LogLevel::Error,
                 git_failure_message(&finalized.errors, repos.len()),
             );
@@ -1816,9 +1978,9 @@ pub async fn take_back(
         Some(_) if came_back => Some(
             store_session_bundle(
                 shared,
-                &mut sink,
+                &mut run.sink,
                 assign,
-                &home_dir,
+                &dirs.home,
                 record.session_id.as_deref(),
                 leak,
             )
@@ -1826,65 +1988,61 @@ pub async fn take_back(
         ),
         _ => None,
     };
-    let failed_git = results
-        .iter()
-        .any(|g| !g.pushed && g.commits.unwrap_or(0) > 0);
+    Saved {
+        artifacts,
+        results,
+        session_bundle,
+    }
+}
+
+/// The failure of a run taken back: `INFRA`, saying what was saved, unless the server
+/// cancelled it; from a damaged record (`unsafe_record`, with why) `INFRA` whatever came
+/// before, cancelled or not, since its work stays on the host. Whether the run ends cancelled.
+fn say_what_was_saved(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    cancelled: bool,
+    unsafe_record: Option<&str>,
+    saved: &Saved,
+    failed_git: bool,
+) -> bool {
+    let assign = run.assign;
     if !cancelled {
-        let mut saved = vec!["the agent was stopped"];
-        if results.iter().any(|g| g.pushed) {
-            saved.push(if failed_git {
+        let mut saved_parts = vec!["the agent was stopped"];
+        if saved.results.iter().any(|g| g.pushed) {
+            saved_parts.push(if failed_git {
                 "some of its work was pushed (the log names what was not)"
             } else {
                 "its work so far was pushed"
             });
         }
         if matches!(
-            session_bundle,
+            saved.session_bundle,
             Some(tinfirm_protocol::SessionBundleOutcome::Stored)
         ) || (assign.session_bundle.is_none() && record.session_id.is_some())
         {
-            saved.push("its session was kept, so the next message goes on from it");
+            saved_parts.push("its session was kept, so the next message goes on from it");
         }
-        failure.set(
+        run.failure.set(
             FailureClass::Infra,
             format!(
                 "The runner host restarted during the run and took the run back: {}.",
-                saved.join(", ")
+                saved_parts.join(", ")
             ),
         );
     }
     // A damaged record fails the run, cancelled or not: its work stays on the host.
     let cancelled = cancelled && unsafe_record.is_none();
-    if let Some(why) = &unsafe_record {
-        failure.force(
+    if let Some(why) = unsafe_record {
+        run.failure.force(
             FailureClass::Infra,
             format!(
                 "The runner host restarted during the run, and its record of the run is damaged ({}); the work was not pushed and stays on the runner host.",
-                sink.redact(why)
+                run.sink.redact(why)
             ),
         );
     }
-    let report = Report {
-        session_id: record.session_id.clone(),
-        git: Some(results),
-        artifacts,
-        session_bundle,
-        ..Report::default()
-    };
-    let finished = finish(&mut sink, assign, failure, cancelled, report);
-    // The run has ended: nothing is left to take back, and a sandbox kept so far goes.
-    if let Some(mut sandbox) = held.take() {
-        sandbox.stop(Duration::from_secs(5)).await;
-    }
-    tokens.drop_record();
-    sink.drop_record();
-    let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
-    cleanup_workspace(
-        shared,
-        &workspace_dir,
-        finished.outcome == Outcome::Failed || failed_git,
-    );
-    TakenBackEnd::Finished(Box::new(finished))
+    cancelled
 }
 
 /// How [`wait_for_the_server`] ended.
