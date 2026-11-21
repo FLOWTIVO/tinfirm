@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 
+use crate::egress;
 use crate::helper::{self, HelperClient, HelperError, VmState};
 use crate::id::{TemplateName, VmId};
 use crate::local::{self, LineError};
@@ -103,6 +104,11 @@ pub struct ListenerConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub allow_root: bool,
+    /// Test-only: what sends `verify`'s datagram of the node's own egress in place of the
+    /// real socket ([`crate::egress::real_sender`]), since a test machine has no node's table.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub egress_sender: Option<egress::Sender>,
 }
 
 fn default_watch() -> u64 {
@@ -174,6 +180,13 @@ pub struct Listener {
     reported: Mutex<BTreeSet<VmId>>,
     events: broadcast::Sender<Value>,
     refusals: Refusals,
+}
+
+/// Adds `item` to the JSON array `list`.
+fn push(list: &mut Value, item: String) {
+    if let Value::Array(items) = list {
+        items.push(Value::String(item));
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -339,6 +352,21 @@ impl Listener {
             "maxVms": checked.free,
             "checked": checked.checked,
         });
+        // The node's own egress, towards the control host: a problem only where the helper
+        // says that the node requires its table, as a missing table is.
+        let sender = self
+            .config
+            .egress_sender
+            .clone()
+            .unwrap_or_else(egress::real_sender);
+        let control_host = self.config.tls.as_ref().map(|tls| tls.control_host);
+        match egress::try_egress(control_host, &sender, checked.node_firewall) {
+            egress::Verdict::Problem(problem) => {
+                tracing::warn!("{problem}");
+                push(&mut result["problems"], problem);
+            }
+            egress::Verdict::Checked(line) => push(&mut result["checked"], line),
+        }
         // The hardening mark, as the helper found it. A helper of an earlier build sends
         // none: the result then has no `hardening`, which the driver counts as `no`.
         match checked.hardening {

@@ -145,5 +145,5 @@ What each switch does and what it costs is in the role's [README](https://github
 
 - SELinux for the VMMs on a node of the Red Hat family: such a node reports `hardened: no`.
 - A runner host and the node agent on one machine. That form is set aside and not built: the node agent refuses a control host on its own machine, so the control host runs on another machine.
-- A check from the node itself that it reaches nothing. Try it yourself after the play, as root on the node: a connection to the control host, to `1.1.1.1:443` and to `169.254.169.254:80` must each time out.
+- A full check from the node itself that it reaches nothing. The node agent tries one thing at each `verify`: a datagram from its listener to the control host, which the node's own table must refuse. Where it gets through, the node reports a problem and the control host places no VM on it. This try has not run on a real node yet. It does not try the server, the model gateway, the code hosts, a metadata service or the internet, and it does not run as root. So check the rest yourself after the play, as root on the node: a connection to the control host, to `1.1.1.1:443` and to `169.254.169.254:80` must each time out. A refused connection fails the check too, because the refusal came from beyond the node.
 - An upgrade of a node in place while VMs run. Replace its image instead.

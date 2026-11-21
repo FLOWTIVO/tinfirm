@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tinfirm_node_agent::backend::{FakeBackend, NodeTable};
+use tinfirm_node_agent::egress::{self, Outcome};
 use tinfirm_node_agent::hardening::{self, Hardening, Line};
 use tinfirm_node_agent::helper::{self, Helper, HelperClient};
 use tinfirm_node_agent::id::{TemplateName, VmId};
 use tinfirm_node_agent::listener::{self, Listener, ListenerConfig};
-use tinfirm_node_agent::plan::HelperConfig;
+use tinfirm_node_agent::plan::{HelperConfig, NodeFirewall};
 use tinfirm_node_agent::{local, spool, tls, wire};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
@@ -93,6 +94,11 @@ struct HelperHalf {
 }
 
 async fn helper_half() -> HelperHalf {
+    helper_half_with(|_| {}).await
+}
+
+/// The helper alone, with its configuration changed by `edit`.
+async fn helper_half_with(edit: impl FnOnce(&mut HelperConfig)) -> HelperHalf {
     let own = local::own_uid().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     // The spool's parent must not be writable by its group or by others, whatever the umask
@@ -109,7 +115,8 @@ async fn helper_half() -> HelperHalf {
         dir(&root.join(name), 0o700);
     }
     let backend = FakeBackend::new();
-    let config = helper_config(&root, own);
+    let mut config = helper_config(&root, own);
+    edit(&mut config);
     let helper = Helper::start(config.clone(), backend.clone()).unwrap();
     let task = tokio::spawn(async move {
         helper::run(helper).await.unwrap();
@@ -157,6 +164,15 @@ fn listener_config(
 }
 
 async fn node_from(half: HelperHalf, socket_peer: Option<u32>) -> Node {
+    node_with(half, socket_peer, |_| {}).await
+}
+
+/// A node whose listener's configuration `edit` changes.
+async fn node_with(
+    half: HelperHalf,
+    socket_peer: Option<u32>,
+    edit: impl FnOnce(&mut ListenerConfig),
+) -> Node {
     let own = local::own_uid().unwrap();
     let HelperHalf {
         tmp,
@@ -169,8 +185,9 @@ async fn node_from(half: HelperHalf, socket_peer: Option<u32>) -> Node {
     let node_cert = tls::generate(tls::SERVER_NAME).unwrap();
     let control_cert = tls::generate("control-host").unwrap();
     let peer = socket_peer.unwrap_or(own);
-    let listener_config =
+    let mut listener_config =
         listener_config(&root, &config.socket, tls::sha256(&control_cert.0), peer);
+    edit(&mut listener_config);
     let socket = listener_config.socket.as_ref().unwrap().path.clone();
     let listener = Listener::start(listener_config).await.unwrap();
     let server = tls::server_config(
@@ -898,7 +915,10 @@ async fn a_helper_answer_without_the_hardening_gives_a_verify_without_it() {
             let _ = write.shutdown().await;
         }
     });
-    let node = node_from(
+    // Its answer has no `nodeFirewall` either: a datagram that passes the node's firewall is
+    // then a line of what was checked, not a problem.
+    let (sender, _) = egress_sender(Outcome::Passed);
+    let node = node_with(
         HelperHalf {
             tmp,
             root,
@@ -907,6 +927,7 @@ async fn a_helper_answer_without_the_hardening_gives_a_verify_without_it() {
             task,
         },
         None,
+        |config| config.egress_sender = Some(sender),
     )
     .await;
     let mut driver = unix_driver(&node).await;
@@ -917,7 +938,141 @@ async fn a_helper_answer_without_the_hardening_gives_a_verify_without_it() {
         .unwrap();
     assert_eq!(
         verified,
-        json!({"problems": [], "maxVms": 2, "checked": ["an older helper"]})
+        json!({"problems": [], "maxVms": 2, "checked": [
+            "an older helper",
+            "NOT HELD: the node's own egress: a datagram from the listener to the control host (udp:127.0.0.1:9) passed the node's firewall; the helper did not say whether this node requires its table (a helper of an earlier build: restart it), so this is not counted as a problem"
+        ]})
+    );
+}
+
+/// What a fake sender of `verify`'s datagram answers, and every target it was given.
+type EgressState = std::sync::Arc<std::sync::Mutex<(Outcome, Vec<std::net::SocketAddr>)>>;
+
+/// A sender of `verify`'s datagram that answers what `outcome` holds at the time, and keeps
+/// every target it was given: a test machine has no node's table to answer for real.
+fn egress_sender(outcome: Outcome) -> (egress::Sender, EgressState) {
+    let state = std::sync::Arc::new(std::sync::Mutex::new((outcome, Vec::new())));
+    let kept = state.clone();
+    let sender = egress::Sender(std::sync::Arc::new(move |target| {
+        let mut state = kept.lock().unwrap();
+        state.1.push(target);
+        state.0.clone()
+    }));
+    (sender, state)
+}
+
+fn strings(value: &Value) -> Vec<&str> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn verify_tries_the_nodes_own_egress_and_a_datagram_that_passed_is_a_problem_where_the_table_is_required()
+ {
+    let (sender, state) = egress_sender(Outcome::Refused);
+    let node = node_with(helper_half().await, None, |config| {
+        config.egress_sender = Some(sender)
+    })
+    .await;
+    let mut driver = unix_driver(&node).await;
+    driver.hello().await;
+    // Refused on the node: a line of what was checked.
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["problems"], json!([]), "{verified}");
+    assert!(
+        strings(&verified["checked"]).contains(
+            &"the node's own egress: a datagram from the listener to the control host (udp:127.0.0.1:9) was refused on the node, as its firewall table drops it"
+        ),
+        "{verified}"
+    );
+    // The try goes to the listener's own `tls.controlHost`, on the discard port, once per
+    // `verify`.
+    assert_eq!(state.lock().unwrap().1, ["127.0.0.1:9".parse().unwrap()]);
+
+    // It passed, on a node whose configuration requires its table: a problem.
+    state.lock().unwrap().0 = Outcome::Passed;
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    let problems = strings(&verified["problems"]);
+    assert_eq!(problems.len(), 1, "{verified}");
+    assert!(
+        problems[0].starts_with("the node's own egress: a datagram from the listener to the control host (udp:127.0.0.1:9) passed the node's firewall, and this node's configuration requires its table"),
+        "{verified}"
+    );
+    // The helper's own check is unchanged by it: the free slots are still counted, and the
+    // driver, not the listener, places no VM on a node with a problem.
+    assert_eq!(verified["maxVms"], 4);
+
+    // Neither answer of the kernel: a line that says the try could not be made.
+    state.lock().unwrap().0 = Outcome::Unknown("sendto answered: network unreachable".into());
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["problems"], json!([]), "{verified}");
+    assert!(
+        strings(&verified["checked"])
+            .iter()
+            .any(|l| l.ends_with("could not be tried: sendto answered: network unreachable")),
+        "{verified}"
+    );
+
+    // Refused again: clean.
+    state.lock().unwrap().0 = Outcome::Refused;
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["problems"], json!([]), "{verified}");
+    assert_eq!(state.lock().unwrap().1.len(), 4);
+}
+
+#[tokio::test]
+async fn a_datagram_that_passed_is_no_problem_on_a_node_that_does_not_require_its_table() {
+    let (sender, _) = egress_sender(Outcome::Passed);
+    let half = helper_half_with(|config| config.node_firewall = NodeFirewall::NotRequired).await;
+    let node = node_with(half, None, |config| config.egress_sender = Some(sender)).await;
+    let mut driver = unix_driver(&node).await;
+    driver.hello().await;
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["problems"], json!([]), "{verified}");
+    assert!(
+        strings(&verified["checked"]).contains(
+            &"NOT HELD: the node's own egress: a datagram from the listener to the control host (udp:127.0.0.1:9) passed the node's firewall, which this node's configuration allows (nodeFirewall \"not-required\")"
+        ),
+        "{verified}"
+    );
+}
+
+/// Without a fake, the listener's own sender runs: the tests' control host is loopback, which
+/// the node's table admits, so it is not tried, and `verify` says so.
+#[tokio::test]
+async fn the_real_sender_does_not_try_a_loopback_control_host() {
+    let node = node(None).await;
+    let mut driver = unix_driver(&node).await;
+    driver.hello().await;
+    let verified = driver
+        .call("verify", json!({"template": TEMPLATE}))
+        .await
+        .unwrap();
+    assert_eq!(verified["problems"], json!([]), "{verified}");
+    assert!(
+        strings(&verified["checked"]).contains(
+            &"the node's own egress: a datagram from the listener to the control host (udp:127.0.0.1:9) could not be tried: the control host's address is loopback, which the node's table admits"
+        ),
+        "{verified}"
     );
 }
 

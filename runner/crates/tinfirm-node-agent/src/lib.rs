@@ -2,7 +2,8 @@
 //! sandbox VMs. It is two processes, as OpenSSH's privilege separation:
 //!
 //! - the **listener** ([`listener`]), an unprivileged user, takes the control host's connection
-//!   and reads the agent's wire ([`wire`]);
+//!   and reads the agent's wire ([`wire`]); in `verify` it also tries the node's own egress
+//!   towards the control host ([`egress`]);
 //! - the **helper** ([`helper`]), root, with no network code, does four things for the listener
 //!   alone: check the node, make a VM, delete a VM, list the VMs. It takes a VM's id ([`id`]) and
 //!   a template's name, derives everything else ([`plan`]), and reads the user data from one
@@ -19,6 +20,7 @@
 
 pub mod backend;
 pub mod bounding;
+pub mod egress;
 pub mod harden;
 pub mod hardening;
 pub mod helper;

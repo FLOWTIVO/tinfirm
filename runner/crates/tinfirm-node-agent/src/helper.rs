@@ -116,6 +116,12 @@ pub struct CheckAnswer {
     /// driver counts as `no`: its absence is no reason to fail the check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hardening: Option<Hardening>,
+    /// The configuration's `nodeFirewall`, so that the listener knows whether a datagram that
+    /// passes the node's firewall is a problem ([`crate::egress`]). This helper always sends
+    /// it; without it (a helper of an earlier build) the listener's try is a line of what was
+    /// checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_firewall: Option<NodeFirewall>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,6 +498,7 @@ impl<B: Backend> Helper<B> {
             checked: checked.checked,
             free: self.free(&state, &found),
             hardening: Some(hardening),
+            node_firewall: Some(self.config.node_firewall),
         })
     }
 
@@ -955,6 +962,12 @@ mod tests {
         let f = fixture();
         let helper = Helper::start(f.config.clone(), f.backend.clone()).unwrap();
         assert_eq!(helper.config().node_firewall, NodeFirewall::Required);
+        // The check says the configuration's choice, for the listener's try of the node's
+        // own egress.
+        assert_eq!(
+            helper.check(&template()).unwrap().node_firewall,
+            Some(NodeFirewall::Required)
+        );
         let a = VmId::generate().unwrap();
         write_user_data(&f, &a, b"{}");
         helper.make(&a, &template()).unwrap();
@@ -1001,6 +1014,7 @@ mod tests {
         f.backend.set_node_table(NodeTable::Missing);
         let check = helper.check(&template()).unwrap();
         assert_eq!(check.problems, Vec::<String>::new());
+        assert_eq!(check.node_firewall, Some(NodeFirewall::NotRequired));
         assert!(
             check
                 .checked
@@ -1095,6 +1109,17 @@ mod tests {
         let without: CheckAnswer =
             typed(json!({"problems": [], "checked": ["x"], "free": 2})).unwrap();
         assert_eq!(without.hardening, None);
+        assert_eq!(without.node_firewall, None);
+        for (text, wanted) in [
+            ("required", NodeFirewall::Required),
+            ("not-required", NodeFirewall::NotRequired),
+        ] {
+            let answer: CheckAnswer =
+                typed(json!({"problems": [], "checked": [], "free": 2, "nodeFirewall": text}))
+                    .unwrap();
+            assert_eq!(answer.node_firewall, Some(wanted));
+            assert_eq!(serde_json::to_value(&answer).unwrap()["nodeFirewall"], text);
+        }
         // Written back, it has no `hardening` key at all.
         assert_eq!(
             serde_json::to_value(&without).unwrap(),
@@ -1108,6 +1133,7 @@ mod tests {
         assert_eq!(with.hardening.unwrap().lines[0].line, "io-uring");
         for wrong in [
             json!({"problems": [], "checked": [], "free": 2, "other": 1}),
+            json!({"problems": [], "checked": [], "free": 2, "nodeFirewall": "maybe"}),
             json!({"problems": [], "checked": [], "free": 2, "hardening": {"hardened": "yes"}}),
             json!({"problems": [], "checked": [], "free": 2, "hardening": {"hardened": "yes", "lines": [], "x": 1}}),
         ] {

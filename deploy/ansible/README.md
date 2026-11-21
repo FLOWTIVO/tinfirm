@@ -549,8 +549,11 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
 - **The single machine** (ADR-0112 decision 5): the runner host and the node agent on one machine.
   It is set aside and not built. The helper refuses a control host on the node's own machine, and so
   does the role.
-- **`verify` trying the node's own egress** (the server, the model gateway, the code hosts, a
-  metadata service). It is planned in the agent: check it from the node yourself (below).
+- **The node's egress to anything but its control host, tried from the node.** The agent's
+  `verify` tries one thing itself: a datagram from its listener towards the control host, which the
+  node's own table must refuse; a node where it passes takes no VM. The server, the model gateway,
+  the code hosts, a metadata service and the internet are not tried by the agent: check them from
+  the node yourself (below). The agent's try has not run on a node yet.
 - **An upgrade in place** of a node under running VMs: how the agent and the image of several nodes
   are upgraded is not specified yet. Replace the node's image instead. Change the VM image's
   variables only on a node without VMs: the role replaces the file and restarts the helper, and
@@ -633,6 +636,12 @@ file with the same values, the control host's command line, the units' order and
 firewall with `nft -c -f` where `nft` may check a ruleset, and the hardening's files: all switches
 on, each off in turn (its lines alone gone), the master switch off (none), and a node below every
 setting. CI's deploy job also parses the VMMs' profile with `apparmor_parser -Q -K`.
+
+The agent tries one of these itself, at every `verify`: one empty UDP datagram from its listener
+to the control host's port 9, which the node's table must refuse on the node. Where it passes, the
+node's `verify` names a problem and the control host places no VM on it
+(`runner/crates/tinfirm-node-agent/README.md`, "The node's own egress"). It tries nothing else, and
+only as the listener's user, so the check below stays yours.
 
 On a node, after the play, check its egress yourself, as root: each of these must time out.
 The node's table drops what the node sends and answers nothing, so a time-out is the one result

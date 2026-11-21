@@ -103,9 +103,9 @@
           first: "{{ tinfirm_sandbox_node_first_port | int }}"
           last: "{{ _tinfirm_sandbox_node_last_port | int }}"
       - >-
-        Not done by this role: `verify` trying the node's own egress. The network outside the
-        node is yours to close: the node reaches nothing, and only the control
-        host reaches the node's ports {{ tinfirm_sandbox_node_agent_port }} and
+        The agent's verify tries the node's own egress towards the control host alone, and
+        not as root. The network outside the node is yours to close: the node reaches
+        nothing, and only the control host reaches the node's ports {{ tinfirm_sandbox_node_agent_port }} and
         {{ tinfirm_sandbox_node_first_port }} to {{ _tinfirm_sandbox_node_last_port }}.
 
 # The hardening mark, as the helper's check found it (the same for every template). A line whose

@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::id::TemplateName;
 
@@ -117,7 +117,7 @@ fn default_jail_mib() -> u32 {
 /// Whether the helper makes VMs only while the node's own firewall table
 /// (`units/tinfirm-node-agent.nft`, `inet tinfirm_node`) is loaded. The table is required
 /// unless the configuration says otherwise, so the weaker choice is the one written down.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NodeFirewall {
     /// `check` names a missing table as a problem, and `make` refuses while it is missing.

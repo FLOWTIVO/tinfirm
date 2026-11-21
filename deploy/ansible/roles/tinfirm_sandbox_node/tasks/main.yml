@@ -6,8 +6,8 @@
 # helper's own check of every template, and fails when it names a problem or when a line of the
 # hardening whose switch is on does not hold.
 #
-# Not done here (deploy/ansible/README.md): the single machine, and `verify` trying the node's
-# own egress.
+# Not done here (deploy/ansible/README.md): the single machine. The agent's `verify` tries the
+# node's own egress towards the control host alone; the rest of the node's egress is not tried.
 
 - name: Check the target and the variables
   ansible.builtin.import_tasks: checks.yml
