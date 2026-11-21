@@ -559,8 +559,9 @@ The host derives its level from what it can see, and only takes your word where 
   ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 5): each node
   agent's helper checks every line of a hardened machine, and its `verify` carries the mark. The
   driver's `verify` says `yes` when every node that offers `--vm-template` says `yes`; `no` when one
-  of them says `no`, or answers without the mark (a node agent older than this host, which the
-  driver's log names); and nothing ("not known") when none says `no` but one does not answer. This
+  of them says `no`, answers without the mark (a node agent older than this host, which the
+  driver's log names), or says `yes` without the lines it checked or beside a line that does not
+  hold; and nothing ("not known") when none says `no` but one does not answer. This
   host takes the value of the `verify` at its start, where "not known" is `no`: it vouches for no
   node it did not hear from. Later, "not known" keeps the last value. Its log and `doctor` name each
   line that does not hold (`node node-1: io-uring: kernel.io_uring_disabled is 0, not 2`). A lower

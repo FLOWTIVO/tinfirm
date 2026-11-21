@@ -37,10 +37,11 @@
 //!   `hardening: {hardened, lines}`. The driver's `verify` answers one mark for the template,
 //!   `hardened`: `yes` when every node that offers the template answered `yes`; `no` when any
 //!   of them answered `no`, or answered without the mark (an agent older than this host); left
-//!   out, for "not known", when none of them said `no` but one did not answer. `notHardened`
-//!   names each line that does not hold, as `node <name>: <line>: <found>`, and why a node
-//!   counts as not hardened or not known. The driver reads `hardened` and `holds`, never the
-//!   lines' ids, so a newer agent can add a line ([`hardening_of`]).
+//!   out, for "not known", when none of them said `no` but one did not answer. A `yes` that
+//!   comes without the lines the agent checked, or beside a line that does not hold, is `no`.
+//!   `notHardened` names each line that does not hold, as `node <name>: <line>: <found>`, and
+//!   why a node counts as not hardened or not known. The driver reads `hardened` and `holds`,
+//!   never the lines' ids, so a newer agent can add a line ([`hardening_of`]).
 //! - **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer
 //!   with no problem. A node that does not answer is not counted, and `checked` names it: a
 //!   host with one node down still starts. A node that reports a problem, or a template that no
@@ -953,11 +954,12 @@ fn choose(answers: &[(&str, Result<Value>)]) -> std::result::Result<usize, Vec<(
 const MARK_LINES_MAX: usize = 32;
 
 /// What one node's `verify` answer says of its hardening (ADR-0113, decision 5): `Ok` when the
-/// node reports `yes` and no line of its mark fails, else the lines of `notHardened` that say
-/// why it counts as not hardened, each `node <name>: …`. A node that sends no `hardening` (an
-/// agent older than this host) or a mark that cannot be read counts as not hardened: the host
-/// cannot vouch for it. The driver reads `hardened` and each line's `holds`, never a line's id,
-/// and passes on the agent's words, on one line and cut.
+/// node reports `yes` with the lines it checked and none of them fails, else the lines of
+/// `notHardened` that say why it counts as not hardened, each `node <name>: …`. A node that
+/// sends no `hardening` (an agent older than this host), a mark that cannot be read, or a `yes`
+/// without its lines counts as not hardened: the host cannot vouch for it. The driver reads
+/// `hardened` and each line's `holds`, never a line's id, and passes on the agent's words, on
+/// one line and cut.
 fn node_hardening(node: &str, verified: &Value) -> std::result::Result<(), Vec<String>> {
     let hardening = &verified["hardening"];
     if hardening.is_null() {
@@ -994,7 +996,15 @@ fn node_hardening(node: &str, verified: &Value) -> std::result::Result<(), Vec<S
             failing.len() - MARK_LINES_MAX
         ));
     }
+    // A `yes` stands on the lines the agent checked: one that comes without them (no list, or
+    // an empty one) says nothing the host could pass on.
+    let checked = hardening["lines"]
+        .as_array()
+        .is_some_and(|lines| !lines.is_empty());
     match hardening["hardened"].as_str() {
+        Some("yes") if !checked => Err(vec![format!(
+            "node {node}: reports hardened without the lines it checked: counted as not hardened"
+        )]),
         Some("yes") if lines.is_empty() => Ok(()),
         // The mark and its lines disagree: the stricter reading.
         Some("yes") => Err(lines),
@@ -1684,6 +1694,30 @@ mod tests {
                 vec!["node n1: lockdown: lockdown is none".to_string()]
             )
         );
+        // `yes` without the lines the agent checked: no list, one that is no list, an empty one.
+        for hardening in [
+            json!({ "hardened": "yes" }),
+            json!({ "hardened": "yes", "lines": null }),
+            json!({ "hardened": "yes", "lines": "all of them" }),
+            json!({ "hardened": "yes", "lines": [] }),
+        ] {
+            assert_eq!(
+                mark(&[("n1", marked(1, hardening.clone()))]),
+                (
+                    Some("no"),
+                    vec![
+                        "node n1: reports hardened without the lines it checked: counted as not hardened"
+                            .to_string()
+                    ]
+                ),
+                "{hardening}"
+            );
+            // And such a node is not preferred for a new VM.
+            assert_eq!(
+                choose(&[("a", marked(1, hardening)), ("b", marked(1, yes()))]),
+                Ok(1)
+            );
+        }
         // `no` without a line, a value the driver does not know, or no value at all.
         for (hardening, expected) in [
             (json!({ "hardened": "no", "lines": [] }), "names no line"),

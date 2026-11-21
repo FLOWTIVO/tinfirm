@@ -1561,7 +1561,10 @@ impl Vms {
             .collect();
         for (id, host, label) in due {
             if label.as_ref().is_some_and(|l| lock(&self.live).contains(l)) {
-                // Held by this process again: not a leftover.
+                // A VM that this process holds is never deleted here. No VM is held again once
+                // its delete was asked: a run taken back adopts its VM at the start, before the
+                // first cleanup ([`Vms::adopt`]), and a create makes a VM with a label of its
+                // own. Should that order ever change, this keeps such a VM.
                 lock(&self.left).vms.remove(&id);
                 continue;
             }
