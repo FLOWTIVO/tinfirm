@@ -1233,7 +1233,7 @@ async fn fronts_started_and_dropped_by_the_hundred_leave_no_zombie() {
 // ----- the egress proxy through a front (slice 3) -------------------------------------------
 
 use tinfirm_runner_host::egress_proxy::{EgressGuard, EgressProxy, EgressSettings, Rule};
-use tinfirm_runner_host::front::sandbox::SandboxFront;
+use tinfirm_runner_host::front::sandbox::{SandboxFront, Serving};
 use tinfirm_runner_host::git_proxy::Endpoint;
 
 /// An egress proxy whose listeners a front serves, with `allow` and loopback as `loopback`.
@@ -1246,6 +1246,14 @@ async fn sandbox_front(command: Option<FrontCommand>) -> Option<std::sync::Arc<S
     match command {
         Some(command) => Some(SandboxFront::start(&command).await.unwrap()),
         None => None,
+    }
+}
+
+/// What serves a proxy: `front` on a listener of the proxy's, or this process without one.
+fn serving(front: Option<std::sync::Arc<SandboxFront>>) -> Serving {
+    match front {
+        Some(front) => Serving::Listener(front),
+        None => Serving::Host,
     }
 }
 
@@ -1265,9 +1273,7 @@ async fn egress_with(front: Option<FrontCommand>, allow: &[String], loopback: bo
         .start_run_at(
             uuid::Uuid::new_v4(),
             Vec::new(),
-            None,
-            sandbox_front(front).await,
-            None,
+            &serving(sandbox_front(front).await),
         )
         .await
         .unwrap()
@@ -1672,9 +1678,7 @@ async fn measure_the_egress_proxy() {
             .start_run_at(
                 uuid::Uuid::new_v4(),
                 Vec::new(),
-                None,
-                sandbox_front(front).await,
-                None,
+                &serving(sandbox_front(front).await),
             )
             .await
             .unwrap();
@@ -1759,9 +1763,7 @@ async fn model_through(
         .start_run_at(
             uuid::Uuid::new_v4(),
             &access,
-            None,
-            sandbox_front(Some(front)).await,
-            None,
+            &serving(sandbox_front(Some(front)).await),
         )
         .await
         .unwrap()
@@ -1898,7 +1900,7 @@ async fn measure_the_model_proxy() {
         };
         let front = sandbox_front(in_front.then(the_front)).await;
         let guard = ModelProxy::new(settings, &endpoint)
-            .start_run_at(uuid::Uuid::new_v4(), &access, None, front, None)
+            .start_run_at(uuid::Uuid::new_v4(), &access, &serving(front))
             .await
             .unwrap();
         let path = format!(
@@ -2043,9 +2045,7 @@ async fn one_front_serves_a_sandboxs_egress_and_model_proxies_and_ends_with_the_
         .start_run_at(
             uuid::Uuid::new_v4(),
             Vec::new(),
-            None,
-            Some(front.clone()),
-            None,
+            &Serving::Listener(front.clone()),
         )
         .await
         .unwrap();
@@ -2067,9 +2067,7 @@ async fn one_front_serves_a_sandboxs_egress_and_model_proxies_and_ends_with_the_
         .start_run_at(
             uuid::Uuid::new_v4(),
             &access,
-            None,
-            Some(front.clone()),
-            None,
+            &Serving::Listener(front.clone()),
         )
         .await
         .unwrap();
@@ -2173,7 +2171,7 @@ async fn a_front_serves_one_listener_of_each_service_and_run_refuses_a_second() 
             api_key: tinfirm_protocol::Secret::new("sk-TEST-ONLY-one-listener-key"),
         };
         ModelProxy::new(settings, &endpoint)
-            .start_run_at(uuid::Uuid::new_v4(), &access, None, Some(front), None)
+            .start_run_at(uuid::Uuid::new_v4(), &access, &Serving::Listener(front))
             .await
     };
     let server = echo_and_http().await;
@@ -2192,9 +2190,7 @@ async fn a_front_serves_one_listener_of_each_service_and_run_refuses_a_second() 
     .start_run_at(
         uuid::Uuid::new_v4(),
         Vec::new(),
-        None,
-        Some(front.clone()),
-        None,
+        &Serving::Listener(front.clone()),
     )
     .await
     .unwrap();
@@ -2237,10 +2233,14 @@ async fn a_hostile_front_gets_from_runs_git_proxy_only_what_its_rules_allow() {
             sandbox_host: "127.0.0.2".into(),
             extra_hosts: Vec::new(),
         };
-        let (proxy, listener) =
-            GitProxy::start_in_front(endpoint, true, ListenerLimits::default(), &front, None)
-                .await
-                .unwrap();
+        let (proxy, listener) = GitProxy::start_in_front(
+            endpoint,
+            true,
+            ListenerLimits::default(),
+            &Serving::Listener(front.clone()),
+        )
+        .await
+        .unwrap();
         // Nine routes: room for more than 64 requests held open at 8 per route.
         let route: Vec<_> = (0..9)
             .map(|i| {
@@ -2316,9 +2316,7 @@ async fn a_front_that_ends_with_its_run_is_no_broken_wire() {
         .start_run_at(
             uuid::Uuid::new_v4(),
             Vec::new(),
-            None,
-            Some(front.clone()),
-            None,
+            &Serving::Listener(front.clone()),
         )
         .await
         .unwrap();
@@ -2341,9 +2339,7 @@ async fn a_front_that_ends_with_its_run_is_no_broken_wire() {
         .start_run_at(
             uuid::Uuid::new_v4(),
             &access,
-            None,
-            Some(front.clone()),
-            None,
+            &Serving::Listener(front.clone()),
         )
         .await
         .unwrap();

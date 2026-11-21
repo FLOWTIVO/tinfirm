@@ -91,7 +91,7 @@ use uuid::Uuid;
 use crate::front::head::{
     Backend, BodyLength, BoxError, Declined, ProxyBody, RequestHead, ResponseHead, Target,
 };
-use crate::front::sandbox::SandboxFront;
+use crate::front::sandbox::{SandboxFront, Serving};
 use crate::front::wire::{FrontLimits, GitRouteSpec, McpRouteSpec};
 use crate::mcp::{self, RunTools};
 use crate::sandbox::Executor;
@@ -577,22 +577,25 @@ impl GitProxy {
         Ok(GitProxy { inner })
     }
 
-    /// One run's own listener, on a host with the bridge: it binds where `endpoint` says, and
-    /// the sandbox's `front` serves its HTTP (ADR-0112, path C, part 2), within `limits`, while
-    /// this process keeps the run half: the tokens, the requests upstream and the run's tools.
-    /// The routes registered on it reach the front with [`GitProxy::publish`]. The listener
-    /// closes when the returned guard is dropped.
+    /// One run's own listener, on a host with the bridge: the sandbox's front that `serving`
+    /// names serves its HTTP (ADR-0112, path C, part 2), within `limits`, while this process
+    /// keeps the run half: the tokens, the requests upstream and the run's tools. The routes
+    /// registered on it reach the front with [`GitProxy::publish`], and their URLs name the
+    /// tunnel's port on the sandbox's loopback. The listener closes when the returned guard is
+    /// dropped.
     pub async fn start_in_front(
-        endpoint: Endpoint,
+        mut endpoint: Endpoint,
         allow_http: bool,
         limits: ListenerLimits,
-        front: &Arc<SandboxFront>,
-        tunnel_port: Option<u16>,
+        serving: &Serving,
     ) -> Result<(GitProxy, FrontListenerGuard)> {
-        // With `tunnel_port` the front serves it for the sandbox's tunnels alone, on that port
-        // of the sandbox's own loopback, and this host binds no listener: the routes' URLs
-        // name that port.
-        let (listener, addr) = match tunnel_port {
+        let front = serving
+            .front()
+            .context("only a sandbox's front serves a run's own git listener")?;
+        if let Some(host) = serving.sandbox_host() {
+            endpoint.sandbox_host = host;
+        }
+        let (listener, addr) = match serving.tunnel_port(crate::front::wire::Service::Git) {
             Some(port) => (None, SocketAddr::new(endpoint.bind.ip(), port)),
             None => {
                 let listener = TcpListener::bind(endpoint.bind).await.with_context(|| {
@@ -704,26 +707,11 @@ impl GitProxy {
         credentials: impl RouteCredentials + 'static,
         branch: &str,
     ) -> Result<RouteGuard> {
-        self.register_at(run_id, repo_url, credentials, branch, None)
-    }
-
-    /// [`GitProxy::register`], with a URL that names `sandbox_host` in place of the endpoint's
-    /// (a local test executor's sandbox over the bridge, which has a loopback address of its
-    /// own).
-    pub fn register_at(
-        &self,
-        run_id: Uuid,
-        repo_url: &str,
-        credentials: impl RouteCredentials + 'static,
-        branch: &str,
-        sandbox_host: Option<&str>,
-    ) -> Result<RouteGuard> {
         let upstream = Upstream::parse(repo_url, self.inner.allow_http)?;
         let secret = Secret::new(new_secret()?);
-        let host = sandbox_host.unwrap_or(&self.inner.endpoint.sandbox_host);
         let sandbox_url = format!(
             "http://{}/{}{}",
-            host_port(host, self.inner.addr.port()),
+            host_port(&self.inner.endpoint.sandbox_host, self.inner.addr.port()),
             secret.expose(),
             upstream.path
         );
@@ -750,21 +738,10 @@ impl GitProxy {
 
     /// Registers a run's platform MCP endpoint, served until the returned guard is dropped.
     pub fn register_mcp(&self, tools: Arc<RunTools>) -> Result<McpGuard> {
-        self.register_mcp_at(tools, None)
-    }
-
-    /// [`GitProxy::register_mcp`], with a URL that names `sandbox_host` (as
-    /// [`GitProxy::register_at`]).
-    pub fn register_mcp_at(
-        &self,
-        tools: Arc<RunTools>,
-        sandbox_host: Option<&str>,
-    ) -> Result<McpGuard> {
         let secret = Secret::new(new_secret()?);
-        let host = sandbox_host.unwrap_or(&self.inner.endpoint.sandbox_host);
         let url = format!(
             "http://{}/{}/mcp",
-            host_port(host, self.inner.addr.port()),
+            host_port(&self.inner.endpoint.sandbox_host, self.inner.addr.port()),
             secret.expose()
         );
         let id = self.inner.next_route.fetch_add(1, Ordering::Relaxed);
@@ -1925,10 +1902,14 @@ mod tests {
                 let front = SandboxFront::start(&crate::front::test_command())
                     .await
                     .unwrap();
-                let (proxy, listener) =
-                    GitProxy::start_in_front(endpoint, true, limits, &front, None)
-                        .await
-                        .unwrap();
+                let (proxy, listener) = GitProxy::start_in_front(
+                    endpoint,
+                    true,
+                    limits,
+                    &Serving::Listener(front.clone()),
+                )
+                .await
+                .unwrap();
                 Proxy {
                     proxy,
                     _listener: Some(listener),

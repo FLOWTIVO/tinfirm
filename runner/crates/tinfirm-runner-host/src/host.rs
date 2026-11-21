@@ -1003,9 +1003,10 @@ impl Shared {
         Ok(Some(proxy))
     }
 
-    /// A new sandbox's front process, which serves the HTTP of that sandbox's proxy listeners
-    /// (ADR-0112, path C, part 2): with the bridge only; `Ok(None)` without it, where this
-    /// process serves them. One per sandbox: its first listener starts it.
+    /// A new sandbox's front process, which holds that sandbox's bridge and serves the HTTP of
+    /// its proxies (ADR-0112, path C, part 2): with the bridge only; `Ok(None)` without it,
+    /// where this process serves them. One per sandbox: a VM's when the VM is created
+    /// (crate::pool), any other's where its run decides what serves its proxies (crate::run).
     pub async fn sandbox_front(&self) -> Result<Option<Arc<crate::front::sandbox::SandboxFront>>> {
         match &self.opts.bridge {
             Some(bridge) => Ok(Some(

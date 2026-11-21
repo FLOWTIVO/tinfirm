@@ -1,14 +1,15 @@
 //! A sandbox's front, as `run` holds it (ADR-0112, path C, part 2): one front process per
-//! sandbox, which serves every listener of that sandbox's proxies, and the part of `run` that
-//! answers its requests.
+//! sandbox, which holds the sandbox's bridge and serves each of that sandbox's proxies, and the
+//! part of `run` that answers its requests.
 //!
-//! A sandbox gets its front with its first listener: a VM's when the VM is made (its egress
-//! listener, crate::pool), any other sandbox's when its run starts its model proxy or its
-//! egress proxy (crate::run). Each listener's guard holds the front, and so does the run's
-//! access (or the VM, until a run claims it): the front ends with the last of them, so with the
-//! sandbox. A listener whose guard is dropped is closed in the front ([`ToFront::Unlisten`]),
-//! and `run` stops answering its requests at once. A sandbox has one listener of each service
-//! in its life, so a front serves each once: `run` refuses a second one itself.
+//! A sandbox gets its front once, with what serves its proxies ([`Serving`]): a VM's when the
+//! VM is made (crate::pool), any other sandbox's when its run starts, before its first proxy
+//! (crate::run). Each proxy's guard holds the front, and so do the run's access and the
+//! bridge's session (or the VM, until a run claims it): the front ends with the last of them,
+//! so with the sandbox. A proxy whose guard is dropped is closed in the front
+//! ([`ToFront::Unlisten`]), and `run` stops answering its requests at once. A sandbox has one
+//! proxy of each service in its life, so a front serves each once: `run` refuses a second one
+//! itself.
 //!
 //! `run` decides here and the front only asks:
 //! - **egress:** a destination that the front asks for is decided and connected by the egress
@@ -81,6 +82,73 @@ struct Answering {
     body_end: Option<oneshot::Sender<()>>,
     /// Cancelled when the front gives the request up, or the listener closes.
     stop: CancellationToken,
+}
+
+/// What serves a sandbox's proxies (the git proxy and the platform tools, the model proxy and
+/// the egress proxy), and how the sandbox names them: decided once for a sandbox, where its
+/// front starts (crate::run for a run's sandbox, crate::pool for a VM), and given to each proxy
+/// the sandbox uses.
+#[derive(Clone)]
+pub enum Serving {
+    /// This process, each proxy on a listener of its own at its endpoint: a host without the
+    /// bridge.
+    Host,
+    /// The sandbox's front, for the sandbox's tunnels to it alone: each service at its fixed
+    /// port ([`crate::bridge::tunnel_port`]) on the sandbox's loopback `loopback`, which the
+    /// proxies' URLs name. This host binds no listener for them. Every sandbox of a host with
+    /// the bridge.
+    Tunnels {
+        front: Arc<SandboxFront>,
+        loopback: std::net::IpAddr,
+    },
+    /// The sandbox's front, on a listener that this process binds at the proxy's endpoint and
+    /// passes to it ([`ToFront::ListenEgress`] and the others), and for tunnels too. No host
+    /// serves a sandbox so: the tests of the front's services reach them this way, without a
+    /// bridge.
+    #[doc(hidden)]
+    Listener(Arc<SandboxFront>),
+}
+
+impl Serving {
+    /// The sandbox's front, when it serves the proxies.
+    pub fn front(&self) -> Option<&Arc<SandboxFront>> {
+        match self {
+            Serving::Host => None,
+            Serving::Tunnels { front, .. } | Serving::Listener(front) => Some(front),
+        }
+    }
+
+    /// The port of the sandbox's tunnel to `service` when its front serves it for the tunnels
+    /// alone; `None` where this process binds a listener for it.
+    pub fn tunnel_port(&self, service: Service) -> Option<u16> {
+        match self {
+            Serving::Tunnels { .. } => Some(crate::bridge::tunnel_port(service)),
+            Serving::Host | Serving::Listener(_) => None,
+        }
+    }
+
+    /// The host that the proxies' URLs name, in place of their endpoint's: the sandbox's
+    /// loopback, where its tunnels listen.
+    pub fn sandbox_host(&self) -> Option<String> {
+        match self {
+            Serving::Tunnels { loopback, .. } => Some(loopback.to_string()),
+            Serving::Host | Serving::Listener(_) => None,
+        }
+    }
+
+    /// The tunnels a sandbox opens for `services`: each at its port on the sandbox's loopback.
+    pub fn tunnels(&self, services: &[Service]) -> Vec<(std::net::SocketAddr, Service)> {
+        let Serving::Tunnels { loopback, .. } = self else {
+            return Vec::new();
+        };
+        services
+            .iter()
+            .map(|&service| {
+                let port = crate::bridge::tunnel_port(service);
+                (std::net::SocketAddr::new(*loopback, port), service)
+            })
+            .collect()
+    }
 }
 
 /// The front process of one sandbox, and what answers it.

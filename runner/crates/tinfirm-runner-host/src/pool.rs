@@ -83,7 +83,7 @@ pub struct IdleVm {
     /// The bridge's identity and where it is dialed.
     keep: crate::sandbox::BridgeKeep,
     egress: Option<EgressGuard>,
-    sandbox_host: Option<String>,
+    loopback: std::net::IpAddr,
     ticket: String,
     boot_settings: Vec<(String, String)>,
     shape: Shape,
@@ -122,7 +122,7 @@ struct Up {
     session: FrontSession,
     keep: crate::sandbox::BridgeKeep,
     egress: Option<EgressGuard>,
-    sandbox_host: Option<String>,
+    loopback: std::net::IpAddr,
     ticket: String,
     boot_settings: Vec<(String, String)>,
 }
@@ -146,9 +146,9 @@ pub struct Claimed {
     pub keep: crate::sandbox::BridgeKeep,
     /// The VM's egress proxy listener, which the run binds to its rules.
     pub egress: Option<EgressGuard>,
-    /// The VM's own loopback in the VM executor's test mode (`VmOptions::on_this_machine`),
-    /// where its tunnels listen; `None` for a real VM.
-    pub sandbox_host: Option<String>,
+    /// Where the VM's tunnels to its front listen: its loopback, which in the VM executor's test
+    /// mode (`VmOptions::on_this_machine`) is a loopback address of its own on this machine.
+    pub loopback: std::net::IpAddr,
     /// The VM's one-time ticket, used up when its bridge connected; it is in the VM's user
     /// data, so the run's log masks it.
     pub ticket: String,
@@ -452,24 +452,20 @@ impl Pool {
         let bridge_id = format!("vm-{id}");
         // Where the VM's tunnels listen in the test mode, whose "VMs" share this machine's
         // network: a loopback address of their own.
-        let sandbox_host = options
-            .on_this_machine
-            .then(|| crate::bridge::local_sandbox_loopback().to_string());
-        // The VM's front holds its bridge and serves its listeners' HTTP: its egress proxy's
+        let loopback = std::net::IpAddr::V4(if options.on_this_machine {
+            crate::bridge::local_sandbox_loopback()
+        } else {
+            crate::bridge::SANDBOX_LOOPBACK
+        });
+        // The VM's front holds its bridge and serves its proxies' HTTP: its egress proxy's
         // now, through the tunnel, and the rest once a run claims the VM.
         let front = host.sandbox_front().await?.context("the VM has no front")?;
+        let serving = crate::front::sandbox::Serving::Tunnels {
+            front: front.clone(),
+            loopback,
+        };
         let egress = match host.egress_proxy().await? {
-            Some(proxy) => Some(
-                proxy
-                    .start_slot(
-                        sandbox_host.as_deref(),
-                        Some(front.clone()),
-                        Some(crate::bridge::tunnel_port(
-                            crate::front::wire::Service::Egress,
-                        )),
-                    )
-                    .await?,
-            ),
+            Some(proxy) => Some(proxy.start_slot(&serving).await?),
             None => None,
         };
         let boot_settings = boot_settings(shape, egress.as_ref());
@@ -540,7 +536,7 @@ impl Pool {
             session,
             keep,
             egress,
-            sandbox_host,
+            loopback,
             ticket,
             boot_settings,
         };
@@ -562,7 +558,7 @@ impl Pool {
             session: up.session,
             keep: up.keep,
             egress: up.egress,
-            sandbox_host: up.sandbox_host,
+            loopback: up.loopback,
             ticket: up.ticket,
             boot_settings: up.boot_settings,
             shape: shape.clone(),
@@ -729,7 +725,7 @@ fn claimed(vm: IdleVm, busy: Busy, served: Served, asked: Instant) -> Claimed {
         session: vm.session,
         keep: vm.keep,
         egress: vm.egress,
-        sandbox_host: vm.sandbox_host,
+        loopback: vm.loopback,
         ticket: vm.ticket,
         boot_settings: vm.boot_settings,
         shape: vm.shape,

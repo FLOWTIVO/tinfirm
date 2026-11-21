@@ -35,6 +35,7 @@ use crate::attachments::{self, AttachmentsDir, Upload, UploadSource};
 use crate::credentials::Credential;
 use crate::docker;
 use crate::egress_proxy::{EgressGuard, Rule};
+use crate::front::sandbox::Serving;
 use crate::front::wire::Service;
 use crate::git::{self, Git, branch_tip, ref_shas};
 use crate::git_proxy::{GitProxy, McpGuard, RouteGuard};
@@ -673,30 +674,10 @@ pub async fn execute(
             None => {}
         }
     }
-    // A local test executor's sandbox over the bridge shares this machine's network: it
-    // reaches the listeners on a loopback address of its own (crate::bridge); a VM of the VM
-    // executor's test mode has one of its own.
-    let sandbox_host = match &claimed {
-        Some(vm) => vm.sandbox_host.clone(),
-        None => (bridged && shared.opts.executor.on_this_machine())
-            .then(|| crate::bridge::local_sandbox_loopback().to_string()),
-    };
-    // One front per sandbox serves its listeners' HTTP on a host with the bridge: a VM's
-    // came with the VM, and holds its bridge; any other's comes with the first listener it
-    // needs, which is the run's own git listener for its fetches and platform tools.
-    let mut front = claimed.as_ref().map(|vm| vm.session.front().clone());
+    let serving = serving(shared, claimed.as_ref()).await;
     // The sandbox's way to fetch and to the platform tools; dropping it (at the latest when
     // this function returns) removes the run's routes from the listener.
-    let mut access = sandbox_access(
-        shared,
-        &mut sink,
-        assign,
-        &repos,
-        roots,
-        sandbox_host,
-        &mut front,
-    )
-    .await;
+    let mut access = sandbox_access(shared, &mut sink, assign, &repos, roots, serving).await;
     let mut phase = None;
     if stop_rx.borrow().is_none() && failure.0.is_none() {
         if !starting {
@@ -704,15 +685,8 @@ pub async fn execute(
         }
         // A gateway's key stays on the host (the model proxy is always on): the runtime gets the
         // run's model proxy as its base URL and a dummy key.
-        let model_proxy = start_model_proxy(
-            shared,
-            &mut sink,
-            assign,
-            credential,
-            access.sandbox_host.as_deref(),
-            &mut front,
-        )
-        .await;
+        let model_proxy =
+            start_model_proxy(shared, &mut sink, assign, credential, &access.serving).await;
         let proxy_url = match &model_proxy {
             Ok(Some(guard)) => Some(guard.base_url().to_string()),
             _ => None,
@@ -775,7 +749,6 @@ pub async fn execute(
         let started = match model_proxy {
             Ok(model_proxy) => {
                 access.model_proxy = model_proxy;
-                let host = access.sandbox_host.clone();
                 let slot = claimed.as_mut().and_then(|vm| vm.egress.take());
                 let started_egress = start_egress(
                     shared,
@@ -783,12 +756,10 @@ pub async fn execute(
                     assign,
                     model,
                     &mut spec,
-                    host.as_deref(),
                     slot,
-                    &mut front,
+                    &access.serving,
                 )
                 .await;
-                access.front = front;
                 match started_egress {
                     Ok(egress) => {
                         access.egress = egress;
@@ -1893,7 +1864,6 @@ async fn clone_all<'a>(
 
 /// What the sandbox reaches on the host: one git proxy route per HTTP(S) repository and the
 /// platform MCP endpoint. Dropping it removes them.
-#[derive(Default)]
 struct SandboxAccess {
     routes: Vec<RouteGuard>,
     mcp: Option<McpGuard>,
@@ -1908,12 +1878,48 @@ struct SandboxAccess {
     /// The run's own listener of the git proxy and the platform tools, which its sandbox's
     /// front serves on a host with the bridge; `None` where the shared listener serves them.
     git_listener: Option<crate::git_proxy::FrontListenerGuard>,
-    /// The sandbox's front, which serves the listeners' HTTP on a host with the bridge; it
-    /// ends with the run's access (and its listeners' guards).
-    front: Option<Arc<crate::front::sandbox::SandboxFront>>,
-    /// Where the sandbox reaches the listeners when it is not the endpoint's host: a local
-    /// test executor's sandbox over the bridge, on a loopback address of its own.
-    sandbox_host: Option<String>,
+    /// What serves the sandbox's proxies ([`serving`]): with the bridge, the sandbox's front,
+    /// which ends with the run's access (and its listeners' guards); `Err` with why the front
+    /// did not start.
+    serving: Result<Serving, String>,
+}
+
+/// What serves the run's sandbox's proxies, decided once for the run: this process without the
+/// bridge; with it, the sandbox's front, for the sandbox's tunnels to it on its loopback. A
+/// claimed VM's front came with the VM and holds its bridge; any other sandbox's front starts
+/// here, the one place a run's sandbox gets its front. A front that cannot start is `Err` with
+/// why: each proxy that needs it fails with that, and so does the sandbox's start.
+async fn serving(
+    shared: &Shared,
+    claimed: Option<&crate::pool::Claimed>,
+) -> Result<Serving, String> {
+    if let Some(vm) = claimed {
+        return Ok(Serving::Tunnels {
+            front: vm.session.front().clone(),
+            loopback: vm.loopback,
+        });
+    }
+    let front = match shared.sandbox_front().await {
+        Ok(Some(front)) => front,
+        Ok(None) => return Ok(Serving::Host),
+        Err(e) => return Err(format!("{e:#}")),
+    };
+    // A local test executor's sandbox over the bridge shares this machine's network: its
+    // tunnels listen on a loopback address of its own (crate::bridge).
+    let loopback = if shared.opts.executor.on_this_machine() {
+        crate::bridge::local_sandbox_loopback()
+    } else {
+        crate::bridge::SANDBOX_LOOPBACK
+    };
+    Ok(Serving::Tunnels {
+        front,
+        loopback: std::net::IpAddr::V4(loopback),
+    })
+}
+
+/// The error of a sandbox's front that did not start ([`serving`]), for each use of it.
+fn no_front(why: &str) -> anyhow::Error {
+    anyhow::anyhow!("{why}")
 }
 
 /// An address of the sandbox network's reserved test range (RFC 5737) on which nothing answers.
@@ -1928,8 +1934,7 @@ async fn start_model_proxy(
     sink: &mut EventSink,
     assign: &RunAssign,
     credential: &RunCredential,
-    sandbox_host: Option<&str>,
-    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
+    serving: &Result<Serving, String>,
 ) -> Result<Option<ModelProxyGuard>, String> {
     let RunCredential::Model(model) = credential else {
         return Ok(None);
@@ -1946,22 +1951,11 @@ async fn start_model_proxy(
         Ok(proxy) => proxy,
         Err(e) => return Err(unavailable(sink, e)),
     };
-    if front.is_none() {
-        match shared.sandbox_front().await {
-            Ok(started) => *front = started,
-            Err(e) => return Err(unavailable(sink, e)),
-        }
-    }
-    let guard = match proxy
-        .start_run_at(
-            assign.run_id,
-            model,
-            sandbox_host,
-            front.clone(),
-            tunnel_port(shared, Service::Model),
-        )
-        .await
-    {
+    let serving = match serving {
+        Ok(serving) => serving,
+        Err(why) => return Err(unavailable(sink, no_front(why))),
+    };
+    let guard = match proxy.start_run_at(assign.run_id, model, serving).await {
         Ok(guard) => guard,
         Err(e) => return Err(unavailable(sink, e)),
     };
@@ -1990,16 +1984,14 @@ async fn start_model_proxy(
 /// fails closed, and the log says why. A VM from the pool (crate::pool) brings its own
 /// listener (`slot`), which its container's settings name already: the run binds its rules to
 /// that one.
-#[allow(clippy::too_many_arguments)]
 async fn start_egress(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     assign: &RunAssign,
     model: Access<'_>,
     spec: &mut SandboxSpec,
-    sandbox_host: Option<&str>,
     slot: Option<EgressGuard>,
-    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
+    serving: &Result<Serving, String>,
 ) -> Result<Option<EgressGuard>, String> {
     if shared.opts.egress.is_none() {
         return Ok(None);
@@ -2044,22 +2036,11 @@ async fn start_egress(
             slot
         }
         (None, Some(proxy)) => {
-            if front.is_none() {
-                match shared.sandbox_front().await {
-                    Ok(started) => *front = started,
-                    Err(e) => return Err(unavailable(sink, e)),
-                }
-            }
-            match proxy
-                .start_run_at(
-                    assign.run_id,
-                    rules,
-                    sandbox_host,
-                    front.clone(),
-                    tunnel_port(shared, Service::Egress),
-                )
-                .await
-            {
+            let serving = match serving {
+                Ok(serving) => serving,
+                Err(why) => return Err(unavailable(sink, no_front(why))),
+            };
+            match proxy.start_run_at(assign.run_id, rules, serving).await {
                 Ok(guard) => guard,
                 Err(e) => return Err(unavailable(sink, e)),
             }
@@ -2136,12 +2117,17 @@ async fn sandbox_access(
     assign: &RunAssign,
     repos: &[Repo<'_>],
     file_roots: Vec<FileRoot>,
-    sandbox_host: Option<String>,
-    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
+    serving: Result<Serving, String>,
 ) -> SandboxAccess {
     let mut access = SandboxAccess {
-        sandbox_host,
-        ..SandboxAccess::default()
+        routes: Vec::new(),
+        mcp: None,
+        tools: None,
+        extra_hosts: Vec::new(),
+        egress: None,
+        model_proxy: None,
+        git_listener: None,
+        serving,
     };
     // Where the sandbox's front serves the run's git proxy for its tunnels alone, the host's
     // shared listener is not started for it.
@@ -2182,7 +2168,7 @@ async fn sandbox_access(
     access.extra_hosts = endpoint.extra_hosts.clone();
     // On a host with the bridge the run gets a listener of its own, which its sandbox's front
     // serves: the front reads the sandbox's requests, and this process attaches the tokens.
-    let proxy = match run_listener(shared, &endpoint, front).await {
+    let proxy = match run_listener(shared, &endpoint, &access.serving).await {
         Ok(Some((own, guard))) => {
             access.git_listener = Some(guard);
             own
@@ -2210,8 +2196,7 @@ async fn sandbox_access(
         }
     };
     for repo in repos {
-        let host = access.sandbox_host.as_deref();
-        if let Some(route) = route_git_proxy(shared, sink, &proxy, repo, assign, host).await {
+        if let Some(route) = route_git_proxy(shared, sink, &proxy, repo, assign).await {
             access.routes.push(route);
         }
     }
@@ -2237,7 +2222,7 @@ async fn sandbox_access(
         .with_public_suffix(shared.public_suffix().clone())
         .with_upload_max_bytes(shared.opts.upload_max_bytes),
     );
-    match proxy.register_mcp_at(tools.clone(), access.sandbox_host.as_deref()) {
+    match proxy.register_mcp(tools.clone()) {
         Ok(mcp) => {
             // Before the URL can appear anywhere: the agent may print its MCP settings.
             shared.add_run_masked(
@@ -2270,38 +2255,24 @@ async fn sandbox_access(
 }
 
 /// The run's own listener of the git proxy and the platform tools in its sandbox's front, on a
-/// host with the bridge (the front starts here if the sandbox has none yet); `Ok(None)`
-/// elsewhere, where the shared listener serves the run.
+/// host with the bridge; `Ok(None)` elsewhere, where the shared listener serves the run.
 async fn run_listener(
     shared: &Arc<Shared>,
     endpoint: &crate::git_proxy::Endpoint,
-    front: &mut Option<Arc<crate::front::sandbox::SandboxFront>>,
+    serving: &Result<Serving, String>,
 ) -> anyhow::Result<Option<(GitProxy, crate::git_proxy::FrontListenerGuard)>> {
-    if front.is_none() {
-        *front = shared.sandbox_front().await?;
-    }
-    let Some(front) = front.as_ref() else {
+    let serving = serving.as_ref().map_err(|why| no_front(why))?;
+    if serving.front().is_none() {
         return Ok(None);
-    };
+    }
     let (proxy, guard) = GitProxy::start_in_front(
         endpoint.clone(),
         shared.opts.allow_insecure_repo_urls,
         crate::git_proxy::ListenerLimits::default(),
-        front,
-        tunnel_port(shared, Service::Git),
+        serving,
     )
     .await?;
     Ok(Some((proxy, guard)))
-}
-
-/// The port in the sandbox where a run's tunnel to `service` listens, when its sandbox's front
-/// serves the service for the tunnels alone; `None` where this host binds a listener for it.
-fn tunnel_port(shared: &Shared, service: Service) -> Option<u16> {
-    shared
-        .opts
-        .bridge
-        .is_some()
-        .then(|| crate::bridge::tunnel_port(service))
 }
 
 /// Registers one repository with the git proxy and points its `origin` at it, so the agent
@@ -2312,7 +2283,6 @@ async fn route_git_proxy(
     proxy: &GitProxy,
     repo: &Repo<'_>,
     assign: &RunAssign,
-    sandbox_host: Option<&str>,
 ) -> Option<RouteGuard> {
     let ws = repo.ws;
     // Only HTTP(S) repositories; `file://` ones exist in tests only.
@@ -2334,12 +2304,11 @@ async fn route_git_proxy(
         );
     };
     // The route reads the token from the run's holder at each request (ADR-0116).
-    let route = match proxy.register_at(
+    let route = match proxy.register(
         assign.run_id,
         &ws.repo_url,
         repo.git.tokens().clone(),
         &ws.branch,
-        sandbox_host,
     ) {
         Ok(route) => route,
         Err(e) => {
@@ -2396,6 +2365,7 @@ async fn start_sandbox(
     let Some(claimed) = claimed else {
         return start_in_front(shared, sink, assign, spec, access, puts, options).await;
     };
+    let serving = access.serving.as_ref().map_err(|why| no_front(why))?;
     // The VM's ticket is in its user data, used up when its bridge connected; it is no
     // credential, but it never leaves the host.
     shared.add_run_masked(assign.run_id, assign.epoch, vec![claimed.ticket.clone()]);
@@ -2410,7 +2380,7 @@ async fn start_sandbox(
             spec,
             claimed,
             shared.opts.vm_reprobe_after,
-            front_tunnels(access),
+            front_tunnels(access, serving),
             puts,
         )
         .await
@@ -2418,11 +2388,10 @@ async fn start_sandbox(
 
 /// The tunnels of a run whose sandbox's front serves its proxies: each service the run uses,
 /// on its fixed port of the sandbox's loopback.
-fn front_tunnels(access: &SandboxAccess) -> Vec<(std::net::SocketAddr, Service)> {
-    let loopback = match access.sandbox_host.as_deref().map(str::parse) {
-        Some(Ok(ip)) => ip,
-        _ => std::net::IpAddr::V4(crate::bridge::SANDBOX_LOOPBACK),
-    };
+fn front_tunnels(
+    access: &SandboxAccess,
+    serving: &Serving,
+) -> Vec<(std::net::SocketAddr, Service)> {
     let mut services = Vec::new();
     if access.git_listener.is_some() && (access.mcp.is_some() || !access.routes.is_empty()) {
         services.push(Service::Git);
@@ -2433,15 +2402,7 @@ fn front_tunnels(access: &SandboxAccess) -> Vec<(std::net::SocketAddr, Service)>
     if access.egress.is_some() {
         services.push(Service::Egress);
     }
-    services
-        .into_iter()
-        .map(|service| {
-            (
-                std::net::SocketAddr::new(loopback, crate::bridge::tunnel_port(service)),
-                service,
-            )
-        })
-        .collect()
+    serving.tunnels(&services)
 }
 
 /// Starts the run's sandbox with its bridge in the sandbox's front (ADR-0112, path C, part 2):
@@ -2463,14 +2424,9 @@ async fn start_in_front(
     let endpoint = shared.bridge_endpoint().await?.context(
         "the sandbox has no network, so its bridge cannot reach this host (--sandbox-bridge)",
     )?;
-    let front = match &access.front {
-        Some(front) => front.clone(),
-        None => shared
-            .sandbox_front()
-            .await?
-            .context("the sandbox has no front")?,
-    };
-    let tunnels = front_tunnels(access);
+    let serving = access.serving.as_ref().map_err(|why| no_front(why))?;
+    let front = serving.front().context("the sandbox has no front")?.clone();
+    let tunnels = front_tunnels(access, serving);
     if spec.extra_hosts.is_empty() {
         spec.extra_hosts = endpoint.extra_hosts.clone();
     }

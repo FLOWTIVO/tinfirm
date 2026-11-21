@@ -104,7 +104,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::egress_proxy::{EgressSettings, is_local_address, refused_address, strip_hop_by_hop};
-use crate::front::sandbox::SandboxFront;
+use crate::front::sandbox::{SandboxFront, Serving};
 use crate::git_proxy::{Endpoint, host_port, new_secret, tls_config};
 use crate::secret_eq::secret_eq;
 
@@ -536,27 +536,19 @@ impl ModelProxy {
     /// Starts a run's listener, which forwards to the gateway of `access` with its key until
     /// the guard is dropped.
     pub async fn start_run(&self, run_id: Uuid, access: &ModelAccess) -> Result<ModelProxyGuard> {
-        self.start_run_at(run_id, access, None, None, None).await
+        self.start_run_at(run_id, access, &Serving::Host).await
     }
 
-    /// [`ModelProxy::start_run`], with a base URL that names `sandbox_host` in place of the
-    /// endpoint's (a local test executor's sandbox over the bridge), and with the listener's
-    /// HTTP served by the sandbox's `front` when it has one: this process then keeps the run
-    /// half only. With `tunnel_port` the front serves it for the sandbox's tunnels alone, on
-    /// that port of the sandbox's own loopback, and this host binds no listener.
+    /// [`ModelProxy::start_run`] for a sandbox whose proxies `serving` serves: with the
+    /// sandbox's front, this process keeps the run half only.
     pub async fn start_run_at(
         &self,
         run_id: Uuid,
         access: &ModelAccess,
-        sandbox_host: Option<&str>,
-        front: Option<Arc<SandboxFront>>,
-        tunnel_port: Option<u16>,
+        serving: &Serving,
     ) -> Result<ModelProxyGuard> {
         anyhow::ensure!(!self.bind_ip.is_unspecified(), UNSPECIFIED_BIND);
-        anyhow::ensure!(
-            tunnel_port.is_none() || front.is_some(),
-            "only a sandbox's front serves the model proxy through its tunnels"
-        );
+        let front = serving.front().cloned();
         let gateway = Gateway::parse(access, self.settings.allow_http, self.host_token.as_ref())?;
         let local_gateway = self
             .settings
@@ -567,7 +559,7 @@ impl ModelProxy {
             .https
             .then(|| self.tls.get_or_init(tls_config).clone());
         let secret = new_secret()?;
-        let (listener, port) = match tunnel_port {
+        let (listener, port) = match serving.tunnel_port(crate::front::wire::Service::Model) {
             Some(port) => (None, port),
             None => {
                 let listener = TcpListener::bind(SocketAddr::new(self.bind_ip, 0))
@@ -579,9 +571,12 @@ impl ModelProxy {
                 (Some(listener), port)
             }
         };
+        let sandbox_host = serving
+            .sandbox_host()
+            .unwrap_or_else(|| self.sandbox_host.clone());
         let base_url = format!(
             "http://{}/{secret}{}",
-            host_port(sandbox_host.unwrap_or(&self.sandbox_host), port),
+            host_port(&sandbox_host, port),
             gateway.base_path
         );
         let state = Arc::new(RunState {
@@ -1594,11 +1589,11 @@ mod tests {
         Front,
     }
 
-    /// The sandbox's front for `mode`.
-    async fn front(mode: Mode) -> Option<Arc<SandboxFront>> {
+    /// What serves the proxy for `mode`: this process, or a front on a listener of its own.
+    async fn front(mode: Mode) -> Serving {
         match mode {
-            Mode::Run => None,
-            Mode::Front => Some(
+            Mode::Run => Serving::Host,
+            Mode::Front => Serving::Listener(
                 SandboxFront::start(&crate::front::test_command())
                     .await
                     .unwrap(),
@@ -1611,9 +1606,7 @@ mod tests {
             .start_run_at(
                 Uuid::new_v4(),
                 &access(format, base_url),
-                None,
-                front(mode).await,
-                None,
+                &front(mode).await,
             )
             .await
             .unwrap()
@@ -2374,9 +2367,7 @@ mod tests {
                 .start_run_at(
                     Uuid::new_v4(),
                     &access(ModelFormat::Anthropic, &url),
-                    None,
-                    front(mode).await,
-                    None,
+                    &front(mode).await,
                 )
                 .await
                 .unwrap();
@@ -2433,9 +2424,7 @@ mod tests {
                     .start_run_at(
                         Uuid::new_v4(),
                         &access(ModelFormat::Anthropic, &url),
-                        None,
-                        front(mode).await,
-                        None,
+                        &front(mode).await,
                     )
                     .await
                     .unwrap()
@@ -2483,9 +2472,7 @@ mod tests {
                 .start_run_at(
                     Uuid::new_v4(),
                     &access(ModelFormat::Anthropic, url),
-                    None,
-                    front(mode).await,
-                    None,
+                    &front(mode).await,
                 )
                 .await
                 .unwrap();
@@ -2509,9 +2496,7 @@ mod tests {
             .start_run_at(
                 Uuid::new_v4(),
                 &access(format, base_url),
-                None,
-                front(mode).await,
-                None,
+                &front(mode).await,
             )
             .await
             .unwrap()

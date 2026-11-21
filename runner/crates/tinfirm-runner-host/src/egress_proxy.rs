@@ -62,7 +62,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::front::sandbox::SandboxFront;
+use crate::front::sandbox::{SandboxFront, Serving};
 use crate::git_proxy::{Endpoint, new_secret};
 use crate::secret_eq::secret_eq;
 
@@ -518,46 +518,32 @@ impl EgressProxy {
     /// Starts a run's listener: the host-wide rules and `run_rules` apply until the guard is
     /// dropped.
     pub async fn start_run(&self, run_id: Uuid, run_rules: Vec<Rule>) -> Result<EgressGuard> {
-        self.start_run_at(run_id, run_rules, None, None, None).await
+        self.start_run_at(run_id, run_rules, &Serving::Host).await
     }
 
-    /// [`EgressProxy::start_run`], with a proxy URL that names `sandbox_host` in place of the
-    /// endpoint's (a local test executor's sandbox over the bridge), and with the listener's
-    /// HTTP served by the sandbox's `front` when it has one: this process then only decides
-    /// and connects. With `tunnel_port` the front serves it for the sandbox's tunnels alone,
-    /// on that port of the sandbox's own loopback, and this host binds no listener.
+    /// [`EgressProxy::start_run`] for a sandbox whose proxies `serving` serves: with the
+    /// sandbox's front, this process only decides and connects.
     pub async fn start_run_at(
         &self,
         run_id: Uuid,
         run_rules: Vec<Rule>,
-        sandbox_host: Option<&str>,
-        front: Option<Arc<SandboxFront>>,
-        tunnel_port: Option<u16>,
+        serving: &Serving,
     ) -> Result<EgressGuard> {
-        let guard = self.start_slot(sandbox_host, front, tunnel_port).await?;
+        let guard = self.start_slot(serving).await?;
         guard.bind(run_id, run_rules);
         Ok(guard)
     }
 
     /// A listener of no run yet, for a sandbox VM that no run has claimed yet (crate::pool):
-    /// it refuses every destination until [`EgressGuard::bind`]. With the sandbox's `front`,
-    /// the front serves its HTTP.
-    pub async fn start_slot(
-        &self,
-        sandbox_host: Option<&str>,
-        front: Option<Arc<SandboxFront>>,
-        tunnel_port: Option<u16>,
-    ) -> Result<EgressGuard> {
+    /// it refuses every destination until [`EgressGuard::bind`].
+    pub async fn start_slot(&self, serving: &Serving) -> Result<EgressGuard> {
         anyhow::ensure!(
             !self.bind_ip.is_unspecified(),
             "the egress proxy must listen on the sandbox network's gateway, not on every address; leave TINFIRM_RUNNER_GIT_PROXY_BIND to an address of that network"
         );
-        anyhow::ensure!(
-            tunnel_port.is_none() || front.is_some(),
-            "only a sandbox's front serves the egress proxy through its tunnels"
-        );
         let secret = new_secret()?;
-        let (listener, port) = match tunnel_port {
+        let front = serving.front().cloned();
+        let (listener, port) = match serving.tunnel_port(crate::front::wire::Service::Egress) {
             Some(port) => (None, port),
             None => {
                 let listener = TcpListener::bind(SocketAddr::new(self.bind_ip, 0))
@@ -601,7 +587,9 @@ impl EgressProxy {
                     .context("the sandbox's front cannot serve the egress proxy")?;
             }
         }
-        let sandbox_host = sandbox_host.unwrap_or(&self.sandbox_host).to_string();
+        let sandbox_host = serving
+            .sandbox_host()
+            .unwrap_or_else(|| self.sandbox_host.clone());
         let host = match sandbox_host.parse::<IpAddr>() {
             Ok(IpAddr::V6(ip)) => format!("[{ip}]"),
             _ => sandbox_host.clone(),
@@ -1750,7 +1738,7 @@ mod tests {
             extra_hosts: Vec::new(),
         };
         let slot = EgressProxy::new(settings, &endpoint)
-            .start_slot(None, None, None)
+            .start_slot(&Serving::Host)
             .await
             .unwrap();
         // Unbound: not even a host-wide destination.
