@@ -1497,3 +1497,108 @@ async fn a_server_without_host_health_gets_no_health_frame() {
     })
     .await;
 }
+
+/// A VM host whose bridge sessions end 2 s after their link is lost, so that a VM that dies
+/// ends its run soon.
+fn vm_host_losing_soon(log: &std::path::Path, env: &[(&str, &str)]) -> HostSetup {
+    HostSetup {
+        options: Some(Box::new(|opts| {
+            opts.bridge
+                .as_mut()
+                .expect("a VM host has the bridge")
+                .timing
+                .gone_after = Duration::from_secs(2);
+        })),
+        ..HostSetup::vm(log, env)
+    }
+}
+
+/// Now, in ms since the epoch, as the fake driver's log has it (`at`).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// A VM that dies during its run (its VMM is killed, or its node reboots): the bridge's session
+/// ends without the adapter's exit status, the driver then describes the VM as failed, and the
+/// run ends as an infrastructure failure that names the VM, not as the agent's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_that_dies_during_its_run_fails_the_run_as_infra_and_names_the_vm() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let die = dir.path().join("die");
+        let die_env = die.to_string_lossy().into_owned();
+        let mut server = FakeServer::start().await;
+        let host = start_host(
+            &server.url,
+            vm_host_losing_soon(&log, &[("FAKE_VM_DIE", &die_env)]),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("slow", None);
+        conn.send(spec.to_json());
+        conn.until_agent_says(spec.run_id, "tick 1 ").await;
+        std::fs::write(&die, "").unwrap();
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{finished:#}");
+        assert_eq!(finished["failureClass"], "INFRA", "{finished:#}");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(
+            message.contains(
+                "The sandbox VM ended during the run (the provider reports the VM failed)"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("the agent process exited"), "{message}");
+        let calls = vm_driver_calls(&log);
+        assert_eq!(calls_of(&calls, "died").len(), 1, "{calls:#?}");
+        assert!(deleted(&calls, "vm-1"), "{calls:#?}");
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// An adapter in a VM that exits by itself is the agent's end, as before: `PROTOCOL_ERROR` with
+/// its last words, and the driver is not asked about the VM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_in_a_vm_that_exits_by_itself_is_reported_as_the_agents_end() {
+    with_timeout(120, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, vm_host_losing_soon(&log, &[])).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("crash", None);
+        conn.send(spec.to_json());
+        conn.wait_running(spec.run_id).await;
+        let running = now_ms();
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{finished:#}");
+        assert_eq!(finished["failureClass"], "PROTOCOL_ERROR", "{finished:#}");
+        let message = finished["failureMessage"].as_str().unwrap();
+        assert!(message.contains("simulated crash"), "{message}");
+        assert!(!message.contains("sandbox VM"), "{message}");
+        // The VM was described while it booted, and never after its agent ran.
+        let calls = vm_driver_calls(&log);
+        let describes = calls_of(&calls, "describe");
+        assert!(!describes.is_empty(), "{calls:#?}");
+        assert!(
+            describes
+                .iter()
+                .all(|c| c["at"].as_u64().unwrap() < running),
+            "{calls:#?}"
+        );
+        assert!(deleted(&calls, "vm-1"), "{calls:#?}");
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}

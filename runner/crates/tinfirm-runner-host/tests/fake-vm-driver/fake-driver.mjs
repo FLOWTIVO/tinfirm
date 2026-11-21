@@ -33,10 +33,14 @@
 //   FAKE_VM_DELETE_MS  how long a `delete` takes before it answers (default 0); the VM goes,
 //                      and the log gets a line {method: "deleted", params: {id}}, when it
 //                      answers
+//   FAKE_VM_DIE        a file: once it is there, every running "VM" dies as a VM whose VMM
+//                      was killed: its bridge is killed, `describe` says `failed` from then
+//                      on, and the file is removed
+// Each line of the log has `at`, the time of the call in ms since the epoch.
 // Templates: `stuck` never comes up; `failing` fails at its start; any other comes up.
 
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const env = process.env;
@@ -65,13 +69,28 @@ for (const leftover of JSON.parse(env.FAKE_VM_LEFTOVERS || "[]")) {
 
 function log(method, params) {
   if (!env.FAKE_VM_LOG) return;
-  appendFileSync(env.FAKE_VM_LOG, JSON.stringify({ method, params }) + "\n");
+  appendFileSync(env.FAKE_VM_LOG, JSON.stringify({ method, params, at: Date.now() }) + "\n");
 }
 
 // The problems of FAKE_VM_BROKEN while its file is there, else null.
 function brokenProblems() {
   if (!env.FAKE_VM_BROKEN || !existsSync(env.FAKE_VM_BROKEN)) return null;
   return JSON.parse(readFileSync(env.FAKE_VM_BROKEN, "utf8"));
+}
+
+// FAKE_VM_DIE: the running "VMs" die once the file is there.
+if (env.FAKE_VM_DIE) {
+  setInterval(() => {
+    if (!existsSync(env.FAKE_VM_DIE)) return;
+    for (const vm of vms.values()) {
+      if (vm.state !== "running") continue;
+      vm.state = "failed";
+      vm.child?.kill("SIGKILL");
+      log("died", { id: vm.id });
+    }
+    save();
+    unlinkSync(env.FAKE_VM_DIE);
+  }, 50).unref();
 }
 
 function random(n) {

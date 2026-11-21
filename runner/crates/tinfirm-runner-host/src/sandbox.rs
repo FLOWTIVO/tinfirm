@@ -1680,6 +1680,26 @@ impl Sandbox {
         front.front().handle().ended().is_some()
     }
 
+    /// Once the agent's output has ended without the run asking, for a VM's sandbox: why the
+    /// sandbox was lost, when its VM ended under the run ([`crate::vm::Vms::lost`]). The
+    /// adapter's own exit status comes a moment after its output ends, so this waits up to
+    /// `wait` for it; after an adapter that exited by itself, the driver is not asked. `None`
+    /// for any other sandbox, and while the driver describes the VM as up.
+    pub async fn vm_lost(&self, wait: Duration) -> Option<String> {
+        let SandboxKind::Bridged { exit, inner, .. } = &self.kind else {
+            return None;
+        };
+        let SandboxKind::Vm { vm, .. } = inner.as_ref() else {
+            return None;
+        };
+        let mut exit = exit.clone();
+        let _ = tokio::time::timeout(wait, exit.wait_for(Option::is_some)).await;
+        if matches!(*exit.borrow(), Some(Exit::Exited { .. })) {
+            return None;
+        }
+        vm.vms().lost(&vm.id).await
+    }
+
     /// After its front ended: one new front takes the bridge's session back, as a host that
     /// restarted does, within `timeout`.
     pub async fn take_back_from_a_new_front(

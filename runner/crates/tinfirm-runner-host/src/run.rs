@@ -938,6 +938,22 @@ pub async fn execute(
                         }
                     }
                 }
+                // A VM's bridge session that ended without the adapter's exit status may have
+                // ended with the VM (its VMM died, its node rebooted): no fault of the agent's.
+                // Only then is the driver asked, once.
+                if !front_ended
+                    && agent_lost_its_output(&agent)
+                    && let Some(cause) = sandbox.vm_lost(Duration::from_secs(2)).await
+                {
+                    let cause = sink.redact(&cause);
+                    tracing::warn!(run_id = %assign.run_id, %cause, "the run's sandbox VM ended during the run");
+                    failure.set(
+                        FailureClass::Infra,
+                        format!(
+                            "The sandbox VM ended during the run ({cause}); the agent's session in it was lost."
+                        ),
+                    );
+                }
                 sandbox.stop_agent(Duration::from_secs(5)).await;
                 // With the bridge, the agent's work comes back before the sandbox goes.
                 let mut collection = None;
@@ -3498,6 +3514,16 @@ fn open_session(
 /// takes an unchanged file as proof that the refresh token was used elsewhere: the provider may
 /// refuse the loser while the winner still handles its answer (ADR-0085, decision 5).
 const REFRESH_RACE_GRACE: Duration = Duration::from_secs(2);
+
+/// Whether the agent's turn ended without the run asking and without the agent's answer: its
+/// output ended under it, or it never answered.
+fn agent_lost_its_output(agent: &AgentPhase) -> bool {
+    agent.stop.is_none()
+        && match &agent.result {
+            None => true,
+            Some(result) => matches!(&result.outcome, Err((_, error)) if error.transport_closed),
+        }
+}
 
 /// Decides the failure (if any) of an agent turn that ended on its own.
 async fn classify_agent_end(

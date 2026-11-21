@@ -63,6 +63,8 @@ const DELETE_TIMEOUT: Duration = Duration::from_secs(120);
 const LIST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often a delete is tried before the VM is left to the next cleanup.
 const DELETE_ATTEMPTS: u32 = 3;
+/// How long a run whose VM's bridge was lost waits for the driver's `describe` of the VM.
+const LOST_WAIT: Duration = Duration::from_secs(25);
 /// The longest line the driver may answer with.
 const MAX_LINE: u64 = 4 * 1024 * 1024;
 /// While the driver can make no VM, how often the host asks its `verify` again on its own
@@ -1317,6 +1319,25 @@ impl Vms {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// Whether the VM `id` ended under its run, asked once when the run's bridge session ended
+    /// without the adapter's exit status: the cause when the driver describes the VM as gone or
+    /// failed (its VMM died, its node rebooted), or cannot describe it within [`LOST_WAIT`] (its
+    /// node does not answer). `None` while the driver describes the VM as up.
+    pub async fn lost(&self, id: &str) -> Option<String> {
+        match tokio::time::timeout(LOST_WAIT, self.driver.describe(id)).await {
+            Ok(Ok(vm)) => match vm.state {
+                VmState::Gone => Some("the VM is gone".to_string()),
+                VmState::Failed => Some("the provider reports the VM failed".to_string()),
+                VmState::Starting | VmState::Running => None,
+            },
+            Ok(Err(e)) => Some(format!("the VM driver cannot describe the VM: {e:#}")),
+            Err(_) => Some(format!(
+                "the VM driver did not describe the VM within {} s",
+                LOST_WAIT.as_secs()
+            )),
         }
     }
 
