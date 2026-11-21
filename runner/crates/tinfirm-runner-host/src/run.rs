@@ -1360,7 +1360,11 @@ async fn agent_outcome(
 ) -> ControlFlow<Option<RunFinished>, AgentOutcome> {
     let shared = run.shared;
     let mut outcome = AgentOutcome::default();
-    match *run.stop_rx.borrow() {
+    // Copied out of the channel first. A `match` on the borrow itself keeps the channel's lock
+    // until the match ends, so through the removal of the workspace: a second stop that the
+    // server sends meanwhile would block the thread that passes it on.
+    let stop = *run.stop_rx.borrow();
+    match stop {
         Some(StopRequest::Abort) => {
             cleanup_workspace(shared, workspace_dir, false);
             return ControlFlow::Break(None);
