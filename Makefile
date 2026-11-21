@@ -28,8 +28,8 @@ REVISION := $(shell git rev-parse --verify -q HEAD 2>/dev/null || echo unknown)
 HADOLINT_IMAGE   := hadolint/hadolint:v2.15.1
 ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12
 SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0
-DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile
-SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh runner/images/vm/local-disk.sh \
+DOCKERFILES      := Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile ee/runner/images/vm/pod.Dockerfile
+SHELL_SCRIPTS    := deploy/compose/deploy-host.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh runner/images/vm/local-disk.sh ee/runner/images/vm/pod-image.sh \
                     .github/check-pins.sh .github/actions/set-version/*.sh deploy/helm/check-runner-pod.sh
 
 # `make release-assets`: the Linux release assets of HEAD (runner-artifacts.yml builds them

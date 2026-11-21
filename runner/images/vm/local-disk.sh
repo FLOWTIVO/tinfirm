@@ -14,7 +14,11 @@
 #     no DHCP client and no network manager, and needs none;
 #   - the user data: `vm-boot` reads it from the VM's second disk, which the kernel's command
 #     line names (`tinfirm.user-data=disk:/dev/vdb`). Nothing of this script is involved;
-#   - no way in: no SSH server, no getty on the serial console, no root password, no resolver.
+#   - no way in: no SSH server, no getty on the serial console, no root password, no resolver;
+#   - a root file system that grows to its disk at boot where the kernel's command line asks
+#     for it (tinfirm-vm-grow-root.service, `tinfirm.grow-root`): a run pod's image
+#     (ee/runner/images/vm/pod-image.sh) holds this image shrunk to what it uses, and the pod
+#     hands the VM a larger disk. A sandbox node's VM does not ask, and nothing grows there.
 #
 # Run as root on a Linux x86-64 machine with Docker:
 #
@@ -47,7 +51,8 @@ for tool in docker mkfs.ext4 mount umount truncate tar du sha256sum; do
 done
 docker info >/dev/null 2>&1 || die "Docker does not answer (docker info)"
 [ -x "$BINARY" ] || die "no runner host binary at $BINARY"
-[ -f "$HERE/setup.sh" ] && [ -f "$HERE/tinfirm-vm-boot.service" ] || die "setup.sh and tinfirm-vm-boot.service must lie beside this script"
+[ -f "$HERE/setup.sh" ] && [ -f "$HERE/tinfirm-vm-boot.service" ] && [ -f "$HERE/tinfirm-vm-grow-root.service" ] \
+    || die "setup.sh, tinfirm-vm-boot.service and tinfirm-vm-grow-root.service must lie beside this script"
 VERSION="$("$BINARY" --version)"
 note "the image gets: $VERSION"
 
@@ -101,7 +106,7 @@ exit $rc
 SHIM
 
 cat >"$WORK/ctx/Dockerfile" <<'DOCKERFILE'
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends systemd systemd-sysv dbus udev kmod procps \
@@ -125,6 +130,7 @@ mkdir -p "$MNT/var/lib/docker" "$MNT/var/lib/containerd"
 install -m 0755 "$BINARY" "$WORK/in/tinfirm-runner-host"
 install -m 0644 "$HERE/tinfirm-vm-boot.service" "$WORK/in/tinfirm-vm-boot.service"
 install -m 0755 "$HERE/setup.sh" "$WORK/in/setup.sh"
+install -m 0644 "$HERE/tinfirm-vm-grow-root.service" "$WORK/in/tinfirm-vm-grow-root.service"
 
 # What a local disk needs beside the recipe; runs in the build container after setup.sh.
 cat >"$WORK/in/after-setup.sh" <<'AFTER'
@@ -150,6 +156,10 @@ systemctl mask serial-getty@ttyS0.service getty@tty1.service console-getty.servi
     systemd-networkd.service systemd-networkd-wait-online.service systemd-resolved.service \
     systemd-timesyncd.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || :
 passwd -l root >/dev/null
+# The root file system grows to its disk at boot where the kernel's command line asks for it
+# (a run pod's disk is larger than the image it holds).
+install -m 0644 /in/tinfirm-vm-grow-root.service /etc/systemd/system/tinfirm-vm-grow-root.service
+systemctl enable tinfirm-vm-grow-root.service
 rm -f /usr/local/sbin/systemctl /usr/sbin/policy-rc.d
 rm -f /var/log/build-dockerd.log /var/log/build-containerd.log
 AFTER
@@ -179,6 +189,7 @@ rm -f "$MNT/etc/resolv.conf"
 : >"$MNT/etc/resolv.conf"
 [ -x "$MNT/opt/tinfirm/tinfirm-runner-host" ] || die "the image has no /opt/tinfirm/tinfirm-runner-host: setup.sh did not finish"
 [ -L "$MNT/etc/systemd/system/multi-user.target.wants/tinfirm-vm-boot.service" ] || die "tinfirm-vm-boot.service is not enabled in the image"
+[ -L "$MNT/etc/systemd/system/local-fs.target.wants/tinfirm-vm-grow-root.service" ] || die "tinfirm-vm-grow-root.service is not enabled in the image"
 [ ! -e "$MNT/etc/systemd/system/multi-user.target.wants/ssh.service" ] || die "the image has an SSH server enabled"
 USED_MIB="$(du -sm "$MNT" | cut -f1)"
 umount "$MNT"

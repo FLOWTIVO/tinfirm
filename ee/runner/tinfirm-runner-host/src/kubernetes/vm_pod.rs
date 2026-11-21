@@ -345,11 +345,18 @@ pub fn guest_mac(guest: Ipv4Addr) -> String {
     format!("06:00:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
 }
 
+/// The word on the guest kernel's command line that has the guest grow its root file system
+/// to its disk at boot (`runner/images/vm/tinfirm-vm-grow-root.service`): the pod's image
+/// holds the VM image shrunk to what it uses, and the pod grows its copy to the template's
+/// disk. A sandbox node's VM does not carry the word, and its guest grows nothing.
+pub const GROW_ROOT_CMDLINE: &str = "tinfirm.grow-root";
+
 /// The guest kernel's command line: its address on its own `ip=`, the pod's side as gateway,
-/// no serial console, and the user-data disk as its second drive.
+/// no serial console, the user-data disk as its second drive, and the word that has the guest
+/// grow its root file system ([`GROW_ROOT_CMDLINE`]).
 pub fn boot_args(env: &PodEnv) -> String {
     format!(
-        "8250.nr_uarts=0 quiet reboot=k panic=1 pci=off ip={}::{}:255.255.255.252::eth0:off {}disk:/dev/vdb",
+        "8250.nr_uarts=0 quiet reboot=k panic=1 pci=off ip={}::{}:255.255.255.252::eth0:off {}disk:/dev/vdb {GROW_ROOT_CMDLINE}",
         env.guest(),
         env.pod_side(),
         crate::vm_boot::CMDLINE_KEY
@@ -624,7 +631,7 @@ mod tests {
     fn firecrackers_configuration_and_the_guests_command_line() {
         assert_eq!(
             boot_args(&env()),
-            "8250.nr_uarts=0 quiet reboot=k panic=1 pci=off ip=172.30.0.2::172.30.0.1:255.255.255.252::eth0:off tinfirm.user-data=disk:/dev/vdb"
+            "8250.nr_uarts=0 quiet reboot=k panic=1 pci=off ip=172.30.0.2::172.30.0.1:255.255.255.252::eth0:off tinfirm.user-data=disk:/dev/vdb tinfirm.grow-root"
         );
         assert_eq!(
             crate::vm_boot::source_from_cmdline(&boot_args(&env())).as_deref(),
