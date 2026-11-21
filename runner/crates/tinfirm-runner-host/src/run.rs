@@ -2150,7 +2150,7 @@ async fn sandbox_access(
     };
     // Where the sandbox's front serves the run's git proxy for its tunnels alone, the host's
     // shared listener is not started for it.
-    let shared_proxy = if shared.sandboxes_tunnel_to_their_front() {
+    let shared_proxy = if shared.opts.bridge.is_some() {
         shared
             .proxies_endpoint()
             .await
@@ -2303,7 +2303,9 @@ async fn run_listener(
 /// serves the service for the tunnels alone; `None` where this host binds a listener for it.
 fn tunnel_port(shared: &Shared, service: Service) -> Option<u16> {
     shared
-        .sandboxes_tunnel_to_their_front()
+        .opts
+        .bridge
+        .is_some()
         .then(|| crate::bridge::tunnel_port(service))
 }
 
@@ -2381,9 +2383,9 @@ fn git_identity(assign: &RunAssign, ws: Option<&WorkspaceSpec>) -> (String, Stri
 
 /// Starts the run's sandbox: attached to its stdio, or with the bridge (ADR-0095,
 /// `run --sandbox-bridge`), where the run's credentials reach the adapter in the bridge's
-/// `start` frame instead of the sandbox's settings, and the sandbox reaches the listeners of
-/// `access` through tunnels of the bridge.
-#[allow(clippy::too_many_arguments)]
+/// `start` frame instead of the sandbox's settings, and the sandbox reaches the proxies of
+/// `access` through tunnels of the bridge to its front: in the VM it claimed, whose front holds
+/// its bridge already, or in a sandbox that starts here ([`start_in_front`]).
 async fn start_sandbox(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
@@ -2393,110 +2395,30 @@ async fn start_sandbox(
     puts: Vec<crate::sandbox::Put>,
     claimed: Option<crate::pool::Claimed>,
 ) -> anyhow::Result<(crate::sandbox::Sandbox, SandboxIo)> {
-    use anyhow::Context as _;
     let Some(options) = shared.opts.bridge.clone() else {
         return shared.opts.executor.start(spec).await;
     };
-    let in_front = shared.sandboxes_tunnel_to_their_front();
-    let claimed = match claimed {
-        Some(claimed) if in_front => {
-            // The VM's ticket is in its user data, used up when its bridge connected; it is no
-            // credential, but it never leaves the host.
-            shared.add_run_masked(assign.run_id, assign.epoch, vec![claimed.ticket.clone()]);
-            sink.log(
-            LogLevel::Debug,
-            "the agent runs over the sandbox bridge, in the sandbox's front; its credentials are not in the sandbox's settings",
-        );
-            return shared
-                .opts
-                .executor
-                .start_claimed(
-                    spec,
-                    claimed,
-                    shared.opts.vm_reprobe_after,
-                    crate::sandbox::Tunnels::Services(front_tunnels(access)),
-                    puts,
-                )
-                .await;
-        }
-        None if in_front => {
-            return start_in_front(shared, sink, assign, spec, access, puts, options).await;
-        }
-        claimed => claimed,
+    let Some(claimed) = claimed else {
+        return start_in_front(shared, sink, assign, spec, access, puts, options).await;
     };
-    // The listeners the run uses, on this host's loopback: the sandbox reaches each through a
-    // tunnel on its own loopback, at the same port.
-    let mut listeners = Vec::new();
-    if access.mcp.is_some() || !access.routes.is_empty() {
-        match &access.git_listener {
-            Some(own) => listeners.push(own.local_addr()),
-            None => {
-                if let Some(proxy) = shared.git_proxy().await? {
-                    listeners.push(proxy.local_addr());
-                }
-            }
-        }
-    }
-    listeners.extend(access.model_proxy.as_ref().map(|m| m.local_addr()));
-    listeners.extend(access.egress.as_ref().map(|e| e.local_addr()));
-    let loopback = match access.sandbox_host.as_deref().map(str::parse) {
-        Some(Ok(ip)) => ip,
-        _ => std::net::IpAddr::V4(crate::bridge::SANDBOX_LOOPBACK),
-    };
-    let tunnels = crate::bridge::tunnels(&listeners, loopback);
-    let bridge_note =
-        "the agent runs over the sandbox bridge; its credentials are not in the sandbox's settings";
-    if let Some(claimed) = claimed {
-        // The VM's ticket is in its user data, used up when its bridge connected; it is no
-        // credential, but it never leaves the host.
-        shared.add_run_masked(assign.run_id, assign.epoch, vec![claimed.ticket.clone()]);
-        sink.log(LogLevel::Debug, bridge_note);
-        return shared
-            .opts
-            .executor
-            .start_claimed(
-                spec,
-                claimed,
-                shared.opts.vm_reprobe_after,
-                crate::sandbox::Tunnels::Targets(tunnels),
-                puts,
-            )
-            .await;
-    }
-    let listener = shared.bridge().await?.context(
-        "the sandbox has no network, so its bridge cannot reach this host (--sandbox-bridge)",
-    )?;
-    if spec.extra_hosts.is_empty() {
-        spec.extra_hosts = listener.extra_hosts.clone();
-    }
-    // A run assigned again with a newer epoch gets a new sandbox and a new registration.
-    let registration = listener
-        .server
-        .register(&format!("{}.{}", assign.run_id, assign.epoch))?;
-    // The ticket is in the sandbox's settings; it is no credential, but it never leaves the host.
-    shared.add_run_masked(
-        assign.run_id,
-        assign.epoch,
-        vec![registration.ticket().to_string()],
+    // The VM's ticket is in its user data, used up when its bridge connected; it is no
+    // credential, but it never leaves the host.
+    shared.add_run_masked(assign.run_id, assign.epoch, vec![claimed.ticket.clone()]);
+    sink.log(
+        LogLevel::Debug,
+        "the agent runs over the sandbox bridge, in the sandbox's front; its credentials are not in the sandbox's settings",
     );
-    sink.log(LogLevel::Debug, bridge_note);
-    let bootstrap = crate::bridge::bootstrap_env(
-        registration.run_id(),
-        registration.ticket(),
-        registration.pin(),
-        &listener.sandbox_addr(),
-    );
-    let bridged = crate::sandbox::Bridged {
-        registration: crate::sandbox::Registered::Shared(registration),
-        bootstrap,
-        binary: options.binary,
-        connect_timeout: options.connect_timeout,
-        tunnels: crate::sandbox::Tunnels::Targets(tunnels),
-        puts,
-        peer: crate::sandbox::BridgePeer::Any,
-        keep: None,
-    };
-    shared.opts.executor.start_bridged(spec, bridged).await
+    shared
+        .opts
+        .executor
+        .start_claimed(
+            spec,
+            claimed,
+            shared.opts.vm_reprobe_after,
+            crate::sandbox::Tunnels::Services(front_tunnels(access)),
+            puts,
+        )
+        .await
 }
 
 /// The tunnels of a run whose sandbox's front serves its proxies: each service the run uses,

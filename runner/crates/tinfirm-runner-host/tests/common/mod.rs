@@ -1933,6 +1933,48 @@ pub fn kill_front(pid: u32) {
     assert!(status.success(), "cannot kill the front {pid}");
 }
 
+/// Makes the record of `run_id` that a crashed host left under `data_dir` one that a host of
+/// the version before each sandbox's bridge was its front's would have left (ADR-0112, path C,
+/// part 2): the record keeps no `bridge`, and the bridge's identity, which the sandbox's bridge
+/// pins, is the shared listener's (`runs/bridge.json`), on the port the bridge dials (none for
+/// a VM's bridge, which the host dials). A host that starts then takes the run back through its
+/// shared listener. Returns once the bridge's port is free, as the shared listener of a host
+/// that died left it.
+pub fn make_record_of_the_version_before(data_dir: &Path, run_id: Uuid) {
+    let records = tinfirm_runner_host::takeback::Records::new(&Paths::new(
+        data_dir.with_file_name("config"),
+        data_dir,
+    ));
+    let mut record = records
+        .load_all()
+        .into_iter()
+        .find(|record| record.run_id() == run_id)
+        .expect("the run's record");
+    let bridge = record
+        .bridge
+        .take()
+        .expect("the record keeps its front's bridge");
+    let identity = bridge
+        .keep(Some(String::new()))
+        .and_then(|keep| keep.identity())
+        .expect("the record's bridge identity");
+    records.save(&record).unwrap();
+    records
+        .save_listener(&identity, bridge.port.unwrap_or(0))
+        .unwrap();
+    if let (Some(ip), Some(port)) = (bridge.ip, bridge.port) {
+        // The front that held the port ends with its host a moment after.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::net::TcpListener::bind((ip, port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the port {port} stays taken"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 /// A runner host in a process of its own, as the restart tests start one (host A, which the
 /// test kills as a crash would). It runs in a process group of its own. A test that ends
 /// without [`HostProcess::crash`], a failed one among them, kills that group when this is

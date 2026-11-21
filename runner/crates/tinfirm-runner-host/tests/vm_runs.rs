@@ -99,9 +99,8 @@ async fn a_run_in_a_vm_clones_runs_commits_pushes_and_deletes_its_vm() {
         assert!(env.get("CLAUDE_CODE_OAUTH_TOKEN").is_none(), "{env}");
         // The driver named no port: the host dialed `--vm-port`, where the bridge listens.
         assert!(calls_of(&calls, "published").is_empty(), "{calls:#?}");
-        // The run's registration ended with the run.
-        let listener = host.host.bridge().await.unwrap().expect("a listener");
-        assert_eq!(listener.server.run_count(), 0);
+        // The VM's bridge was its front's: the host started no shared listener for it.
+        assert!(host.host.started_bridge().await.is_none());
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })
@@ -682,9 +681,6 @@ async fn a_cancelled_run_takes_its_work_back_and_deletes_its_vm() {
 const RESTART_DIR: &str = "TINFIRM_TEST_VM_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_VM_RESTART_URL";
 const RESTART_PUBLISH: &str = "TINFIRM_TEST_VM_RESTART_PUBLISH";
-/// Set: host A registers its VMs' bridges with its shared listener, and writes their records
-/// as hosts did before each VM's bridge was its front's.
-const RESTART_LEGACY: &str = "TINFIRM_TEST_VM_RESTART_LEGACY";
 
 /// The hosts of the VM restart test: the fake driver keeps its VMs in a file, so the driver
 /// of the host that restarted has them, and they outlive the host that is killed. With
@@ -707,29 +703,20 @@ fn vm_restart_test_host_a() {
         return;
     };
     let publish = std::env::var(RESTART_PUBLISH).is_ok();
-    let legacy = std::env::var(RESTART_LEGACY).is_ok();
     let dir = std::path::PathBuf::from(dir);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
-            let mut setup = restart_setup(&dir, publish);
-            if legacy {
-                setup.options = Some(Box::new(|opts| {
-                    opts.bridge
-                        .as_mut()
-                        .expect("a VM host has the bridge")
-                        .shared_listener_for_new_runs = true;
-                }));
-            }
+            let setup = restart_setup(&dir, publish);
             let _host = start_host_at(&dir.join("host"), &url, setup).await;
             std::future::pending::<()>().await;
         });
 }
 
 /// Host A of the VM restart tests ([`vm_restart_test_host_a`]), on `dir`, connecting to `url`.
-fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool, legacy: bool) -> HostProcess {
+fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool) -> HostProcess {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -744,23 +731,20 @@ fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool, legacy: bool) -> H
     if publish {
         command.env(RESTART_PUBLISH, "1");
     }
-    if legacy {
-        command.env(RESTART_LEGACY, "1");
-    }
     HostProcess::spawn(command)
 }
 
 /// A run in a VM whose host is killed and started again: host B takes it back. With `publish`,
 /// the run's record keeps the VM's port and host B dials it there; without, the record has no
 /// port, as one written before the port existed, and host B dials `--vm-port`. The VM's bridge
-/// is its front's, and host B gives it a new front, which it dials for; with `legacy`, host A
-/// is of the version before, whose VMs' bridges were its shared listener's, and host B takes
-/// the run back through its own shared listener.
+/// is its front's, and host B gives it a new front, which it dials for; with `legacy`, host A's
+/// record is made one of the version before, whose VMs' bridges were its shared listener's, and
+/// host B takes the run back through its own shared listener.
 async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
     let repo = TestRepo::new();
     let mut server = FakeServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let mut host_a = vm_host_a(dir.path(), &server.url, publish, legacy);
+    let mut host_a = vm_host_a(dir.path(), &server.url, publish);
     let mut conn = server.accept().await;
     conn.handshake(1).await;
     let spec = AssignSpec::new("slow", Some(&repo.url));
@@ -771,8 +755,7 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
         .join(format!("host/data/runs/{}.json", spec.run_id));
     assert!(record.exists(), "no record of the run");
     conn.until_seq(spec.run_id, 3).await;
-    // One front for the VM: it holds the VM's bridge, or, on a host of the version before,
-    // only serves its listeners' HTTP.
+    // One front for the VM: it holds the VM's bridge.
     assert_eq!(fronts_of(host_a.id()).len(), 1);
     host_a.crash();
     let log = dir.path().join("driver.log");
@@ -799,17 +782,13 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
         user_data[tinfirm_bridge::ENV_PIN].is_string(),
         "{user_data}"
     );
-    if legacy {
-        assert!(kept.get("bridge").is_none(), "{kept}");
-    } else {
-        let bridge = &kept["bridge"];
-        assert!(
-            bridge["cert"].is_string() && bridge["key"].is_string(),
-            "{kept}"
-        );
-        for listener in ["ip", "port", "peer"] {
-            assert!(bridge.get(listener).is_none(), "{kept}");
-        }
+    let bridge = &kept["bridge"];
+    assert!(
+        bridge["cert"].is_string() && bridge["key"].is_string(),
+        "{kept}"
+    );
+    for listener in ["ip", "port", "peer"] {
+        assert!(bridge.get(listener).is_none(), "{kept}");
     }
     let published = calls_of(&vm_driver_calls(&log), "published")
         .first()
@@ -824,6 +803,12 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
             assert!(!publish);
             assert!(kept["sandbox"].get("port").is_none(), "{kept}");
         }
+    }
+
+    if legacy {
+        make_record_of_the_version_before(&dir.path().join("host/data"), spec.run_id);
+        let kept: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert!(kept.get("bridge").is_none(), "{kept}");
     }
 
     // Nodes with one slot, which host A's VM holds: no room is free. Host B's start check, as
@@ -909,7 +894,7 @@ async fn a_vms_front_that_ends_during_its_run_is_replaced_once_and_the_work_is_s
         let repo = TestRepo::new();
         let mut server = FakeServer::start().await;
         let dir = tempfile::tempdir().unwrap();
-        let mut host_a = vm_host_a(dir.path(), &server.url, false, false);
+        let mut host_a = vm_host_a(dir.path(), &server.url, false);
         let mut conn = server.accept().await;
         conn.handshake(1).await;
         let spec = AssignSpec::new("slow", Some(&repo.url));

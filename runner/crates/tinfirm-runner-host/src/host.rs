@@ -695,24 +695,13 @@ impl Shared {
         self.opts.executor.on_this_machine() || self.opts.sandbox_network.as_deref() == Some("host")
     }
 
-    /// The sandbox bridge's shared listener, started on first use where the sandboxes reach
-    /// this host (the sandbox network's gateway), on a port the system picks. The git proxy's
-    /// and the other listeners then bind loopback ([`crate::bridge::listeners_endpoint`]).
-    /// Only the runs of records of the previous version use it: every new sandbox's bridge,
-    /// a VM's too, is its own front's. `Ok(None)` without `opts.bridge`, or when the sandboxes
-    /// have no network.
-    pub async fn bridge(&self) -> Result<Option<BridgeListener>> {
-        Ok(self
-            .start_bridge(Vec::new())
-            .await?
-            .map(|(listener, _)| listener))
-    }
-
-    /// The bridge listener, started on first use. Its identity and port are kept with the
-    /// runs' records, for the next process of this host (ADR-0101). With `reclaim`, the
-    /// sessions of the runs that this host takes back after a restart: the listener starts
-    /// with the identity and on the port that the process before had, which their bridges pin
-    /// and dial, and their registrations come back in order.
+    /// The sandbox bridge's shared listener, which serves only the runs of records of the
+    /// version before each sandbox's bridge was its front's ([`crate::bridge::BridgeListener`]):
+    /// started where the sandboxes reach this host (the sandbox network's gateway), with the
+    /// identity and on the port that the process before kept with its records (ADR-0101), which
+    /// the bridges of `reclaim`'s runs pin and dial. Their registrations come back in order. Its
+    /// identity and port are kept again, for the next process of this host. `Ok(None)` without
+    /// `opts.bridge`, or when the sandboxes have no network.
     async fn start_bridge(
         &self,
         reclaim: Vec<(String, tinfirm_bridge::control::Hidden)>,
@@ -721,13 +710,10 @@ impl Shared {
             return Ok(None);
         };
         let mut slot = self.bridge.lock().await;
-        if let Some(listener) = slot.as_ref() {
-            anyhow::ensure!(
-                reclaim.is_empty(),
-                "the sandbox bridge listens already; runs are taken back before it starts"
-            );
-            return Ok(Some((listener.clone(), Vec::new())));
-        }
+        anyhow::ensure!(
+            slot.is_none(),
+            "the sandbox bridge listens already; runs are taken back before it starts"
+        );
         let Some(endpoint) = git_proxy::endpoint(
             &self.opts.executor,
             self.opts.sandbox_network.as_deref(),
@@ -737,12 +723,7 @@ impl Shared {
         else {
             return Ok(None);
         };
-        let kept = if reclaim.is_empty() {
-            None
-        } else {
-            self.records.listener()
-        };
-        let (identity, port) = match kept {
+        let (identity, port) = match self.records.listener() {
             Some(kept) => kept,
             None => (tinfirm_bridge::tls::Identity::generate()?, 0),
         };
@@ -779,11 +760,7 @@ impl Shared {
             sandbox_host = %endpoint.sandbox_host,
             "sandbox bridge listening"
         );
-        let listener = BridgeListener {
-            server,
-            sandbox_host: endpoint.sandbox_host,
-            extra_hosts: endpoint.extra_hosts,
-        };
+        let listener = BridgeListener { server };
         *slot = Some(listener.clone());
         Ok(Some((listener, registrations)))
     }
@@ -1024,15 +1001,6 @@ impl Shared {
         let proxy = Arc::new(EgressProxy::new(settings.clone(), &endpoint));
         *slot = Some(proxy.clone());
         Ok(Some(proxy))
-    }
-
-    /// Whether a run's sandbox reaches its proxies through tunnels that end in its front, with no
-    /// listener of this host's for them: on a host whose sandboxes' bridges are their fronts'.
-    pub fn sandboxes_tunnel_to_their_front(&self) -> bool {
-        self.opts
-            .bridge
-            .as_ref()
-            .is_some_and(|bridge| !bridge.shared_listener_for_new_runs)
     }
 
     /// A new sandbox's front process, which serves the HTTP of that sandbox's proxy listeners

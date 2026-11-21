@@ -1,7 +1,8 @@
-//! The sandbox bridge in the runner host (ADR-0095, `run --sandbox-bridge`): its options, the
-//! listener the runs register with, where the host's other listeners go and the tunnels that
-//! reach them, which of a run's variables stay in the sandbox's own settings, and the check
-//! that the binary mounted into Docker sandboxes runs there.
+//! The sandbox bridge in the runner host (ADR-0095, `run --sandbox-bridge`): its options, each
+//! sandbox's own bridge listener, the shared listener that serves the runs of records of the
+//! version before, where a sandbox's tunnels to its front listen and the address its proxies
+//! count as their own, which of a run's variables stay in the sandbox's own settings, and the
+//! check that the binary mounted into Docker sandboxes runs there.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -9,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tinfirm_bridge::host::{BridgeServer, HostTiming, TunnelTarget};
+use tinfirm_bridge::host::{BridgeServer, HostTiming};
 
 use crate::git_proxy::Endpoint;
 
@@ -37,10 +38,6 @@ pub struct BridgeOptions {
     /// The ports from which each sandbox's bridge listener takes one (`run
     /// --sandbox-bridge-ports`), both included; `None`: a port the system picks.
     pub ports: Option<(u16, u16)>,
-    /// New runs register with this process's one shared listener, as hosts did before each
-    /// sandbox's bridge was its front's: only for the tests of the take-back of such a run.
-    /// `run` never sets it, and no flag or variable does.
-    pub shared_listener_for_new_runs: bool,
 }
 
 impl BridgeOptions {
@@ -57,7 +54,6 @@ impl BridgeOptions {
             connect_timeout: Duration::from_secs(180),
             timing: HostTiming::default(),
             ports: None,
-            shared_listener_for_new_runs: false,
         }
     }
 
@@ -123,20 +119,12 @@ fn rand_below(n: u32) -> u32 {
     u32::from_le_bytes(bytes) % n.max(1)
 }
 
-/// The host's bridge listener, and how a sandbox reaches it (the git proxy's endpoint).
+/// The host's shared bridge listener, which serves only the runs taken back from records of the
+/// version before each sandbox's bridge was its front's (`runs/bridge.json`): their bridges pin
+/// its identity and dial its port, or, a VM's, are dialed by it.
 #[derive(Clone)]
 pub struct BridgeListener {
     pub server: BridgeServer,
-    pub sandbox_host: String,
-    /// Docker `extra_hosts` the sandbox needs to resolve `sandbox_host`.
-    pub extra_hosts: Vec<String>,
-}
-
-impl BridgeListener {
-    /// `HOST:PORT` that a sandbox connects to.
-    pub fn sandbox_addr(&self) -> String {
-        crate::git_proxy::host_port(&self.sandbox_host, self.server.local_addr().port())
-    }
 }
 
 /// Where a sandbox's tunnel to a service of its front listens, on the sandbox's own loopback,
@@ -153,18 +141,18 @@ pub fn tunnel_port(service: crate::front::wire::Service) -> u16 {
     }
 }
 
-/// Where a sandbox reaches the host's listeners with the bridge: its own loopback, on each
-/// listener's port, through a tunnel.
+/// Where a sandbox reaches its proxies with the bridge: its own loopback, at each service's
+/// [`tunnel_port`], through a tunnel to its front.
 pub const SANDBOX_LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
-/// Where the listeners bind when the sandbox shares this machine's network.
+/// The proxies' own address where the sandbox shares this machine's network.
 const SHARED_LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
-/// With the bridge, the git proxy and the platform tools, the model proxy and the egress proxy
-/// listen on this machine's loopback, which a sandbox reaches only through its own bridge
-/// (R28), and their URLs name the sandbox's loopback on the same ports, where the bridge's
-/// tunnels listen. Where the sandbox shares this machine's network (the local test executor,
-/// `TINFIRM_RUNNER_SANDBOX_NETWORK=host`), they listen on 127.0.0.2, so that the tunnels can
-/// take their ports on 127.0.0.1.
+/// The endpoint of the git proxy and the platform tools, the model proxy and the egress proxy on
+/// a host with the bridge. No listener binds there: a sandbox reaches its proxies only through
+/// its bridge's tunnels to its front (R28), and their URLs name the sandbox's loopback at the
+/// tunnels' ports. The proxies count its address as their own, which they never connect to: this
+/// machine's loopback, or 127.0.0.2 where the sandbox shares this machine's network (the local
+/// test executor, `TINFIRM_RUNNER_SANDBOX_NETWORK=host`), whose 127.0.0.1 is the sandboxes'.
 pub fn listeners_endpoint(shares_host_network: bool) -> Endpoint {
     let ip = if shares_host_network {
         SHARED_LOOPBACK
@@ -178,29 +166,12 @@ pub fn listeners_endpoint(shares_host_network: bool) -> Endpoint {
     }
 }
 
-/// A run's tunnels: one per listener it uses, at the listener's port on `loopback`, the
-/// sandbox's ([`SANDBOX_LOOPBACK`], or a local test executor's run's own).
-pub fn tunnels(listeners: &[SocketAddr], loopback: IpAddr) -> Vec<TunnelTarget> {
-    let mut out: Vec<TunnelTarget> = Vec::new();
-    for &target in listeners {
-        if out.iter().all(|t| t.target != target) {
-            out.push(TunnelTarget {
-                listen: SocketAddr::new(loopback, target.port()),
-                target,
-            });
-        }
-    }
-    out
-}
-
 /// The loopback address of a local test executor's sandbox over the bridge, one per run: its
-/// "sandbox" shares this machine's network, so that runs' tunnels, which take their listeners'
-/// ports, would take each other's on one address (Linux, where all of 127.0.0.0/8 is
-/// loopback).
-///
-/// The tunnels to a sandbox's front take fixed ports ([`tunnel_port`]), so two processes of
-/// this machine (a host and the next one after its restart, or tests' hosts) must not hand out
-/// the same address: each starts at a random place.
+/// "sandbox" shares this machine's network, and the tunnels to a sandbox's front take fixed
+/// ports ([`tunnel_port`]), so that runs' tunnels on one address would take each other's
+/// (Linux, where all of 127.0.0.0/8 is loopback). Two processes of this machine (a host and the
+/// next one after its restart, or tests' hosts) must not hand out the same address either: each
+/// starts at a random place.
 pub fn local_sandbox_loopback() -> Ipv4Addr {
     static NEXT: std::sync::OnceLock<std::sync::atomic::AtomicU32> = std::sync::OnceLock::new();
     let next = NEXT.get_or_init(|| std::sync::atomic::AtomicU32::new(rand_below(u32::MAX)));
@@ -309,7 +280,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_listeners_go_to_loopback_and_the_sandbox_reaches_them_on_the_same_ports() {
+    fn the_proxies_endpoint_is_loopback_or_its_second_address_beside_sandboxes_of_this_machine() {
         let own = listeners_endpoint(false);
         assert_eq!(own.bind, "127.0.0.1:0".parse().unwrap());
         assert_eq!(own.sandbox_host, "127.0.0.1");
@@ -317,22 +288,6 @@ mod tests {
         assert_eq!(
             listeners_endpoint(true).bind,
             "127.0.0.2:0".parse().unwrap()
-        );
-        let git: SocketAddr = "127.0.0.1:40001".parse().unwrap();
-        let model: SocketAddr = "127.0.0.1:40002".parse().unwrap();
-        let tunnels = tunnels(&[git, model, git], IpAddr::V4(SANDBOX_LOOPBACK));
-        assert_eq!(
-            tunnels,
-            [
-                TunnelTarget {
-                    listen: "127.0.0.1:40001".parse().unwrap(),
-                    target: git
-                },
-                TunnelTarget {
-                    listen: "127.0.0.1:40002".parse().unwrap(),
-                    target: model
-                },
-            ]
         );
     }
 

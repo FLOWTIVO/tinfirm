@@ -484,9 +484,6 @@ const RESTART_DIR: &str = "TINFIRM_TEST_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_RESTART_URL";
 /// Set: host A speaks protocol 2.
 const RESTART_V2: &str = "TINFIRM_TEST_RESTART_V2";
-/// Set, in the test and in host A: host A registers its runs' bridges with its shared
-/// listener, and writes their records as hosts did before each sandbox's bridge was its front's.
-const RESTART_LEGACY: &str = "TINFIRM_TEST_RESTART_LEGACY";
 /// Set, in host A: the program its readers run ([`held_reader`]).
 const RESTART_READER: &str = "TINFIRM_TEST_RESTART_READER";
 
@@ -513,16 +510,13 @@ fn restart_test_host_a() {
         .block_on(async {
             let v2 = std::env::var_os(RESTART_V2).is_some();
             let mut setup = restart_setup(v2);
-            let legacy = std::env::var_os(RESTART_LEGACY).is_some();
-            let reader = std::env::var_os(RESTART_READER).map(PathBuf::from);
-            setup.options = Some(Box::new(move |opts| {
-                let bridge = opts.bridge.as_mut().expect("a bridged host");
-                bridge.shared_listener_for_new_runs = legacy;
-                if let Some(reader) = reader {
+            if let Some(reader) = std::env::var_os(RESTART_READER).map(PathBuf::from) {
+                setup.options = Some(Box::new(move |opts| {
+                    let bridge = opts.bridge.as_mut().expect("a bridged host");
                     bridge.reader = tinfirm_runner_host::reader::Reader::new(reader)
                         .allowing_unconfined(bridge.reader.allows_unconfined());
-                }
-            }));
+                }));
+            }
             let _host = start_host_at(std::path::Path::new(&dir), &url, setup).await;
             std::future::pending::<()>().await;
         });
@@ -598,21 +592,14 @@ async fn a_host_process_that_its_test_did_not_crash_leaves_nothing_behind() {
 /// A host on the directories under `dir`, in a process of its own ([`restart_test_host_a`]),
 /// which the test kills as a crash would.
 fn host_process(dir: &std::path::Path, url: &str, v2: bool) -> HostProcess {
-    host_process_with(dir, url, v2, false)
+    host_process_reading(dir, url, v2, None)
 }
 
-/// [`host_process`]; with `legacy`, a host that registers its runs' bridges with its shared
-/// listener, as hosts did before each sandbox's bridge was its front's.
-fn host_process_with(dir: &std::path::Path, url: &str, v2: bool, legacy: bool) -> HostProcess {
-    host_process_reading(dir, url, v2, legacy, None)
-}
-
-/// [`host_process_with`]; with `reader`, the program that host A's readers run.
+/// [`host_process`]; with `reader`, the program that host A's readers run.
 fn host_process_reading(
     dir: &std::path::Path,
     url: &str,
     v2: bool,
-    legacy: bool,
     reader: Option<&std::path::Path>,
 ) -> HostProcess {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -623,9 +610,6 @@ fn host_process_reading(
         .stdout(std::process::Stdio::null());
     if v2 {
         command.env(RESTART_V2, "1");
-    }
-    if legacy {
-        command.env(RESTART_LEGACY, "1");
     }
     if let Some(reader) = reader {
         command.env(RESTART_READER, reader);
@@ -1668,7 +1652,7 @@ async fn a_front_killed_mid_run_in(
     u32,
 ) {
     let reader = held.then(|| held_reader(dir.path()));
-    let host_a = host_process_reading(dir.path(), &server.url, false, false, reader.as_deref());
+    let host_a = host_process_reading(dir.path(), &server.url, false, reader.as_deref());
     let mut conn = server.accept().await;
     conn.handshake(1).await;
     let spec = AssignSpec::new("slow", repo.map(|repo| repo.url.as_str()));
@@ -1882,20 +1866,21 @@ async fn a_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener
         let repo = TestRepo::new();
         let mut server = FakeServer::start().await;
         let dir = tempfile::tempdir().unwrap();
-        // Host A writes its record as the code before each sandbox's bridge was its front's.
-        let mut host_a = host_process_with(dir.path(), &server.url, false, true);
+        let mut host_a = host_process(dir.path(), &server.url, false);
         let mut conn = server.accept().await;
         conn.handshake(1).await;
         let spec = AssignSpec::new("slow", Some(&repo.url));
         conn.send(spec.to_json());
         conn.wait_running(spec.run_id).await;
         conn.until_seq(spec.run_id, 3).await;
+        host_a.crash();
+        // Host A's record becomes one of the code before each sandbox's bridge was its front's.
+        make_record_of_the_version_before(&dir.path().join("data"), spec.run_id);
         let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
         let kept: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
         assert!(kept.get("bridge").is_none(), "{kept}");
         assert!(dir.path().join("data/runs/bridge.json").exists());
-        host_a.crash();
 
         // Host B, of this version, takes the run back through its shared listener.
         let host = start_host_at(dir.path(), &server.url, HostSetup::bridged()).await;
