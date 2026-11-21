@@ -631,10 +631,18 @@ on, each off in turn (its lines alone gone), the master switch off (none), and a
 setting. CI's deploy job also parses the VMMs' profile with `apparmor_parser -Q -K`.
 
 On a node, after the play, check its egress yourself, as root: each of these must time out.
+The node's table drops what the node sends and answers nothing, so a time-out is the one result
+that passes. A connection that is refused did not pass: the refusal is the other machine's
+answer, so the node's packet left the node.
 
 ```sh
 for target in <control host>/22 1.1.1.1/443 8.8.8.8/53 169.254.169.254/80; do
-  timeout 3 bash -c "</dev/tcp/$target" 2>/dev/null && echo "REACHED $target" || echo "no answer from $target"
+  timeout 3 bash -c "</dev/tcp/$target" 2>/dev/null
+  case $? in
+    124) echo "timed out: $target" ;;
+    0) echo "REACHED $target" ;;
+    *) echo "NOT A TIME-OUT (refused, or no route): $target" ;;
+  esac
 done
 ```
 
