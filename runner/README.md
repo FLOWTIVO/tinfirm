@@ -1328,8 +1328,10 @@ tinfirm-runner-host run --executor vm --vm-driver node --vm-template sandbox-4c8
 The Helm chart runs one host as a pod with `runner.enabled` ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
 decision 8; [the operator guide](../docs-site/content/operator-guide/helm.md#the-runner-pod)): a company host
 of one declared company, which the server registers itself from
-`TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_NAME` and `_TOKEN`. It runs `--executor vm --vm-driver
-digitalocean`, which is Pro's and Enterprise's, and keeps no ready VMs unless
+`TINFIRM_COMPANIES_<KEY>_RUNNER_HOST_NAME` and `_TOKEN`. It runs `--executor vm` with the driver
+`runner.vm.driver`: `digitalocean` (the default, Pro's and Enterprise's), `node`, or `pod`, a pod
+per run in the same cluster ([the operator guide's page](../docs-site/content/operator-guide/kubernetes-pod-per-run.md);
+its image's recipe is `ee/runner/images/vm/pod-image.sh`), and keeps no ready VMs unless
 `runner.pool.maxReady` is above 0. The pod runs the image
 `ghcr.io/flowtivo/tinfirm-runner-host` (the last stage of `deploy/release/runner-musl.Dockerfile`:
 this binary, git, the CA certificates and `kill`, user 10001), with `run --server <public URL>
