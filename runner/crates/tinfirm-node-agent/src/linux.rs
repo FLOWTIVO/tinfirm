@@ -7,7 +7,8 @@
 //!
 //! **The execution half.** [`LinuxBackend`] runs them as root: each command as an argument
 //! vector without a shell, each result checked, and what a silent failure would hide read
-//! back. Its tests need KVM, Firecracker and root (`tests/linux_kvm.rs`).
+//! back. Its tests need KVM, Firecracker and root (`tests/linux_kvm.rs`); the unit tests run
+//! its make and delete with the node's tools stood in for, and pin each command and its order.
 //!
 //! Every value in what these functions produce comes from the helper's configuration, the
 //! slot and the serial. Nothing comes from a caller: no id, no name, no label, no user data.
@@ -1195,23 +1196,143 @@ impl LinuxBackend {
         Ok(())
     }
 
-    /// The make's steps. Whatever it returns, the caller removes what is there on an error.
+    /// The make's steps, in their order, each followed by the test's failure after it. Whatever
+    /// it returns, the caller removes what is there on an error.
     fn build(&self, plan: &VmPlan, disk: &[u8], places: &Places) -> Result<(), BackendError> {
-        let jail = plan.names.jail();
-        let run = |argv: &[String], stdin: Option<&str>| tool(argv, stdin).map_err(failed);
+        let making = Making {
+            plan,
+            places,
+            jail: plan.names.jail(),
+        };
+        making.mark()?;
+        self.done(Step::Mark)?;
+        making.network()?;
+        self.done(Step::Network)?;
+        making.firewall()?;
+        self.done(Step::Firewall)?;
+        let device = making.disks()?;
+        self.done(Step::Disks)?;
+        making.jail(disk, device)?;
+        self.done(Step::Jail)?;
+        making.vmm(&self.starter, device)?;
+        self.done(Step::Vmm)
+    }
+}
 
-        // The mark: from here on, `list` shows this VM, whatever state it is in.
-        let parent = places.jail_dir.parent().unwrap_or(Path::new("/"));
+// ----- a make's steps, and the delete's steps that remove what each made ---------------------
+//
+// Each step of a make ([`Making`]) is followed here by the steps of the delete ([`Removal`])
+// that remove what it made. A make that fails runs the whole delete
+// ([`LinuxBackend::make`]), whose steps run in an order of their own
+// ([`LinuxBackend::delete`]).
+
+/// Runs one tool for a make: a tool that fails fails the make.
+fn run(argv: &[String], stdin: Option<&str>) -> Result<String, BackendError> {
+    tool(argv, stdin).map_err(failed)
+}
+
+/// What a make's steps share: the plan, where the VM's things are, and the jail's name, which
+/// names the namespace, the jailer's `--id` and the cgroup too.
+struct Making<'a> {
+    plan: &'a VmPlan,
+    places: &'a Places,
+    jail: String,
+}
+
+/// The snapshot's device as the disks' step made it: its numbers, by which the jail's step
+/// makes its node in the chroot and the VMM's step names it in the VM's `io.max`.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotDevice {
+    major: u32,
+    minor: u32,
+}
+
+/// What a delete's steps share: where the VM's things are, how long a step may wait, and what
+/// of the VM is left so far.
+struct Removal<'a> {
+    names: &'a Names,
+    places: Places,
+    /// [`KILL_TIMEOUT`], or none for a VM whose last delete failed.
+    patience: Duration,
+    left: Vec<String>,
+}
+
+impl Removal<'_> {
+    /// One thing's state after its step: nothing to say when it is gone.
+    fn check(&mut self, what: String, state: Presence) {
+        match state {
+            Presence::Gone => {}
+            Presence::There => self.left.push(what),
+            Presence::Unknown(why) => self.left.push(format!("{what}, perhaps ({why})")),
+        }
+    }
+
+    /// The delete's answer, once every step was tried: the VM is gone, or what is left of it.
+    /// A VM with something left is one whose next delete does not wait again.
+    fn finish(
+        self,
+        failed_deletes: &std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    ) -> Result<(), BackendError> {
+        if self.left.is_empty() {
+            lock(failed_deletes).remove(&self.names.serial);
+            Ok(())
+        } else {
+            lock(failed_deletes).insert(self.names.serial);
+            Err(failed(format!(
+                "of the VM {} this is left: {}",
+                self.names.jail(),
+                self.left.join(", ")
+            )))
+        }
+    }
+}
+
+/// The VM's processes: gone when its cgroup's `cgroup.procs` is read and empty.
+fn process_presence(cgroup: &Path) -> Presence {
+    match cgroup_pids(cgroup) {
+        Ok(pids) if pids.is_empty() => Presence::Gone,
+        Ok(_) => Presence::There,
+        Err(why) => Presence::Unknown(why),
+    }
+}
+
+/// The snapshot's device: gone when sysfs is read and no device-mapper device has its name.
+fn device_presence(device: &str) -> Presence {
+    match dm_exists(device) {
+        Ok(false) => Presence::Gone,
+        Ok(true) => Presence::There,
+        Err(why) => Presence::Unknown(why),
+    }
+}
+
+/// The loop device of a file: gone when sysfs is read and no loop device has it as its
+/// backing file.
+fn loop_presence(file: &Path) -> Presence {
+    match loops_of(file) {
+        Ok(found) if found.is_empty() => Presence::Gone,
+        Ok(_) => Presence::There,
+        Err(why) => Presence::Unknown(why),
+    }
+}
+
+impl Making<'_> {
+    /// Step 1 of a make, the mark: the jail's own directory, root's, 0700. From here on,
+    /// `list` shows this VM, whatever state it is in. The delete removes it last
+    /// ([`Removal::remove_jail`]).
+    fn mark(&self) -> Result<(), BackendError> {
+        let parent = self.places.jail_dir.parent().unwrap_or(Path::new("/"));
         std::fs::create_dir_all(parent)
             .map_err(|e| failed(format!("cannot make {}: {}", parent.display(), e.kind())))?;
-        private_dir(&places.jail_dir)?;
-        self.done(Step::Mark)?;
+        private_dir(&self.places.jail_dir)
+    }
 
-        // The network, and what a silent failure would hide.
-        for argv in network_commands(plan) {
+    /// Step 2 of a make, the network ([`network_commands`]), and what a silent failure would
+    /// hide ([`network_read_backs`]).
+    fn network(&self) -> Result<(), BackendError> {
+        for argv in network_commands(self.plan) {
             run(&argv, None)?;
         }
-        for (argv, wanted) in network_read_backs(plan) {
+        for (argv, wanted) in network_read_backs(self.plan) {
             let found = run(&argv, None)?;
             if found != wanted {
                 return Err(failed(format!(
@@ -1221,12 +1342,41 @@ impl LinuxBackend {
                 )));
             }
         }
-        self.done(Step::Network)?;
+        Ok(())
+    }
+}
 
-        // The firewall: the node's table of this VM, and the namespace's.
+impl Removal<'_> {
+    /// The network. The veth first: removing the node's end removes its peer in the namespace
+    /// at once, where the namespace's own end would go only a moment after the namespace. Then
+    /// the namespace, with its tap device and its table.
+    fn remove_network(&mut self) {
+        let jail = self.names.jail();
+        let veth = self.names.veth();
+        let veth_path = Path::new("/sys/class/net").join(&veth);
+        if presence(&veth_path) != Presence::Gone {
+            let _ = tool(&words(&["ip", "link", "del", &veth]), None);
+        }
+        self.check(format!("the interface {veth}"), presence(&veth_path));
+        if presence(&self.places.netns) != Presence::Gone {
+            let _ = tool(&words(&["ip", "netns", "del", &jail]), None);
+        }
+        self.check(
+            format!("the network namespace {jail}"),
+            presence(&self.places.netns),
+        );
+    }
+}
+
+impl Making<'_> {
+    /// Step 3 of a make, the firewall: the node's table of this VM ([`node_rules`]), and the
+    /// namespace's ([`namespace_rules`]), each listed again once it is loaded.
+    fn firewall(&self) -> Result<(), BackendError> {
+        let plan = self.plan;
+        let jail = &self.jail;
         run(&words(&["nft", "-f", "-"]), Some(&node_rules(plan)))?;
         run(
-            &words(&["ip", "netns", "exec", &jail, "nft", "-f", "-"]),
+            &words(&["ip", "netns", "exec", jail, "nft", "-f", "-"]),
             Some(&namespace_rules(plan)),
         )?;
         let table = plan.names.table();
@@ -1237,7 +1387,7 @@ impl LinuxBackend {
         }
         let loaded = run(
             &words(&[
-                "ip", "netns", "exec", &jail, "nft", "list", "table", "inet", "tinfirm",
+                "ip", "netns", "exec", jail, "nft", "list", "table", "inet", "tinfirm",
             ]),
             None,
         )?;
@@ -1246,28 +1396,36 @@ impl LinuxBackend {
                 "the namespace's table is not as it was loaded: three chains must drop by policy",
             ));
         }
-        self.done(Step::Firewall)?;
+        Ok(())
+    }
+}
 
-        // The disks: the shared image read-only, and this VM's snapshot over it.
-        let image = plan.template.image.display().to_string();
-        let listing = run(
-            &words(&[
-                "losetup",
-                "--noheadings",
-                "--output",
-                "NAME,RO",
-                "--associated",
-                &image,
-            ]),
-            None,
-        )?;
-        let origin = match read_only_loop(&listing) {
-            Some(origin) => origin,
-            None => run(
-                &words(&["losetup", "--find", "--show", "--read-only", &image]),
-                None,
-            )?,
+impl Removal<'_> {
+    /// The node's table of the VM: gone only when nft itself says that it does not exist
+    /// ([`table_is_gone`]). The namespace's table goes with the namespace
+    /// ([`Removal::remove_network`]).
+    fn remove_node_table(&mut self) {
+        let table = self.names.table();
+        let listing = words(&["nft", "list", "table", "inet", &table]);
+        let table_state = || match tool(&listing, None) {
+            Ok(_) => Presence::There,
+            Err(ToolError::Exit { said, .. }) if table_is_gone(&said) => Presence::Gone,
+            Err(e) => Presence::Unknown(e.to_string()),
         };
+        if table_state() == Presence::There {
+            let _ = tool(&words(&["nft", "delete", "table", "inet", &table]), None);
+        }
+        self.check(format!("the firewall table {table}"), table_state());
+    }
+}
+
+impl Making<'_> {
+    /// Step 4 of a make, the disks: the shared image read-only, and this VM's snapshot over
+    /// it ([`snapshot_table`]).
+    fn disks(&self) -> Result<SnapshotDevice, BackendError> {
+        let plan = self.plan;
+        let places = self.places;
+        let origin = self.shared_image()?;
         std::fs::File::options()
             .write(true)
             .create_new(true)
@@ -1309,19 +1467,137 @@ impl LinuxBackend {
         )?;
         let (major, minor) = device_numbers(&numbers)
             .ok_or_else(|| failed("the snapshot's device numbers cannot be read"))?;
-        self.done(Step::Disks)?;
+        Ok(SnapshotDevice { major, minor })
+    }
 
-        // The jail: the chroot is a file system of its own, with a size and a number of
-        // inodes, so what the VM's user writes there takes no room from the node or from
-        // another VM. It is root's until the jailer hands it to the VM's user.
-        let chroot = &places.chroot;
+    /// The shared image's loop device: the read-only one that is attached for every VM
+    /// ([`read_only_loop`]), or a new one, read-only.
+    fn shared_image(&self) -> Result<String, BackendError> {
+        let image = self.plan.template.image.display().to_string();
+        let listing = run(
+            &words(&[
+                "losetup",
+                "--noheadings",
+                "--output",
+                "NAME,RO",
+                "--associated",
+                &image,
+            ]),
+            None,
+        )?;
+        match read_only_loop(&listing) {
+            Some(origin) => Ok(origin),
+            None => run(
+                &words(&["losetup", "--find", "--show", "--read-only", &image]),
+                None,
+            ),
+        }
+    }
+}
+
+impl Removal<'_> {
+    /// The snapshot's device, then its loop device, then its file, with the VMM's console
+    /// and errors files.
+    fn remove_disks(&mut self) {
+        let patience = self.patience;
+        let device = self.names.snapshot();
+        if device_presence(&device) != Presence::Gone {
+            // The VMM's descriptor of the device closes a moment after its process is gone:
+            // the first tries may find the device busy. `dmsetup remove --retry` would sleep
+            // 200 ms after each; this loop tries again every 10 ms.
+            wait_until(patience, || {
+                let _ = tool(
+                    &words(&["dmsetup", "remove", "--noudevsync", &device]),
+                    None,
+                );
+                device_presence(&device) != Presence::There
+            });
+        }
+        self.check(
+            format!("the device-mapper device {device}"),
+            device_presence(&device),
+        );
+        let snapshot_file = self.places.snapshot_file.clone();
+        for attached in loops_of(&snapshot_file).unwrap_or_default() {
+            let _ = tool(&words(&["losetup", "--detach", &attached]), None);
+        }
+        // A loop device is detached once its last user closed it, which may be a moment later.
+        // While the snapshot's device is still there it is that user: no waiting for it then.
+        if device_presence(&device) == Presence::Gone {
+            wait_until(patience, || {
+                loop_presence(&snapshot_file) != Presence::There
+            });
+        }
+        self.check(
+            format!("the loop device of {}", snapshot_file.display()),
+            loop_presence(&snapshot_file),
+        );
+        for file in [
+            snapshot_file,
+            self.places.console.clone(),
+            self.places.errors.clone(),
+        ] {
+            let _ = std::fs::remove_file(&file);
+            self.check(format!("the file {}", file.display()), presence(&file));
+        }
+    }
+}
+
+impl Making<'_> {
+    /// A file of the jail, by its path inside the chroot.
+    fn inside(&self, name: &str) -> PathBuf {
+        self.places.chroot.join(name.trim_start_matches('/'))
+    }
+
+    /// Step 5 of a make, the jail: its own file system ([`Making::mount_jail`]), with the
+    /// guest kernel (a copy), the user-data disk, the VMM's configuration
+    /// ([`firecracker_config`]), Firecracker's empty log and the device node of the snapshot,
+    /// each the VM's user's, 0600.
+    fn jail(&self, disk: &[u8], device: SnapshotDevice) -> Result<(), BackendError> {
+        let plan = self.plan;
+        self.mount_jail()?;
+        let kernel = std::fs::read(&plan.template.kernel).map_err(|e| {
+            failed(format!(
+                "cannot read {}: {}",
+                plan.template.kernel.display(),
+                e.kind()
+            ))
+        })?;
+        put(&self.inside(KERNEL), &kernel, plan.uid, plan.gid)?;
+        drop(kernel);
+        put(&self.inside(USER_DATA_DISK), disk, plan.uid, plan.gid)?;
+        let config = serde_json::to_vec(&firecracker_config(plan))
+            .map_err(|_| failed("the VMM's configuration cannot be written"))?;
+        put(&self.inside(VM_CONFIG), &config, plan.uid, plan.gid)?;
+        put(&self.inside(VMM_LOG), b"", plan.uid, plan.gid)?;
+        let root_disk = self.inside(ROOT_DISK);
+        run(
+            &words(&[
+                "mknod",
+                "-m",
+                "600",
+                &root_disk.display().to_string(),
+                "b",
+                &device.major.to_string(),
+                &device.minor.to_string(),
+            ]),
+            None,
+        )?;
+        own(&root_disk, plan.uid, plan.gid)
+    }
+
+    /// The chroot is a file system of its own, with a size and a number of inodes
+    /// ([`jail_mount_options`]), so what the VM's user writes there takes no room from the
+    /// node or from another VM. It is root's until the jailer hands it to the VM's user.
+    fn mount_jail(&self) -> Result<(), BackendError> {
+        let chroot = &self.places.chroot;
         private_dir(chroot)?;
         rustix::mount::mount(
             "tinfirm-jail",
             chroot,
             "tmpfs",
             rustix::mount::MountFlags::NOSUID,
-            std::ffi::CString::new(jail_mount_options(&plan.firecracker))
+            std::ffi::CString::new(jail_mount_options(&self.plan.firecracker))
                 .expect("no NUL in it")
                 .as_c_str(),
         )
@@ -1331,43 +1607,76 @@ impl LinuxBackend {
                 chroot.display(),
                 std::io::Error::from(e).kind()
             ))
-        })?;
-        let inside = |name: &str| chroot.join(name.trim_start_matches('/'));
-        let kernel = std::fs::read(&plan.template.kernel).map_err(|e| {
-            failed(format!(
-                "cannot read {}: {}",
-                plan.template.kernel.display(),
-                e.kind()
-            ))
-        })?;
-        put(&inside(KERNEL), &kernel, plan.uid, plan.gid)?;
-        drop(kernel);
-        put(&inside(USER_DATA_DISK), disk, plan.uid, plan.gid)?;
-        let config = serde_json::to_vec(&firecracker_config(plan))
-            .map_err(|_| failed("the VMM's configuration cannot be written"))?;
-        put(&inside(VM_CONFIG), &config, plan.uid, plan.gid)?;
-        put(&inside(VMM_LOG), b"", plan.uid, plan.gid)?;
-        let root_disk = inside(ROOT_DISK);
-        run(
-            &words(&[
-                "mknod",
-                "-m",
-                "600",
-                &root_disk.display().to_string(),
-                "b",
-                &major.to_string(),
-                &minor.to_string(),
-            ]),
-            None,
-        )?;
-        own(&root_disk, plan.uid, plan.gid)?;
-        self.done(Step::Jail)?;
+        })
+    }
+}
 
-        // The VMM: the jailer, started with the cut bounding set. Its standard output is the
-        // guest's serial console: a file with `guestConsole`, nowhere without it, so that a
-        // guest's kernel, which can write to the serial port's address whatever its command
-        // line says, writes into nothing. Its standard error is a file of its own, which
-        // holds what the jailer or Firecracker say when they cannot start.
+impl Removal<'_> {
+    /// The jail: the last, since it is what `list` finds the VM by, and only when nothing
+    /// else of the VM is left. Its own file system first, then its directory, which is the
+    /// mark ([`Making::mark`]).
+    fn remove_jail(&mut self) {
+        let places = &self.places;
+        let left = &mut self.left;
+        if left.is_empty() {
+            // The jail's own file system goes with everything in it, whatever its user made
+            // there. Where it is not mounted (a helper that was started again has a mount
+            // namespace of its own, in which the file system of an earlier helper's jail is
+            // not: it ended with its VMM), the chroot is an empty directory.
+            match rustix::mount::unmount(&places.chroot, rustix::mount::UnmountFlags::DETACH) {
+                Ok(()) | Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOENT) => {}
+                Err(e) => left.push(format!(
+                    "the jail's file system on {} ({})",
+                    places.chroot.display(),
+                    std::io::Error::from(e).kind()
+                )),
+            }
+        }
+        if left.is_empty() {
+            // Not `std::fs::remove_dir_all`: the chroot is the VM's user's, and a tree that
+            // user made thousands of levels deep must not end the removal (`crate::tree`).
+            match crate::tree::remove_tree(&places.jail_dir) {
+                Ok(()) => {}
+                Err(e) => left.push(format!(
+                    "the jail {} ({})",
+                    places.jail_dir.display(),
+                    e.kind()
+                )),
+            }
+            if left.is_empty() {
+                match presence(&places.jail_dir) {
+                    Presence::Gone => {}
+                    Presence::There => left.push(format!("the jail {}", places.jail_dir.display())),
+                    Presence::Unknown(why) => left.push(format!(
+                        "the jail {}, perhaps ({why})",
+                        places.jail_dir.display()
+                    )),
+                }
+            }
+        }
+    }
+}
+
+impl Making<'_> {
+    /// Step 6 of a make, the VMM: the jailer, started with the cut bounding set
+    /// ([`Making::start_jailer`]); the template's `io.max`; the wait until the guest runs; and
+    /// what the VMM runs as.
+    fn vmm(&self, starter: &Path, device: SnapshotDevice) -> Result<(), BackendError> {
+        self.start_jailer(starter)?;
+        self.set_io_max(device)?;
+        self.wait_for_guest()?;
+        self.check_vmm()
+    }
+
+    /// The jailer ([`jailer_argv`]), through the helper's own binary as `start-jailer`, in a
+    /// process group of its own, until its first process ends. Its standard output is the
+    /// guest's serial console: a file with `guestConsole`, nowhere without it, so that a
+    /// guest's kernel, which can write to the serial port's address whatever its command line
+    /// says, writes into nothing. Its standard error is a file of its own, which holds what
+    /// the jailer or Firecracker say when they cannot start.
+    fn start_jailer(&self, starter: &Path) -> Result<(), BackendError> {
+        let plan = self.plan;
+        let places = self.places;
         let new_file = |path: &Path| {
             std::fs::File::options()
                 .write(true)
@@ -1385,7 +1694,7 @@ impl LinuxBackend {
         let errors = new_file(&places.errors)?;
         // The helper's own binary again, as `start-jailer`: it cuts its bounding set to the
         // jailer's six capabilities and becomes the jailer.
-        let mut child = Command::new(&self.starter)
+        let mut child = Command::new(starter)
             .arg(bounding::START_JAILER)
             .args(jailer_argv(plan))
             .env_clear()
@@ -1413,9 +1722,14 @@ impl LinuxBackend {
                 last_words(&places.errors)
             )));
         }
-        // The template's limit of the VMM's reads and writes of the root disk. The VMM has
-        // run for a moment without it by now, and its guest has not.
-        if let Some(limit) = io_max(&plan.template, (major, minor)) {
+        Ok(())
+    }
+
+    /// The template's limit of the VMM's reads and writes of the root disk ([`io_max`]). The
+    /// VMM has run for a moment without it by now, and its guest has not.
+    fn set_io_max(&self, device: SnapshotDevice) -> Result<(), BackendError> {
+        let places = self.places;
+        if let Some(limit) = io_max(&self.plan.template, (device.major, device.minor)) {
             let parent = places
                 .cgroup
                 .parent()
@@ -1430,12 +1744,18 @@ impl LinuxBackend {
                 ))
             })?;
         }
-        // The jailer's second process execs the VMM in the cgroup; when that fails (a
-        // capability the jailer lacks, a configuration Firecracker refuses), the cgroup is
-        // empty at once, and waiting longer would only hold the helper.
-        let socket = inside(API_SOCKET);
+        Ok(())
+    }
+
+    /// Waits, at most [`START_TIMEOUT`], until Firecracker's log says that the VM is started
+    /// and its API reports a running guest. The jailer's second process execs the VMM in the
+    /// cgroup; when that fails (a capability the jailer lacks, a configuration Firecracker
+    /// refuses), the cgroup is empty at once, and waiting longer would only hold the helper.
+    fn wait_for_guest(&self) -> Result<(), BackendError> {
+        let places = self.places;
+        let socket = self.inside(API_SOCKET);
         let mut ended = false;
-        let log = inside(VMM_LOG);
+        let log = self.inside(VMM_LOG);
         let mut started = false;
         let runs = wait_until(START_TIMEOUT, || {
             // The API is asked only once the log says that the VM is started: a request that
@@ -1464,7 +1784,15 @@ impl LinuxBackend {
                 last_words(&places.errors)
             )));
         }
-        let pid = vmm_pid(&places.cgroup)
+        Ok(())
+    }
+
+    /// What the VMM that runs runs as: its `/proc/<pid>/status` ([`vmm_status_problems`]),
+    /// and its AppArmor label where the configuration requires the profile
+    /// ([`hardening::make_label_problem`]).
+    fn check_vmm(&self) -> Result<(), BackendError> {
+        let plan = self.plan;
+        let pid = vmm_pid(&self.places.cgroup)
             .map_err(failed)?
             .ok_or_else(|| failed("no VMM runs in the VM's cgroup after its start"))?;
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
@@ -1485,7 +1813,37 @@ impl LinuxBackend {
                 return Err(failed(problem));
             }
         }
-        self.done(Step::Vmm)
+        Ok(())
+    }
+}
+
+impl Removal<'_> {
+    /// The VMM and whatever else is in its cgroup, through `cgroup.kill` (`check` asks for
+    /// it). There is no other way: the helper may not signal another user's process.
+    fn end_processes(&mut self) {
+        let cgroup = self.places.cgroup.clone();
+        if presence(&cgroup) != Presence::Gone {
+            let _ = std::fs::write(cgroup.join("cgroup.kill"), "1");
+            wait_until(self.patience, || {
+                process_presence(&cgroup) != Presence::There
+            });
+            self.check("processes of its cgroup".into(), process_presence(&cgroup));
+        }
+    }
+
+    /// The cgroup: empty by now, but the kernel may need a moment to let it go.
+    fn remove_cgroup(&mut self) {
+        let cgroup = self.places.cgroup.clone();
+        if presence(&cgroup) != Presence::Gone {
+            wait_until(self.patience, || {
+                let _ = std::fs::remove_dir(&cgroup);
+                presence(&cgroup) != Presence::There
+            });
+        }
+        self.check(
+            format!("the cgroup {}", cgroup.display()),
+            presence(&cgroup),
+        );
     }
 }
 
@@ -1573,69 +1931,121 @@ fn built_in_modules(places: &[PathBuf]) -> Option<String> {
         .find_map(|place| std::fs::read_to_string(place).ok())
 }
 
-impl Backend for LinuxBackend {
-    /// What a node needs before its first make, each as a problem that names what is missing.
-    fn check(&self, template: &Template) -> Checked {
-        let mut problems = Vec::new();
-        let mut checked = Vec::new();
-        for (device, what) in [
-            ("/dev/kvm", "this machine has no KVM"),
-            ("/dev/net/tun", "the tun module is missing"),
-            ("/dev/mapper/control", "the device-mapper is missing"),
-            ("/dev/loop-control", "the loop module is missing"),
-        ] {
-            match std::fs::metadata(device) {
-                Ok(meta) if meta.file_type().is_char_device() => checked.push(device.into()),
-                _ => problems.push(format!("{device} is missing: {what}")),
+/// `check`: the devices of KVM, the tap device, the snapshot and the loop devices.
+fn check_devices(answer: &mut Checked) {
+    let Checked { problems, checked } = answer;
+    for (device, what) in [
+        ("/dev/kvm", "this machine has no KVM"),
+        ("/dev/net/tun", "the tun module is missing"),
+        ("/dev/mapper/control", "the device-mapper is missing"),
+        ("/dev/loop-control", "the loop module is missing"),
+    ] {
+        match std::fs::metadata(device) {
+            Ok(meta) if meta.file_type().is_char_device() => checked.push(device.into()),
+            _ => problems.push(format!("{device} is missing: {what}")),
+        }
+    }
+}
+
+/// `check`: the tools the execution runs, in the system's directories.
+fn check_tools(answer: &mut Checked) {
+    let Checked { problems, checked } = answer;
+    for name in TOOLS {
+        let found = TOOL_PATH
+            .split(':')
+            .map(|dir| Path::new(dir).join(name))
+            .find(|path| path.is_file());
+        match found {
+            Some(path) => checked.push(format!("the tool {}", path.display())),
+            None => problems.push(format!("the tool `{name}` is not in {TOOL_PATH}")),
+        }
+    }
+}
+
+/// `check`: the kernel modules a make needs, loaded or built in ([`module_present`]).
+fn check_modules(answer: &mut Checked) {
+    let Checked { problems, checked } = answer;
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let built_in = built_in_modules(&[
+        PathBuf::from(format!("/lib/modules/{}/modules.builtin", release.trim())),
+        PathBuf::from(BUILT_IN_COPY),
+    ]);
+    for name in MODULES {
+        if module_present(
+            name,
+            Path::new("/sys/module"),
+            built_in.as_deref().unwrap_or(""),
+        ) {
+            checked.push(format!("the module {name}"));
+        } else if built_in.is_some() {
+            problems.push(format!(
+                "the kernel module {name} is neither loaded (no /sys/module/{name}) nor built into this kernel: the helper loads none"
+            ));
+        } else {
+            problems.push(format!(
+                "the kernel module {name} is not loaded (no /sys/module/{name}), and the kernel's list of built-in modules cannot be read, neither in /lib/modules nor at {BUILT_IN_COPY}: the helper loads none"
+            ));
+        }
+    }
+}
+
+/// `check`: the node's own forwarding, which the helper never writes, and `cgroup.kill`.
+fn check_forwarding_and_cgroup_kill(answer: &mut Checked) {
+    let Checked { problems, checked } = answer;
+    match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
+        Ok(value) if value.trim() == "1" => checked.push(format!("{NODE_FORWARDING}=1")),
+        _ => problems.push(format!(
+            "{NODE_FORWARDING} is not 1: the node does not forward a published port to its VM"
+        )),
+    }
+    if cgroup_kill_there() {
+        checked.push("cgroup.kill".into());
+    } else {
+        problems.push(
+            "this kernel's cgroups have no `cgroup.kill` (Linux 5.14): the helper ends a VM's processes through it and in no other way".into(),
+        );
+    }
+}
+
+/// `check`: the cgroup controllers of the VMM's limits, and the io controller where the
+/// template has an `ioMax`.
+fn check_cgroup_controllers(template: &Template, answer: &mut Checked) {
+    let Checked { problems, checked } = answer;
+    match std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
+        Ok(controllers) => {
+            for controller in ["cpu", "memory", "pids"] {
+                if controllers.split_whitespace().any(|c| c == controller) {
+                    checked.push(format!("the cgroup controller {controller}"));
+                } else {
+                    problems.push(format!(
+                        "the cgroup controller {controller} is missing: a VM would run without that limit"
+                    ));
+                }
             }
         }
-        for name in TOOLS {
-            let found = TOOL_PATH
-                .split(':')
-                .map(|dir| Path::new(dir).join(name))
-                .find(|path| path.is_file());
-            match found {
-                Some(path) => checked.push(format!("the tool {}", path.display())),
-                None => problems.push(format!("the tool `{name}` is not in {TOOL_PATH}")),
-            }
-        }
-        // Not a check: what runs, for the operator, who answers for a patched kernel.
-        checked.push(hardening::kernel_line(Path::new("/")));
-        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-        let built_in = built_in_modules(&[
-            PathBuf::from(format!("/lib/modules/{}/modules.builtin", release.trim())),
-            PathBuf::from(BUILT_IN_COPY),
-        ]);
-        for name in MODULES {
-            if module_present(
-                name,
-                Path::new("/sys/module"),
-                built_in.as_deref().unwrap_or(""),
-            ) {
-                checked.push(format!("the module {name}"));
-            } else if built_in.is_some() {
-                problems.push(format!(
-                    "the kernel module {name} is neither loaded (no /sys/module/{name}) nor built into this kernel: the helper loads none"
-                ));
-            } else {
-                problems.push(format!(
-                    "the kernel module {name} is not loaded (no /sys/module/{name}), and the kernel's list of built-in modules cannot be read, neither in /lib/modules nor at {BUILT_IN_COPY}: the helper loads none"
-                ));
-            }
-        }
-        match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
-            Ok(value) if value.trim() == "1" => checked.push(format!("{NODE_FORWARDING}=1")),
-            _ => problems.push(format!(
-                "{NODE_FORWARDING} is not 1: the node does not forward a published port to its VM"
-            )),
-        }
-        if cgroup_kill_there() {
-            checked.push("cgroup.kill".into());
+        Err(_) => problems.push(
+            "/sys/fs/cgroup is not a cgroup v2 hierarchy: a VM would run without limits".into(),
+        ),
+    }
+    // A template with `ioMax` needs the io controller handed down from the root cgroup,
+    // which a service manager does only when some unit asks for it.
+    if template.io_max.is_some() {
+        let handed = std::fs::read_to_string("/sys/fs/cgroup/cgroup.subtree_control")
+            .is_ok_and(|c| c.split_whitespace().any(|c| c == "io"));
+        if handed {
+            checked.push("the cgroup controller io, for the template's ioMax".into());
         } else {
             problems.push(
-                "this kernel's cgroups have no `cgroup.kill` (Linux 5.14): the helper ends a VM's processes through it and in no other way".into(),
+                "the template has an ioMax, and the root cgroup does not hand down the controller io (cgroup.subtree_control): the helper's unit asks for it with IOAccounting=yes".into(),
             );
         }
+    }
+}
+
+impl LinuxBackend {
+    /// `check`: the room for every slot's snapshot, and the memory for every slot's VM.
+    fn check_room_and_memory(&self, template: &Template, answer: &mut Checked) {
+        let Checked { problems, checked } = answer;
         // Every slot at once: the snapshots' room, and the VMMs' memory.
         let all = u64::from(self.config.max_vms);
         if let Some(problem) = self.room_problem(all.saturating_mul(snapshot_bytes(template))) {
@@ -1659,51 +2069,18 @@ impl Backend for LinuxBackend {
             )),
             None => problems.push("the node's memory cannot be read from /proc/meminfo".into()),
         }
-        match std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
-            Ok(controllers) => {
-                for controller in ["cpu", "memory", "pids"] {
-                    if controllers.split_whitespace().any(|c| c == controller) {
-                        checked.push(format!("the cgroup controller {controller}"));
-                    } else {
-                        problems.push(format!(
-                            "the cgroup controller {controller} is missing: a VM would run without that limit"
-                        ));
-                    }
-                }
-            }
-            Err(_) => problems.push(
-                "/sys/fs/cgroup is not a cgroup v2 hierarchy: a VM would run without limits".into(),
-            ),
-        }
-        // A template with `ioMax` needs the io controller handed down from the root cgroup,
-        // which a service manager does only when some unit asks for it.
-        if template.io_max.is_some() {
-            let handed = std::fs::read_to_string("/sys/fs/cgroup/cgroup.subtree_control")
-                .is_ok_and(|c| c.split_whitespace().any(|c| c == "io"));
-            if handed {
-                checked.push("the cgroup controller io, for the template's ioMax".into());
-            } else {
-                problems.push(
-                    "the template has an ioMax, and the root cgroup does not hand down the controller io (cgroup.subtree_control): the helper's unit asks for it with IOAccounting=yes".into(),
-                );
-            }
-        }
+    }
+
+    /// `check`: the files the helper runs or hands a VM, and the directories it makes its
+    /// things in.
+    fn check_files(&self, template: &Template, answer: &mut Checked) {
+        let Checked { problems, checked } = answer;
         let fc = &self.config.firecracker;
-        root_file(&mut problems, &mut checked, "the jailer", &fc.jailer);
-        root_file(&mut problems, &mut checked, "Firecracker", &fc.firecracker);
-        root_file(&mut problems, &mut checked, "the VM image", &template.image);
-        root_file(
-            &mut problems,
-            &mut checked,
-            "the guest kernel",
-            &template.kernel,
-        );
-        root_dir(
-            &mut problems,
-            &mut checked,
-            "the jails' directory",
-            &fc.chroot_base,
-        );
+        root_file(problems, checked, "the jailer", &fc.jailer);
+        root_file(problems, checked, "Firecracker", &fc.firecracker);
+        root_file(problems, checked, "the VM image", &template.image);
+        root_file(problems, checked, "the guest kernel", &template.kernel);
+        root_dir(problems, checked, "the jails' directory", &fc.chroot_base);
         match std::fs::symlink_metadata(&fc.work) {
             Ok(meta)
                 if meta.file_type().is_dir() && meta.uid() == 0 && meta.mode() & 0o077 == 0 =>
@@ -1720,9 +2097,25 @@ impl Backend for LinuxBackend {
                 e.kind()
             )),
         }
+    }
+}
+
+impl Backend for LinuxBackend {
+    /// What a node needs before its first make, each as a problem that names what is missing.
+    fn check(&self, template: &Template) -> Checked {
+        let mut answer = Checked::default();
+        check_devices(&mut answer);
+        check_tools(&mut answer);
+        // Not a check: what runs, for the operator, who answers for a patched kernel.
+        answer.checked.push(hardening::kernel_line(Path::new("/")));
+        check_modules(&mut answer);
+        check_forwarding_and_cgroup_kill(&mut answer);
+        self.check_room_and_memory(template, &mut answer);
+        check_cgroup_controllers(template, &mut answer);
+        self.check_files(template, &mut answer);
         // The node's own firewall table is asked by the helper itself (`node_table`), which
         // decides with its configuration whether a missing one is a problem.
-        Checked { problems, checked }
+        answer
     }
 
     /// `nft list tables`, read for the node's own table. The role loads the table; the
@@ -1790,29 +2183,6 @@ impl Backend for LinuxBackend {
     /// still holds a process, which is the second check.
     fn delete(&self, names: &Names) -> Result<(), BackendError> {
         let places = places(&self.config.firecracker, names);
-        let mut left: Vec<String> = Vec::new();
-        // One thing's state after its step: nothing to say when it is gone.
-        let mut check = |what: String, state: Presence| match state {
-            Presence::Gone => {}
-            Presence::There => left.push(what),
-            Presence::Unknown(why) => left.push(format!("{what}, perhaps ({why})")),
-        };
-        let pids = |cgroup: &Path| match cgroup_pids(cgroup) {
-            Ok(pids) if pids.is_empty() => Presence::Gone,
-            Ok(_) => Presence::There,
-            Err(why) => Presence::Unknown(why),
-        };
-        let device_state = |device: &str| match dm_exists(device) {
-            Ok(false) => Presence::Gone,
-            Ok(true) => Presence::There,
-            Err(why) => Presence::Unknown(why),
-        };
-        let loop_state = |file: &Path| match loops_of(file) {
-            Ok(found) if found.is_empty() => Presence::Gone,
-            Ok(_) => Presence::There,
-            Err(why) => Presence::Unknown(why),
-        };
-
         // A VM whose last delete failed is not waited for again: the listener asks for a
         // delete of a VM that cannot be removed about every second, and every make sweeps
         // it, so each step is then tried once, and the answer comes at once.
@@ -1821,142 +2191,21 @@ impl Backend for LinuxBackend {
         } else {
             KILL_TIMEOUT
         };
-
-        // The VMM and whatever else is in its cgroup, through `cgroup.kill` (`check` asks for
-        // it). There is no other way: the helper may not signal another user's process.
-        if presence(&places.cgroup) != Presence::Gone {
-            let _ = std::fs::write(places.cgroup.join("cgroup.kill"), "1");
-            wait_until(patience, || pids(&places.cgroup) != Presence::There);
-            check("processes of its cgroup".into(), pids(&places.cgroup));
-        }
-
-        // The snapshot's device, then its loop device, then its file.
-        let device = names.snapshot();
-        if device_state(&device) != Presence::Gone {
-            // The VMM's descriptor of the device closes a moment after its process is gone:
-            // the first tries may find the device busy. `dmsetup remove --retry` would sleep
-            // 200 ms after each; this loop tries again every 10 ms.
-            wait_until(patience, || {
-                let _ = tool(
-                    &words(&["dmsetup", "remove", "--noudevsync", &device]),
-                    None,
-                );
-                device_state(&device) != Presence::There
-            });
-        }
-        check(
-            format!("the device-mapper device {device}"),
-            device_state(&device),
-        );
-        for attached in loops_of(&places.snapshot_file).unwrap_or_default() {
-            let _ = tool(&words(&["losetup", "--detach", &attached]), None);
-        }
-        // A loop device is detached once its last user closed it, which may be a moment later.
-        // While the snapshot's device is still there it is that user: no waiting for it then.
-        if device_state(&device) == Presence::Gone {
-            wait_until(patience, || {
-                loop_state(&places.snapshot_file) != Presence::There
-            });
-        }
-        check(
-            format!("the loop device of {}", places.snapshot_file.display()),
-            loop_state(&places.snapshot_file),
-        );
-        for file in [&places.snapshot_file, &places.console, &places.errors] {
-            let _ = std::fs::remove_file(file);
-            check(format!("the file {}", file.display()), presence(file));
-        }
-
-        // The veth first: removing the node's end removes its peer in the namespace at once,
-        // where the namespace's own end would go only a moment after the namespace. Then the
-        // namespace, with its tap device and its table.
-        let jail = names.jail();
-        let veth = names.veth();
-        let veth_path = Path::new("/sys/class/net").join(&veth);
-        if presence(&veth_path) != Presence::Gone {
-            let _ = tool(&words(&["ip", "link", "del", &veth]), None);
-        }
-        check(format!("the interface {veth}"), presence(&veth_path));
-        if presence(&places.netns) != Presence::Gone {
-            let _ = tool(&words(&["ip", "netns", "del", &jail]), None);
-        }
-        check(
-            format!("the network namespace {jail}"),
-            presence(&places.netns),
-        );
-
-        // The node's table of the VM: gone only when nft itself says that it does not exist.
-        let table = names.table();
-        let listing = words(&["nft", "list", "table", "inet", &table]);
-        let table_state = || match tool(&listing, None) {
-            Ok(_) => Presence::There,
-            Err(ToolError::Exit { said, .. }) if table_is_gone(&said) => Presence::Gone,
-            Err(e) => Presence::Unknown(e.to_string()),
+        let mut removal = Removal {
+            names,
+            places,
+            patience,
+            left: Vec::new(),
         };
-        if table_state() == Presence::There {
-            let _ = tool(&words(&["nft", "delete", "table", "inet", &table]), None);
-        }
-        check(format!("the firewall table {table}"), table_state());
-
-        // The cgroup: empty by now, but the kernel may need a moment to let it go.
-        if presence(&places.cgroup) != Presence::Gone {
-            wait_until(patience, || {
-                let _ = std::fs::remove_dir(&places.cgroup);
-                presence(&places.cgroup) != Presence::There
-            });
-        }
-        check(
-            format!("the cgroup {}", places.cgroup.display()),
-            presence(&places.cgroup),
-        );
-
-        // The jail's directory: the last, since it is what `list` finds the VM by.
-        if left.is_empty() {
-            // The jail's own file system goes with everything in it, whatever its user made
-            // there. Where it is not mounted (a helper that was started again has a mount
-            // namespace of its own, in which the file system of an earlier helper's jail is
-            // not: it ended with its VMM), the chroot is an empty directory.
-            match rustix::mount::unmount(&places.chroot, rustix::mount::UnmountFlags::DETACH) {
-                Ok(()) | Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOENT) => {}
-                Err(e) => left.push(format!(
-                    "the jail's file system on {} ({})",
-                    places.chroot.display(),
-                    std::io::Error::from(e).kind()
-                )),
-            }
-        }
-        if left.is_empty() {
-            // Not `std::fs::remove_dir_all`: the chroot is the VM's user's, and a tree that
-            // user made thousands of levels deep must not end the removal (`crate::tree`).
-            match crate::tree::remove_tree(&places.jail_dir) {
-                Ok(()) => {}
-                Err(e) => left.push(format!(
-                    "the jail {} ({})",
-                    places.jail_dir.display(),
-                    e.kind()
-                )),
-            }
-            if left.is_empty() {
-                match presence(&places.jail_dir) {
-                    Presence::Gone => {}
-                    Presence::There => left.push(format!("the jail {}", places.jail_dir.display())),
-                    Presence::Unknown(why) => left.push(format!(
-                        "the jail {}, perhaps ({why})",
-                        places.jail_dir.display()
-                    )),
-                }
-            }
-        }
-        if left.is_empty() {
-            lock(&self.failed_deletes).remove(&names.serial);
-            Ok(())
-        } else {
-            lock(&self.failed_deletes).insert(names.serial);
-            Err(failed(format!(
-                "of the VM {jail} this is left: {}",
-                left.join(", ")
-            )))
-        }
+        // Every step is tried whatever the one before did, in the order of the README's "A
+        // delete", 1 to 6.
+        removal.end_processes();
+        removal.remove_disks();
+        removal.remove_network();
+        removal.remove_node_table();
+        removal.remove_cgroup();
+        removal.remove_jail();
+        removal.finish(&self.failed_deletes)
     }
 
     /// Each line of the mark, read under the machine's own root. The VMMs' AppArmor labels are
