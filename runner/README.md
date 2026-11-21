@@ -899,6 +899,17 @@ The front:
   included. A pair of Unix sockets stays allowed, which reaches no other process. It runs as
   `run`'s user, in a process group of its own, with an empty environment and no descriptor but its
   control channel on stdin, `/dev/null` on stdout and a pipe to `run` for its stderr.
+- **How this is tested** (ADR-0112 decision 8, path C: `tests/path_c.rs`). Two runs over the bridge
+  on one host use the git, model and egress proxies, with canaries for the host's token, each run's
+  git token and the gateway's key. A probe that `run`'s own code starts as a sandbox's front, given
+  copies of what `run` gave run 2's front, can read no file of the host's and nothing of `run`'s,
+  run 1's front's or the sandboxes' processes under `/proc`, write nothing, signal, limit or open a
+  pidfd of none of them, make no socket, and connect or bind nowhere (run 1's bridge and tunnels,
+  any port of the test, an abstract socket): Landlock refuses the paths, the seccomp filter the
+  rest. A tap on what `run` writes to its fronts (the frames, and the sockets `run` fills) finds no
+  form of a canary over both runs, and does find one that the test makes `run` send. Stand-in
+  agents, a fake server and fake upstreams on one machine, not real machines; `ptrace` and
+  `process_vm_readv` are not tried themselves (no call without `unsafe` code), `/proc/<pid>/mem` is.
 
 Both:
 

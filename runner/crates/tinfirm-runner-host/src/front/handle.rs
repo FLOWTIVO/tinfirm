@@ -61,6 +61,10 @@ pub struct FrontCommand {
     pub args: Vec<String>,
     /// The front's whole environment: none in production.
     pub env: Vec<(String, String)>,
+    /// Test-only: what `run` sends the front is recorded ([`super::tap`]). `run` never sets
+    /// it, and no flag or variable does.
+    #[doc(hidden)]
+    pub tap: Option<super::tap::FrontTap>,
 }
 
 impl FrontCommand {
@@ -70,6 +74,7 @@ impl FrontCommand {
             program: std::env::current_exe().context("cannot find this executable")?,
             args: vec![super::SUBCOMMAND.to_string()],
             env: Vec::new(),
+            tap: None,
         })
     }
 }
@@ -243,6 +248,7 @@ pub struct FrontHandle {
     answer_timeout: Duration,
     send_timeout: Duration,
     requests: Mutex<Option<tokio::sync::mpsc::Receiver<FrontRequest>>>,
+    tap: Option<super::tap::TapFront>,
 }
 
 impl std::fmt::Debug for FrontHandle {
@@ -351,6 +357,7 @@ impl FrontHandle {
             answer_timeout: ANSWER_TIMEOUT,
             send_timeout: SEND_TIMEOUT,
             requests: Mutex::new(Some(requests)),
+            tap: command.tap.as_ref().map(|tap| tap.front(pgid)),
         };
         handle.send(&ToFront::Init { run: run_id }, None).await?;
         Ok(handle)
@@ -420,6 +427,10 @@ impl FrontHandle {
             bail!("{ended}");
         }
         let frame = wire::encode(message, MAX_TO_FRONT)?;
+        let descriptors = match &self.tap {
+            Some(tap) => tap.sent(message, &frame, descriptors)?,
+            None => descriptors,
+        };
         let write = async {
             let mut writer = self.writer.lock().await;
             let stream: &UnixStream = (*writer).as_ref();

@@ -41,6 +41,7 @@ fn the_front() -> FrontCommand {
         program: PathBuf::from(BIN),
         args: vec![tinfirm_runner_host::front::SUBCOMMAND.to_string()],
         env: Vec::new(),
+        tap: None,
     }
 }
 
@@ -898,6 +899,7 @@ fn hostile_bridge_front(mode: &str, ticket: &str) -> FrontCommand {
             (HOSTILE.to_string(), mode.to_string()),
             (HOSTILE_TICKET.to_string(), ticket.to_string()),
         ],
+        tap: None,
     }
 }
 

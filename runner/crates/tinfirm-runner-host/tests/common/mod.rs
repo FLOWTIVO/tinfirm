@@ -1393,6 +1393,7 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
             program: PathBuf::from(env!("CARGO_BIN_EXE_tinfirm-runner-host")),
             args: vec![tinfirm_runner_host::front::SUBCOMMAND.to_string()],
             env: Vec::new(),
+            tap: None,
         };
         opts.bridge = Some(bridge);
     }

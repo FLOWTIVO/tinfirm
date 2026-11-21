@@ -2632,6 +2632,7 @@ async fn probe_front(paths: &Paths) -> Result<tinfirm_runner_host::front::Probe>
         ],
         signal: vec![std::process::id()],
         linger: false,
+        inside: None,
     };
     let binary = std::env::current_exe().context("cannot find this executable")?;
     tokio::task::spawn_blocking(move || {

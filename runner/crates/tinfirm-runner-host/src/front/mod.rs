@@ -53,9 +53,11 @@ mod bridge;
 pub mod conn;
 pub mod handle;
 pub mod head;
+pub mod inside;
 pub mod sandbox;
 mod serve;
 pub mod session;
+pub mod tap;
 pub mod wire;
 
 /// The hidden subcommand that starts a front.
@@ -85,6 +87,10 @@ pub struct ProbeJob {
     /// After its answer, stay until its stdin ends: a sibling front for another's probe.
     #[serde(default)]
     pub linger: bool,
+    /// Started as `run` starts a front, take what `run` sends, and try this from inside
+    /// ([`inside`]): the test of path C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside: Option<inside::Attempts>,
 }
 
 /// What a front's probe found. Every field but `status`, `own_group` and `runtime` is what got
@@ -170,6 +176,9 @@ pub fn child_main(probe: Option<&str>) -> ExitCode {
         Some(Err(e)) => return fail(&format!("the probe's job is not valid: {e}")),
         None => return serve::serve(status),
     };
+    if let Some(attempts) = &job.inside {
+        return inside::child_main(status, &job, attempts);
+    }
     let answer = run_probe(status, &job);
     let mut out = std::io::stdout().lock();
     let written = serde_json::to_writer(&mut out, &answer)
@@ -368,6 +377,7 @@ pub(crate) fn test_command() -> handle::FrontCommand {
         .map(String::from)
         .to_vec(),
         env: Vec::new(),
+        tap: None,
     }
 }
 

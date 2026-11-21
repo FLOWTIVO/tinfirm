@@ -77,6 +77,9 @@
 //   egress             opens a `CONNECT` to the `[target:<host:port>]` marker through its
 //                      HTTPS_PROXY (with the proxy's credential), sends a line there and reports
 //                      the proxy's status and the line that comes back
+//   proxies            fetches `main` (through the git proxy), then does what `model-proxy` and
+//                      `egress` do and reports it all, and with `[wait]` then waits like `gate`
+//                      until the file `release` appears
 //   skills             lists the skills in `~/.claude/skills` and `~/.agents/skills`, each with
 //                      the `name:` line of its SKILL.md and whether its folder is read-only,
 //                      then writes a file of its own in `~/.claude`, as a runtime saves its
@@ -315,6 +318,83 @@ async function mcpCall(server, method, params, id) {
 
 async function toolCall(sessionId, id, title, kind, rawInput, extra = {}) {
   notify(sessionId, { sessionUpdate: "tool_call", toolCallId: id, title, kind, status: "pending", rawInput, ...extra });
+}
+
+// The model proxy, as the `model-proxy` scenario reports it.
+async function modelProxyReport() {
+  const env = process.env;
+  const base = env.ANTHROPIC_BASE_URL ?? env.TINFIRM_MODEL_BASE_URL ?? env.OPENAI_BASE_URL ?? "";
+  const key = env.ANTHROPIC_AUTH_TOKEN ?? env.OPENAI_API_KEY ?? "";
+  const ask = async (method, endpoint) => {
+    try {
+      const response = await fetch(`${base}${endpoint}`, {
+        method,
+        headers: { authorization: `Bearer ${key}`, "x-api-key": key, "content-type": "application/json" },
+        body: "{}",
+      });
+      await response.text();
+      return String(response.status);
+    } catch {
+      return "unreachable";
+    }
+  };
+  let port = "-";
+  let host = "-";
+  try {
+    port = new URL(base).port || "-";
+    host = new URL(base).hostname || "-";
+  } catch {}
+  const report = [
+    `model-port=${port}`,
+    `model-host=${host}`,
+    `model-key=${key}`,
+    `messages=${await ask("POST", "/v1/messages")}`,
+    `keys=${await ask("POST", "/key/generate")}`,
+  ];
+  return report;
+}
+
+// A connection through the egress proxy, as the `egress` scenario reports it.
+async function egressReport(text) {
+  const report = [];
+  try {
+    const proxy = new URL(process.env.HTTPS_PROXY ?? "");
+    const target = markers(text, "target")[0];
+    const auth = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64");
+    report.push(`proxy: ${proxy.hostname}:${proxy.port}`);
+    report.push(
+      await new Promise((resolve, reject) => {
+        const socket = net.connect(Number(proxy.port), proxy.hostname);
+        let buf = "";
+        let open = false;
+        socket.on("error", reject);
+        socket.on("close", () => resolve(open ? `closed after: ${buf.trim()}` : `closed: ${buf.trim()}`));
+        socket.on("data", (data) => {
+          buf += data.toString();
+          if (!open) {
+            const end = buf.indexOf("\r\n\r\n");
+            if (end < 0) return;
+            const status = buf.slice(0, buf.indexOf("\r\n"));
+            buf = buf.slice(end + 4);
+            if (!status.includes(" 200")) {
+              socket.destroy();
+              return resolve(`status: ${status}`);
+            }
+            open = true;
+            socket.write("hello through the tunnel\n");
+          }
+          if (buf.includes("\n")) {
+            socket.destroy();
+            resolve(`echo: ${buf.trim()}`);
+          }
+        });
+        socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`);
+      }),
+    );
+  } catch (e) {
+    report.push(`egress failed: ${e.message}`);
+  }
+  return report;
 }
 
 async function prompt(msg) {
@@ -596,36 +676,7 @@ async function prompt(msg) {
       return done({ stopReason: "end_turn" });
     }
     case "model-proxy": {
-      const env = process.env;
-      const base = env.ANTHROPIC_BASE_URL ?? env.TINFIRM_MODEL_BASE_URL ?? env.OPENAI_BASE_URL ?? "";
-      const key = env.ANTHROPIC_AUTH_TOKEN ?? env.OPENAI_API_KEY ?? "";
-      const ask = async (method, endpoint) => {
-        try {
-          const response = await fetch(`${base}${endpoint}`, {
-            method,
-            headers: { authorization: `Bearer ${key}`, "x-api-key": key, "content-type": "application/json" },
-            body: "{}",
-          });
-          await response.text();
-          return String(response.status);
-        } catch {
-          return "unreachable";
-        }
-      };
-      let port = "-";
-      let host = "-";
-      try {
-        port = new URL(base).port || "-";
-        host = new URL(base).hostname || "-";
-      } catch {}
-      const report = [
-        `model-port=${port}`,
-        `model-host=${host}`,
-        `model-key=${key}`,
-        `messages=${await ask("POST", "/v1/messages")}`,
-        `keys=${await ask("POST", "/key/generate")}`,
-      ];
-      chunk(sessionId, report.join(" "));
+      chunk(sessionId, (await modelProxyReport()).join(" "));
       return done({ stopReason: "end_turn" });
     }
     case "leak-commit": {
@@ -836,45 +887,26 @@ async function prompt(msg) {
       return done({ stopReason: "end_turn" });
     }
     case "egress": {
+      chunk(sessionId, `\n${(await egressReport(text)).join("\n")}`);
+      return done({ stopReason: "end_turn" });
+    }
+    case "proxies": {
       const report = [];
       try {
-        const proxy = new URL(process.env.HTTPS_PROXY ?? "");
-        const target = markers(text, "target")[0];
-        const auth = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64");
-        report.push(`proxy: ${proxy.hostname}:${proxy.port}`);
-        report.push(
-          await new Promise((resolve, reject) => {
-            const socket = net.connect(Number(proxy.port), proxy.hostname);
-            let buf = "";
-            let open = false;
-            socket.on("error", reject);
-            socket.on("close", () => resolve(open ? `closed after: ${buf.trim()}` : `closed: ${buf.trim()}`));
-            socket.on("data", (data) => {
-              buf += data.toString();
-              if (!open) {
-                const end = buf.indexOf("\r\n\r\n");
-                if (end < 0) return;
-                const status = buf.slice(0, buf.indexOf("\r\n"));
-                buf = buf.slice(end + 4);
-                if (!status.includes(" 200")) {
-                  socket.destroy();
-                  return resolve(`status: ${status}`);
-                }
-                open = true;
-                socket.write("hello through the tunnel\n");
-              }
-              if (buf.includes("\n")) {
-                socket.destroy();
-                resolve(`echo: ${buf.trim()}`);
-              }
-            });
-            socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`);
-          }),
-        );
+        git(cwd, "fetch", "origin", "main");
+        report.push("fetch: ok");
       } catch (e) {
-        report.push(`egress failed: ${e.message}`);
+        report.push(`fetch failed: ${(e.stderr || e.message || "").toString().trim()}`);
       }
-      chunk(sessionId, `\n${report.join("\n")}`);
+      report.push(...(await modelProxyReport()));
+      report.push(...(await egressReport(text)));
+      chunk(sessionId, `\n${report.join("\n")}\n`);
+      if (text.includes("[wait]")) {
+        chunk(sessionId, "waiting for release");
+        while (!fs.existsSync(path.join(root, "release"))) {
+          if (await waitCancel(100)) return done({ stopReason: "cancelled" });
+        }
+      }
       return done({ stopReason: "end_turn" });
     }
     case "request-repo": {

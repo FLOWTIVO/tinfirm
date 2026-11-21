@@ -88,6 +88,7 @@ fn a_front_reads_no_file_of_the_host_reaches_no_other_process_and_starts_nothing
         // This test process stands for `run`.
         signal: vec![host, bystander.id(), sibling.id()],
         linger: false,
+        inside: None,
     };
     let probe: Probe = front::probe(BIN.as_ref(), &job, WAIT).unwrap();
     assert!(probe.status.confined(), "{}", probe.describe());
@@ -148,6 +149,7 @@ fn the_front() -> FrontCommand {
         program: PathBuf::from(BIN),
         args: vec![front::SUBCOMMAND.to_string()],
         env: Vec::new(),
+        tap: None,
     }
 }
 
@@ -166,6 +168,7 @@ fn hostile_front(mode: &str, extra: &[(&str, &str)]) -> FrontCommand {
             .map(String::from)
             .to_vec(),
         env,
+        tap: None,
     }
 }
 
@@ -1045,6 +1048,7 @@ fn without_landlock_the_fronts_seccomp_filter_still_refuses_sockets_signals_and_
         deny_read: Vec::new(),
         signal: vec![host, bystander.id()],
         linger: false,
+        inside: None,
     });
     // Landlock is gone, as before Linux 5.19; the filter is there.
     assert!(!probe.status.landlock, "{probe:?}");

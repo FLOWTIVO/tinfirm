@@ -51,6 +51,7 @@ impl BridgeOptions {
                 program: binary.clone(),
                 args: vec![crate::front::SUBCOMMAND.to_string()],
                 env: Vec::new(),
+                tap: None,
             },
             binary,
             connect_timeout: Duration::from_secs(180),
