@@ -1592,16 +1592,7 @@ impl Making<'_> {
     fn mount_jail(&self) -> Result<(), BackendError> {
         let chroot = &self.places.chroot;
         private_dir(chroot)?;
-        rustix::mount::mount(
-            "tinfirm-jail",
-            chroot,
-            "tmpfs",
-            rustix::mount::MountFlags::NOSUID,
-            std::ffi::CString::new(jail_mount_options(&self.plan.firecracker))
-                .expect("no NUL in it")
-                .as_c_str(),
-        )
-        .map_err(|e| {
+        mount_jail_fs(chroot, &jail_mount_options(&self.plan.firecracker)).map_err(|e| {
             failed(format!(
                 "cannot mount the jail's file system on {}: {}",
                 chroot.display(),
@@ -1609,6 +1600,37 @@ impl Making<'_> {
             ))
         })
     }
+}
+
+/// Mounts a jail's file system on `chroot`: a tmpfs with `options` ([`jail_mount_options`]),
+/// on which no file is set-user-ID.
+fn mount_jail_fs(chroot: &Path, options: &str) -> Result<(), rustix::io::Errno> {
+    // In the unit tests, the fake node of the test's thread answers here as it does for the
+    // node's tools in [`tool`], unless the test asked for the kernel's own
+    // (`tests::FakeNode::with_the_kernels_jail`).
+    #[cfg(test)]
+    if let Some(answer) = tests::fake_jail_mount() {
+        return answer;
+    }
+    rustix::mount::mount(
+        "tinfirm-jail",
+        chroot,
+        "tmpfs",
+        rustix::mount::MountFlags::NOSUID,
+        std::ffi::CString::new(options)
+            .expect("no NUL in it")
+            .as_c_str(),
+    )
+}
+
+/// Unmounts a jail's file system, with everything in it. `EINVAL` says that `chroot` is not a
+/// mount point, and `ENOENT` that it is not there.
+fn unmount_jail_fs(chroot: &Path) -> Result<(), rustix::io::Errno> {
+    #[cfg(test)]
+    if let Some(answer) = tests::fake_jail_unmount(chroot) {
+        return answer;
+    }
+    rustix::mount::unmount(chroot, rustix::mount::UnmountFlags::DETACH)
 }
 
 impl Removal<'_> {
@@ -1623,7 +1645,7 @@ impl Removal<'_> {
             // there. Where it is not mounted (a helper that was started again has a mount
             // namespace of its own, in which the file system of an earlier helper's jail is
             // not: it ended with its VMM), the chroot is an empty directory.
-            match rustix::mount::unmount(&places.chroot, rustix::mount::UnmountFlags::DETACH) {
+            match unmount_jail_fs(&places.chroot) {
                 Ok(()) | Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOENT) => {}
                 Err(e) => left.push(format!(
                     "the jail's file system on {} ({})",
@@ -3017,11 +3039,22 @@ mod tests {
     /// tables that `nft -f -` loaded are kept, so `nft list table` and `nft delete table`
     /// answer by them. An entry of `answers` replaces the answer of every command that starts
     /// with its words: `Ok` with what it prints, `Err` with what it writes when it fails.
+    ///
+    /// It stands in for the kernel in one place too: the jail's file system. A process may
+    /// mount one only with `CAP_SYS_ADMIN`, and without it the kernel refuses even to unmount
+    /// a directory that is not a mount point. Root in a container that an image is built in
+    /// (where CI runs these tests) does not have it, and a developer's own user does not
+    /// either. So the jail of a fake node is the plain directory that the make made, root's
+    /// and mode 0700 as the file system's own root is: its mount succeeds and mounts nothing,
+    /// and its unmount answers what the kernel answers for such a directory (`EINVAL`, and
+    /// `ENOENT` when it is not there). The test that is about the file system itself asks for
+    /// the kernel's ([`FakeNode::with_the_kernels_jail`]) and runs where [`can_mount`] holds.
     #[derive(Debug, Default)]
     pub(super) struct FakeNode {
         ran: Vec<String>,
         tables: std::collections::BTreeMap<String, String>,
         answers: Vec<(String, Result<String, String>)>,
+        kernels_jail: bool,
     }
 
     thread_local! {
@@ -3040,7 +3073,35 @@ mod tests {
         })
     }
 
+    /// The fake node's answer to the mount of a jail's file system: where a test set one up
+    /// on this thread and did not ask for the kernel's own, nothing is mounted.
+    pub(super) fn fake_jail_mount() -> Option<Result<(), rustix::io::Errno>> {
+        FAKE_NODE.with(|node| match node.borrow().as_ref() {
+            Some(node) if !node.kernels_jail => Some(Ok(())),
+            _ => None,
+        })
+    }
+
+    /// The fake node's answer to the unmount of a jail's file system that it did not mount:
+    /// the kernel's for a directory that is not a mount point.
+    pub(super) fn fake_jail_unmount(chroot: &Path) -> Option<Result<(), rustix::io::Errno>> {
+        FAKE_NODE.with(|node| match node.borrow().as_ref() {
+            Some(node) if !node.kernels_jail => Some(Err(if chroot.exists() {
+                rustix::io::Errno::INVAL
+            } else {
+                rustix::io::Errno::NOENT
+            })),
+            _ => None,
+        })
+    }
+
     impl FakeNode {
+        /// The jail's file system is mounted and unmounted by the kernel, as on a node.
+        fn with_the_kernels_jail(mut self) -> FakeNode {
+            self.kernels_jail = true;
+            self
+        }
+
         fn answer(mut self, prefix: &str, answer: Result<&str, &str>) -> FakeNode {
             self.answers.push((
                 prefix.to_string(),
@@ -3293,6 +3354,23 @@ mod tests {
         rustix::process::geteuid().is_root()
     }
 
+    /// Whether this process may mount a file system, tried on a directory of its own: being
+    /// root is not enough, the kernel asks for `CAP_SYS_ADMIN`.
+    fn can_mount() -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let mounted = rustix::mount::mount(
+            "tinfirm-test",
+            dir.path(),
+            "tmpfs",
+            rustix::mount::MountFlags::NOSUID,
+            c"size=4k",
+        );
+        if mounted.is_ok() {
+            rustix::mount::unmount(dir.path(), rustix::mount::UnmountFlags::DETACH).unwrap();
+        }
+        mounted.is_ok()
+    }
+
     /// Whether the chroot is a mount point, from this process's mount table.
     fn mounted(chroot: &Path) -> Option<String> {
         let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
@@ -3464,13 +3542,17 @@ mod tests {
 
     #[test]
     fn a_make_left_after_its_jail_holds_the_vms_files_on_a_file_system_of_its_own() {
-        if !is_root() {
-            eprintln!("skipped: the jail's file system is mounted, which needs root");
+        if !can_mount() {
+            eprintln!(
+                "skipped: the jail's own file system is mounted, and this process may not mount \
+                 (root with CAP_SYS_ADMIN may)"
+            );
             return;
         }
+        let kernels = || FakeNode::default().with_the_kernels_jail();
         let rig = self::rig(|_, _| {});
         let backend = LinuxBackend::new(rig.config.clone()).failing_after(Step::Jail, true);
-        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+        let (made, ran) = on_fake_node(kernels(), rig.dir.path(), || {
             backend.make(&rig.plan, USER_DATA)
         });
         assert!(made.is_err());
@@ -3527,7 +3609,7 @@ mod tests {
         );
 
         // The delete unmounts the jail's file system, with what is in it, and removes the jail.
-        let mut node = FakeNode::default();
+        let mut node = kernels();
         node.tables
             .insert("inet tinfirm_000000000001".into(), node_rules(&rig.plan));
         let (deleted, ran) = on_fake_node(node, rig.dir.path(), || backend.delete(&rig.plan.names));
@@ -3539,7 +3621,7 @@ mod tests {
         // Made to fail after the same step, the make removes it all itself.
         let rig = self::rig(|_, _| {});
         let backend = LinuxBackend::new(rig.config.clone()).failing_after(Step::Jail, false);
-        let (made, ran) = on_fake_node(FakeNode::default(), rig.dir.path(), || {
+        let (made, ran) = on_fake_node(kernels(), rig.dir.path(), || {
             backend.make(&rig.plan, USER_DATA)
         });
         assert_eq!(
@@ -3556,7 +3638,7 @@ mod tests {
     #[test]
     fn the_jailer_is_started_through_start_jailer_with_the_console_and_its_errors_in_files() {
         if !is_root() {
-            eprintln!("skipped: the jail's file system is mounted, which needs root");
+            eprintln!("skipped: the VM's files are given to its user, which needs root");
             return;
         }
         let rig = self::rig(|config, _| config.firecracker.guest_console = true);
@@ -3602,7 +3684,7 @@ mod tests {
     #[test]
     fn after_the_jailer_the_make_sets_the_io_limit_and_fails_at_once_when_the_vmm_is_gone() {
         if !is_root() {
-            eprintln!("skipped: the jail's file system is mounted, which needs root");
+            eprintln!("skipped: the VM's files are given to its user, which needs root");
             return;
         }
         // An io.max that cannot be written: its cgroup is not there, since nothing made it.
@@ -3658,7 +3740,7 @@ mod tests {
     #[test]
     fn a_jailer_that_does_not_end_is_killed_after_ten_seconds() {
         if !is_root() {
-            eprintln!("skipped: the jail's file system is mounted, which needs root");
+            eprintln!("skipped: the VM's files are given to its user, which needs root");
             return;
         }
         let rig = self::rig(|_, _| {});
