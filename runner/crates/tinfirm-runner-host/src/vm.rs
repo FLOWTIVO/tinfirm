@@ -90,6 +90,8 @@ const CHECK_WAIT: Duration = Duration::from_secs(5);
 /// The most of the driver's problems that the host passes on in a rejection: it goes to the
 /// server, and is shown as the run's queue reason.
 const CAUSE_MAX: usize = 1000;
+/// Why the hardening is `no` before the driver's `verify` has answered.
+const NOT_ASKED: &str = "the VM driver's verify has not answered yet";
 
 /// The program that is the driver, with its arguments and the environment it gets in addition
 /// to the host's.
@@ -351,6 +353,56 @@ pub struct Verified {
     /// What the driver checked, for the log.
     #[serde(default)]
     pub checked: Vec<String>,
+    /// Whether the machines that run the template's VMs are hardened (ADR-0113, decision 5):
+    /// `yes`, `no`, or `None`, left out, when the driver cannot tell now. This binary's node
+    /// driver sends it ([`crate::node`]); the host reads it only for that driver
+    /// (crate::isolation), and an operator's own driver keeps the operator's statement. A
+    /// value other than `yes` or `no` reads as `no`.
+    #[serde(default, deserialize_with = "mark_of")]
+    pub hardened: Option<Mark>,
+    /// Why the machines are not hardened, or why the driver cannot tell, for the log and
+    /// `doctor`: the node driver names each line that does not hold, `node <name>: <line>:
+    /// <what it found>`. The host passes these on and interprets none of them.
+    #[serde(default)]
+    pub not_hardened: Vec<String>,
+}
+
+/// The hardening mark of the machines that run a host's VMs (ADR-0113, decision 5), as the
+/// node driver reports it: `yes` or `no`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Yes,
+    No,
+}
+
+impl Mark {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mark::Yes => "yes",
+            Mark::No => "no",
+        }
+    }
+}
+
+/// `verify`'s `hardened`: `yes`, `no`, or absent (`null` too). Any other value is `no`: the
+/// host never reads `yes` into what it does not understand, and a value it does not know does
+/// not make the whole answer unreadable.
+fn mark_of<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Mark>, D::Error> {
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => None,
+        Some(Value::String(mark)) if mark == "yes" => Some(Mark::Yes),
+        Some(_) => Some(Mark::No),
+    })
+}
+
+/// The last known hardening of the machines that run the host's VMs ([`Vms::hardening`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hardening {
+    pub hardened: Mark,
+    /// Why not `yes`: the lines that do not hold, as the driver named them.
+    pub not_hardened: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -872,6 +924,9 @@ pub struct Vms {
     made: AtomicU64,
     /// Counts the health checks that ended, for those that wait for one.
     checks: tokio::sync::watch::Sender<u64>,
+    /// The last known hardening of the machines that run the VMs, from the driver's `verify`
+    /// ([`Vms::note_hardening`]).
+    hardening: tokio::sync::watch::Sender<Hardening>,
 }
 
 /// The VMs whose delete failed, by id, and whether a task tries them again now.
@@ -938,7 +993,72 @@ impl Vms {
             made: AtomicU64::new(0),
             checking: std::sync::atomic::AtomicBool::new(false),
             checks: tokio::sync::watch::Sender::new(0),
+            hardening: tokio::sync::watch::Sender::new(Hardening {
+                hardened: Mark::No,
+                not_hardened: vec![NOT_ASKED.to_string()],
+            }),
         })
+    }
+
+    // ----- the hardening of the machines that run the VMs ----------------------------------
+    //
+    // ADR-0113, decision 5. The node driver's `verify` says whether the nodes that offer the
+    // template are hardened: `yes`, `no`, or nothing when it cannot tell (a node did not answer,
+    // and none said `no`). Nothing keeps the last value the host knows: a node that is down
+    // takes no run, and its next answer counts. At the start there is no value to keep, so
+    // nothing there is `no`: the host cannot vouch for a node it did not hear.
+
+    /// The last known hardening of the machines that run this host's VMs: `no` until the
+    /// driver's `verify` has answered.
+    pub fn hardening(&self) -> Hardening {
+        self.hardening.borrow().clone()
+    }
+
+    /// The same, as it changes.
+    pub fn hardening_watch(&self) -> tokio::sync::watch::Receiver<Hardening> {
+        self.hardening.subscribe()
+    }
+
+    /// Notes what a `verify` said of the hardening: its value, or with none, the last known
+    /// one, and at the start (`at_start`, the check of [`Vms::check`]) `no`. A change of the
+    /// mark is logged, a loss as a warning that names the lines.
+    pub(crate) fn note_hardening(&self, verified: &Verified, at_start: bool) {
+        let now = match (verified.hardened, at_start) {
+            (Some(hardened), _) => Hardening {
+                hardened,
+                not_hardened: verified.not_hardened.clone(),
+            },
+            (None, true) => Hardening {
+                hardened: Mark::No,
+                not_hardened: std::iter::once(
+                    "the VM driver cannot tell whether its machines are hardened, and this host vouches for none it did not hear from".to_string(),
+                )
+                .chain(verified.not_hardened.iter().cloned())
+                .collect(),
+            },
+            (None, false) => return,
+        };
+        let mut before = None;
+        self.hardening.send_if_modified(|known| {
+            if *known == now {
+                return false;
+            }
+            before = Some(known.hardened);
+            *known = now.clone();
+            true
+        });
+        let template = &self.options.template;
+        match (before, now.hardened) {
+            (Some(Mark::Yes), Mark::No) => tracing::warn!(
+                %template,
+                not_hardened = %now.not_hardened.join("; "),
+                "the machines that run this host's VMs are no longer hardened"
+            ),
+            (Some(Mark::No), Mark::Yes) => {
+                tracing::info!(%template, "the machines that run this host's VMs are hardened")
+            }
+            _ => {}
+        }
     }
 
     // ----- whether the driver can make a VM ----------------------------------------------
@@ -957,7 +1077,10 @@ impl Vms {
     /// Asks the driver's `verify`, within the driver's own [`VERIFY_TIMEOUT`].
     async fn health(&self) -> Health {
         match self.driver.verify(&self.options.template).await {
-            Ok(verified) => no_vms_cause(&verified).map_or(Health::Clean, Health::NoVms),
+            Ok(verified) => {
+                self.note_hardening(&verified, false);
+                no_vms_cause(&verified).map_or(Health::Clean, Health::NoVms)
+            }
             Err(e) => Health::Unknown(format!("{e:#}")),
         }
     }
@@ -1132,6 +1255,8 @@ impl Vms {
     ) -> Result<(DriverHello, Verified, u32)> {
         let hello = self.driver.hello().await?;
         let verified = self.driver.verify(&self.options.template).await?;
+        // The start's value of the hardening: a driver that cannot tell gives `no`.
+        self.note_hardening(&verified, true);
         if !verified.problems.is_empty() {
             bail!(
                 "the VM template `{}` breaks the contract of a sandbox VM (the VM driver `{}` found: {}); fix the setup, or name another template",
@@ -1850,7 +1975,7 @@ mod tests {
         let verified = |problems: &[&str], max_vms: Option<u32>| Verified {
             problems: problems.iter().map(|p| p.to_string()).collect(),
             max_vms,
-            checked: Vec::new(),
+            ..Verified::default()
         };
         let table = "node node-1: the node's own firewall table is not loaded";
         assert_eq!(
@@ -1866,6 +1991,89 @@ mod tests {
         let long = "y".repeat(10 * CAUSE_MAX);
         let cause = no_vms_cause(&verified(&[&long], Some(0))).unwrap();
         assert!(cause.len() <= CAUSE_MAX, "{}", cause.len());
+    }
+
+    #[test]
+    fn verify_reads_the_hardening_and_reads_a_value_it_does_not_know_as_no() {
+        let read = |answer: Value| serde_json::from_value::<Verified>(answer).unwrap();
+        // A driver that sends nothing of it, as an operator's own or an older one.
+        let older = read(json!({ "problems": [], "maxVms": 2 }));
+        assert_eq!((older.hardened, older.not_hardened.len()), (None, 0));
+        assert_eq!(read(json!({ "hardened": null })).hardened, None);
+        assert_eq!(read(json!({ "hardened": "yes" })).hardened, Some(Mark::Yes));
+        let no = read(json!({
+            "hardened": "no",
+            "notHardened": ["node n1: io-uring: kernel.io_uring_disabled is 0, not 2"],
+        }));
+        assert_eq!(no.hardened, Some(Mark::No));
+        assert_eq!(
+            no.not_hardened,
+            ["node n1: io-uring: kernel.io_uring_disabled is 0, not 2"]
+        );
+        // Never `yes` from what the host does not understand, and the rest is still read.
+        for odd in [
+            json!("YES"),
+            json!("none"),
+            json!(true),
+            json!({ "yes": 1 }),
+        ] {
+            let verified = read(json!({ "hardened": odd, "maxVms": 3 }));
+            assert_eq!(verified.hardened, Some(Mark::No), "{odd}");
+            assert_eq!(verified.max_vms, Some(3));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hardening_keeps_the_last_known_value_and_starts_at_no() {
+        let vms = Vms::new(VmOptions::new(
+            DriverCommand::node(PathBuf::from("/nonexistent/node-driver.json")).unwrap(),
+            "sandbox".into(),
+        ));
+        let mut watch = vms.hardening_watch();
+        // Before the driver answered: `no`, and why.
+        assert_eq!(vms.hardening().hardened, Mark::No);
+        assert_eq!(vms.hardening().not_hardened, [NOT_ASKED]);
+        let verified = |hardened: Option<Mark>, why: &[&str]| Verified {
+            hardened,
+            not_hardened: why.iter().map(|w| w.to_string()).collect(),
+            ..Verified::default()
+        };
+        let silent = "node n2: did not answer, so its hardening is not known";
+        // At the start, a driver that cannot tell (a node that does not answer) gives `no`.
+        vms.note_hardening(&verified(None, &[silent]), true);
+        let start = vms.hardening();
+        assert_eq!(start.hardened, Mark::No);
+        assert!(start.not_hardened[0].contains("vouches for none it did not hear from"));
+        assert_eq!(start.not_hardened[1], silent);
+        // At the start, `yes`.
+        vms.note_hardening(&verified(Some(Mark::Yes), &[]), true);
+        assert!(watch.has_changed().unwrap());
+        assert_eq!(
+            *watch.borrow_and_update(),
+            Hardening {
+                hardened: Mark::Yes,
+                not_hardened: Vec::new()
+            }
+        );
+        // Later, a value that is not known keeps the last known one, and changes nothing.
+        vms.note_hardening(&verified(None, &[silent]), false);
+        assert_eq!(vms.hardening().hardened, Mark::Yes);
+        assert!(!watch.has_changed().unwrap());
+        // A `no` replaces it, with the lines.
+        let line = "node n1: io-uring: kernel.io_uring_disabled is 0, not 2";
+        vms.note_hardening(&verified(Some(Mark::No), &[line]), false);
+        assert_eq!(
+            vms.hardening(),
+            Hardening {
+                hardened: Mark::No,
+                not_hardened: vec![line.to_string()]
+            }
+        );
+        assert!(watch.has_changed().unwrap());
+        // The same answer again is no change.
+        watch.borrow_and_update();
+        vms.note_hardening(&verified(Some(Mark::No), &[line]), false);
+        assert!(!watch.has_changed().unwrap());
     }
 
     #[tokio::test]

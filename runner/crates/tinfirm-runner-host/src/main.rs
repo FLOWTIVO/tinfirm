@@ -1539,8 +1539,6 @@ async fn doctor(
             ),
         ),
     }
-    // The level of isolation that `run` reports with these settings (ADR-0113).
-    doctor_isolation(&mut checks, sandbox_args, vm_args);
     // The reader of the sandboxes' input, and this host's memory (ADR-0112, open question 1).
     doctor_reader(
         &mut checks,
@@ -1558,9 +1556,11 @@ async fn doctor(
             "not found on PATH (the host clones and pushes with git)",
         ),
     }
+    // With `--vm-driver node`, the hardening of its nodes, as the driver's `verify` said it.
+    let mut hardening = None;
     if vm_host {
         // A VM per run: the driver in Docker's place, and no Docker at all on this host.
-        doctor_vm(&mut checks, paths, max_concurrent_runs, vm_args).await;
+        hardening = doctor_vm(&mut checks, paths, max_concurrent_runs, vm_args).await;
         checks.info(
             "docker",
             "not used: --executor vm creates a VM per run, and its images are the VM image's",
@@ -1568,6 +1568,9 @@ async fn doctor(
     } else {
         doctor_docker(&mut checks, paths).await;
     }
+    // The level of isolation that `run` reports with these settings (ADR-0113): after the VM
+    // driver's check, whose `verify` says whether the nodes are hardened.
+    doctor_isolation(&mut checks, sandbox_args, vm_args, hardening.as_ref());
     doctor_credentials(&mut checks, paths).await;
     if checks.failed > 0 {
         bail!("{} check(s) failed", checks.failed);
@@ -1579,16 +1582,27 @@ async fn doctor(
 /// With `--executor vm`: what `run --executor vm` checks at its start. The driver's options;
 /// with `--vm-driver node`, its configuration and client keys; then the driver's `hello` and a
 /// `verify` of the template, with room for `max_concurrent_runs` VMs, this host's own counted
-/// as at `run`'s start ([`tinfirm_runner_host::vm::Vms::check`]).
-async fn doctor_vm(checks: &mut Checks, paths: &Paths, max_concurrent_runs: u32, vm_args: &VmArgs) {
+/// as at `run`'s start ([`tinfirm_runner_host::vm::Vms::check`]). With `--vm-driver node`, the
+/// hardening of its nodes too, each line that does not hold named; that hardening is returned
+/// for the isolation's check. `None` where the driver was not asked.
+async fn doctor_vm(
+    checks: &mut Checks,
+    paths: &Paths,
+    max_concurrent_runs: u32,
+    vm_args: &VmArgs,
+) -> Option<tinfirm_runner_host::vm::Hardening> {
     let options = match vm_args.options() {
         Ok(Some((options, _))) => options,
-        Ok(None) => return,
+        Ok(None) => return None,
         Err(e) => {
             checks.fail("vm driver", format!("{e:#}"));
-            return;
+            return None;
         }
     };
+    let nodes = matches!(
+        options.driver.builtin,
+        Some(tinfirm_runner_host::vm::Builtin::Node { .. })
+    );
     if let Some(tinfirm_runner_host::vm::Builtin::Node { config }) = &options.driver.builtin {
         match tinfirm_runner_host::node::NodeConfig::load(config) {
             Ok(loaded) => checks.ok(
@@ -1607,7 +1621,7 @@ async fn doctor_vm(checks: &mut Checks, paths: &Paths, max_concurrent_runs: u32,
             ),
             Err(e) => {
                 checks.fail("node driver configuration", format!("{e:#}"));
-                return;
+                return None;
             }
         }
     }
@@ -1638,6 +1652,26 @@ async fn doctor_vm(checks: &mut Checks, paths: &Paths, max_concurrent_runs: u32,
             );
         }
         Err(e) => checks.fail("vm driver", format!("{e:#}")),
+    }
+    let hardening = vms.hardening();
+    if nodes {
+        // A lower mark stops nothing (ADR-0113, decision 5): information, not a failure.
+        checks.info("node hardening", describe_hardening(&hardening, &template));
+    }
+    Some(hardening)
+}
+
+/// The node driver's hardening for `template`, in a sentence: `yes`, or `no` with each line
+/// that does not hold, as the driver named it (`node <name>: <line>: <what it found>`).
+fn describe_hardening(hardening: &tinfirm_runner_host::vm::Hardening, template: &str) -> String {
+    match hardening.hardened {
+        tinfirm_runner_host::vm::Mark::Yes => format!(
+            "yes: every node that offers the template `{template}` reports each line of the hardening as holding"
+        ),
+        tinfirm_runner_host::vm::Mark::No if hardening.not_hardened.is_empty() => "no".to_string(),
+        tinfirm_runner_host::vm::Mark::No => {
+            format!("no: {}", hardening.not_hardened.join("; "))
+        }
     }
 }
 
@@ -1887,10 +1921,15 @@ async fn doctor_credentials(checks: &mut Checks, paths: &Paths) {
 }
 
 /// The level of isolation that `run` would report with these options and environment
-/// (`--executor`, `--sandbox-runtime`, `--vm-driver`, with `node` its configuration, and
-/// `--isolation-*`), and what an escape from a sandbox reaches on such a host (ADR-0112,
-/// decision 7).
-fn doctor_isolation(checks: &mut Checks, sandbox_args: &SandboxArgs, vm_args: &VmArgs) {
+/// (`--executor`, `--sandbox-runtime`, `--vm-driver`, with `node` its configuration and the
+/// `hardening` its `verify` reported in [`doctor_vm`], and `--isolation-*`), and what an escape
+/// from a sandbox reaches on such a host (ADR-0112, decision 7).
+fn doctor_isolation(
+    checks: &mut Checks,
+    sandbox_args: &SandboxArgs,
+    vm_args: &VmArgs,
+    hardening: Option<&tinfirm_runner_host::vm::Hardening>,
+) {
     let sandboxes = match vm_args.executor {
         ExecutorChoice::Vm => match vm_args
             .vm_driver
@@ -1908,7 +1947,11 @@ fn doctor_isolation(checks: &mut Checks, sandbox_args: &SandboxArgs, vm_args: &V
         )),
     };
     let sandboxes = match sandboxes {
-        Ok(sandboxes) => sandboxes,
+        // Only the node driver's mark is read; `no` where its `verify` was not asked.
+        Ok(sandboxes) => match hardening {
+            Some(hardening) => sandboxes.hardened(hardening.hardened),
+            None => sandboxes,
+        },
         Err(e) => {
             checks.fail("isolation", e);
             return;
@@ -1918,8 +1961,17 @@ fn doctor_isolation(checks: &mut Checks, sandbox_args: &SandboxArgs, vm_args: &V
     match isolation::derive(sandboxes, stated) {
         Ok(reported) => {
             let escape = isolation::what_an_escape_reaches(sandboxes, &reported);
+            // Why the node driver's host is not hardened: each line that does not hold.
+            let why = match (sandboxes, hardening) {
+                (Sandboxes::Nodes(_, tinfirm_runner_host::vm::Mark::No), Some(hardening))
+                    if !hardening.not_hardened.is_empty() =>
+                {
+                    format!(" Not hardened: {}.", hardening.not_hardened.join("; "))
+                }
+                _ => String::new(),
+            };
             let detail = format!(
-                "reports {} (as `run` with these options and this environment). {escape}",
+                "reports {} (as `run` with these options and this environment).{why} {escape}",
                 isolation::describe(&reported)
             );
             // A VM host of a driver of your own, shown as a container host until you state its
@@ -2218,7 +2270,8 @@ async fn run(
         None => Sandboxes::docker(&settings),
     };
     let isolation_stated = stated_isolation(vm_args.isolation_level, vm_args.isolation_hardened);
-    let reported = isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
+    // Refused here, before any check: a statement where the host derives its own level.
+    isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
     // A VM's firewall lets nothing out: the egress proxy is its only way to the network.
     let egress_on = sandbox_args.egress_proxy || vm_options.is_some();
     // `--egress-allow-private` lets the model proxy, which is always on, reach a gateway inside
@@ -2343,6 +2396,10 @@ async fn run(
     opts.upload_max_bytes = upload_max_bytes;
     opts.sandbox = settings;
     opts.isolation_stated = isolation_stated;
+    // What the host reports, as `Host::new` derives it: with the node driver, with the
+    // hardening its nodes reported in the start's `verify`.
+    let sandboxes = Sandboxes::of(&opts.executor, &opts.sandbox).map_err(anyhow::Error::msg)?;
+    let reported = isolation::derive(sandboxes, isolation_stated).map_err(anyhow::Error::msg)?;
     log_isolation(sandboxes, &reported, cfg.protocol_version);
     let host = Shared::new(opts, cfg);
     host.warn_operator_public_suffix_wildcards();
@@ -2701,6 +2758,8 @@ async fn vm_executor(
         pool_max_ready = pool.max_ready,
         pool_runtime = if pool.multi_runtime { "any" } else { pool.runtime.as_str() },
         vm_checked = ?verified.checked,
+        vm_hardened = verified.hardened.map_or("-", |mark| mark.as_str()),
+        vm_not_hardened = ?verified.not_hardened,
         sandbox_family = settings.family().as_str(),
         sandbox_docker = settings.docker,
         sandbox_env = ?settings.env_keys(),

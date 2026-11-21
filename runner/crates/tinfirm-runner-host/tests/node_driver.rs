@@ -564,3 +564,164 @@ async fn the_driver_reconnects_to_an_agent_that_was_restarted() {
         "the driver did not reconnect"
     );
 }
+
+/// A hardening mark of every line the agent checks: each holds, but those of `off`, which do
+/// not and say what was found.
+fn mark(off: &[(&str, &str)]) -> tinfirm_node_agent::hardening::Hardening {
+    use tinfirm_node_agent::hardening::{Hardening, LINES, Line};
+    Hardening::of(
+        LINES
+            .iter()
+            .map(|id| match off.iter().find(|(line, _)| line == id) {
+                Some((_, found)) => Line::new(id, false, *found),
+                None => Line::new(id, true, "holds"),
+            })
+            .collect(),
+    )
+}
+
+fn socket_node(name: &str, socket: &Path, templates: &[&str]) -> Value {
+    json!({ "name": name, "socket": socket, "templates": templates })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_driver_reports_the_hardening_of_the_nodes_that_offer_the_template() {
+    use tinfirm_runner_host::vm::Mark;
+    let tmp = tempfile::tempdir().unwrap();
+    let client = client(tmp.path());
+    let (a, b, c) = (
+        agent(1, &client.cert).await,
+        agent(4, &client.cert).await,
+        agent(4, &client.cert).await,
+    );
+    a.backend.set_hardening(mark(&[]));
+    b.backend.set_hardening(mark(&[]));
+    // `c` keeps the fake backend's own mark, every line failing; it offers another template
+    // only, so it does not count for this one.
+    let nodes = driver(
+        tmp.path(),
+        vec![
+            socket_node("node-a", &a.socket, &[TEMPLATE]),
+            socket_node("node-b", &b.socket, &[TEMPLATE]),
+            socket_node("node-c", &c.socket, &["other"]),
+        ],
+    );
+    nodes.hello().await.unwrap();
+    let verified = nodes.verify(TEMPLATE).await.unwrap();
+    assert_eq!(verified.hardened, Some(Mark::Yes), "{verified:?}");
+    assert!(verified.not_hardened.is_empty(), "{verified:?}");
+
+    // One line off on one node: `no`, and that line, named with its node.
+    let io_uring = "kernel.io_uring_disabled is 0, not 2";
+    b.backend.set_hardening(mark(&[("io-uring", io_uring)]));
+    let verified = nodes.verify(TEMPLATE).await.unwrap();
+    assert_eq!(verified.hardened, Some(Mark::No), "{verified:?}");
+    assert_eq!(
+        verified.not_hardened,
+        [format!("node node-b: io-uring: {io_uring}")]
+    );
+
+    // A VM goes to the hardened node with one free slot before the other with four; once it is
+    // full, to the other.
+    let first = nodes
+        .create(TEMPLATE, "n0", &user_data(), &labels("v0"))
+        .await
+        .unwrap();
+    assert!(first.starts_with("node-a:"), "{first}");
+    let second = nodes
+        .create(TEMPLATE, "n1", &user_data(), &labels("v1"))
+        .await
+        .unwrap();
+    assert!(second.starts_with("node-b:"), "{second}");
+    for id in [&first, &second] {
+        nodes.delete(id, &host_only()).await.unwrap();
+    }
+
+    // A node that does not answer beside one that says `yes`: not known, and which.
+    let with_down = driver(
+        tmp.path(),
+        vec![
+            socket_node("node-a", &a.socket, &[TEMPLATE]),
+            socket_node("down", &tmp.path().join("nothing.sock"), &[TEMPLATE]),
+        ],
+    );
+    let verified = with_down.verify(TEMPLATE).await.unwrap();
+    assert_eq!(verified.hardened, None, "{verified:?}");
+    assert_eq!(
+        verified.not_hardened,
+        ["node down: did not answer, so its hardening is not known"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_names_each_line_of_a_node_that_does_not_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let client = client(tmp.path());
+    let (a, b) = (agent(2, &client.cert).await, agent(2, &client.cert).await);
+    a.backend.set_hardening(mark(&[]));
+    b.backend.set_hardening(mark(&[
+        ("io-uring", "kernel.io_uring_disabled is 0, not 2"),
+        (
+            "lockdown",
+            "the lockdown level is none, not integrity or confidentiality",
+        ),
+    ]));
+    let config = tmp.path().join("node-driver.json");
+    std::fs::write(
+        &config,
+        json!({ "nodes": [
+            socket_node("node-a", &a.socket, &[TEMPLATE]),
+            socket_node("node-b", &b.socket, &[TEMPLATE]),
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let doctor = || async {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_tinfirm-runner-host"))
+            .args([
+                "doctor",
+                "--executor",
+                "vm",
+                "--vm-driver",
+                "node",
+                "--vm-template",
+                TEMPLATE,
+            ])
+            .env("TINFIRM_RUNNER_CONFIG_DIR", tmp.path().join("config"))
+            .env("TINFIRM_RUNNER_DATA_DIR", tmp.path().join("data"))
+            .env("TINFIRM_RUNNER_LOG", "warn")
+            .env("TINFIRM_NODE_DRIVER_CONFIG", &config)
+            .env_remove("TINFIRM_RUNNER_ISOLATION_LEVEL")
+            .env_remove("TINFIRM_RUNNER_ISOLATION_HARDENED")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let report = doctor().await;
+    let lines = "node node-b: io-uring: kernel.io_uring_disabled is 0, not 2; node node-b: lockdown: the lockdown level is none, not integrity or confidentiality";
+    assert!(
+        report.contains(&format!("[info] node hardening: no: {lines}\n")),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "[info] isolation: reports vm-jail, hardened no (as `run` with these options and this environment). Not hardened: {lines}. "
+        )),
+        "{report}"
+    );
+    // Every node hardened: `yes`, and the isolation says so.
+    b.backend.set_hardening(mark(&[]));
+    let report = doctor().await;
+    assert!(
+        report.contains(&format!(
+            "[info] node hardening: yes: every node that offers the template `{TEMPLATE}` reports each line of the hardening as holding"
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains("[info] isolation: reports vm-jail, hardened yes (as `run`"),
+        "{report}"
+    );
+}

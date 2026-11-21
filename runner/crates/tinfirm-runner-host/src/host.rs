@@ -3490,6 +3490,71 @@ mod tests {
         .unwrap();
         let h = hello(node(&tls), vms(), None, &config).await;
         assert_eq!(level(&h), seen(IsolationTier::Machine));
+        // The nodes' hardening, as the driver's `verify` at the start reported it (ADR-0113,
+        // decision 5): `yes` is sent, `no` is left out.
+        let mark = |mark| crate::vm::Verified {
+            hardened: Some(mark),
+            ..Default::default()
+        };
+        let checked = |driver: crate::vm::DriverCommand, mark| {
+            let vms = crate::vm::Vms::new(crate::vm::VmOptions::new(driver, "sandbox".into()));
+            vms.note_hardening(&mark, true);
+            Executor::Vm(vms)
+        };
+        let node_driver = || crate::vm::DriverCommand::node(tls.clone()).unwrap();
+        let h = hello(
+            checked(node_driver(), mark(crate::vm::Mark::Yes)),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(
+            level(&h),
+            (vec![IsolationTier::Machine], Some(Hardened::Yes), false)
+        );
+        let h = hello(
+            checked(node_driver(), mark(crate::vm::Mark::No)),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(level(&h), seen(IsolationTier::Machine));
+        // A driver that could not tell at the start: `no`.
+        let h = hello(
+            checked(node_driver(), Default::default()),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(level(&h), seen(IsolationTier::Machine));
+        // An operator's own driver whose `verify` says `yes`: its operator's statement stands.
+        let own = || crate::vm::DriverCommand::parse("/usr/local/bin/my-driver").unwrap();
+        let h = hello(
+            checked(own(), mark(crate::vm::Mark::Yes)),
+            vms(),
+            None,
+            &config,
+        )
+        .await;
+        assert_eq!(level(&h), seen(IsolationTier::Container));
+        let no = Stated {
+            level: IsolationTier::VmJail,
+            hardened: Hardened::No,
+        };
+        let h = hello(
+            checked(own(), mark(crate::vm::Mark::Yes)),
+            vms(),
+            Some(no),
+            &config,
+        )
+        .await;
+        assert_eq!(
+            level(&h),
+            (vec![IsolationTier::VmJail], Some(Hardened::No), true)
+        );
         // A statement with the node driver: the host reports `container` (`run` refuses it at
         // start).
         let h = hello(node(&tls), vms(), Some(stated), &config).await;

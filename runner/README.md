@@ -536,8 +536,8 @@ The host derives its level from what it can see, and only takes your word where 
 | Docker with runc, or with a `kata…` `--sandbox-runtime` | `container` | left out (`no`) |
 | Docker with a `runsc…` `--sandbox-runtime` | `gvisor` | left out (`no`) |
 | `--executor vm --vm-driver digitalocean` | `machine` | `none` |
-| `--executor vm --vm-driver node`, every node over its local socket ([Sandbox nodes](#sandbox-nodes)) | `vm-jail` | left out (`no`) |
-| `--executor vm --vm-driver node`, every node over TLS at an address that is not this host's own | `machine` | left out (`no`) |
+| `--executor vm --vm-driver node`, every node over its local socket ([Sandbox nodes](#sandbox-nodes)) | `vm-jail` | `yes` when every node that offers `--vm-template` reports it, else left out (`no`) |
+| `--executor vm --vm-driver node`, every node over TLS at an address that is not this host's own | `machine` | `yes` when every node that offers `--vm-template` reports it, else left out (`no`) |
 | `--executor vm` with a driver of your own and `--isolation-level` | What `--isolation-level` states, with `"isolationStated": true` | What `--isolation-hardened` states |
 | `--executor vm` with a driver of your own and no `--isolation-level` | `container` | left out (`no`) |
 | Protocol 1 | `container` | not sent |
@@ -555,9 +555,18 @@ The host derives its level from what it can see, and only takes your word where 
   host until you state its level.
 - **A statement never overrides what the host can see:** `run` refuses `--isolation-level` with
   the Docker executor, with `--vm-driver digitalocean` and with `--vm-driver node`.
-- **The node driver's hardening** is `no` for now: the node agent's checks of a hardened machine,
-  which must pass before a host reports `yes`
-  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 5), are not built.
+- **The node driver's hardening** is what the nodes report
+  ([ADR-0113](../docs/adr/0113-levels-of-isolation-and-placement.md), decision 5): each node
+  agent's helper checks every line of a hardened machine, and its `verify` carries the mark. The
+  driver's `verify` says `yes` when every node that offers `--vm-template` says `yes`; `no` when one
+  of them says `no`, or answers without the mark (a node agent older than this host, which the
+  driver's log names); and nothing ("not known") when none says `no` but one does not answer. This
+  host takes the value of the `verify` at its start, where "not known" is `no`: it vouches for no
+  node it did not hear from. Later, "not known" keeps the last value. Its log and `doctor` name each
+  line that does not hold (`node node-1: io-uring: kernel.io_uring_disabled is 0, not 2`). A lower
+  mark stops nothing: the host still starts and its nodes still take VMs. For now the host sends
+  the value of its start in every hello; a change while it runs reaches the server when it starts
+  again (planned: at once). A driver of your own is not asked: `--isolation-hardened` states it.
 - **Where it shows.** `run` logs the level at its start, with what an escape from a sandbox reaches
   on such a host. `doctor` says the same for the settings in its environment
   (`TINFIRM_RUNNER_EXECUTOR`, `TINFIRM_RUNNER_VM_DRIVER`, `TINFIRM_RUNNER_ISOLATION_*`; it does not
@@ -1064,7 +1073,11 @@ VM's bridge at `address:port`; without one, at `address:--vm-port`. The bridge i
 `--vm-port` either way. A run's take-back record keeps the port, so that a restarted host dials the
 same; a record without one, such as one written before the field existed, means `--vm-port`. A
 request is a JSON object with `jsonrpc` `"2.0"`, a `method` and an `id` (a number or a string); the
-protocol has no notifications and no batches. A method that fails is answered with an error of code
+protocol has no notifications and no batches. `verify` answers `problems`, `maxVms` and `checked`,
+and two optional fields that this host reads only from `vm-driver node`: `hardened` (`yes` or `no`,
+left out when the driver cannot tell; any other value reads as `no`) and `notHardened`, a list of
+why, for the log ([Isolation level](#isolation-level)). A driver of your own may leave both out: its
+hardening is what `--isolation-hardened` states. A method that fails is answered with an error of code
 -32000 and a message for this host's log, an unknown method too. A line that is not JSON is
 answered with -32700 and `id` `null`, JSON that is no request with -32600 (with its `id` when it has
 one), and an empty line with nothing. This binary's drivers (`vm-driver digitalocean` and `vm-driver
@@ -1093,17 +1106,19 @@ Ansible plays that set up a node and a control host (`deploy/ansible/README.md`)
 once, on 2026-11-20 (Ubuntu 24.04), with runs of this host's tests' stand-in agent through a node;
 on the same day, conversations with real runtimes (Claude Code and PI, with a real model) ran
 through a node, in a Firecracker VM, with the sandbox's front confined (Landlock and seccomp).
-Still planned: the node's hardening, the single machine (until its firewall is built, the node agent
-refuses a control host on its own machine), and the published VM image. The Helm chart's runner pod
-has not run against a node. Here, the
-driver is tested against node agents with their fake backend.
+The node's hardening is built and has not run on a node: the Ansible role's tasks that set it up,
+the node agent's checks of it, and this host's reading of them. Still planned: the single machine
+(until its firewall is built, the node agent refuses a control host on its own machine) and the
+published VM image. The Helm chart's runner pod has not run against a node. Here, the driver is
+tested against node agents with their fake backend.
 
 - **Editions.** In the core, in every edition: the driver lists no paid feature
   ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)).
 - **Its level of isolation** ([Isolation level](#isolation-level)). This host reads the driver's
   configuration at its start (the same file: it names it to the driver with `--config`) and reports
   `vm-jail` when every node is reached over its local socket, and `machine` when every node is reached
-  over TLS at an address that is not this host's own; hardened `no`. An agent that leaves its VM
+  over TLS at an address that is not this host's own; hardened `yes` when every node that offers
+  `--vm-template` reports it ([Isolation level](#isolation-level)). An agent that leaves its VM
   through the VMM is then one jailed user that reads no credential, and a flaw of the kernel under the
   VMs (KVM) reaches the machine with every credential (`vm-jail`), or the node, which holds no
   credential, and the other runs on it (`machine`). A configuration that cannot be read, that mixes
@@ -1143,8 +1158,9 @@ driver is tested against node agents with their fake backend.
   node's for `nodeSha256`. `tinfirm-node-agent identity` and `fingerprint` do the same with the same
   files: a certificate made by either binary works with the other, and the control host needs no node
   agent's binary for its own.
-- **Placement.** A new VM goes to the node with the most free slots, by each node's `verify`, among the
-  nodes that offer the template, answer and report no problem; the first in the file's order on a tie.
+- **Placement.** A new VM goes to a node that reports itself hardened before one that does not, then to
+  the node with the most free slots, by each node's `verify`, among the nodes that offer the template,
+  answer and report no problem; the first in the file's order on a tie.
   When no node can take it, the `create`'s error names each node's cause: its problems (cut to 400
   bytes), that it did not answer, or that it has no free slot. Only when every such node is healthy
   and full is it "no node of the driver has a free slot".
@@ -1290,7 +1306,7 @@ firewall, the probe from a Droplet) and the nightly conformance test.
 | `credential add anthropic-api-key\|openai-api-key --label <l> [--pool 3]` | Stores an API key; the pool (1–16) is a ceiling |
 | `credential list`, `credential remove <label>` | Manage credentials |
 | `images build [--runtime claude\|codex\|pi\|opencode\|all\|multi] [--no-cache] [--build-arg KEY=VALUE]…` | Builds the runner images locally, with the [build arguments](#image-build-arguments) of a host without internet access, and records the arguments and runtimes in `images.json` for [the rebuilds of `run`](#rebuilds-after-an-upgrade) |
-| `doctor [--max-concurrent-runs N] [run's sandbox and VM options]` | Checks the setup as `run` would start with the same options and environment (`TINFIRM_RUNNER_*`): the ceiling N (default 2) as `run` takes it for the executor (at most 16 with Docker), directories and their modes, git, credentials, server, [the reader](#the-reader) and the front, and the level of isolation. With the Docker executor, Docker, its runtimes and the runner images: the names of the recorded image build arguments and each image that `run` would rebuild. With `--executor vm`, no Docker (it says "not used"), but what `run --executor vm` checks at its start: the driver's options; with `--vm-driver node`, its configuration and that every client key is this user's alone (0600); then the driver's `hello` and a `verify` of `--vm-template`, with room for N VMs (default 2), this host's own VMs counted as at `run`'s start ([Checked at start](#a-vm-per-run)). Also the number of mirrors and their total size, and the runs that the next `run` takes back, with those whose work waits on this host for the server |
+| `doctor [--max-concurrent-runs N] [run's sandbox and VM options]` | Checks the setup as `run` would start with the same options and environment (`TINFIRM_RUNNER_*`): the ceiling N (default 2) as `run` takes it for the executor (at most 16 with Docker), directories and their modes, git, credentials, server, [the reader](#the-reader) and the front, and the level of isolation. With the Docker executor, Docker, its runtimes and the runner images: the names of the recorded image build arguments and each image that `run` would rebuild. With `--executor vm`, no Docker (it says "not used"), but what `run --executor vm` checks at its start: the driver's options; with `--vm-driver node`, its configuration and that every client key is this user's alone (0600); then the driver's `hello` and a `verify` of `--vm-template`, with room for N VMs (default 2), this host's own VMs counted as at `run`'s start ([Checked at start](#a-vm-per-run)); with `--vm-driver node`, the nodes' hardening, with each line that does not hold, which the level of isolation then reports. Also the number of mirrors and their total size, and the runs that the next `run` takes back, with those whose work waits on this host for the server |
 | `mirrors list` | Lists the repository mirrors: key, size, last use, last gc, repository URL |
 | `mirrors prune [--older-than-days N] [--dry-run]` | Deletes idle mirrors and collects garbage in the others, like `run` does every 6 hours; refused while `run` is active (`--dry-run` only shows what it would do) |
 | `run [--max-concurrent-runs N] [--protocol-version 1\|2] [--server <url> --token-file <file>] [--no-image-rebuild] [--sandbox-runtime <name>] [--sandbox-docker] [--sandbox-env KEY=VALUE]… [--sandbox-bridge] [--executor docker\|vm --vm-driver <command> --vm-template <name>]` | Connects and serves. N (1–16, default 2; up to 1000 with `--executor vm` and protocol 2) is the host's [ceiling](#capacity-ceilings-and-tinfirm-settings); other values are refused. `--protocol-version` (or `TINFIRM_RUNNER_PROTOCOL_VERSION`) picks the [runner protocol](#protocol-versions) for this start. Before it connects, it [rebuilds the images](#rebuilds-after-an-upgrade) that its binary would build otherwise, unless `--no-image-rebuild` (or `TINFIRM_RUNNER_NO_IMAGE_REBUILD`). `--upload-max-bytes` (or `TINFIRM_RUNNER_UPLOAD_MAX_BYTES`, default 26214400, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` of 25 MiB, at most 100 MiB) is the largest file an upload of the agent may have; a larger one is refused on its size before it is read, and at most 3 uploads read, scan and send a file at once. The sandbox options: [Kata Containers and Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox); the VM executor's: [A VM per run](#a-vm-per-run). `--server` with `--token-file` (`TINFIRM_RUNNER_SERVER`, `TINFIRM_RUNNER_TOKEN_FILE`) stands in for `login`, for a host whose settings come from its environment ([In Kubernetes](#in-kubernetes)): the URL is checked as `login` checks it, and the token is read from the file once. Writes its PID into `run.lock` |

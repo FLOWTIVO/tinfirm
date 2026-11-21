@@ -28,10 +28,19 @@
 //!
 //! Several nodes behind one driver (ADR-0112, "To specify"):
 //!
-//! - **Placement.** A new VM goes to the node with the most free slots, by each node's
-//!   `verify`, asked at the create, among the nodes that offer the template, answer and report
-//!   no problem; the first in the configuration's order on a tie. It spreads the runs, and the
-//!   count is the agent's own, which no other host's create can make stale for long.
+//! - **Placement.** A new VM goes to a node that reports itself hardened before one that does
+//!   not, then to the node with the most free slots, by each node's `verify`, asked at the
+//!   create, among the nodes that offer the template, answer and report no problem; the first
+//!   in the configuration's order on a tie. It spreads the runs, and the count is the agent's
+//!   own, which no other host's create can make stale for long.
+//! - **Hardening** (ADR-0113, decision 5). Each node's `verify` carries its hardening mark,
+//!   `hardening: {hardened, lines}`. The driver's `verify` answers one mark for the template,
+//!   `hardened`: `yes` when every node that offers the template answered `yes`; `no` when any
+//!   of them answered `no`, or answered without the mark (an agent older than this host); left
+//!   out, for "not known", when none of them said `no` but one did not answer. `notHardened`
+//!   names each line that does not hold, as `node <name>: <line>: <found>`, and why a node
+//!   counts as not hardened or not known. The driver reads `hardened` and `holds`, never the
+//!   lines' ids, so a newer agent can add a line ([`hardening_of`]).
 //! - **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer
 //!   with no problem. A node that does not answer is not counted, and `checked` names it: a
 //!   host with one node down still starts. A node that reports a problem, or a template that no
@@ -856,6 +865,9 @@ impl Node {
 /// The `node` driver: its nodes, in the configuration's order.
 pub struct NodeDriver {
     nodes: Vec<Arc<Node>>,
+    /// The nodes whose last `verify` answer carried no hardening mark, so that the driver says
+    /// so once for each, not at every `verify`.
+    unmarked: Mutex<HashSet<String>>,
 }
 
 /// The driver's id of a VM: the node's name and the agent's id.
@@ -894,10 +906,11 @@ const CAUSE_MAX: usize = 400;
 const NO_PLACE_MAX: usize = 2000;
 
 /// Where a new VM goes, from the `verify` answers of the nodes that offer its template, in the
-/// configuration's order: the index of the node with the most free slots among those that
-/// answer with no problem, the first on a tie; else why each node was skipped.
+/// configuration's order: among those that answer with no problem and have a free slot, a node
+/// that reports itself hardened ([`node_hardening`]) before one that does not, then the node
+/// with the most free slots, the first on a tie; else why each node was skipped.
 fn choose(answers: &[(&str, Result<Value>)]) -> std::result::Result<usize, Vec<(String, Skipped)>> {
-    let mut best: Option<(usize, u64)> = None;
+    let mut best: Option<(usize, (bool, u64))> = None;
     let mut skipped = Vec::new();
     for (i, (node, answer)) in answers.iter().enumerate() {
         let verified = match answer {
@@ -924,13 +937,111 @@ fn choose(answers: &[(&str, Result<Value>)]) -> std::result::Result<usize, Vec<(
             continue;
         }
         let free = verified["maxVms"].as_u64().unwrap_or(0);
+        // A hardened node first (ADR-0113, decision 4's order within one host), then the most
+        // free slots; `true` orders after `false`, and an equal key keeps the earlier node.
+        let key = (node_hardening(node, verified).is_ok(), free);
         if free == 0 {
             skipped.push((node.to_string(), Skipped::Full));
-        } else if best.is_none_or(|(_, most)| free > most) {
-            best = Some((i, free));
+        } else if best.is_none_or(|(_, most)| key > most) {
+            best = Some((i, key));
         }
     }
     best.map(|(i, _)| i).ok_or(skipped)
+}
+
+/// The most of a node's lines that do not hold that `notHardened` names; the rest are counted.
+const MARK_LINES_MAX: usize = 32;
+
+/// What one node's `verify` answer says of its hardening (ADR-0113, decision 5): `Ok` when the
+/// node reports `yes` and no line of its mark fails, else the lines of `notHardened` that say
+/// why it counts as not hardened, each `node <name>: …`. A node that sends no `hardening` (an
+/// agent older than this host) or a mark that cannot be read counts as not hardened: the host
+/// cannot vouch for it. The driver reads `hardened` and each line's `holds`, never a line's id,
+/// and passes on the agent's words, on one line and cut.
+fn node_hardening(node: &str, verified: &Value) -> std::result::Result<(), Vec<String>> {
+    let hardening = &verified["hardening"];
+    if hardening.is_null() {
+        return Err(vec![format!(
+            "node {node}: its node agent sent no hardening mark (an agent older than this host): counted as not hardened"
+        )]);
+    }
+    let text = |value: &Value| {
+        let text = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_string);
+        crate::util::one_line(&text, CAUSE_MAX)
+    };
+    let failing: Vec<&Value> = hardening["lines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|line| line["holds"].as_bool() != Some(true))
+        .collect();
+    let mut lines: Vec<String> = failing
+        .iter()
+        .take(MARK_LINES_MAX)
+        .map(|line| {
+            format!(
+                "node {node}: {}: {}",
+                text(&line["line"]),
+                text(&line["found"])
+            )
+        })
+        .collect();
+    if failing.len() > MARK_LINES_MAX {
+        lines.push(format!(
+            "node {node}: {} more line(s) that do not hold",
+            failing.len() - MARK_LINES_MAX
+        ));
+    }
+    match hardening["hardened"].as_str() {
+        Some("yes") if lines.is_empty() => Ok(()),
+        // The mark and its lines disagree: the stricter reading.
+        Some("yes") => Err(lines),
+        Some("no") if lines.is_empty() => Err(vec![format!(
+            "node {node}: reports not hardened, and names no line that does not hold"
+        )]),
+        Some("no") => Err(lines),
+        _ => Err(vec![format!(
+            "node {node}: its hardening mark cannot be read ({}): counted as not hardened",
+            crate::util::one_line(&hardening["hardened"].to_string(), 64)
+        )]),
+    }
+}
+
+/// The driver's mark for a template, from the `verify` answers of the nodes that offer it, in
+/// the configuration's order: `yes` when every one of them answered `yes`; `no` when one
+/// answered `no` or without a readable mark; `None` ("not known") when none of them said `no`
+/// but one did not answer. With it, `notHardened`: the lines of the nodes that are not hardened
+/// ([`node_hardening`]), or, when the mark is not known, which nodes did not answer. No node at
+/// all is `no`: nothing vouches for the template.
+fn hardening_of(answers: &[(&str, &Result<Value>)]) -> (Option<&'static str>, Vec<String>) {
+    if answers.is_empty() {
+        return (
+            Some("no"),
+            vec!["no node of the driver offers the template".to_string()],
+        );
+    }
+    let (mut not_hardened, mut silent) = (Vec::new(), Vec::new());
+    for (node, answer) in answers {
+        match answer {
+            Ok(verified) => {
+                if let Err(lines) = node_hardening(node, verified) {
+                    not_hardened.extend(lines);
+                }
+            }
+            Err(_) => silent.push(format!(
+                "node {node}: did not answer, so its hardening is not known"
+            )),
+        }
+    }
+    if !not_hardened.is_empty() {
+        (Some("no"), not_hardened)
+    } else if !silent.is_empty() {
+        (None, silent)
+    } else {
+        (Some("yes"), Vec::new())
+    }
 }
 
 /// The error of a create that no node can take: why, for each node that offers the template.
@@ -973,7 +1084,10 @@ impl NodeDriver {
             .into_iter()
             .map(|spec| Node::new(spec, policy).map(Arc::new))
             .collect::<Result<_>>()?;
-        Ok(NodeDriver { nodes })
+        Ok(NodeDriver {
+            nodes,
+            unmarked: Mutex::new(HashSet::new()),
+        })
     }
 
     fn node(&self, name: &str) -> Result<&Arc<Node>> {
@@ -1036,7 +1150,9 @@ impl NodeDriver {
     }
 
     /// The nodes' problems with the template, and the free slots of those that answer with
-    /// none. A node that does not answer is not counted, and `checked` names it.
+    /// none. A node that does not answer is not counted, and `checked` names it. With them, the
+    /// nodes' hardening mark for the template ([`hardening_of`]): `hardened`, left out when it
+    /// is not known, and `notHardened`.
     pub async fn verify(&self, template: &str) -> Result<Value> {
         let nodes = self.offering(template);
         let mut problems = Vec::new();
@@ -1048,7 +1164,8 @@ impl NodeDriver {
                 "no node of the driver offers the template `{template}`"
             ));
         }
-        for (node, answer) in nodes.iter().zip(self.verify_each(&nodes, template).await) {
+        let answers = self.verify_each(&nodes, template).await;
+        for (node, answer) in nodes.iter().zip(&answers) {
             match answer {
                 Ok(verified) => {
                     answered += 1;
@@ -1077,16 +1194,37 @@ impl NodeDriver {
         if !nodes.is_empty() && answered == 0 {
             problems.push("no node of the driver answered".to_string());
         }
-        Ok(json!({
+        let named: Vec<(&str, &Result<Value>)> =
+            nodes.iter().map(|node| node.name()).zip(&answers).collect();
+        let (hardened, not_hardened) = hardening_of(&named);
+        // An older agent is the one cause the host's log would not show otherwise: said once
+        // for a node, and again only after an answer of it that carried the mark.
+        for (node, answer) in &named {
+            let Ok(verified) = answer else { continue };
+            let mut unmarked = lock(&self.unmarked);
+            if !verified["hardening"].is_null() {
+                unmarked.remove(*node);
+            } else if unmarked.insert(node.to_string()) {
+                eprintln!(
+                    "node {node}: its node agent sent no hardening mark in verify (an agent older than this host): it counts as not hardened until it is upgraded"
+                );
+            }
+        }
+        let mut verified = json!({
             "problems": problems,
             "maxVms": max_vms.min(u64::from(u32::MAX)),
             "checked": checked,
-        }))
+            "notHardened": not_hardened,
+        });
+        if let Some(hardened) = hardened {
+            verified["hardened"] = json!(hardened);
+        }
+        Ok(verified)
     }
 
-    /// The node a new VM of `template` goes to: the most free slots among the nodes that offer
-    /// it, answer and report no problem; the first on a tie. When there is none, the error says
-    /// why for each node ([`no_place`]).
+    /// The node a new VM of `template` goes to, among the nodes that offer it, answer and report
+    /// no problem: a hardened node first, then the most free slots; the first on a tie
+    /// ([`choose`]). When there is none, the error says why for each node ([`no_place`]).
     async fn place(&self, template: &str) -> Result<&Arc<Node>> {
         let nodes = self.offering(template);
         if nodes.is_empty() {
@@ -1461,6 +1599,163 @@ mod tests {
         // A node with problems is skipped even when it names free slots.
         let odd = Ok(json!({ "problems": ["x"], "maxVms": 3 }));
         assert_eq!(choose(&[("a", odd), ("b", healthy(1))]), Ok(1));
+    }
+
+    /// A healthy node with `free` slots and the hardening mark `hardening`.
+    fn marked(free: u64, hardening: Value) -> Result<Value> {
+        Ok(json!({ "problems": [], "maxVms": free, "checked": [], "hardening": hardening }))
+    }
+
+    fn yes() -> Value {
+        json!({ "hardened": "yes", "lines": [
+            { "line": "io-uring", "holds": true, "found": "kernel.io_uring_disabled is 2" },
+        ]})
+    }
+
+    fn no() -> Value {
+        json!({ "hardened": "no", "lines": [
+            { "line": "user-namespaces", "holds": true, "found": "user.max_user_namespaces is 0" },
+            { "line": "io-uring", "holds": false, "found": "kernel.io_uring_disabled is 0, not 2" },
+            { "line": "max-uptime", "holds": false, "found": "up 41 days, more than 30" },
+        ]})
+    }
+
+    fn mark(answers: &[(&str, Result<Value>)]) -> (Option<&'static str>, Vec<String>) {
+        let answers: Vec<(&str, &Result<Value>)> = answers.iter().map(|(n, a)| (*n, a)).collect();
+        hardening_of(&answers)
+    }
+
+    #[test]
+    fn the_nodes_mark_is_yes_only_when_every_node_says_yes() {
+        // Every node `yes`: `yes`, and nothing named.
+        assert_eq!(
+            mark(&[("n1", marked(1, yes())), ("n2", marked(0, yes()))]),
+            (Some("yes"), Vec::new())
+        );
+        // One `no`: `no`, with each line of it that does not hold, in the agent's words.
+        assert_eq!(
+            mark(&[("n1", marked(1, yes())), ("n2", marked(1, no()))]),
+            (
+                Some("no"),
+                vec![
+                    "node n2: io-uring: kernel.io_uring_disabled is 0, not 2".to_string(),
+                    "node n2: max-uptime: up 41 days, more than 30".to_string(),
+                ]
+            )
+        );
+        // A node without `hardening`, an agent older than this host: `no`, and why.
+        let (hardened, why) = mark(&[("n1", marked(1, yes())), ("n2", healthy(1))]);
+        assert_eq!(hardened, Some("no"));
+        assert_eq!(
+            why,
+            [
+                "node n2: its node agent sent no hardening mark (an agent older than this host): counted as not hardened"
+            ]
+        );
+        // A node that does not answer, the rest `yes`: not known.
+        assert_eq!(
+            mark(&[("n1", marked(1, yes())), ("n2", silent("n2"))]),
+            (
+                None,
+                vec!["node n2: did not answer, so its hardening is not known".to_string()]
+            )
+        );
+        // A `no` wins over a node that does not answer.
+        let (hardened, why) = mark(&[("n1", silent("n1")), ("n2", marked(1, no()))]);
+        assert_eq!(hardened, Some("no"));
+        assert!(why.iter().all(|w| w.starts_with("node n2: ")), "{why:?}");
+        // A node that reports a problem still reports its mark.
+        let broken_yes = Ok(json!({ "problems": [TABLE], "maxVms": 0, "hardening": yes() }));
+        assert_eq!(mark(&[("n1", broken_yes)]), (Some("yes"), Vec::new()));
+        // No node: nothing vouches for the template.
+        assert_eq!(mark(&[]).0, Some("no"));
+    }
+
+    #[test]
+    fn a_mark_that_cannot_be_read_or_disagrees_with_its_lines_is_no() {
+        // `yes` beside a line that does not hold: the stricter reading.
+        let odd = json!({ "hardened": "yes", "lines": [
+            { "line": "lockdown", "holds": false, "found": "lockdown is none" },
+        ]});
+        assert_eq!(
+            mark(&[("n1", marked(1, odd))]),
+            (
+                Some("no"),
+                vec!["node n1: lockdown: lockdown is none".to_string()]
+            )
+        );
+        // `no` without a line, a value the driver does not know, or no value at all.
+        for (hardening, expected) in [
+            (json!({ "hardened": "no", "lines": [] }), "names no line"),
+            (
+                json!({ "hardened": "maybe", "lines": [] }),
+                "cannot be read (\"maybe\")",
+            ),
+            (json!({ "lines": [] }), "cannot be read (null)"),
+            (json!("yes"), "cannot be read"),
+        ] {
+            let (hardened, why) = mark(&[("n1", marked(1, hardening.clone()))]);
+            assert_eq!(hardened, Some("no"), "{hardening}");
+            assert!(why[0].contains(expected), "{hardening}: {why:?}");
+        }
+        // A line id the driver does not know is passed on: the driver interprets no id. A
+        // `found` that is long or has line breaks is put on one line and cut.
+        let long = format!("{}\nsecond line", "x".repeat(2 * CAUSE_MAX));
+        let newer = json!({ "hardened": "no", "lines": [
+            { "line": "a-line-of-a-later-agent", "holds": false, "found": long },
+        ]});
+        let (_, why) = mark(&[("n1", marked(1, newer))]);
+        assert!(
+            why[0].starts_with("node n1: a-line-of-a-later-agent: x"),
+            "{why:?}"
+        );
+        assert!(
+            !why[0].contains('\n') && why[0].len() < CAUSE_MAX + 64,
+            "{why:?}"
+        );
+        // Many lines that do not hold: the first ones, and a count of the rest.
+        let many: Vec<Value> = (0..MARK_LINES_MAX + 5)
+            .map(|i| json!({ "line": format!("l{i}"), "holds": false, "found": "off" }))
+            .collect();
+        let (_, why) = mark(&[("n1", marked(1, json!({ "hardened": "no", "lines": many })))]);
+        assert_eq!(why.len(), MARK_LINES_MAX + 1);
+        assert_eq!(
+            why[MARK_LINES_MAX],
+            "node n1: 5 more line(s) that do not hold"
+        );
+    }
+
+    #[test]
+    fn a_vm_goes_to_a_hardened_node_before_one_with_more_free_slots() {
+        // `yes` with one slot before `no` with four, and before a node of an older agent.
+        assert_eq!(
+            choose(&[("a", marked(4, no())), ("b", marked(1, yes()))]),
+            Ok(1)
+        );
+        assert_eq!(choose(&[("a", healthy(4)), ("b", marked(1, yes()))]), Ok(1));
+        // Among hardened nodes, and among the others, the existing order holds: the most free
+        // slots, then the first.
+        assert_eq!(
+            choose(&[
+                ("a", marked(1, yes())),
+                ("b", marked(3, yes())),
+                ("c", marked(9, no()))
+            ]),
+            Ok(1)
+        );
+        assert_eq!(
+            choose(&[("a", marked(2, yes())), ("b", marked(2, yes()))]),
+            Ok(0)
+        );
+        assert_eq!(choose(&[("a", marked(2, no())), ("b", healthy(3))]), Ok(1));
+        assert_eq!(choose(&[("a", marked(2, no())), ("b", healthy(2))]), Ok(0));
+        // A hardened node that is full, broken or silent is still skipped.
+        assert_eq!(
+            choose(&[("a", marked(0, yes())), ("b", marked(1, no()))]),
+            Ok(1)
+        );
+        let broken_yes = Ok(json!({ "problems": [TABLE], "maxVms": 3, "hardening": yes() }));
+        assert_eq!(choose(&[("a", broken_yes), ("b", marked(1, no()))]), Ok(1));
     }
 
     #[test]
