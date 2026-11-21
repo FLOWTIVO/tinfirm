@@ -41,6 +41,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::egress_proxy::EgressGuard;
+use crate::front::session::FrontSession;
 use crate::host::{HostOptions, Shared};
 use crate::vm::{VmGuard, Vms};
 
@@ -78,9 +79,9 @@ impl Shape {
 /// it is deleted.
 pub struct IdleVm {
     vm: VmGuard,
-    session: crate::sandbox::Session,
-    /// The bridge's identity and where it is dialed, when the VM's front holds it.
-    keep: Option<crate::sandbox::BridgeKeep>,
+    session: FrontSession,
+    /// The bridge's identity and where it is dialed.
+    keep: crate::sandbox::BridgeKeep,
     egress: Option<EgressGuard>,
     sandbox_host: Option<String>,
     ticket: String,
@@ -118,8 +119,8 @@ impl IdleVm {
 /// A VM's bridge, connected, and what came with it, before its build and its network are
 /// checked.
 struct Up {
-    session: crate::sandbox::Session,
-    keep: Option<crate::sandbox::BridgeKeep>,
+    session: FrontSession,
+    keep: crate::sandbox::BridgeKeep,
     egress: Option<EgressGuard>,
     sandbox_host: Option<String>,
     ticket: String,
@@ -138,11 +139,11 @@ pub enum Served {
 /// A VM that a run claimed: the run's until it ends, then deleted.
 pub struct Claimed {
     pub vm: VmGuard,
-    /// The VM's bridge, connected; the adapter is not started yet.
-    pub session: crate::sandbox::Session,
-    /// The bridge's identity and where it is dialed, when the VM's front holds it: what a
-    /// new front, or a host that restarted, takes the session back with.
-    pub keep: Option<crate::sandbox::BridgeKeep>,
+    /// The VM's bridge, connected in the VM's front; the adapter is not started yet.
+    pub session: FrontSession,
+    /// The bridge's identity and where it is dialed: what a new front, or a host that
+    /// restarted, takes the session back with.
+    pub keep: crate::sandbox::BridgeKeep,
     /// The VM's egress proxy listener, which the run binds to its rules.
     pub egress: Option<EgressGuard>,
     /// The VM's own loopback in the VM executor's test mode (`VmOptions::on_this_machine`),
@@ -523,7 +524,7 @@ impl Pool {
             )),
         };
         let session = match connected {
-            Ok(session) => crate::sandbox::Session::Front(session),
+            Ok(session) => session,
             Err(e) => {
                 vm.delete().await;
                 return Err(e);
@@ -537,7 +538,7 @@ impl Pool {
         };
         let up = Up {
             session,
-            keep: Some(keep),
+            keep,
             egress,
             sandbox_host,
             ticket,

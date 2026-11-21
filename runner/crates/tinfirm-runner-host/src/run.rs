@@ -684,12 +684,7 @@ pub async fn execute(
     // One front per sandbox serves its listeners' HTTP on a host with the bridge: a VM's
     // came with the VM, and holds its bridge; any other's comes with the first listener it
     // needs, which is the run's own git listener for its fetches and platform tools.
-    let mut front = claimed.as_ref().and_then(|vm| {
-        vm.session
-            .sandbox_front()
-            .or_else(|| vm.egress.as_ref().and_then(|egress| egress.sandbox_front()))
-            .cloned()
-    });
+    let mut front = claimed.as_ref().map(|vm| vm.session.front().clone());
     // The sandbox's way to fetch and to the platform tools; dropping it (at the latest when
     // this function returns) removes the run's routes from the listener.
     let mut access = sandbox_access(
@@ -2415,7 +2410,7 @@ async fn start_sandbox(
             spec,
             claimed,
             shared.opts.vm_reprobe_after,
-            crate::sandbox::Tunnels::Services(front_tunnels(access)),
+            front_tunnels(access),
             puts,
         )
         .await
@@ -2525,14 +2520,14 @@ async fn start_in_front(
         },
     };
     let bridged = crate::sandbox::Bridged {
-        registration: crate::sandbox::Registered::Front(registration),
+        registration,
         bootstrap,
         binary: options.binary,
         connect_timeout: options.connect_timeout,
-        tunnels: crate::sandbox::Tunnels::Services(tunnels),
+        tunnels,
         puts,
         peer: shared.bridge_peer(&endpoint),
-        keep: Some(keep),
+        keep,
     };
     shared.opts.executor.start_bridged(spec, bridged).await
 }

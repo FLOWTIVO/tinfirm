@@ -720,11 +720,6 @@ impl EgressGuard {
         self.front.as_deref().map(SandboxFront::handle)
     }
 
-    /// The sandbox's front that serves this listener, when one does.
-    pub fn sandbox_front(&self) -> Option<&Arc<SandboxFront>> {
-        self.front.as_ref()
-    }
-
     /// The run's places in use, of its 256 open connections.
     pub fn open_connections(&self) -> usize {
         MAX_TUNNELS - self.state.tunnels.available_permits()
