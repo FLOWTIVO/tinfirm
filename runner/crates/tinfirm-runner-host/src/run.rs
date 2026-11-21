@@ -3802,6 +3802,7 @@ impl AgentTurn {
                     agent_version.as_deref(),
                 ));
                 open_session(&mut self.mapper, sink, &id, why.as_ref());
+                sink.session_opened(&id);
                 self.session_id = Some(id);
                 self.not_resumed = Some(why);
             } else if let AcpInbound::Update { params, .. } = item {
@@ -5445,5 +5446,46 @@ mod tests {
             git_failure_message(&two, 3),
             "git failed in 2 of 3 repositories: `Server` (/workspace/server): a; `Web` (/workspace/web): b"
         );
+    }
+
+    /// A session that the agent opened just before its turn ended is found by the drain, and
+    /// the take-back record keeps it as the loop's own handling does.
+    #[tokio::test]
+    async fn a_session_that_the_drain_finds_is_kept_in_the_take_back_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = crate::takeback::Records::new(&paths);
+        let local = crate::sandbox::Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        // TEST-ONLY token, no real credential.
+        let config = crate::config::HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYdrainsessiontesthosttoken0123456789"),
+        );
+        let shared = Shared::new(crate::host::HostOptions::new(paths, local), config);
+        let assign = test_assign();
+        let mut sink = EventSink::new(shared.clone(), assign.run_id, assign.epoch);
+        let handle = RecordHandle::create(&records, crate::takeback::tests::record()).unwrap();
+        sink.keep_record(Arc::new(handle));
+
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let mut turn = AgentTurn::new(&shared, &assign, control_tx);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        inbound_tx
+            .send(AcpInbound::Prompting {
+                session_id: "session-1".into(),
+                not_resumed: None,
+                agent_version: None,
+            })
+            .unwrap();
+        let (_log_tx, mut log_rx) = mpsc::channel::<String>(1);
+        turn.drain(&mut inbound_rx, &mut log_rx, &mut sink, &assign);
+
+        assert_eq!(turn.session_id.as_deref(), Some("session-1"));
+        let kept = records.load_all();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].session_id.as_deref(), Some("session-1"));
     }
 }

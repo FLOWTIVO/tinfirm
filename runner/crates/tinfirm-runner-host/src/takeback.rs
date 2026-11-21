@@ -549,12 +549,12 @@ impl RecordHandle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
 
-    fn record() -> RunRecord {
+    pub(crate) fn record() -> RunRecord {
         let assign: RunAssign = serde_json::from_value(serde_json::json!({
             "runId": Uuid::new_v4(),
             "epoch": 2,
