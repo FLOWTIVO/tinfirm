@@ -8,8 +8,9 @@
 #
 # Not done by this role: the single machine (ADR-0112 decision 5), which the node agent refuses
 # today, and the node's egress to anything but the control host, which the agent's `verify`
-# does not try. Sandbox nodes are not ready for production: the hardening below has not run on
-# a machine yet. Tinfirm publishes no VM image: the site builds it.
+# does not try. Sandbox nodes are not ready for production: the hardening below has run on one
+# node only (2026-11-22, Ubuntu 24.04), and no real conversation has run under it yet. Tinfirm
+# publishes no VM image: the site builds it.
 
 # --- The node agent's binary -----------------------------------------------------------------
 
@@ -188,16 +189,19 @@ tinfirm_sandbox_node_harden_io_uring: true
 # - `off` (or false): no profile. One that an earlier run loaded is unloaded and its file removed;
 #   a VMM that runs keeps its confinement until it ends. `vmm-mac` fails, and makes do not ask.
 # A Red Hat family node has SELinux and no AppArmor: the role refuses complain and enforce there.
-# The default is `complain` because the profile has not run on a real machine yet: in enforce
-# mode a rule it lacks would stop every VM from starting. It becomes `enforce` once the profile
-# has run on a node. Until then, a node set up with the defaults reports `hardened: no` for this
-# line alone.
+# The default is `complain`: in enforce mode a rule the profile lacks would stop every VM from
+# starting. On 2026-11-22 the profile ran on one node (Ubuntu 24.04) in both modes, and logged
+# nothing over the VMs' life; no real conversation has run under it yet. The default becomes
+# `enforce` once one has. Until then, a node set up with the defaults reports `hardened: no` for
+# this line alone.
 tinfirm_sandbox_node_harden_mac: complain
 # kernel.panic_on_oops = 1, and kernel.panic = tinfirm_sandbox_node_kernel_panic: an exploit that
 # fails takes the node down instead of trying again, and ends every run on it. Off:
 # `panic-on-oops` fails.
 tinfirm_sandbox_node_harden_panic_on_oops: true
-# Seconds after a panic before the node reboots; 0: it stays down until an operator looks.
+# Seconds after a panic before the node reboots; 0: it stays down until an operator looks, also
+# on a cloud's image that rebooted by itself after a panic before the role ran (`kernel.panic`
+# was -1 on the image of 2026-11-22).
 tinfirm_sandbox_node_kernel_panic: 0
 # kernel.modules_disabled = 1, set at each boot by tinfirm-node-agent-hardening.service once the
 # modules the agent needs are loaded. Until the next reboot no module loads: a firewall rule or a

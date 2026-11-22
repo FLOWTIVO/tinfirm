@@ -807,7 +807,11 @@ holds its bridge.
   takes the session back with the run's key, on the same port (a VM's dials it again), the agent
   is stopped, its work comes back and is saved, and the run fails with `INFRA`, saying what was
   saved and what was not. When the new front ends too, the run fails and says that its work is
-  lost. The other runs and the host are not touched.
+  lost. The other runs and the host are not touched. Shown on a control host with a VM per run
+  (2026-11-22; the outputs are not in this repository): a VM's front, killed during the run, was
+  replaced in under a second, and the run ended with "a new front took the sandbox back, the agent
+  was stopped, and its work so far was saved." During that run the front showed `NoNewPrivs 1`
+  and `Seccomp 2` with 13 filters.
 
 <a id="the-reader"></a>
 
@@ -1199,12 +1203,18 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   again later", then "sandbox VM deleted, after a delete that had failed" once the node answers.
   The first 12 failed tries (about 40 minutes) are warnings; the twelfth says "the sandbox VM is
   still left; the host keeps trying its delete", and the tries after it are in the debug log only.
-  The cleanup at the next connection or start deletes such a VM too.
+  The cleanup at the next connection or start deletes such a VM too. Shown on machines
+  (2026-11-22) with a node rebooted during a run: the host logged a first and a second failed
+  delete (no connection in time, then the connection refused), then that the VM was deleted once
+  the node answered, without a restart of its process; `doctor` then said "room for 2 more VM(s)".
 - **A VM that ends during its run** (its VMM dies, its node reboots) ends the run's bridge session
   without the adapter's exit status once the bridge has been gone for 30 s. This host then asks the
   driver's `describe` once, for at most 25 s: when the VM is gone or failed, or the driver cannot
   describe it, the run fails with `INFRA`, "The sandbox VM ended during the run (…)", not as the
   agent's fault. An adapter that exits by itself is reported as before, without that question.
+  Shown on machines (2026-11-22) with the VMM killed during a run on a sandbox node: the run failed
+  as `INFRA` after 47 seconds, "The sandbox VM ended during the run (the provider reports the VM
+  failed); the agent's session in it was lost."
 - **A VM that does not come up** (connected) within `--vm-start-timeout`, or that the provider fails,
   fails its run with `INFRA` and is deleted.
 - **A driver that can make no VM.** After a `create` that fails, this host asks the driver's
@@ -1347,13 +1357,18 @@ Ansible plays that set up a node and a control host (`deploy/ansible/README.md`)
 once, on 2026-11-20 (Ubuntu 24.04), with runs of this host's tests' stand-in agent through a node;
 on the same day, conversations with real runtimes (Claude Code and PI, with a real model) ran
 through a node, in a Firecracker VM, with the sandbox's front confined (Landlock and seccomp).
-The node's hardening is built and has not run on a node: the Ansible role's tasks that set it up,
-the node agent's checks of it, and this host's reading of them. Tinfirm publishes no VM image:
-the image holds Claude Code when built with every runtime, and Tinfirm does not redistribute it,
-so you build the image with `images/vm/local-disk.sh` and this host's own binary
-([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4). A CI job that
-builds and boots the image is planned. The Helm chart's runner pod has not run against a node.
-Here, the driver is tested against node agents with their fake backend.
+The node's hardening is built: the Ansible role's tasks that set it up, the node agent's checks of
+it, and this host's reading of them. On 2026-11-22, on one node (Ubuntu 24.04, kernel 7.0), the
+play, the 13 checks, the unit that sets kexec, lockdown and module loading at each boot, and the
+VMMs' AppArmor profile in both modes held, with nothing logged by the profile, driven through the
+driver's `verify` and `doctor` from a control host with no server (the outputs are not in this
+repository). Not shown: a real conversation through a hardened VM, this host reporting `hardened`
+to a server, a new VM going to a hardened node first, and this host's log naming a failing line.
+Tinfirm publishes no VM image: the image holds Claude Code when built with every runtime, and
+Tinfirm does not redistribute it, so you build the image with `images/vm/local-disk.sh` and this
+host's own binary ([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4).
+A CI job that builds and boots the image is planned. The Helm chart's runner pod has not run
+against a node. Here, the driver is tested against node agents with their fake backend.
 
 - **Editions.** In the core, in every edition: the driver lists no paid feature
   ([ADR-0114](../docs/adr/0114-the-secure-sandbox-is-in-the-core.md)).

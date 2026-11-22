@@ -224,7 +224,8 @@ on large workspaces).
 
 > **Not ready for production.** The two plays ran on machines once, on 2026-11-20, on one
 > distribution: [Test on two machines](#test-on-two-machines) says what ran and what it found. A
-> node's hardening has not run on a machine yet, and the VM image is yours to build
+> node's hardening ran on one node, on 2026-11-22, with no real conversation through it
+> ([The hardening on a node](#the-hardening-on-a-node)), and the VM image is yours to build
 > ([The VM image](#the-vm-image)). Use them to prepare and to test.
 
 [ADR-0112](../../docs/adr/0112-no-credential-on-a-sandbox-machine.md) splits a runner host with
@@ -497,6 +498,11 @@ stop it, and then re-image the machine.
   VM, and its `check` names the table as a problem, so the control host places no VM on the node
   until the table is loaded again (`systemctl reload tinfirm-node-agent-firewall.service`). The
   VMs that run go on running.
+  The table also cuts off what the node's own programs reach beyond the control host: cloud-init
+  ([Variables of a sandbox node](#variables-of-a-sandbox-node), `tinfirm_sandbox_node_cloud_init`),
+  and a cloud's own guest agent on the machine, which stays active and cannot reach its platform.
+  What the platform does through that agent, such as running a command on the machine or its
+  extensions, is then expected to stop working. That was inferred on a node, not tried.
 - **On the control host:** this role sets no firewall; it is yours. It lets the control host reach
   each node's agent port and published ports, and admits nothing from the nodes' network
   (ADR-0112 decision 3).
@@ -516,21 +522,22 @@ only while every node that offers the template reports `yes`
 ([runner/README.md](../../runner/README.md#isolation-level)).
 
 **With the defaults, a node reports `hardened: no`, for the line `vmm-mac` alone.** The VMMs'
-AppArmor profile has not run on a real machine yet, so its default mode is `complain`: loaded,
-refusing nothing, and logging what it would refuse. It does not count as confinement. Once the
-profile has run on a node, the default becomes `enforce`; until then, set
-`tinfirm_sandbox_node_harden_mac: enforce` yourself once the complain-mode log is clean.
+AppArmor profile's default mode is `complain`: loaded, refusing nothing, and logging what it would
+refuse. It does not count as confinement. The profile ran on one node, on 2026-11-22, in both modes,
+and logged nothing over the VMs' life ([The hardening on a node](#the-hardening-on-a-node)); no
+real conversation has run under it yet. The default becomes `enforce` once one has; until then,
+set `tinfirm_sandbox_node_harden_mac: enforce` yourself once the complain-mode log is clean.
 
 | Switch (`tinfirm_sandbox_node_harden_…`) | What the role does | What it costs |
 |---|---|---|
 | (none) | `user.max_user_namespaces = 0`, always (`60-tinfirm-node-agent.conf`): the jail relies on it | No user namespaces on the node |
 | `bpf` | `kernel.unprivileged_bpf_disabled = 1` in `/etc/sysctl.d/61-tinfirm-node-hardening.conf` | One-way until a reboot |
 | `io_uring` | `kernel.io_uring_disabled = 2`, same file. Refused on a kernel without the setting (older than 6.6: Debian 12's 6.1) | No io_uring on the node |
-| `panic_on_oops` | `kernel.panic_on_oops = 1` and `kernel.panic = tinfirm_sandbox_node_kernel_panic` (0: the node stays down) | An oops ends every run on the node |
+| `panic_on_oops` | `kernel.panic_on_oops = 1` and `kernel.panic = tinfirm_sandbox_node_kernel_panic` (0: the node stays down) | An oops ends every run on the node. With the role's default the node then stays down until someone restarts it, also on an image that rebooted by itself after a panic: the cloud's image of [The hardening on a node](#the-hardening-on-a-node) had `kernel.panic = -1` |
 | `distribution` | `kernel.kptr_restrict`, `kernel.dmesg_restrict`, `kernel.perf_event_paranoid`, `kernel.randomize_va_space`, `fs.protected_symlinks`, `fs.protected_hardlinks` at the mark's values; a value the node has stricter already (Ubuntu's `perf_event_paranoid = 4`) is left out, never lowered | Users cannot read the kernel's log or addresses |
-| `mac`: `off` (or `false`), `complain` (**the default**) or `enforce` | `complain`: installs AppArmor, writes the VMMs' profile `/etc/apparmor.d/tinfirm-vmm` with `complain` in its flags (checked with `apparmor_parser -Q -K` first), and loads it; `helper.json` says `"vmmProfile": "not-required"`. The kernel logs what the profile would refuse as lines with `apparmor="ALLOWED"` (`journalctl -k`, or the audit log), and the proof says so. `enforce`: the same profile without `complain`, loaded in enforce mode, and `"vmmProfile": "required"`: a make fails for a VMM the profile does not confine. A change between the two loads the profile again in the new mode; the mode is in the file, so it holds across a reboot. `off`: a profile that an earlier run loaded is unloaded (`apparmor_parser -R`) and its file removed, and `"vmmProfile": "not-required"`; **a VMM that runs keeps the confinement it started with until it ends**. Complain and enforce are refused on a node without AppArmor, which a Red Hat family node is | **The profile is unverified** until the round on a real machine: it parses, and has not confined a VMM yet; hence `complain` by default, in which `vmm-mac` does not hold and the mark is `no`. In enforce mode, VMMs that ran before the profile was loaded stay unconfined, and the mark `no`, until they are deleted. The profile names `/srv/tinfirm-jails` and `/var/lib/tinfirm-node-agent/work`, which the role does not let a site change |
+| `mac`: `off` (or `false`), `complain` (**the default**) or `enforce` | `complain`: installs AppArmor, writes the VMMs' profile `/etc/apparmor.d/tinfirm-vmm` with `complain` in its flags (checked with `apparmor_parser -Q -K` first), and loads it; `helper.json` says `"vmmProfile": "not-required"`. The kernel logs what the profile would refuse as lines with `apparmor="ALLOWED"` (`journalctl -k`, or the audit log), and the proof says so. `enforce`: the same profile without `complain`, loaded in enforce mode, and `"vmmProfile": "required"`: a make fails for a VMM the profile does not confine. A change between the two loads the profile again in the new mode; the mode is in the file, so it holds across a reboot. `off`: a profile that an earlier run loaded is unloaded (`apparmor_parser -R`) and its file removed, and `"vmmProfile": "not-required"`; **a VMM that runs keeps the confinement it started with until it ends**. Complain and enforce are refused on a node without AppArmor, which a Red Hat family node is | **The profile ran on one node** (2026-11-22, Ubuntu 24.04): in complain mode it logged no `ALLOWED` line, and in enforce mode no `DENIED` line, over the VMs' whole life. No real conversation has run under it yet, hence `complain` by default, in which `vmm-mac` does not hold and the mark is `no`. In enforce mode, VMMs that ran before the profile was loaded stay unconfined, and the mark `no`, until they are deleted. The profile names `/srv/tinfirm-jails` and `/var/lib/tinfirm-node-agent/work`, which the role does not let a site change |
 | `modules`, `kexec`, `lockdown` | `/etc/tinfirm/node-agent/hardening.json`, which `tinfirm-node-agent-hardening.service` applies at each boot after the modules' and firewall's units and after kdump: kexec off, lockdown at `integrity`, then module loading off once every module the agent needs is loaded. Lockdown is refused on a kernel without the lockdown LSM | **All three last until a reboot, and only a reboot undoes them.** No module loads after it: a firewall rule or a tool that needs a new one fails. A change of the modules' list while module loading is off stops the play with "reboot the node": the new unit is installed and loads at the next boot |
-| `setuid` | Finds the setuid and setgid programs under `/usr`, `/opt`, `/bin` and `/sbin` that others may run, as the helper's scan does, and strips both bits; keeps `sudo` as `4750 root:sudo` (`root:wheel` on the Red Hat family). On Debian and Ubuntu each change is recorded with `dpkg-statoverride`, so that a package upgrade keeps it; on the Red Hat family an upgrade puts the bits back, and the next run of the role removes them again. Refused for a play whose user is neither root nor in that group | Users lose `su`, `passwd`, `chsh`, `chfn`, `newgrp`, `gpasswd`, `mount`, `umount`, `fusermount3`, `pkexec`, `ssh-keysign`, `crontab`, `wall`, snaps (`snap-confine`), and every other such program; `sudo` stays for the admin group alone |
+| `setuid` | Finds the setuid and setgid programs under `/usr`, `/opt`, `/bin` and `/sbin` that others may run, as the helper's scan does, and strips both bits; keeps `sudo` as `4750 root:sudo` (`root:wheel` on the Red Hat family). On Debian and Ubuntu each change is recorded with `dpkg-statoverride`, so that a package upgrade keeps it; on the Red Hat family an upgrade puts the bits back, and the next run of the role removes them again. Refused for a play whose user is neither root nor in that group | Users lose `su`, `passwd`, `chsh`, `chfn`, `newgrp`, `gpasswd`, `mount`, `umount`, `fusermount3`, `pkexec`, `ssh-keysign`, `crontab`, `wall`, snaps (`snap-confine`), `unix_chkpwd` (a program that is not root can then not check a password; not tried), and every other such program; `sudo` stays for the admin group alone |
 
 The lines of no switch of their own follow the master switch: `no-docker` (no Docker, containerd or
 podman socket), `listening-sockets` (no TCP listener beyond loopback but the agent's port and
@@ -553,7 +560,8 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
   `verify` tries one thing itself: a datagram from its listener towards the control host, which the
   node's own table must refuse; a node where it passes takes no VM. The server, the model gateway,
   the code hosts, a metadata service and the internet are not tried by the agent: check them from
-  the node yourself (below). The agent's try has not run on a node yet.
+  the node yourself (below). The agent's try ran on one real node, with its table loaded, deleted,
+  and replaced by one that lets the datagram pass ([Test on two machines](#test-on-two-machines)).
 - **An upgrade in place** of a node under running VMs: how the agent and the image of several nodes
   are upgraded is not specified yet. Replace the node's image instead. Change the VM image's
   variables only on a node without VMs: the role replaces the file and restarts the helper, and
@@ -561,7 +569,7 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
 - **Kata's removal** from the runner hosts of `runner-host.yml`.
 - **Another distribution or aarch64**: the role knows the RHEL family's and Debian's package names and
   Firecracker's arm64 checksums, but only Ubuntu 24.04 on x86-64 has run a node, and no arm64 guest
-  kernel is pinned.
+  kernel is pinned. The hardening has run on one kernel (7.0).
 
 ### Variables of a sandbox node
 
@@ -584,7 +592,7 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
 | `tinfirm_sandbox_node_management_address` | none | The one address admitted to SSH. Required |
 | `tinfirm_sandbox_node_ssh_port` | `22` | The node's SSH port, which the firewall admits from the management address (its `ssh_port`). The role does not change sshd's port |
 | `tinfirm_sandbox_node_check_ssh_source` | `true` | Stop when the play's SSH comes from another address, or goes to another port than `tinfirm_sandbox_node_ssh_port` |
-| `tinfirm_sandbox_node_cloud_init` | `refuse` | `refuse` stops the play on a node whose cloud-init would run at the next start; `disable` writes `/etc/cloud/cloud-init.disabled`. With cloud-init active, a node does not finish its start once the firewall is loaded, since cloud-init waits for the metadata service that the firewall drops |
+| `tinfirm_sandbox_node_cloud_init` | `refuse` | `refuse` stops the play on a node whose cloud-init would run at the next start; `disable` writes `/etc/cloud/cloud-init.disabled`. With cloud-init active, a node does not finish its start once the firewall is loaded, since cloud-init waits for the metadata service that the firewall drops. A cloud's own guest agent is cut off the same way ([Firewalls](#firewalls)) |
 | `tinfirm_sandbox_node_agent_port` | `7700` | The listener's TLS port |
 | `tinfirm_sandbox_node_first_port` | `20000` | The first VM's published port; the last is `first_port + max_vms - 1` |
 | `tinfirm_sandbox_node_vm_range` | `10.231.0.0/16` | The VMs' own addresses, which never leave the node |
@@ -600,8 +608,8 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
 | `tinfirm_sandbox_node_name` | the inventory name | The node's name in the entry the play shows |
 | `tinfirm_sandbox_node_harden` | `true` | The master switch of the hardening: `false` turns every line off |
 | `tinfirm_sandbox_node_harden_bpf`, `_io_uring`, `_panic_on_oops`, `_modules`, `_kexec`, `_lockdown`, `_setuid`, `_distribution` | `true` each | One line of the hardening each ([The hardening](#the-hardening)) |
-| `tinfirm_sandbox_node_harden_mac` | `complain` | The VMMs' AppArmor profile: `off` (or `false`), `complain` or `enforce`. In complain mode the node's mark is `no` for `vmm-mac`; the default becomes `enforce` once the profile has run on a node |
-| `tinfirm_sandbox_node_kernel_panic` | `0` | `kernel.panic`: seconds before a node that panicked reboots; 0, it stays down |
+| `tinfirm_sandbox_node_harden_mac` | `complain` | The VMMs' AppArmor profile: `off` (or `false`), `complain` or `enforce`. In complain mode the node's mark is `no` for `vmm-mac`; the default becomes `enforce` once a real conversation has run under the profile |
+| `tinfirm_sandbox_node_kernel_panic` | `0` | `kernel.panic`: seconds before a node that panicked reboots; 0, it stays down until someone restarts it, also where the image rebooted by itself before |
 | `tinfirm_sandbox_node_max_uptime_days` | `30` | The most days since the boot before the mark is `no` (`hardening.maxUptimeDays`) |
 
 ### Variables of a control host
@@ -719,3 +727,56 @@ Two things to know that the plays do not change:
   within 5 seconds.
 - Where an earlier run left a node with its firewall loaded and its own name in no file, give
   Ansible more time once: `ANSIBLE_TIMEOUT=40 ansible-playbook … sandbox-node.yml`.
+
+On 2026-11-22, at `cdf8209`, both plays ran again on a server, a control host and one node with
+its hardening off (the outputs are not in this repository), and the driver's `verify` was clean.
+The agent's own egress try ran there on a real node: with the node's table loaded, each `verify`
+said the datagram "was refused on the node, as its firewall table drops it", and the table's
+counter of what the node sends grew by one per `verify`. With the table deleted, `verify` named the
+missing table and the datagram that passed. With a table of the right name whose output chain
+accepts, the helper's check of the name passed and the egress try alone named the problem: a new
+run waited with `RUNNER_HOST_UNHEALTHY` and that cause, and went on by itself 12 seconds after the
+real table was loaded again; while the table let it pass, the control host received one empty
+datagram on UDP port 9 per `verify`. With `"nodeFirewall": "not-required"`, `checked` had a line
+that starts with `NOT HELD:`, and VMs were still made.
+
+### The hardening on a node
+
+Ran once, on 2026-11-22, at commit `7fed9a4`, on one fresh node (Ubuntu 24.04, kernel 7.0, a
+cloud's image, Secure Boot off, KVM through nested virtualisation) with a control host of its own
+and no Tinfirm server: the node was driven through the `node` driver's `verify` and `doctor`, and
+VMs were made, reached, listed and deleted through the driver's protocol. The outputs are not in
+this repository.
+
+- **The play with its defaults**, and `tinfirm_sandbox_node_cloud_init: disable`, ran through on
+  its first run; a second run, and one after a reboot, changed nothing. The node took SSH with
+  sudo afterwards, with all five units active. On that image the play changed
+  `user.max_user_namespaces` (58109 to 0), `kernel.unprivileged_bpf_disabled` (2 to 1),
+  `kernel.io_uring_disabled` (0 to 2), `kernel.panic_on_oops` (0 to 1), `kernel.panic` (-1 to 0),
+  `kernel.modules_disabled` and `kernel.kexec_load_disabled` (0 to 1), and lockdown (`none` to
+  `integrity`). 19 programs lost their setuid or setgid bit, each recorded with
+  `dpkg-statoverride`; `sudo` stayed as `4750 root:sudo`, and `dbus-daemon-launch-helper` as
+  `4754 root:messagebus`, which others cannot run.
+- **The mark.** With the defaults, `hardened: no` for `vmm-mac` alone, the profile being in complain
+  mode; the other 12 lines held on the first run. With `tinfirm_sandbox_node_harden_mac: enforce`,
+  `hardened: yes` with all 13 lines, with no VMM and with two running, and `doctor` said so.
+- **VMs under the profile.** In both modes VMs were made, reached on their published port, listed
+  and deleted, two side by side, with nothing left on the node. The profile logged nothing: no
+  `ALLOWED` line in complain mode over the VMs' whole life (a command run under it by hand showed
+  that the logging works), and no `DENIED` line in enforce mode, also with the guest's console on.
+- **A line that stops holding.** With `kernel.io_uring_disabled` set back to 0 by hand, `verify`
+  answered `hardened: no` and named the line, with no problem and the free VMs unchanged, and the
+  node still made, served and deleted a VM. Set to 2 again, the next `verify` said `yes`.
+- **A reboot.** `verify` answered `hardened: yes` 13 seconds after the reboot was asked. The units
+  started in order (firewall, modules, hardening, helper, listener, within about 6 seconds of the
+  boot), the hardening unit set kexec, lockdown and module loading again, the profile was in
+  enforce mode again, and no unit failed. As root on the node, connections to the control host, to
+  a public address and to two metadata or platform addresses each timed out.
+- **The most days since the boot.** `tinfirm_sandbox_node_max_uptime_days: 0` is refused by the play
+  before it changes anything, and by the helper, which does not start. With 1 the line held. A
+  failing `max-uptime` line was not seen: the smallest value is one day.
+
+Not shown in that round: a real conversation through a hardened VM (there was no server), a make
+that fails after its VMM started, the control host reporting `hardened` to a server, a new VM
+going to a hardened node first (there was one node), the host's log naming a failing line, a
+second distribution or kernel, and SELinux on the Red Hat family, which is not built.
