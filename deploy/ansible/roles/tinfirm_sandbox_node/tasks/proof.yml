@@ -94,14 +94,14 @@
   ansible.builtin.debug:
     msg:
       - "The node's fingerprint, which the control host pins: {{ _tinfirm_sandbox_node_fingerprint.stdout | trim }}"
-      - "Its entry in the control host's tinfirm_runner_host_nodes:"
+      - >-
+        Its entry for the control host's inventory, in the variable tinfirm_runner_host_nodes of
+        control-host.yml. It is not a part of node-driver.json, which the control host's play writes:
       - name: "{{ tinfirm_sandbox_node_name }}"
         address: "{{ tinfirm_sandbox_node_address }}:{{ tinfirm_sandbox_node_agent_port }}"
         nodeSha256: "{{ _tinfirm_sandbox_node_fingerprint.stdout | trim }}"
         templates: "{{ tinfirm_sandbox_node_templates.keys() | list }}"
-        publishedPorts:
-          first: "{{ tinfirm_sandbox_node_first_port | int }}"
-          last: "{{ _tinfirm_sandbox_node_last_port | int }}"
+        publishedPorts: "{{ {'first': tinfirm_sandbox_node_first_port | int, 'last': _tinfirm_sandbox_node_last_port | int} }}"
       - >-
         The agent's verify tries the node's own egress towards the control host alone, and
         not as root. The network outside the node is yours to close: the node reaches
