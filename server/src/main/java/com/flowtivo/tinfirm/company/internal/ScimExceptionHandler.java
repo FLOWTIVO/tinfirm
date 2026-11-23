@@ -2,6 +2,7 @@ package com.flowtivo.tinfirm.company.internal;
 
 import java.util.Map;
 
+import org.apache.tomcat.util.http.InvalidParameterException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.Ordered;
@@ -47,6 +48,15 @@ class ScimExceptionHandler {
             }
         }
         return scim(ScimException.invalidSyntax("The request is not SCIM's JSON"));
+    }
+
+    /** A query string Tomcat cannot parse ({@code ApiExceptionHandler.handleInvalidParameter}), never echoed. */
+    @ExceptionHandler(InvalidParameterException.class)
+    ResponseEntity<Map<String, Object>> parameters(InvalidParameterException ex) {
+        if (ex.getErrorCode() == 413) {
+            return scim(new ScimException(413, null, "The request's parameters are larger than Tinfirm allows"));
+        }
+        return scim(ScimException.invalidSyntax("The request's parameters cannot be read"));
     }
 
     @ExceptionHandler(HttpMediaTypeNotSupportedException.class)

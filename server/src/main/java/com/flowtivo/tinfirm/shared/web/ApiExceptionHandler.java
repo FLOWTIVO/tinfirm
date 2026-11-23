@@ -6,6 +6,7 @@ import java.util.Map;
 
 import jakarta.validation.ConstraintViolationException;
 
+import org.apache.tomcat.util.http.InvalidParameterException;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,6 +79,27 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
             .map(violation -> fieldError(violation.getPropertyPath().toString(), violation.getMessage()))
             .toList();
         return ResponseEntity.badRequest().body(validationProblem(errors));
+    }
+
+    /**
+     * Tomcat could not parse the request's parameters, from the query string or a form body: a value that is not
+     * valid UTF-8, a malformed percent-escape, more parameters than {@code maxParameterCount}, or a form body larger
+     * than {@code maxPostSize}. Servlet 6.1 lets {@code getParameter} throw instead of dropping the parameter. The
+     * status is Tomcat's, 400 or 413. The message quotes the parameter's name and value, so it is never sent or logged.
+     * {@link RequestInputFilter} brings here the same exception from a servlet filter.
+     */
+    @ExceptionHandler(InvalidParameterException.class)
+    ResponseEntity<ProblemDetail> handleInvalidParameter(InvalidParameterException ex) {
+        if (ex.getErrorCode() == HttpStatus.CONTENT_TOO_LARGE.value()) {
+            return ResponseEntity.status(HttpStatus.CONTENT_TOO_LARGE)
+                .body(ProblemDetail.forStatusAndDetail(HttpStatus.CONTENT_TOO_LARGE,
+                        "The request's parameters are larger than the server allows"));
+        }
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST,
+                "The request's parameters cannot be read: a value is not valid UTF-8, an escape is malformed, "
+                        + "or there are too many");
+        problem.setProperty(CODE, ProblemCode.VALIDATION_FAILED.name());
+        return ResponseEntity.badRequest().body(problem);
     }
 
     @ExceptionHandler(Exception.class)

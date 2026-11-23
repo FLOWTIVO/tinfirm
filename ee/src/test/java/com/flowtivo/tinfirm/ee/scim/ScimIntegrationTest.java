@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import com.flowtivo.tinfirm.ee.licence.TestLicences;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.RawHttp;
 import com.flowtivo.tinfirm.support.TenantSql;
 import com.flowtivo.tinfirm.support.TestDatabase;
 
@@ -224,6 +225,19 @@ class ScimIntegrationTest extends ScimTest {
         }
         assertThat(last.status()).isEqualTo(429);
         assertThat(last.header("Retry-After")).isNotNull();
+    }
+
+    @Test
+    void aQueryTomcatCannotParseIsScimsInvalidSyntax() {
+        // Not valid UTF-8 (Tomcat's InvalidParameterException): SCIM's own 400, never echoing the value.
+        String token = issueToken(scimCompany());
+        for (String query : List.of("filter=%00%ff%27", "filter=%zz")) {
+            RawHttp.Answer answer = RawHttp.send(port, "GET", "/scim/v2/Users?" + query,
+                    Map.of("Authorization", "Bearer " + token, "Accept", SCIM_JSON), null);
+            assertThat(answer.status()).as("%s", answer).isEqualTo(400);
+            assertThat(answer.header("Content-Type")).startsWith(SCIM_JSON);
+            assertThat(answer.body()).contains("\"scimType\":\"invalidSyntax\"").doesNotContain("filter");
+        }
     }
 
     // ---- create, read, list ---------------------------------------------------------------------------------------
