@@ -8,6 +8,10 @@
 //   happy              thought, plan, permission-gated edit, git commit, usage + rate
 //                      limit meta, a streamed final message, an uncommitted file (WIP)
 //   slow               writes slow.txt, then streams a chunk every 100 ms until cancelled
+//   end-window         writes done.txt (uncommitted) and, under protocol v2, /output/report.md
+//                      (and /output/appendix.md with `[second-output]`), says "Done: …" and ends
+//                      its turn with its usage; with `[leak]`, first prints the host's credential
+//                      as `leak` does and waits to be stopped
 //   gate               streams a chunk every 100 ms until the file `release` appears in the
 //                      workspace root (the test creates it), then ends the turn; or until
 //                      cancelled
@@ -540,6 +544,26 @@ async function prompt(msg) {
       return done({
         stopReason: "end_turn",
         usage: { inputTokens: 120, outputTokens: 45, cachedReadTokens: 30, cachedWriteTokens: 15, totalTokens: 210 },
+      });
+    }
+    case "end-window": {
+      // Ends its turn by itself with work left uncommitted, a file in /output (protocol v2) and
+      // its usage: what a host that dies in the run's end must still save and report.
+      fs.writeFileSync(path.join(cwd, "done.txt"), "the finished work\n");
+      const outputDir = process.env.TINFIRM_OUTPUT_DIR;
+      if (outputDir) {
+        fs.writeFileSync(path.join(outputDir, "report.md"), "The report.\n");
+        if (text.includes("[second-output]")) fs.writeFileSync(path.join(outputDir, "appendix.md"), "The appendix.\n");
+      }
+      if (text.includes("[leak]")) {
+        // As `leak` does: the host stops the agent for it.
+        chunk(sessionId, `The token in base64 is ${Buffer.from(`x-access-token:${hostSecret()}`).toString("base64")}.`);
+        if (await waitCancel(10000)) return done({ stopReason: "cancelled" });
+      }
+      chunk(sessionId, "Done: the work is in done.txt.");
+      return done({
+        stopReason: "end_turn",
+        usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
       });
     }
     case "slow": {

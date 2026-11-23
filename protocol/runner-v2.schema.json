@@ -273,7 +273,7 @@
           }
         },
         "activeRuns": {
-          "description": "Runs still running in this runner host process when it reconnects after a network interruption. The server keeps a run whose epoch matches and whose lease has not expired, and answers run.cancel for any other. After a process restart the host sends an empty array.",
+          "description": "The runs this runner host process holds: those it executes, and those whose run.finished may not have reached the server yet, which it writes again after a reconnect. The server keeps a run whose epoch matches and whose lease has not expired, and answers run.cancel for any other. After a process restart the host lists the runs it takes back from the records the process before it kept (ADR-0101): a run whose sandbox comes back, or whose work came back from the sandbox to the host before the restart; and a run whose run.finished that process had made but had not written to a connection before it ended (a crash, or a stop while cut off from the server), or had written within the host's retention before a crash, which the host sends again (the protocol has no acknowledgement of run.finished). After an orderly stop, a run.finished that was written counts as sent. A run of the process before without such a record or report is not listed.",
           "type": "array",
           "items": {
             "type": "object",

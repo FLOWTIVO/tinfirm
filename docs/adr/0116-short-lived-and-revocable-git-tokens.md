@@ -92,7 +92,7 @@ Each holds its own copy: `Git.authorization`, `Route.authorization`, and the rec
    | What | After the revocation |
    |---|---|
    | Memory | The holder drops the token and keeps the reason and the message |
-   | The take-back record | The host writes the record again, whole and 0600 as today. The repository's `git` is null, and a new optional field `revoked` names the repository with the message. A host that restarts then neither uses the token nor pushes the repository. The record's format version stays 1 |
+   | The take-back record | The host writes the record again, whole and 0600 as today. The repository's `git` is null, and a new optional field `revoked` names the repository with the message. A host that restarts then neither uses the token nor pushes the repository. The record's format version stays 1 for a record that only drops a revoked token; a record that keeps a run's own end ([ADR-0101](0101-closing-the-elastic-runners-gaps.md), amended 2026-11-23) is version 2, which a host before it discards rather than misreads |
    | The git proxy | The route stays. Each new request gets 403 with the server's message as plain text, as `git-receive-pack` gets today |
    | A clone or mirror fetch not yet started | Fails with `cannot clone <repository>: <message>`, `GIT_ERROR`, as a failed clone does today |
    | The mirror fetch before the push | Is not attempted. The scan compares with the refs at clone time, as after a failed fetch today |

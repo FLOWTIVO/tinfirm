@@ -92,7 +92,7 @@ attaches to the container's stdio, and `run` itself serves the proxies.
 
 | Module | What it owns |
 |---|---|
-| `takeback.rs` | The take-back records (`runs/<run id>.json`): `RunRecord`, `RecordHandle` |
+| `takeback.rs` | The take-back records (`runs/<run id>.json`): `RunRecord`, `RecordHandle`; a run's kept report (`runs/<run id>.<epoch>.finished.json`, `ReportRecord`) |
 | `isolation.rs` | The host's level of isolation, reported in `hello` and by `doctor` |
 | `main.rs` (`doctor`, `doctor_*`) | `doctor`'s checks: Docker, VMs, credentials, isolation, the front and the reader |
 
@@ -119,19 +119,34 @@ stage that ends the run early returns `ControlFlow::Break` with what `execute` r
 8. `run_agent`: `connect_the_agent`, `acp::run_session`, the turn's loop over `AgentTurn`, then
    `AgentTurn::drain` and `AgentTurn::end`: `AgentPhase`.
 9. `bring_the_work_back`: `a_new_front_takes_the_sandbox_back` when the front ended, the VM's
-   end, `stop_agent`, `collect_from_sandbox`, `Sandbox::stop`, then the record goes.
+   end, `stop_agent`, `collect_from_sandbox`, then `keep_the_record_for_the_end`
+   (`RecordHandle::collected_at_the_end`: the record says the work came back, with a leak or a
+   cancel known then, and stays),
+   then `Sandbox::stop`.
 10. `close_the_access`: the run's result, and `SandboxAccess` goes.
-11. `agent_outcome` (`classify_agent_end`, `usage_limit`): `AgentOutcome`.
-12. `save_the_output` (`collect_output`), `finalize_repositories` (`finalize_git`),
+11. `agent_outcome` (`classify_agent_end`, `usage_limit`): `AgentOutcome`; `keep_the_outcome`
+    writes it into the record (`RecordHandle::outcome_decided`).
+12. `aborted_in_the_end` before each of these and after the last: `save_the_output` (`collect_output`; the record keeps
+    each file as it is saved, `RecordHandle::output_file_saved`, then `output_saved`),
+    `finalize_repositories` (`finalize_git`),
     `store_the_session` (`store_session_bundle`).
-13. `Run::finish` (`finish`: the report), then `cleanup_workspace`.
+13. `Run::finish` (`finish`: the report), `keep_the_report` (`RecordHandle::report_made`: the
+    report is kept in the record's place), then `cleanup_workspace`. The report goes when the
+    outbox forgets the run (`Shared::forget_delivered_reports`, on the host's 5-second tick, and
+    `Shared::forget_written_reports` once the connection of an orderly stop has ended).
 
 A run taken back after a restart: `Shared::take_back_runs` (`host.rs`) holds each record's
 sandbox (`TakenBack::hold`) and calls `run::take_back`. Its stages are
 `redact_the_runs_secrets`, `redact_the_earlier_tokens` (the record's hashes),
 `taken_back_dirs`, `restore_repositories`, `bring_the_sandbox_back`
 (`collect_the_work_taken_back`), `wait_for_the_server`, the stop, `save_the_work` and
-`say_what_was_saved`.
+`say_what_was_saved`. A record whose work came back already (`collected`) has no sandbox to
+hold. One of a host that died in the run's own end (`RunRecord::end`) is finished the same
+way: `save_the_work` does not save again the files of `/output` that the record lists, lets
+nothing leave after a leak, and `finalize_git` counts a refused push as pushed when the branch
+is at the run's head; `say_what_was_saved` reports the agent's outcome that the record keeps,
+or its leak or cancel. Before the records, `Shared::send_kept_reports` puts each kept report
+into the outbox.
 
 ## Where a credential lives
 
@@ -142,7 +157,8 @@ sandbox (`TakenBack::hold`) and calls `run::take_back`. Its stages are
 | A run's git tokens | `git_tokens.rs` (`RunGitTokens`), per git command (`git.rs`), the take-back record | the sandbox, any `.git/config`, the process list: the sandbox fetches through `git_proxy.rs` | 6.6, 7.1, 7.5 |
 | A gateway's key | `model_proxy.rs`, the take-back record | the sandbox (`start_model_proxy` fails closed) | 7.3, 7.13, R23 |
 | A bridge's TLS key | the sandbox's front, the take-back record (`BridgeKeep`) | another sandbox's front | 6.13, 6.20 |
-| The take-back record | `takeback.rs`, `runs/<run id>.json`, 0600, while the sandbox lives | the server | 6.20, R36 |
+| The take-back record | `takeback.rs`, `runs/<run id>.json`, 0600, from the sandbox's start until the run's report is made (or until a run taken back ends) | the server | 6.20, R36 |
+| A run's kept report | `takeback.rs`, `runs/<run id>.<epoch>.finished.json`, 0600: the `run.finished` frame, redacted, no credential; until it is delivered | | 6.20 |
 
 ## Tests
 
@@ -150,7 +166,7 @@ sandbox (`TakenBack::hold`) and calls `run::take_back`. Its stages are
 |---|---|
 | unit tests (`src/**`) | each module on its own; `run.rs`'s splitter, push failures, sandbox env and settings |
 | `local_runs` | runs end to end against the fake server and the fake agent, with the local test executor |
-| `bridge_runs` | runs over the bridge, the take-back after a restart, a front that ends during a run |
+| `bridge_runs` | runs over the bridge, the take-back after a restart, a host killed in a run's end, a front that ends during a run |
 | `vm_runs` | runs with the VM executor and the fake driver (`tests/fake-vm-driver`) |
 | `docker_runs` | key runs in real containers; needs Docker and builds `tinfirm-runner-fake:test` |
 | `capacity` | capacity settings, admission codes and drain |
@@ -174,17 +190,44 @@ driver. `TINFIRM_SKIP_DOCKER_TESTS=1` skips the Docker tests.
   `runner/Cargo.toml` names, two in `ee/src/kubernetes/tap.rs`; `tests/unsafe_code.rs` fails
   on any other.
 - **Test-only hooks are `#[doc(hidden)]` options that no flag sets.** `Executor::Local` (the
-  local test executor), `VmOptions::on_this_machine`, `Serving::Listener` and
-  `FrontCommand::tap` exist for the tests. No command-line flag or environment variable of
+  local test executor), `VmOptions::on_this_machine`, `Serving::Listener`,
+  `FrontCommand::tap` and `HostOptions::halt_at` (a run's end waits for good at a moment
+  that `run::EndStep` names, for the restart tests) exist for the tests. No command-line flag or environment variable of
   `run` reaches them.
 - **The first writer of a run's failure wins.** `Failure::set` keeps the first class and
   message. `Failure::force` replaces it, only where a later finding must win: a commit that
   leaks (`finalize_repositories`, `save_the_work`), a new front that did not bring all the work
   back (`bring_the_work_back`), and a damaged take-back record (`say_what_was_saved`).
 - **The sandbox is collected before it goes.** With the bridge, the work comes back
-  (`collect_from_sandbox`) before `Sandbox::stop`. The take-back record goes only after the
-  sandbox has stopped. A run taken back writes `RecordHandle::collected` before it stops its
-  sandbox, and keeps the sandbox when the mark cannot be written.
+  (`collect_from_sandbox`) before `Sandbox::stop`, and the take-back record says so before
+  the sandbox stops: `RecordHandle::collected_at_the_end` in a run's own end,
+  `RecordHandle::collected` in a run taken back. A run's own end that cannot write the mark
+  removes the record once the sandbox has stopped, as before; a run taken back keeps the
+  sandbox then.
+- **A record or a report is on disk until the run's end has been delivered.** The record goes
+  only when the report is made, and the report (`runs/<run id>.<epoch>.finished.json`) takes its
+  place in the same step (`RecordHandle::report_made`), the directory synced between the two.
+  The report goes once the outbox forgets the run (its end written on a connection that stayed
+  up for the retention), on an orderly end of the process when its end was written to a
+  connection (`Shared::forget_written_reports`), or when another execution of the run replaces
+  it in the outbox. A report that cannot be written does not stop the record from going: the
+  run is then lost on a restart before the server has its end, as before the kept report. At
+  the start a record of a newer execution of the run wins over its kept report. Only the newest
+  handle of a run id writes or removes a record or a report (`Records`); all of them take one
+  lock in turn, so a write of one run's record waits for another's. Every step that a host which takes the run back may do
+  again is harmless done twice: the push (a branch at the run's head is up to date, with git and
+  with the host's own client; a push refused because the branch reached that head meanwhile
+  counts as pushed), `/output` (the record lists each file as it is saved: at most the one in
+  flight is uploaded again), the session bundle (the server keeps the latest), `run.finished`
+  (a server that has it ignores it).
+- **After a leak nothing of the run leaves the host, also across a restart.** The leak is in the
+  record with the mark, before the sandbox stops (`EndRecord::leak`); a mark that cannot be
+  written drops the record before the sandbox stops, and the run is lost rather than pushed.
+- **An abort is looked at between the steps of a run's end** (`aborted_in_the_end`, and once in
+  `take_back` before its report): no further step begins, and the run makes no report. The step
+  under way finishes: the rest of its files of `/output`, the push of its remaining
+  repositories, or its session bundle. No cleanup of an aborted or finished execution touches
+  the workspace of a newer execution of the run (`Shared::no_newer_execution`).
 - **What lives until the run ends is held by `execute`.** The VM the sandbox did not take, the
   `SandboxReader` (the sandbox's front's last owner), the skills' leases, the attachments, the
   clones, the tokens' renewal, the handle of `/output` and the home's lease are its locals or

@@ -681,6 +681,9 @@ async fn a_cancelled_run_takes_its_work_back_and_deletes_its_vm() {
 const RESTART_DIR: &str = "TINFIRM_TEST_VM_RESTART_DIR";
 const RESTART_URL: &str = "TINFIRM_TEST_VM_RESTART_URL";
 const RESTART_PUBLISH: &str = "TINFIRM_TEST_VM_RESTART_PUBLISH";
+/// Set: host A's run halts for good once its outcome is decided in the run's end, after it
+/// writes the file `halted` in the test's directory.
+const RESTART_HALT: &str = "TINFIRM_TEST_VM_RESTART_HALT";
 
 /// The hosts of the VM restart test: the fake driver keeps its VMs in a file, so the driver
 /// of the host that restarted has them, and they outlive the host that is killed. With
@@ -709,7 +712,17 @@ fn vm_restart_test_host_a() {
         .build()
         .unwrap()
         .block_on(async {
-            let setup = restart_setup(&dir, publish);
+            let mut setup = restart_setup(&dir, publish);
+            if std::env::var_os(RESTART_HALT).is_some() {
+                let marker = dir.join("halted");
+                setup.options = Some(Box::new(move |opts| {
+                    opts.halt_at = Some(tinfirm_runner_host::run::HaltAt {
+                        step: tinfirm_runner_host::run::EndStep::Decided,
+                        marker,
+                        resume: false,
+                    });
+                }));
+            }
             let _host = start_host_at(&dir.join("host"), &url, setup).await;
             std::future::pending::<()>().await;
         });
@@ -717,6 +730,11 @@ fn vm_restart_test_host_a() {
 
 /// Host A of the VM restart tests ([`vm_restart_test_host_a`]), on `dir`, connecting to `url`.
 fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool) -> HostProcess {
+    vm_host_a_halting(dir, url, publish, false)
+}
+
+/// [`vm_host_a`]; with `halt`, its run halts once its outcome is decided ([`RESTART_HALT`]).
+fn vm_host_a_halting(dir: &std::path::Path, url: &str, publish: bool, halt: bool) -> HostProcess {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -730,6 +748,9 @@ fn vm_host_a(dir: &std::path::Path, url: &str, publish: bool) -> HostProcess {
         .stdout(std::process::Stdio::null());
     if publish {
         command.env(RESTART_PUBLISH, "1");
+    }
+    if halt {
+        command.env(RESTART_HALT, "1");
     }
     HostProcess::spawn(command)
 }
@@ -886,6 +907,85 @@ async fn a_host_that_restarted_dials_the_port_its_record_keeps() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_vm_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener() {
     with_timeout(180, a_host_that_restarted_takes_back_the_run(false, true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_in_the_end_of_a_vms_run_is_finished_by_the_next_with_the_agents_outcome() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host_a = vm_host_a_halting(dir.path(), &server.url, false, true);
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("end-window", Some(&repo.url));
+        conn.send(spec.to_json());
+        // The work came back from the VM, the VM went, and the outcome is in the record.
+        let marker = dir.path().join("halted");
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while !marker.exists() {
+            assert!(std::time::Instant::now() < deadline, "host A never halted");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let record = dir
+            .path()
+            .join(format!("host/data/runs/{}.json", spec.run_id));
+        let kept: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        assert_eq!(kept["collected"], true, "{kept:#}");
+        assert!(kept["end"]["outcome"].is_object(), "{kept:#}");
+        host_a.crash();
+        let log = dir.path().join("driver.log");
+        // Host A deleted the run's VM before it halted.
+        assert_eq!(
+            calls_of(&vm_driver_calls(&log), "delete").len(),
+            1,
+            "{:#?}",
+            vm_driver_calls(&log)
+        );
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+
+        // Host B takes the run back from its disk: it needs no VM, and creates none.
+        let creates = calls_of(&vm_driver_calls(&log), "create").len();
+        let host = start_host_at(
+            &dir.path().join("host"),
+            &server.url,
+            restart_setup(dir.path(), false),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        let hello = conn.handshake(1).await;
+        assert_eq!(hello["activeRuns"][0]["runId"], spec.run_id.to_string());
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{}", t.text());
+        assert_eq!(finished["usage"]["outputTokens"], 20, "{}", t.text());
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert!(
+            finished["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("Done: the work is in done.txt.")),
+            "{}",
+            t.text()
+        );
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "done.txt").as_deref(),
+            Some("the finished work\n")
+        );
+        let calls = vm_driver_calls(&log);
+        assert_eq!(calls_of(&calls, "create").len(), creates, "{calls:#?}");
+        let state: Vec<Value> =
+            serde_json::from_slice(&std::fs::read(dir.path().join("vms.json")).unwrap()).unwrap();
+        assert!(
+            state.iter().all(|vm| vm["state"] != "running"),
+            "{state:#?}"
+        );
+        assert!(!record.exists());
+        assert!(!host.paths.workspace(spec.run_id).exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

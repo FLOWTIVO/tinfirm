@@ -486,6 +486,24 @@ const RESTART_URL: &str = "TINFIRM_TEST_RESTART_URL";
 const RESTART_V2: &str = "TINFIRM_TEST_RESTART_V2";
 /// Set, in host A: the program its readers run ([`held_reader`]).
 const RESTART_READER: &str = "TINFIRM_TEST_RESTART_READER";
+/// Set, in host A: the moment of a run's end at which its run halts for good ([`halt_step`]),
+/// once it has written the file `halted` in host A's directory.
+const RESTART_HALT: &str = "TINFIRM_TEST_RESTART_HALT";
+
+/// The moment of a run's end that [`RESTART_HALT`] names.
+fn halt_step(name: &str) -> tinfirm_runner_host::run::EndStep {
+    use tinfirm_runner_host::run::EndStep;
+    match name {
+        "stopped" => EndStep::Stopped,
+        "decided" => EndStep::Decided,
+        "pushed" => EndStep::Pushed,
+        "reported" => EndStep::Reported,
+        "stopping" => EndStep::Stopping,
+        "report-kept" => EndStep::ReportKept,
+        "output-file-saved" => EndStep::OutputFileSaved,
+        other => panic!("no moment of a run's end is called {other}"),
+    }
+}
 
 /// The setup of both hosts of a restart test.
 fn restart_setup(v2: bool) -> HostSetup {
@@ -510,13 +528,23 @@ fn restart_test_host_a() {
         .block_on(async {
             let v2 = std::env::var_os(RESTART_V2).is_some();
             let mut setup = restart_setup(v2);
-            if let Some(reader) = std::env::var_os(RESTART_READER).map(PathBuf::from) {
-                setup.options = Some(Box::new(move |opts| {
+            let reader = std::env::var_os(RESTART_READER).map(PathBuf::from);
+            let halt =
+                std::env::var(RESTART_HALT)
+                    .ok()
+                    .map(|step| tinfirm_runner_host::run::HaltAt {
+                        step: halt_step(&step),
+                        marker: std::path::Path::new(&dir).join("halted"),
+                        resume: false,
+                    });
+            setup.options = Some(Box::new(move |opts| {
+                if let Some(reader) = reader {
                     let bridge = opts.bridge.as_mut().expect("a bridged host");
                     bridge.reader = tinfirm_runner_host::reader::Reader::new(reader)
                         .allowing_unconfined(bridge.reader.allows_unconfined());
-                }));
-            }
+                }
+                opts.halt_at = halt;
+            }));
             let _host = start_host_at(std::path::Path::new(&dir), &url, setup).await;
             std::future::pending::<()>().await;
         });
@@ -602,6 +630,17 @@ fn host_process_reading(
     v2: bool,
     reader: Option<&std::path::Path>,
 ) -> HostProcess {
+    host_process_with(dir, url, v2, reader, None)
+}
+
+/// [`host_process_reading`]; with `halt`, a run's end halts at that moment ([`RESTART_HALT`]).
+fn host_process_with(
+    dir: &std::path::Path,
+    url: &str,
+    v2: bool,
+    reader: Option<&std::path::Path>,
+    halt: Option<&str>,
+) -> HostProcess {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args(["restart_test_host_a", "--exact", "--ignored", "--nocapture"])
@@ -613,6 +652,9 @@ fn host_process_reading(
     }
     if let Some(reader) = reader {
         command.env(RESTART_READER, reader);
+    }
+    if let Some(halt) = halt {
+        command.env(RESTART_HALT, halt);
     }
     HostProcess::spawn(command)
 }
@@ -1911,6 +1953,1264 @@ async fn a_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener
         assert_eq!(listener.server.run_count(), 0);
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+// ----- a host that dies in a run's end (ADR-0101) -----------------------------------------
+
+/// A run of protocol 2 with a session bundle to store, of `scenario` with `extra` in its
+/// prompt. The `end-window` scenario ends its turn by itself, with work to push, files in
+/// `/output` and its session.
+fn end_run(
+    scenario: &'static str,
+    repo_url: &str,
+    extra: &str,
+) -> (AssignSpec<'static>, serde_json::Value) {
+    let mut spec = AssignSpec::new(scenario, Some(repo_url));
+    spec.protocol_version = 2;
+    spec.prompt_extra = extra.to_string();
+    let mut frame = spec.to_json();
+    frame["sessionBundle"] = json!({});
+    (spec, frame)
+}
+
+/// Waits until a host in a process of its own has halted where the test asked ([`RESTART_HALT`]).
+async fn until_halted(dir: &std::path::Path) {
+    let marker = dir.join("halted");
+    let started = std::time::Instant::now();
+    while !marker.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "the host never reached the moment of the run's end"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    std::fs::remove_file(&marker).unwrap();
+}
+
+/// What a killed host's connection carried after the kill: the frames until it closed. None is
+/// a `run.finished`: the killed host reported nothing of the run's end.
+async fn assert_no_end_reported(conn: &mut Conn, run_id: uuid::Uuid) {
+    while conn.next().await.is_some() {}
+    let id = run_id.to_string();
+    assert!(
+        !conn
+            .frames
+            .iter()
+            .any(|f| f["type"] == "run.finished" && f["runId"] == id),
+        "the killed host reported the run's end"
+    );
+}
+
+/// The take-back record of the run in `dir`, as JSON.
+fn kept_record(dir: &std::path::Path, run_id: uuid::Uuid) -> serde_json::Value {
+    let path = dir.join(format!("data/runs/{run_id}.json"));
+    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+}
+
+/// The run's kept report ([`tinfirm_runner_host::takeback::ReportRecord`]).
+fn kept_report(dir: &std::path::Path, run_id: uuid::Uuid, epoch: i64) -> PathBuf {
+    dir.join(format!("data/runs/{run_id}.{epoch}.finished.json"))
+}
+
+/// The names of the kept reports in `dir`'s records.
+fn kept_reports(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir.join("data/runs"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|name| name.ends_with(".finished.json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Host A, in a process of its own, gets `frame` and halts at `halt` of the run's end; `while_halted`
+/// acts on its connection then. Then it is killed (SIGKILL). The directories.
+async fn host_a_killed_at(
+    server: &mut FakeServer,
+    spec: &AssignSpec<'_>,
+    frame: serde_json::Value,
+    halt: &str,
+    while_halted: impl AsyncFnOnce(&mut Conn),
+) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host_a = host_process_with(dir.path(), &server.url, true, None, Some(halt));
+    let mut conn = server.accept().await;
+    conn.handshake(1).await;
+    conn.send(frame);
+    until_halted(dir.path()).await;
+    while_halted(&mut conn).await;
+    host_a.crash();
+    assert_no_end_reported(&mut conn, spec.run_id).await;
+    dir
+}
+
+/// [`host_a_killed_at`] with the `end-window` run (`extra` in its prompt). Before the kill, the
+/// sandbox has stopped and the record says that the work came back in the run's end.
+async fn a_host_killed_in_the_runs_end(
+    server: &mut FakeServer,
+    repo_url: &str,
+    halt: &str,
+    extra: &str,
+) -> (tempfile::TempDir, AssignSpec<'static>, PathBuf) {
+    let (spec, frame) = end_run("end-window", repo_url, extra);
+    let dir = host_a_killed_at(server, &spec, frame, halt, async |_| {}).await;
+    let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
+    let kept = kept_record(dir.path(), spec.run_id);
+    assert_eq!(kept["collected"], true, "{kept:#}");
+    assert_eq!(kept["version"], 2, "{kept:#}");
+    assert!(kept["end"].is_object(), "{kept:#}");
+    assert_eq!(kept["repos"][0]["collected"]["result"], "ok", "{kept:#}");
+    (dir, spec, record)
+}
+
+/// The setup of the host that finishes a run: it forgets a delivered report after a second of
+/// connection, not 3 minutes.
+fn next_host_setup() -> HostSetup {
+    HostSetup {
+        options: Some(Box::new(|opts| {
+            opts.finished_retention = Duration::from_secs(1);
+        })),
+        ..restart_setup(true)
+    }
+}
+
+/// Host B, on the directories of the host killed in `dir`: it takes the run back, finishes it
+/// and reports it, once; `after_hello` acts on its connection first. Its transcript, once its
+/// kept report is gone and the host has stopped; and nothing of the run is left on this host.
+async fn finished_by_the_next_host_after(
+    server: &mut FakeServer,
+    dir: &std::path::Path,
+    spec: &AssignSpec<'_>,
+    after_hello: impl AsyncFnOnce(&mut Conn),
+) -> Transcript {
+    let host = start_host_at(dir, &server.url, next_host_setup()).await;
+    let mut conn = server.accept().await;
+    let hello = conn.handshake(1).await;
+    assert_eq!(
+        hello["activeRuns"][0]["runId"],
+        spec.run_id.to_string(),
+        "{hello}"
+    );
+    after_hello(&mut conn).await;
+    let t = conn.until_finished(spec.run_id).await;
+    t.assert_no_secrets();
+    // The report goes once the connection stayed up for the retention after it.
+    let report = kept_report(dir, spec.run_id, spec.epoch);
+    let started = std::time::Instant::now();
+    while report.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the delivered report stays"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    host.shutdown.cancel();
+    host.handle.await.unwrap().unwrap();
+    while conn.next().await.is_some() {}
+    // The end was reported once, and the server's frames got no complaint back.
+    let id = spec.run_id.to_string();
+    let ends = conn
+        .frames
+        .iter()
+        .filter(|f| f["type"] == "run.finished" && f["runId"] == id)
+        .count();
+    assert_eq!(ends, 1, "{}", t.text());
+    assert!(
+        !conn.frames.iter().any(|f| f["type"] == "error"),
+        "{:?}",
+        conn.frames
+    );
+    // Nothing of the run is left: its record and report, its workspace and the sandbox's
+    // stand-in beside it, its /output, its attachments.
+    let paths = &host.paths;
+    assert!(!dir.join(format!("data/runs/{id}.json")).exists());
+    let workspace = paths.workspace(spec.run_id);
+    assert!(!workspace.exists());
+    assert!(
+        !tinfirm_runner_host::sandbox_files::Layout::local(&workspace)
+            .local_root
+            .is_some_and(|root| root.exists())
+    );
+    assert!(!paths.output(spec.run_id).exists());
+    assert!(!paths.attachments(spec.run_id).exists());
+    // A run that failed keeps its workspace for inspection, as any failed run does.
+    let failed = paths.data_dir.join("failed-workspaces").join(&id);
+    assert_eq!(
+        failed.exists(),
+        t.finished()["outcome"] == "FAILED",
+        "{}",
+        t.text()
+    );
+    t
+}
+
+/// [`finished_by_the_next_host_after`], with nothing done after the hello.
+async fn finished_by_the_next_host(
+    server: &mut FakeServer,
+    dir: &std::path::Path,
+    spec: &AssignSpec<'_>,
+) -> Transcript {
+    finished_by_the_next_host_after(server, dir, spec, async |_| {}).await
+}
+
+/// The uploads of the run's `/output` file `name` and of its session bundle.
+fn uploads_of_named(server: &FakeServer, name: &str) -> (usize, usize) {
+    let uploads = server.uploads.lock().unwrap();
+    let output = uploads
+        .iter()
+        .filter(|u| !u.path.contains("/session-bundle") && u.file_name() == name)
+        .count();
+    let bundles = uploads
+        .iter()
+        .filter(|u| u.path.contains("/session-bundle"))
+        .count();
+    (output, bundles)
+}
+
+/// [`uploads_of_named`] of `report.md`.
+fn uploads_of(server: &FakeServer) -> (usize, usize) {
+    uploads_of_named(server, "report.md")
+}
+
+/// The run ended as its agent did: succeeded, with the agent's summary and usage, its work
+/// pushed to the run's branch, `/output` listed and its session stored.
+fn assert_the_agents_outcome(t: &Transcript, repo: &TestRepo) {
+    let finished = t.finished();
+    assert_eq!(finished["outcome"], "SUCCEEDED", "{}", t.text());
+    assert!(finished.get("failureClass").is_none(), "{}", t.text());
+    assert!(
+        finished["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("Done: the work is in done.txt.")),
+        "{}",
+        t.text()
+    );
+    assert_eq!(finished["usage"]["outputTokens"], 20, "{}", t.text());
+    assert_eq!(finished["resumeOutcome"], "FIRST_RUN", "{}", t.text());
+    assert!(finished["sessionId"].is_string(), "{}", t.text());
+    assert_eq!(finished["sessionBundle"], "STORED", "{}", t.text());
+    assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+    let artifacts = finished["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no artifacts: {}", t.text()));
+    assert!(
+        artifacts.iter().any(|a| a["name"] == "report.md"),
+        "{}",
+        t.text()
+    );
+    assert_eq!(
+        repo.file_at("agent/TEST-1", "done.txt").as_deref(),
+        Some("the finished work\n")
+    );
+    // One WIP commit on the branch: the work was pushed once.
+    assert_eq!(
+        repo.subjects("agent/TEST-1").len(),
+        2,
+        "{:?}",
+        repo.subjects("agent/TEST-1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_once_the_runs_outcome_is_decided_is_finished_by_the_next_with_that_outcome()
+{
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) =
+            a_host_killed_in_the_runs_end(&mut server, &repo.url, "decided", "").await;
+        let kept = kept_record(dir.path(), spec.run_id);
+        let outcome = &kept["end"]["outcome"];
+        assert!(outcome["summary"].is_string(), "{kept:#}");
+        assert!(outcome.get("failureClass").is_none(), "{kept:#}");
+        assert!(kept["end"].get("artifacts").is_none(), "{kept:#}");
+        // Host A pushed nothing and saved nothing of /output.
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        assert_eq!(uploads_of(&server), (0, 0));
+
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        assert!(
+            t.text().contains("restarted at the end of the run"),
+            "{}",
+            t.text()
+        );
+        assert_eq!(uploads_of(&server), (1, 1));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_right_after_the_sandbox_stopped_has_its_run_pushed_and_reported_as_taken_back()
+ {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) =
+            a_host_killed_in_the_runs_end(&mut server, &repo.url, "stopped", "").await;
+        let kept = kept_record(dir.path(), spec.run_id);
+        assert!(kept["end"].get("outcome").is_none(), "{kept:#}");
+
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        let finished = t.finished();
+        // The agent's outcome was not in the record yet: the run is reported as taken back,
+        // with what was saved.
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "INFRA");
+        let message = finished["failureMessage"].as_str().unwrap();
+        for part in [
+            "restarted at the end of the run",
+            "the agent's turn had ended",
+            "its work was pushed",
+            "its session was kept",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(finished["artifacts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(finished["sessionBundle"], "STORED", "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "done.txt").as_deref(),
+            Some("the finished work\n")
+        );
+        assert_eq!(uploads_of(&server), (1, 1));
+    })
+    .await;
+}
+
+/// A run whose agent leaked a credential value, its host killed at `halt` of its end: the next
+/// host lets nothing of it leave, and reports the leak.
+async fn a_leak_survives_a_restart_in_the_runs_end(halt: &str) {
+    let repo = TestRepo::new();
+    let mut server = FakeServer::start().await;
+    // The run's token expires in an hour: a host that takes a run back renews every token that
+    // expires before it pushes, unless the run leaked.
+    let (mut spec, _) = end_run("end-window", &repo.url, "[leak]");
+    spec.workspaces = vec![WorkspaceEntry::new("repo", "Repo", &repo.url).expiring(
+        TEST_GIT_TOKEN,
+        chrono::Utc::now() + chrono::TimeDelta::minutes(60),
+        TEST_MIRROR_KEY,
+    )];
+    let mut frame = spec.to_json();
+    frame["sessionBundle"] = json!({});
+    let dir = host_a_killed_at(&mut server, &spec, frame, halt, async |_| {}).await;
+    // The leak is in the record with its mark, before the sandbox stopped.
+    let kept = kept_record(dir.path(), spec.run_id);
+    assert_eq!(kept["end"]["leak"], true, "{kept:#}");
+    assert!(
+        kept["assign"]["workspaces"][0]["git"]["expiresAt"].is_string(),
+        "{kept:#}"
+    );
+
+    let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+    let finished = t.finished();
+    assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+    assert_eq!(finished["failureClass"], "CREDENTIAL_LEAK", "{}", t.text());
+    assert_eq!(finished["git"][0]["pushed"], false, "{}", t.text());
+    assert_ne!(finished["sessionBundle"], "STORED", "{}", t.text());
+    assert!(repo.branch_head("agent/TEST-1").is_none());
+    // No file of /output and no session bundle left the host, before or after the restart.
+    assert!(server.uploads.lock().unwrap().is_empty());
+    // A run that leaked asks for no new git token.
+    assert!(!t.text().contains("GIT_TOKEN"), "{}", t.text());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leak_whose_host_died_while_the_sandbox_stopped_leaves_nothing_after_a_restart() {
+    with_timeout(180, a_leak_survives_a_restart_in_the_runs_end("stopped")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leak_whose_host_died_once_the_outcome_was_decided_leaves_nothing_after_a_restart() {
+    with_timeout(180, a_leak_survives_a_restart_in_the_runs_end("decided")).await;
+}
+
+/// A run that the server cancelled, its host killed at `halt` of its end: the next host pushes
+/// its work and reports it cancelled.
+async fn a_cancel_survives_a_restart_in_the_runs_end(halt: &str) {
+    let repo = TestRepo::new();
+    let mut server = FakeServer::start().await;
+    let (spec, frame) = end_run("slow", &repo.url, "");
+    let dir = tempfile::tempdir().unwrap();
+    let mut host_a = host_process_with(dir.path(), &server.url, true, None, Some(halt));
+    let mut conn = server.accept().await;
+    conn.handshake(1).await;
+    conn.send(frame);
+    conn.until_agent_says(spec.run_id, "tick").await;
+    conn.send(json!({"type": "run.cancel", "runId": spec.run_id, "epoch": 1}));
+    until_halted(dir.path()).await;
+    host_a.crash();
+    assert_no_end_reported(&mut conn, spec.run_id).await;
+    let kept = kept_record(dir.path(), spec.run_id);
+    assert_eq!(kept["end"]["cancelled"], true, "{kept:#}");
+
+    let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+    let finished = t.finished();
+    assert_eq!(finished["outcome"], "CANCELLED", "{}", t.text());
+    assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+    assert_eq!(
+        repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+        Some("work in progress\n")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_whose_host_died_while_the_sandbox_stopped_ends_cancelled_after_a_restart() {
+    with_timeout(180, a_cancel_survives_a_restart_in_the_runs_end("stopped")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_whose_host_died_once_the_outcome_was_decided_ends_cancelled_after_a_restart() {
+    with_timeout(180, a_cancel_survives_a_restart_in_the_runs_end("decided")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_the_runs_end_decided_is_reported_by_the_next_host() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (spec, frame) = end_run("refusal", &repo.url, "");
+        let dir = host_a_killed_at(&mut server, &spec, frame, "decided", async |_| {}).await;
+        let kept = kept_record(dir.path(), spec.run_id);
+        assert_eq!(
+            kept["end"]["outcome"]["failureClass"], "MODEL_REFUSED",
+            "{kept:#}"
+        );
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "MODEL_REFUSED", "{}", t.text());
+        assert!(
+            finished["failureMessage"]
+                .as_str()
+                .is_some_and(|m| m.contains("refusal")),
+            "{}",
+            t.text()
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_in_the_runs_end_stays_with_the_record_and_the_next_host_does_not_push() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        let component = spec.workspaces[0].component_id;
+        let run_id = spec.run_id;
+        // Host A gets the revocation while it is in the run's end, applies and confirms it.
+        let dir = host_a_killed_at(&mut server, &spec, frame, "decided", async |conn| {
+            conn.send(git_revoke(run_id, 1, &[component], REVOKED));
+            let id = run_id.to_string();
+            conn.take_where("the confirmation", |f| {
+                f["type"] == "run.git.revoked" && f["runId"] == id
+            })
+            .await;
+        })
+        .await;
+        let text =
+            std::fs::read_to_string(dir.path().join(format!("data/runs/{run_id}.json"))).unwrap();
+        assert!(!text.contains(TEST_GIT_TOKEN), "{text}");
+        let kept: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(kept["revoked"][0]["componentId"], component.to_string());
+
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        let finished = t.finished();
+        // The revoked repository's commits stay on the host: GIT_ERROR, as in the run's end.
+        assert_eq!(finished["outcome"], "FAILED", "{}", t.text());
+        assert_eq!(finished["failureClass"], "GIT_ERROR", "{}", t.text());
+        assert_eq!(finished["git"][0]["pushed"], false, "{}", t.text());
+        assert!(t.text().contains(&format!("not pushed: {REVOKED}")));
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abort_at_the_next_host_of_a_run_in_its_end_pushes_and_reports_nothing() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, record) =
+            a_host_killed_in_the_runs_end(&mut server, &repo.url, "decided", "").await;
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake_listing(1, SERVER_FEATURES).await;
+        // The run waits for welcome.done; the server calls its execution stale meanwhile.
+        conn.send(json!({
+            "type": "error",
+            "code": "STALE_EPOCH",
+            "message": "epoch 1 is stale",
+            "runId": spec.run_id,
+            "epoch": 1
+        }));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        conn.send(json!({"type": "welcome.done"}));
+        let id = spec.run_id.to_string();
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            while conn.next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            !conn
+                .frames
+                .iter()
+                .any(|f| f["type"] == "run.finished" && f["runId"] == id),
+            "an aborted run reports nothing"
+        );
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        assert_eq!(uploads_of(&server), (0, 0));
+        assert!(!record.exists());
+        assert!(!kept_report(dir.path(), spec.run_id, 1).exists());
+        assert!(!host.paths.workspace(spec.run_id).exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_during_the_push_has_its_run_pushed_once_by_the_next() {
+    use common::git_http::{GitHttpServer, test_git_authorization};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(test_git_authorization())).await;
+        let url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host_a = host_process_with(dir.path(), &server.url, true, None, None);
+        // Host A is killed while its push is with the repository: after the client sent it,
+        // before the repository took it. What host A started (git's push) lives on.
+        let pid = Arc::new(AtomicU32::new(host_a.id()));
+        let killed = Arc::new(AtomicBool::new(false));
+        {
+            let (pid, killed) = (pid.clone(), killed.clone());
+            git_server.before_push(move || {
+                if killed.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let pid = pid.load(Ordering::SeqCst);
+                std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .unwrap();
+                while !ended(pid) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("end-window", &url, "");
+        conn.send(frame);
+        assert_no_end_reported(&mut conn, spec.run_id).await;
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "host A ended before its push"
+        );
+        host_a.crash();
+        // The push that host A had started has ended, with the repository's answer or without.
+        let started = std::time::Instant::now();
+        while git_server
+            .seen()
+            .iter()
+            .any(|r| r.path.ends_with("/git-receive-pack") && r.status == 0)
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let before = repo.branch_head("agent/TEST-1");
+
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        // The branch is at the run's head: pushed by host A's push or by host B's, once.
+        let head = repo.branch_head("agent/TEST-1").unwrap();
+        assert_eq!(t.finished()["git"][0]["headSha"], head.as_str());
+        if let Some(before) = before {
+            assert_eq!(before, head, "host B pushed another head");
+        }
+        assert_eq!(uploads_of(&server).0, 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_refused_because_the_branch_reached_the_runs_head_meanwhile_counts_as_pushed() {
+    use common::git_http::{GitHttpServer, test_git_authorization};
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let git_server =
+            GitHttpServer::start(repo.dir.path(), Some(test_git_authorization())).await;
+        let url = format!("{}/origin.git", git_server.url);
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) = a_host_killed_in_the_runs_end(&mut server, &url, "decided", "").await;
+        // Between host B's look at the branch and its update, another push (as host A's own
+        // `git push`, which outlived it, would) puts the run's head on the branch: B's update
+        // is refused.
+        let clone = dir
+            .path()
+            .join(format!("data/workspaces/{}/repo", spec.run_id));
+        let bare = repo.bare.clone();
+        git_server.before_push(move || {
+            git(
+                &clone,
+                &[
+                    "push",
+                    "-q",
+                    bare.to_str().unwrap(),
+                    "HEAD:refs/heads/agent/TEST-1",
+                ],
+            );
+        });
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        assert!(
+            t.text().contains("is at the run's head already"),
+            "{}",
+            t.text()
+        );
+        assert_eq!(
+            t.finished()["git"][0]["headSha"],
+            repo.branch_head("agent/TEST-1").unwrap().as_str()
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_between_two_files_of_output_has_only_the_others_saved_by_the_next() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) = a_host_killed_in_the_runs_end(
+            &mut server,
+            &repo.url,
+            "output-file-saved",
+            "[second-output]",
+        )
+        .await;
+        // Host A saved the first file (by path, appendix.md) and the record says so.
+        let kept = kept_record(dir.path(), spec.run_id);
+        assert_eq!(
+            kept["end"]["artifacts"][0]["name"], "appendix.md",
+            "{kept:#}"
+        );
+        assert!(kept["end"].get("outputSaved").is_none(), "{kept:#}");
+        assert_eq!(uploads_of_named(&server, "appendix.md").0, 1);
+        assert_eq!(uploads_of(&server).0, 0);
+        let first = server.uploads.lock().unwrap()[0].attachment_id.to_string();
+
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        // Each file was uploaded once; the report lists both, the first with host A's id.
+        assert_eq!(uploads_of_named(&server, "appendix.md").0, 1);
+        assert_eq!(uploads_of(&server).0, 1);
+        let artifacts = t.finished()["artifacts"].as_array().unwrap().clone();
+        assert_eq!(artifacts.len(), 2, "{}", t.text());
+        let appendix = artifacts
+            .iter()
+            .find(|a| a["name"] == "appendix.md")
+            .unwrap();
+        assert_eq!(appendix["attachmentId"], first.as_str());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_after_the_push_and_before_the_report_is_made_has_its_end_reported_once() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) =
+            a_host_killed_in_the_runs_end(&mut server, &repo.url, "reported", "").await;
+        // Host A pushed, saved /output and stored the session; the record keeps the files.
+        let pushed = repo.branch_head("agent/TEST-1").expect("host A pushed");
+        assert_eq!(uploads_of(&server), (1, 1));
+        let kept = kept_record(dir.path(), spec.run_id);
+        assert_eq!(kept["end"]["artifacts"][0]["name"], "report.md", "{kept:#}");
+        assert_eq!(kept["end"]["outputSaved"], true, "{kept:#}");
+
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        // The branch was at the run's head already; /output is not saved again, the session
+        // bundle is stored again (the server keeps the latest).
+        assert_eq!(
+            repo.branch_head("agent/TEST-1").as_deref(),
+            Some(pushed.as_str())
+        );
+        assert_eq!(uploads_of(&server), (1, 2));
+        let listed = &t.finished()["artifacts"][0]["attachmentId"];
+        let first = server.uploads.lock().unwrap()[0].attachment_id.to_string();
+        assert_eq!(listed, first.as_str(), "{}", t.text());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_with_its_report_undelivered_has_it_delivered_once_by_the_next() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        // Host A makes and keeps the report, and dies before the server has it.
+        let dir = host_a_killed_at(&mut server, &spec, frame, "report-kept", async |_| {}).await;
+        assert!(
+            !dir.path()
+                .join(format!("data/runs/{}.json", spec.run_id))
+                .exists()
+        );
+        let report = kept_report(dir.path(), spec.run_id, 1);
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(kept["finished"]["outcome"], "SUCCEEDED", "{kept:#}");
+        assert_eq!(crate_mode(&report), Some(0o600));
+        let pushed = repo.branch_head("agent/TEST-1").expect("host A pushed");
+        let uploads = server.uploads.lock().unwrap().len();
+
+        // Host B sends the report as it is, and does nothing else of the run.
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        let mut sent = t.finished().clone();
+        sent.as_object_mut().unwrap().remove("type");
+        assert_eq!(sent, kept["finished"]);
+        assert!(t.events().is_empty(), "{}", t.text());
+        assert_eq!(
+            repo.branch_head("agent/TEST-1").as_deref(),
+            Some(pushed.as_str())
+        );
+        assert_eq!(server.uploads.lock().unwrap().len(), uploads);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_the_server_had_already_is_sent_once_more_and_then_forgotten() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host_a = host_process_with(dir.path(), &server.url, true, None, None);
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        conn.send(frame);
+        // The server has the report; host A dies before it forgets it (3 minutes).
+        conn.until_finished(spec.run_id).await;
+        let report = kept_report(dir.path(), spec.run_id, 1);
+        assert!(report.exists());
+        host_a.crash();
+
+        // As a server does for a run that ended, it answers the hello that lists it with
+        // `run.cancel`; host B sends the report once more, which the server ignores, and then
+        // forgets it.
+        let id = spec.run_id;
+        let t = finished_by_the_next_host_after(&mut server, dir.path(), &spec, async |conn| {
+            conn.send(json!({"type": "run.cancel", "runId": id, "epoch": 1}));
+        })
+        .await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.events().is_empty(), "{}", t.text());
+    })
+    .await;
+}
+
+/// A file's mode bits.
+fn crate_mode(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_dies_again_in_the_end_it_took_back_leaves_the_run_to_the_next() {
+    with_timeout(240, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) =
+            a_host_killed_in_the_runs_end(&mut server, &repo.url, "decided", "").await;
+        // Host B, in a process of its own, takes the run back, saves /output, pushes, and is
+        // killed then.
+        let mut host_b = host_process_with(dir.path(), &server.url, true, None, Some("pushed"));
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        until_halted(dir.path()).await;
+        host_b.crash();
+        assert_no_end_reported(&mut conn, spec.run_id).await;
+        let pushed = repo.branch_head("agent/TEST-1").expect("host B pushed");
+        assert_eq!(uploads_of(&server), (1, 0));
+        let kept = kept_record(dir.path(), spec.run_id);
+        assert_eq!(kept["end"]["artifacts"][0]["name"], "report.md", "{kept:#}");
+        assert!(kept["end"]["outcome"].is_object(), "{kept:#}");
+
+        // Host C finishes it.
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        assert_eq!(
+            repo.branch_head("agent/TEST-1").as_deref(),
+            Some(pushed.as_str())
+        );
+        assert_eq!(uploads_of(&server), (1, 1));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_at_the_hello_does_not_change_the_outcome_that_the_runs_end_decided() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) =
+            a_host_killed_in_the_runs_end(&mut server, &repo.url, "decided", "").await;
+        // A cancel that the server held for the run while no host ran it comes at the hello:
+        // the agent's turn had ended, so the run reports its outcome, as its end would have.
+        let id = spec.run_id;
+        let t = finished_by_the_next_host_after(&mut server, dir.path(), &spec, async |conn| {
+            conn.send(json!({"type": "run.cancel", "runId": id, "epoch": 1}));
+        })
+        .await;
+        assert_the_agents_outcome(&t, &repo);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_that_cannot_be_marked_in_the_runs_end_goes_with_the_sandbox_as_before() {
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::bridged()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("gate", Some(&repo.url));
+        conn.send(spec.to_json());
+        conn.wait_running(spec.run_id).await;
+        let record = host
+            .paths
+            .data_dir
+            .join(format!("runs/{}.json", spec.run_id));
+        assert!(record.exists());
+        // The record cannot be written: its temporary file's place is taken.
+        let blocker = record.with_extension("json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        release(&host.paths, spec.run_id);
+        let t = conn.until_finished(spec.run_id).await;
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(
+            t.text()
+                .contains("cannot write in its record that the run's work came back"),
+            "{}",
+            t.text()
+        );
+        assert!(!record.exists());
+        std::fs::remove_dir(&blocker).unwrap();
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+// ----- the kept report across executions and planned stops --------------------------------
+
+/// A host on `dir`, in this process, that forgets a delivered report after a second.
+async fn host_with_short_retention(dir: &std::path::Path, server: &FakeServer) -> TestHost {
+    start_host_at(dir, &server.url, next_host_setup()).await
+}
+
+/// Runs `spec` (`frame`) on `conn` to its end.
+async fn run_to_its_end(
+    conn: &mut Conn,
+    spec: &AssignSpec<'_>,
+    frame: serde_json::Value,
+) -> Transcript {
+    conn.send(frame);
+    let t = conn.until_finished(spec.run_id).await;
+    assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+    t
+}
+
+/// The next start on `dir` lists no run and sends no end of one.
+async fn the_next_start_sends_nothing(dir: &std::path::Path, server: &mut FakeServer) {
+    let host = start_host_at(dir, &server.url, restart_setup(true)).await;
+    let mut conn = server.accept().await;
+    let hello = conn.handshake(1).await;
+    assert!(
+        hello["activeRuns"]
+            .as_array()
+            .is_none_or(|runs| runs.is_empty()),
+        "{hello}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while conn.next().await.is_some() {}
+    })
+    .await;
+    assert!(
+        !conn.frames.iter().any(|f| f["type"] == "run.finished"),
+        "{:?}",
+        conn.frames
+    );
+    host.shutdown.cancel();
+    host.handle.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_report_of_an_older_execution_gives_way_to_the_newer_executions_record() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        // Epoch 2 of the run is in its end when its host dies; a report of epoch 1 is on disk
+        // beside its record (the outbox of an earlier process held it when epoch 2 came).
+        let (mut spec, _) = end_run("end-window", &repo.url, "");
+        spec.epoch = 2;
+        let mut frame = spec.to_json();
+        frame["sessionBundle"] = json!({});
+        let dir = host_a_killed_at(&mut server, &spec, frame, "decided", async |_| {}).await;
+        let records =
+            tinfirm_runner_host::takeback::Records::new(&tinfirm_runner_host::paths::Paths::new(
+                dir.path().join("config"),
+                dir.path().join("data"),
+            ));
+        let older: tinfirm_protocol::RunFinished = serde_json::from_value(json!({
+            "runId": spec.run_id, "epoch": 1, "outcome": "FAILED", "lastSeq": 4,
+            "failureClass": "INFRA", "failureMessage": "the older execution"
+        }))
+        .unwrap();
+        records.save_report(&older).unwrap();
+        assert_eq!(kept_record(dir.path(), spec.run_id)["assign"]["epoch"], 2);
+
+        // The next start takes epoch 2 back and sends nothing of epoch 1.
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_the_agents_outcome(&t, &repo);
+        assert_eq!(t.finished()["epoch"], 2, "{}", t.text());
+        assert!(!t.text().contains("the older execution"), "{}", t.text());
+        assert!(
+            kept_reports(dir.path()).is_empty(),
+            "{:?}",
+            kept_reports(dir.path())
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_run_assigned_again_to_the_same_host_leaves_no_report_of_its_old_execution() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (mut spec, frame) = end_run("end-window", &repo.url, "");
+        run_to_its_end(&mut conn, &spec, frame).await;
+        assert!(kept_report(dir.path(), spec.run_id, 1).exists());
+        // The server gives the run to this host again, as epoch 2.
+        spec.epoch = 2;
+        spec.scenario = "gate";
+        let mut frame = spec.to_json();
+        frame["sessionBundle"] = json!({});
+        conn.send(frame);
+        let id = spec.run_id.to_string();
+        conn.take_where("epoch 2 accepted", |f| {
+            f["type"] == "run.accepted" && f["runId"] == id && f["epoch"] == 2
+        })
+        .await;
+        // Epoch 1's report goes once epoch 2 has taken its place in the outbox.
+        let started = std::time::Instant::now();
+        while kept_report(dir.path(), spec.run_id, 1).exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the report of epoch 1 stays"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        conn.wait_running(spec.run_id).await;
+        release(&host.paths, spec.run_id);
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["epoch"], 2, "{}", t.text());
+        assert!(!kept_report(dir.path(), spec.run_id, 1).exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_stopped_right_after_a_run_ended_leaves_no_report_and_its_next_start_sends_nothing()
+{
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        run_to_its_end(&mut conn, &spec, frame).await;
+        assert!(kept_report(dir.path(), spec.run_id, 1).exists());
+        // SIGTERM: the end was written on the connection, which then closed in order.
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+        assert!(
+            kept_reports(dir.path()).is_empty(),
+            "{:?}",
+            kept_reports(dir.path())
+        );
+        the_next_start_sends_nothing(dir.path(), &mut server).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_drained_right_after_a_run_ended_leaves_no_report_and_its_next_start_sends_nothing()
+{
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_with_short_retention(dir.path(), &server).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        run_to_its_end(&mut conn, &spec, frame).await;
+        assert!(host.host.request_drain());
+        host.handle.await.unwrap().unwrap();
+        assert!(
+            kept_reports(dir.path()).is_empty(),
+            "{:?}",
+            kept_reports(dir.path())
+        );
+        the_next_start_sends_nothing(dir.path(), &mut server).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_stopped_while_cut_off_keeps_its_report_and_its_next_start_sends_it_once() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("gate", &repo.url, "");
+        conn.send(frame);
+        conn.wait_running(spec.run_id).await;
+        // The host is cut off from the server; the run ends meanwhile.
+        server.set_refusing(true);
+        conn.kill();
+        release(&host.paths, spec.run_id);
+        let report = kept_report(dir.path(), spec.run_id, 1);
+        let started = std::time::Instant::now();
+        while !report.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "no report kept"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // SIGTERM while still cut off: the end was never written, so its report stays.
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+        assert!(report.exists());
+        server.set_refusing(false);
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.events().is_empty(), "{}", t.text());
+    })
+    .await;
+}
+
+/// A host in this process whose runs' ends wait at `step` until the test removes
+/// `<dir>/halted`.
+async fn host_pausing_at(
+    dir: &std::path::Path,
+    server: &FakeServer,
+    step: tinfirm_runner_host::run::EndStep,
+) -> TestHost {
+    let marker = dir.join("halted");
+    start_host_at(
+        dir,
+        &server.url,
+        HostSetup {
+            options: Some(Box::new(move |opts| {
+                opts.halt_at = Some(tinfirm_runner_host::run::HaltAt {
+                    step,
+                    marker,
+                    resume: true,
+                });
+            })),
+            ..restart_setup(true)
+        },
+    )
+    .await
+}
+
+/// Waits until a host of [`host_pausing_at`] waits at its step.
+async fn until_paused(dir: &std::path::Path) {
+    let marker = dir.join("halted");
+    let started = std::time::Instant::now();
+    while !marker.exists() {
+        assert!(started.elapsed() < Duration::from_secs(90), "never paused");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The server calls execution `epoch` of `run_id` stale: the host aborts it.
+fn call_stale(conn: &Conn, run_id: uuid::Uuid, epoch: i64) {
+    conn.send(json!({
+        "type": "error",
+        "code": "STALE_EPOCH",
+        "message": format!("epoch {epoch} is stale"),
+        "runId": run_id,
+        "epoch": epoch
+    }));
+    conn.send(json!({"type": "run.cancel", "runId": run_id, "epoch": epoch}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abort_after_the_session_bundle_makes_and_keeps_no_report() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_pausing_at(
+            dir.path(),
+            &server,
+            tinfirm_runner_host::run::EndStep::SessionStored,
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        conn.send(frame);
+        until_paused(dir.path()).await;
+        call_stale(&conn, spec.run_id, 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        std::fs::remove_file(dir.path().join("halted")).unwrap();
+        let id = spec.run_id.to_string();
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            while conn.next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            !conn
+                .frames
+                .iter()
+                .any(|f| f["type"] == "run.finished" && f["runId"] == id),
+            "an aborted run reports nothing"
+        );
+        assert!(
+            kept_reports(dir.path()).is_empty(),
+            "{:?}",
+            kept_reports(dir.path())
+        );
+        assert!(!dir.path().join(format!("data/runs/{id}.json")).exists());
+        assert!(!host.paths.workspace(spec.run_id).exists());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_execution_in_its_end_leaves_the_newer_executions_workspace_alone() {
+    with_timeout(240, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_pausing_at(
+            dir.path(),
+            &server,
+            tinfirm_runner_host::run::EndStep::SessionStored,
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (mut spec, frame) = end_run("end-window", &repo.url, "");
+        conn.send(frame);
+        until_paused(dir.path()).await;
+        // The server gives the run to this host again as epoch 2: epoch 1 is aborted, and epoch
+        // 2 starts once epoch 1 has ended or 20 s have passed.
+        spec.epoch = 2;
+        spec.scenario = "gate";
+        let mut frame = spec.to_json();
+        frame["sessionBundle"] = json!({});
+        conn.send(frame);
+        let id = spec.run_id.to_string();
+        conn.take_where("epoch 2 running", |f| {
+            f["runId"] == id
+                && f["epoch"] == 2
+                && f["eventType"] == "STATUS"
+                && f["payload"]["phase"] == "running"
+        })
+        .await;
+        let workspace = host.paths.workspace(spec.run_id);
+        assert!(workspace.is_dir());
+        // Epoch 1 goes on, sees its abort, and leaves epoch 2's workspace and record alone.
+        std::fs::remove_file(dir.path().join("halted")).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(workspace.is_dir(), "epoch 1 removed epoch 2's workspace");
+        assert_eq!(kept_record(dir.path(), spec.run_id)["assign"]["epoch"], 2);
+        release(&host.paths, spec.run_id);
+        // Epoch 2 waits at the same moment of its end: it goes on too.
+        until_paused(dir.path()).await;
+        std::fs::remove_file(dir.path().join("halted")).unwrap();
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["epoch"], 2, "{}", t.text());
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_whose_mark_cannot_be_written_is_gone_before_the_sandbox_stops() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host_a = host_process_with(dir.path(), &server.url, true, None, Some("stopping"));
+        let group = host_a.id();
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("gate", &repo.url, "");
+        conn.send(frame);
+        conn.wait_running(spec.run_id).await;
+        let record = dir.path().join(format!("data/runs/{}.json", spec.run_id));
+        assert!(record.exists());
+        // The record cannot be written from now on: its temporary file's place is taken.
+        std::fs::create_dir(record.with_extension("json.tmp")).unwrap();
+        let paths = tinfirm_runner_host::paths::Paths::new(
+            dir.path().join("config"),
+            dir.path().join("data"),
+        );
+        release(&paths, spec.run_id);
+        // The sandbox has not stopped yet, and the record is gone already.
+        until_halted(dir.path()).await;
+        assert!(!record.exists());
+        host_a.crash();
+        assert_no_end_reported(&mut conn, spec.run_id).await;
+        // So a restart there does not take the run back from a sandbox that is still there.
+        std::fs::remove_dir(record.with_extension("json.tmp")).unwrap();
+        the_next_start_sends_nothing(dir.path(), &mut server).await;
+        assert!(repo.branch_head("agent/TEST-1").is_none());
+        // What host A started (the sandbox's bridge) goes with the test.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{group}")])
+            .stderr(std::process::Stdio::null())
+            .status();
     })
     .await;
 }

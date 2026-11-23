@@ -32,7 +32,7 @@ use crate::acp::{
     self, AcpControl, AcpInbound, AcpLine, AcpParams, AcpResult, AcpTransport, NotResumed,
     ThoughtLevel,
 };
-use crate::attachments::{self, AttachmentsDir, Upload, UploadSource};
+use crate::attachments::{self, AttachmentsDir, Upload, UploadResponse, UploadSource};
 use crate::credentials::Credential;
 use crate::docker;
 use crate::egress_proxy::{EgressGuard, Rule};
@@ -53,7 +53,9 @@ use crate::sandbox_files::{self, Layout};
 use crate::session_bundles;
 use crate::skills::{self, ProvidedSkill};
 use crate::steer::Steering;
-use crate::takeback::{CollectedRecord, RecordHandle, RepoRecord, RunRecord};
+use crate::takeback::{
+    CollectedRecord, OutcomeRecord, RecordHandle, RepoRecord, RunRecord, SessionRecord,
+};
 use crate::usage::{UsageMode, prompt_usage};
 use crate::util::{
     EVENT_PAYLOAD_MAX, LOG_MESSAGE_MAX, SUMMARY_MAX, shrink_json, truncate_with_marker,
@@ -150,7 +152,7 @@ pub struct EventSink {
 /// The numbers of a run's events.
 struct Numbering {
     seq: u64,
-    /// The run's record while its sandbox lives (ADR-0101): it reserves the event numbers.
+    /// The run's record while it has one (ADR-0101): it reserves the event numbers.
     record: Option<Arc<RecordHandle>>,
 }
 
@@ -192,6 +194,11 @@ impl EventSink {
     /// Keeps the run's record up to date from now on.
     pub fn keep_record(&mut self, record: Arc<RecordHandle>) {
         self.numbering().record = Some(record);
+    }
+
+    /// The run's record, while it has one.
+    pub fn record(&self) -> Option<Arc<RecordHandle>> {
+        self.numbering().record.clone()
     }
 
     /// Nothing is left to take back: the record goes.
@@ -331,6 +338,57 @@ impl Failure {
     }
 }
 
+/// A moment of a run's end (tests only, [`HaltAt`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndStep {
+    /// The work came back and the record says so, or is gone; the sandbox is about to stop.
+    Stopping,
+    /// The work came back and the sandbox stopped; the agent's outcome is not in the record yet.
+    Stopped,
+    /// The agent's outcome is in the record.
+    Decided,
+    /// The first file of `/output` is saved, and the record says so.
+    OutputFileSaved,
+    /// The repositories are pushed (finalized).
+    Pushed,
+    /// The session bundle is stored; the abort is not looked at yet.
+    SessionStored,
+    /// The report is made, and not yet kept.
+    Reported,
+    /// The report is kept ([`RecordHandle::report_made`]) and the record is gone; the report
+    /// is not queued yet.
+    ReportKept,
+}
+
+/// Tests only, and no flag of `run` sets it ([`crate::host::HostOptions::halt_at`]): at `step`
+/// of a run's end, the run's task writes `marker` and waits for good, so that a test kills the
+/// host at that moment; with `resume`, it waits only until the test removes `marker`.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct HaltAt {
+    pub step: EndStep,
+    pub marker: PathBuf,
+    pub resume: bool,
+}
+
+/// Waits for good at `step` when the host's test options say so ([`HaltAt`]); otherwise returns
+/// at once.
+async fn halt_at(shared: &Shared, step: EndStep) {
+    if let Some(halt) = &shared.opts.halt_at
+        && halt.step == step
+    {
+        tracing::warn!(?step, "halted at a moment of a run's end, as the test asks");
+        let _ = std::fs::write(&halt.marker, format!("{step:?}"));
+        if !halt.resume {
+            std::future::pending::<()>().await;
+        }
+        while halt.marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 struct AgentPhase {
     session_id: Option<String>,
     /// Set once the session is open: `None` inside when `session/load` succeeded.
@@ -410,7 +468,11 @@ impl Run<'_> {
 /// clone of its repositories, its files and skills, its sandbox (a VM from the pool, the
 /// sandbox's access to the host, the start), the agent's turn in it, the work that comes back
 /// before the sandbox goes, then the outcome of the agent's phase, `/output`, the git finalize,
-/// the session bundle and the report. A stage that ends the run early returns
+/// the session bundle and the report. With a take-back record, that end is the record's too
+/// (ADR-0101): it says that the work came back before the sandbox stops, keeps the agent's
+/// outcome and the files of `/output` saved as each is known, and goes once the report is
+/// made, so that a host that restarts in the end finishes the run ([`take_back`]). A stage that
+/// ends the run early returns
 /// [`ControlFlow::Break`] with what this function returns. What lives until the run ends is
 /// held here, and goes when this function returns, in the reverse of the order in which it was
 /// made: the VM the sandbox did not take, the sandbox's reader (which holds the sandbox's front
@@ -514,7 +576,8 @@ pub async fn execute(
                 if let Some(files) = started.sandbox.files() {
                     sandbox_reader.set(files, reader_of(shared));
                 }
-                // While the sandbox lives, a host that restarts takes the run back (ADR-0101).
+                // From now until the run's report is made, a host that restarts takes the run
+                // back (ADR-0101).
                 keep_a_take_back_record(&mut run, &started, &repos);
                 run.sink.status(Phase::Running, None);
                 let params = agent_params(&run, &started.spec, &access, dirs.new_home, steering);
@@ -560,19 +623,50 @@ pub async fn execute(
     .await
     {
         ControlFlow::Continue(outcome) => outcome,
-        ControlFlow::Break(end) => return end,
+        ControlFlow::Break(end) => {
+            // Aborted: nothing is left to take back.
+            forget_the_record(&mut run);
+            return end;
+        }
     };
+    // A host that restarts from now on reports this outcome ([`take_back`]).
+    keep_the_outcome(&mut run, &outcome, result.as_ref());
+    halt_at(shared, EndStep::Decided).await;
+
+    // An abort (a stale epoch: the server gave the run to a newer execution) that comes in the
+    // run's end is looked at between its steps: no further step begins, and the run makes no
+    // report. A step under way finishes: the rest of its files of /output, the push of its
+    // remaining repositories, or its session bundle.
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
 
     // --- /output (protocol v2) ----------------------------------------------------------
     // Before the git finalize and the cleanup: what the agent left in /output becomes the
     // artifacts of the job. After a leak nothing leaves the host, as with the push.
     let artifacts = save_the_output(&mut run, dirs.output_root.as_ref(), outcome.leak).await;
+    if dirs.output_root.is_some()
+        && let Some(record) = run.sink.record()
+    {
+        record.output_saved(&artifacts);
+    }
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
 
     // --- git finalize -------------------------------------------------------------------
     let results = finalize_repositories(&mut run, &repos, &mut outcome).await;
+    halt_at(shared, EndStep::Pushed).await;
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
 
     // --- session bundle (ADR-0097) -------------------------------------------------------
     let session_bundle = store_the_session(&mut run, &dirs, &outcome).await;
+    halt_at(shared, EndStep::SessionStored).await;
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
 
     let failed_git = results
         .iter()
@@ -588,12 +682,112 @@ pub async fn execute(
         session_bundle,
     };
     let finished = run.finish(outcome.cancelled, report);
-    cleanup_workspace(
-        shared,
-        &dirs.workspace,
-        finished.outcome == Outcome::Failed || failed_git,
-    );
+    halt_at(shared, EndStep::Reported).await;
+    // The report is made, and the caller queues it at once. It is kept until it cannot be lost
+    // any more, in place of the record, before the workspace goes, so that no record names
+    // work that is gone.
+    keep_the_report(&mut run, &finished);
+    halt_at(shared, EndStep::ReportKept).await;
+    // The workspace's path is the run's, whatever its epoch: one that a newer execution of the
+    // run on this host uses already is left to it.
+    if shared.no_newer_execution(assign.run_id, assign.epoch) {
+        cleanup_workspace(
+            shared,
+            &dirs.workspace,
+            finished.outcome == Outcome::Failed || failed_git,
+        );
+    }
     Some(finished)
+}
+
+/// The run's record goes, if it has one: nothing is left to take back.
+fn forget_the_record(run: &mut Run<'_>) {
+    run.tokens.drop_record();
+    run.sink.drop_record();
+}
+
+/// The run's report is made: a run with a record keeps the report in its place
+/// ([`RecordHandle::report_made`]) until the outbox has delivered it
+/// ([`crate::host::Shared::forget_delivered_reports`]); then the record goes.
+fn keep_the_report(run: &mut Run<'_>, finished: &RunFinished) {
+    if let Some(record) = run.sink.record() {
+        record.report_made(finished);
+    }
+    forget_the_record(run);
+}
+
+/// An abort came in the run's end: nothing more of the run leaves the host, its record goes,
+/// its workspace too, and it reports nothing.
+fn aborted_in_the_end(run: &mut Run<'_>, workspace: &Path) -> bool {
+    if *run.stop_rx.borrow() != Some(StopRequest::Abort) {
+        return false;
+    }
+    let (run_id, epoch) = (run.assign.run_id, run.assign.epoch);
+    tracing::info!(%run_id, epoch, "the run's end stops: a newer execution of the run took it over");
+    forget_the_record(run);
+    // The workspace's path is the run's, whatever its epoch: a newer execution on this host
+    // that uses it already keeps it.
+    if run.shared.no_newer_execution(run_id, epoch) {
+        cleanup_workspace(run.shared, workspace, false);
+    }
+    true
+}
+
+/// How each repository came back from the sandbox, as a record keeps it.
+fn collected_repos(repos: &[Repo<'_>]) -> Vec<(String, CollectedRecord)> {
+    repos
+        .iter()
+        .filter_map(|repo| {
+            let collected = repo.collected.as_ref()?;
+            Some((repo.ws.dir.clone(), CollectedRecord::of(collected)))
+        })
+        .collect()
+}
+
+/// The agent's outcome, into the run's record: what the report says of it, redacted as the
+/// report is, before `/output`, the push and the session bundle. A record that cannot be
+/// written is a warning: a restart then reports the run as taken back.
+fn keep_the_outcome(run: &mut Run<'_>, outcome: &AgentOutcome, result: Option<&RunResult>) {
+    let Some(record) = run.sink.record() else {
+        return;
+    };
+    let (failure_class, failure_message) = match &run.failure.0 {
+        Some((class, message)) => (Some(*class), Some(run.sink.redact(message))),
+        None => (None, None),
+    };
+    let session = match &outcome.not_resumed {
+        None => SessionRecord::NotOpened,
+        Some(None) => SessionRecord::Resumed,
+        Some(Some(why)) => SessionRecord::NotResumed {
+            outcome: why.outcome,
+        },
+    };
+    let kept = OutcomeRecord {
+        failure_class,
+        failure_message,
+        cancelled: outcome.cancelled,
+        leak: outcome.leak,
+        summary: outcome.summary.as_deref().map(|s| run.sink.redact(s)),
+        result: result.map(|r| RunResult {
+            outcome: r.outcome,
+            summary: run.sink.redact(&r.summary),
+            next_steps: r.next_steps.iter().map(|s| run.sink.redact(s)).collect(),
+            open_questions: r
+                .open_questions
+                .iter()
+                .map(|s| run.sink.redact(s))
+                .collect(),
+        }),
+        usage: outcome.usage.clone(),
+        session_id: outcome.session_id.clone(),
+        session,
+    };
+    if !record.outcome_decided(kept) {
+        run.sink.log(
+            LogLevel::Warn,
+            "the runner host cannot write the agent's outcome in its record of the run, so a restart before the run's end is reported would report the run as taken back",
+        );
+    }
 }
 
 /// The run's directories on this host ([`prepare_directories`]).
@@ -1108,8 +1302,9 @@ fn bridge_puts(
     }
 }
 
-/// While the sandbox lives, a host that restarts takes the run back (ADR-0101): the run's
-/// record, for a sandbox on the bridge. A record that cannot be written is a warning.
+/// From the sandbox's start until the run's report is made, a host that restarts takes the run
+/// back (ADR-0101): the run's record, for a sandbox on the bridge. A record that cannot be
+/// written is a warning.
 fn keep_a_take_back_record(run: &mut Run<'_>, started: &StartedSandbox, repos: &[Repo<'_>]) {
     let (shared, assign) = (run.shared, run.assign);
     let Some((kind, bridge_id, session_key, keep)) = started.sandbox.take_back_record() else {
@@ -1147,6 +1342,7 @@ fn keep_a_take_back_record(run: &mut Run<'_>, started: &StartedSandbox, repos: &
             // The holder sets it ([`RunGitTokens::make_record`]).
             redaction: None,
             bridge: keep.as_ref().map(crate::takeback::BridgeRecord::of),
+            end: None,
         });
     match made {
         Ok(record) => run.sink.keep_record(record),
@@ -1193,7 +1389,10 @@ fn agent_params(
 /// After the agent's turn: a front that ended during the run is replaced once
 /// ([`a_new_front_takes_the_sandbox_back`]), a VM that ended under the run fails it with
 /// `INFRA`, the agent stops, and with the bridge its work comes back before the sandbox goes.
-/// The take-back record goes only once the sandbox is gone.
+/// The take-back record says so before the sandbox goes ([`RecordHandle::collected_at_the_end`])
+/// and stays until the run's report is made: a host that restarts meanwhile finishes the run
+/// from this host's disk. A record that cannot say so goes before the sandbox stops, as does
+/// the record of a run whose work did not come back (an abort).
 async fn bring_the_work_back(
     run: &mut Run<'_>,
     mut sandbox: crate::sandbox::Sandbox,
@@ -1258,9 +1457,42 @@ async fn bring_the_work_back(
     {
         run.failure.force(FailureClass::Infra, message);
     }
+    // The work is on this host now. The record says so before the sandbox goes, so that a
+    // restart at any moment finds the work where the record says it is: in the sandbox until
+    // the mark is on disk, here after it.
+    // A record that is not kept goes before the sandbox stops: until then it is the record of a
+    // sandbox that still holds the work, and a host that restarted meanwhile would take the run
+    // back from it, a run that leaked included. Without it, a restart loses the run.
+    let kept = collection.is_some() && keep_the_record_for_the_end(run, repos, agent);
+    if !kept {
+        forget_the_record(run);
+    }
+    halt_at(shared, EndStep::Stopping).await;
     sandbox.stop(Duration::from_secs(5)).await;
-    run.tokens.drop_record();
-    run.sink.drop_record();
+    halt_at(shared, EndStep::Stopped).await;
+}
+
+/// Marks the run's record collected in the run's own end, with what is known already: a leak
+/// of the agent's output (it was stopped for it), and the server's cancel. A host that restarts
+/// keeps to them even when the agent's outcome never reaches the record. Whether the record
+/// stays: `false` without a record, or when the mark cannot be written (a warning: a restart
+/// before the run's end is reported then loses the run, as without a record, which is the safe
+/// side for a run that leaked: nothing of it leaves the host).
+fn keep_the_record_for_the_end(run: &mut Run<'_>, repos: &[Repo<'_>], agent: &AgentPhase) -> bool {
+    let Some(record) = run.sink.record() else {
+        return false;
+    };
+    let leak = matches!(agent.stop, Some(StopCause::Leak));
+    let cancelled = matches!(agent.stop, Some(StopCause::Cancel))
+        || *run.stop_rx.borrow() == Some(StopRequest::Cancel);
+    if record.collected_at_the_end(&collected_repos(repos), leak, cancelled) {
+        return true;
+    }
+    run.sink.log(
+        LogLevel::Warn,
+        "the runner host cannot write in its record that the run's work came back from the sandbox, so a restart before the run's end is reported would lose the run",
+    );
+    false
 }
 
 /// The sandbox's front ended during the run: one new front takes the bridge's session back
@@ -1441,7 +1673,9 @@ async fn save_the_output(
                 "not saving the files of /output: the run leaked a credential value",
             );
         } else {
-            artifacts = collect_output(run.shared, &mut run.sink, run.assign, output_root).await;
+            let record = run.sink.record();
+            artifacts =
+                collect_output(run.shared, &mut run.sink, run.assign, output_root, record).await;
         }
     }
     artifacts
@@ -1466,6 +1700,7 @@ async fn finalize_repositories(
             run.tokens,
             assign.run_id,
             outcome.leak,
+            false,
         )
         .await;
         if finalized.outgoing_leak {
@@ -1539,6 +1774,13 @@ pub enum TakenBackEnd {
 /// the run is reported failed with `INFRA`, or cancelled when the server cancels it meanwhile.
 /// The record stays until the run ends, so a restart while the run waits takes it back again.
 ///
+/// A run whose host restarted in the run's own end ([`RunRecord::end`]) is finished the same
+/// way, from this host's disk: what its end saved already (`/output`) is not saved again, a
+/// push or a session bundle that the earlier process made is made again harmlessly (a branch
+/// at the run's head is up to date), and the run reports the outcome its record keeps, the
+/// failure of a push included, as [`execute`] would have; without one, it is reported failed
+/// with `INFRA`, saying that the agent's turn had ended.
+///
 /// The stages: the run's redaction from its record, its directories and repositories as the
 /// earlier process left them, the sandbox's bridge coming back with the work, the wait for the
 /// server, the stop, and what the run leaves (`save_the_work`, `say_what_was_saved`).
@@ -1577,7 +1819,9 @@ pub async fn take_back(
     let unsafe_record = redact_the_earlier_tokens(&run, &record);
     run.sink.log(
         LogLevel::Warn,
-        if record.collected {
+        if record.end.is_some() {
+            "the runner host restarted at the end of the run, after the agent's turn and once the work had come back from the sandbox: the run's end is finished from this host"
+        } else if record.collected {
             "the runner host restarted again before it pushed the run's work: the work it took from the sandbox is pushed from this host"
         } else {
             "the runner host restarted during the run and takes it back: the agent stops, and its work and its session are saved"
@@ -1585,7 +1829,7 @@ pub async fn take_back(
     );
     run.sink.status(Phase::Finalizing, None);
 
-    let dirs = taken_back_dirs(&mut run);
+    let dirs = taken_back_dirs(&mut run, record.collected);
     let mut repos = restore_repositories(&run, &record, &dirs);
 
     // --- the sandbox's bridge comes back --------------------------------------------------
@@ -1612,12 +1856,17 @@ pub async fn take_back(
                 return TakenBackEnd::Left(held.map(Box::new));
             }
         }
-        if *run.stop_rx.borrow() != Some(StopRequest::Abort) && shared.speaks_v2() {
+        // A run that leaked pushes nothing, so it asks for no new token either.
+        if *run.stop_rx.borrow() != Some(StopRequest::Abort)
+            && shared.speaks_v2()
+            && !leaked_at_the_end(&record)
+        {
             crate::git_refresh::renew(shared, tokens, None).await;
         }
     }
 
     let stop = *run.stop_rx.borrow();
+    let outcome = record.end.as_ref().and_then(|end| end.outcome.as_ref());
     let cancelled = match stop {
         Some(StopRequest::Abort) => {
             if let Some(mut sandbox) = held.take() {
@@ -1629,6 +1878,11 @@ pub async fn take_back(
             cleanup_workspace(shared, &dirs.workspace, false);
             return TakenBackEnd::Aborted;
         }
+        // The outcome that the run's own end decided stands: a cancel that comes after it
+        // changes it no more than it would have in that end. Without it, the cancel that the
+        // record's mark kept stands.
+        _ if outcome.is_some() => outcome.is_some_and(|o| o.cancelled),
+        _ if record.end.as_ref().is_some_and(|end| end.cancelled) => true,
         Some(StopRequest::Cancel) => true,
         None => false,
     };
@@ -1637,12 +1891,26 @@ pub async fn take_back(
     let saved = save_the_work(
         &mut run,
         &record,
+        &kept,
         came_back,
         unsafe_record.as_deref(),
         &repos,
         &dirs,
     )
     .await;
+    // An abort that came while the work was saved: the run makes no report, and nothing more
+    // of it is done here (what was under way has finished).
+    if *run.stop_rx.borrow() == Some(StopRequest::Abort) {
+        if let Some(mut sandbox) = held.take() {
+            sandbox.stop(Duration::from_secs(5)).await;
+        }
+        forget_the_record(&mut run);
+        let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
+        if shared.no_newer_execution(assign.run_id, assign.epoch) {
+            cleanup_workspace(shared, &dirs.workspace, false);
+        }
+        return TakenBackEnd::Aborted;
+    }
     let failed_git = saved
         .results
         .iter()
@@ -1655,26 +1923,49 @@ pub async fn take_back(
         &saved,
         failed_git,
     );
-    let report = Report {
-        session_id: record.session_id.clone(),
-        git: Some(saved.results),
-        artifacts: saved.artifacts,
-        session_bundle: saved.session_bundle,
-        ..Report::default()
+    let report = match outcome {
+        Some(outcome) => Report {
+            summary: outcome.summary.clone(),
+            result: outcome.result.clone(),
+            session_id: outcome.session_id.clone().or(record.session_id.clone()),
+            not_resumed: match outcome.session {
+                SessionRecord::NotOpened => None,
+                SessionRecord::Resumed => Some(None),
+                SessionRecord::NotResumed { outcome } => Some(Some(NotResumed {
+                    outcome,
+                    error: None,
+                })),
+            },
+            git: Some(saved.results),
+            usage: outcome.usage.clone(),
+            artifacts: saved.artifacts,
+            session_bundle: saved.session_bundle,
+        },
+        None => Report {
+            session_id: record.session_id.clone(),
+            git: Some(saved.results),
+            artifacts: saved.artifacts,
+            session_bundle: saved.session_bundle,
+            ..Report::default()
+        },
     };
     let finished = run.finish(cancelled, report);
-    // The run has ended: nothing is left to take back, and a sandbox kept so far goes.
+    halt_at(shared, EndStep::Reported).await;
+    // The run has ended: its report is kept in place of the record until it is delivered, and
+    // a sandbox kept so far goes.
     if let Some(mut sandbox) = held.take() {
         sandbox.stop(Duration::from_secs(5)).await;
     }
-    tokens.drop_record();
-    run.sink.drop_record();
+    keep_the_report(&mut run, &finished);
+    halt_at(shared, EndStep::ReportKept).await;
     let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
-    cleanup_workspace(
-        shared,
-        &dirs.workspace,
-        finished.outcome == Outcome::Failed || failed_git,
-    );
+    if shared.no_newer_execution(assign.run_id, assign.epoch) {
+        cleanup_workspace(
+            shared,
+            &dirs.workspace,
+            finished.outcome == Outcome::Failed || failed_git,
+        );
+    }
     TakenBackEnd::Finished(Box::new(finished))
 }
 
@@ -1717,8 +2008,10 @@ struct TakenBackDirs {
 }
 
 /// The workspace, the leased home and the `/output` of a run taken back, and where its
-/// sandbox has them. An `/output` that cannot be anchored is a warning.
-fn taken_back_dirs(run: &mut Run<'_>) -> TakenBackDirs {
+/// sandbox has them. An `/output` that cannot be anchored is a warning. The `/output` of a run
+/// whose work came back already (`collected`) holds that work, and is anchored as it is;
+/// otherwise it is anchored empty, and the work comes back into it.
+fn taken_back_dirs(run: &mut Run<'_>, collected: bool) -> TakenBackDirs {
     let (shared, assign) = (run.shared, run.assign);
     let paths = &shared.opts.paths;
     let workspace_dir = paths.workspace(assign.run_id);
@@ -1726,7 +2019,12 @@ fn taken_back_dirs(run: &mut Run<'_>) -> TakenBackDirs {
     let home_dir = home_lease.path().to_path_buf();
     let output_path = paths.output(assign.run_id);
     let output_root = if output_path.is_dir() {
-        match OutputRoot::create(&output_path) {
+        let anchored = if collected {
+            OutputRoot::open(&output_path)
+        } else {
+            OutputRoot::create(&output_path)
+        };
+        match anchored {
             Ok(root) => Some(root),
             Err(e) => {
                 run.sink.log(
@@ -1896,14 +2194,7 @@ async fn collect_the_work_taken_back(
     // The work is on this host now. The record says so before the sandbox goes, so that a
     // restart at any moment finds the work where the record says it is: in the sandbox until
     // the mark is on disk, here after it.
-    let collected: Vec<(String, CollectedRecord)> = repos
-        .iter()
-        .filter_map(|repo| {
-            let collected = repo.collected.as_ref()?;
-            Some((repo.ws.dir.clone(), CollectedRecord::of(collected)))
-        })
-        .collect();
-    if kept.collected(&collected) {
+    if kept.collected(&collected_repos(repos)) {
         sandbox.stop(Duration::from_secs(5)).await;
         None
     } else {
@@ -1920,21 +2211,29 @@ struct Saved {
     artifacts: Vec<ArtifactResult>,
     /// One per repository: pushed, or as it was cloned when it was not finalized.
     results: Vec<GitResult>,
+    /// The repositories that failed, in the words of [`git_failure_message`].
+    git_error: Option<String>,
     session_bundle: Option<tinfirm_protocol::SessionBundleOutcome>,
 }
 
 /// What a run taken back leaves, once its work came back: the files of `/output`, the push of
 /// its repositories and its session bundle. After a leak in a commit the session bundle is not
-/// stored; from a damaged record (`unsafe_record`, with why) nothing leaves the host.
+/// stored; from a damaged record (`unsafe_record`, with why) nothing leaves the host. A run
+/// whose own end decided its outcome ([`RunRecord::end`]) keeps to it: after a leak of the
+/// agent's nothing leaves the host either, and the files of `/output` that end saved are
+/// listed, not saved again; those it had not are saved, and `kept` says so.
 async fn save_the_work(
     run: &mut Run<'_>,
     record: &RunRecord,
+    kept: &Arc<RecordHandle>,
     came_back: bool,
     unsafe_record: Option<&str>,
     repos: &[Repo<'_>],
     dirs: &TakenBackDirs,
 ) -> Saved {
     let (shared, assign) = (run.shared, run.assign);
+    let end = record.end.as_ref();
+    let agent_leak = leaked_at_the_end(record);
     if unsafe_record.is_some() {
         run.sink.log(
             LogLevel::Error,
@@ -1942,14 +2241,29 @@ async fn save_the_work(
         );
     }
     let mut artifacts = Vec::new();
-    if came_back
+    if let Some(end) = end.filter(|end| end.output_saved) {
+        artifacts = end.artifacts.clone();
+    } else if came_back
         && unsafe_record.is_none()
         && let Some(output_root) = &dirs.output_root
     {
-        artifacts = collect_output(shared, &mut run.sink, assign, output_root).await;
+        if agent_leak {
+            run.sink.log(
+                LogLevel::Warn,
+                "not saving the files of /output: the run leaked a credential value",
+            );
+        } else {
+            // The files that the run's end saved already are listed, not saved again.
+            let record = end.is_some().then(|| kept.clone());
+            artifacts = collect_output(shared, &mut run.sink, assign, output_root, record).await;
+        }
+        if end.is_some() {
+            kept.output_saved(&artifacts);
+        }
     }
     // A damaged record refuses the session bundle as a leak does.
-    let mut leak = unsafe_record.is_some();
+    let mut leak = unsafe_record.is_some() || agent_leak;
+    let mut git_error = None;
     let results = if came_back && !repos.is_empty() && unsafe_record.is_none() {
         run.sink.status(Phase::Finalizing, None);
         let finalized = finalize_git(
@@ -1958,7 +2272,8 @@ async fn save_the_work(
             repos,
             run.tokens,
             assign.run_id,
-            false,
+            agent_leak,
+            end.is_some(),
         )
         .await;
         if finalized.outgoing_leak {
@@ -1969,11 +2284,13 @@ async fn save_the_work(
             );
         }
         if !finalized.errors.is_empty() {
-            run.sink.log(
-                LogLevel::Error,
-                git_failure_message(&finalized.errors, repos.len()),
-            );
+            let message = git_failure_message(&finalized.errors, repos.len());
+            if end.and_then(|end| end.outcome.as_ref()).is_none() {
+                run.sink.log(LogLevel::Error, message.clone());
+            }
+            git_error = Some(message);
         }
+        halt_at(shared, EndStep::Pushed).await;
         finalized.results
     } else {
         repos.iter().map(Repo::unfinalized_result).collect()
@@ -1995,6 +2312,7 @@ async fn save_the_work(
     Saved {
         artifacts,
         results,
+        git_error,
         session_bundle,
     }
 }
@@ -2002,6 +2320,9 @@ async fn save_the_work(
 /// The failure of a run taken back: `INFRA`, saying what was saved, unless the server
 /// cancelled it; from a damaged record (`unsafe_record`, with why) `INFRA` whatever came
 /// before, cancelled or not, since its work stays on the host. Whether the run ends cancelled.
+/// A run whose own end decided its outcome ([`RunRecord::end`]) fails as that end would have:
+/// with the agent's failure, or with `GIT_ERROR` for a repository that failed, unless it was
+/// cancelled; a run whose end had not decided it yet says that the agent's turn had ended.
 fn say_what_was_saved(
     run: &mut Run<'_>,
     record: &RunRecord,
@@ -2011,11 +2332,39 @@ fn say_what_was_saved(
     failed_git: bool,
 ) -> bool {
     let assign = run.assign;
-    if !cancelled {
-        let mut saved_parts = vec!["the agent was stopped"];
+    if let Some(outcome) = record.end.as_ref().and_then(|end| end.outcome.as_ref()) {
+        if let (Some(class), Some(message)) = (outcome.failure_class, &outcome.failure_message) {
+            run.failure.set(class, message.clone());
+        }
+        if let Some(message) = &saved.git_error {
+            if cancelled {
+                run.sink.log(LogLevel::Error, message.clone());
+            } else {
+                run.failure.set(FailureClass::GitError, message.clone());
+            }
+        }
+    }
+    let decided = record.end.as_ref().is_some_and(|end| end.outcome.is_some());
+    // A leak that the record's mark kept, without the outcome: the leak's failure, and nothing
+    // of the run left the host.
+    if !decided && record.end.as_ref().is_some_and(|end| end.leak) {
+        run.failure.set(
+            FailureClass::CredentialLeak,
+            "The runner host restarted at the end of the run, after the agent's output contained a credential value; the run was stopped and nothing of it left the host.",
+        );
+    }
+    if !cancelled && !decided {
+        let at_the_end = record.end.is_some();
+        let mut saved_parts = vec![if at_the_end {
+            "the agent's turn had ended"
+        } else {
+            "the agent was stopped"
+        }];
         if saved.results.iter().any(|g| g.pushed) {
             saved_parts.push(if failed_git {
                 "some of its work was pushed (the log names what was not)"
+            } else if at_the_end {
+                "its work was pushed"
             } else {
                 "its work so far was pushed"
             });
@@ -2029,10 +2378,17 @@ fn say_what_was_saved(
         }
         run.failure.set(
             FailureClass::Infra,
-            format!(
-                "The runner host restarted during the run and took the run back: {}.",
-                saved_parts.join(", ")
-            ),
+            if at_the_end {
+                format!(
+                    "The runner host restarted at the end of the run and took the run back: {}; the agent's own outcome was not kept.",
+                    saved_parts.join(", ")
+                )
+            } else {
+                format!(
+                    "The runner host restarted during the run and took the run back: {}.",
+                    saved_parts.join(", ")
+                )
+            },
         );
     }
     // A damaged record fails the run, cancelled or not: its work stays on the host.
@@ -2047,6 +2403,15 @@ fn say_what_was_saved(
         );
     }
     cancelled
+}
+
+/// Whether the record says that the run's own end leaked a credential value: by its mark, or by
+/// the agent's outcome. Nothing of such a run leaves the host.
+fn leaked_at_the_end(record: &RunRecord) -> bool {
+    record
+        .end
+        .as_ref()
+        .is_some_and(|end| end.leak || end.outcome.as_ref().is_some_and(|outcome| outcome.leak))
 }
 
 /// How [`wait_for_the_server`] ended.
@@ -4285,6 +4650,11 @@ fn git_failure_message(errors: &[String], total: usize) -> String {
 /// of its default branch, with a lease on the task branch's clone-time tip ([`Git::push`]).
 /// A read-only repository (ADR-0017) is never pushed, so its commits are not scanned either.
 /// A failed repository does not stop the others.
+///
+/// With `recheck` (the end of a run that a host took back after it died in that end), a push
+/// that the repository refuses is checked again: a branch that is at the run's head already was
+/// pushed, by the earlier process's own push (a `git push` it started may outlive it) or by an
+/// earlier take-back, and counts as pushed.
 async fn finalize_git(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
@@ -4292,6 +4662,7 @@ async fn finalize_git(
     tokens: &Arc<RunGitTokens>,
     run_id: Uuid,
     leak: bool,
+    recheck: bool,
 ) -> Finalized {
     let mut finalized = Finalized::default();
     // A token that expires is renewed before the mirror fetch and the push use it, when it
@@ -4396,6 +4767,17 @@ async fn finalize_git(
                 finalized.results[i].pushed = true;
                 sink.git(repo.ws, GitAction::Pushed, head, Some(commits));
             }
+            Ok(_) if recheck && branch_is_at(shared, repo, head.as_deref()).await => {
+                finalized.results[i].pushed = true;
+                sink.log(
+                    LogLevel::Info,
+                    format!(
+                        "{} is at the run's head already: an earlier push of the run's work reached it",
+                        repo.label()
+                    ),
+                );
+                sink.git(repo.ws, GitAction::Pushed, head, Some(commits));
+            }
             Ok(out) => {
                 let detail = sink.redact(out.stderr.trim());
                 let reason = push_failure(&format!("{}\n{}", out.stdout, out.stderr));
@@ -4410,6 +4792,29 @@ async fn finalize_git(
         }
     }
     finalized
+}
+
+/// Whether the remote branch of `repo` is at `head` now, as the host's mirror of the repository
+/// fetches it again. `false` when it cannot be read.
+async fn branch_is_at(shared: &Arc<Shared>, repo: &Repo<'_>, head: Option<&str>) -> bool {
+    let (Some(head), Ok(authorization)) = (head, repo.git.authorization()) else {
+        return false;
+    };
+    let key = repo
+        .git
+        .tokens()
+        .mirror_key(repo.git.repo_url(), authorization.as_ref());
+    match shared
+        .mirrors
+        .refresh_keyed(&key, repo.git.repo_url(), authorization.as_ref())
+        .await
+    {
+        Ok(refs) => branch_tip(&refs, &repo.ws.branch) == Some(head),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "cannot read the repository again after a refused push");
+            false
+        }
+    }
 }
 
 /// Sanitize, WIP commit, ahead count and (with `scan`) the credential scan of one repository.
@@ -4518,23 +4923,43 @@ struct Report {
 /// each one scanned with the run's redactor and posted with the host token and
 /// `artifact=true&source=output`. The log lines go out as LOG events; the run goes on
 /// whatever happens.
+///
+/// With the run's record of its own end (`record`), each file saved is written in the record at
+/// once ([`RecordHandle::output_file_saved`]), and a file that the record names as saved (by a
+/// process before a restart) is listed with its attachment, not uploaded again: after a
+/// restart, at most the one file whose upload was under way is uploaded twice.
 async fn collect_output(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     assign: &RunAssign,
     output_root: &OutputRoot,
+    record: Option<Arc<RecordHandle>>,
 ) -> Vec<ArtifactResult> {
     let redactor = shared.run_redactor(assign.run_id, assign.epoch);
     let server_url = shared.config.server_url.clone();
     let token = shared.config.token.expose().to_string();
     let (run_id, epoch) = (assign.run_id, assign.epoch);
+    let saved_before = record
+        .as_ref()
+        .map(|record| record.saved_artifacts())
+        .unwrap_or_default();
     let collected = output::collect(
         output_root,
         shared.opts.upload_max_bytes,
         &|content| redactor.contains_any(content),
         |file: OutputFile| {
             let (server_url, token) = (server_url.clone(), token.clone());
+            let (shared, record) = (shared.clone(), record.clone());
+            let before = saved_before.iter().find(|a| a.name == file.name).cloned();
             async move {
+                if let Some(before) = before {
+                    return Ok(UploadResponse::Answered {
+                        stored: true,
+                        message: "saved before the runner host restarted".into(),
+                        attachment_id: Some(before.attachment_id),
+                    });
+                }
+                let (name, size_bytes) = (file.name.clone(), file.content.len() as u64);
                 let upload = Upload {
                     run_id,
                     epoch,
@@ -4544,12 +4969,29 @@ async fn collect_output(
                     content: file.content,
                     source: UploadSource::Output,
                 };
-                attachments::upload(&server_url, &token, upload)
+                let answer = attachments::upload(&server_url, &token, upload)
                     .await
                     .map_err(|e| {
                         tracing::warn!(%run_id, error = %format!("{e:#}"), "cannot upload a file of /output");
                         "Tinfirm could not be reached, or did not answer.".to_string()
-                    })
+                    });
+                if let (
+                    Some(record),
+                    Ok(UploadResponse::Answered {
+                        stored: true,
+                        attachment_id: Some(attachment_id),
+                        ..
+                    }),
+                ) = (&record, &answer)
+                {
+                    record.output_file_saved(&ArtifactResult {
+                        name,
+                        attachment_id: *attachment_id,
+                        size_bytes,
+                    });
+                    halt_at(&shared, EndStep::OutputFileSaved).await;
+                }
+                answer
             }
         },
     )
@@ -4721,6 +5163,13 @@ fn prune_failed(shared: &Shared) {
     for (_, path) in dirs.into_iter().skip(shared.opts.keep_failed_workspaces) {
         let _ = std::fs::remove_dir_all(path);
     }
+}
+
+/// The workspace of a run whose report the process before this one kept, if it is still there
+/// (that process ended between the report and the cleanup): cleaned as the run's end would
+/// have, kept for inspection when the run `failed`.
+pub fn cleanup_kept_workspace(shared: &Arc<Shared>, run_id: Uuid, failed: bool) {
+    cleanup_workspace(shared, &shared.opts.paths.workspace(run_id), failed);
 }
 
 /// Startup: workspaces, `/output` folders and attachments left by a previous process belong

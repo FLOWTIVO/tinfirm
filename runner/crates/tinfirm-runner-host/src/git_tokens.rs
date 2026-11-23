@@ -149,7 +149,8 @@ pub struct RunGitTokens {
     run_id: Uuid,
     epoch: i64,
     entries: Mutex<Vec<Entry>>,
-    /// The take-back record while the run's sandbox lives (ADR-0101).
+    /// The run's take-back record while it has one (ADR-0101): from its sandbox's start until
+    /// its report is made.
     record: Mutex<Option<Arc<RecordHandle>>>,
     log: Mutex<Log>,
     /// The salted hashes of every token the run has held, revoked and replaced ones included,
@@ -503,7 +504,7 @@ impl RunGitTokens {
         lock(&self.hashes).clone()
     }
 
-    /// The record is gone with the sandbox.
+    /// The record is gone: nothing of the run is left to take back.
     pub fn drop_record(&self) {
         lock(&self.record).take();
     }
@@ -864,6 +865,7 @@ mod tests {
                         collected: false,
                         redaction: None,
                         bridge: None,
+                        end: None,
                     }
                 })
                 .unwrap();

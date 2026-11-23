@@ -70,6 +70,10 @@ struct Inner {
     /// When the connection ended; `None` while connected (or before the first connection).
     /// Time from then on does not count towards a finished run's retention.
     disconnected_at: Option<Instant>,
+    /// The executions forgotten since [`Outbox::take_forgotten`] last took them, by run and
+    /// epoch: a finished one whose end can no longer be lost, or one that another execution of
+    /// its run replaced or that was dropped (its end no longer matters).
+    forgotten: Vec<(Uuid, i64)>,
 }
 
 #[derive(Debug)]
@@ -125,7 +129,7 @@ impl Outbox {
     /// Starts the queue of a run with its `run.accepted`.
     pub fn open_run(&self, accepted: RunAccepted) {
         let mut inner = self.lock();
-        inner.runs.retain(|q| q.run_id != accepted.run_id);
+        inner.replace(accepted.run_id, accepted.epoch);
         inner.runs.push(RunQueue {
             run_id: accepted.run_id,
             epoch: accepted.epoch,
@@ -149,7 +153,7 @@ impl Outbox {
     /// and `hello.activeRuns` lists it.
     pub fn resume_run(&self, run_id: Uuid, epoch: i64, last_seq: u64) {
         let mut inner = self.lock();
-        inner.runs.retain(|q| q.run_id != run_id);
+        inner.replace(run_id, epoch);
         inner.runs.push(RunQueue {
             run_id,
             epoch,
@@ -239,9 +243,14 @@ impl Outbox {
 
     /// Forgets one execution (stale epoch: the server wants nothing more from it).
     pub fn drop_run(&self, run_id: Uuid, epoch: i64) {
-        self.lock()
+        let mut inner = self.lock();
+        let before = inner.runs.len();
+        inner
             .runs
             .retain(|q| !(q.run_id == run_id && q.epoch == epoch));
+        if inner.runs.len() != before {
+            inner.forgotten.push((run_id, epoch));
+        }
     }
 
     /// `true` while the outbox still holds a run (executing or recently finished).
@@ -327,6 +336,28 @@ impl Outbox {
         !inner.runs.is_empty()
     }
 
+    /// The executions that the outbox forgot since the last call, by run and epoch: finished
+    /// ones as the retention allows (their end was written on a connection that then stayed up
+    /// for the retention), and ones that another execution of the run replaced or that were
+    /// dropped.
+    pub fn take_forgotten(&self) -> Vec<(Uuid, i64)> {
+        let mut inner = self.lock();
+        inner.gc(Instant::now(), self.retention);
+        std::mem::take(&mut inner.forgotten)
+    }
+
+    /// The finished executions whose `run.finished` has been written (on this connection or on
+    /// one that broke after it: what was written counts as sent), by run and epoch. On an
+    /// orderly end of the process their end counts as delivered.
+    pub fn finished_written(&self) -> Vec<(Uuid, i64)> {
+        self.lock()
+            .runs
+            .iter()
+            .filter(|q| q.finished_pushed && q.next_unsent >= q.items.len())
+            .map(|q| (q.run_id, q.epoch))
+            .collect()
+    }
+
     /// `true` when nothing is waiting to be written.
     pub fn is_drained(&self) -> bool {
         let inner = self.lock();
@@ -373,11 +404,31 @@ impl Inner {
     /// `retention`. While disconnected, the connection's time ended with it.
     fn gc(&mut self, now: Instant, retention: Duration) {
         let connected_until = self.disconnected_at.unwrap_or(now);
+        let forgotten = &mut self.forgotten;
         self.runs.retain(|q| {
-            !(q.finished_pushed
+            let done = q.finished_pushed
                 && q.next_unsent >= q.items.len()
                 && q.finished_sent_at
-                    .is_some_and(|t| connected_until.saturating_duration_since(t) > retention))
+                    .is_some_and(|t| connected_until.saturating_duration_since(t) > retention);
+            if done {
+                forgotten.push((q.run_id, q.epoch));
+            }
+            !done
+        });
+    }
+
+    /// A new queue of `run_id` at `epoch` takes the place of the run's queue: one of another
+    /// epoch is forgotten, its end no longer matters (the server gave the run to the new one).
+    fn replace(&mut self, run_id: Uuid, epoch: i64) {
+        let forgotten = &mut self.forgotten;
+        self.runs.retain(|q| {
+            if q.run_id != run_id {
+                return true;
+            }
+            if q.epoch != epoch {
+                forgotten.push((q.run_id, q.epoch));
+            }
+            false
         });
     }
 }
@@ -502,6 +553,47 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_finished_run_that_the_outbox_forgets_is_named_once() {
+        let outbox = Outbox::with_retention(Duration::ZERO);
+        let (done, running) = (Uuid::new_v4(), Uuid::new_v4());
+        for run in [done, running] {
+            outbox.open_run(RunAccepted {
+                run_id: run,
+                epoch: 1,
+            });
+        }
+        outbox.push_finished(finished(done, 0));
+        // Not written yet: kept.
+        assert!(outbox.take_forgotten().is_empty());
+        take_all(&outbox);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(outbox.take_forgotten(), vec![(done, 1)]);
+        assert!(outbox.take_forgotten().is_empty());
+        assert!(outbox.knows_run(running));
+        // Without a connection, no time counts; what was written is named as written.
+        outbox.on_disconnect();
+        outbox.push_finished(finished(running, 0));
+        assert!(outbox.finished_written().is_empty());
+        take_all(&outbox);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(outbox.take_forgotten().is_empty());
+        assert_eq!(outbox.finished_written(), vec![(running, 1)]);
+        // Another execution of the run takes its place: the finished one is named, by its
+        // epoch; the same epoch again is not.
+        outbox.open_run(RunAccepted {
+            run_id: running,
+            epoch: 2,
+        });
+        assert_eq!(outbox.take_forgotten(), vec![(running, 1)]);
+        outbox.resume_run(running, 2, 0);
+        assert!(outbox.take_forgotten().is_empty());
+        // A dropped execution is named; one that is not there is not.
+        outbox.drop_run(running, 2);
+        outbox.drop_run(running, 2);
+        assert_eq!(outbox.take_forgotten(), vec![(running, 2)]);
     }
 
     #[test]

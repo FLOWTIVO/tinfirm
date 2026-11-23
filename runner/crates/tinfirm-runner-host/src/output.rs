@@ -93,6 +93,25 @@ impl OutputRoot {
         })
     }
 
+    /// Anchors the directory at `path` as it is, with what it holds: the `/output` of a run
+    /// whose work came back from its sandbox before this process started (a run taken back
+    /// with its work on this host, crate::takeback). The path must name the directory itself,
+    /// not a link to one; no sandbox writes to it any more.
+    pub fn open(path: &Path) -> Result<OutputRoot> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        if !dir.metadata()?.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        Ok(OutputRoot {
+            path: path.to_path_buf(),
+            dir,
+        })
+    }
+
     /// The host directory, for the mount and the log lines.
     pub fn path(&self) -> &Path {
         &self.path
@@ -394,6 +413,27 @@ mod tests {
     /// sandbox (the test) writes into it.
     fn anchored(tmp: &Path) -> OutputRoot {
         OutputRoot::create(&tmp.join("outputs").join("run")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_output_that_came_back_before_a_restart_is_anchored_with_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = anchored(tmp.path()).path().to_path_buf();
+        std::fs::write(root.join("report.md"), "The report.").unwrap();
+        // The next process anchors it as it is, and saves what it holds.
+        let anchor = OutputRoot::open(&root).unwrap();
+        let id = Uuid::new_v4();
+        let collected = collect(&anchor, MAX_FILE_BYTES, &|_| false, |_| async move {
+            stored(id)
+        })
+        .await;
+        assert_eq!(collected.artifacts.len(), 1, "{:?}", collected.log);
+        assert_eq!(collected.artifacts[0].name, "report.md");
+        // Not through a link, and not a file.
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(OutputRoot::open(&link).is_err());
+        assert!(OutputRoot::open(&root.join("report.md")).is_err());
     }
 
     #[tokio::test]

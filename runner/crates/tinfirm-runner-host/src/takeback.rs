@@ -1,30 +1,61 @@
 //! A runner host that restarted takes its runs back (ADR-0101, threat model R36).
 //!
-//! While a run's sandbox lives on the sandbox bridge, the host keeps a record of it in its data
-//! directory (`runs/<runId>.json`, 0600): the assignment, the sandbox, the bridge session's key,
+//! From the start of a run's sandbox on the sandbox bridge until the run's report is made,
+//! the host keeps a record of it in its data directory (`runs/<runId>.json`, 0600): the
+//! assignment, the sandbox, the bridge session's key,
 //! the repositories as they were cloned, and the agent's session once it is open. Where the
 //! sandbox's front holds its bridge (ADR-0112, path C, part 2), the record keeps that bridge's
 //! own TLS identity, its listener's address and port, and the address it connects from
 //! ([`RunRecord::bridge`]): the bridge pins the one and dials the other, and a host that
 //! restarts gives the run a new front with them. A record without them is of a host before
 //! that: its bridge pins the shared listener's identity, kept beside the records with its port
-//! (`runs/bridge.json`), which serves such runs for one release. A record goes once the
-//! sandbox has stopped.
+//! (`runs/bridge.json`), which serves such runs for one release.
+//!
+//! In the run's own end, the work comes back from the sandbox and the record says so
+//! ([`RunRecord::collected`], [`RunRecord::end`]) before the sandbox stops, with what is known
+//! then: whether the agent's output leaked a credential value and whether the server cancelled
+//! the run. Then the record keeps the agent's outcome, and each file of `/output` as it is
+//! saved. A host that restarts in that end finishes the run from its own disk: it saves what is
+//! not saved yet, pushes (nothing after a leak), stores the session and reports the outcome
+//! the run had. Such a record is of version [`RECORD_VERSION_END`], which a host before it
+//! removes instead of misreading.
+//!
+//! When the run's report (`run.finished`) is made, it takes the record's place: the host writes
+//! it (`runs/<runId>.<epoch>.finished.json`, [`ReportRecord`]), syncs the directory, and then
+//! removes the record, under one lock, so a crash or a power loss leaves one of the two. The
+//! report holds the frame as it is sent, redacted, and no credential. It goes:
+//! - once the outbox forgets the run: its end was written on a connection that then stayed up
+//!   for the retention (`TINFIRM_RUNNER_FINISHED_RETENTION`, 3 minutes);
+//! - on an orderly end of the process, once its connection has ended, when the end was written
+//!   to a connection: what was written counts as sent, as the outbox counts it;
+//! - when another execution of the run takes its place in the outbox (the server assigned the
+//!   run again), or the execution is dropped.
+//!
+//! The protocol has no acknowledgement of `run.finished`, so that is as sure as the host can
+//! be. A host that starts and finds a report puts it into its outbox: the run is in
+//! `hello.activeRuns`, and its `run.finished` is written again; a server that ended the run
+//! already ignores it. A record of a newer execution of the same run wins over the report,
+//! which goes unsent. A report that cannot be read, or is of another format, is logged and
+//! removed. A host before this one does not read such a name.
+//!
+//! Only the newest [`RecordHandle`] of a run id writes or removes its record and report
+//! ([`Records`]): a stale execution of the run (an older epoch that the host aborts) leaves the
+//! newer one's alone.
 //!
 //! A host that starts and finds records takes each run back before it says hello: the run is
 //! listed in `hello.activeRuns`, so the server keeps it; its bridge comes back with the session
 //! key; the agent that the earlier process started is stopped; and the run ends as a run that
 //! the host stopped does: the work comes back from the sandbox and is pushed, the session's
 //! bundle is stored, and the run is reported failed with `INFRA`. The next turn goes on from
-//! the session. A record that cannot be taken back (another executor now, or no bridge) is
-//! reported in the log and removed.
+//! the session. A run whose record keeps the agent's outcome reports that outcome instead. A
+//! record that cannot be taken back (another executor now, or no bridge) is reported in the
+//! log and removed.
 //!
 //! The record's git tokens are those of the run's holder ([`crate::git_tokens`]): the record is
 //! written again whenever the holder changes ([`RecordHandle::sync_git`]). A repository whose
 //! token the server revoked (ADR-0116) has no `git` in the record's assignment and is named in
 //! `revoked` with the server's reason and message, so a host that restarts neither uses the
-//! token nor pushes the repository. The format stays version 1: a record without `revoked`
-//! revoked nothing.
+//! token nor pushes the repository. A record without `revoked` revoked nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -35,7 +66,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tinfirm_bridge::control::Hidden;
 use tinfirm_bridge::tls::Identity;
-use tinfirm_protocol::RunAssign;
+use tinfirm_protocol::{
+    ArtifactResult, FailureClass, ResumeOutcome, RunAssign, RunResult, UsagePayload,
+};
 use uuid::Uuid;
 
 use crate::git::MirrorRef;
@@ -45,6 +78,15 @@ use crate::sandbox_files::Collected;
 
 /// The format of the records. A record of another one is not taken back.
 pub const RECORD_VERSION: u32 = 1;
+
+/// The format of a record that keeps a run's own end ([`RunRecord::end`]). This host reads it and
+/// [`RECORD_VERSION`]; a host before it removes such a record and does not take the run back,
+/// since it would read the record as one whose work came back before a restart (it would empty
+/// the run's `/output` and push after a leak).
+pub const RECORD_VERSION_END: u32 = 2;
+
+/// The format of a run's kept report ([`ReportRecord`]).
+pub const REPORT_VERSION: u32 = 1;
 
 /// The event numbers that a record reserves at a time: a host that takes the run back numbers
 /// its events after them, so it never reuses one the server has.
@@ -94,6 +136,87 @@ pub struct RunRecord {
     /// a host whose sandboxes' bridges used its shared listener (`runs/bridge.json`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<BridgeRecord>,
+    /// The run's own end: the agent's turn ended and the work came back from the sandbox in
+    /// the run's end, not after a restart ([`RecordHandle::collected_at_the_end`]); then what
+    /// that end has decided and saved so far. `collected` is set with it. An older host ignores
+    /// the field and takes the run back as one whose work came back before a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<EndRecord>,
+}
+
+/// What a run's own end has decided and saved, as its record keeps it ([`RunRecord::end`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndRecord {
+    /// The agent's output held a credential value (it was stopped for it): nothing of the run
+    /// leaves the host. Written with the mark, before the sandbox stops.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leak: bool,
+    /// The server had cancelled the run when its work came back. Written with the mark.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+    /// The agent's outcome, once the host has decided it: a host that takes the run back
+    /// reports it. `None`: the host restarted before, and the run is reported as taken back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<OutcomeRecord>,
+    /// The files of `/output` saved as artifacts of the job so far, each written as it is
+    /// saved: a host that takes the run back lists them and saves none of them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactResult>,
+    /// Every file of `/output` was saved, or skipped: nothing of `/output` is left to save.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_saved: bool,
+}
+
+/// A run's report, kept from the moment it is made until it cannot be lost any more
+/// ([`RecordHandle::report_made`]): `runs/<runId>.<epoch>.finished.json`, 0600. Its name is no
+/// `<uuid>.json`, so a host before it leaves it alone. It holds the `run.finished` frame as
+/// the host sends it, redacted, and nothing else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportRecord {
+    pub version: u32,
+    pub finished: tinfirm_protocol::RunFinished,
+}
+
+/// The agent's outcome as the run's end decided it, before `/output`, the push and the
+/// session bundle: what the run reports, but for what the push adds. Every text in it is
+/// redacted as the report's is; it holds no credential.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+    /// The server cancelled the run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
+    /// The agent's output held a credential value: nothing of the run leaves the host.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leak: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsagePayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub session: SessionRecord,
+}
+
+/// Whether the agent's session was opened, and whether it resumed the assignment's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum SessionRecord {
+    #[default]
+    NotOpened,
+    Resumed,
+    NotResumed {
+        outcome: ResumeOutcome,
+    },
 }
 
 /// A sandbox's bridge that its front holds, as a record keeps it: the certificate and its
@@ -289,16 +412,27 @@ struct ListenerRecord {
     port: u16,
 }
 
-/// The records of a data directory.
+/// The records of a data directory. Its clones share which handle owns each run's record
+/// ([`RecordHandle`]): only the newest handle of a run id writes or removes its record, and the
+/// writes and removals of every handle are made one at a time, so no two share a temporary file.
 #[derive(Debug, Clone)]
 pub struct Records {
     dir: PathBuf,
+    owners: std::sync::Arc<Mutex<Owners>>,
+}
+
+/// The newest handle of each run id with a record ([`Records::claim`]).
+#[derive(Debug, Default)]
+struct Owners {
+    next: u64,
+    by_run: std::collections::HashMap<Uuid, u64>,
 }
 
 impl Records {
     pub fn new(paths: &Paths) -> Records {
         Records {
             dir: paths.data_dir.join("runs"),
+            owners: Default::default(),
         }
     }
 
@@ -306,18 +440,100 @@ impl Records {
         self.dir.join(format!("{run_id}.json"))
     }
 
+    /// `runs/<runId>.<epoch>.finished.json`: one per execution, its epoch in its name.
+    fn report_path(&self, run_id: Uuid, epoch: i64) -> PathBuf {
+        self.dir.join(format!("{run_id}.{epoch}.finished.json"))
+    }
+
+    fn owners(&self) -> std::sync::MutexGuard<'_, Owners> {
+        self.owners.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A new handle of `run_id` owns its record from now on: an older one writes nothing more.
+    fn claim(&self, run_id: Uuid) -> u64 {
+        let mut owners = self.owners();
+        owners.next += 1;
+        let owner = owners.next;
+        owners.by_run.insert(run_id, owner);
+        owner
+    }
+
+    /// Writes `record` when `owner` still owns it. `Ok(false)`: a newer handle owns it, and
+    /// nothing was written.
+    fn save_owned(&self, owner: u64, record: &RunRecord) -> Result<bool> {
+        let owners = self.owners();
+        if owners.by_run.get(&record.run_id()) != Some(&owner) {
+            return Ok(false);
+        }
+        self.write(record)?;
+        Ok(true)
+    }
+
+    /// Removes the record of `run_id` when `owner` still owns it.
+    fn remove_owned(&self, owner: u64, run_id: Uuid) {
+        let mut owners = self.owners();
+        if owners.by_run.get(&run_id) == Some(&owner) {
+            owners.by_run.remove(&run_id);
+            self.remove_file(run_id);
+        }
+    }
+
+    /// Writes the report and then removes the record, when `owner` still owns the record: a
+    /// crash leaves one of the two at every moment. `Ok(false)`: a newer handle owns it.
+    fn report_owned(
+        &self,
+        owner: u64,
+        run_id: Uuid,
+        finished: &tinfirm_protocol::RunFinished,
+    ) -> Result<bool> {
+        let mut owners = self.owners();
+        if owners.by_run.get(&run_id) != Some(&owner) {
+            return Ok(false);
+        }
+        self.save_report(finished)?;
+        // The report's name must be on disk before the record's goes, also after a power loss:
+        // the directory is synced once, here, between the two.
+        if let Err(e) = std::fs::File::open(&self.dir).and_then(|dir| dir.sync_all()) {
+            tracing::warn!(error = %e, "cannot sync the directory of the runs' records");
+        }
+        owners.by_run.remove(&run_id);
+        self.remove_file(run_id);
+        Ok(true)
+    }
+
     fn listener_path(&self) -> PathBuf {
         self.dir.join("bridge.json")
     }
 
-    /// Writes `record`, in place of the run's earlier one.
+    /// Writes `record`, in place of the run's earlier one, whichever handle owns it.
     pub fn save(&self, record: &RunRecord) -> Result<()> {
+        let _owners = self.owners();
+        self.write(record)
+    }
+
+    /// The write itself: of [`RECORD_VERSION_END`] for a record that keeps a run's own end.
+    fn write(&self, record: &RunRecord) -> Result<()> {
         crate::secure_fs::ensure_private_dir(&self.dir)?;
-        let bytes = serde_json::to_vec(record).context("cannot encode the run's record")?;
+        let bytes = if record.end.is_some() && record.version != RECORD_VERSION_END {
+            let mut record = record.clone();
+            record.version = RECORD_VERSION_END;
+            serde_json::to_vec(&record)
+        } else {
+            serde_json::to_vec(record)
+        }
+        .context("cannot encode the run's record")?;
         write_replacing(&self.path(record.run_id()), &bytes)
     }
 
+    /// Removes the record of `run_id`, whichever handle owns it (a record that the host does
+    /// not take back).
     pub fn remove(&self, run_id: Uuid) {
+        let mut owners = self.owners();
+        owners.by_run.remove(&run_id);
+        self.remove_file(run_id);
+    }
+
+    fn remove_file(&self, run_id: Uuid) {
         let path = self.path(run_id);
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -347,7 +563,11 @@ impl Records {
             let read = crate::secure_fs::read_private_file(&path)
                 .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).map_err(Into::into));
             match read {
-                Ok(record) if record.version == RECORD_VERSION && record.run_id() == id => {
+                Ok(record)
+                    if (record.version == RECORD_VERSION
+                        || record.version == RECORD_VERSION_END)
+                        && record.run_id() == id =>
+                {
                     records.push(record)
                 }
                 Ok(_) => {
@@ -396,6 +616,67 @@ impl Records {
         (runs, waiting)
     }
 
+    /// Keeps a run's report until it cannot be lost any more ([`ReportRecord`]).
+    pub fn save_report(&self, finished: &tinfirm_protocol::RunFinished) -> Result<()> {
+        crate::secure_fs::ensure_private_dir(&self.dir)?;
+        let kept = ReportRecord {
+            version: REPORT_VERSION,
+            finished: finished.clone(),
+        };
+        let bytes = serde_json::to_vec(&kept).context("cannot encode the run's report")?;
+        write_replacing(&self.report_path(finished.run_id, finished.epoch), &bytes)
+    }
+
+    /// The report of that execution of the run can no longer be lost, or no longer matters
+    /// (a newer execution of the run took its place): it goes, if there is one.
+    pub fn remove_report(&self, run_id: Uuid, epoch: i64) {
+        let path = self.report_path(run_id, epoch);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), error = %e, "cannot remove a run's kept report");
+        }
+    }
+
+    /// Every kept report there is. One that cannot be read, or is of another format (a newer
+    /// host's, after a downgrade), is logged and removed: its run's end is not sent again.
+    pub fn load_reports(&self) -> Vec<tinfirm_protocol::RunFinished> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut reports = Vec::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Some((id, epoch)) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".finished.json"))
+                .and_then(|n| n.split_once('.'))
+                .and_then(|(id, epoch)| Some((Uuid::parse_str(id).ok()?, epoch.parse().ok()?)))
+            else {
+                continue;
+            };
+            let read = crate::secure_fs::read_private_file(&path).and_then(|bytes| {
+                serde_json::from_slice::<ReportRecord>(&bytes).map_err(Into::into)
+            });
+            match read {
+                Ok(kept)
+                    if kept.version == REPORT_VERSION
+                        && kept.finished.run_id == id
+                        && kept.finished.epoch == epoch =>
+                {
+                    reports.push(kept.finished)
+                }
+                _ => {
+                    tracing::warn!(run_id = %id, epoch, "a run's kept report cannot be read; it is not sent again");
+                    self.remove_report(id, epoch);
+                }
+            }
+        }
+        reports.sort_by_key(|f| (f.run_id, f.epoch));
+        reports
+    }
+
     /// The bridge listener's identity and port, as the listener kept them.
     pub fn listener(&self) -> Option<(Identity, u16)> {
         let bytes = crate::secure_fs::read_private_file(&self.listener_path()).ok()?;
@@ -426,9 +707,11 @@ fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&temp, path).with_context(|| format!("cannot write {}", path.display()))
 }
 
-/// A run's record while its sandbox lives: the run updates it as it goes.
+/// A run's record while it has one: the run updates it as it goes.
 pub struct RecordHandle {
     records: Records,
+    /// Which handle of the run id this is ([`Records::claim`]).
+    owner: u64,
     record: Mutex<RunRecord>,
     /// Set by [`RecordHandle::remove`]: a change that comes later writes nothing.
     removed: AtomicBool,
@@ -445,14 +728,18 @@ impl std::fmt::Debug for RecordHandle {
 impl RecordHandle {
     /// Writes the record and keeps it.
     pub fn create(records: &Records, record: RunRecord) -> Result<RecordHandle> {
-        records.save(&record)?;
-        Ok(RecordHandle::kept(records, record))
+        let handle = RecordHandle::kept(records, record);
+        let record = handle.record.lock().unwrap_or_else(|e| e.into_inner());
+        records.save_owned(handle.owner, &record)?;
+        drop(record);
+        Ok(handle)
     }
 
     /// A record that is written already: a run's that this host takes back.
     pub fn kept(records: &Records, record: RunRecord) -> RecordHandle {
         RecordHandle {
             records: records.clone(),
+            owner: records.claim(record.run_id()),
             record: Mutex::new(record),
             removed: AtomicBool::new(false),
             unsaved: AtomicBool::new(false),
@@ -470,10 +757,16 @@ impl RecordHandle {
         if !changed && !self.unsaved.load(Ordering::SeqCst) {
             return true;
         }
-        match self.records.save(&record) {
-            Ok(()) => {
+        match self.records.save_owned(self.owner, &record) {
+            Ok(true) => {
                 self.unsaved.store(false, Ordering::SeqCst);
                 true
+            }
+            Ok(false) => {
+                // A newer execution of the run owns the record: this one writes nothing more.
+                self.removed.store(true, Ordering::SeqCst);
+                tracing::warn!(run_id = %record.run_id(), "the run's record belongs to a newer execution of the run; this one writes it no more");
+                false
             }
             Err(e) => {
                 self.unsaved.store(true, Ordering::SeqCst);
@@ -540,11 +833,107 @@ impl RecordHandle {
         })
     }
 
+    /// In the run's own end ([`RunRecord::end`]): the work came back from the sandbox, as
+    /// [`RecordHandle::collected`] says, and the record stays until the run's report is made;
+    /// with it, what is known already: whether the run leaked a credential value and whether the
+    /// server cancelled it. `true` once that is on disk: only then may the sandbox go with the
+    /// record kept.
+    pub fn collected_at_the_end(
+        &self,
+        repos: &[(String, CollectedRecord)],
+        leak: bool,
+        cancelled: bool,
+    ) -> bool {
+        self.update(|record| {
+            record.collected = true;
+            record.version = RECORD_VERSION_END;
+            record.end = Some(EndRecord {
+                leak,
+                cancelled,
+                ..EndRecord::default()
+            });
+            for kept in &mut record.repos {
+                kept.collected = repos
+                    .iter()
+                    .find(|(dir, _)| *dir == kept.dir)
+                    .map(|(_, collected)| collected.clone());
+            }
+            true
+        })
+    }
+
+    /// The agent's outcome is decided ([`EndRecord::outcome`]). `true` once it is on disk.
+    pub fn outcome_decided(&self, outcome: OutcomeRecord) -> bool {
+        self.update(|record| match record.end.as_mut() {
+            Some(end) if end.outcome.as_ref() != Some(&outcome) => {
+                end.outcome = Some(outcome);
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// One file of `/output` is saved ([`EndRecord::artifacts`]). `true` once it is on disk.
+    pub fn output_file_saved(&self, artifact: &ArtifactResult) -> bool {
+        self.update(|record| match record.end.as_mut() {
+            Some(end) if !end.artifacts.iter().any(|a| a.name == artifact.name) => {
+                end.artifacts.push(artifact.clone());
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// Every file of `/output` is saved or skipped ([`EndRecord::output_saved`]): `artifacts` is
+    /// the list the report gives. `true` once it is on disk.
+    pub fn output_saved(&self, artifacts: &[ArtifactResult]) -> bool {
+        self.update(|record| match record.end.as_mut() {
+            Some(end) if !end.output_saved || end.artifacts != artifacts => {
+                end.artifacts = artifacts.to_vec();
+                end.output_saved = true;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// The files of `/output` saved so far, by the record's run's own end.
+    pub fn saved_artifacts(&self) -> Vec<ArtifactResult> {
+        let record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        record
+            .end
+            .as_ref()
+            .map(|end| end.artifacts.clone())
+            .unwrap_or_default()
+    }
+
+    /// The run's report is made: it is kept ([`ReportRecord`]) and then the record goes, in one
+    /// step that a crash cannot split. `true` once the report is on disk; `false` when it cannot
+    /// be written (the record goes all the same, a warning: a restart before the report reaches
+    /// the server then loses the run, as without a record) or a newer execution owns the record.
+    pub fn report_made(&self, finished: &tinfirm_protocol::RunFinished) -> bool {
+        let record = self.record.lock().unwrap_or_else(|e| e.into_inner());
+        if self.removed.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        match self
+            .records
+            .report_owned(self.owner, record.run_id(), finished)
+        {
+            Ok(kept) => kept,
+            Err(e) => {
+                tracing::warn!(run_id = %record.run_id(), error = %format!("{e:#}"), "cannot keep the run's report; a restart before the server has it would lose the run");
+                self.records.remove_owned(self.owner, record.run_id());
+                false
+            }
+        }
+    }
+
     /// Nothing is left to take back: the run has ended, or its sandbox did not come back.
     pub fn remove(&self) {
         let record = self.record.lock().unwrap_or_else(|e| e.into_inner());
         self.removed.store(true, Ordering::SeqCst);
-        self.records.remove(record.run_id());
+        self.records.remove_owned(self.owner, record.run_id());
     }
 }
 
@@ -592,6 +981,7 @@ pub(crate) mod tests {
             collected: false,
             redaction: None,
             bridge: None,
+            end: None,
         }
     }
 
@@ -718,6 +1108,197 @@ pub(crate) mod tests {
         );
         let failed = CollectedRecord::of(&Err("the bundle was refused".into()));
         assert_eq!(failed.restore(), Err("the bundle was refused".to_string()));
+    }
+
+    #[test]
+    fn a_record_of_a_runs_end_keeps_its_outcome_and_its_files_and_reads_as_before_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let handle = RecordHandle::create(&records, record()).unwrap();
+        let outcome = OutcomeRecord {
+            summary: Some("Done.".into()),
+            session_id: Some("session-1".into()),
+            session: SessionRecord::NotResumed {
+                outcome: ResumeOutcome::FirstRun,
+            },
+            ..OutcomeRecord::default()
+        };
+        // Before the run's end has marked the record, neither is written.
+        assert!(handle.outcome_decided(outcome.clone()));
+        assert!(handle.output_saved(&[]));
+        assert!(records.load_all()[0].end.is_none());
+
+        assert!(handle.collected_at_the_end(
+            &[(
+                "repo".into(),
+                CollectedRecord::Ok {
+                    wip: true,
+                    head: "def".into()
+                }
+            )],
+            false,
+            false
+        ));
+        let loaded = records.load_all();
+        assert!(loaded[0].collected);
+        assert_eq!(loaded[0].end, Some(EndRecord::default()));
+        assert_eq!(records.census(), (1, 1));
+
+        assert!(handle.outcome_decided(outcome.clone()));
+        let artifact = ArtifactResult {
+            name: "report.md".into(),
+            attachment_id: uuid::Uuid::new_v4(),
+            size_bytes: 12,
+        };
+        // Each file as it is saved, then the whole of /output.
+        assert!(handle.output_file_saved(&artifact));
+        let end = records.load_all()[0].end.clone().unwrap();
+        assert_eq!(end.artifacts, vec![artifact.clone()]);
+        assert!(!end.output_saved);
+        assert_eq!(handle.saved_artifacts(), vec![artifact.clone()]);
+        assert!(handle.output_saved(std::slice::from_ref(&artifact)));
+        let end = records.load_all()[0].end.clone().unwrap();
+        assert_eq!(end.outcome, Some(outcome));
+        assert_eq!(end.artifacts, vec![artifact]);
+        assert!(end.output_saved);
+        let text = std::fs::read_to_string(
+            dir.path()
+                .join(format!("data/runs/{}.json", loaded[0].run_id())),
+        )
+        .unwrap();
+        assert!(
+            text.contains(r#""session":{"state":"notResumed","outcome":"FIRST_RUN"}"#),
+            "{text}"
+        );
+        // An outcome without a session, as JSON of the fields it has, reads back.
+        let read: OutcomeRecord = serde_json::from_str(r#"{"cancelled":true}"#).unwrap();
+        assert!(read.cancelled && read.session == SessionRecord::NotOpened);
+    }
+
+    #[test]
+    fn a_record_of_a_runs_end_has_the_next_version_and_both_versions_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let first = record();
+        let path = dir
+            .path()
+            .join(format!("data/runs/{}.json", first.run_id()));
+        let handle = RecordHandle::create(&records, first).unwrap();
+        let version = |path: &Path| {
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()
+                ["version"]
+                .clone()
+        };
+        // A record without `end` stays of version 1, which a host before this one reads.
+        assert_eq!(version(&path), 1);
+        assert_eq!(records.load_all().len(), 1);
+        // With `end`, version 2: a host before this one removes it, and does not misread it.
+        assert!(handle.collected_at_the_end(&[], true, false));
+        assert_eq!(version(&path), 2);
+        let loaded = records.load_all();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].end.as_ref().unwrap().leak);
+        // A record written by Records::save with `end` is of version 2 too.
+        let mut other = record();
+        other.end = Some(EndRecord::default());
+        records.save(&other).unwrap();
+        let other_path = dir
+            .path()
+            .join(format!("data/runs/{}.json", other.run_id()));
+        assert_eq!(version(&other_path), 2);
+        // A version this host does not know is not taken back.
+        let mut unknown: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&other_path).unwrap()).unwrap();
+        unknown["version"] = 3.into();
+        std::fs::write(&other_path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+        assert_eq!(records.load_all().len(), 1);
+        assert!(!other_path.exists());
+    }
+
+    #[test]
+    fn only_the_newest_handle_of_a_run_writes_or_removes_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let mut first = record();
+        first.assign.epoch = 1;
+        let run_id = first.run_id();
+        let older = RecordHandle::create(&records, first.clone()).unwrap();
+        // A newer execution of the same run, on the same host, gets its own record.
+        let mut second = first.clone();
+        second.assign.epoch = 2;
+        let newer = RecordHandle::create(&records, second).unwrap();
+        // The older one's updates and its removal change nothing.
+        assert!(!older.update(|record| {
+            record.session_id = Some("stale".into());
+            true
+        }));
+        older.numbered(10 * SEQ_BLOCK);
+        older.collected_at_the_end(&[], false, false);
+        older.remove();
+        let finished: tinfirm_protocol::RunFinished = serde_json::from_value(serde_json::json!({
+            "runId": run_id, "epoch": 1, "outcome": "SUCCEEDED", "lastSeq": 3
+        }))
+        .unwrap();
+        assert!(!older.report_made(&finished));
+        let loaded = records.load_all();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].assign.epoch, 2);
+        assert_eq!(loaded[0].session_id, None);
+        assert_eq!(loaded[0].seq_floor, SEQ_BLOCK);
+        assert!(!loaded[0].collected);
+        assert!(records.load_reports().is_empty());
+        // The newer one's go through.
+        newer.session_opened("s");
+        assert_eq!(records.load_all()[0].session_id.as_deref(), Some("s"));
+        newer.remove();
+        assert!(records.load_all().is_empty());
+    }
+
+    #[test]
+    fn a_report_takes_the_records_place_and_is_kept_until_it_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let first = record();
+        let run_id = first.run_id();
+        let handle = RecordHandle::create(&records, first).unwrap();
+        let finished: tinfirm_protocol::RunFinished = serde_json::from_value(serde_json::json!({
+            "runId": run_id, "epoch": 2, "outcome": "FAILED", "lastSeq": 1003,
+            "failureClass": "INFRA", "failureMessage": "m"
+        }))
+        .unwrap();
+        assert!(handle.report_made(&finished));
+        // One step: the record is gone, and the report is there, 0600, under a name that a host
+        // before this one does not read as a record.
+        assert!(records.load_all().is_empty());
+        let path = dir
+            .path()
+            .join(format!("data/runs/{run_id}.2.finished.json"));
+        assert_eq!(crate::secure_fs::mode_of(&path), Some(0o600));
+        assert_eq!(records.census(), (0, 0));
+        assert_eq!(records.load_reports(), vec![finished.clone()]);
+        // A later change of the handle writes nothing.
+        handle.numbered(10 * SEQ_BLOCK);
+        assert!(records.load_all().is_empty());
+        // Another execution's removal leaves it; its own takes it.
+        records.remove_report(run_id, 1);
+        assert_eq!(records.load_reports().len(), 1);
+        records.remove_report(run_id, 2);
+        assert!(records.load_reports().is_empty());
+        // One that cannot be read is removed, and so is one whose name and content disagree.
+        std::fs::write(&path, b"{").unwrap();
+        assert!(records.load_reports().is_empty());
+        assert!(!path.exists());
+        records.save_report(&finished).unwrap();
+        let misnamed = dir
+            .path()
+            .join(format!("data/runs/{run_id}.3.finished.json"));
+        std::fs::rename(&path, &misnamed).unwrap();
+        assert!(records.load_reports().is_empty());
+        assert!(!misnamed.exists());
     }
 
     #[test]

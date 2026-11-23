@@ -715,7 +715,8 @@ holds its bridge.
     port that `runs/bridge.json` keeps, only while that version's runs are taken back (below). With
     a [VM per run](#a-vm-per-run) the control host dials each VM and listens on nothing for it.
 - **A restart of this host loses no work** ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
-  threat model R36). While a run's sandbox lives, this host keeps a record of it in its data
+  threat model R36). From the start of a run's sandbox until the run's report is made, this host
+  keeps a record of it in its data
   directory (`runs/<run id>.json`, 0600): the assignment, the sandbox, the bridge's session key, the
   repositories as cloned and the agent's session, and the sandbox's bridge (`bridge`: its TLS
   identity, and on Docker its port and its peer's address; a VM's dial target is the record's
@@ -744,8 +745,44 @@ holds its bridge.
   without the bridge, a record that could not be written) and whose agent had started stays lost.
   - The turn does not go on in place: the agent is stopped. Runs without the bridge, and a Docker
     host's runs when the machine itself restarts (Docker stops the containers), are lost.
+  - **A restart in the run's own end.** Once the agent's turn has ended, the work comes back from
+    the sandbox and the record says so before the sandbox stops, with what is known then: whether
+    the agent's output leaked a credential value, and whether Tinfirm cancelled the run. The record
+    then keeps the agent's outcome (its failure, the summary, the `finish` result, the usage, the
+    session; every text redacted), and each file of `/output` as it is saved. A `run` that starts
+    after a crash in that end finishes the run from its own disk: it saves the files of `/output`
+    not saved yet, pushes after Tinfirm's answer (a branch already at the run's head counts as
+    pushed), stores the session bundle, and reports the outcome the run had. After a leak nothing
+    leaves the host, no new git token is asked for, and the run fails with `CREDENTIAL_LEAK`; a
+    cancelled run ends cancelled. When the host cannot write its record's mark, the record goes
+    before the sandbox stops, and a restart then loses the run instead of pushing it. An abort
+    (Tinfirm gave the run to another execution) is looked at between the steps of the end: no
+    further step begins and no report is made, while the step under way finishes. A
+    crash before the outcome is in the record ends the run failed with `INFRA`, saying that the
+    agent's turn had ended and what was saved. Such a record is of version 2: an earlier version
+    of the host removes it, so the run is lost on a downgrade in that window. Before 2026-11-23
+    the record went when the sandbox stopped, and a crash in the run's end lost the run with its
+    work unpushed on the host.
+  - **The report until it is delivered.** When the run's report (`run.finished`) is made, the host
+    keeps it (`runs/<run id>.<epoch>.finished.json`, 0600: the frame as sent, no credential) in the
+    record's place, and removes it once it was written on a connection that then stayed up for
+    `TINFIRM_RUNNER_FINISHED_RETENTION` (3 minutes), or, on an orderly stop (SIGTERM, a drain),
+    once it was written at all; Tinfirm assigning the run again removes it too. A `run` that
+    starts after a crash, or after a stop while it was cut off from Tinfirm, finds the reports it
+    never wrote or wrote shortly before and sends them again; Tinfirm ignores a report of a run it
+    ended already. A record of a newer execution of the same run is taken back, and the older
+    report goes unsent. The protocol has no acknowledgement of the report, so one that Tinfirm
+    drops after it was written is still lost.
+  - Of one `/output` file whose upload was under way at the crash, the next start's upload is
+    refused as a duplicate name: the file is stored once and the run's report does not list it.
+  - A record or report that the host cannot remove (a read-only or failing disk) stays: the next
+    start finishes the run again and reports it a second time, which Tinfirm ignores. A panic in a
+    run's task leaves its record and the credentials in it on disk until the host restarts; the
+    next start finishes the run from the record.
+  - None of this has run on real machines yet: it is shown by tests that kill a host's process at
+    each moment of a run's end.
   - The records hold the run's credentials (the repositories' tokens, a model access key) and the
-    bridge's private key while the sandbox lives, as the config directory holds the host token.
+    bridge's private key until the run's report is made, as the config directory holds the host token.
     A record's git tokens are those the run holds now: when Tinfirm revokes a repository's token
     ([Revoked git tokens](#revoked-git-tokens-protocol-v2)), the host writes the record again,
     whole and 0600, without the token and with the repository in its `revoked` list (the

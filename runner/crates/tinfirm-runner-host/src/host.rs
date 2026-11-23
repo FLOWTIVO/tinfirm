@@ -130,6 +130,10 @@ pub struct HostOptions {
     /// host's own receive-pack client, which has been checked against a git server run for
     /// the test and, for a new branch, GitHub, and not yet against GitLab, Gitea or Azure DevOps.
     pub push_client: crate::git_push::PushClient,
+    /// Tests only, and no flag sets it: a run's task waits for good at this moment of the
+    /// run's end ([`crate::run::HaltAt`]), so that a test kills the host there.
+    #[doc(hidden)]
+    pub halt_at: Option<crate::run::HaltAt>,
 }
 
 impl HostOptions {
@@ -167,6 +171,7 @@ impl HostOptions {
             upload_max_bytes: crate::attachments::DEFAULT_UPLOAD_MAX_BYTES,
             runner_version: crate::version::RUNNER_VERSION.to_string(),
             push_client: crate::git_push::PushClient::Git,
+            halt_at: None,
         }
     }
 
@@ -785,6 +790,7 @@ impl Shared {
     /// the run ([`run::take_back`]). A record that this host cannot take back is logged and
     /// removed.
     pub async fn take_back_runs(self: &Arc<Self>) {
+        self.send_kept_reports();
         let mut records = self.records.load_all();
         if records.is_empty() {
             return;
@@ -793,8 +799,18 @@ impl Shared {
         for record in std::mem::take(&mut records) {
             let run_id = record.run_id();
             if record.collected {
-                // Its work came back from the sandbox before an earlier restart: only the push
-                // and the report are left, from this host's disk (ADR-0116, decision 10).
+                // Its work came back from the sandbox, in the run's own end or before an earlier
+                // restart: only what is left of the run's end is, from this host's disk
+                // (ADR-0116, decision 10). The sandbox was stopping when the process ended: a
+                // container that is still there goes (a VM, which names no run, is a leftover
+                // that `cleanup_orphans` deletes).
+                if let (Executor::Docker(_), crate::takeback::SandboxRecord::Docker { .. }) =
+                    (&self.opts.executor, &record.sandbox)
+                    && let Ok(sandbox) =
+                        crate::sandbox::TakenBack::hold(&self.opts.executor, &record.sandbox)
+                {
+                    sandbox.discard(Duration::from_secs(5)).await;
+                }
                 if self.opts.paths.workspace(run_id).is_dir() {
                     tracing::info!(%run_id, epoch = record.assign.epoch, "taking back a run whose work this host holds; it waits for the server before it pushes");
                     self.spawn_taken_back(record, None);
@@ -881,6 +897,71 @@ impl Shared {
                 record,
                 Some((sandbox, crate::sandbox::Registered::Shared(registration))),
             );
+        }
+    }
+
+    /// At the start, before the first hello: the reports that the process before this one made
+    /// and kept ([`crate::takeback::ReportRecord`]) go into the outbox, as a finished run's end
+    /// that may not have reached the server: the run is listed in `hello.activeRuns`, and its
+    /// `run.finished` is written after the hello, until the outbox forgets it
+    /// ([`Shared::forget_delivered_reports`]).
+    ///
+    /// A record of the same run decides by its epoch. A record of a newer execution is that
+    /// execution's: it is taken back, and the older report goes, unsent. A record of the same
+    /// or an older execution is a leftover of the moment between the report's write and the
+    /// record's removal: it goes, and so does what is left of the run's directories. Of two
+    /// reports of one run, only the newest execution's is sent.
+    fn send_kept_reports(self: &Arc<Self>) {
+        let records: HashMap<Uuid, i64> = self
+            .records
+            .load_all()
+            .iter()
+            .map(|record| (record.run_id(), record.assign.epoch))
+            .collect();
+        let reports = self.records.load_reports();
+        for (i, finished) in reports.iter().enumerate() {
+            let (run_id, epoch) = (finished.run_id, finished.epoch);
+            let newer_record = records.get(&run_id).is_some_and(|kept| *kept > epoch);
+            let newer_report = reports[i + 1..]
+                .iter()
+                .any(|other| other.run_id == run_id && other.epoch > epoch);
+            if newer_record || newer_report {
+                tracing::info!(%run_id, epoch, "a kept report of an execution that a newer one of the run replaced; it is not sent");
+                self.records.remove_report(run_id, epoch);
+                continue;
+            }
+            tracing::info!(%run_id, epoch, outcome = ?finished.outcome, "sending again the report of a run of the process before this one");
+            if records.contains_key(&run_id) {
+                self.records.remove(run_id);
+            }
+            let _ = std::fs::remove_dir_all(self.opts.paths.attachments(run_id));
+            let failed = finished.outcome == tinfirm_protocol::Outcome::Failed
+                || finished
+                    .git
+                    .iter()
+                    .flatten()
+                    .any(|g| !g.pushed && g.commits.unwrap_or(0) > 0);
+            run::cleanup_kept_workspace(self, run_id, failed);
+            self.outbox.resume_run(run_id, epoch, finished.last_seq);
+            self.outbox.push_finished(finished.clone());
+        }
+    }
+
+    /// The kept reports of the executions that the outbox has forgotten go: their end can no
+    /// longer be lost, or no longer matters.
+    pub fn forget_delivered_reports(&self) {
+        for (run_id, epoch) in self.outbox.take_forgotten() {
+            self.records.remove_report(run_id, epoch);
+        }
+    }
+
+    /// On an orderly end of the process, once its connection has ended: a run's end that was
+    /// written on a connection counts as delivered, as the outbox counts it, so its kept report
+    /// goes. A report never written to a connection stays for the next start.
+    pub fn forget_written_reports(&self) {
+        self.forget_delivered_reports();
+        for (run_id, epoch) in self.outbox.finished_written() {
+            self.records.remove_report(run_id, epoch);
         }
     }
 
@@ -1356,6 +1437,13 @@ impl Shared {
                 epoch: e.epoch,
             })
             .collect()
+    }
+
+    /// Whether no newer execution of the run has taken its entry on this host.
+    pub(crate) fn no_newer_execution(&self, run_id: Uuid, epoch: i64) -> bool {
+        lock(&self.runs)
+            .get(&run_id)
+            .is_none_or(|entry| entry.epoch <= epoch)
     }
 
     pub fn live_run_ids(&self) -> HashSet<Uuid> {
@@ -2840,6 +2928,7 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
                     _ = interval.tick() => {
                         host.expire_cooldowns();
                         host.refresh_redactor();
+                        host.forget_delivered_reports();
                     }
                 }
             }
@@ -2890,9 +2979,10 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
         pool.stop().await;
     }
     host.stop_git_proxy().await;
-    match stop {
+    let ended = match stop {
+        // The server closed the connection for good: the kept reports stay for the next start.
         Stop::Fatal(result) => {
-            result.unwrap_or_else(|e| Err(anyhow::anyhow!("connection task failed: {e}")))
+            return result.unwrap_or_else(|e| Err(anyhow::anyhow!("connection task failed: {e}")));
         }
         // Let the connection deliver the final run.finished messages.
         Stop::Shutdown => deliver_within(&mut connection, Duration::from_secs(30)).await,
@@ -2905,7 +2995,14 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
                 deliver_within(&mut connection, Duration::from_secs(30)).await
             }
         },
+    };
+    // An orderly end: the ends written on the connection count as delivered, as the outbox
+    // counts them, and their kept reports go; one never written stays for the next start. The
+    // ticker that forgets delivered reports has stopped already.
+    if ended.is_ok() {
+        host.forget_written_reports();
     }
+    ended
 }
 
 #[cfg(test)]
