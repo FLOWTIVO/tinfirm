@@ -127,7 +127,8 @@ pub struct HostOptions {
     pub runner_version: String,
     /// `run --push-client`: which client pushes a run's work (crate::git_push). `git`, the
     /// default, is `git push` with the run's token in its environment; `host` is the runner
-    /// host's own receive-pack client, which has been checked against no code host yet.
+    /// host's own receive-pack client, which has been checked against a git server run for
+    /// the test and, for a new branch, GitHub, and not yet against GitLab, Gitea or Azure DevOps.
     pub push_client: crate::git_push::PushClient,
 }
 

@@ -1,6 +1,7 @@
 //! The runner host's own receive-pack client (ADR-0112, path C): a push without the run's git
 //! token in git's process tree. `run --push-client host` turns it on; the default is
-//! `git push` ([`crate::git::Git::push`]). It has been checked against no code host yet
+//! `git push` ([`crate::git::Git::push`]). It has been checked against a git server run for the
+//! test and, for a new branch, GitHub, and not yet against GitLab, Gitea or Azure DevOps
 //! (runner/README.md, "The push").
 //!
 //! `git push` runs in the host's process tree with the token in its environment, and its

@@ -2413,7 +2413,8 @@ new session (`resumeOutcome` `NO_SESSION`).
    refused: nothing is pushed or overwritten, and the reason is "the remote branch changed
    during the run". Never a plain force. `run --push-client host` pushes with the runner host's
    own client and the same lease, without the token in git's process tree, and has been checked
-   against no code host yet ([The push](#the-push)). A read-only repository (`workspaces[].readOnly`,
+   against a git server run for the test and, for a new branch, GitHub alone
+   ([The push](#the-push)). A read-only repository (`workspaces[].readOnly`,
    ADR-0017) is never pushed, and its commits are not scanned. A failed push does not stop the
    others; the run then fails with `GIT_ERROR` and a `failureMessage` that names the
    repositories. `run.finished` carries one git result per cloned repository (in

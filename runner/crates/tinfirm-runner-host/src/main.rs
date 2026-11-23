@@ -144,8 +144,9 @@ enum Command {
         /// token in its environment; or `host`, the runner host's own receive-pack client, which
         /// has the objects packed by a process without the token (a reader, with
         /// --sandbox-bridge or --executor vm) and sends them itself, so that the token is in no
-        /// process that reads a sandbox's objects. `host` has been checked against no code host
-        /// yet (GitHub, GitLab, Gitea, Azure DevOps): turn it on only to test it.
+        /// process that reads a sandbox's objects. `host` has been checked against a git server
+        /// run for the test and, for a new branch, GitHub, and not yet against GitLab, Gitea or
+        /// Azure DevOps: turn it on only to test it.
         #[arg(
             long,
             env = "TINFIRM_RUNNER_PUSH_CLIENT",
@@ -414,7 +415,7 @@ enum PushClientChoice {
     /// `git push`, with the run's git token in its environment.
     Git,
     /// The runner host's own receive-pack client: the token stays in `run`, and a process
-    /// without it packs the objects. Checked against no code host yet.
+    /// without it packs the objects. Not yet checked against GitLab, Gitea or Azure DevOps.
     Host,
 }
 
@@ -2544,7 +2545,7 @@ async fn run(
     opts.push_client = push_client;
     if push_client == tinfirm_runner_host::git_push::PushClient::Host {
         tracing::warn!(
-            "--push-client host: the runner host's own receive-pack client pushes the runs' work, and the git tokens stay out of git's process tree. It has been checked against no code host yet (GitHub, GitLab, Gitea, Azure DevOps); without the option, `git push` pushes"
+            "--push-client host: the runner host's own receive-pack client pushes the runs' work, and the git tokens stay out of git's process tree. It has been checked against a git server run for the test and, for a new branch, GitHub, and not yet against GitLab, Gitea or Azure DevOps; without the option, `git push` pushes"
         );
     }
     opts.sandbox = settings;
