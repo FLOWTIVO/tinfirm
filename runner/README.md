@@ -590,7 +590,12 @@ The host derives its level from what it can see, and only takes your word where 
   known" changes nothing, there is at most one such reconnect per 5 minutes, and none while the
   connection is down: the next hello carries the value. Runs go on through the reconnect as
   through any other: the server keeps their leases, the new hello lists them, and their events
-  follow on the new connection. A driver of your own is not asked: `--isolation-hardened` states
+  follow on the new connection. Shown with one hardened node and a server (2026-11-22; the
+  outputs are not in this repository): with `kernel.io_uring_disabled` set back to 0 by hand while
+  the host ran, it logged that the machines that run its VMs are no longer hardened and that it
+  reconnects, connected again at once, and the server's stored `hardened` went from `YES` to `NO`,
+  the level staying `MACHINE`; a run right after succeeded and pushed. With the setting restored, a
+  new hello brought `YES` again. A driver of your own is not asked: `--isolation-hardened` states
   it.
 - **Where it shows.** `run` logs the level at its start, with what an escape from a sandbox reaches
   on such a host. `doctor` says the same for the settings in its environment
@@ -723,7 +728,16 @@ holds its bridge.
   of that file. The agent that the earlier process started stops, its work comes back and is pushed, its
   session is saved, and the run ends failed with `INFRA`, saying what was saved; the next message
   goes on from there. A sandbox that does not come back within 2 minutes is removed, and its work
-  is lost.
+  is lost. Shown on a control host with a VM per run (2026-11-22; the outputs are not in this
+  repository): `run` killed with `kill -9` 13 seconds into a run was started again by the service
+  manager about 5 seconds later; the new process logged "taking back a run of the process before
+  this one, through a new front", deleted the VM, and logged "run taken back and finished", and the
+  server failed the run as infrastructure with "The runner host restarted during the run and took
+  the run back: the agent was stopped, its work so far was pushed, its session was kept, so the next
+  message goes on from it." A known limit: the record is written once the run's sandbox is ready
+  (about 7 seconds after the run turned `RUNNING` on those machines), so a process that ends without
+  a stop (a kill, a panic, a power loss) before that leaves none, its VM is deleted as a leftover,
+  and the server marks the run `LOST`, which it does not start again.
   - The turn does not go on in place: the agent is stopped. Runs without the bridge, and a Docker
     host's runs when the machine itself restarts (Docker stops the containers), are lost.
   - The records hold the run's credentials (the repositories' tokens, a model access key) and the
@@ -876,7 +890,8 @@ The reader:
   to the run's branch alone. A flaw in git's reading of such objects in the push would still reach
   that run's token and the files of `run`'s user: this is what is left of path C for the pack. With
   `run --push-client host` a reader writes the pack too, and the token stays in `run`, which sends
-  the pack unread ([The push](#the-push)); that client has been checked against no code host yet.
+  the pack unread ([The push](#the-push)); that client has been checked against a git server run for
+  the test and, for a new branch, GitHub alone.
 
 The front:
 
@@ -1052,8 +1067,9 @@ git runs in `run`'s process tree with the run's git token in its environment, an
 `pack-objects` reads the objects that a sandbox made. `run --push-client host`
 (`TINFIRM_RUNNER_PUSH_CLIENT=host`) pushes with the runner host's own receive-pack client instead
 (`git_push.rs`), so that no process that reads a sandbox's objects holds the token. **This client has
-been checked against no code host yet** (GitHub, GitLab, Gitea, Azure DevOps). Until it has, `git
-push` stays the default, and `host` is for testing it. With `--push-client host`, for a repository
+been checked against two servers alone:** a git smart-HTTP server run for the test, and GitHub for a
+new branch ([On real machines](#on-real-machines)). It was not checked against GitLab, Gitea or Azure
+DevOps, so `git push` stays the default, and `host` is for testing it. With `--push-client host`, for a repository
 over https:
 
 1. `run` reads the run's token at that request, from the run's holder of git tokens, as the git
@@ -1129,6 +1145,45 @@ HEAD that `run` checked, and only from the lease. Tested in `tests/git_push.rs` 
 tests with seeded random input, and runs in `tests/local_runs.rs`. `TINFIRM_TEST_PUSH_CLIENT=host`
 sets this client on every test host, which uses it for the repositories that a test serves over
 HTTP; most tests use `file://` repositories, which git pushes, and the log says so.
+
+#### On real machines
+
+On 2026-11-22, at `cdf8209`, with the client switched on at a control host and real runs (the
+outputs are not in this repository), against a git smart-HTTP server run for the test, which
+recorded every request, and against GitHub for a new branch. What passed:
+
+- The ref discovery: 200, `Content-Type` exactly `application/x-git-receive-pack-advertisement`,
+  and the server's capabilities (`report-status report-status-v2 delete-refs side-band-64k quiet
+  atomic ofs-delta object-format=sha1`). The User-Agent `git/2.0 (tinfirm-runner-host <version>)`
+  was accepted.
+- A new branch, at GitHub and at the test's server. An update after a rebase, with the lease (a
+  forced update from the leased value).
+- A stale lease (the branch moved during the run): "the remote branch changed during the run …
+  nothing was pushed", with one GET and no POST. An empty push (HEAD is already the tip): one GET,
+  no POST.
+- A pack under 1 MiB went with a `Content-Length`, and one of 125 MiB in chunks (13519 of them), with
+  no 411 and no 413.
+- A refusal by a server hook: "the repository refused the push: remote: …" with the hook's own
+  text. A wrong or expired token: 401, "git push failed: … returned error: 401". A redirect (a 302
+  that the test's server made): refused, "follows no redirect, so that the token goes to the
+  repository's own URL alone".
+- More than 256 refs (313 advertised): the push went through with a correct pack.
+
+Not shown, or in part:
+
+- Every point but the new branch ran against the test's own server alone, and at GitHub only a new
+  branch was pushed. GitLab, Gitea and Azure DevOps were not reached (no account).
+- A branch that moves between the client's two requests (the second half of the stale lease).
+- A push to a SHA-256 repository: the test's server advertised `object-format=sha256`, but no run
+  pushed to such a repository.
+- A repository with no ref at all: a run cannot clone an empty repository, so only "the branch does
+  not exist yet" was shown, by the new branch.
+- A shallow repository; the time and memory of a 1 GiB push against `git push` (not measured: the
+  test's server was the slow part; the large pack went in 64 KiB chunks); an HTTPS proxy in between
+  (a proxy set for the whole host made the run's clone fail first); and a pack writer that fails
+  after writing a whole pack, on a real host.
+
+So `git push` stays the default.
 
 ## A VM per run
 
@@ -1362,8 +1417,14 @@ it, and this host's reading of them. On 2026-11-22, on one node (Ubuntu 24.04, k
 play, the 13 checks, the unit that sets kexec, lockdown and module loading at each boot, and the
 VMMs' AppArmor profile in both modes held, with nothing logged by the profile, driven through the
 driver's `verify` and `doctor` from a control host with no server (the outputs are not in this
-repository). Not shown: a real conversation through a hardened VM, this host reporting `hardened`
-to a server, a new VM going to a hardened node first, and this host's log naming a failing line.
+repository). Later that day, with a server and the VMMs' profile in enforce mode, a real
+conversation (Claude Code with a real model, from its start to its push), a run of the tests'
+stand-in agent and a make that failed after its VMM started ran through a hardened node with no
+`DENIED` line; the server stored this host's level `machine` with `hardened` `yes`, and a line set
+back by hand reached it as `no` by a new hello ([Isolation level](#isolation-level)). Not shown: a
+new VM going to a hardened node first (there was one node), and the failing line in this host's
+warning: the warning carries it in its field `not_hardened`, but the round's notes have the
+message without its fields (`doctor` named the line).
 Tinfirm publishes no VM image: the image holds Claude Code when built with every runtime, and
 Tinfirm does not redistribute it, so you build the image with `images/vm/local-disk.sh` and this
 host's own binary ([ADR-0112](../docs/adr/0112-no-credential-on-a-sandbox-machine.md), decision 4).

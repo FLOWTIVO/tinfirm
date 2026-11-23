@@ -224,7 +224,7 @@ on large workspaces).
 
 > **Not ready for production.** The two plays ran on machines once, on 2026-11-20, on one
 > distribution: [Test on two machines](#test-on-two-machines) says what ran and what it found. A
-> node's hardening ran on one node, on 2026-11-22, with no real conversation through it
+> node's hardening ran on one node, on 2026-11-22, with a real conversation through it
 > ([The hardening on a node](#the-hardening-on-a-node)), and the VM image is yours to build
 > ([The VM image](#the-vm-image)). Use them to prepare and to test.
 
@@ -794,4 +794,36 @@ this repository.
 Not shown in that round: a real conversation through a hardened VM (there was no server), a make
 that fails after its VMM started, the control host reporting `hardened` to a server, a new VM
 going to a hardened node first (there was one node), the host's log naming a failing line, a
-second distribution or kernel, and SELinux on the Red Hat family, which is not built.
+second distribution or kernel, and SELinux on the Red Hat family, which is not built. The second
+round, below, showed the first three.
+
+**Under real runs.** Later on 2026-11-22, at `cdf8209`, the nodes' play ran on one node with
+`tinfirm_sandbox_node_harden: true` and `tinfirm_sandbox_node_harden_mac: enforce`, with a server
+and a control host (`run --executor vm --vm-driver node`). The outputs are not in this repository.
+
+- **The play** ran through (97 tasks ok, 10 changed, none failed) and printed "The hardening mark:
+  yes."; all 13 lines held, and SSH and sudo kept working. `doctor` on the control host said "node
+  hardening: yes" and the isolation level "machine, hardened yes", and the server stored the
+  host's level `MACHINE` with `hardened: YES`.
+- **Runs through a hardened VM.** One conversation of a real agent runtime (Claude Code) with a real
+  model, on a test repository at a code host, from its start to its push: it succeeded, with six
+  model requests and one commit pushed. One run of the tests' stand-in agent, from its start to its
+  push. Each VMM ran under the profile in enforce mode (`tinfirm-vmm (enforce)`).
+- **A make that fails after its VMM started.** With the VMs' published ports dropped on the node by
+  hand, a run's VM was made and its VMM started under the profile; the guest's bridge was not
+  reachable, the make timed out, and the VM was deleted after about five and a half minutes.
+- **No denial.** The kernel logged no `apparmor="DENIED"` line for `tinfirm-vmm` from the play
+  through all these runs: the conversation's clone, file writes, commit, push and model calls, the
+  stand-in run, and the failing make.
+- **A line set back while the host runs.** With `kernel.io_uring_disabled` set to 0 by hand, a run
+  right after succeeded and pushed, and `doctor` said "node hardening: no" and named the line. The
+  control host noticed by itself: it logged that the machines that run its VMs are no longer
+  hardened and that it reconnects so that the server gets a hello with the mark, and connected
+  again at once. The server's stored `hardened` went from `YES` to `NO`, and the level stayed
+  `MACHINE`. With the setting restored, a new hello went out and the server showed `YES` again.
+
+So the VMMs' profile is in enforce mode by default now ([The hardening](#the-hardening)). Not shown:
+a new VM going to a hardened node before an unhardened one (there was one node), the failing line in
+the host's warning (the warning carries it in its field `not_hardened`, but the round's notes have
+the message without its fields; `doctor` named the line), a second distribution or kernel, and
+SELinux on the Red Hat family, which is not built.
