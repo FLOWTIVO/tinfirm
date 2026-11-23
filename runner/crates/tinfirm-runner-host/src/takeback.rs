@@ -458,6 +458,18 @@ impl Records {
         owner
     }
 
+    /// Writes a new record and claims its run for it, in that order and under one lock: when
+    /// the write fails, an older execution of the run keeps its record on disk and stays its
+    /// owner, so that it still rewrites it at a revocation and removes it at its end.
+    fn create_owned(&self, record: &RunRecord) -> Result<u64> {
+        let mut owners = self.owners();
+        self.write(record)?;
+        owners.next += 1;
+        let owner = owners.next;
+        owners.by_run.insert(record.run_id(), owner);
+        Ok(owner)
+    }
+
     /// Writes `record` when `owner` still owns it. `Ok(false)`: a newer handle owns it, and
     /// nothing was written.
     fn save_owned(&self, owner: u64, record: &RunRecord) -> Result<bool> {
@@ -726,13 +738,17 @@ impl std::fmt::Debug for RecordHandle {
 }
 
 impl RecordHandle {
-    /// Writes the record and keeps it.
+    /// Writes the record and keeps it. The run is this handle's only once the record is on
+    /// disk: a write that fails leaves an older execution's record and its handle as they were.
     pub fn create(records: &Records, record: RunRecord) -> Result<RecordHandle> {
-        let handle = RecordHandle::kept(records, record);
-        let record = handle.record.lock().unwrap_or_else(|e| e.into_inner());
-        records.save_owned(handle.owner, &record)?;
-        drop(record);
-        Ok(handle)
+        let owner = records.create_owned(&record)?;
+        Ok(RecordHandle {
+            records: records.clone(),
+            owner,
+            record: Mutex::new(record),
+            removed: AtomicBool::new(false),
+            unsaved: AtomicBool::new(false),
+        })
     }
 
     /// A record that is written already: a run's that this host takes back.
@@ -1215,6 +1231,41 @@ pub(crate) mod tests {
         std::fs::write(&other_path, serde_json::to_vec(&unknown).unwrap()).unwrap();
         assert_eq!(records.load_all().len(), 1);
         assert!(!other_path.exists());
+    }
+
+    /// A newer execution whose record cannot be written takes nothing from the older one: the
+    /// older execution still writes and removes its own record, so that its credentials do not
+    /// stay on disk until the next start.
+    #[test]
+    fn a_newer_record_that_cannot_be_written_leaves_the_older_one_with_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = Records::new(&paths);
+        let mut first = record();
+        first.assign.epoch = 1;
+        let run_id = first.run_id();
+        let older = RecordHandle::create(&records, first.clone()).unwrap();
+        // The newer execution's write fails: a directory stands where its temporary file goes.
+        let blocker = dir.path().join(format!("data/runs/{run_id}.json.tmp"));
+        std::fs::create_dir(&blocker).unwrap();
+        let mut second = first.clone();
+        second.assign.epoch = 2;
+        assert!(RecordHandle::create(&records, second).is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        // The older execution's record is whole, and still its own to change and to remove.
+        let loaded = records.load_all();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].assign.epoch, 1);
+        assert!(older.update(|record| {
+            record.session_id = Some("still mine".into());
+            true
+        }));
+        assert_eq!(
+            records.load_all()[0].session_id.as_deref(),
+            Some("still mine")
+        );
+        older.remove();
+        assert!(records.load_all().is_empty());
     }
 
     #[test]
