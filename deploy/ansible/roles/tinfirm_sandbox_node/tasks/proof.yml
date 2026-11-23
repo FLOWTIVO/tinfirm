@@ -147,8 +147,9 @@
       {%- endfor -%}
       {{ failing }}
 
-# Complain mode: what the profile would have refused is in the kernel's log. Read it before the
-# mode becomes enforce (the role's defaults, tinfirm_sandbox_node_harden_mac).
+# Complain mode, which a site sets for a first run on a distribution or kernel the profile has
+# not run on (enforce is the default, tinfirm_sandbox_node_harden_mac): what the profile would
+# have refused is in the kernel's log. Read it before the mode goes back to enforce.
 - name: Say where complain mode logs
   ansible.builtin.debug:
     msg: >-

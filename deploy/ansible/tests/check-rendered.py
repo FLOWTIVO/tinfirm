@@ -239,17 +239,17 @@ def hardening(out):
     check(settings == ALL_ON, "hardening all on: every setting, perf_event_paranoid left at the node's stricter 4")
     check(harden == {"modulesDisabled": True, "kexecDisabled": True, "lockdown": "integrity"},
           "hardening all on: harden sets module loading, kexec and lockdown")
-    # The default mode of the VMMs' profile is complain, while it is unverified: installed,
-    # loaded in complain mode, not required by makes, and vmm-mac not required by the proof.
-    check(derived["mac"] == "complain" and h["vmmProfile"] == "not-required",
-          "hardening all on: the VMMs' profile in complain mode by default, vmmProfile not-required")
+    # The default mode of the VMMs' profile is enforce (since 2026-11-22): installed, loaded in
+    # enforce mode, required by makes, and vmm-mac required by the proof.
+    check(derived["mac"] == "enforce" and h["vmmProfile"] == "required",
+          "hardening all on: the VMMs' profile in enforce mode by default, vmmProfile required")
     check(h["hardening"] == {"agentPort": 7700, "sshPort": 22, "maxUptimeDays": 30},
           "hardening all on: the agent's port, SSH's and the most days since the boot")
     check(derived["pending"] == [], "hardening all on: a node that has every setting gets none applied again")
     check("apparmor" in derived["packages"], "hardening all on: AppArmor's package")
-    check([k for k, v in derived["mark_lines"].items() if not v] == ["vmm-mac"] and len(derived["mark_lines"]) == 13,
-          "hardening all on: the proof requires every line of the mark but vmm-mac, in complain mode")
-    profile(out, "all-on", "complain")
+    check(all(derived["mark_lines"].values()) and len(derived["mark_lines"]) == 13,
+          "hardening all on: the proof requires every line of the mark, vmm-mac too")
+    profile(out, "all-on", "enforce")
 
     settings, harden, h, derived = hardening_case(out, "master-off")
     check(settings == {}, "hardening master off: no setting")
@@ -270,12 +270,12 @@ def hardening(out):
             wanted[HARDEN_JSON[switch]] = "none" if switch == "lockdown" else False
         check(harden == wanted, f"hardening {switch} off: hardening.json changes only its own field")
         mac = switch != "mac"
-        check(h["vmmProfile"] == "not-required" and ("apparmor" in derived["packages"]) == mac
-              and derived["mac"] == ("complain" if mac else "off"),
-              f"hardening {switch} off: AppArmor's package follows the AppArmor switch alone, vmmProfile not-required")
+        check(h["vmmProfile"] == ("required" if mac else "not-required") and ("apparmor" in derived["packages"]) == mac
+              and derived["mac"] == ("enforce" if mac else "off"),
+              f"hardening {switch} off: AppArmor's package and vmmProfile follow the AppArmor switch alone")
         off = [k for k, v in derived["mark_lines"].items() if not v]
-        check(off == sorted({MARK_LINE[switch], "vmm-mac"}),
-              f"hardening {switch} off: the proof leaves out {MARK_LINE[switch]} (and vmm-mac, in complain mode)")
+        check(off == [MARK_LINE[switch]],
+              f"hardening {switch} off: the proof leaves out {MARK_LINE[switch]} alone")
         check((out / "hardening" / f"{switch}-off" / "tinfirm-vmm").exists() == mac,
               f"hardening {switch} off: the profile installed while AppArmor's switch is on")
 
@@ -283,11 +283,12 @@ def hardening(out):
     check(derived["mac"] == "off" and h["vmmProfile"] == "not-required" and "apparmor" not in derived["packages"]
           and not (out / "hardening" / "mac-off-string" / "tinfirm-vmm").exists(),
           "hardening: \"off\" as a string is off, as false is")
-    settings, harden, h, derived = hardening_case(out, "mac-enforce")
-    check(derived["mac"] == "enforce" and h["vmmProfile"] == "required" and "apparmor" in derived["packages"],
-          "hardening in enforce mode: vmmProfile required, AppArmor's package")
-    check(all(derived["mark_lines"].values()), "hardening in enforce mode: the proof requires every line, vmm-mac too")
-    profile(out, "mac-enforce", "enforce")
+    settings, harden, h, derived = hardening_case(out, "mac-complain")
+    check(derived["mac"] == "complain" and h["vmmProfile"] == "not-required" and "apparmor" in derived["packages"],
+          "hardening in complain mode: vmmProfile not-required, AppArmor's package")
+    check([k for k, v in derived["mark_lines"].items() if not v] == ["vmm-mac"],
+          "hardening in complain mode: the proof requires every line of the mark but vmm-mac")
+    profile(out, "mac-complain", "complain")
     _, _, h, _ = hardening_case(out, "master-off")
     check(h["vmmProfile"] == "not-required", "hardening master off: the profile off whatever its own switch says")
 

@@ -1,7 +1,10 @@
 # The AppArmor profile of every VM's VMM (ADR-0113, decision 5): one profile for all of them,
 # since every VM's files have the same names in its own jail and the users keep the VMs
-# apart. UNVERIFIED: CI parses it, and it has not been loaded on a node yet. Load it first in complain
-# mode, run VMs with and without guestConsole and a make that fails, and read the
+# apart. CI parses it. On 2026-11-22 it ran on one node (an Ubuntu 24.04 cloud image): in complain
+# mode with no apparmor="ALLOWED" line, and in enforce mode, through a real conversation and a
+# make that failed after its VMM started, with no apparmor="DENIED" line. The role loads it in
+# enforce mode by default. On a distribution or kernel it has not run on, load it first in
+# complain mode, run VMs with and without guestConsole and a make that fails, and read the
 # apparmor="ALLOWED" lines before it is enforced (the crate's README, "The VMM's profile").
 #
 # How it attaches: the helper, `start-jailer` and the jailer are unconfined, and the jailer
@@ -38,10 +41,10 @@ profile tinfirm-vmm /{,srv/tinfirm-jails/firecracker/tfvm-*/root/}firecracker fl
   unix (create, bind, listen, accept, send, receive, getattr, getopt, setopt, shutdown) type=stream,
 
   # The devices the jailer makes in the jail: KVM, and the tap device that
-  # firecracker_config's network interface (`host_dev_name`) opens. /dev/urandom is kept
-  # until the complain-mode run shows whether Firecracker opens it. /dev/userfaultfd, which
-  # the jailer also makes, is left out: it serves a snapshot's restore, which the helper
-  # never asks for.
+  # firecracker_config's network interface (`host_dev_name`) opens. /dev/urandom is kept:
+  # whether Firecracker opens it is not known, and no run can show it while this rule allows
+  # the open, in either mode. /dev/userfaultfd, which the jailer also makes, is left out: it
+  # serves a snapshot's restore, which the helper never asks for.
   /dev/kvm rw,
   /dev/net/tun rw,
   /dev/urandom r,

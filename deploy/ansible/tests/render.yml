@@ -41,9 +41,10 @@
         mode: "0644"
       loop: [helper.json, listener.json, firewall.nft, listener-control-host.conf]
 
-    # The hardening: every switch on (the node's settings as example-vars.yml reads them), each
-    # switch off in turn, the master switch off, and a node whose settings are below the
-    # hardening's (check-rendered.py, "hardening").
+    # The hardening: every switch on (the node's settings as example-vars.yml reads them, the
+    # VMMs' profile in enforce mode, its default), each switch off in turn, the master switch off,
+    # the profile in complain mode, and a node whose settings are below the hardening's
+    # (check-rendered.py, "hardening").
     - name: Render the hardening with every switch on
       ansible.builtin.include_tasks: render-hardening.yml
       vars:
@@ -79,11 +80,11 @@
         _case: mac-off-string
         tinfirm_sandbox_node_harden_mac: "off"
 
-    - name: Render the hardening with the VMMs' profile in enforce mode
+    - name: Render the hardening with the VMMs' profile in complain mode
       ansible.builtin.include_tasks: render-hardening.yml
       vars:
-        _case: mac-enforce
-        tinfirm_sandbox_node_harden_mac: enforce
+        _case: mac-complain
+        tinfirm_sandbox_node_harden_mac: complain
 
     - name: Render the hardening with panic on oops off
       ansible.builtin.include_tasks: render-hardening.yml

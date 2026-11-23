@@ -521,12 +521,25 @@ switch that is off leaves the machine's setting as it is: the line may then fail
 only while every node that offers the template reports `yes`
 ([runner/README.md](../../runner/README.md#isolation-level)).
 
-**With the defaults, a node reports `hardened: no`, for the line `vmm-mac` alone.** The VMMs'
-AppArmor profile's default mode is `complain`: loaded, refusing nothing, and logging what it would
-refuse. It does not count as confinement. The profile ran on one node, on 2026-11-22, in both modes,
-and logged nothing over the VMs' life ([The hardening on a node](#the-hardening-on-a-node)); no
-real conversation has run under it yet. The default becomes `enforce` once one has; until then,
-set `tinfirm_sandbox_node_harden_mac: enforce` yourself once the complain-mode log is clean.
+**With the defaults, a node reports `hardened: yes` when every line holds.** The VMMs' AppArmor
+profile's default mode is `enforce` since 2026-11-22 (the owner's decision): loaded in enforce
+mode, with `"vmmProfile": "required"`, so that a make fails for a VMM that the profile does not
+confine. Before, the default was `complain`, and a node set up with the defaults reported `no` for
+the line `vmm-mac` alone. The evidence, and its limit: on one node, from an Ubuntu 24.04 cloud
+image, the profile logged no `ALLOWED` line in complain mode over the VMs' whole life, and no
+`DENIED` line in enforce mode over a real conversation, a run of the tests' stand-in agent and a
+make that failed after its VMM started ([The hardening on a node](#the-hardening-on-a-node)). That
+is one distribution and one kernel. The role sets the profile up on the Debian family (Ubuntu and
+Debian) with AppArmor on, and has run on Ubuntu 24.04 alone.
+
+**If VMs stop starting after the change**, look for `apparmor="DENIED"` lines of `tinfirm-vmm` in
+the node's kernel log (`journalctl -k --grep 'apparmor="DENIED"'`, or the audit log where auditd
+runs). Set `tinfirm_sandbox_node_harden_mac: complain` and run the play again: the node's mark is
+then `no`, for `vmm-mac`. Report the lines. `complain` stays a value, for a first run on a
+distribution or kernel the profile has not run on: loaded, refusing nothing, and logging what it
+would refuse as `apparmor="ALLOWED"` lines. It does not count as confinement. Set `enforce` again
+once that log is clean. A Red Hat family node is as before: the role refuses `complain` and
+`enforce` there, so set `off`, and `vmm-mac` does not hold (SELinux for the VMMs is not built).
 
 | Switch (`tinfirm_sandbox_node_harden_…`) | What the role does | What it costs |
 |---|---|---|
@@ -535,7 +548,7 @@ set `tinfirm_sandbox_node_harden_mac: enforce` yourself once the complain-mode l
 | `io_uring` | `kernel.io_uring_disabled = 2`, same file. Refused on a kernel without the setting (older than 6.6: Debian 12's 6.1) | No io_uring on the node |
 | `panic_on_oops` | `kernel.panic_on_oops = 1` and `kernel.panic = tinfirm_sandbox_node_kernel_panic` (0: the node stays down) | An oops ends every run on the node. With the role's default the node then stays down until someone restarts it, also on an image that rebooted by itself after a panic: the cloud's image of [The hardening on a node](#the-hardening-on-a-node) had `kernel.panic = -1` |
 | `distribution` | `kernel.kptr_restrict`, `kernel.dmesg_restrict`, `kernel.perf_event_paranoid`, `kernel.randomize_va_space`, `fs.protected_symlinks`, `fs.protected_hardlinks` at the mark's values; a value the node has stricter already (Ubuntu's `perf_event_paranoid = 4`) is left out, never lowered | Users cannot read the kernel's log or addresses |
-| `mac`: `off` (or `false`), `complain` (**the default**) or `enforce` | `complain`: installs AppArmor, writes the VMMs' profile `/etc/apparmor.d/tinfirm-vmm` with `complain` in its flags (checked with `apparmor_parser -Q -K` first), and loads it; `helper.json` says `"vmmProfile": "not-required"`. The kernel logs what the profile would refuse as lines with `apparmor="ALLOWED"` (`journalctl -k`, or the audit log), and the proof says so. `enforce`: the same profile without `complain`, loaded in enforce mode, and `"vmmProfile": "required"`: a make fails for a VMM the profile does not confine. A change between the two loads the profile again in the new mode; the mode is in the file, so it holds across a reboot. `off`: a profile that an earlier run loaded is unloaded (`apparmor_parser -R`) and its file removed, and `"vmmProfile": "not-required"`; **a VMM that runs keeps the confinement it started with until it ends**. Complain and enforce are refused on a node without AppArmor, which a Red Hat family node is | **The profile ran on one node** (2026-11-22, Ubuntu 24.04): in complain mode it logged no `ALLOWED` line, and in enforce mode no `DENIED` line, over the VMs' whole life. No real conversation has run under it yet, hence `complain` by default, in which `vmm-mac` does not hold and the mark is `no`. In enforce mode, VMMs that ran before the profile was loaded stay unconfined, and the mark `no`, until they are deleted. The profile names `/srv/tinfirm-jails` and `/var/lib/tinfirm-node-agent/work`, which the role does not let a site change |
+| `mac`: `off` (or `false`), `complain` or `enforce` (**the default**) | `complain`: installs AppArmor, writes the VMMs' profile `/etc/apparmor.d/tinfirm-vmm` with `complain` in its flags (checked with `apparmor_parser -Q -K` first), and loads it; `helper.json` says `"vmmProfile": "not-required"`. The kernel logs what the profile would refuse as lines with `apparmor="ALLOWED"` (`journalctl -k`, or the audit log), and the proof says so. `enforce`: the same profile without `complain`, loaded in enforce mode, and `"vmmProfile": "required"`: a make fails for a VMM the profile does not confine. A change between the two loads the profile again in the new mode; the mode is in the file, so it holds across a reboot. `off`: a profile that an earlier run loaded is unloaded (`apparmor_parser -R`) and its file removed, and `"vmmProfile": "not-required"`; **a VMM that runs keeps the confinement it started with until it ends**. Complain and enforce are refused on a node without AppArmor, which a Red Hat family node is | **The profile has run on one node** (2026-11-22, Ubuntu 24.04): in complain mode it logged no `ALLOWED` line over the VMs' whole life, and in enforce mode no `DENIED` line, through a real conversation and a make that failed after its VMM started; hence `enforce` by default. On a distribution or kernel it has not run on, a rule it lacks stops every VM from starting: use `complain` there first (above). In complain mode `vmm-mac` does not hold and the mark is `no`. In enforce mode, VMMs that ran before the profile was loaded stay unconfined, and the mark `no`, until they are deleted. The profile names `/srv/tinfirm-jails` and `/var/lib/tinfirm-node-agent/work`, which the role does not let a site change |
 | `modules`, `kexec`, `lockdown` | `/etc/tinfirm/node-agent/hardening.json`, which `tinfirm-node-agent-hardening.service` applies at each boot after the modules' and firewall's units and after kdump: kexec off, lockdown at `integrity`, then module loading off once every module the agent needs is loaded. Lockdown is refused on a kernel without the lockdown LSM | **All three last until a reboot, and only a reboot undoes them.** No module loads after it: a firewall rule or a tool that needs a new one fails. A change of the modules' list while module loading is off stops the play with "reboot the node": the new unit is installed and loads at the next boot |
 | `setuid` | Finds the setuid and setgid programs under `/usr`, `/opt`, `/bin` and `/sbin` that others may run, as the helper's scan does, and strips both bits; keeps `sudo` as `4750 root:sudo` (`root:wheel` on the Red Hat family). On Debian and Ubuntu each change is recorded with `dpkg-statoverride`, so that a package upgrade keeps it; on the Red Hat family an upgrade puts the bits back, and the next run of the role removes them again. Refused for a play whose user is neither root nor in that group | Users lose `su`, `passwd`, `chsh`, `chfn`, `newgrp`, `gpasswd`, `mount`, `umount`, `fusermount3`, `pkexec`, `ssh-keysign`, `crontab`, `wall`, snaps (`snap-confine`), `unix_chkpwd` (a program that is not root can then not check a password; not tried), and every other such program; `sudo` stays for the admin group alone |
 
@@ -552,7 +565,8 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
 ### Not done by these roles
 
 - **SELinux on a Red Hat family node** (ADR-0113 decision 5): such a node reports `no` for the line
-  `vmm-mac`, and the role refuses the AppArmor switch there.
+  `vmm-mac`, and the role refuses the AppArmor switch there: set
+  `tinfirm_sandbox_node_harden_mac: "off"` on such a node.
 - **The single machine** (ADR-0112 decision 5): the runner host and the node agent on one machine.
   It is set aside and not built. The helper refuses a control host on the node's own machine, and so
   does the role.
@@ -608,7 +622,7 @@ failure does not stop the helper: the mark says `no`, and the unit's journal say
 | `tinfirm_sandbox_node_name` | the inventory name | The node's name in the entry the play shows |
 | `tinfirm_sandbox_node_harden` | `true` | The master switch of the hardening: `false` turns every line off |
 | `tinfirm_sandbox_node_harden_bpf`, `_io_uring`, `_panic_on_oops`, `_modules`, `_kexec`, `_lockdown`, `_setuid`, `_distribution` | `true` each | One line of the hardening each ([The hardening](#the-hardening)) |
-| `tinfirm_sandbox_node_harden_mac` | `complain` | The VMMs' AppArmor profile: `off` (or `false`), `complain` or `enforce`. In complain mode the node's mark is `no` for `vmm-mac`; the default becomes `enforce` once a real conversation has run under the profile |
+| `tinfirm_sandbox_node_harden_mac` | `enforce` | The VMMs' AppArmor profile: `off` (or `false`), `complain` or `enforce`. `enforce` by default since 2026-11-22; `complain` is for a first run on a distribution or kernel the profile has not run on, and the node's mark is then `no` for `vmm-mac`. `off` on a Red Hat family node |
 | `tinfirm_sandbox_node_kernel_panic` | `0` | `kernel.panic`: seconds before a node that panicked reboots; 0, it stays down until someone restarts it, also where the image rebooted by itself before |
 | `tinfirm_sandbox_node_max_uptime_days` | `30` | The most days since the boot before the mark is `no` (`hardening.maxUptimeDays`) |
 
@@ -642,7 +656,8 @@ python3 -I deploy/ansible/tests/check-rendered.py /tmp/rendered
 README, `node-driver.json` against the runner host's, the rendered firewall against the units' own
 file with the same values, the control host's command line, the units' order and copies, the
 firewall with `nft -c -f` where `nft` may check a ruleset, and the hardening's files: all switches
-on, each off in turn (its lines alone gone), the master switch off (none), and a node below every
+on, with the VMMs' profile in enforce mode, each off in turn (its lines alone gone), the master
+switch off (none), the profile in complain mode (every line but `vmm-mac`), and a node below every
 setting. CI's deploy job also parses the VMMs' profile with `apparmor_parser -Q -K`.
 
 The agent tries one of these itself, at every `verify`: one empty UDP datagram from its listener
@@ -757,8 +772,8 @@ this repository.
   `integrity`). 19 programs lost their setuid or setgid bit, each recorded with
   `dpkg-statoverride`; `sudo` stayed as `4750 root:sudo`, and `dbus-daemon-launch-helper` as
   `4754 root:messagebus`, which others cannot run.
-- **The mark.** With the defaults, `hardened: no` for `vmm-mac` alone, the profile being in complain
-  mode; the other 12 lines held on the first run. With `tinfirm_sandbox_node_harden_mac: enforce`,
+- **The mark.** With the defaults of that commit, `hardened: no` for `vmm-mac` alone, the profile
+  being in complain mode, its default then; the other 12 lines held on the first run. With `tinfirm_sandbox_node_harden_mac: enforce`,
   `hardened: yes` with all 13 lines, with no VMM and with two running, and `doctor` said so.
 - **VMs under the profile.** In both modes VMs were made, reached on their published port, listed
   and deleted, two side by side, with nothing left on the node. The profile logged nothing: no

@@ -9,7 +9,7 @@
 # Not done by this role: the single machine (ADR-0112 decision 5), which the node agent refuses
 # today, and the node's egress to anything but the control host, which the agent's `verify`
 # does not try. Sandbox nodes are not ready for production: the hardening below has run on one
-# node only (2026-11-22, Ubuntu 24.04), and no real conversation has run under it yet. Tinfirm
+# node only (2026-11-22, Ubuntu 24.04), a real conversation through it included. Tinfirm
 # publishes no VM image: the site builds it.
 
 # --- The node agent's binary -----------------------------------------------------------------
@@ -188,13 +188,17 @@ tinfirm_sandbox_node_harden_io_uring: true
 #   `vmm-mac` does not hold, so the node's mark is `no`.
 # - `off` (or false): no profile. One that an earlier run loaded is unloaded and its file removed;
 #   a VMM that runs keeps its confinement until it ends. `vmm-mac` fails, and makes do not ask.
-# A Red Hat family node has SELinux and no AppArmor: the role refuses complain and enforce there.
-# The default is `complain`: in enforce mode a rule the profile lacks would stop every VM from
-# starting. On 2026-11-22 the profile ran on one node (Ubuntu 24.04) in both modes, and logged
-# nothing over the VMs' life; no real conversation has run under it yet. The default becomes
-# `enforce` once one has. Until then, a node set up with the defaults reports `hardened: no` for
-# this line alone.
-tinfirm_sandbox_node_harden_mac: complain
+# A Red Hat family node has SELinux and no AppArmor: the role refuses complain and enforce there,
+# so set `off` on such a node.
+# The default is `enforce`, since 2026-11-22 (the owner). On one node (an Ubuntu 24.04 cloud
+# image) the profile logged nothing in complain mode over the VMs' whole life, and no
+# apparmor="DENIED" line in enforce mode over a real conversation, a run of the tests' stand-in
+# agent and a make that failed after its VMM started. That is one distribution and kernel: a rule
+# the profile lacks elsewhere stops every VM from starting. If VMs stop starting, look for
+# apparmor="DENIED" lines of tinfirm-vmm in the kernel's log (`journalctl -k`), set `complain`
+# (the node's mark is then `no` for `vmm-mac`), and report the lines. `complain` is for a first
+# run on a distribution or kernel the profile has not run on.
+tinfirm_sandbox_node_harden_mac: enforce
 # kernel.panic_on_oops = 1, and kernel.panic = tinfirm_sandbox_node_kernel_panic: an exploit that
 # fails takes the node down instead of trying again, and ends every run on it. Off:
 # `panic-on-oops` fails.
