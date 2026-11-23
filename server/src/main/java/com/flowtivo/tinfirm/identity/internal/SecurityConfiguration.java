@@ -112,6 +112,7 @@ class SecurityConfiguration {
                 .defaultAccessDeniedHandlerFor(problems, api))
             .headers(headers -> securityHeaders(headers, tinfirm, outlook))
             .addFilterBefore(new SessionMaxAgeFilter(sessionLifetime.maxAge(), clock), SecurityContextHolderFilter.class)
+            .addFilterBefore(MultipartCsrfFilter.headerRequired(api, exceptionResolver), CsrfFilter.class)
             .addFilterAfter(new CsrfCookieFilter(), CsrfFilter.class)
             .addFilterBefore(new ActiveUserFilter(users), AnonymousAuthenticationFilter.class);
 

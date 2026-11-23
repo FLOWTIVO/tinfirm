@@ -184,6 +184,7 @@ class AuthorizationServerConfiguration {
             .addFilterBefore(new NotServedFilter(notServed, problems), SecurityContextHolderFilter.class)
             .addFilterBefore(new SessionMaxAgeFilter(sessionLifetime.maxAge(), clock), SecurityContextHolderFilter.class)
             .addFilterAfter(new AuthorizationServerUserFilter(access), SecurityContextHolderFilter.class)
+            .addFilterBefore(MultipartCsrfFilter.noMultipart(exceptionResolver), CsrfFilter.class)
             .addFilterAfter(new ConsentCsrfFilter(paths.matcher(HttpMethod.POST, settings.getAuthorizationEndpoint()),
                     csrfTokenRepository, problems), CsrfFilter.class);
         return http.build();
