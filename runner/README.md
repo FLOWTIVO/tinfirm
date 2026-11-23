@@ -743,6 +743,10 @@ holds its bridge.
   ([ADR-0073](../docs/adr/0073-automatic-retries.md), decision 9); it does so only when nothing of the
   run past its preparation reached it, so a run that has no record for another reason (a sandbox
   without the bridge, a record that could not be written) and whose agent had started stays lost.
+  On real machines on 2026-11-23, at `620b3f9`: a host killed before its run's record existed lost
+  the run, and the server started the turn again after 1 minute, then after 2 and after 4, and
+  after the third lost start left the turn to the person; a host killed after its agent had
+  started took the run back and the server started nothing by itself.
   - The turn does not go on in place: the agent is stopped. Runs without the bridge, and a Docker
     host's runs when the machine itself restarts (Docker stops the containers), are lost.
   - **A restart in the run's own end.** Once the agent's turn has ended, the work comes back from
@@ -779,8 +783,13 @@ holds its bridge.
     start finishes the run again and reports it a second time, which Tinfirm ignores. A panic in a
     run's task leaves its record and the credentials in it on disk until the host restarts; the
     next start finishes the run from the record.
-  - None of this has run on real machines yet: it is shown by tests that kill a host's process at
-    each moment of a run's end.
+  - On real machines, on 2026-11-23 at `620b3f9` (the outputs are not in this repository): a host
+    killed during the push took the run back, pushed, and reported that the run succeeded, with
+    the work on the branch once; a report that could not be delivered was sent once after the
+    host was back; an orderly restart took nothing back and left no report; a cancelled run
+    whose host was killed ended cancelled. Not shown there: the leak (the test's stand-in agent
+    holds no credential to leak), and a kill between the end's other steps, which follow each
+    other within about a second: the tests reach those, by stopping the host's process at each.
   - The records hold the run's credentials (the repositories' tokens, a model access key) and the
     bridge's private key until the run's report is made, as the config directory holds the host token.
     A record's git tokens are those the run holds now: when Tinfirm revokes a repository's token
