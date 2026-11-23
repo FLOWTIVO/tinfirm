@@ -65,6 +65,14 @@ class ToolCallStore {
             .optional();
     }
 
+    /** Whether the run has a row: a call of its agent reached the journal. */
+    boolean anyOfRun(UUID runId) {
+        return jdbc.sql("SELECT EXISTS (SELECT 1 FROM tool_call WHERE run_id = ?)")
+            .param(runId)
+            .query(Boolean.class)
+            .single();
+    }
+
     /** The row, locked for its change ({@code FOR NO KEY UPDATE}: no key of it changes). */
     Optional<Row> lock(UUID runId, UUID requestId) {
         return jdbc.sql("SELECT " + COLUMNS + " FROM tool_call WHERE run_id = ? AND request_id = ? FOR NO KEY UPDATE")

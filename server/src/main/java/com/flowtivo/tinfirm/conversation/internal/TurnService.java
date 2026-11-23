@@ -33,6 +33,7 @@ import com.flowtivo.tinfirm.run.ActiveRun;
 import com.flowtivo.tinfirm.run.NewTurn;
 import com.flowtivo.tinfirm.run.PlacementNote;
 import com.flowtivo.tinfirm.run.QueueReasonCode;
+import com.flowtivo.tinfirm.run.RunAgentStart;
 import com.flowtivo.tinfirm.run.RunEvents;
 import com.flowtivo.tinfirm.run.RunInfo;
 import com.flowtivo.tinfirm.run.RunReads;
@@ -65,7 +66,8 @@ import com.flowtivo.tinfirm.shared.time.TimeSource;
  * <li>A turn that failed for a reason that may pass is retried by itself when its settings' owner chose so
  * (ADR-0073): a {@code RETRY} turn that nobody started, whose run waits {@code RETRY_SCHEDULED} until its time, at most
  * {@value #AUTO_RETRIES} in a row, after 1, 2 and 4 minutes; the failure reaches its place only once they are
- * spent.</li>
+ * spent. A run lost because its runner host restarted before its agent got a prompt is started again so without that
+ * choice, in the same row: it did no work and spent no budget.</li>
  * <li>What the conversation waits on, the first that applies: ended, nothing; an open decision, the person (its kind);
  * a waiting binding that holds the turn up (parked calls, or the active run waits {@code ACCOUNT_REQUIRED}), the person
  * ({@code ACCOUNT}); a running run, the agent; a queued run, the runner (its queue reason); a failed turn, the person
@@ -119,11 +121,15 @@ class TurnService implements ConversationTurns, TurnEnded, TurnSteered {
 
     private final Principals principals;
 
+    private final RunAgentStart agentStart;
+
     TurnService(ConversationStore store, BindingStore bindingStore, BindingService bindings,
             WorkspaceService workspace, DecisionReads decisions, ConversationMessagesImpl messages, Turns turns,
             RunReads runs, Agents agents, Settings settings, List<TurnEndHook> hooks, TimeSource time,
-            TriggerPorts triggers, ApplicationEventPublisher events, ToolCallStore toolCalls, Principals principals) {
+            TriggerPorts triggers, ApplicationEventPublisher events, ToolCallStore toolCalls, Principals principals,
+            RunAgentStart agentStart) {
         this.principals = principals;
+        this.agentStart = agentStart;
         this.triggers = triggers;
         this.events = events;
         this.store = store;
@@ -618,7 +624,8 @@ class TurnService implements ConversationTurns, TurnEnded, TurnSteered {
      * What follows a failed turn by itself (ADR-0073): {@code scheduled}, an automatic retry, when the failure may pass
      * ({@link #mayPass}), the conversation is open, nothing else waits (a decision, a firing, a message: the turn that
      * takes it comes first, as after any failure), its trigger is not paused, the settings' owner chose automatic
-     * retries, and fewer than {@value #AUTO_RETRIES} came in a row; {@code spent} when only the last is not so.
+     * retries or the run was lost before its agent got a prompt ({@link #beforePrompt}), and fewer than
+     * {@value #AUTO_RETRIES} came in a row, of both kinds; {@code spent} when only the last is not so.
      */
     private AutoRetry autoRetry(ConversationInfo conversation, TurnEnd end, @Nullable String failureClass) {
         UUID companyId = conversation.companyId();
@@ -628,7 +635,10 @@ class TurnService implements ConversationTurns, TurnEnded, TurnSteered {
                 || triggers.pausedTrigger(conversation).isPresent()) {
             return AutoRetry.NONE;
         }
-        if (!settings.effective(companyId, conversation.agentId(), conversation.settingsOwner()).autoRetry()) {
+        boolean chosen = settings.effective(companyId, conversation.agentId(), conversation.settingsOwner())
+            .autoRetry();
+        boolean beforePrompt = !chosen && beforePrompt(end);
+        if (!chosen && !beforePrompt) {
             return AutoRetry.NONE;
         }
         int done = store.automaticRetries(companyId, conversationId);
@@ -636,8 +646,19 @@ class TurnService implements ConversationTurns, TurnEnded, TurnSteered {
             return new AutoRetry(null, true);
         }
         int attempt = done + 1;
-        return new AutoRetry(new NewTurn.Scheduled(time.now().plus(waitBefore(attempt)), attempt, AUTO_RETRIES),
-                false);
+        return new AutoRetry(new NewTurn.Scheduled(time.now().plus(waitBefore(attempt)), attempt, AUTO_RETRIES,
+                beforePrompt), false);
+    }
+
+    /**
+     * Whether a run was lost because its runner host restarted before its agent got a prompt (ADR-0073, amended
+     * 2026-11-23): {@code HOST_RESTARTED}, the run module holds proof that the agent got none
+     * ({@link RunAgentStart#mayHaveStarted}), and no call of the run reached the call journal. Such a turn is started
+     * again without its owner's choice: nothing was done and no budget spent. Any doubt counts as a prompt.
+     */
+    private boolean beforePrompt(TurnEnd end) {
+        return end.status() == RunStatus.LOST && "HOST_RESTARTED".equals(end.lostCause())
+                && !toolCalls.anyOfRun(end.runId()) && !agentStart.mayHaveStarted(end.companyId(), end.runId());
     }
 
     /**
@@ -720,7 +741,8 @@ class TurnService implements ConversationTurns, TurnEnded, TurnSteered {
 
     /**
      * Tinfirm's note of a failed turn, saying when it is retried by itself ({@code retry}, ADR-0073) or that the
-     * automatic retries in a row are spent ({@code spent}).
+     * automatic retries in a row are spent ({@code spent}). A run lost before its agent got a prompt, started again
+     * without its owner's choice, says so in plain words instead.
      */
     static String failureMessage(TurnEnd end, @Nullable String failureClass, NewTurn.@Nullable Scheduled retry,
             boolean spent) {
@@ -728,6 +750,13 @@ class TurnService implements ConversationTurns, TurnEnded, TurnSteered {
             // The runner's message, which names the limit, is on the turn; the note says what to do.
             return "The turn reached its time limit and stopped. Its work so far is kept: retry the turn to go on from "
                     + "where it stopped, or say what to do next.";
+        }
+        if (retry != null && retry.beforePrompt()) {
+            long minutes = waitBefore(retry.attempt()).toMinutes();
+            return "The runner host restarted before the agent started on this turn, so nothing was lost. Tinfirm "
+                    + "starts the turn again by itself in " + minutes + (minutes == 1 ? " minute" : " minutes")
+                    + " (automatic retry " + retry.attempt() + " of " + retry.attempts()
+                    + "); cancel the turn to stop it.";
         }
         StringBuilder body = new StringBuilder();
         if (end.status() == RunStatus.LOST) {

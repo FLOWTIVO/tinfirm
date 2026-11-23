@@ -168,6 +168,8 @@ The menu beside the title holds **Cancel turn**, **Retry** and **End conversatio
 
 Some failures pass by themselves: the model's provider or gateway is overloaded or unavailable, or the runner host restarted. Turn on **Automatic retries** in your [My settings](my-settings.md) for the agent, and such a turn is retried up to three times in a row, 1, 2 and 4 minutes after each failure, paid as the turn was. Meanwhile the conversation shows **Waiting · Retrying soon**, and the thread says when it retries. Cancel the turn to stop the retries.
 
+One failure is retried without the setting: when the runner host restarted before the agent started on the turn. Nothing was done and nothing was spent, so Tinfirm starts the turn again by itself, at most three times in a row and after the same waits, and the thread says so.
+
 ### The time limit of a turn
 
 A turn may run for a limited time: 60 minutes unless the operator or the agent sets another, from 5 minutes to 24 hours. At the limit, the runner host stops the turn and keeps its work. The conversation shows **Stopped · Time limit**, and **Continue** goes on from where it stopped. You can also write what to do next instead.

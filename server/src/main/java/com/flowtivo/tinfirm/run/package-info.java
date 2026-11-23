@@ -29,7 +29,8 @@
  * ({@link com.flowtivo.tinfirm.vault.DataKeys}), and swept with the conversation. Keeping them is Pro's and
  * Enterprise's, under {@code ee/} (ADR-0100); deleting them is the core's, in every edition.</li>
  * </ul>
- * API: {@link com.flowtivo.tinfirm.run.Turns}, {@link com.flowtivo.tinfirm.run.RunReads} and the events of
+ * API: {@link com.flowtivo.tinfirm.run.Turns}, {@link com.flowtivo.tinfirm.run.RunReads},
+ * {@link com.flowtivo.tinfirm.run.RunAgentStart} (whether a run's agent may have had its prompt) and the events of
  * {@link com.flowtivo.tinfirm.run.RunEvents}. It implements the agent module's
  * {@link com.flowtivo.tinfirm.agent.AgentRuns} (an agent with active runs is not deleted; pausing it with
  * {@code stopRunning} cancels them). Ports the conversation module (package 3c) implements:

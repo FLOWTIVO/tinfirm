@@ -737,7 +737,11 @@ holds its bridge.
   message goes on from it." A known limit: the record is written once the run's sandbox is ready
   (about 7 seconds after the run turned `RUNNING` on those machines), so a process that ends without
   a stop (a kill, a panic, a power loss) before that leaves none, its VM is deleted as a leftover,
-  and the server marks the run `LOST`, which it does not start again.
+  and the server marks the run `LOST` (`HOST_RESTARTED`). Since the agent of such a run never got a
+  prompt, the server starts the turn again by itself, at most three times in a row
+  ([ADR-0073](../docs/adr/0073-automatic-retries.md), decision 9); it does so only when nothing of the
+  run past its preparation reached it, so a run that has no record for another reason (a sandbox
+  without the bridge, a record that could not be written) and whose agent had started stays lost.
   - The turn does not go on in place: the agent is stopped. Runs without the bridge, and a Docker
     host's runs when the machine itself restarts (Docker stops the containers), are lost.
   - The records hold the run's credentials (the repositories' tokens, a model access key) and the

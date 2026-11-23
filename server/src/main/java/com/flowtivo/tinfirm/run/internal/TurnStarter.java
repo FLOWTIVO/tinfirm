@@ -1,5 +1,6 @@
 package com.flowtivo.tinfirm.run.internal;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -102,14 +103,32 @@ class TurnStarter implements Turns {
             .detail("turnReason", turn.reason().name())
             .detail("payerPrincipalId", turn.payerPrincipalId().toString())
             .detail("modelAccess", modelAccess(turn.modelAccess()))
-            .details(scheduled != null ? Map.of("automatic", true, "attempt", scheduled.attempt(), "retryAt",
-                    scheduled.at().toString()) : Map.of())
+            .details(automatic(scheduled))
             .build());
         log.info("Run {} created for turn {} of conversation {} ({}{})", run.id(), turn.number(),
                 turn.conversationKey(), turn.reason(), scheduled != null ? ", automatic " + scheduled.attempt()
                         + " of " + scheduled.attempts() + " at " + scheduled.at() : "");
         publisher.publishEvent(new DispatchNeeded(run.id()));
         return Optional.of(run.id());
+    }
+
+    /**
+     * An automatic retry's details of {@code run.started} (ADR-0073): {@code automatic}, {@code attempt} and
+     * {@code retryAt}; and {@code beforePrompt} for a run lost before its agent got a prompt, started again without
+     * its owner's choice.
+     */
+    private static Map<String, Object> automatic(NewTurn.@Nullable Scheduled scheduled) {
+        if (scheduled == null) {
+            return Map.of();
+        }
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("automatic", true);
+        details.put("attempt", scheduled.attempt());
+        details.put("retryAt", scheduled.at().toString());
+        if (scheduled.beforePrompt()) {
+            details.put("beforePrompt", true);
+        }
+        return details;
     }
 
     @Override
