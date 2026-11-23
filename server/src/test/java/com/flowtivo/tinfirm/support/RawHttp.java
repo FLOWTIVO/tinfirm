@@ -10,6 +10,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * One HTTP/1.1 request written byte for byte to the test server on the loopback, for what {@link ApiClient} cannot
@@ -60,6 +65,72 @@ public final class RawHttp {
         }
         catch (IOException ex) {
             throw new UncheckedIOException(ex);
+        }
+    }
+
+    /**
+     * The end of a streamed upload: whether the whole body went out before the server closed the connection, and the
+     * answer the client read while it sent, or null when none arrived.
+     */
+    public record Upload(boolean sentAll, Answer answer) {
+    }
+
+    /**
+     * Sends a {@code multipart/form-data} body of one file part named {@code file} with {@code size} zero bytes, as a
+     * client sends a file: the body is written in pieces while the answer is read on another thread, so that an
+     * answer the server sends early is seen. Nothing of the body is held in memory beyond one piece.
+     */
+    public static Upload upload(int port, String target, Map<String, String> headers, String fileName, long size) {
+        String boundary = "tinfirm-" + UUID.randomUUID();
+        byte[] head = ("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + fileName
+                + "\"\r\nContent-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
+        byte[] tail = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.US_ASCII);
+        // Plain HTTP to the test server on the loopback, as the test's client speaks it: nothing crosses a network.
+        try (Socket socket = new Socket("localhost", port)) { // nosemgrep: java.lang.security.audit.crypto.unencrypted-socket.unencrypted-socket
+            socket.setSoTimeout(30_000);
+            StringBuilder request = new StringBuilder("POST ").append(target).append(" HTTP/1.1\r\nHost: localhost\r\n")
+                .append("Content-Type: multipart/form-data; boundary=").append(boundary).append("\r\n")
+                .append("Content-Length: ").append(head.length + size + tail.length).append("\r\n")
+                .append("Accept: application/json\r\n");
+            headers.forEach((name, value) -> request.append(name).append(": ").append(value).append("\r\n"));
+            request.append("\r\n");
+            CompletableFuture<Answer> answer = CompletableFuture
+                .supplyAsync(() -> {
+                    try {
+                        return read(socket.getInputStream());
+                    }
+                    catch (IOException ex) {
+                        return null;
+                    }
+                });
+            boolean sentAll;
+            try {
+                OutputStream out = socket.getOutputStream();
+                out.write(request.toString().getBytes(StandardCharsets.US_ASCII));
+                out.write(head);
+                byte[] piece = new byte[64 * 1024];
+                for (long left = size; left > 0; left -= piece.length) {
+                    out.write(piece, 0, (int) Math.min(piece.length, left));
+                }
+                out.write(tail);
+                out.flush();
+                sentAll = true;
+            }
+            catch (IOException ex) {
+                // The server closed the connection while the body was still on its way.
+                sentAll = false;
+            }
+            return new Upload(sentAll, answer.get(30, TimeUnit.SECONDS));
+        }
+        catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        }
+        catch (ExecutionException | TimeoutException ex) {
+            throw new IllegalStateException(ex);
+        }
+        catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(ex);
         }
     }
 

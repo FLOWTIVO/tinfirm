@@ -43,7 +43,8 @@ spring:
     multipart:
       # A conversation's files and a runner host's uploads of /output (ADR-0014): one file per request, buffered on
       # disk. The same variable as tinfirm.attachment.max-file-size, so an oversized upload is refused before it is
-      # read completely (413 ATTACHMENT_TOO_LARGE).
+      # parsed or stored (413 ATTACHMENT_TOO_LARGE; tinfirm.attachment.max-drain-size says how much of it is still
+      # read and thrown away so that the client gets the answer).
       max-file-size: ${TINFIRM_ATTACHMENT_MAX_FILE_SIZE:25MB}
       max-request-size: ${TINFIRM_ATTACHMENT_MAX_REQUEST_SIZE:26MB}
       # The body is parsed, and its parts written to disk, only when a handler first reads a parameter or a part, after
@@ -219,6 +220,11 @@ tinfirm:
     max-file-size: ${TINFIRM_ATTACHMENT_MAX_FILE_SIZE:25MB}
     max-files-per-conversation: ${TINFIRM_ATTACHMENT_MAX_FILES_PER_CONVERSATION:50}
     max-conversation-size: ${TINFIRM_ATTACHMENT_MAX_CONVERSATION_SIZE:250MB}
+    # An upload over the multipart limit (above) that declares at most this many bytes, from an authenticated caller,
+    # is read to its end and thrown away before its 413 is answered, so that a client still sending gets the answer
+    # instead of a reset connection (shared.web.ApiExceptionHandler). Neither memory nor disk holds it. A larger one,
+    # and any anonymous one, is closed after the answer. The bundled reverse proxies let 64 MiB through.
+    max-drain-size: ${TINFIRM_ATTACHMENT_MAX_DRAIN_SIZE:64MB}
   conversation:
     change-requests:
       # The state of a watched change request (not MERGED) is read again this long after the last read; at least

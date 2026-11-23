@@ -174,6 +174,7 @@ No variable lets the model's provider run a tool itself for a run: the model rel
 |---|---|---|---|
 | `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` | `25MB` | The largest file of a conversation, a person's or the agent's | `extraConfig` |
 | `TINFIRM_ATTACHMENT_MAX_REQUEST_SIZE` | `26MB` | The largest upload request, the file with its other parts | `extraConfig` |
+| `TINFIRM_ATTACHMENT_MAX_DRAIN_SIZE` | `64MB` | The largest upload over the limits that the server still reads to its end, and throws away, for a signed-in person, a token or a runner host, so that the client gets its 413 instead of a closed connection; keep it at the ingress's body size | `extraConfig` |
 | `TINFIRM_ATTACHMENT_MAX_FILES_PER_CONVERSATION` | `50` | The most files one conversation holds | `extraConfig` |
 | `TINFIRM_ATTACHMENT_MAX_CONVERSATION_SIZE` | `250MB` | The most bytes of all files of one conversation | `extraConfig` |
 | `SERVER_TOMCAT_MAXPARTHEADERSIZE` | `16KB` | The largest header of one part of an upload, which carries the file's name | `extraConfig` |
