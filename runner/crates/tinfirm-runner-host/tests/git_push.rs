@@ -585,7 +585,10 @@ async fn push_large(size: usize) -> (f64, Option<u64>, SeenRequest) {
 }
 
 /// A pack of 48 MiB goes in chunks (no length), and this process (the client, and the test's
-/// server, which streams too) never holds it: its memory grows by far less than the pack.
+/// server, which streams too) never holds it: its memory grows by less than half the pack.
+/// The bound is not tighter because the measure is the whole process's: alone, this test grows
+/// it by about 6 MiB, and the other tests of this file, which run beside it in the same
+/// process, add theirs (17 to 18 MiB together on a loaded machine).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_pack_is_streamed_in_chunks_and_never_held_whole() {
     with_timeout(300, async {
@@ -598,7 +601,7 @@ async fn a_large_pack_is_streamed_in_chunks_and_never_held_whole() {
         eprintln!("48 MiB pushed in {seconds:.1} s; peak growth {growth:?} KiB");
         match growth {
             Some(kib) => assert!(
-                kib < 16 * 1024,
+                kib < (size as u64 / 2) / 1024,
                 "the process grew by {kib} KiB for a 48 MiB pack"
             ),
             None => eprintln!("SKIPPED (the memory part): this kernel does not reset the peak RSS"),
