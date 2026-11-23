@@ -27,6 +27,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.MultipartException;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 /**
@@ -102,6 +103,23 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         return ResponseEntity.badRequest().body(problem);
     }
 
+    /**
+     * A multipart body Tomcat cannot parse (a broken boundary or part header). A body over the multipart limit is
+     * {@link #handleMaxUploadSizeExceededException}'s. Spring MVC wraps what the parts' reader threw, such as
+     * {@link NulRefusingRequest}'s refusal, which is answered as itself. The message may quote the body: never sent.
+     */
+    @ExceptionHandler(MultipartException.class)
+    ResponseEntity<ProblemDetail> handleMultipart(MultipartException ex) {
+        for (Throwable cause = ex.getCause(); cause != null; cause = cause.getCause()) {
+            if (cause instanceof ApiException refusal) {
+                return handleApiException(refusal);
+            }
+        }
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Malformed multipart body");
+        problem.setProperty(CODE, ProblemCode.VALIDATION_FAILED.name());
+        return ResponseEntity.badRequest().body(problem);
+    }
+
     @ExceptionHandler(Exception.class)
     ResponseEntity<ProblemDetail> handleUnexpected(Exception ex) {
         log.error("Unhandled exception", ex);
@@ -137,7 +155,8 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     protected ResponseEntity<Object> handleHttpMessageNotReadable(HttpMessageNotReadableException ex,
             HttpHeaders headers, HttpStatusCode status, WebRequest request) {
         // The parser message may quote request content: never echo it.
-        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, "Malformed request body");
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST,
+                nul(ex) ? NulCharacterException.DETAIL : "Malformed request body");
         problem.setProperty(CODE, ProblemCode.VALIDATION_FAILED.name());
         return ResponseEntity.badRequest().headers(headers).body(problem);
     }
@@ -163,6 +182,16 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
             problem.setProperty(CODE, ProblemCode.VALIDATION_FAILED.name());
         }
         return super.handleExceptionInternal(ex, body, headers, statusCode, request);
+    }
+
+    /** Whether the body was refused for U+0000 while it was read ({@link NulRefusingRequest}). */
+    private static boolean nul(Throwable thrown) {
+        for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
+            if (cause instanceof NulCharacterException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static ProblemDetail validationProblem(List<Map<String, String>> errors) {

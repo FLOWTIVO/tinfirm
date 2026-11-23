@@ -43,6 +43,7 @@ import com.flowtivo.tinfirm.shared.security.ApiScope;
 import com.flowtivo.tinfirm.shared.security.BearerGrant;
 import com.flowtivo.tinfirm.shared.security.BearerGrantHolder;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
+import com.flowtivo.tinfirm.shared.web.NulCharacterException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 
 import tools.jackson.core.JacksonException;
@@ -170,7 +171,16 @@ final class McpRequestFilter extends OncePerRequestFilter {
             error(response, HttpStatus.NOT_FOUND, idOf(request), -32600, "Company not found", null, null);
             return;
         }
-        byte[] body = read(request.getInputStream());
+        byte[] body;
+        try {
+            body = read(request.getInputStream());
+        }
+        catch (NulCharacterException ex) {
+            // U+0000 in a string (shared.web.RequestInputFilter), as JSON-RPC's error.
+            error(response, HttpStatus.BAD_REQUEST, null, -32600, NulCharacterException.DETAIL,
+                    ProblemCode.VALIDATION_FAILED, null);
+            return;
+        }
         if (body == null) {
             error(response, HttpStatus.CONTENT_TOO_LARGE, null, -32600,
                     "The request is larger than " + MAX_BODY_BYTES + " bytes", ProblemCode.VALIDATION_FAILED, null);
@@ -227,7 +237,13 @@ final class McpRequestFilter extends OncePerRequestFilter {
         if (request.getContentLengthLong() > MAX_BODY_BYTES) {
             return null;
         }
-        byte[] body = read(request.getInputStream());
+        byte[] body;
+        try {
+            body = read(request.getInputStream());
+        }
+        catch (NulCharacterException ex) {
+            return null;
+        }
         JsonNode message = body != null ? parse(body) : null;
         return message != null && message.isObject() ? message.get("id") : null;
     }
