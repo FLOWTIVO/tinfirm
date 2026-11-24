@@ -151,6 +151,11 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         if (answer != ServerBusy.Answer.NONE) {
             return handleApiException(ServerBusy.exception(answer, ex));
         }
+        if (nul(ex)) {
+            // A handler read the JSON body itself (the chats' endpoints, the Gmail add-on's), so no converter turned
+            // the refusal into its 400. The caller's mistake, and anyone may call those: answered, not logged.
+            return handleApiException(ApiException.validation(NulCharacterException.DETAIL));
+        }
         log.error("Unhandled exception", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
             .body(ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "Internal server error"));

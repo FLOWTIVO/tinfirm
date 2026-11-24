@@ -7,7 +7,8 @@ import java.io.Serial;
  * A request's JSON body holds U+0000 in a string (the escape {@code \u0000}), or a raw NUL byte, found while the
  * body is read ({@link RequestInputFilter}). PostgreSQL refuses U+0000 in {@code text} and {@code jsonb}, so no
  * string of a request may hold it. Thrown from the body's {@code read}, so that the reader of the body fails as for
- * any other body it cannot read: Spring MVC's converters as {@code 400 VALIDATION_FAILED}.
+ * any other body it cannot read: Spring MVC's converters as {@code 400 VALIDATION_FAILED}. A handler that reads the
+ * body itself lets it pass, and {@link ApiExceptionHandler} answers the same.
  */
 public final class NulCharacterException extends IOException {
 

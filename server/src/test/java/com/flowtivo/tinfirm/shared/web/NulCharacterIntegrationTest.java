@@ -24,8 +24,9 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * U+0000 (NUL), which PostgreSQL refuses in {@code text} and {@code jsonb}, is refused at the web boundary in every
  * text of a request that may reach SQL: a query or form parameter, a multipart part's name, file name and fields, and
- * a string of a JSON body. {@code 400 VALIDATION_FAILED}, never an unhandled 500. A path cannot hold it (Tomcat
- * refuses {@code %00} in a path), and the webhook inbox and the model relay keep their own rules for their bodies.
+ * a string of a JSON body, also of one that its endpoint reads itself. {@code 400 VALIDATION_FAILED}, never an
+ * unhandled 500. A path cannot hold it (Tomcat refuses {@code %00} in a path), and the webhook inbox and the model
+ * relay keep their own rules for their bodies.
  */
 @ExtendWith(OutputCaptureExtension.class)
 class NulCharacterIntegrationTest extends IntegrationTest {
@@ -85,6 +86,24 @@ class NulCharacterIntegrationTest extends IntegrationTest {
         ApiResponse escaped = owner.post(company.path("/groups"), "{\"name\":\"" + name + "\",\"memberIds\":[]}");
         assertThat(escaped.status()).as("%s", escaped).isEqualTo(201);
         assertThat(escaped.json().get("name").asString()).endsWith("\\u0000");
+    }
+
+    @Test
+    void aJsonBodyWithNulThatItsEndpointReadsItselfIsRefused(CapturedOutput output) {
+        int before = output.getOut().length();
+        // The chats' endpoints and the Gmail add-on's read the body raw, before they look anything up or check a
+        // signature, and anyone may call them: no converter refuses the body for them.
+        String slack = "/api/chat/slack/" + UUID.randomUUID();
+        for (String path : List.of("/api/chat/teams/x/messages", slack + "/events", slack + "/interactions",
+                "/api/gmail/" + UUID.randomUUID() + "/home")) {
+            assertRefused(client().post(path, "{\"text\":\"a\\u0000b\"}"), path);
+            RawHttp.Answer raw = RawHttp.send(port, "POST", path, Map.of("Content-Type", "application/json",
+                    "Accept", "application/json"), "{\"text\":\"a\u0000b\"}".getBytes(StandardCharsets.UTF_8));
+            assertRefused(raw.status(), raw.header("Content-Type"), raw.body(), path + " with a raw NUL byte");
+        }
+        assertThat(output.getOut().substring(before)).doesNotContain("Unhandled exception");
+        // Without U+0000 they answer as before: an unknown system is not found.
+        assertThat(client().post("/api/chat/teams/x/messages", "{\"text\":\"ab\"}").status()).isEqualTo(404);
     }
 
     @Test
