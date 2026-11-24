@@ -43,6 +43,10 @@ import com.flowtivo.tinfirm.shared.tx.FailedAfterCommit;
  * committed, it is answered by the rule. A failure inside that chain after the commit is thrown on as before: its
  * answer is not complete, and the connection must end.
  * <p>
+ * It also answers a request with a session whose failure is the pool's timeout, which the dispatcher leaves to it
+ * ({@link BusyAnswerOutsideTheSession}): written here, on the plain response, the answer commits nothing of the
+ * session.
+ * <p>
  * The filter reads nothing itself, so a body stays unread until its handler reads it (a multipart is resolved
  * lazily, after authentication). Its cost per request is the wrapper, a scan of each parameter value when it is read,
  * and one pass over a JSON body's bytes as its reader reads them.
@@ -91,13 +95,17 @@ final class RequestInputFilter extends OncePerRequestFilter {
                 }
                 throw ex;
             }
-            Exception refusal = refusal(ex);
-            ServerBusy.Answer answer = refusal == null ? ServerBusy.decide(ex, request.getMethod())
+            // A failure the dispatcher left to this filter (BusyAnswerOutsideTheSession) is answered as itself, also
+            // when Spring Session's commit at the end of its filter failed after it and took its place.
+            Throwable failure = request.getAttribute(BusyAnswerOutsideTheSession.FAILURE) instanceof Exception left
+                    ? left : ex;
+            Exception refusal = failure == ex ? refusal(ex) : null;
+            ServerBusy.Answer answer = refusal == null ? ServerBusy.decide(failure, request.getMethod())
                     : ServerBusy.Answer.NONE;
             if (refusal == null && answer == ServerBusy.Answer.NONE) {
                 throw ex;
             }
-            answer(request, response, refusal != null ? refusal : ServerBusy.exception(answer, ex));
+            answer(request, response, refusal != null ? refusal : ServerBusy.exception(answer, failure));
         }
         catch (Error error) {
             // An Error a step after a saved change threw is still answered as such, and then thrown as it is.

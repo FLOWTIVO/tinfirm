@@ -25,6 +25,12 @@ class RequestInputConfiguration {
         return registration;
     }
 
+    /** {@link BusyAnswerOutsideTheSession}, before the dispatcher's own exception resolvers. */
+    @Bean
+    HandlerExceptionResolver busyAnswerOutsideTheSession() {
+        return new BusyAnswerOutsideTheSession();
+    }
+
     /** {@link SessionAnswered}, right inside Spring Session's filter ({@code spring.session.servlet.filter-order}). */
     @Bean
     FilterRegistrationBean<SessionAnswered> sessionAnsweredFilter(
