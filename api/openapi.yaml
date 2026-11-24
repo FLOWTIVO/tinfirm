@@ -9910,7 +9910,8 @@ components:
             after 1, 2 and 4 minutes (`QueueReasonCode` `RETRY_SCHEDULED`); each retry is paid as the turn was. A run
             lost because its lease expired is not retried by itself, since its host may still take it back. A turn
             lost because its runner host restarted before its agent got a prompt is retried so also when this is false
-            (in the same row of three), since it did no work and spent no budget (ADR-0073, decision 9).
+            (in the same row of three), since it did no work and spent no budget (ADR-0073, decision 9): a turn paid
+            from a budget only, since for a turn on a subscription the server cannot tell that the agent did no work.
         defaultRepositoryIds:
           type: array
           items: { type: string, format: uuid }

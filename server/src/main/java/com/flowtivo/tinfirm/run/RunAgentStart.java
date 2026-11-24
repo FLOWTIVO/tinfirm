@@ -10,11 +10,13 @@ import java.util.UUID;
 public interface RunAgentStart {
 
     /**
-     * False only when the server holds proof that the run's agent got no prompt: every event stored of the run is the
-     * host's preparation ({@code STATUS} {@code preparing}, {@code cloning} or {@code starting}, {@code LOG},
-     * {@code GIT} {@code cloned}), so no {@code STATUS} {@code running}, which a host sends before the first prompt,
-     * and no event of the agent; and the model relay admitted no request of the run. True in every other case, an
-     * unknown run included.
+     * False only when the server holds proof that the run's agent got no prompt: the run is paid from a budget, so
+     * that every model request of its agent passes the model relay, and the relay admitted none; and every event
+     * stored of the run is the host's preparation ({@code STATUS} {@code preparing}, {@code cloning} or
+     * {@code starting}, {@code LOG}, {@code GIT} {@code cloned}), so no {@code STATUS} {@code running}, which a host
+     * sends before the first prompt, and no event of the agent. True in every other case, an unknown run included,
+     * and always for a run on a subscription: its agent's requests go from the host to the provider, and the host
+     * keeps the run's events in memory while its connection is down, so the stored events alone prove nothing.
      */
     boolean mayHaveStarted(UUID companyId, UUID runId);
 }

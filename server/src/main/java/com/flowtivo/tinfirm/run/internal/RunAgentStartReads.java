@@ -11,7 +11,9 @@ import com.flowtivo.tinfirm.run.RunAgentStart;
 /**
  * {@link RunAgentStart} from the run's stored events and the relay's counts of its requests. The relay notes a
  * request as admitted, in a transaction of its own, before it forwards it; a request whose answer has not ended counts
- * as one too. A run that does not go through the relay (a subscription on a personal host) has only its events.
+ * as one too. A run that does not go through the relay (a subscription on a personal host) has only its events, and
+ * they prove nothing: a host keeps a run's events in memory while its connection is down, so the agent may have
+ * worked on the subscription without one of them stored. Such a run may always have started.
  */
 @Component
 class RunAgentStartReads implements RunAgentStart {
@@ -31,7 +33,8 @@ class RunAgentStartReads implements RunAgentStart {
     @Override
     @Transactional(readOnly = true)
     public boolean mayHaveStarted(UUID companyId, UUID runId) {
-        if (runs.find(runId).isEmpty() || events.pastPreparation(runId)) {
+        RunStore.RunRow run = runs.find(runId).orElse(null);
+        if (run == null || !run.budget() || events.pastPreparation(runId)) {
             return true;
         }
         return relay.usage(companyId, runId).requests() > 0 || relay.answersUnderWay(companyId, runId) > 0;

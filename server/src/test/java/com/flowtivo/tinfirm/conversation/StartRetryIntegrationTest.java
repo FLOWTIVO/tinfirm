@@ -30,9 +30,10 @@ import tools.jackson.databind.JsonNode;
  * event of the agent, no model request through the relay) is started again by itself, also when its settings' owner
  * did not choose automatic retries (ADR-0073, amended 2026-11-23): in the same row of at most three as the chosen
  * retries, with the same waits, its own note and an audit that tells it apart. A run whose agent may have had its
- * prompt, and a run lost for another cause, are as before. Through the API and fake runner hosts that restart: the
- * host drops its connection and comes back with a {@code hello} that does not list the run. Time is moved by setting
- * the scheduled run's {@code dispatch_after}.
+ * prompt, and a run lost for another cause, are as before; so is every run on a subscription, whose model requests
+ * never pass the relay. Through the API and fake runner hosts that restart: the host drops its connection and comes
+ * back with a {@code hello} that does not list the run. Time is moved by setting the scheduled run's
+ * {@code dispatch_after}.
  */
 class StartRetryIntegrationTest extends ConversationTestBench {
 
@@ -148,6 +149,51 @@ class StartRetryIntegrationTest extends ConversationTestBench {
         host.runner().assertFramesValid();
     }
 
+    /**
+     * A subscription's requests go from the host to the provider, and the host keeps the run's events in memory while
+     * its connection is down: nothing the server holds says that the agent got no prompt, so the person decides.
+     */
+    @Test
+    void aSubscriptionsRunLostWithNothingPastThePreparationIsNotStartedAgainWithoutTheChoice() {
+        Bench bench = bench(false);
+        UUID agentId = agent(bench.member(), bench, "Fixer", "", List.<UUID[]>of(), "READ", List.of());
+        // The member's own host, with the subscription their settings name.
+        RunnerHostRef ref = registerRunnerHost(bench.member(), bench.id(), unique("laptop"));
+        Host host = connect(ref, List.of(FakeRunner.credential("claude-max", "CLAUDE_LOGIN", List.of("CLAUDE_CODE"),
+                1)));
+        String settings = bench.path("/agents/" + agentId + "/settings/me");
+        Map<String, Object> subscription = Map.of("modelAccess", "SUBSCRIPTION", "runtime", "CLAUDE_CODE",
+                "subscription", Map.of("runnerHostId", ref.id().toString(), "label", "claude-max"));
+        ApiResponse saved = bench.member().put(settings, subscription);
+        assertThat(saved.status()).as("%s", saved).isEqualTo(200);
+        assertThat(saved.json().get("autoRetry").asBoolean()).isFalse();
+        String id = start(bench.member(), bench, agentId, "Fix the flaky test").get("id").asString();
+
+        // Exactly what the budget's run of the first test stored: the preparation, and nothing after it.
+        JsonNode assign = accept(bench, id, host.runner().expect("run.assign"), host);
+        assertThat(assign.get("credentialLabel").asString()).isEqualTo("claude-max");
+        assertThat(assign.has("modelAccess")).isFalse();
+        prepare(bench, host, assign);
+        host.restart();
+        awaitWaitsForThePerson(bench, id, host);
+        assertThat(lostCause(bench, assign.get("runId").asString())).isEqualTo("HOST_RESTARTED");
+
+        // With the choice it is retried as any run lost so, and not as one lost before its prompt.
+        Map<String, Object> chosen = new java.util.HashMap<>(subscription);
+        chosen.put("autoRetry", true);
+        assertThat(bench.member().put(settings, chosen).status()).isEqualTo(200);
+        bench.member().post(bench.path("/conversations/" + id + "/retry"), null);
+        assign = accept(bench, id, host.runner().expect("run.assign"), host);
+        prepare(bench, host, assign);
+        host.restart();
+        assertThat(lastSystem(awaitScheduled(bench, id, 1))).isEqualTo("The turn was lost: its runner host stopped "
+                + "reporting it. The runner host restarted and no longer runs it. Tinfirm retries it by itself in 1 "
+                + "minute (automatic retry 1 of 3); cancel the turn to stop it.");
+        assertThat(auditEvents(bench.owner(), bench.company(), "run.started").getFirst().get("details")
+            .has("beforePrompt")).isFalse();
+        host.runner().assertFramesValid();
+    }
+
     @Test
     void theStartsAgainShareTheRowOfThreeWithTheChosenRetries() {
         Bench bench = bench(true);
@@ -212,15 +258,21 @@ class StartRetryIntegrationTest extends ConversationTestBench {
 
     // ---- helpers ---------------------------------------------------------------------------------------------------
 
-    /** A company runner host of protocol v2 that may restart: its connection drops, and a new one says hello. */
+    /**
+     * A runner host of protocol v2 that may restart: its connection drops, and a new one says hello, with the
+     * credentials it has (a personal host's subscriptions; none on a company host).
+     */
     private final class Host {
 
         private final RunnerHostRef ref;
 
+        private final List<Map<String, Object>> credentials;
+
         private FakeRunner runner;
 
-        Host(RunnerHostRef ref, FakeRunner runner) {
+        Host(RunnerHostRef ref, List<Map<String, Object>> credentials, FakeRunner runner) {
             this.ref = ref;
+            this.credentials = credentials;
             this.runner = runner;
         }
 
@@ -238,18 +290,21 @@ class StartRetryIntegrationTest extends ConversationTestBench {
             await().atMost(WAIT).until(() -> !connections.isConnected(ref.id()));
             runner = FakeRunner.connect(port, ref.token());
             opened.add(runner);
-            runner.helloV2AndWelcome(List.of(), activeRuns, RUNNER_VERSION, 4);
+            runner.helloV2AndWelcome(credentials, activeRuns, RUNNER_VERSION, 4);
             await().atMost(WAIT).until(() -> connections.isConfigured(ref.id()));
         }
     }
 
     private Host host(Bench bench) {
-        RunnerHostRef ref = registerRunnerHost(bench.owner(), bench.id(), unique("host"), "COMPANY");
+        return connect(registerRunnerHost(bench.owner(), bench.id(), unique("host"), "COMPANY"), List.of());
+    }
+
+    private Host connect(RunnerHostRef ref, List<Map<String, Object>> credentials) {
         FakeRunner runner = FakeRunner.connect(port, ref.token());
         opened.add(runner);
-        runner.helloV2AndWelcome(List.of(), List.of(), RUNNER_VERSION, 4);
+        runner.helloV2AndWelcome(credentials, List.of(), RUNNER_VERSION, 4);
         await().atMost(WAIT).until(() -> connections.isConfigured(ref.id()));
-        return new Host(ref, runner);
+        return new Host(ref, credentials, runner);
     }
 
     /** The host accepts the assignment, and the server has the run RUNNING. */
