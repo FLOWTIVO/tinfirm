@@ -344,7 +344,8 @@ def nft_check(path):
 
 def confinement(out):
     """The opt-out of the reader's and the fronts' confinement in the units (`run
-    --allow-unconfined-reader`), and what confinement.yml takes of `doctor`'s answer."""
+    --allow-unconfined-reader`), what confinement.yml takes of `doctor`'s answer, and the stop's
+    signal going to `run` alone (KillMode=mixed)."""
     unit = lambda name: unit_lines((out / f"tinfirm-runner-host.{name}.service").read_text())
     start = lambda name: next(line for line in unit(name).splitlines() if line.startswith("ExecStart="))
     for name in ("docker", "vm"):
@@ -354,7 +355,8 @@ def confinement(out):
     check("--allow-unconfined-reader" not in unit("docker-nobridge-unconfined"),
           "docker unit without the bridge: no --allow-unconfined-reader (no reader, no front)")
     check("--allow-unconfined-reader" in start("vm-unconfined"), "control host unit with the opt-out: --allow-unconfined-reader")
-    for name in ("docker-unconfined", "vm-unconfined"):
+    for name in ("docker", "vm", "docker-unconfined", "vm-unconfined"):
+        check("\nKillMode=mixed\n" in unit(name), f"{name} unit: the stop's SIGTERM goes to `run` alone (KillMode=mixed)")
         check("\n\n\n" not in unit(name), f"{name} unit: no double blank line")
     judged = json.loads((out / "confinement.json").read_text())
     wanted = {"confined": 0, "reader": 1, "both": 2, "front-wire": 1, "allowed": 0, "other-failures": 0,
