@@ -173,7 +173,7 @@ describe('KillSwitchesPage', () => {
             kind: 'SERVICE_IDENTITY_SUSPENDED',
             targetId: IDS.svcReader,
             name: 'svc-reader',
-            cause: 'USER_DEACTIVATED',
+            cause: 'ADMIN',
           }),
         ],
       }),
@@ -189,7 +189,10 @@ describe('KillSwitchesPage', () => {
       `/c/c1/service-identities/${IDS.svcReader}`,
     );
     expect(words(el.querySelector('[data-principal=svc-reader]'))).toContain(
-      'reactivating the user resumes them',
+      'An admin suspended it; an admin resumes it.',
+    );
+    expect(words(el.querySelector('[data-principal=Dave]'))).toContain(
+      'An admin suspended them; an admin resumes them.',
     );
     expect(words(q('other-switches'))).toContain('Analyst · paused agent');
   });
@@ -198,6 +201,7 @@ describe('KillSwitchesPage', () => {
     ['suspended by an admin', { userId: IDS.daveUser }, true],
     ['without a user named', { userId: null }, false],
     ['by the user’s deactivation', { userId: IDS.daveUser, cause: 'USER_DEACTIVATED' }, false],
+    ['by the identity provider', { userId: IDS.daveUser, cause: 'SCIM' }, false],
   ])('offers to resume a member %s in place', async (_, change, offered) => {
     await open('ADMIN', noSwitches({ switches: [aSuspendedMember(change)] }));
     const resume = el.querySelector<HTMLButtonElement>('button[aria-label="Resume Dave"]');
@@ -217,6 +221,23 @@ describe('KillSwitchesPage', () => {
       'Their waiting turns go on; triggers they wrote stay paused until resumed.',
     );
     expect(q('suspended-switch')?.textContent).toContain('Nobody is suspended.');
+  });
+
+  it.each<[string, string]>([
+    [
+      'USER_DEACTIVATED',
+      'Their Tinfirm account was deactivated; an instance admin reactivates the user, which resumes them.',
+    ],
+    [
+      'SCIM',
+      'The company’s identity provider deactivated them; the identity provider reactivates them, which resumes them.',
+    ],
+  ])('says a member’s suspension of cause %s and who lifts it', async (cause, text) => {
+    await open(
+      'ADMIN',
+      noSwitches({ switches: [aSuspendedMember({ userId: IDS.daveUser, cause, byName: null })] }),
+    );
+    expect(words(el.querySelector('[data-principal=Dave]'))).toContain(text);
   });
 
   it('stops the company’s runs with a reason', async () => {

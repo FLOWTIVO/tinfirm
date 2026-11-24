@@ -242,6 +242,56 @@ describe('turnLine and turnMeta', () => {
     expect(turnLine(run)).toMatchObject({ label: 'Blocked', tone: 'human' });
   });
 
+  it('says a turn’s commits left unpushed where its git access was revoked, cancelled or not', () => {
+    const revoked = {
+      reason: 'SUSPENDED',
+      message:
+        'Tinfirm revoked this run’s access to acme/shop: the account’s holder was suspended because their Tinfirm account was deactivated. Fetching from and pushing to it no longer works in this run.',
+      revokedAt: '2026-11-24T08:13:32Z',
+      delivery: 'CONFIRMED' as const,
+    };
+    const shop = {
+      dir: 'shop',
+      repositoryName: 'acme/shop',
+      readOnly: false,
+      headSha: 'abc1234def',
+    };
+    const cancelled = aRun({
+      status: 'CANCELLED',
+      repositories: [{ ...shop, pushed: false, commits: 1, gitRevoked: revoked }],
+    });
+    expect(turnLine(cancelled)).toMatchObject({
+      label: 'Cancelled',
+      push: { text: '1 commit not pushed: git access revoked', branch: null },
+    });
+    const failed = aRun({
+      status: 'FAILED',
+      failureClass: 'GIT_ERROR',
+      repositories: [{ ...shop, pushed: false, commits: 2, gitRevoked: revoked }],
+    });
+    expect(turnLine(failed).push).toEqual({
+      text: '2 commits not pushed: git access revoked',
+      branch: null,
+    });
+    // Another repository pushed: both are said.
+    const mixed = aRun({
+      repositories: [
+        { ...shop, pushed: false, commits: 1, gitRevoked: revoked },
+        { ...shop, dir: 'web', repositoryName: 'acme/web', pushed: true, commits: 3 },
+      ],
+    });
+    expect(turnLine(mixed).push).toEqual({
+      text: '1 commit not pushed: git access revoked · Pushed 3 commits to',
+      branch: 'agent/SHOP-241-1',
+    });
+    // A revoked repository without commits loses nothing: a cancelled turn says nothing of it.
+    const nothing = aRun({
+      status: 'CANCELLED',
+      repositories: [{ ...shop, pushed: false, commits: 0, gitRevoked: revoked }],
+    });
+    expect(turnLine(nothing).push).toBeNull();
+  });
+
   it('names the turn, why it started and its host', () => {
     expect(turnMeta(aRun())).toBe('Turn 1 · first message · office');
   });

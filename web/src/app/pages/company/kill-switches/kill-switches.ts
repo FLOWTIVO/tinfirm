@@ -276,9 +276,17 @@ export class KillSwitchesPage {
 
   // --- Suspended members, resumed in place --------------------------------------------------------
 
-  /** A member's suspension an admin may lift here: not one the user's deactivation made. */
+  /**
+   * A member's suspension an admin may lift here: an admin's, not one the user's deactivation or the
+   * company's identity provider made.
+   */
   protected resumable(kill: KillSwitch): boolean {
-    return kill.kind === 'MEMBER_SUSPENDED' && !!kill.userId && kill.cause !== 'USER_DEACTIVATED';
+    return (
+      kill.kind === 'MEMBER_SUSPENDED' &&
+      !!kill.userId &&
+      kill.cause !== 'USER_DEACTIVATED' &&
+      kill.cause !== 'SCIM'
+    );
   }
 
   protected readonly resumingMember = signal<string | null>(null);
@@ -297,7 +305,9 @@ export class KillSwitchesPage {
     } catch (error) {
       this.notify.error(`Couldn't resume ${kill.name}`, error, {
         ...FORBIDDEN,
-        PRINCIPAL_SUSPENDED: `${kill.name}'s Tinfirm account was deactivated: reactivating the user resumes them.`,
+        PRINCIPAL_SUSPENDED:
+          suspensionCause(kill.cause) ??
+          `${kill.name}’s suspension is not an admin’s: reactivating them resumes them.`,
       });
     } finally {
       this.resumingMember.set(null);

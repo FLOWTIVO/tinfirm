@@ -317,15 +317,16 @@ export function inboxRowView(item: InboxItem, reader: InboxReader): InboxRowView
       const system = a.systemName ?? 'a system';
       const waiting = `It keeps ${plural(a.conversations, 'conversation')} waiting.`;
       if (a.reason === 'SUSPENDED') {
-        const holder = a.holderName ?? 'A service account';
+        // A member or a service account, suspended by an admin, by the user's deactivation or by the
+        // identity provider: the item carries none of these, so it says what holds whatever the cause,
+        // and Kill switches says which and who lifts it.
+        const holder = a.holderName ?? 'The account’s holder';
         return {
           kind: 'Suspended',
           title: `${holder} is suspended`,
-          body: `The credential it borrows on ${system} acts for nothing through it until an admin resumes it. ${waiting}`,
+          body: `Nothing acts on ${system} through ${a.holderName ?? 'them'} until the suspension is lifted. Kill switches shows why and who lifts it. ${waiting}`,
           tone: 'human',
-          link: a.holderPrincipalId
-            ? { label: `Open ${holder}`, commands: ['service-identities', a.holderPrincipalId] }
-            : null,
+          link: { label: 'Open Kill switches', commands: ['kill-switches'] },
           action: null,
         };
       }

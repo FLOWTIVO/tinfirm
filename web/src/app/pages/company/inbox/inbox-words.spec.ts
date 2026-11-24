@@ -243,22 +243,28 @@ describe('inbox words (plan §5)', () => {
     expect(view.body).toContain('an event does not verify (#412)');
   });
 
-  it('a suspended service account is resumed on its page, not signed in', () => {
-    const item = INBOX_ITEMS.ACCOUNT();
-    item.account = {
-      ...item.account!,
-      reason: 'SUSPENDED',
-      credential: null,
-      holderPrincipalId: IDS.svcReader,
-      holderName: 'svc-reader',
-    };
-    const view = inboxRowView(item, OWNER);
-    expect(view.kind).toBe('Suspended');
-    expect(view.title).toBe('svc-reader is suspended');
-    expect(view.action).toBeNull();
-    expect(view.link?.commands.join('/')).toBe(`service-identities/${IDS.svcReader}`);
-    expect(view.body).toContain('The credential it borrows on GitHub acts for nothing');
-    expect(view.body).toContain('It keeps 3 conversations waiting.');
+  it('a suspended holder, a member or a service account, leads to Kill switches, not to a sign-in', () => {
+    // The item carries neither the holder's kind nor the cause (an admin's suspension, the user's
+    // deactivation, the identity provider's): its words hold for each, and Kill switches says which.
+    for (const holderName of ['svc-reader', 'Ana Member']) {
+      const item = INBOX_ITEMS.ACCOUNT();
+      item.account = {
+        ...item.account!,
+        reason: 'SUSPENDED',
+        credential: null,
+        holderPrincipalId: IDS.svcReader,
+        holderName,
+      };
+      const view = inboxRowView(item, OWNER);
+      expect(view.kind).toBe('Suspended');
+      expect(view.title).toBe(`${holderName} is suspended`);
+      expect(view.action).toBeNull();
+      expect(view.link).toEqual({ label: 'Open Kill switches', commands: ['kill-switches'] });
+      expect(view.body).toBe(
+        `Nothing acts on GitHub through ${holderName} until the suspension is lifted. Kill switches shows why and who lifts it. It keeps 3 conversations waiting.`,
+      );
+      expect(view.body).not.toContain('an admin resumes');
+    }
   });
 
   it.each`

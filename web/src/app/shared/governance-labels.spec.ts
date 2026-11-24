@@ -11,6 +11,7 @@ import {
   spendRangeError,
   stillOnPhrase,
   suspensionCause,
+  type SuspendedWho,
   switchCountPhrase,
   switchLink,
 } from './governance-labels';
@@ -44,15 +45,33 @@ describe('governance labels', () => {
     expect(stillOnPhrase(stillOn)).toBe(text);
   });
 
-  it.each<[string | null, string | null]>([
-    ['ADMIN', null],
-    [null, null],
+  it.each<[string | null, SuspendedWho, string | null]>([
+    ['ADMIN', 'them', 'An admin suspended them; an admin resumes them.'],
+    ['ADMIN', 'it', 'An admin suspended it; an admin resumes it.'],
+    ['ADMIN', 'you', 'An admin suspended you; an admin resumes you.'],
     [
       'USER_DEACTIVATED',
-      'Their Tinfirm account was deactivated; reactivating the user resumes them.',
+      'them',
+      'Their Tinfirm account was deactivated; an instance admin reactivates the user, which resumes them.',
     ],
-  ])('names the cause %s of a suspension', (cause, text) => {
-    expect(suspensionCause(cause)).toBe(text);
+    [
+      'USER_DEACTIVATED',
+      'you',
+      'Your Tinfirm account was deactivated; an instance admin reactivates it, which resumes you.',
+    ],
+    [
+      'SCIM',
+      'them',
+      'The company’s identity provider deactivated them; the identity provider reactivates them, which resumes them.',
+    ],
+    [
+      'SCIM',
+      'you',
+      'The company’s identity provider deactivated you; it reactivates you, which resumes you.',
+    ],
+    [null, 'them', null],
+  ])('names the cause %s of a suspension and what lifts it (%s)', (cause, who, text) => {
+    expect(suspensionCause(cause, who)).toBe(text);
   });
 
   it.each<[Parameters<typeof switchLink>[0], string[] | null]>([

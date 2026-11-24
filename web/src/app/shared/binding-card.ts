@@ -68,7 +68,7 @@ function goneWhy(b: ConversationBinding): string | null {
     case 'ACCOUNT_REMOVED':
       return 'the trigger’s accounts no longer include one on it';
     case 'SUSPENDED':
-      return `${b.holderName ?? 'its service account'} is suspended`;
+      return `${b.holderName ?? 'the account’s holder'} is suspended`;
     default:
       return null;
   }
@@ -168,9 +168,12 @@ export function bindingCardText(
         actionable: false,
       };
     case 'SUSPENDED':
+      // The server's words: who is suspended (a member or a service account), why when it is a
+      // deactivation, and what lifts it (an admin, an instance admin's reactivation of the user, or
+      // the identity provider), which this binding's fields do not carry.
       return {
-        title: `${system} waits for an admin`,
-        body: `${b.holderName ?? 'The service account'} is suspended until an admin resumes it.`,
+        title: `${system} waits until a suspension is lifted`,
+        body: b.text,
         actionable: false,
       };
     case 'SYSTEM_OFF':

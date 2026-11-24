@@ -65,11 +65,22 @@ describe('KillSwitchBanner', () => {
     [
       'by the user’s deactivation',
       aSuspendedMember({ cause: 'USER_DEACTIVATED', byName: null, reason: null }),
-      'reactivating the user resumes them',
+      'Your Tinfirm account was deactivated; an instance admin reactivates it, which resumes you.',
+    ],
+    [
+      'by the identity provider',
+      aSuspendedMember({ cause: 'SCIM', byName: null, reason: null }),
+      'The company’s identity provider deactivated you; it reactivates you, which resumes you.',
     ],
   ])('tells a suspended member, suspended %s', async (_, suspension, text) => {
     const el = await render(null, suspension);
     expect(words(el.querySelector('[data-testid=my-suspension]'))).toContain(text);
+    expect(words(el.querySelector('[data-testid=my-suspension]'))).toContain(
+      'until the suspension is lifted.',
+    );
+    expect(words(el.querySelector('[data-testid=my-suspension]'))).not.toContain(
+      'kill switches until an admin resumes you',
+    );
   });
 });
 

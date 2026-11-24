@@ -99,7 +99,7 @@
           <h2 hlmCardTitle id="mine-title">You are suspended</h2>
           <p hlmCardDescription>{{ pulled(mine, 'Suspended') }}</p>
         </div>
-        @if (causeOf(mine.cause); as c) {
+        @if (causeOf(mine.cause, 'you'); as c) {
           <p hlmCardContent class="text-muted-foreground text-sm">{{ c }}</p>
         }
       </section>
@@ -213,7 +213,10 @@
                       · {{ kill.kind === 'MEMBER_SUSPENDED' ? 'member' : 'service account' }}</span
                     >
                     <p class="text-muted-foreground text-pretty">{{ pulled(kill, 'Suspended') }}</p>
-                    @if (causeOf(kill.cause); as c) {
+                    @if (
+                      causeOf(kill.cause, kill.kind === 'MEMBER_SUSPENDED' ? 'them' : 'it');
+                      as c
+                    ) {
                       <p class="text-muted-foreground">{{ c }}</p>
                     }
                   </div>

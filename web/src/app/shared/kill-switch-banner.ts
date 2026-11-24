@@ -46,7 +46,7 @@ export function pulledSentence(
           <p class="font-semibold">You are suspended in this company</p>
           <p class="text-muted-foreground text-pretty">
             Nothing acts as you, with your accounts or on your budget here, and you can open nothing
-            but the company’s kill switches until an admin resumes you.
+            but the company’s kill switches until the suspension is lifted.
             {{ suspendedText() }}
           </p>
           @if (cause(); as c) {
@@ -93,7 +93,7 @@ export class KillSwitchBanner {
   readonly manages = input(false);
   readonly companyId = input<string | undefined>();
 
-  protected readonly cause = computed(() => suspensionCause(this.suspension()?.cause));
+  protected readonly cause = computed(() => suspensionCause(this.suspension()?.cause, 'you'));
   protected readonly stoppedText = computed(() => {
     const st = this.stop();
     return st ? pulledSentence('Stopped', st.stoppedAt, st.byName, st.reason) : '';

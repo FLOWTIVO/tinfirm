@@ -215,7 +215,7 @@ const CODE_MESSAGES: Record<ProblemCode, string> = {
     'Creating a token needs a sign-in of the last 10 minutes. Sign in again, then create it.',
   DUPLICATE_SERVICE_IDENTITY_NAME: 'A service account with this name already exists.',
   PRINCIPAL_SUSPENDED:
-    'Suspended in this company: nothing acts as this person or service account, or with what it holds or borrows or its budget, until an admin resumes it.',
+    'Suspended in this company: nothing acts as this person or service account, or with what it holds or borrows or its budget, until the suspension is lifted.',
   DUPLICATE_SYSTEM_NAME: 'A system with this name already exists.',
   INVALID_BASE_URL: 'Tinfirm may not connect to this address.',
   SYSTEM_KIND_INVALID: 'This kind of system cannot be used here yet.',
