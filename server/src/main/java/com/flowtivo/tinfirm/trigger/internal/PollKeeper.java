@@ -20,6 +20,7 @@ import com.flowtivo.tinfirm.conversation.TriggerConversations;
 import com.flowtivo.tinfirm.principal.PrincipalEvents;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.system.SystemEvents;
 import com.flowtivo.tinfirm.trigger.TriggerAccount;
 import com.flowtivo.tinfirm.trigger.TriggerEvent;
@@ -109,10 +110,15 @@ class PollKeeper {
     }
 
     /**
-     * The poll of the trigger's source account, made when there is none and due now. In a transaction of its own; the
-     * poll's row is the only one it locks.
+     * The poll of the trigger's source account, made when there is none and due now. In a transaction of its own, once
+     * the transaction that told it has released its connection ({@link AfterTransaction}); the poll's row is the only
+     * one it locks.
      */
     void ensure(java.util.UUID companyId, java.util.UUID triggerId) {
+        AfterTransaction.run(() -> ensureNow(companyId, triggerId));
+    }
+
+    private void ensureNow(java.util.UUID companyId, java.util.UUID triggerId) {
         try {
             SystemContext.runInCompany(companyId, () -> separate.executeWithoutResult(status -> {
                 TriggerInfo trigger = triggers.find(companyId, triggerId).filter(TriggerInfo::active).orElse(null);
@@ -139,7 +145,12 @@ class PollKeeper {
         }
     }
 
+    /** The polls go on, in a transaction of their own, as {@link #ensure} makes one. */
     private void activate(UUID companyId, java.util.function.Supplier<List<UUID>> polls) {
+        AfterTransaction.run(() -> activateNow(companyId, polls));
+    }
+
+    private void activateNow(UUID companyId, java.util.function.Supplier<List<UUID>> polls) {
         try {
             SystemContext.runInCompany(companyId, () -> separate.executeWithoutResult(status -> {
                 for (UUID pollId : polls.get()) {

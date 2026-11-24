@@ -43,6 +43,7 @@ import org.springframework.security.web.util.matcher.AndRequestMatcher;
 import org.springframework.security.web.util.matcher.NegatedRequestMatcher;
 import org.springframework.security.web.util.matcher.OrRequestMatcher;
 import org.springframework.security.web.util.matcher.RequestMatcher;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.web.servlet.HandlerExceptionResolver;
 
 import com.flowtivo.tinfirm.shared.config.TinfirmProperties;
@@ -90,15 +91,19 @@ class AuthorizationServerConfiguration {
         return clients.repository();
     }
 
+    /** Each call in one transaction ({@link TransactionalAuthorizations}). */
     @Bean
-    OAuth2AuthorizationService authorizationService(JdbcTemplate jdbc, RegisteredClientRepository clients) {
-        return new JdbcOAuth2AuthorizationService(jdbc, clients);
+    OAuth2AuthorizationService authorizationService(JdbcTemplate jdbc, RegisteredClientRepository clients,
+            PlatformTransactionManager transactionManager) {
+        return TransactionalAuthorizations.of(new JdbcOAuth2AuthorizationService(jdbc, clients), transactionManager);
     }
 
+    /** Each call in one transaction ({@link TransactionalAuthorizations}). */
     @Bean
     OAuth2AuthorizationConsentService authorizationConsentService(JdbcTemplate jdbc,
-            RegisteredClientRepository clients) {
-        return new JdbcOAuth2AuthorizationConsentService(jdbc, clients);
+            RegisteredClientRepository clients, PlatformTransactionManager transactionManager) {
+        return TransactionalAuthorizations.of(new JdbcOAuth2AuthorizationConsentService(jdbc, clients),
+                transactionManager);
     }
 
     /** The request cache of authorization requests interrupted by a login, shared with the OIDC success handler. */

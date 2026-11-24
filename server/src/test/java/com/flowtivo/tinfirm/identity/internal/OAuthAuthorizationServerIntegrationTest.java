@@ -33,6 +33,7 @@ import com.flowtivo.tinfirm.shared.security.ApiScope;
 import com.flowtivo.tinfirm.shared.security.BearerGrant;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 import com.flowtivo.tinfirm.support.TestDatabase;
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -283,6 +284,7 @@ class OAuthAuthorizationServerIntegrationTest extends IntegrationTest {
 
     @Test
     void theWholeAuthorizationCodeFlowWithLoginConsentRefreshAndRevocation() {
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         UUID companyId = createCompany(admin(), unique("OAuth Co"));
         Member owner = newMember(companyId, "OWNER");
         String clientId = publishClient("Test MCP Client", "http://localhost/callback", "http://127.0.0.1/callback");
@@ -431,6 +433,8 @@ class OAuthAuthorizationServerIntegrationTest extends IntegrationTest {
         assertThat(consented.get("details").get("companyId").asString()).isEqualTo(companyId.toString());
         assertThat(consented.get("details").get("scopes").toString()).contains("tinfirm:read", "tinfirm:write")
             .doesNotContain("decide");
+        // A stored authorization's or consent's client is looked up on the query's own connection.
+        assertThat(mark.at(CimdClients.class.getName())).as("second connections asked for").isZero();
     }
 
     @Test
@@ -821,6 +825,7 @@ class OAuthAuthorizationServerIntegrationTest extends IntegrationTest {
 
     @Test
     void theMcpInspectorIsABuiltInClient() {
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         UUID companyId = createCompany(admin(), unique("Inspector Co"));
         Member member = newMember(companyId, "OWNER");
         Tokens tokens = connect(member, BuiltInOAuthClients.MCP_INSPECTOR, "http://localhost:6274/oauth/callback",
@@ -839,6 +844,8 @@ class OAuthAuthorizationServerIntegrationTest extends IntegrationTest {
             .get(authorizePath(BuiltInOAuthClients.MCP_INSPECTOR, "https://inspector.example/oauth/callback",
                     "tinfirm:read", resource(companyId), "s", verifier()));
         assertThat(otherHost.status()).isEqualTo(400);
+        // A pre-registered client is looked up on the query's own connection.
+        assertThat(mark.at(OAuthClients.class.getName())).as("second connections asked for").isZero();
     }
 
     @Test

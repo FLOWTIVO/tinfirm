@@ -17,7 +17,6 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionExecution;
 import org.springframework.transaction.TransactionExecutionListener;
 import org.springframework.transaction.TransactionStatus;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -31,6 +30,7 @@ import com.flowtivo.tinfirm.shared.tenant.TenantContext;
 import com.flowtivo.tinfirm.shared.tenant.TenantContextHolder;
 import com.flowtivo.tinfirm.shared.tenant.TenantScope;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 
 import tools.jackson.databind.JsonNode;
 
@@ -49,9 +49,10 @@ import tools.jackson.databind.JsonNode;
  * which it is appended: a transaction that entered several companies appends each company's events in that company's
  * context, then sets its own back ({@link TenantScope#eachIn}). A transaction that rolls back appends none. An event
  * recorded once the transaction's events were appended (an {@code afterCommit} or {@code afterCompletion} callback on
- * the same thread, whose transaction-local tenant context is gone) is appended in a transaction of its own, and so is
- * one kept past a commit through a transaction manager without the listener. Without a transaction synchronization, an
- * event is appended at once. A nested transaction's savepoint is not followed (the application takes none): its events
+ * the same thread, whose transaction-local tenant context is gone) is appended in a transaction of its own once the
+ * thread's transaction has released its connection ({@link AfterTransaction}), and so is one kept past a commit through
+ * a transaction manager without the listener. Without a transaction of the thread, an event is appended at once, in a
+ * transaction of its own. A nested transaction's savepoint is not followed (the application takes none): its events
  * stay with its transaction.
  * <p>
  * An event recorded while the thread runs under a bearer credential of the MCP endpoint ({@link BearerGrantHolder})
@@ -94,13 +95,20 @@ class JdbcAuditLog implements AuditLog {
     private record Pending(AuditRecord record, JsonNode details, Instant occurredAt, TenantContext tenant) {
     }
 
+    /**
+     * Not {@code @Transactional}: recorded in a transaction's {@code afterCommit} or {@code afterCompletion} callback, a
+     * transaction asked for here would join the finished one. Without a transaction of the thread, or in its
+     * {@code afterCompletion} callbacks (when its synchronizations are cleared), the event is appended in a transaction
+     * of its own: at once, or once the thread's transaction released its connection.
+     */
     @Override
-    @Transactional
     public void record(AuditRecord record) {
         Pending event = new Pending(record, AuditCanonicalForm.detailsTree(withGrant(record.details(),
                 BearerGrantHolder.current())), timeSource.now(), TenantContextHolder.current());
-        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-            append(event);
+        // In an afterCompletion callback the transaction is still active but its synchronizations are cleared.
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.isSynchronizationActive()) {
+            AfterTransaction.run(() -> afterCommit.executeWithoutResult(status -> appendAll(List.of(event))));
             return;
         }
         AtCommit atCommit = atCommit();
@@ -187,14 +195,21 @@ class JdbcAuditLog implements AuditLog {
         }
     }
 
+    /**
+     * In a transaction of its own, once the thread's transaction has released its connection, which its
+     * {@code afterCommit} and {@code afterCompletion} callbacks still hold ({@link AfterTransaction}). Each event keeps
+     * the tenant context of its call.
+     */
     private void appendAfterCommit(List<Pending> pending) {
-        try {
-            afterCommit.executeWithoutResult(status -> appendAll(pending));
-        }
-        catch (RuntimeException ex) {
-            log.error("{} audit events recorded after their transaction's commit could not be appended",
-                    pending.size(), ex);
-        }
+        AfterTransaction.run(() -> {
+            try {
+                afterCommit.executeWithoutResult(status -> appendAll(pending));
+            }
+            catch (RuntimeException ex) {
+                log.error("{} audit events recorded after their transaction's commit could not be appended",
+                        pending.size(), ex);
+            }
+        });
     }
 
     /**

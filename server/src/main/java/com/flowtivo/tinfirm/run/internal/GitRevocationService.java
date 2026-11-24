@@ -38,8 +38,11 @@ import com.flowtivo.tinfirm.runner.RunnerProperties;
 import com.flowtivo.tinfirm.shared.security.AuthenticatedUser;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
+import com.flowtivo.tinfirm.shared.tenant.TenantContext;
+import com.flowtivo.tinfirm.shared.tenant.TenantScope;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.shared.tx.AfterCommit;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 
 /**
@@ -85,12 +88,15 @@ class GitRevocationService implements RunGitRevocations {
 
     private final SystemTransactions transactions;
 
+    private final TenantScope tenants;
+
     private final ApplicationEventPublisher publisher;
 
     GitRevocationService(RunStore runs, RunLocks locks, RunRepositoryStore repositories, RunCommandStore commands,
             RunnerConnections connections, RunnerProperties runnerProperties, AuditLog auditLog, RunEventHub hub,
             TimeSource time, RunPorts ports, PlatformTransactionManager transactionManager,
-            SystemTransactions transactions, ApplicationEventPublisher publisher) {
+            SystemTransactions transactions, ApplicationEventPublisher publisher, TenantScope tenants) {
+        this.tenants = tenants;
         this.publisher = publisher;
         this.transactions = transactions;
         this.ports = ports;
@@ -220,8 +226,18 @@ class GitRevocationService implements RunGitRevocations {
             UUID companyId = run.companyId();
             AfterCommit.run(() -> {
                 if (connections.send(hostId, frame)) {
-                    SystemContext.runInCompany(companyId, () -> separate.executeWithoutResult(
-                            status -> commands.markRevocationSent(commandId, time.now())));
+                    // Once the transaction has released its connection, which its afterCommit still holds. A mark
+                    // that fails is only logged, as it was: the row stays ON_RECONNECT and goes again at the hello.
+                    AfterTransaction.run(() -> {
+                        try {
+                            SystemContext.runInCompany(companyId, () -> separate
+                                .executeWithoutResult(status -> commands.markRevocationSent(commandId, time.now())));
+                        }
+                        catch (RuntimeException ex) {
+                            log.warn("Run {}: the revocation sent to runner host {} could not be marked sent; it goes "
+                                    + "again at its hello", run.id(), hostId, ex);
+                        }
+                    });
                 }
                 else {
                     log.info("Run {}: the revocation could not be sent to runner host {}; it goes at its hello",
@@ -463,7 +479,7 @@ class GitRevocationService implements RunGitRevocations {
     /**
      * The end of the answer to a {@code hello} that lists {@code run.git.revoke} (ADR-0116, decision 1): it holds back
      * the commit of every revocation of a run on the host's presences ({@link RunCommandStore#holdRevocationsOf}, which
-     * also waits for those that took their lock to commit), reads in each company, in a transaction of its own, the
+     * also waits for those that took their lock to commit), reads in each company, under its tenant context, the
      * revocations of the runs the hello listed there, for the epoch it listed and of an assignment that went to that
      * presence, that were never written to a connection, writes them, writes {@code welcome.done}, and only then lets
      * them commit. So every revocation of those runs that committed before {@code welcome.done} was written went
@@ -476,19 +492,22 @@ class GitRevocationService implements RunGitRevocations {
         Map<UUID, List<RunnerMessages.RunGitRevoke>> written = new LinkedHashMap<>();
         transactions.unscoped(() -> {
             commands.holdRevocationsOf(listed.keySet().stream().map(ConnectedHost::runnerHostId).toList());
-            for (Map.Entry<ConnectedHost, List<RunnerMessages.ActiveRun>> entry : listed.entrySet()) {
-                ConnectedHost placed = entry.getKey();
-                if (entry.getValue().isEmpty()) {
-                    continue;
-                }
-                List<RunnerMessages.RunGitRevoke> frames = SystemContext.callInCompany(placed.company(),
-                        () -> separate.execute(status -> unwritten(placed, entry.getValue())));
+            // Each company's revocations are read in this transaction, under that company's tenant context in turn:
+            // the hold stays, and the thread never asks for a second connection while it holds this one.
+            List<Map.Entry<ConnectedHost, List<RunnerMessages.ActiveRun>>> presences = listed.entrySet()
+                .stream()
+                .filter(entry -> !entry.getValue().isEmpty())
+                .toList();
+            Map<ConnectedHost, List<RunnerMessages.RunGitRevoke>> unwritten = new LinkedHashMap<>();
+            tenants.eachIn(presences, entry -> TenantContext.forCompany(entry.getKey().company()),
+                    entry -> unwritten.put(entry.getKey(), unwritten(entry.getKey(), entry.getValue())));
+            unwritten.forEach((placed, frames) -> {
                 for (RunnerMessages.RunGitRevoke frame : frames) {
                     if (write.test(frame)) {
                         written.computeIfAbsent(placed.company(), id -> new ArrayList<>()).add(frame);
                     }
                 }
-            }
+            });
             write.test(new RunnerMessages.WelcomeDone());
             return null;
         });

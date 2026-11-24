@@ -18,6 +18,7 @@ import com.flowtivo.tinfirm.runner.ConnectedHost;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.TenantSql;
 import com.flowtivo.tinfirm.support.TestCredentials;
@@ -107,6 +108,9 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
         return found;
     }
 
+    /** The frames of the class whose second connections the tests look for. */
+    private static final String REVOCATIONS = "com.flowtivo.tinfirm.run.internal.GitRevocationService";
+
     // ---- The ticket's acceptance criterion ---------------------------------------------------------------------------
 
     @Test
@@ -173,6 +177,7 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
 
     @Test
     void aWithdrawnGrantRevokesAndAHostThatReconnectsGetsTheRevocationAgainBeforeACancel() {
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         Bench bench = bench(true);
         UUID[] git = gitHost(bench, "Shop");
         Lent credential = lent(bench, git[0], "WRITE");
@@ -207,6 +212,8 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
             again.assertFramesValid();
         }
         assertThat(revocations(bench, runId)).hasSize(1);
+        // The revocation sent after its commit, and the hello's answer, each with one connection at a time.
+        assertThat(mark.at(REVOCATIONS)).as("second connections asked for").isZero();
     }
 
     // ---- The end of a hello's answer ---------------------------------------------------------------------------------
@@ -286,6 +293,26 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
             JsonNode audit = revocations(bench, assign.get("runId").asString()).getFirst();
             assertThat(audit.get("details").get("systemId").asString()).isEqualTo(git[0].toString());
             runner.assertFramesValid();
+        }
+    }
+
+    /** A revocation sent whose mark fails after the pause's commit: the pause is answered, the mark goes at the hello. */
+    @Test
+    void aRevocationSentWhoseMarkFailsLeavesThePauseAnsweredAndTheRevocationPending() throws Exception {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        lent(bench, git[0], "WRITE");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        try (FakeRunner runner = host(hostRef(bench), List.of(REVOKE), List.of())) {
+            JsonNode assign = running(bench, runner, agentId);
+            ApiResponse paused;
+            try (AutoCloseable busy = ConnectionWatch.timeOutKeptWorkAt(REVOCATIONS)) {
+                paused = bench.owner().post(bench.path("/systems/" + git[0] + "/pause"),
+                        Map.of("reason", "The token leaked"));
+            }
+            assertThat(paused.status()).as("%s", paused).isEqualTo(200);
+            assertThat(runner.expect(REVOKE).get("reason").asString()).isEqualTo("SYSTEM_PAUSED");
+            assertThat(deliveryOf(bench, assign.get("runId").asString())).isEqualTo("PENDING");
         }
     }
 
@@ -601,6 +628,7 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
 
     @Test
     void aRevocationInAHellosAnswerCountsAsSentOnlyOnceTheAnswerWasWritten() {
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         Bench bench = bench(true);
         UUID[] git = gitHost(bench, "Shop");
         Lent credential = lent(bench, git[0], "WRITE");
@@ -642,6 +670,8 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
             SystemContext.runInCompany(bench.id(), () -> listener.revocationsWritten(bench.id(), frames));
             assertThat(deliveryOf(bench, runId)).isEqualTo("SENT");
         }
+        // Each company's revocations are read in the hello's own transaction.
+        assertThat(mark.at(REVOCATIONS)).as("second connections asked for").isZero();
     }
 
     @Test
@@ -789,6 +819,61 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
         listener.endHelloAnswer(Map.of(new ConnectedHost(UUID.randomUUID(), bench.id(), 2),
                 List.of(new RunnerMessages.ActiveRun(UUID.fromString(runId), epoch, 0L))), written::add);
         assertThat(written).singleElement().isInstanceOf(RunnerMessages.WelcomeDone.class);
+    }
+
+    /** A run of the bench's company host whose revocation waits for the host's hello. */
+    private record Pending(Bench bench, RunnerHostRef ref, String runId, long epoch) {
+
+        RunnerMessages.ActiveRun active() {
+            return new RunnerMessages.ActiveRun(UUID.fromString(runId), epoch, 0L);
+        }
+    }
+
+    private Pending pendingRevocation() {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        Lent credential = lent(bench, git[0], "WRITE");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        RunnerHostRef ref = hostRef(bench);
+        JsonNode assign;
+        try (FakeRunner runner = host(ref, List.of(REVOKE), List.of())) {
+            assign = running(bench, runner, agentId);
+        }
+        String runId = assign.get("runId").asString();
+        await().atMost(WAIT).until(() -> !connections.isConnected(ref.id()));
+        assertThat(bench.owner().patch(bench.path("/systems/" + git[0] + "/credentials/"
+                + credential.credentialId()), Map.of("enabled", false)).status()).isEqualTo(200);
+        await().atMost(WAIT).until(() -> !revocations(bench, runId).isEmpty());
+        assertThat(deliveryOf(bench, runId)).isEqualTo("PENDING");
+        return new Pending(bench, ref, runId, assign.get("epoch").asLong());
+    }
+
+    /**
+     * A hello's presences in two companies: each company's revocations are read under that company's tenant context,
+     * in the hello's one transaction, and none of another company's: a run listed under a presence in a company that
+     * is not the run's is invisible there.
+     */
+    @Test
+    void aHelloWithPresencesInTwoCompaniesReadsEachCompanysRevocationsAndNoneOfAnothers() {
+        Pending first = pendingRevocation();
+        Pending second = pendingRevocation();
+        Map<ConnectedHost, List<RunnerMessages.ActiveRun>> listed = new java.util.LinkedHashMap<>();
+        listed.put(new ConnectedHost(first.ref().id(), first.bench().id(), 2), List.of(first.active()));
+        listed.put(new ConnectedHost(second.ref().id(), second.bench().id(), 2), List.of(second.active()));
+        // The first company's run, listed again by a presence in the second company: row-level security hides it.
+        listed.put(new ConnectedHost(first.ref().id(), second.bench().id(), 2), List.of(first.active()));
+
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
+        List<RunnerMessages.Outbound> written = new java.util.concurrent.CopyOnWriteArrayList<>();
+        listener.endHelloAnswer(listed, written::add);
+
+        assertThat(written).hasSize(3);
+        assertThat(written.subList(0, 2)).extracting(frame -> ((RunnerMessages.RunGitRevoke) frame).runId().toString())
+            .containsExactly(first.runId(), second.runId());
+        assertThat(written.getLast()).isInstanceOf(RunnerMessages.WelcomeDone.class);
+        assertThat(deliveryOf(first.bench(), first.runId())).isEqualTo("SENT");
+        assertThat(deliveryOf(second.bench(), second.runId())).isEqualTo("SENT");
+        assertThat(mark.at(REVOCATIONS)).as("second connections asked for").isZero();
     }
 
     // ---- An earlier execution (Q48 c and d) ---------------------------------------------------------------------------

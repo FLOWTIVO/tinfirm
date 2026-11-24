@@ -21,6 +21,7 @@ import com.flowtivo.tinfirm.shared.security.AuthenticatedUser;
 import com.flowtivo.tinfirm.shared.security.BearerGrantHolder;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.tenant.TenantScope;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 
@@ -140,7 +141,8 @@ class CompanyAccessGuardImpl implements CompanyAccessGuard {
             }
             tenantScope.enterCompany(companyId);
             if (auditBreakGlass) {
-                adminAccessAudit.record(companyId, userId, permission);
+                // In a transaction of its own once the request's has released its connection (AfterTransaction).
+                AfterTransaction.runOrFail(() -> adminAccessAudit.record(companyId, userId, permission));
             }
             return new CompanyAccess(companyId, null, true);
         }

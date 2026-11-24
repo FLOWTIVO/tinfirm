@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import com.flowtivo.tinfirm.ee.licence.TestLicences;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.RawHttp;
 import com.flowtivo.tinfirm.support.TenantSql;
 import com.flowtivo.tinfirm.support.TestDatabase;
@@ -589,10 +590,14 @@ class ScimIntegrationTest extends ScimTest {
         Scim scim = scim(company);
         UUID owner = company.userId("OWNER");
 
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         ApiResponse last = scim.patch("/Users/" + owner, patch(op("replace", "active", false)));
         scimError(last, 400, "mutability");
         assertThat(last.json().get("detail").asString()).isEqualTo("LAST_OWNER");
         scimError(scim.delete("/Users/" + owner), 400, "mutability");
+        // The refusal is kept once the request's transaction, which rolled back, has released its connection.
+        assertThat(mark.at("com.flowtivo.tinfirm.ee.scim.ScimDirectoryImpl")).as("second connections asked for")
+            .isZero();
         ApiClient ownerSession = loginAs(company.email("OWNER"));
         assertThat(ownerSession.get(company.path("/inbox")).json().get("items")).anySatisfy(
                 item -> assertThat(item.get("kind").asString()).isEqualTo("SCIM_LAST_OWNER"));

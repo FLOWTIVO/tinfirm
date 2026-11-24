@@ -33,6 +33,7 @@ import com.flowtivo.tinfirm.shared.licence.Feature;
 import com.flowtivo.tinfirm.shared.licence.Licensing;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.tenant.TenantScope;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 
@@ -385,10 +386,13 @@ class ScimDirectoryImpl implements ScimDirectory {
 
     /**
      * {@code 400 mutability} with the detail {@code LAST_OWNER}; the refusal is kept for the OWNER's inbox in a
-     * transaction of its own, since the request's rolls back.
+     * transaction of its own, since the request's rolls back, once that one has released its connection
+     * ({@link AfterTransaction}). A refusal that cannot be kept fails the request in place of the refusal's answer, as
+     * it did when it was kept first.
      */
     private void refuseLastOwner(UUID companyId, UUID userId) {
-        ownTransaction.executeWithoutResult(status -> members.lastOwnerRefused(companyId, userId));
+        AfterTransaction.runOrFail(() -> ownTransaction.executeWithoutResult(status -> members.lastOwnerRefused(companyId,
+                userId)));
         throw ScimException.mutability("LAST_OWNER");
     }
 

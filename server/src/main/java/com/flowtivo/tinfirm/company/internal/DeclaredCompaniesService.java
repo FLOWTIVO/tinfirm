@@ -33,6 +33,7 @@ import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
 import com.flowtivo.tinfirm.shared.tenant.TenantScope;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 
 /**
  * Applies the companies the deployment declares (ADR-0075), as actor SYSTEM with the instance's rights. At every
@@ -99,7 +100,7 @@ class DeclaredCompaniesService implements DeclaredCompanies {
         this.auditLog = auditLog;
         this.time = time;
         this.jdbc = jdbc;
-        // After the login's or the key's commit its transaction is still bound to the thread: the work needs its own.
+        // Its own transaction, whoever calls: at the start, after a sign-in and after a key's commit.
         this.afterCommit = new TransactionTemplate(transactionManager);
         this.afterCommit.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -110,7 +111,7 @@ class DeclaredCompaniesService implements DeclaredCompanies {
             log.info("No company is declared (TINFIRM_COMPANIES_<KEY>_NAME): the companies stay as they are");
             return;
         }
-        // A transaction of its own: after a key's commit (licenceChanged) the finished one is still bound to the thread.
+        // A transaction of its own, under the declarations' lock: at the start, and once a key's transaction has ended.
         SystemContext.call(() -> afterCommit.execute(status -> {
             jdbc.sql("SELECT pg_advisory_xact_lock(?)").param(DECLARATIONS_LOCK_KEY).query().singleRow();
             // ADR-0077, decision 4: a declared company beyond the first is Enterprise's, up to its key's cap; one that
@@ -170,26 +171,36 @@ class DeclaredCompaniesService implements DeclaredCompanies {
         }));
     }
 
-    /** Another key came into force: the declarations that waited for one are applied (ADR-0077). */
+    /**
+     * Another key came into force: the declarations that waited for one are applied (ADR-0077), once the key's
+     * transaction has released its connection ({@link AfterTransaction}).
+     */
     @TransactionalEventListener(fallbackExecution = true)
     void licenceChanged(LicenceChanged event) {
-        try {
-            apply();
-        }
-        catch (RuntimeException ex) {
-            log.warn("The declared companies could not be applied after the licence changed: {}", ex.toString());
-        }
+        AfterTransaction.run(() -> {
+            try {
+                apply();
+            }
+            catch (RuntimeException ex) {
+                log.warn("The declared companies could not be applied after the licence changed: {}", ex.toString());
+            }
+        });
     }
 
     /**
      * After the login's commit: the user becomes the OWNER of each declared company that names them and has none, if
-     * they signed in locally or through that company's provider.
+     * they signed in locally or through that company's provider. Before the sign-in is answered.
      */
     @TransactionalEventListener(fallbackExecution = true)
     void signedIn(UserEvents.UserSignedIn event) {
         if (properties.companies().isEmpty()) {
             return;
         }
+        // Once the sign-in's transaction has released its connection: its afterCommit still holds it.
+        AfterTransaction.run(() -> claimDeclared(event));
+    }
+
+    private void claimDeclared(UserEvents.UserSignedIn event) {
         try {
             SystemContext.call(() -> afterCommit.execute(status -> {
                 Optional<UserSummary> user = users.findById(event.userId());
