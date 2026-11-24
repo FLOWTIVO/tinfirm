@@ -55,6 +55,12 @@ public final class AfterTransaction {
     /** Whether a transaction neither read-only nor bookkeeping committed in the thread's current piece of work. */
     private static final ThreadLocal<Boolean> SAVED = new ThreadLocal<>();
 
+    /** Whether the thread's current request was answered by the rule of the busy answer, for want of a connection. */
+    private static final ThreadLocal<Boolean> ANSWERED_BUSY = new ThreadLocal<>();
+
+    /** Whether one of Spring Session's own transactions of the thread's current request found no connection. */
+    private static final ThreadLocal<Boolean> SESSION_FOUND_NONE = new ThreadLocal<>();
+
     /** Transactions joined while the one they join was completing: in its callbacks, after its commit. */
     private static final AtomicLong JOINED_WHILE_COMPLETING = new AtomicLong();
 
@@ -220,6 +226,36 @@ public final class AfterTransaction {
     }
 
     /**
+     * Whether the thread's current request was answered by the rule of the busy answer for want of a database
+     * connection ({@code shared.web.ServerBusy}), until {@link #endOfWork}: the answer is written, and Spring Session's
+     * bookkeeping after it asks the pool for nothing more ({@code SessionTransactions}).
+     */
+    public static boolean answeredBusy() {
+        return ANSWERED_BUSY.get() != null;
+    }
+
+    /**
+     * The thread's current request is answered by the rule of the busy answer for want of a database connection: a
+     * failure that the request's work caught and got over is not answered so.
+     */
+    public static void answeredBusy(boolean answered) {
+        if (answered) {
+            ANSWERED_BUSY.set(Boolean.TRUE);
+        }
+    }
+
+    /** Whether one of Spring Session's own transactions of the current request found no connection, until the end. */
+    static boolean sessionFoundNoConnection() {
+        return SESSION_FOUND_NONE.get() != null;
+    }
+
+    static void sessionFoundNoConnection(boolean found) {
+        if (found) {
+            SESSION_FOUND_NONE.set(Boolean.TRUE);
+        }
+    }
+
+    /**
      * How many transactions were joined while the transaction they joined was completing, in its {@code afterCommit}
      * or {@code afterCompletion} callbacks: such work runs on the finished transaction's connection, without its
      * tenant context, and what it writes is lost. For the tests' guard.
@@ -316,12 +352,15 @@ public final class AfterTransaction {
      * The end of a piece of work (a request, a scheduled job's run, a socket's callback) where the thread holds no
      * transaction: work still kept, or a transaction still counted, is a bug of the thread's work (a transaction never
      * ended), logged as an error that names it. The work is run, its failures logged, and the thread's state reset;
-     * {@link #savedInThisWork} is forgotten.
+     * {@link #savedInThisWork} is forgotten, and so are {@link #answeredBusy()} and whether the session found no
+     * connection.
      *
      * @param where what ended, for the log
      */
     public static void endOfWork(String where) {
         SAVED.remove();
+        ANSWERED_BUSY.remove();
+        SESSION_FOUND_NONE.remove();
         State state = STATE.get();
         if (state == null) {
             return;

@@ -100,6 +100,11 @@ public final class ServerBusy {
         return timedOut || afterCommit ? Answer.SAVED_THEN_FAILED : Answer.NONE;
     }
 
+    /** Whether the failure is the pool's: no free database connection in time, among its causes or suppressed ones. */
+    public static boolean timedOut(Throwable thrown) {
+        return chain(thrown).stream().anyMatch(SQLTransientConnectionException.class::isInstance);
+    }
+
     /** The exception, its causes and its suppressed exceptions, each once, at most {@link #MAX_EXCEPTIONS}. */
     private static Set<Throwable> chain(Throwable thrown) {
         Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -123,6 +128,8 @@ public final class ServerBusy {
      * message (a database that is down shows as such), a failure with its stack.
      */
     public static ApiException exception(Answer answer, Throwable thrown) {
+        // Answered for want of a connection: Spring Session asks no more of the pool (shared.tx.SessionTransactions).
+        AfterTransaction.answeredBusy(answer != Answer.NONE && timedOut(thrown));
         return switch (answer) {
             case BUSY -> {
                 Throwable innermost = thrown;

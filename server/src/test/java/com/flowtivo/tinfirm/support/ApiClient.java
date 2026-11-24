@@ -77,6 +77,20 @@ public final class ApiClient {
         return send("DELETE", path, null);
     }
 
+    /** The client's cookies as a {@code Cookie} header, for a request sent another way. */
+    public String cookieHeader() {
+        return cookies.getCookieStore()
+            .getCookies()
+            .stream()
+            .map(cookie -> cookie.getName() + "=" + cookie.getValue())
+            .collect(java.util.stream.Collectors.joining("; "));
+    }
+
+    /** The address the client presents through {@code X-Forwarded-For}. */
+    public String clientIp() {
+        return clientIp;
+    }
+
     /** Loads the XSRF-TOKEN cookie like the SPA does before logging in. */
     public ApiResponse fetchCsrfToken() {
         return get("/api/auth/providers");

@@ -34,8 +34,9 @@ class TransactionManagerConfiguration {
     /**
      * Spring Session's transactions, as Spring Session makes them (each of its own), named {@link
      * AfterTransaction#BOOKKEEPING}: the session's reads and saves are not the request's change, so their commits leave
-     * {@link AfterTransaction#savedInThisWork} as it is. Set on Spring Session's configuration before it makes its
-     * repository; no {@code TransactionOperations} bean, which would take the place of Spring Boot's.
+     * {@link AfterTransaction#savedInThisWork} as it is. Once the request found no free connection, they are not begun
+     * again ({@link SessionTransactions}). Set on Spring Session's configuration before it makes its repository; no
+     * {@code TransactionOperations} bean, which would take the place of Spring Boot's.
      */
     @Bean
     static BeanPostProcessor bookkeepingSessionTransactions(ObjectProvider<PlatformTransactionManager> managers) {
@@ -43,7 +44,7 @@ class TransactionManagerConfiguration {
             @Override
             public Object postProcessBeforeInitialization(Object bean, String beanName) {
                 if (bean instanceof JdbcHttpSessionConfiguration sessions) {
-                    TransactionTemplate template = new TransactionTemplate(managers.getObject());
+                    TransactionTemplate template = new SessionTransactions(managers.getObject());
                     template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
                     template.setName(AfterTransaction.BOOKKEEPING);
                     sessions.setTransactionOperations(template);

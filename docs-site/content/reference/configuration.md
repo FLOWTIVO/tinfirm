@@ -20,7 +20,7 @@ Durations are ISO 8601, such as `PT20S` or `P7D`. Sizes take a unit, such as `25
 | `SPRING_FLYWAY_PASSWORD` | none | **Secret.** Its password | `database.existingSecret`, key `database.secretKeys.ownerPassword` |
 | `SPRING_FLYWAY_URL` | the datasource's URL | A URL of its own for the migrations, for example to bypass a transaction pooler | `extraConfig` |
 | `SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE` | `10` | The connection pool of each server pod | `extraConfig` |
-| `SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT` | `30000` | How long a request waits for a free connection of the pool, in milliseconds. A read, or a write that cannot have saved anything yet, that finds none in time is answered `503` with `Retry-After` and may be sent again; a write that may already have saved a change is answered `500`, saying so | `extraConfig` |
+| `SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT` | `30000` | How long a request waits for a free connection of the pool, in milliseconds, each time it asks for one: a request asks several times, so its busy answer can come later than one wait. A read, or a write that cannot have saved anything yet, that finds none in time is answered `503` with `Retry-After` and may be sent again; a write that may already have saved a change is answered `500`, saying so | `extraConfig` |
 
 [Prepare PostgreSQL](../operator-guide/database.md) explains the roles, TLS and pool sizes.
 

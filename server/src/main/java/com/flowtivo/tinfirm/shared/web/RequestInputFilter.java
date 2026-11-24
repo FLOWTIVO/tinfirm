@@ -10,9 +10,12 @@ import jakarta.servlet.http.HttpServletResponse;
 
 import org.apache.tomcat.util.http.InvalidParameterException;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.servlet.HandlerExceptionResolver;
 
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.tx.FailedAfterCommit;
 
 /**
@@ -33,6 +36,13 @@ import com.flowtivo.tinfirm.shared.tx.FailedAfterCommit;
  * U+0000 itself and audits the delivery it refuses ({@code trigger.internal.WebhookInbox}), and the model relay, whose
  * bodies go to the model gateway as they are and never into SQL ({@code model.internal.ModelRelayImpl}).
  * <p>
+ * A failure for want of a database connection from Spring Session's commit at the end of its filter, once the chain
+ * inside it returned ({@link SessionAnswered}), is not thrown on: when the request was answered by the rule of the busy
+ * answer, the response holds that answer, already logged, and nothing more is said; else, when the answer was
+ * committed whole, a warning is logged, since thrown on, the failure would make the container cut the answer. Not
+ * committed, it is answered by the rule. A failure inside that chain after the commit is thrown on as before: its
+ * answer is not complete, and the connection must end.
+ * <p>
  * The filter reads nothing itself, so a body stays unread until its handler reads it (a multipart is resolved
  * lazily, after authentication). Its cost per request is the wrapper, a scan of each parameter value when it is read,
  * and one pass over a JSON body's bytes as its reader reads them.
@@ -41,6 +51,8 @@ final class RequestInputFilter extends OncePerRequestFilter {
 
     /** The paths whose JSON bodies are not scanned for U+0000 (above). */
     private static final List<String> RAW_BODIES = List.of("/api/hooks/", "/api/runner/v1/model/");
+
+    private static final Logger log = LoggerFactory.getLogger(RequestInputFilter.class);
 
     private final HandlerExceptionResolver resolver;
 
@@ -58,7 +70,25 @@ final class RequestInputFilter extends OncePerRequestFilter {
             chain.doFilter(new NulRefusingRequest(request, scanBody), response);
         }
         catch (IOException | ServletException | RuntimeException ex) {
+            if (request.getAttribute(SessionAnswered.ANSWERED) != null && ServerBusy.timedOut(ex)
+                    && AfterTransaction.answeredBusy()) {
+                // The chain inside Spring Session's filter returned with the request answered by the rule of the busy
+                // answer, which logged it: the response holds that answer, committed or not, and Spring Session's
+                // bookkeeping after it failed for want of a connection as the request did. Nothing more to say.
+                return;
+            }
             if (response.isCommitted()) {
+                if (request.getAttribute(SessionAnswered.ANSWERED) != null && ServerBusy.timedOut(ex)) {
+                    // The chain inside Spring Session's filter returned: the answer is whole and committed. Spring
+                    // Session saved the session when the answer was committed; at the end of its filter it commits
+                    // again: it reads the requested session once more (its first commit forgot it) to compare the
+                    // session's id, and saves the session, which writes only what changed after the answer was
+                    // committed. That is what is lost here, with the session's id in a cookie that a committed answer
+                    // can no longer carry anyway. Thrown on, the failure would make the container cut the answer.
+                    log.warn("The session's bookkeeping after an answered request found no free database connection;"
+                            + " the answer is complete: {}", ex.toString());
+                    return;
+                }
                 throw ex;
             }
             Exception refusal = refusal(ex);
