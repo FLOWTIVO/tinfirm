@@ -60,9 +60,9 @@ RestartSec=5
 # SIGTERM cancels the runs and pushes their work in progress; give it time.
 TimeoutStopSec=180
 # The stop's SIGTERM goes to `run` alone. With systemd's default it would also go to every
-# process `run` started, the front of each sandbox among them: a front that dies then looks like
-# a crash to its run, which would end FAILED instead of CANCELLED and could lose the work it was
-# collecting. What `run` leaves behind when it exits is still killed.
+# process `run` started: the git commands, the readers of what sandboxes send back and the VM
+# driver, which `run` still needs to cancel its runs and push their work. (A sandbox's front
+# stays on SIGTERM by itself.) What `run` leaves behind when it exits is still killed.
 KillMode=mixed
 
 {% if _tinfirm_runner_host_vm | bool %}

@@ -95,7 +95,7 @@ On Kubernetes, the Helm chart can run a company host for you, as a pod whose san
 
 ### Run it as a service
 
-With systemd, `systemctl reload` drains and systemd starts the binary installed now once `run` has exited; `stop` and `restart` send SIGTERM, which cancels the active runs. Keep `KillMode=mixed` in the unit: with systemd's default, the signal also goes to every process `run` started, and on a host with the sandbox bridge that ends each sandbox's front process under its run, which then fails instead of being cancelled:
+With systemd, `systemctl reload` drains and systemd starts the binary installed now once `run` has exited; `stop` and `restart` send SIGTERM, which cancels the active runs. Keep `KillMode=mixed` in the unit: with systemd's default, the signal also goes to every process `run` started (git, the readers of what sandboxes send back, a VM driver), which `run` still needs to cancel its runs and push their work:
 
 ```ini title="/etc/systemd/system/tinfirm-runner-host.service"
 [Unit]

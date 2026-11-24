@@ -43,8 +43,8 @@ The role:
    `--sandbox-env` mirror settings, sandboxed by systemd (`NoNewPrivileges`,
    `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, writable only its own directories),
    and starts it. A stop's signal goes to `run` alone (`KillMode=mixed`), which cancels its runs
-   and pushes their work; sent to every process of the unit, it would end each sandbox's front
-   process under its run.
+   and pushes their work; sent to every process of the unit, it would also end the git commands
+   and the readers that `run` needs for that.
 
 A company runner host receives the git token and the prompt of every conversation it runs:
 treat it as a tier-0 asset beside the server (threat model 5.13). The role's defaults are
