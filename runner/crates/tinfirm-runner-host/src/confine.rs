@@ -31,7 +31,10 @@
 //!   priority (`prlimit64`, the `sched_set*` calls, `setpriority`, `ioprio_set`). A positive pid
 //!   of its own group cannot be told from another in a seccomp filter, so only the reader's own
 //!   pid is allowed: git's cleanup of its children after an error is refused, and the host's
-//!   kill of the group does it.
+//!   kill of the group does it. The list names its calls by their numbers in the 64-bit ABI. An
+//!   x86-64 kernel built with the x32 ABI takes each of them under a second number as well,
+//!   which no rule of the list matches: on x86-64 a further filter refuses every call of that
+//!   ABI. A call of a 32-bit ABI ends the process.
 //!
 //! Landlock 2 (Linux 5.19) is the least that counts as confined: before it, Landlock refuses
 //! every rename between two directories, which git needs to store an object. The child
@@ -609,12 +612,63 @@ mod seccomp {
         libc::SYS_vfork,
     ];
 
+    /// The bit that the numbers of the x32 ABI's system calls have set (`__X32_SYSCALL_BIT`).
+    #[cfg(target_arch = "x86_64")]
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+    /// x86-64 as a filter reads it in `seccomp_data.arch` (`AUDIT_ARCH_X86_64`).
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
+    /// Refuses every system call of the x32 ABI, with `EPERM`. An x86-64 kernel built with that
+    /// ABI takes each call under a second number, the 64-bit one with [`X32_SYSCALL_BIT`] set,
+    /// and names the same architecture for both. A [`SeccompFilter`] compares the whole number
+    /// with each one it lists, so no rule of the other filters matches such a call: `socket`,
+    /// `setsid`, `kill` and the rest would get through. It has no rule for a range of numbers
+    /// either, so this program is written out instead. The reader, the front and git are 64-bit
+    /// programs and make no such call: every number from the bit on is refused, whatever the
+    /// call. Another architecture ends the process, as in seccompiler's own programs.
+    #[cfg(target_arch = "x86_64")]
+    fn x32_refused() -> BpfProgram {
+        // Where `seccomp_data` holds the call's number and its architecture, 32 bits each.
+        const NUMBER: u32 = 0;
+        const ARCHITECTURE: u32 = 4;
+        let instruction = |code: u32, jt: u8, jf: u8, k: u32| seccompiler::sock_filter {
+            code: code as u16,
+            jt,
+            jf,
+            k,
+        };
+        let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+        let jump = libc::BPF_JMP | libc::BPF_K;
+        let answer = libc::BPF_RET | libc::BPF_K;
+        vec![
+            instruction(load, 0, 0, ARCHITECTURE),
+            instruction(jump | libc::BPF_JEQ, 1, 0, AUDIT_ARCH_X86_64),
+            instruction(answer, 0, 0, SeccompAction::KillProcess.into()),
+            instruction(load, 0, 0, NUMBER),
+            // Unsigned, as the kernel compares: below the bit is a 64-bit call, which the other
+            // filters judge.
+            instruction(jump | libc::BPF_JGE, 0, 1, X32_SYSCALL_BIT),
+            instruction(
+                answer,
+                0,
+                0,
+                SeccompAction::Errno(libc::EPERM as u32).into(),
+            ),
+            instruction(answer, 0, 0, SeccompAction::Allow.into()),
+        ]
+    }
+
+    /// The programs of `profile`, in the order they are installed. The kernel runs every one
+    /// of them on each system call and takes the answer that restricts most, so each adds its
+    /// refusals to the others'.
     fn filters(
         arch: TargetArch,
         own: i32,
         group: i32,
         profile: Profile,
-    ) -> Result<(BpfProgram, BpfProgram), seccompiler::Error> {
+    ) -> Result<Vec<BpfProgram>, seccompiler::Error> {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
             DENIED.iter().map(|&call| (call, Vec::new())).collect();
         signal_rules(&mut rules, own, group, profile)?;
@@ -669,30 +723,130 @@ mod seccomp {
             arch,
         )?
         .try_into()?;
-        Ok((denied, clone3))
+        Ok(vec![
+            denied,
+            clone3,
+            #[cfg(target_arch = "x86_64")]
+            x32_refused(),
+        ])
     }
 
     pub fn apply(profile: Profile) -> Result<(), String> {
         let arch = ARCH.ok_or("this architecture has no seccomp filter of Tinfirm's")?;
         let own = rustix::process::getpid().as_raw_nonzero().get();
         let group = rustix::process::getpgrp().as_raw_nonzero().get();
-        let (denied, clone3) = filters(arch, own, group, profile).map_err(|e| e.to_string())?;
-        seccompiler::apply_filter(&denied).map_err(|e| e.to_string())?;
-        seccompiler::apply_filter(&clone3).map_err(|e| e.to_string())
+        for program in filters(arch, own, group, profile).map_err(|e| e.to_string())? {
+            seccompiler::apply_filter(&program).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
 
+        /// This architecture as a filter reads it in `seccomp_data.arch` (`AUDIT_ARCH_*`).
+        #[cfg(target_arch = "x86_64")]
+        const AUDIT_ARCH: u32 = AUDIT_ARCH_X86_64;
+        #[cfg(target_arch = "aarch64")]
+        const AUDIT_ARCH: u32 = 0xc000_00b7;
+
+        const ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
+        const EPERM: u32 = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        const ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+
+        /// Runs `program` on a system call of `arch` with the number `nr`, as the kernel runs
+        /// a filter, and returns its action. It knows the instructions that these programs
+        /// reach for a call whose arguments no rule looks at; any other fails the test.
+        fn run(program: &[seccompiler::sock_filter], arch: u32, nr: u32) -> u32 {
+            const LOAD: u32 = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+            const SKIP: u32 = libc::BPF_JMP | libc::BPF_JA;
+            const IF_EQUAL: u32 = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+            const IF_AT_LEAST: u32 = libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K;
+            const ANSWER: u32 = libc::BPF_RET | libc::BPF_K;
+            let (mut at, mut loaded) = (0usize, 0u32);
+            loop {
+                let step = &program[at];
+                at += 1;
+                match u32::from(step.code) {
+                    LOAD => {
+                        loaded = match step.k {
+                            0 => nr,
+                            4 => arch,
+                            offset => panic!("a load of offset {offset}, an argument"),
+                        }
+                    }
+                    SKIP => at += step.k as usize,
+                    IF_EQUAL => at += usize::from(if loaded == step.k { step.jt } else { step.jf }),
+                    IF_AT_LEAST => {
+                        at += usize::from(if loaded >= step.k { step.jt } else { step.jf })
+                    }
+                    ANSWER => return step.k,
+                    code => panic!("an instruction this test does not know: {code:#x}"),
+                }
+            }
+        }
+
+        /// What the kernel does with the call `nr` once all of `programs` are installed: every
+        /// one runs, and the action that restricts most is taken, which is the lowest as a
+        /// signed number (seccomp(2)).
+        fn decision(programs: &[BpfProgram], nr: i64) -> u32 {
+            programs
+                .iter()
+                .map(|program| run(program, AUDIT_ARCH, nr as u32))
+                .min_by_key(|action| (action & libc::SECCOMP_RET_ACTION_FULL) as i32)
+                .unwrap()
+        }
+
         #[test]
         fn the_filters_compile_for_this_architecture() {
             assert!(ARCH.is_some());
             if let Some(arch) = ARCH {
                 for profile in [Profile::Reader, Profile::Front] {
-                    let (denied, clone3) = filters(arch, 4242, 4242, profile).unwrap();
-                    assert!(!denied.is_empty() && !clone3.is_empty());
+                    let programs = filters(arch, 4242, 4242, profile).unwrap();
+                    // The list, clone3's and, on x86-64, the x32 ABI's.
+                    let expected = if cfg!(target_arch = "x86_64") { 3 } else { 2 };
+                    assert_eq!(programs.len(), expected);
+                    assert!(programs.iter().all(|program| !program.is_empty()));
+                    // And they answer as they are meant to: a call of the list, clone3, and one
+                    // that nothing refuses.
+                    assert_eq!(decision(&programs, libc::SYS_socket), EPERM);
+                    assert_eq!(decision(&programs, libc::SYS_clone3), ENOSYS);
+                    assert_eq!(decision(&programs, libc::SYS_read), ALLOW);
                 }
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        #[test]
+        fn a_call_of_the_x32_abi_is_refused_whatever_its_number() {
+            // The 32-bit calls of an x86-64 kernel (`int 0x80`): `AUDIT_ARCH_I386`.
+            const I386: u32 = 0x4000_0003;
+            const X32: i64 = X32_SYSCALL_BIT as i64;
+            let x32 = x32_refused();
+            assert_eq!(run(&x32, AUDIT_ARCH, 0), ALLOW);
+            assert_eq!(run(&x32, AUDIT_ARCH, X32_SYSCALL_BIT - 1), ALLOW);
+            assert_eq!(run(&x32, AUDIT_ARCH, X32_SYSCALL_BIT), EPERM);
+            assert_eq!(run(&x32, AUDIT_ARCH, u32::MAX), EPERM);
+            assert_eq!(run(&x32, I386, 0), libc::SECCOMP_RET_KILL_PROCESS);
+            for profile in [Profile::Reader, Profile::Front] {
+                let programs = filters(ARCH.unwrap(), 4242, 4242, profile).unwrap();
+                // What the list refuses under its 64-bit number is refused under its x32
+                // number too, and so is what the list allows.
+                for call in [
+                    libc::SYS_socket,
+                    libc::SYS_setsid,
+                    libc::SYS_kill,
+                    libc::SYS_clone3,
+                    libc::SYS_read,
+                ] {
+                    assert_eq!(decision(&programs, X32 | call), EPERM, "{call}");
+                }
+                // A number that only the x32 ABI has (they begin at 512), and the highest of all.
+                assert_eq!(decision(&programs, X32 | 512), EPERM);
+                assert_eq!(decision(&programs, i64::from(u32::MAX)), EPERM);
+                // The last number below the bit is a 64-bit call, and no filter refuses it.
+                assert_eq!(decision(&programs, X32 - 1), ALLOW);
             }
         }
     }

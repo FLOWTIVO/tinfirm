@@ -918,7 +918,10 @@ The reader:
     abstract sockets outside the reader (Linux 6.12) are refused too;
   - a seccomp filter: no socket of any kind, no `ptrace` or `process_vm_*`, no namespaces, no
     mounts, no `io_uring`, no `bpf`, no new session or process group, and it cannot make itself
-    dumpable again. It also keeps the reader's signals inside its process group on every kernel,
+    dumpable again. The filter knows these calls by their 64-bit numbers: on x86-64 it also
+    refuses every system call of the x32 ABI, under whose numbers a kernel built with that ABI
+    would take all of them, and a call of a 32-bit ABI ends the process. It also keeps the
+    reader's signals inside its process group on every kernel,
     before Linux 6.12 too: a signal by pid only to its own group (0 or the group's negative id) or
     itself, or the signal 0 (a check that a process exists) to any; no `pidfd_open` or
     `pidfd_send_signal`, no `F_SETOWN` or `FIOSETOWN` (a `SIGIO` sent for it); and no
