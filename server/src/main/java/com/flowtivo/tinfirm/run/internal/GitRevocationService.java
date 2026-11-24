@@ -394,6 +394,10 @@ class GitRevocationService implements RunGitRevocations {
      * after the server stopped tracking the run (it ended, or was lost longer ago than the resume window). A
      * repository a frame of the answer names already for that assignment is not named again. A host that does not
      * take revocations gets the answer as it is.
+     * <p>
+     * Only for an assignment that went to this host ({@link #wentTo}): a host may name any run of its company, and it
+     * learns nothing of a run it does not hold. The cancel of any other run goes alone, and nothing is recorded or
+     * marked for it.
      *
      * @param locked the runs the caller holds locked, for which a revocation may be recorded
      */
@@ -405,7 +409,7 @@ class GitRevocationService implements RunGitRevocations {
         if (!takesRevocations(host.runnerHostId())) {
             // The host that reports these runs will never be told: their revocations say so, not "pending".
             for (RunnerMessages.Outbound frame : answer) {
-                if (frame instanceof RunnerMessages.RunCancel cancel) {
+                if (frame instanceof RunnerMessages.RunCancel cancel && wentTo(host, cancel.runId(), cancel.epoch())) {
                     commands.markRevocationsUnsupported(cancel.runId(), cancel.epoch());
                 }
             }
@@ -421,7 +425,7 @@ class GitRevocationService implements RunGitRevocations {
         }
         List<RunnerMessages.Outbound> frames = new ArrayList<>();
         for (RunnerMessages.Outbound frame : answer) {
-            if (frame instanceof RunnerMessages.RunCancel cancel) {
+            if (frame instanceof RunnerMessages.RunCancel cancel && wentTo(host, cancel.runId(), cancel.epoch())) {
                 Set<UUID> sent = named.computeIfAbsent(cancel.runId() + "/" + cancel.epoch(), key -> new HashSet<>());
                 frames.addAll(beforeCancel(cancel.runId(), cancel.epoch(), locked.contains(cancel.runId()), sent,
                         now));
@@ -431,9 +435,24 @@ class GitRevocationService implements RunGitRevocations {
         return frames;
     }
 
+    /**
+     * Whether the run's assignment of {@code epoch} went to this host: to its presence in the company
+     * ({@code run_assignment_repository.runner_host_id}), or, for a member's machine, to the machine
+     * ({@code personal_host_id}), whose presence is a new one once its owner left the company and joined it again. An
+     * assignment that cloned nothing with a binding's token has no row, and nothing to revoke.
+     */
+    private boolean wentTo(ConnectedHost host, UUID runId, long epoch) {
+        UUID machine = host.personalHostId();
+        return repositories.ofAssignment(runId, epoch)
+            .stream()
+            .anyMatch(row -> host.runnerHostId().equals(row.runnerHostId())
+                    || machine != null && machine.equals(row.personalHostId()));
+    }
+
     private List<RunnerMessages.Outbound> beforeCancel(UUID runId, long epoch, boolean locked, Set<UUID> sent,
             Instant now) {
-        // The run is of the host's company (the tenant context); the host reports it with that epoch.
+        // The run is of the host's company (the tenant context), and its assignment of that epoch went to the host
+        // that reports it: the caller checked.
         RunStore.RunRow run = runs.find(runId).orElse(null);
         if (run == null) {
             return List.of();
