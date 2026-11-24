@@ -56,6 +56,8 @@ final class SessionTransactions extends TransactionTemplate {
         if (AfterTransaction.answeredBusy()) {
             return;
         }
+        // TransactionOperations.executeWithoutResult is a default method that calls execute, overridden above: a
+        // refused connection is noticed there.
         super.executeWithoutResult(action);
     }
 

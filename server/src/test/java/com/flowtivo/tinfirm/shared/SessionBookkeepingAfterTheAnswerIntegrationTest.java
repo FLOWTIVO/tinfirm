@@ -20,6 +20,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 
+import com.flowtivo.tinfirm.shared.web.ServerBusy;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
 import com.flowtivo.tinfirm.support.ConnectionWatch;
@@ -162,6 +163,42 @@ class SessionBookkeepingAfterTheAnswerIntegrationTest extends IntegrationTest {
     }
 
     /**
+     * A write with a small answer whose change is saved and whose session's save at the answer's commit finds no
+     * connection: refused once, as when the pool is free again for the next asking, and with the pool fully dry. The
+     * answer is the 500 that says a change may already be saved, logged once, and nothing more is asked of the pool.
+     */
+    @Test
+    void aSavedWriteWhoseSessionSaveFindsNoConnectionLogsOneError(CapturedOutput output) throws Exception {
+        for (boolean dry : new boolean[] { false, true }) {
+            Setup setup = setup();
+            String name = unique("Small");
+            ConnectionWatch.askedAfterRefusal();
+
+            int start = output.getOut().length();
+            ApiResponse created;
+            try (AutoCloseable busy = dry ? ConnectionWatch.timeOutAt(SAVE_AT_COMMIT)
+                    : ConnectionWatch.timeOutOnceAt(SAVE_AT_COMMIT)) {
+                created = setup.member().post(setup.company().path("/agents"), Map.of("name", name, "runtimes",
+                        List.of("CLAUDE_CODE"), "instructions", "Short.", "systems", List.of(), "repositories",
+                        List.of(), "shareGroupIds", List.of()));
+            }
+
+            assertThat(created.status()).as("dry %s: %s", dry, abbreviated(created)).isEqualTo(500);
+            assertThat(created.json().get("detail").asString()).isEqualTo(ServerBusy.SAVED_THEN_FAILED);
+            assertThat(created.header("Retry-After")).isNull();
+            assertThat(askedAfterRefusal()).as("dry %s: asked for after the first refusal", dry).isEmpty();
+            String logged = output.getOut().substring(start);
+            List<String> events = logged.lines().toList();
+            assertThat(events.stream().filter(line -> line.contains("A request failed after a change of it was "
+                    + "committed"))).as("dry %s: %s", dry, logged).hasSize(1);
+            assertThat(events).as("dry %s", dry).noneMatch(line -> line.contains("Failure in @ExceptionHandler")
+                    || line.contains("Failure while trying to resolve exception")
+                    || line.contains("answered 503 SERVER_BUSY"));
+            assertThat(setup.member().get(setup.company().path("/agents")).body()).contains(name);
+        }
+    }
+
+    /**
      * A sign-in whose new session cannot be saved is not answered as signed in: the answer is the rule's, and the
      * browser holds no session afterwards.
      */
@@ -183,6 +220,8 @@ class SessionBookkeepingAfterTheAnswerIntegrationTest extends IntegrationTest {
         assertThat(askedAfterRefusal()).as("asked for after the first refusal").isEmpty();
         String logged = output.getOut().substring(start);
         assertThat(logged.lines()).noneMatch(line -> line.contains("Failure in @ExceptionHandler"));
+        assertThat(logged.lines().filter(line -> line.contains("A request failed after a change of it was committed")
+                || line.contains("answered 503 SERVER_BUSY"))).as(logged).hasSize(1);
         assertThat(browser.get("/api/me").status()).isEqualTo(401);
     }
 
