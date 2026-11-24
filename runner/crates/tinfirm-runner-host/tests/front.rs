@@ -873,6 +873,31 @@ fn a_front_exits_when_its_channel_closes() {
     assert!(status.success(), "{status:?}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_front_stays_on_sigterm_and_ends_with_its_handle() {
+    let handle = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    // It answers from its runtime, where it listens for the signal from then on.
+    handle.ping().await.unwrap();
+    let pid = handle.pgid();
+    // As a service manager that stops the host signals every process of the service.
+    let status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot signal the front {pid}");
+    // A front that took the signal's default action would be gone long before this.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    handle.ping().await.unwrap();
+    handle.check_descriptor().await.unwrap();
+    assert_eq!(handle.ended(), None);
+    assert!(alive(pid));
+    // `run` still ends it: its channel closes and its group is killed.
+    drop(handle);
+    assert!(gone(pid).await, "the front outlived its handle");
+}
+
 /// The descriptors of this process that point at `path`.
 fn descriptors_of(path: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")

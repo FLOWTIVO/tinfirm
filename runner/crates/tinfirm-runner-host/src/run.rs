@@ -581,7 +581,7 @@ pub async fn execute(
                 keep_a_take_back_record(&mut run, &started, &repos);
                 run.sink.status(Phase::Running, None);
                 let params = agent_params(&run, &started.spec, &access, dirs.new_home, steering);
-                let agent = run_agent(
+                let mut agent = run_agent(
                     shared,
                     assign,
                     &mut run.sink,
@@ -594,7 +594,7 @@ pub async fn execute(
                 bring_the_work_back(
                     &mut run,
                     started.sandbox,
-                    &agent,
+                    &mut agent,
                     &contents,
                     &mut repos,
                     started.home_exclude,
@@ -1396,7 +1396,7 @@ fn agent_params(
 async fn bring_the_work_back(
     run: &mut Run<'_>,
     mut sandbox: crate::sandbox::Sandbox,
-    agent: &AgentPhase,
+    agent: &mut AgentPhase,
     contents: &SandboxContents<'_>,
     repos: &mut [Repo<'_>],
     home_exclude: Vec<String>,
@@ -1410,6 +1410,13 @@ async fn bring_the_work_back(
     let mut taken_back = false;
     if front_ended {
         taken_back = a_new_front_takes_the_sandbox_back(run, &mut sandbox).await;
+        // A front that ended while the host stops ended with that stop, and the agent's turn
+        // with the front. The stop cancels every run: this turn was stopped by it too, and is
+        // not looked at as one that ended by itself (an agent that lost its output would
+        // fail the run).
+        if shared.is_shutting_down() && agent_lost_its_output(agent) {
+            agent.stop = Some(StopCause::Cancel);
+        }
     }
     // A VM's bridge session that ended without the adapter's exit status may have ended with
     // the VM (its VMM died, its node rebooted): no fault of the agent's. Only then is the
@@ -1497,8 +1504,10 @@ fn keep_the_record_for_the_end(run: &mut Run<'_>, repos: &[Repo<'_>], agent: &Ag
 
 /// The sandbox's front ended during the run: one new front takes the bridge's session back
 /// ([`crate::sandbox::Sandbox::take_back_from_a_new_front`]) and the agent stops. Either way
-/// the run fails with `INFRA`, saying whether its work can come back. Whether the new front
-/// took the sandbox back.
+/// the run fails with `INFRA`, saying whether its work can come back, with one exception: a
+/// front that ended while the host stops, and whose sandbox the new front took back, fails no
+/// run. That run ends cancelled, as every run of a host that stops. Whether the new front took
+/// the sandbox back.
 async fn a_new_front_takes_the_sandbox_back(
     run: &mut Run<'_>,
     sandbox: &mut crate::sandbox::Sandbox,
@@ -1526,10 +1535,16 @@ async fn a_new_front_takes_the_sandbox_back(
                     ),
                 );
             }
-            run.failure.set(
-                FailureClass::Infra,
-                "The sandbox's front process ended during the run; a new front took the sandbox back, the agent was stopped, and its work so far was saved.",
-            );
+            // A front that ended while the host stops is the stop's doing, not a fault of the
+            // run's: a service manager may signal the fronts with `run` (systemd without
+            // `KillMode=mixed`). The run then ends as the stop ends every run, cancelled, with
+            // the work that the new front brings back.
+            if !shared.is_shutting_down() {
+                run.failure.set(
+                    FailureClass::Infra,
+                    "The sandbox's front process ended during the run; a new front took the sandbox back, the agent was stopped, and its work so far was saved.",
+                );
+            }
         }
         Err(e) => {
             let error = run.sink.redact(&format!("{e:#}"));

@@ -871,7 +871,12 @@ holds its bridge.
   takes the session back with the run's key, on the same port (a VM's dials it again), the agent
   is stopped, its work comes back and is saved, and the run fails with `INFRA`, saying what was
   saved and what was not. When the new front ends too, the run fails and says that its work is
-  lost. The other runs and the host are not touched. Shown on a control host with a VM per run
+  lost. The other runs and the host are not touched. A front that ends while `run` stops
+  (SIGTERM, `Ctrl-C`) is replaced the same way, and its run ends `CANCELLED` like the host's
+  other runs when all of its work came back. A front itself does not end on SIGTERM: it ends
+  when `run` closes its channel or kills its process group, so a service manager that signals
+  every process of the service leaves the fronts to `run`
+  ([Drain and upgrades](#drain-and-upgrades)). Shown on a control host with a VM per run
   (2026-11-22; the outputs are not in this repository): a VM's front, killed during the run, was
   replaced in under a second, and the run ended with "a new front took the sandbox back, the agent
   was stopped, and its work so far was saved." During that run the front showed `NoNewPrivs 1`
@@ -1979,7 +1984,12 @@ The new `run` [rebuilds the runner images](#rebuilds-after-an-upgrade) whose Doc
 new binary changed before it connects; no `images build` is needed.
 
 With systemd, `systemctl reload` drains and systemd starts the new binary once `run` has
-exited; `systemctl stop` and `restart` send SIGTERM, which still cancels the active runs:
+exited; `systemctl stop` and `restart` send SIGTERM, which still cancels the active runs.
+The unit needs `KillMode=mixed`, which sends that SIGTERM to `run` alone: with systemd's
+default (`control-group`) every process that `run` started gets it too, a `git push` or a
+reader among them, and ends before the runs' work in progress is back and pushed. A sandbox's
+front stays on SIGTERM either way and ends with `run`; one that ends while `run` stops is
+replaced, and its run still ends `CANCELLED` with its work pushed.
 
 ```ini
 [Unit]
@@ -1997,6 +2007,10 @@ Restart=always
 RestartSec=5
 # SIGTERM cancels the runs and pushes their work in progress; give it time.
 TimeoutStopSec=180
+# The signal goes to `run` alone: it needs the processes it started (git, the readers, the
+# sandboxes' fronts) to bring that work back and push it. systemd kills what is left of the
+# service once `run` has exited, or after TimeoutStopSec.
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target

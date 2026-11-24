@@ -3,8 +3,9 @@
 //!
 //! The front is confined already when this starts. It says so first ([`ToMain::Ready`]),
 //! then builds its tokio runtime and reads `run`'s messages on a thread of their own until
-//! `run` closes its end, and then exits. One dispatcher ([`Front::dispatch`]) hands each
-//! message, in order, to the handler of its service, which keeps that service's state:
+//! `run` closes its end, and then exits; SIGTERM does not end it ([`serve`]). One dispatcher
+//! ([`Front::dispatch`]) hands each message, in order, to the handler of its service, which
+//! keeps that service's state:
 //! - the egress proxy, served on the runtime ([`crate::egress_proxy::serve`]): each connection
 //!   it needs is asked of `run` ([`ToMain::Connect`]) and given back as a descriptor or
 //!   refused;
@@ -576,6 +577,13 @@ pub fn serve(status: Status) -> ExitCode {
     };
     let mut messages = read_messages(socket);
     runtime.block_on(async move {
+        // A front ends with its channel, or with the kill of its group, and not on SIGTERM. A
+        // service manager that stops the host may signal every process of the service, the
+        // fronts with `run` (systemd's default, `KillMode=control-group`), and `run` then
+        // still needs each front to stop its run's agent and to bring the work back. The
+        // listener replaces the signal's default action for the life of the process; nothing
+        // reads it. Where it cannot be made, the signal ends the front as before.
+        let _sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
         let mut init = false;
         let mut front = Front::new(writer);
         while let Some(item) = messages.recv().await {

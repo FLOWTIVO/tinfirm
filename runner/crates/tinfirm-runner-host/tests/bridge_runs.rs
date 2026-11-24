@@ -548,7 +548,14 @@ fn restart_test_host_a() {
                 }
                 opts.halt_at = halt;
             }));
-            let _host = start_host_at(std::path::Path::new(&dir), &url, setup).await;
+            // SIGTERM stops host A as it stops `run`: its runs are cancelled and their ends
+            // delivered. The process stays until its test ends it.
+            let mut stop =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+            let host = start_host_at(std::path::Path::new(&dir), &url, setup).await;
+            stop.recv().await;
+            host.shutdown.cancel();
+            let _ = host.handle.await;
             std::future::pending::<()>().await;
         });
 }
@@ -1786,6 +1793,55 @@ async fn a_second_front_that_ends_too_is_not_replaced_and_the_run_says_its_work_
         // No third front was started for the run.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(fronts_of(host_a.id()).is_empty());
+        host_a.crash();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_front_that_ends_as_the_host_stops_leaves_its_run_cancelled_with_its_work_pushed() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut host_a = host_process(dir.path(), &server.url, false);
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let spec = AssignSpec::new("slow", Some(&repo.url));
+        conn.send(spec.to_json());
+        conn.wait_running(spec.run_id).await;
+        conn.until_seq(spec.run_id, 3).await;
+        let fronts = fronts_of(host_a.id());
+        assert_eq!(
+            fronts.len(),
+            1,
+            "one front for the run's sandbox: {fronts:?}"
+        );
+        // As a service manager stops the host's service with a signal to each of its
+        // processes (systemd without `KillMode=mixed`): the front goes as `run` is told to
+        // stop. A front stays on SIGTERM now, so SIGKILL stands in for one that did not.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "kill -KILL {} && kill -TERM {}",
+                fronts[0],
+                host_a.id()
+            ))
+            .status()
+            .unwrap();
+        assert!(status.success(), "cannot signal the front and the host");
+        // The stop cancels the run: a new front brings its work back, and the front's end is
+        // no failure of the run.
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        assert_eq!(finished["outcome"], "CANCELLED", "{}", t.text());
+        assert!(finished.get("failureClass").is_none(), "{}", t.text());
+        assert_eq!(finished["git"][0]["pushed"], true, "{}", t.text());
+        assert_eq!(
+            repo.file_at("agent/TEST-1", "slow.txt").as_deref(),
+            Some("work in progress\n")
+        );
         host_a.crash();
     })
     .await;
