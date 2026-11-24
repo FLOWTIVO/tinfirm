@@ -30,6 +30,7 @@ import com.flowtivo.tinfirm.runner.RunnerSessionListener;
 import com.flowtivo.tinfirm.shared.licence.Feature;
 import com.flowtivo.tinfirm.shared.licence.Licensing;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 
 /**
  * The runner endpoint {@code /api/runner/v1/connect} (docs/archive/v1/CONVENTIONS.md §15.1).
@@ -118,6 +119,10 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
+        ended("a runner host's connection", () -> established(session));
+    }
+
+    private void established(WebSocketSession session) {
         WebSocketSession out = new ConcurrentWebSocketSessionDecorator(session, SEND_TIME_LIMIT_MS,
                 SEND_BUFFER_LIMIT_BYTES);
         session.getAttributes().put(OUT, out);
@@ -134,15 +139,30 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage frame) {
-        ConnectedHost host = current(session);
-        WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
-        if (host == null || out == null) {
-            return;
+        ended("a runner host's frame", () -> {
+            ConnectedHost host = current(session);
+            WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
+            if (host == null || out == null) {
+                return;
+            }
+            boolean renew = registry.markInbound(host.machineId(), out.getId());
+            process(session, out, host, frame);
+            if (renew) {
+                hostActive(host);
+            }
+        });
+    }
+
+    /**
+     * The safety net of work kept for after a transaction (CONVENTIONS §10) after each callback: the container may
+     * run the connection's next callback on this thread.
+     */
+    private static void ended(String where, Runnable callback) {
+        try {
+            callback.run();
         }
-        boolean renew = registry.markInbound(host.machineId(), out.getId());
-        process(session, out, host, frame);
-        if (renew) {
-            hostActive(host);
+        finally {
+            AfterTransaction.endOfWork(where);
         }
     }
 
@@ -618,11 +638,13 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     protected void handlePongMessage(WebSocketSession session, PongMessage message) {
-        ConnectedHost host = current(session);
-        WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
-        if (host != null && out != null && registry.markInbound(host.machineId(), out.getId())) {
-            hostActive(host);
-        }
+        ended("a runner host's pong", () -> {
+            ConnectedHost host = current(session);
+            WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
+            if (host != null && out != null && registry.markInbound(host.machineId(), out.getId())) {
+                hostActive(host);
+            }
+        });
     }
 
     /** The host talks, so it is alive: its running runs get a fresh lease. */
@@ -644,6 +666,13 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        // A connection the server closes in a transaction's afterCommit (a host revoked or deleted) is closed on that
+        // thread: what the disconnect writes waits for the transaction's end (AfterTransaction), never joining it. Not
+        // the end of a piece of work then, so no safety net here.
+        AfterTransaction.run(() -> closed(session));
+    }
+
+    private void closed(WebSocketSession session) {
         ConnectedHost host = current(session);
         WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
         if (host == null || out == null) {
