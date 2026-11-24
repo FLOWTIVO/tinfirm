@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use tinfirm_bridge::files::{Limits, ReadOne};
+use tinfirm_bridge::files::{Limits, MAX_LEFT_OUT, ReadOne};
 use tinfirm_runner_host::reader::{Reader, verify_tree};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tinfirm-runner-host");
@@ -287,6 +287,61 @@ fn too_many_entries_or_bytes_fail_the_reading() {
         format!("{error:#}").contains("more than 10 bytes"),
         "{error:#}"
     );
+}
+
+/// A home with a package manager's tree of links, whose names alone are more than a reader's
+/// answer may hold: the reader names a few and counts the rest, and its unpacking comes back.
+#[test]
+fn a_home_with_more_links_than_an_answer_holds_comes_back_with_its_links_counted() {
+    const LINKS: usize = 20_000;
+    let scene = Scene::new();
+    let mut entries = vec![
+        entry(b"project", tar::EntryType::Directory, 0, b"", b""),
+        file("project/package.json", b"{}\n"),
+    ];
+    let mut named = 0;
+    for i in 0..LINKS {
+        let name = format!("project/node_modules/.pnpm/node_modules/dependency-{i:05}-of-many");
+        named += name.len();
+        entries.push(entry(
+            name.as_bytes(),
+            tar::EntryType::Symlink,
+            0,
+            b"",
+            b"../../store/dependency",
+        ));
+    }
+    entries.push(file("project/after.txt", b"after the links\n"));
+    // The host kills a reader that answers more than 1 MiB.
+    assert!(named > 1 << 20, "{named}");
+    let done = reader()
+        .unpack(
+            &mut archive(&entries).as_slice(),
+            &scene.dest,
+            &tinfirm_runner_host::sandbox_files::HOME_LIMITS,
+            false,
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(done.files, 2);
+    assert_eq!(done.bytes, 19);
+    assert!(
+        !done.left_out.is_empty() && done.left_out.len() <= MAX_LEFT_OUT,
+        "{}",
+        done.left_out.len()
+    );
+    assert_eq!(done.left_out.len() + done.left_out_more, LINKS);
+    assert!(
+        done.left_out_list()
+            .ends_with(&format!(" and {} more", done.left_out_more)),
+        "{}",
+        done.left_out_list()
+    );
+    assert_eq!(
+        names(&scene.dest),
+        ["project", "project/after.txt", "project/package.json"]
+    );
+    scene.untouched();
 }
 
 /// An input that never ends: zeros after a header that claims a terabyte.
@@ -635,6 +690,16 @@ fn a_reader_that_plants_links_or_lies_about_what_it_wrote_is_refused() {
         (
             format!("cat >/dev/null; echo '{{\"ok\":{{\"kind\":\"unpacked\",\"files\":0,\"bytes\":0,\"left_out\":[\"{}\"]}}}}'", "x".repeat(5000)),
             "longer than",
+        ),
+        (
+            r#"cat >/dev/null; echo '{"ok":{"kind":"unpacked","files":0,"bytes":0,"left_out":["a"],"left_out_more":20}}'"#
+                .to_string(),
+            "more entries than an archive may have",
+        ),
+        (
+            r#"cat >/dev/null; echo '{"ok":{"kind":"unpacked","files":0,"bytes":0,"left_out":[],"left_out_more":18446744073709551615}}'"#
+                .to_string(),
+            "more entries than an archive may have",
         ),
     ] {
         let reader = fake_reader(scripts.path(), &body);

@@ -949,7 +949,11 @@ The reader:
   anything: only directories and regular files with one link each, within the limits, and the counts
   the reader claimed. A link, a hard link, a device or a file over its limit fails the reading and
   empties the directory. For a bundle, the reader must answer the `HEAD` the sandbox named; `run`
-  then puts back the clone's `.git` configuration and reads `HEAD` again.
+  then puts back the clone's `.git` configuration and reads `HEAD` again. Of the entries an
+  unpacking leaves out (links, devices, files over their limit) the reader names at most 100, in
+  at most 2 KiB, and counts the rest, so that its answer stays short: a home with tens of thousands
+  of links (a pnpm, conda or Nix tree) still comes back, and the run's LOG event names those and
+  says `and N more`.
 - **git after the import.** The clone then holds objects a sandbox made, so every git command `run`
   runs on it afterwards (the ahead count, `HEAD`, the credential scan's listings) runs in a reader
   too, read only. A host that takes a run back after a restart reads the run's clone that way from

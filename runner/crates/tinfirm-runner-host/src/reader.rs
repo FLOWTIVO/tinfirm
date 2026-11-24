@@ -65,6 +65,15 @@ const MAX_ANSWER: usize = 1 << 20;
 const MAX_STDERR: usize = 16 * 1024;
 /// The longest name of an entry left out that the host takes from a reader.
 const MAX_NAME: usize = 4096;
+
+// The names a reader gives of what it left out fit the host's bounds, whatever the archive: each
+// is short enough, and all of them are far from the longest answer, with every byte as JSON's
+// longest escape (`\u0000`) and each name's quotes and comma. A reader whose answer passes
+// `MAX_ANSWER` is killed, and what it unpacked is lost with it.
+const _: () = assert!(
+    files::MAX_LEFT_OUT_BYTES <= MAX_NAME
+        && 6 * files::MAX_LEFT_OUT_BYTES + 3 * files::MAX_LEFT_OUT + 1024 <= MAX_ANSWER
+);
 /// The most a reader's file of [`Reader::read_one`] may be: the largest upload.
 const MAX_READ_ONE: u64 = crate::mcp::MAX_UPLOAD_BYTES;
 /// What the reader may hold in memory (`RLIMIT_DATA`) while it unpacks or reads one file.
@@ -189,7 +198,12 @@ enum Done {
     Unpacked {
         files: u64,
         bytes: u64,
+        /// The entries left out that the reader names: a few ([`files::MAX_LEFT_OUT`]), so
+        /// that its answer stays a short line whatever the archive holds.
         left_out: Vec<String>,
+        /// How many more it left out.
+        #[serde(default)]
+        left_out_more: u64,
     },
     /// The file's `size` bytes follow the line, for `file`.
     ReadOne {
@@ -366,8 +380,8 @@ impl Reader {
     }
 
     /// Unpacks the archive `input` (gzipped with `gzip`) into `dest`, which exists and is
-    /// empty: directories and regular files only, within `limits`, entries left out by name
-    /// ([`files::unpack_untrusted`], in a reader). Blocking.
+    /// empty: directories and regular files only, within `limits`, entries left out by name, or
+    /// counted where they are many ([`files::unpack_untrusted`], in a reader). Blocking.
     ///
     /// Whatever the reader answers, what is in `dest` once it is gone is walked again
     /// ([`verify_tree`]). A tree that breaks the rules, or does not match what the reader said
@@ -418,6 +432,7 @@ impl Reader {
                 files,
                 bytes,
                 left_out,
+                left_out_more,
             } = done
             else {
                 bail!("the reader answered an unpacking with something else");
@@ -432,7 +447,9 @@ impl Reader {
                     found.bytes
                 );
             }
-            if left_out.len() > limits.max_files {
+            // Those it names and those it only counts, together.
+            let left_out_more = usize::try_from(left_out_more).unwrap_or(usize::MAX);
+            if left_out.len().saturating_add(left_out_more) > limits.max_files {
                 bail!("the reader left out more entries than an archive may have");
             }
             let mut names = Vec::with_capacity(left_out.len());
@@ -446,6 +463,7 @@ impl Reader {
                 files: found.files,
                 bytes: found.bytes,
                 left_out: names,
+                left_out_more,
             })
         })();
         if check.is_err() {
@@ -1201,6 +1219,7 @@ fn unpack(dest: &Path, gzip: bool, limits: Limits) -> Answer {
             files: unpacked.files as u64,
             bytes: unpacked.bytes,
             left_out: unpacked.left_out,
+            left_out_more: unpacked.left_out_more as u64,
         }),
         Err(e) => Answer::Error(e.to_string()),
     }

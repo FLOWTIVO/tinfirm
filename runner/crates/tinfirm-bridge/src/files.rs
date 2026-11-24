@@ -7,9 +7,10 @@
 //! - On the host's side, an archive of the sandbox's is unpacked by [`unpack_untrusted`]: only
 //!   directories and regular files, at relative paths without `..`, into a directory that is
 //!   new or empty, with caps on the files, the other entries and the bytes. Links and the rest
-//!   are left out, by name. [`read_one`] reads the one regular file of an archive. The runner
-//!   host runs both in a reader process of its own, which holds no credential and is confined
-//!   to that reading's directory (ADR-0112, open question 1), never in its own process.
+//!   are left out: at most [`MAX_LEFT_OUT`] of them by name, the others counted. [`read_one`]
+//!   reads the one regular file of an archive. The runner host runs both in a reader process
+//!   of its own, which holds no credential and is confined to that reading's directory
+//!   (ADR-0112, open question 1), never in its own process.
 
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Read, Write};
@@ -35,13 +36,45 @@ pub struct Limits {
     pub max_file_bytes: u64,
 }
 
+/// The most entries left out that [`unpack_untrusted`] names, and the most bytes their names
+/// take together. The names are for one line of a log, and a home with a package manager's tree
+/// of links (pnpm, conda, Nix) leaves out tens of thousands: the rest are counted.
+pub const MAX_LEFT_OUT: usize = 100;
+pub const MAX_LEFT_OUT_BYTES: usize = 2048;
+
 /// What [`unpack_untrusted`] wrote, and the entries it left out: links, devices, and files
 /// larger than [`Limits::max_file_bytes`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Unpacked {
     pub files: usize,
     pub bytes: u64,
+    /// By name, at most [`MAX_LEFT_OUT`] of them in [`MAX_LEFT_OUT_BYTES`].
     pub left_out: Vec<String>,
+    /// How many more were left out than `left_out` names.
+    pub left_out_more: usize,
+}
+
+impl Unpacked {
+    /// Notes the entry `name` as left out: by name where the list has room for it.
+    fn leave_out(&mut self, name: String) {
+        let room = self.left_out.len() < MAX_LEFT_OUT
+            && self.left_out.iter().map(String::len).sum::<usize>() + name.len()
+                <= MAX_LEFT_OUT_BYTES;
+        if room {
+            self.left_out.push(name);
+        } else {
+            self.left_out_more += 1;
+        }
+    }
+
+    /// The entries left out, for a line of a log: the names, and how many more there were.
+    pub fn left_out_list(&self) -> String {
+        match (self.left_out.is_empty(), self.left_out_more) {
+            (_, 0) => self.left_out.join(", "),
+            (true, more) => format!("{more} entries"),
+            (false, more) => format!("{} and {more} more", self.left_out.join(", ")),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -243,7 +276,7 @@ pub fn unpack_untrusted<R: Read>(
                         return Err(UnpackError::TooManyEntries(limits.max_files));
                     }
                     // The reader skips its bytes on the way to the next entry.
-                    done.left_out.push(name);
+                    done.leave_out(name);
                     continue;
                 }
                 if done.bytes.saturating_add(size) > limits.max_bytes {
@@ -272,7 +305,7 @@ pub fn unpack_untrusted<R: Read>(
                 done.files += 1;
                 done.bytes += copied;
             }
-            _ => done.left_out.push(name),
+            _ => done.leave_out(name),
         }
     }
     Ok(done)
@@ -596,5 +629,68 @@ mod tests {
         let twice = builder.into_inner().unwrap();
         let error = unpack_untrusted(twice.as_slice(), &at("twice"), &limits()).unwrap_err();
         assert!(matches!(error, UnpackError::Clash(_)), "{error}");
+    }
+
+    /// An archive of `names` as symbolic links, then one regular file.
+    fn links(names: impl Iterator<Item = String>) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for name in names {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            builder
+                .append_link(&mut header, name, "../store/package")
+                .unwrap();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "last.txt", &b"last"[..])
+            .unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    /// A home with a package manager's tree of links: a few are named and the rest counted, so
+    /// that what a reader answers of them stays short.
+    #[test]
+    fn of_many_entries_left_out_a_few_are_named_and_the_rest_counted() {
+        let dest = tempfile::tempdir().unwrap();
+        let many = Limits {
+            max_files: 5_000,
+            ..limits()
+        };
+        // More short names than are named.
+        let archive = links((0..5_000).map(|i| format!("l{i}")));
+        let done = unpack_untrusted(archive.as_slice(), &dest.path().join("short"), &many).unwrap();
+        assert_eq!(done.files, 1);
+        assert_eq!(done.left_out.len(), MAX_LEFT_OUT);
+        assert_eq!(done.left_out[0], "l0");
+        assert_eq!(done.left_out_more, 5_000 - MAX_LEFT_OUT);
+        assert!(done.left_out_list().ends_with(", l99 and 4900 more"));
+        // Longer names fill the bytes first.
+        let name = |i: usize| format!("node_modules/.pnpm/node_modules/dependency-{i:04}");
+        let archive = links((0..5_000).map(name));
+        let done = unpack_untrusted(archive.as_slice(), &dest.path().join("long"), &many).unwrap();
+        let named: usize = done.left_out.iter().map(String::len).sum();
+        assert!(named <= MAX_LEFT_OUT_BYTES && named + name(0).len() > MAX_LEFT_OUT_BYTES);
+        assert_eq!(done.left_out.len() + done.left_out_more, 5_000);
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("long/last.txt")).unwrap(),
+            "last"
+        );
+        // A name that alone is longer than the list is counted, and the next one is named.
+        let archive = links(["x".repeat(MAX_LEFT_OUT_BYTES + 1), "short".to_string()].into_iter());
+        let done = unpack_untrusted(archive.as_slice(), &dest.path().join("one"), &many).unwrap();
+        assert_eq!(done.left_out, ["short"]);
+        assert_eq!(done.left_out_list(), "short and 1 more");
+        // Nothing named, and nothing left out.
+        let counted = Unpacked {
+            left_out_more: 3,
+            ..Unpacked::default()
+        };
+        assert_eq!(counted.left_out_list(), "3 entries");
+        assert_eq!(Unpacked::default().left_out_list(), "");
     }
 }

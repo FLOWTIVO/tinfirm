@@ -2548,11 +2548,15 @@ async fn restore_session_bundle(
                     restored.dirs.join(", ")
                 ),
             );
-            if !restored.left_out.is_empty() {
+            if !restored.left_out.is_empty() || restored.left_out_more > 0 {
+                let more = match restored.left_out_more {
+                    0 => String::new(),
+                    more => format!(" and {more} more"),
+                };
                 sink.log(
                     LogLevel::Warn,
                     format!(
-                        "left out of the session bundle (not the runtime's session folders, or not plain files): {}",
+                        "left out of the session bundle (not the runtime's session folders, or not plain files): {}{more}",
                         restored.left_out.join(", ")
                     ),
                 );
@@ -3735,11 +3739,11 @@ async fn collect_from_sandbox(
         sandbox_files::collect_home(files, reader, layout, home_exclude, home_dir, &tag).await;
     collection.part("the session home".to_string(), home.is_ok());
     match home {
-        Ok(home) if !home.left_out.is_empty() => sink.log(
+        Ok(home) if !home.left_out.is_empty() || home.left_out_more > 0 => sink.log(
             LogLevel::Debug,
             format!(
                 "left out of the session home, as links or devices: {}",
-                sink.redact(&home.left_out.join(", "))
+                sink.redact(&home.left_out_list())
             ),
         ),
         Ok(_) => {}
@@ -3758,12 +3762,12 @@ async fn collect_from_sandbox(
             output.is_ok(),
         );
         match output {
-            Ok(output) if !output.left_out.is_empty() => sink.log(
+            Ok(output) if !output.left_out.is_empty() || output.left_out_more > 0 => sink.log(
                 LogLevel::Warn,
                 format!(
                     "not saved from {}: {} (a link, a device, or a file larger than {} MiB)",
                     crate::sandbox::OUTPUT,
-                    sink.redact(&output.left_out.join(", ")),
+                    sink.redact(&output.left_out_list()),
                     crate::output::MAX_FILE_BYTES / (1024 * 1024)
                 ),
             ),

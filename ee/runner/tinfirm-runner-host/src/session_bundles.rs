@@ -129,6 +129,8 @@ pub struct Restored {
     pub files: usize,
     /// What it left out: links, devices, and entries outside the runtime's session folders.
     pub left_out: Vec<String>,
+    /// How many more the unpacking left out without naming them ([`files::Unpacked`]).
+    pub left_out_more: usize,
 }
 
 /// Unpacks `bundle` into a directory beside `home`, then puts each of the runtime's session
@@ -180,6 +182,7 @@ fn restore_via(
     let mut restored = Restored {
         files: unpacked.files,
         left_out: unpacked.left_out,
+        left_out_more: unpacked.left_out_more,
         ..Restored::default()
     };
     // Entries outside the runtime's session folders, or in what stays out of them, are dropped.
