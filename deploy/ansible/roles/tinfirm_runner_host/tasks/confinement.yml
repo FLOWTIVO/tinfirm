@@ -7,7 +7,9 @@
 # runner host's user: `doctor` probes both as `run` does at its start, so a kernel with Landlock
 # backported passes and one with Landlock turned off does not. `doctor` also checks Docker, the
 # images and the login, which are not this file's business: only its lines about the reader and
-# the fronts count here, and its exit status does not.
+# the fronts count here, and its exit status does not. A `doctor` that says nothing about them
+# has not answered: the play stops then too, unless the binary is one from before the reader
+# and the fronts, which has nothing to confine.
 - name: Ask the runner host whether it can confine the reader and the fronts
   ansible.builtin.command:
     argv: >-
@@ -19,6 +21,19 @@
   register: _tinfirm_runner_host_doctor
   changed_when: false
   failed_when: false
+
+- name: Check that the runner host answered
+  ansible.builtin.assert:
+    that:
+      - (_tinfirm_runner_host_confinement_answered | bool) or (_tinfirm_runner_host_confinement_older | bool)
+    fail_msg: >-
+      `{{ tinfirm_runner_host_binary_path }} doctor --sandbox-bridge` did not say whether this
+      machine can confine what the host reads from sandboxes: exit status
+      {{ _tinfirm_runner_host_doctor.rc | default('none') }},
+      {{ (_tinfirm_runner_host_doctor.stderr_lines | default([]) | last | default(_tinfirm_runner_host_doctor.msg | default('no output'), true)) }}.
+      The service was neither started nor reloaded. Run that command as {{ tinfirm_runner_host_user }}
+      on the machine to see why.
+    quiet: true
 
 - name: Check that the runner host can confine the reader and the fronts
   ansible.builtin.assert:

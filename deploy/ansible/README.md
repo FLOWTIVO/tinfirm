@@ -665,7 +665,7 @@ python3 -I deploy/ansible/tests/check-rendered.py /tmp/rendered
 `check-rendered.py` checks `helper.json` and `listener.json` field by field against the agent's
 README, `node-driver.json` against the runner host's, the rendered firewall against the units' own
 file with the same values, the control host's command line, the opt-out of the reader's
-confinement in both units and what the play takes of `doctor`'s answer, the units' order and copies, the
+confinement in both units and what the play takes of `doctor`'s answer (also of none), the units' order and copies, the
 firewall with `nft -c -f` where `nft` may check a ruleset, and the hardening's files: all switches
 on, with the VMMs' profile in enforce mode, each off in turn (its lines alone gone), the master
 switch off (none), the profile in complain mode (every line but `vmm-mac`), and a node below every

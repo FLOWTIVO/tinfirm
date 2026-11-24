@@ -116,6 +116,18 @@ _tinfirm_runner_host_images_build_argv: >-
 _tinfirm_runner_host_unconfined: >-
   {{ _tinfirm_runner_host_doctor.stdout_lines | default([])
      | select('match', '^[[]FAIL[]] (reader|front)') | list }}
+# Whether that `doctor` answered the question at all: it says one line about the reader and one
+# about the fronts, whatever it finds. A binary that could not be run, ended early or printed
+# something else has answered nothing, and the play must not take that for a yes.
+_tinfirm_runner_host_confinement_answered: >-
+  {{ (_tinfirm_runner_host_doctor.stdout_lines | default([]) | select('match', '^[[].{4}[]] reader: ') | list | length > 0)
+     and (_tinfirm_runner_host_doctor.stdout_lines | default([]) | select('match', '^[[].{4}[]] front: ') | list | length > 0) }}
+# A runner host from before the reader and the fronts: its `doctor` takes no option, so it ends
+# with clap's status 2 and "unexpected argument". It has nothing to confine and `run` does not
+# refuse to start, so there is nothing to ask it.
+_tinfirm_runner_host_confinement_older: >-
+  {{ (_tinfirm_runner_host_doctor.rc | default(-1) | int) == 2
+     and 'unexpected argument' in (_tinfirm_runner_host_doctor.stderr | default('')) }}
 
 # tinfirm_runner_host_sandbox_bridge_ports as checks.yml takes it: empty, or FROM-TO (or one
 # port) from 1 to 65535 with a port for every run at once, on a Docker host with the sandbox

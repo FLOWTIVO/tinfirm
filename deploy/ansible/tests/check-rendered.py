@@ -359,10 +359,20 @@ def confinement(out):
         check("\nKillMode=mixed\n" in unit(name), f"{name} unit: the stop's SIGTERM goes to `run` alone (KillMode=mixed)")
         check("\n\n\n" not in unit(name), f"{name} unit: no double blank line")
     judged = json.loads((out / "confinement.json").read_text())
-    wanted = {"confined": 0, "reader": 1, "both": 2, "front-wire": 1, "allowed": 0, "other-failures": 0,
-              "no-answer": 0, "not-run": 0}
-    for case, lines in wanted.items():
-        check(judged.get(case) == lines, f"doctor's answer {case}: {lines} line(s) that stop the play")
+    # Per answer of `doctor`: the lines that stop the play, whether it answered about the reader
+    # and the fronts at all, and whether it is a runner host from before both. The play goes on
+    # only when it answered, or is such an older one, and no line stops it.
+    wanted = {"confined": (0, True, False), "reader": (1, True, False), "both": (2, True, False),
+              "front-wire": (1, False, False), "allowed": (0, True, False), "other-failures": (0, False, False),
+              "reader-only": (0, False, False), "no-answer": (0, False, False), "older": (0, False, True),
+              "not-run": (0, False, False)}
+    goes_on = {"confined", "allowed", "older"}
+    for case, (refused, answered, older) in wanted.items():
+        got = judged.get(case, {})
+        check((got.get("refused"), got.get("answered"), got.get("older")) == (refused, answered, older),
+              f"doctor's answer {case}: {refused} line(s) that stop the play, answered {answered}, older {older}")
+        check(((got.get("answered") or got.get("older")) and got.get("refused") == 0) == (case in goes_on),
+              f"doctor's answer {case}: the play {'goes on' if case in goes_on else 'stops'}")
 
 
 def main():

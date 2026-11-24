@@ -252,7 +252,11 @@
     # main.rs (`doctor_reader`, `doctor_front`).
     - name: Judge the answers of doctor about the reader and the fronts
       ansible.builtin.set_fact:
-        _confinement: "{{ _confinement | default({}) | combine({item.case: _tinfirm_runner_host_unconfined | length}) }}"
+        _confinement: >-
+          {{ _confinement | default({}) | combine({item.case: {
+               'refused': _tinfirm_runner_host_unconfined | length,
+               'answered': _tinfirm_runner_host_confinement_answered | bool,
+               'older': _tinfirm_runner_host_confinement_older | bool}}) }}
       loop:
         - case: confined
           lines:
@@ -285,17 +289,35 @@
             - "[FAIL] docker: cannot find a Docker socket; is Docker running?"
             - "[FAIL] git: not found on PATH (the host clones and pushes with git)"
             - "[info] reader: cannot be confined here (only used with --sandbox-bridge or --executor vm)"
+        # It ended before it came to the fronts.
+        - case: reader-only
+          lines:
+            - "[ ok ] reader: confined: Landlock ABI 7"
         - case: no-answer
           lines: []
+          rc: 1
+          stderr: "error: cannot read the configuration"
+        # A runner host from before the reader and the fronts: `doctor` takes no option.
+        - case: older
+          lines: []
+          rc: 2
+          stderr: "error: unexpected argument '--sandbox-bridge' found\n\nUsage: tinfirm-runner-host doctor"
       loop_control:
         label: "{{ item.case }}"
       vars:
         _tinfirm_runner_host_doctor:
           stdout_lines: "{{ item.lines }}"
+          rc: "{{ item.rc | default(1) }}"
+          stderr: "{{ item.stderr | default('error: 2 check(s) failed') }}"
 
+    # The command could not be started at all: no status, no output.
     - name: Judge a doctor that could not be run
       ansible.builtin.set_fact:
-        _confinement: "{{ _confinement | combine({'not-run': _tinfirm_runner_host_unconfined | length}) }}"
+        _confinement: >-
+          {{ _confinement | combine({'not-run': {
+               'refused': _tinfirm_runner_host_unconfined | length,
+               'answered': _tinfirm_runner_host_confinement_answered | bool,
+               'older': _tinfirm_runner_host_confinement_older | bool}}) }}
       vars:
         _tinfirm_runner_host_doctor: {}
 
