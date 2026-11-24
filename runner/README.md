@@ -911,17 +911,26 @@ The reader:
   stdin, stdout and stderr, and no token.
 - **What it cannot do** (Linux 5.19 or later, with Landlock enabled), applied by itself before it
   reads a byte:
-  - Landlock: it reads and writes only its directories (it executes nothing there), reads and
-    executes the system's directories for git, and nothing else: not this host's config or data
-    directory, its token, the take-back records, another run's directories, or `/proc` (so not
-    `/proc/<pid>/mem` of `run`). Where the kernel has them, TCP (Linux 6.7) and signals and
-    abstract sockets outside the reader (Linux 6.12) are refused too;
-  - a seccomp filter: no socket of any kind, no `ptrace` or `process_vm_*`, no namespaces, no
-    mounts, no `io_uring`, no `bpf`, no new session or process group, and it cannot make itself
-    dumpable again. The filter knows these calls by their 64-bit numbers: on x86-64 it also
-    refuses every system call of the x32 ABI, under whose numbers a kernel built with that ABI
-    would take all of them, and a call of a 32-bit ABI ends the process. It also keeps the
-    reader's signals inside its process group on every kernel,
+  - Landlock: it reads and writes only its directories (it executes nothing there), and reads and
+    executes the system's directories for git. Anywhere else it opens no file, lists no directory,
+    executes nothing, and creates, removes, renames or links nothing: not in this host's config or
+    data directory (its token, the take-back records), in another run's directories, or in `/proc`
+    (so not `/proc/<pid>/mem` of `run`). Landlock checks no path's metadata, on any kernel: a
+    reader can still `stat` any path that `run`'s user can reach and read its extended attributes,
+    and change the mode, the times, the extended attributes and the group of that user's files
+    (`chmod`, `utimensat`, `setxattr`, `chown`), this host's among them. So it can lock `run` out
+    of its own files until an operator sets their modes right, or open one to the machine's other
+    users, but it reads and writes the content of none. Where the kernel has them, TCP (Linux 6.7)
+    and signals and abstract sockets outside the reader (Linux 6.12) are refused too;
+  - a seccomp filter: no socket of any kind, no `truncate` of a file by its path (Landlock checks
+    a truncation only from Linux 6.2; a file is still truncated through a descriptor, which needs
+    it opened for writing), no `ptrace` or `process_vm_*`, no namespaces, no mounts, no
+    `io_uring`, no `bpf`, no new session or process group, and it cannot make itself dumpable
+    again. The filter knows these calls by their 64-bit numbers: on x86-64 it also refuses every
+    system call of the x32 ABI, under whose numbers a kernel built with that ABI would take all of
+    them, and a call of a 32-bit ABI ends the process. It leaves `chmod`, `chown`, `utimensat` and
+    `setxattr` alone: git changes modes by path itself, and a filter cannot tell one path from
+    another. It also keeps the reader's signals inside its process group on every kernel,
     before Linux 6.12 too: a signal by pid only to its own group (0 or the group's negative id) or
     itself, or the signal 0 (a check that a process exists) to any; no `pidfd_open` or
     `pidfd_send_signal`, no `F_SETOWN` or `FIOSETOWN` (a `SIGIO` sent for it); and no
@@ -999,7 +1008,11 @@ The front:
 Both:
 
 - **What they do not protect against.** A flaw of the kernel (Landlock, seccomp) from inside a
-  reader or a front; and what `run` still parses itself: the agent's ACP messages (lines of up to
+  reader or a front; the metadata of the files of `run`'s user, which Landlock checks on no kernel
+  and the filter leaves alone (a reader or a front that a flaw took over can set the mode, times,
+  extended attributes and group of this host's files, and so keep `run` from its own files or
+  open one to the machine's other users, though it reads and writes the content of none); and
+  what `run` still parses itself: the agent's ACP messages (lines of up to
   8 MiB), the JSON of the platform tools' calls (1 MiB at most), the fronts' messages (closed,
   bounded types), the readers' answers and the walk of what they wrote, stderr and log text, the
   answers of the code host and of the model's gateway (not the sandbox's input, but a model's text

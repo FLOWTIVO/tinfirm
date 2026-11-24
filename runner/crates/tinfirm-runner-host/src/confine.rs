@@ -10,14 +10,23 @@
 //!   reads its memory;
 //! - restricts itself with Landlock: reading and executing the system's directories (for git),
 //!   reading the directories its job reads, writing only the directories its job writes (and
-//!   never executing there), `/dev/null`, reading `/dev/urandom`; every other path is refused,
-//!   `/proc` included. Where
-//!   the kernel has them, TCP `bind` and `connect` are refused (Landlock 4, Linux 6.7), and so
-//!   are signals to and abstract sockets of processes outside its domain (Landlock 6, Linux
-//!   6.12). Landlock also refuses it `ptrace` of any process outside its domain. This sets
-//!   `no_new_privs`;
+//!   never executing there), `/dev/null`, reading `/dev/urandom`. Of every other path, `/proc`
+//!   included, it is refused what Landlock checks: opening a file, listing a directory,
+//!   executing, and creating, removing, renaming or linking anything; from Landlock 3 (Linux
+//!   6.2) also truncating a file. Landlock checks no path's metadata, in any version: a reader
+//!   can still `stat` any path its user can reach and read its extended attributes, and change
+//!   the mode, the times, the extended attributes and (as far as its user may) the owner or
+//!   group of that user's files, the host's among them (`chmod`, `utimensat`, `setxattr`,
+//!   `chown`). So it can lock the host out of its own files or open one to the machine's other
+//!   users, but it reads and writes the content of none. The filter below does not refuse
+//!   those calls: it cannot tell one path from another, and git changes modes by path itself
+//!   (its lock files). Where the kernel has them, TCP `bind` and `connect` are refused
+//!   (Landlock 4, Linux 6.7), and so are signals to and abstract sockets of processes outside
+//!   its domain (Landlock 6, Linux 6.12). Landlock also refuses it `ptrace` of any process
+//!   outside its domain. This sets `no_new_privs`;
 //! - installs a seccomp filter that refuses, with `EPERM`: creating a socket of any family, so
-//!   no network and no Unix socket, whatever Landlock's version; `ptrace`,
+//!   no network and no Unix socket, whatever Landlock's version; `truncate` by path, which
+//!   Landlock checks only from its version 3 (Linux 6.2); `ptrace`,
 //!   `process_vm_readv`/`writev`, `pidfd_getfd`, `kcmp`; namespaces (`unshare`, `setns`,
 //!   `clone` with a `CLONE_NEW*` flag; `clone3` answers `ENOSYS`, so the C library falls back
 //!   to `clone`); mounts and `chroot`; `io_uring`, whose operations seccomp does not see;
@@ -445,6 +454,11 @@ mod seccomp {
         libc::SYS_fanotify_init,
         libc::SYS_setsid,
         libc::SYS_setpgid,
+        // By path it would empty any file of the reader's user, the host's among them: Landlock
+        // checks a truncation only from its version 3 (Linux 6.2), and Landlock 2 counts as
+        // confined. git and the standard library truncate only a file they have opened
+        // (`ftruncate`), and Landlock checks the opening.
+        libc::SYS_truncate,
     ];
 
     /// `clone` with one of these makes a namespace.
@@ -814,6 +828,15 @@ mod seccomp {
                     assert_eq!(decision(&programs, libc::SYS_clone3), ENOSYS);
                     assert_eq!(decision(&programs, libc::SYS_read), ALLOW);
                 }
+            }
+        }
+
+        #[test]
+        fn a_file_is_truncated_through_a_descriptor_and_never_by_its_path() {
+            for profile in [Profile::Reader, Profile::Front] {
+                let programs = filters(ARCH.unwrap(), 4242, 4242, profile).unwrap();
+                assert_eq!(decision(&programs, libc::SYS_truncate), EPERM);
+                assert_eq!(decision(&programs, libc::SYS_ftruncate), ALLOW);
             }
         }
 
