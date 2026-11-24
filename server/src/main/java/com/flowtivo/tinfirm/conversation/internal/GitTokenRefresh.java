@@ -30,6 +30,12 @@ import com.flowtivo.tinfirm.system.Systems;
  * covers, a repository gone, and a binding whose account is no App installation any more are refused for good
  * ({@code GIT_REVOKED}); a kill switch that holds is {@code GIT_HELD}; GitHub not answering now is
  * {@code GIT_UNAVAILABLE}.
+ * <p>
+ * GitHub mints for a whole set of repositories or for none of them: one repository that the installation no longer
+ * covers refuses the binding's whole set. A set refused so is asked for again, each repository alone, so that only
+ * a repository GitHub still refuses is refused for good (a revocation never means more than the server checked,
+ * decision 1). Each of the others then has a token of its own until its next renewal, which is one token per
+ * repository where decision 8 has one per access.
  */
 @Component
 class GitTokenRefresh {
@@ -86,8 +92,14 @@ class GitTokenRefresh {
             }
             ConversationBindings.BindingUse use = bindings.use(companyId, group.getKey(), "run:" + run.runId(),
                     new ConversationBindings.GitScope(scope));
+            // GitHub refused the whole set for a repository it does not cover, and does not say which: each alone.
+            boolean alone = use instanceof ConversationBindings.BindingUse.NotCovered && scope.size() > 1;
             for (ConversationBindings.GitRepository repository : scope) {
                 UUID componentId = repository.repositoryId();
+                if (alone && aboutItsRepositories(use)) {
+                    use = bindings.use(companyId, group.getKey(), "run:" + run.runId(),
+                            new ConversationBindings.GitScope(List.of(repository)));
+                }
                 switch (use) {
                     case ConversationBindings.BindingUse.AppTokens app -> {
                         Accounts.RunGitToken.Minted token = app.tokens().get(componentId);
@@ -120,6 +132,16 @@ class GitTokenRefresh {
             }
         }
         return new RunRequests.GitTokenAnswer(tokens, refused);
+    }
+
+    /**
+     * Whether the answer is about the repositories it was asked for (their tokens, or one the installation does not
+     * cover). Any other is about the binding or about GitHub now (a kill switch, a binding that waits or is gone,
+     * GitHub not answering), and holds for the binding's other repositories without asking again.
+     */
+    private static boolean aboutItsRepositories(ConversationBindings.BindingUse use) {
+        return use instanceof ConversationBindings.BindingUse.AppTokens
+                || use instanceof ConversationBindings.BindingUse.NotCovered;
     }
 
     private static RunRequests.Refusal revoked(String reason, String why) {

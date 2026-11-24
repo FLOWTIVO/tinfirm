@@ -2,6 +2,7 @@ package com.flowtivo.tinfirm.support;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.matching;
+import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
@@ -152,6 +153,19 @@ public final class GitHubAppStub {
     public StubMapping refusesMint(long installationId) {
         return GitHubStub.server().stubFor(post(urlEqualTo(path + "/app/installations/" + installationId
                 + "/access_tokens"))
+            .willReturn(GitHubStub.json(422, Map.of("message", "There is at least one repository that does not "
+                    + "exist or is not accessible to the parent installation."))));
+    }
+
+    /**
+     * {@code POST …/access_tokens} answers 422 for every set of repositories that names this one, as GitHub does once
+     * the installation no longer covers it; a set without it is answered as before, whatever is stubbed after this.
+     */
+    public StubMapping refusesMintOf(long installationId, String repository) {
+        return GitHubStub.server().stubFor(post(urlEqualTo(path + "/app/installations/" + installationId
+                + "/access_tokens"))
+            .atPriority(1)
+            .withRequestBody(matchingJsonPath("$.repositories[?(@ == '" + repository + "')]"))
             .willReturn(GitHubStub.json(422, Map.of("message", "There is at least one repository that does not "
                     + "exist or is not accessible to the parent installation."))));
     }

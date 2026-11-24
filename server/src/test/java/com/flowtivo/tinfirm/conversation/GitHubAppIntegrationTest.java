@@ -15,6 +15,7 @@ import com.flowtivo.tinfirm.support.ApiResponse;
 import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.GitHubAppStub;
 import com.flowtivo.tinfirm.support.GitHubStub;
+import com.flowtivo.tinfirm.support.TestSettings;
 
 import tools.jackson.databind.JsonNode;
 
@@ -25,7 +26,8 @@ import tools.jackson.databind.JsonNode;
  * own, minted for its repository with {@code contents} and {@code pull_requests} only, with its expiry and the
  * credential's mirror key, on a host that renews tokens; the host renews it with {@code GIT_TOKEN}; a credential
  * disabled refuses the renewal for good; a host that cannot renew never gets the run ({@code NO_HOST_FOR_APP_TOKENS});
- * a repository the installation does not cover ends the turn with a message that names it. TEST FIXTURE ONLY: keys
+ * a repository the installation does not cover ends the turn with a message that names it, and one it no longer
+ * covers at a renewal is revoked alone, while the binding's other repositories are renewed. TEST FIXTURE ONLY: keys
  * and tokens are test values.
  */
 class GitHubAppIntegrationTest extends ConversationTestBench {
@@ -308,5 +310,104 @@ class GitHubAppIntegrationTest extends ConversationTestBench {
             assertThat(app.mintBodies(41)).isEmpty();
         }
         assertThat(GitHubStub.url()).isNotBlank();
+    }
+
+    /** The repositories each mint of a run's token named so far, by name. */
+    private static List<List<String>> runMints(GitHubAppStub app, long installationId) {
+        return app.mintBodies(installationId).stream()
+            .filter(mint -> mint.hasNonNull("repositories"))
+            .map(mint -> mint.get("repositories").valueStream().map(JsonNode::asString).sorted().toList())
+            .toList();
+    }
+
+    /**
+     * GitHub refuses a mint for a whole set when the installation does not cover one of its repositories, and does
+     * not say which. A renewal then asks for each repository alone: only the one GitHub still refuses is revoked, and
+     * the other of the same binding gets its new token and is renewed again later.
+     */
+    @Test
+    void aRenewalRevokesOnlyTheRepositoryTheInstallationNoLongerCovers() {
+        Bench bench = bench(true);
+        GitHubAppStub app = GitHubAppStub.create(919191);
+        UUID[] git = gitHub(bench, app, "https://localhost/acme/shop");
+        ApiResponse second = bench.owner().post(bench.path("/systems/" + git[0] + "/repositories"),
+                Map.of("url", "https://localhost/acme/web"));
+        assertThat(second.status()).as("%s", second).isEqualTo(201);
+        String shop = git[1].toString();
+        String web = second.json().get("id").asString();
+        appCredential(bench, app, git[0], 51, "WRITE");
+        app.mints(51, "test-ghs-run-first");
+        // One agent with both repositories of the system, writable: one binding, one access, so one token for both.
+        ApiResponse agent = bench.member().post(bench.path("/agents"), Map.of("name", unique("Builder"), "runtimes",
+                List.of("CLAUDE_CODE", "CODEX"), "instructions", "", "systems", List.of(Map.of("systemId",
+                        git[0].toString(), "tools", List.of())), "repositories", List.of(Map.of("repositoryId", shop,
+                                "access", "WRITE"), Map.of("repositoryId", web, "access", "WRITE")),
+                "shareGroupIds", List.of()));
+        assertThat(agent.status()).as("%s", agent).isEqualTo(201);
+        UUID agentId = UUID.fromString(agent.json().get("id").asString());
+        TestSettings.nameModel(bench.id(), agentId, bench.memberPrincipal());
+        try (FakeRunner runner = host(bench, RENEWS)) {
+            start(bench.member(), bench, agentId, "Fix the cart");
+            JsonNode assign = runner.expect("run.assign");
+            assertThat(assign.get("workspaces")).hasSize(2).allSatisfy(workspace -> assertThat(workspace.get("git")
+                .get("token").asString()).isEqualTo("test-ghs-run-first"));
+            assertThat(runMints(app, 51)).containsExactly(List.of("shop", "web"));
+            String runId = assign.get("runId").asString();
+            long epoch = assign.get("epoch").asLong();
+            runner.accepted(UUID.fromString(runId), epoch);
+            await().atMost(WAIT).until(() -> "RUNNING".equals(bench.member().get(bench.path("/runs/" + runId))
+                .json().get("status").asString()));
+
+            // An admin of acme takes acme/web out of the installation: GitHub refuses every set that names it.
+            app.mints(51, "test-ghs-run-second");
+            app.refusesMintOf(51, "web");
+            JsonNode renewed = runner.requestAndAck(UUID.fromString(runId), epoch, "GIT_TOKEN",
+                    Map.of("componentIds", List.of(shop, web)));
+            assertThat(renewed.get("status").asString()).as("%s", renewed).isEqualTo("DONE");
+            assertThat(renewed.get("payload").get("git")).singleElement().satisfies(token -> {
+                assertThat(token.get("componentId").asString()).isEqualTo(shop);
+                assertThat(token.get("token").asString()).isEqualTo("test-ghs-run-second");
+            });
+            assertThat(renewed.get("payload").get("refused")).singleElement().satisfies(refusal -> {
+                assertThat(refusal.get("componentId").asString()).isEqualTo(web);
+                assertThat(refusal.get("code").asString()).isEqualTo("GIT_REVOKED");
+                assertThat(refusal.get("message").asString()).contains("does not cover web").doesNotContain("shop");
+            });
+            // The set as at the assignment, refused; then each repository alone.
+            assertThat(runMints(app, 51)).containsExactlyInAnyOrder(List.of("shop", "web"), List.of("shop", "web"),
+                    List.of("shop"), List.of("web"));
+
+            // Only acme/web is revoked: one frame, one audit event, and the run's page says so on that repository.
+            JsonNode revoke = runner.expect("run.git.revoke");
+            assertThat(revoke.get("componentIds")).singleElement()
+                .satisfies(id -> assertThat(id.asString()).isEqualTo(web));
+            assertThat(revoke.get("reason").asString()).isEqualTo("REFRESH_REFUSED");
+            runner.expectNone("run.git.revoke", Duration.ofMillis(500));
+            assertThat(auditEvents(bench.owner(), bench.company(), "run.git_revoked").stream()
+                .filter(event -> runId.equals(event.get("targetId").asString()))).singleElement()
+                .satisfies(event -> assertThat(event.get("details").get("componentIds")).singleElement()
+                    .satisfies(id -> assertThat(id.asString()).isEqualTo(web)));
+            for (JsonNode repository : bench.member().get(bench.path("/runs/" + runId)).json().get("repositories")) {
+                boolean revoked = repository.hasNonNull("gitRevoked");
+                assertThat(revoked).as("%s", repository).isEqualTo(web.equals(repository.get("repositoryId")
+                    .asString()));
+            }
+
+            // acme/shop is renewed as before, with the one mint of its set; acme/web stays revoked for this run.
+            app.mints(51, "test-ghs-run-third");
+            JsonNode again = runner.requestAndAck(UUID.fromString(runId), epoch, "GIT_TOKEN",
+                    Map.of("componentIds", List.of(shop, web)));
+            assertThat(again.get("status").asString()).as("%s", again).isEqualTo("DONE");
+            assertThat(again.get("payload").get("git")).singleElement().satisfies(token -> {
+                assertThat(token.get("componentId").asString()).isEqualTo(shop);
+                assertThat(token.get("token").asString()).isEqualTo("test-ghs-run-third");
+            });
+            assertThat(again.get("payload").get("refused")).singleElement().satisfies(refusal -> {
+                assertThat(refusal.get("componentId").asString()).isEqualTo(web);
+                assertThat(refusal.get("code").asString()).isEqualTo("GIT_REVOKED");
+            });
+            assertThat(runMints(app, 51)).hasSize(5);
+            runner.assertFramesValid();
+        }
     }
 }
