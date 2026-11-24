@@ -107,6 +107,16 @@ _tinfirm_runner_host_images_build_argv: >-
      + (tinfirm_runner_host_images_build_args.items() | map('join', '=')
         | map('regex_replace', '^', '--build-arg=') | list) }}
 
+# The lines of the installed binary's `doctor` that say this machine cannot confine the reader of
+# what sandboxes send back, or the front process of a sandbox, as confinement.yml takes them
+# (main.rs, `doctor_reader` and `doctor_front`): the lines `doctor` marks as failed and that
+# are about the reader or a front. `run` refuses to start for each of them. `doctor`'s other
+# failures (Docker, the images, the login) are not among them, nor is a line it only warns of,
+# as with `--allow-unconfined-reader`.
+_tinfirm_runner_host_unconfined: >-
+  {{ _tinfirm_runner_host_doctor.stdout_lines | default([])
+     | select('match', '^[[]FAIL[]] (reader|front)') | list }}
+
 # tinfirm_runner_host_sandbox_bridge_ports as checks.yml takes it: empty, or FROM-TO (or one
 # port) from 1 to 65535 with a port for every run at once, on a Docker host with the sandbox
 # bridge (`run --sandbox-bridge-ports`, as bridge.rs `parse_port_range` reads it).

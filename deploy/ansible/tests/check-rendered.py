@@ -342,6 +342,27 @@ def nft_check(path):
         return
 
 
+def confinement(out):
+    """The opt-out of the reader's and the fronts' confinement in the units (`run
+    --allow-unconfined-reader`), and what confinement.yml takes of `doctor`'s answer."""
+    unit = lambda name: unit_lines((out / f"tinfirm-runner-host.{name}.service").read_text())
+    start = lambda name: next(line for line in unit(name).splitlines() if line.startswith("ExecStart="))
+    for name in ("docker", "vm"):
+        check("--allow-unconfined-reader" not in unit(name), f"{name} unit: no --allow-unconfined-reader by default")
+    check("--sandbox-bridge --allow-unconfined-reader" in start("docker-unconfined"),
+          "docker unit with the opt-out: --allow-unconfined-reader, after --sandbox-bridge")
+    check("--allow-unconfined-reader" not in unit("docker-nobridge-unconfined"),
+          "docker unit without the bridge: no --allow-unconfined-reader (no reader, no front)")
+    check("--allow-unconfined-reader" in start("vm-unconfined"), "control host unit with the opt-out: --allow-unconfined-reader")
+    for name in ("docker-unconfined", "vm-unconfined"):
+        check("\n\n\n" not in unit(name), f"{name} unit: no double blank line")
+    judged = json.loads((out / "confinement.json").read_text())
+    wanted = {"confined": 0, "reader": 1, "both": 2, "front-wire": 1, "allowed": 0, "other-failures": 0,
+              "no-answer": 0, "not-run": 0}
+    for case, lines in wanted.items():
+        check(judged.get(case) == lines, f"doctor's answer {case}: {lines} line(s) that stop the play")
+
+
 def main():
     out = Path(sys.argv[1])
     h = json.loads((out / "helper.json").read_text())
@@ -369,6 +390,7 @@ def main():
     check("\n[Service]\nIPAddressAllow=10.0.0.5\n" in dropin, "listener's drop-in: IPAddressAllow the control host")
     units((out / "tinfirm-runner-host.docker.service").read_text(), (out / "tinfirm-runner-host.vm.service").read_text())
     bridge_ports(out)
+    confinement(out)
     for name in ("firewall.nft", "firewall-one-vm-static.nft"):
         nft_check(out / name)
     print(f"\n{len(failures)} failed" if failures else "\nall passed")

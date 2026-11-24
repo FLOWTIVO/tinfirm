@@ -149,6 +149,17 @@ tinfirm_runner_host_sandbox_bridge: true
 # tinfirm_runner_host_max_concurrent_runs ports, since a run that finds no free port fails.
 # Empty: the system picks each port from its range for local ports (net.ipv4.ip_local_port_range).
 tinfirm_runner_host_sandbox_bridge_ports: ""
+# With the sandbox bridge, and on a control host, `run` refuses to start on a machine that
+# cannot confine the reader of what sandboxes send back and the front process of each sandbox:
+# that takes Landlock at ABI 2 (Linux 5.19 or later, enabled at boot) and seccomp. Ubuntu 22.04
+# on its first kernel (5.15) and Debian 11 do not have it. The role asks the installed binary
+# (`doctor`) before it starts or reloads the service, and stops with the reason. true starts
+# such a host anyway (`run --allow-unconfined-reader`) and gives that confinement up: a flaw in
+# the reading of a sandbox's archive, git bundle, bridge or HTTP then reaches every file of the
+# host's user, the host's token and stored credentials among them (runner/README.md, "The
+# reader"). Prefer a newer kernel; on a Docker host, tinfirm_runner_host_sandbox_bridge false
+# is the other way out, at the cost named above.
+tinfirm_runner_host_allow_unconfined_reader: false
 # A static Linux build of the runner host for the sandboxes (TINFIRM_RUNNER_BRIDGE_BINARY).
 # Empty: the installed binary itself.
 tinfirm_runner_host_bridge_binary: ""

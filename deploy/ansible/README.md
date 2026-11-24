@@ -33,7 +33,10 @@ The role:
 4. creates the runner host's user (uid 1990, not the sandbox's 1000), installs the
    `tinfirm-runner-host` binary (a release archive only against its line of the release's
    `SHA256SUMS`, trusted once `SHA256SUMS.sig` verifies against the public key the role ships),
-   and logs in to the server with the host token;
+   and logs in to the server with the host token. With the sandbox bridge it then asks the
+   installed binary (`doctor`) whether this machine can confine what the host reads from
+   sandboxes, and stops with the reason where it cannot: `run` would refuse to start there, and
+   the unit would only be started again and again;
 5. builds the runner images with `images build` and the build arguments of your mirrors;
 6. installs the systemd unit `tinfirm-runner-host` with
    `run --sandbox-runtime kata --sandbox-docker --egress-proxy --sandbox-bridge` and the
@@ -62,6 +65,7 @@ installs.
 |---|---|
 | Control node | ansible-core 2.15 or newer (the role uses only `ansible.builtin`) |
 | Target VM | Ubuntu 22.04 or 24.04, Debian 12 or 13, or RHEL, Rocky or AlmaLinux 9 or 10; systemd; sudo for the Ansible user |
+| Target VM | With the sandbox bridge (the default): Linux 5.19 or later with Landlock enabled at boot, so that the host can confine what it reads from sandboxes (runner/README.md, "The reader"). The first kernel of Ubuntu 22.04 (5.15) is too old: use a newer one (its HWE kernel), or see `tinfirm_runner_host_allow_unconfined_reader` below. The role asks the installed binary and stops where the machine cannot |
 | Target VM | Nested virtualisation: `/dev/kvm` exists in the VM. Enable it in the hypervisor (VMware: "Expose hardware assisted virtualization to the guest OS"; Proxmox and KVM: CPU type `host`; Hyper-V: `Set-VMProcessor -ExposeVirtualizationExtensions $true`) |
 | Network | The Tinfirm server's URL, Docker's repository, the Kata release, and the mirrors below, or their mirrors |
 
@@ -120,6 +124,7 @@ The main ones:
 | `tinfirm_runner_host_egress_allow` | `[]` | `run --egress-allow`, one per entry |
 | `tinfirm_runner_host_sandbox_bridge` | `true` | `run --sandbox-bridge` (ADR-0095): the host's listeners on loopback, the run's credentials out of the container's settings. Needs a static build of the runner host (the release archives are), else `tinfirm_runner_host_bridge_binary`. `false` puts the listeners on Docker's bridge (R28) |
 | `tinfirm_runner_host_sandbox_bridge_ports` | empty | `run --sandbox-bridge-ports FROM-TO`, with the sandbox bridge only: the ports from which each sandbox's bridge listener takes one, on the sandbox network's gateway address, for a host firewall (below). At least `tinfirm_runner_host_max_concurrent_runs` ports: a run that finds none free fails. Empty: the system picks each port from `net.ipv4.ip_local_port_range` |
+| `tinfirm_runner_host_allow_unconfined_reader` | `false` | `run --allow-unconfined-reader`, with the sandbox bridge and on a control host: starts the host on a machine that cannot confine the reader of what sandboxes send back and each sandbox's front process (before Linux 5.19, or Landlock off at boot), where `run` otherwise refuses to start and the play stops. It gives that confinement up: a flaw in the reading of a sandbox's archive, git bundle, bridge or HTTP then reaches every file of the host's user, its token and stored credentials among them. Prefer a newer kernel |
 | `tinfirm_runner_host_public_key` | `cosign.pub` (the role's `files/`) | The key the release's `SHA256SUMS.sig` must verify against before any checksum in `SHA256SUMS` is trusted (with `openssl`, as auto-deploy does): FLOWTIVO's release key, a copy of `deploy/compose/auto-deploy/cosign.pub`. For `rolling`, the rolling key `deploy/compose/auto-deploy/cosign-rolling.pub` |
 | `tinfirm_runner_host_release_url` | the archive's directory | Where the release's `SHA256SUMS` and `SHA256SUMS.sig` are |
 | `tinfirm_runner_host_allow_unsigned` | `false` | `true` installs a release whose `SHA256SUMS.sig` is missing (404) against `tinfirm_runner_host_binary_checksum`, with a warning; a signature that does not verify is refused even then |
@@ -285,7 +290,10 @@ The role `tinfirm_runner_host` with `tinfirm_runner_host_executor: vm`, which th
 
 The control host still runs the reader of what a sandbox sends back in a confined process, which
 needs Linux 5.19 or later with Landlock enabled at boot (runner/README.md, "The reader"); `run`
-refuses to start without it.
+refuses to start without it. The play asks the installed binary (`doctor`) right after it
+installed it, and stops with the reason on a machine that cannot;
+`tinfirm_runner_host_allow_unconfined_reader` starts the host there anyway and gives that
+confinement up.
 
 ### What `sandbox-node.yml` does
 
@@ -654,7 +662,8 @@ python3 -I deploy/ansible/tests/check-rendered.py /tmp/rendered
 
 `check-rendered.py` checks `helper.json` and `listener.json` field by field against the agent's
 README, `node-driver.json` against the runner host's, the rendered firewall against the units' own
-file with the same values, the control host's command line, the units' order and copies, the
+file with the same values, the control host's command line, the opt-out of the reader's
+confinement in both units and what the play takes of `doctor`'s answer, the units' order and copies, the
 firewall with `nft -c -f` where `nft` may check a ruleset, and the hardening's files: all switches
 on, with the VMMs' profile in enforce mode, each off in turn (its lines alone gone), the master
 switch off (none), the profile in complain mode (every line but `vmm-mac`), and a node below every

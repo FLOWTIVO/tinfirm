@@ -1,0 +1,37 @@
+---
+# Before the service is started or reloaded: `run` with the sandbox bridge, and on a control
+# host, refuses to start on a machine that cannot confine the reader of what sandboxes send back
+# and the front process of each sandbox (Landlock at ABI 2, so Linux 5.19 or later with Landlock
+# enabled at boot, and seccomp). Without this check the play would end well and leave a unit
+# that systemd starts again every few seconds. The installed binary is asked itself, as the
+# runner host's user: `doctor` probes both as `run` does at its start, so a kernel with Landlock
+# backported passes and one with Landlock turned off does not. `doctor` also checks Docker, the
+# images and the login, which are not this file's business: only its lines about the reader and
+# the fronts count here, and its exit status does not.
+- name: Ask the runner host whether it can confine the reader and the fronts
+  ansible.builtin.command:
+    argv: >-
+      {{ [tinfirm_runner_host_binary_path, 'doctor', '--sandbox-bridge']
+         + (['--allow-unconfined-reader'] if tinfirm_runner_host_allow_unconfined_reader | bool else []) }}
+  become: true
+  become_user: "{{ tinfirm_runner_host_user }}"
+  environment: "{{ _tinfirm_runner_host_env }}"
+  register: _tinfirm_runner_host_doctor
+  changed_when: false
+  failed_when: false
+
+- name: Check that the runner host can confine the reader and the fronts
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_runner_host_unconfined | length == 0
+    fail_msg: >-
+      {{ tinfirm_runner_host_binary_path }} cannot confine what it reads from sandboxes on this
+      machine, and `run` refuses to start so{{ ' on a control host' if _tinfirm_runner_host_vm | bool
+      else ' with the sandbox bridge' }}: {{ _tinfirm_runner_host_unconfined | join(' ') }}
+      The service was neither started nor reloaded. Run this host on Linux 5.19 or later with
+      Landlock enabled at boot (`landlock` is then among the names in /sys/kernel/security/lsm),
+      or set tinfirm_runner_host_allow_unconfined_reader to true, which gives that confinement
+      up{{ '' if _tinfirm_runner_host_vm | bool
+      else ', or tinfirm_runner_host_sandbox_bridge to false, which gives the bridge up' }}
+      (defaults/main.yml says what each costs).
+    quiet: true

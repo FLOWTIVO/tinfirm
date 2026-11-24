@@ -121,7 +121,7 @@ Settings that are not options of the unit's command go in its environment (`Envi
 
 **A company host is a tier-0 asset.** It receives the git token and the prompt of every conversation it runs, so harden it like the server. The Ansible role does by default, and a unit you write yourself should too:
 
-- `--egress-proxy` and `--sandbox-bridge` on the command line: the sandboxes reach only what the egress proxy allows, and the host's listeners only through each sandbox's own bridge;
+- `--egress-proxy` and `--sandbox-bridge` on the command line: the sandboxes reach only what the egress proxy allows, and the host's listeners only through each sandbox's own bridge. With the bridge the host reads what a sandbox sends in confined processes, which takes Linux 5.19 or later with Landlock enabled at boot: `run` refuses to start on a machine without it. `tinfirm-runner-host doctor --sandbox-bridge` says beforehand whether the machine has it (its lines `reader` and `front`), and the role asks it before it starts the service; the first kernel of Ubuntu 22.04 (5.15) is too old;
 - the service sandboxed by systemd: `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, and `ReadWritePaths=` the host's config and data directories (outside `/home`);
 - a service user whose uid is not 1000, the sandbox's, when the bridge is on;
 - every download checked: the release's `SHA256SUMS` against its signature `SHA256SUMS.sig` and FLOWTIVO's public key (`tinfirm_runner_host_public_key`, the key shipped with the role; `tinfirm_runner_host_allow_unsigned` admits a release without a signature), then the archive against `SHA256SUMS`, Kata's tarball against its SHA-256, Docker's repository key by its fingerprint.

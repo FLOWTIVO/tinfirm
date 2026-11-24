@@ -232,6 +232,79 @@
       vars:
         tinfirm_runner_host_executor: vm
 
+    - name: Render the runner host's unit for a host that may run without the confinement
+      ansible.builtin.template:
+        src: "{{ _host }}/templates/tinfirm-runner-host.service.j2"
+        dest: "{{ render_dir }}/tinfirm-runner-host.{{ item.name }}.service"
+        mode: "0644"
+      loop:
+        - {name: docker-unconfined, executor: docker, bridge: true}
+        - {name: docker-nobridge-unconfined, executor: docker, bridge: false}
+        - {name: vm-unconfined, executor: vm, bridge: true}
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        tinfirm_runner_host_executor: "{{ item.executor }}"
+        tinfirm_runner_host_sandbox_bridge: "{{ item.bridge }}"
+        tinfirm_runner_host_allow_unconfined_reader: true
+
+    # What confinement.yml takes of the installed binary's `doctor`, for answers in the words of
+    # main.rs (`doctor_reader`, `doctor_front`).
+    - name: Judge the answers of doctor about the reader and the fronts
+      ansible.builtin.set_fact:
+        _confinement: "{{ _confinement | default({}) | combine({item.case: _tinfirm_runner_host_unconfined | length}) }}"
+      loop:
+        - case: confined
+          lines:
+            - "[ ok ] reader: confined: Landlock ABI 7 (files, TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable"
+            - "[ ok ] front wire: ready, a round trip, a descriptor passed"
+            - "[ ok ] front: confined: Landlock ABI 7 (files, TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable"
+            - "[FAIL] docker: cannot find a Docker socket; is Docker running?"
+            - "[FAIL] server: not logged in"
+        - case: reader
+          lines:
+            - "[FAIL] reader: cannot be confined here: no Landlock 2 (Linux 5.19) here, seccomp filter, no_new_privs, not dumpable"
+            - "[ ok ] front wire: ready, a round trip, a descriptor passed"
+            - "[ ok ] front: confined: Landlock ABI 7"
+        - case: both
+          lines:
+            - "[FAIL] reader: cannot be confined here: no Landlock 2 (Linux 5.19) here"
+            - "[ ok ] front wire: ready, a round trip, a descriptor passed"
+            - "[FAIL] front: cannot be confined here: no Landlock 2 (Linux 5.19) here"
+        - case: front-wire
+          lines:
+            - "[ ok ] reader: confined: Landlock ABI 7"
+            - "[FAIL] front wire: the front did not answer"
+        - case: allowed
+          lines:
+            - "[warn] reader: cannot be confined here: no Landlock 2 (Linux 5.19) here. --allow-unconfined-reader accepts this"
+            - "[ ok ] front wire: ready, a round trip, a descriptor passed"
+            - "[warn] front: cannot be confined here: no Landlock 2 (Linux 5.19) here. --allow-unconfined-reader accepts this"
+        - case: other-failures
+          lines:
+            - "[FAIL] docker: cannot find a Docker socket; is Docker running?"
+            - "[FAIL] git: not found on PATH (the host clones and pushes with git)"
+            - "[info] reader: cannot be confined here (only used with --sandbox-bridge or --executor vm)"
+        - case: no-answer
+          lines: []
+      loop_control:
+        label: "{{ item.case }}"
+      vars:
+        _tinfirm_runner_host_doctor:
+          stdout_lines: "{{ item.lines }}"
+
+    - name: Judge a doctor that could not be run
+      ansible.builtin.set_fact:
+        _confinement: "{{ _confinement | combine({'not-run': _tinfirm_runner_host_unconfined | length}) }}"
+      vars:
+        _tinfirm_runner_host_doctor: {}
+
+    - name: Write what confinement.yml takes
+      ansible.builtin.copy:
+        content: "{{ _confinement | to_nice_json }}\n"
+        dest: "{{ render_dir }}/confinement.json"
+        mode: "0644"
+
     - name: Show the derived values the tasks use
       ansible.builtin.copy:
         content: "{{ _derived | to_nice_json }}\n"

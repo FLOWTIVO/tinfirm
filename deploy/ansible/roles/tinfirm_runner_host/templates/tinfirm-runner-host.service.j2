@@ -32,7 +32,8 @@ ExecStart={{ tinfirm_runner_host_binary_path }} run \
     --vm-driver node \
     --vm-template {{ arg(tinfirm_runner_host_vm_template) }} \
     --vm-port {{ tinfirm_runner_host_vm_port | int }}{% for check in tinfirm_runner_host_vm_probe %} \
-    --vm-probe {{ arg(check) }}{% endfor %}{% if tinfirm_runner_host_sandbox_docker | bool %} \
+    --vm-probe {{ arg(check) }}{% endfor %}{% if tinfirm_runner_host_allow_unconfined_reader | bool %} \
+    --allow-unconfined-reader{% endif %}{% if tinfirm_runner_host_sandbox_docker | bool %} \
     --sandbox-docker{% endif %}{% for host in _tinfirm_runner_host_egress_allow %} \
     --egress-allow {{ arg(host) }}{% endfor %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
     --sandbox-env {{ arg(key ~ '=' ~ value) }}{% endfor %}
@@ -45,7 +46,8 @@ ExecStart={{ tinfirm_runner_host_binary_path }} run \
     --egress-proxy{% for host in _tinfirm_runner_host_egress_allow %} \
     --egress-allow {{ arg(host) }}{% endfor %}{% endif %}{% if tinfirm_runner_host_sandbox_bridge | bool %} \
     --sandbox-bridge{% if tinfirm_runner_host_sandbox_bridge_ports | string | trim | length > 0 %} \
-    --sandbox-bridge-ports {{ arg(tinfirm_runner_host_sandbox_bridge_ports | string | trim) }}{% endif %}{% endif %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
+    --sandbox-bridge-ports {{ arg(tinfirm_runner_host_sandbox_bridge_ports | string | trim) }}{% endif %}{% if tinfirm_runner_host_allow_unconfined_reader | bool %} \
+    --allow-unconfined-reader{% endif %}{% endif %}{% for key, value in _tinfirm_runner_host_sandbox_env.items() %} \
     --sandbox-env {{ arg(key ~ '=' ~ value) }}{% endfor %}
 
 {% endif %}

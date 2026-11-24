@@ -27,6 +27,13 @@
 - name: Install and register the runner host
   ansible.builtin.import_tasks: runner.yml
 
+# Right after the binary is there, and before the images are built: a machine that cannot run
+# this host should say so early. A failure here leaves the handlers that reload the service
+# unrun.
+- name: Check that the runner host can confine what it reads from sandboxes
+  ansible.builtin.import_tasks: confinement.yml
+  when: (tinfirm_runner_host_sandbox_bridge | bool) or (_tinfirm_runner_host_vm | bool)
+
 - name: Make the client certificate and write the sandbox nodes' configuration
   ansible.builtin.import_tasks: nodes.yml
   when: _tinfirm_runner_host_vm | bool
