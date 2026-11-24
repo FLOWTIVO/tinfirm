@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -16,6 +17,7 @@ import org.springframework.transaction.event.TransactionalEventListener;
 
 import com.flowtivo.tinfirm.company.CompanyRunsDependents;
 import com.flowtivo.tinfirm.principal.PrincipalEvents;
+import com.flowtivo.tinfirm.principal.PrincipalSwitches;
 import com.flowtivo.tinfirm.run.RunCancellations;
 import com.flowtivo.tinfirm.run.RunGitRevocations;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
@@ -45,8 +47,12 @@ class RunSwitches implements RunCancellations, CompanyRunsDependents {
 
     private final RunPorts ports;
 
+    private final PrincipalSwitches principals;
+
     RunSwitches(RunStore runs, RunLocks locks, TurnStarter starter, RunWorkers workers,
-            SystemTransactions transactions, RunGitRevocations revocations, RunPorts ports) {
+            SystemTransactions transactions, RunGitRevocations revocations, RunPorts ports,
+            PrincipalSwitches principals) {
+        this.principals = principals;
         this.revocations = revocations;
         this.ports = ports;
         this.runs = runs;
@@ -70,19 +76,24 @@ class RunSwitches implements RunCancellations, CompanyRunsDependents {
         active.forEach(run -> conversations.add(run.conversationId()));
         held.forEach(binding -> conversations.addAll(revocations.conversationsOfBinding(companyId, binding)));
         locks.lockConversations(companyId, conversations);
-        held.forEach(binding -> revocations.ofBinding(companyId, binding, BindingSuspended.REASON,
-                BindingSuspended.WHY));
+        String why = BindingSuspended.why(principals.suspendedFor(companyId, principalId).orElse(null));
+        held.forEach(binding -> revocations.ofBinding(companyId, binding, BindingSuspended.REASON, why));
         return cancel(active, PRINCIPAL_SUSPENDED);
     }
 
-    /** The reason and the words of a binding whose holder was suspended, as the conversation module writes them. */
-    private static final class BindingSuspended {
+    /**
+     * The reason and the words of a binding whose holder was suspended, as the conversation module writes them: a
+     * deactivation says so, since it is why the run's commits are not pushed (ADR-0116, decision 2).
+     */
+    static final class BindingSuspended {
 
         static final String REASON = "SUSPENDED";
 
-        static final String WHY = "the account's holder was suspended";
-
         private BindingSuspended() {
+        }
+
+        static String why(PrincipalSwitches.@Nullable Cause cause) {
+            return "the account's holder was suspended" + (cause != null ? cause.because() : "");
         }
     }
 

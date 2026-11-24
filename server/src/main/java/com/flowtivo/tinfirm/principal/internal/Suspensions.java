@@ -268,6 +268,15 @@ class Suspensions implements PrincipalSwitches, MemberStatuses {
             .map(Suspensions::suspension);
     }
 
+    @Override
+    @Transactional(readOnly = true)
+    public Optional<Cause> suspendedFor(UUID companyId, UUID principalId) {
+        return store.suspension(companyId, principalId)
+            .filter(row -> row.status() == PrincipalStatus.SUSPENDED)
+            .map(PrincipalStore.SuspensionRow::cause)
+            .map(Cause::valueOf);
+    }
+
     private Suspension view(UUID companyId, UUID principalId) {
         return suspension(store.suspension(companyId, principalId).orElseThrow());
     }

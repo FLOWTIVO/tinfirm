@@ -179,7 +179,9 @@ class CompanyAccessGuardImpl implements CompanyAccessGuard {
 
     /** A suspended member: a read is 403, a write 409, as the request's method says. */
     private static ApiException suspended() {
-        String detail = "You are suspended in this company: an admin resumes you";
+        // The guard does not read the cause (an admin's, the user's deactivation, the identity provider's), so
+        // it names nobody who lifts it; the kill switches' page, which a suspended member may open, does.
+        String detail = "You are suspended in this company until the suspension is lifted";
         if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attributes) {
             String method = attributes.getRequest().getMethod();
             if ("GET".equals(method) || "HEAD".equals(method)) {

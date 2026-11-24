@@ -11473,9 +11473,11 @@ components:
       type: object
       description: >-
         Why and when Tinfirm revoked a run's git token of one repository (ADR-0116): the conversation's account there
-        failed its check, its system was paused, a trigger's binding followed another credential, or a renewal was
-        refused. A host that took the revocation refuses the agent's next fetch and does not push the repository; the
-        run's failure says so when it had commits to push.
+        failed its check (its holder suspended, deactivated or gone included), its system was paused, a trigger's
+        binding followed another credential, or a renewal was refused. A host that took the revocation refuses the
+        agent's next fetch and does not push the repository: the run's failure says so when it had commits to push,
+        and a run cancelled with the revocation, as a suspension or a deactivation cancels it, keeps its commits
+        counted with `pushed` false beside this revocation.
       required: [reason, message, revokedAt, delivery]
       properties:
         reason:
@@ -11841,7 +11843,7 @@ components:
             The credential the waiting bindings name (ADR-0072), as it is now: a token is stored again, a sign-in
             signed in again, a disabled one enabled; null for a suspended service account's
         bot: { type: boolean, description: "The chat system's bot: it is fixed with the bot, on the system's page" }
-        holderPrincipalId: { type: string, format: uuid, nullable: true, description: 'The service account it acts through, for a suspended one' }
+        holderPrincipalId: { type: string, format: uuid, nullable: true, description: 'For a suspended holder, whom it acts through: a member (their own account) or a service account' }
         holderName: { type: string, nullable: true }
         reason: { type: string, enum: [RECONNECT_COMPANY, SUSPENDED] }
         conversations: { type: integer, format: int32, description: How many conversations it keeps waiting }
@@ -13424,7 +13426,7 @@ components:
         cause:
           type: string
           nullable: true
-          description: 'A suspension''s cause: `ADMIN`, or `USER_DEACTIVATED` (lifted by reactivating the user)'
+          description: 'A suspension''s cause: `ADMIN` (an admin resumes it), `USER_DEACTIVATED` (an instance admin reactivates the user, which resumes them) or `SCIM` (the company''s identity provider deactivated the member, and only its reactivation resumes them)'
         pausedTriggers:
           type: array
           nullable: true

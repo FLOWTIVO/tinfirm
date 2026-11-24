@@ -177,7 +177,7 @@ class DecisionService {
         if (caller == null && principals.ofMember(companyId, userId).filter(found -> !found.active()).isPresent()) {
             // G6: a suspended approver decides nothing, in the app, a chat or a client.
             throw ApiException.conflict(ProblemCode.PRINCIPAL_SUSPENDED, "You are suspended in this company: your "
-                    + "decisions wait for an admin to lift the suspension, or for someone else to decide them");
+                    + "decisions wait until the suspension is lifted, or for someone else to decide them");
         }
         if (!decider.approves(visible.decision(), visible.conversation())) {
             throw ApiException.conflict(ProblemCode.CONVERSATION_BOUND, "Only the conversation's person decides its "

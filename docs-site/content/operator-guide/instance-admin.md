@@ -55,7 +55,7 @@ Turn the **Admin** switch on their row on or off. The instance always keeps an a
 
 **Deactivate…** on a row's menu ends the user's sessions at once, and they can't sign in, locally or through single sign-on, until you activate them again. You can't deactivate yourself.
 
-Their memberships stay, but in every company they belong to they are suspended: nothing acts as them, with their accounts or on their budget, and their running turns are cancelled ([Kill switches](../admin-guide/kill-switches.md#suspend-a-member-or-a-service-account)). A company's Owners and Admins cannot lift that suspension; the page tells them that the user was deactivated.
+Their memberships stay, but in every company they belong to they are suspended: nothing acts as them, with their accounts or on their budget, and their running turns are cancelled ([Kill switches](../admin-guide/kill-switches.md#suspend-a-member-or-a-service-account)). Those turns do not push what their agent committed with the user's accounts: their git access is revoked before the cancel, and each run page says why on the repository. A company's Owners and Admins cannot lift that suspension; the page tells them that the user was deactivated.
 
 **Activate** lets them sign in again, and lifts those suspensions, and only those. A deactivated user holds no seat; activating them takes their seats back, and is refused when every seat of the licence is taken.
 

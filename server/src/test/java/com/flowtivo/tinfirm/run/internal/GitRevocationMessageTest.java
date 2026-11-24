@@ -8,6 +8,7 @@ import java.util.UUID;
 
 import org.junit.jupiter.api.Test;
 
+import com.flowtivo.tinfirm.principal.PrincipalSwitches;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 
 /** ADR-0116: the message a revoked run's host gets, for its log and the agent. */
@@ -21,6 +22,20 @@ class GitRevocationMessageTest {
         assertThat(GitRevocationService.message(List.of("acme/shop", "acme/web", "acme/api"), "Shop was paused"))
             .startsWith("Tinfirm revoked this run's access to acme/shop, acme/web and acme/api: Shop was paused. ")
             .endsWith("to them no longer works in this run.");
+    }
+
+    @Test
+    void aSuspensionSaysWhenTheHolderWasDeactivated() {
+        assertThat(GitRevocationService.message(List.of("acme/shop"),
+                RunSwitches.BindingSuspended.why(PrincipalSwitches.Cause.USER_DEACTIVATED)))
+            .isEqualTo("Tinfirm revoked this run's access to acme/shop: the account's holder was suspended because "
+                    + "their Tinfirm account was deactivated. Fetching from and pushing to it no longer works in this "
+                    + "run.");
+        assertThat(RunSwitches.BindingSuspended.why(PrincipalSwitches.Cause.SCIM))
+            .isEqualTo("the account's holder was suspended because the company's identity provider deactivated them");
+        assertThat(RunSwitches.BindingSuspended.why(PrincipalSwitches.Cause.ADMIN))
+            .isEqualTo("the account's holder was suspended");
+        assertThat(RunSwitches.BindingSuspended.why(null)).isEqualTo("the account's holder was suspended");
     }
 
     @Test

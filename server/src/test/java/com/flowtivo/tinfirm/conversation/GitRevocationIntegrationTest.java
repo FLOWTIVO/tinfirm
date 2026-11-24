@@ -1103,6 +1103,99 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
         }
     }
 
+    /**
+     * The run's end as a runner host reports it after a revocation and then a cancel (ADR-0116, decision 3): the
+     * revocation's warning in the run's log, its confirmation, then, at the cancel, the error of the push it did not
+     * attempt, and {@code CANCELLED} with the commit counted and not pushed.
+     */
+    private static void cancelledAfterTheRevocation(FakeRunner runner, JsonNode assign, String message) {
+        UUID run = UUID.fromString(assign.get("runId").asString());
+        long epoch = assign.get("epoch").asLong();
+        JsonNode workspace = assign.get("workspaces").get(0);
+        String componentId = workspace.get("componentId").asString();
+        runner.event(run, epoch, 1, "LOG", Map.of("level", "warn", "message", message));
+        runner.send(revoked(run.toString(), epoch, List.of(componentId)));
+        runner.expect("run.cancel");
+        runner.event(run, epoch, 2, "LOG", Map.of("level", "error", "message", "git failed in `"
+                + workspace.get("name").asString() + "` (/workspace/" + workspace.get("dir").asString()
+                + "): not pushed: " + message));
+        Map<String, Object> finished = new LinkedHashMap<>();
+        finished.put("type", "run.finished");
+        finished.put("runId", run.toString());
+        finished.put("epoch", epoch);
+        finished.put("outcome", "CANCELLED");
+        finished.put("lastSeq", 2);
+        finished.put("git", List.of(Map.of("componentId", componentId, "branch", workspace.get("branch").asString(),
+                "pushed", false, "commits", 1, "headSha", "0123456789abcdef0123456789abcdef01234567")));
+        runner.send(finished);
+    }
+
+    @Test
+    void aDeactivatedMembersRunThatCommittedSaysOnItsRepositoryThatItsWorkWasNotPushedAndWhy() {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        connectOwn(bench.member(), bench, git[0], "test-own-token");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        try (FakeRunner runner = host(hostRef(bench), List.of(REVOKE), List.of())) {
+            JsonNode assign = running(bench, runner, agentId);
+            String runId = assign.get("runId").asString();
+            String name = assign.get("workspaces").get(0).get("name").asString();
+
+            // An instance admin deactivates the member while the agent has committed.
+            ApiResponse deactivated = admin().patch("/api/admin/users/" + bench.company().userId("MEMBER"),
+                    Map.of("active", false));
+            assertThat(deactivated.status()).as("%s", deactivated).isEqualTo(200);
+            JsonNode revoke = runner.expect(REVOKE);
+            String message = "Tinfirm revoked this run's access to " + name + ": the account's holder was suspended "
+                    + "because their Tinfirm account was deactivated. Fetching from and pushing to it no longer works "
+                    + "in this run.";
+            assertThat(revoke.get("reason").asString()).isEqualTo("SUSPENDED");
+            assertThat(revoke.get("message").asString()).isEqualTo(message);
+            cancelledAfterTheRevocation(runner, assign, message);
+            // The revocation went before the cancel, so the cancelled run did not push the deactivated user's work.
+            revokedBeforeTheCancel(runner);
+            await().atMost(WAIT).until(() -> "CANCELLED".equals(bench.owner().get(bench.path("/runs/" + runId)).json()
+                .get("status").asString()));
+
+            // The run, as its OWNER reads it: the repository says it was not pushed, and why.
+            JsonNode run = bench.owner().get(bench.path("/runs/" + runId)).json();
+            assertThat(run.has("failureClass")).isFalse();
+            JsonNode repository = run.get("repositories").get(0);
+            assertThat(repository.get("pushed").asBoolean()).isFalse();
+            assertThat(repository.get("commits").asInt()).isEqualTo(1);
+            assertThat(repository.get("gitRevoked").get("reason").asString()).isEqualTo("SUSPENDED");
+            assertThat(repository.get("gitRevoked").get("message").asString()).isEqualTo(message);
+            assertThat(repository.get("gitRevoked").get("delivery").asString()).isEqualTo("CONFIRMED");
+            // The conversation's turn is the same run.
+            JsonNode conversation = conversation(bench.owner(), bench, run.get("conversationId").asString());
+            JsonNode turn = lastTurn(conversation);
+            assertThat(turn.get("repositories").get(0).get("gitRevoked").get("message").asString())
+                .isEqualTo(message);
+            // Its binding and its note name the person, the deactivation and who lifts it.
+            JsonNode binding = conversation.get("bindings").get(0);
+            String card = binding.get("systemName").asString() + ": " + binding.get("holderName").asString()
+                    + ", whose account it acts through, is suspended because their Tinfirm account was deactivated; an "
+                    + "instance admin reactivates the user, which resumes them.";
+            assertThat(binding.get("text").asString()).isEqualTo(card);
+            assertThat(conversation.get("messages")).extracting(m -> m.get("body").asString()).contains(card,
+                    "The turn was cancelled.");
+            // Its events keep what the host logged.
+            assertThat(bench.owner().get(bench.path("/runs/" + runId + "/events")).json().get("items"))
+                .extracting(event -> event.get("payload").get("message").asString())
+                .containsExactly(message, "git failed in `" + name + "` (/workspace/"
+                        + assign.get("workspaces").get(0).get("dir").asString() + "): not pushed: " + message);
+            // Audited once, by the suspension's cancel, with the cancel's cause beside it.
+            assertThat(revocations(bench, runId)).singleElement().satisfies(event -> assertThat(event.get("details")
+                .get("reason").asString()).isEqualTo("SUSPENDED"));
+            assertThat(auditEvents(bench.owner(), bench.company(), "run.cancelled")).filteredOn(event -> event
+                .get("targetId").asString().equals(runId))
+                .singleElement()
+                .satisfies(event -> assertThat(event.get("details").get("cause").asString())
+                    .isEqualTo("principal.suspended"));
+            runner.assertFramesValid();
+        }
+    }
+
     @Test
     void aMemberWhoLeavesHasTheirRunsGitAccessRevokedBeforeItsCancel() {
         Bench bench = bench(true);
