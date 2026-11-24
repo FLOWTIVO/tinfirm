@@ -125,7 +125,7 @@ public final class ConnectionWatch {
 
     private static final String KEPT = "com.flowtivo.tinfirm.shared.tx.AfterTransaction";
 
-    private record TimingOut(String frame, boolean keptOnly, List<String> unless, AtomicLong used) {
+    private record TimingOut(String frame, boolean keptOnly, List<String> unless, long limit, AtomicLong used) {
     }
 
     /**
@@ -135,12 +135,20 @@ public final class ConnectionWatch {
      * ends ({@link #endOfClass}).
      */
     public static AutoCloseable timeOutAt(String frame, String... unless) {
-        return timingOut(new TimingOut(frame, false, List.of(unless), new AtomicLong()));
+        return timingOut(new TimingOut(frame, false, List.of(unless), Long.MAX_VALUE, new AtomicLong()));
+    }
+
+    /**
+     * {@link #timeOutAt}, for the first such connection only: the pool is busy once, and free again for the next one
+     * (a request that asks again after its first refusal then gets one).
+     */
+    public static AutoCloseable timeOutOnceAt(String frame, String... unless) {
+        return timingOut(new TimingOut(frame, false, List.of(unless), 1, new AtomicLong()));
     }
 
     /** {@link #timeOutAt}, for the connections of work kept for after a transaction ({@code AfterTransaction}) only. */
     public static AutoCloseable timeOutKeptWorkAt(String frame) {
-        return timingOut(new TimingOut(frame, true, List.of(), new AtomicLong()));
+        return timingOut(new TimingOut(frame, true, List.of(), Long.MAX_VALUE, new AtomicLong()));
     }
 
     private static AutoCloseable timingOut(TimingOut timingOut) {
@@ -177,6 +185,7 @@ public final class ConnectionWatch {
             unused.add("timeOutAt(" + timingOut.frame() + "), never closed");
         }
         TIMING_OUT.clear();
+        AFTER_REFUSAL.clear();
         return unused;
     }
 
@@ -202,19 +211,55 @@ public final class ConnectionWatch {
 
     private static void timeOutIfAsked(Throwable stack) throws SQLException {
         plantIfAsked(stack);
-        if (TIMING_OUT.isEmpty()) {
+        List<String> after = AFTER_REFUSAL.get(Thread.currentThread());
+        if (TIMING_OUT.isEmpty() && after == null) {
             return;
         }
         StackTraceElement[] frames = stack.getStackTrace();
         boolean kept = Arrays.stream(frames).anyMatch(each -> each.getClassName().startsWith(KEPT));
         for (TimingOut timingOut : TIMING_OUT) {
             if ((kept || !timingOut.keptOnly()) && at(frames, timingOut.frame())
-                    && timingOut.unless().stream().noneMatch(frame -> at(frames, frame))) {
-                timingOut.used().incrementAndGet();
+                    && timingOut.unless().stream().noneMatch(frame -> at(frames, frame))
+                    && timingOut.used().getAndIncrement() < timingOut.limit()) {
+                if (after != null) {
+                    after.add(asker(frames) + " (refused)");
+                }
+                AFTER_REFUSAL.putIfAbsent(Thread.currentThread(), new java.util.concurrent.CopyOnWriteArrayList<>());
                 throw new java.sql.SQLTransientConnectionException(
                         "HikariPool-1 - Connection is not available, request timed out after 30000ms (test fixture)");
             }
         }
+        if (after != null) {
+            after.add(asker(frames));
+        }
+    }
+
+    /** What each thread on which a fixture refused a connection asked the pool for after that refusal. */
+    private static final Map<Thread, List<String>> AFTER_REFUSAL = new ConcurrentHashMap<>();
+
+    /**
+     * What the threads on which a fixture refused a connection ({@link #timeOutAt}) asked the pool for after their
+     * first refusal, each by its asker (the innermost frame of the application or of Spring Session), with
+     * {@code (refused)} where a fixture refused it too; read and forgotten. For a test that counts how often a
+     * request that already found the pool dry still asks for a connection, each asking a wait of its own.
+     */
+    public static List<String> askedAfterRefusal() {
+        List<String> asked = new ArrayList<>();
+        AFTER_REFUSAL.values().forEach(asked::addAll);
+        AFTER_REFUSAL.clear();
+        return asked;
+    }
+
+    /** The innermost frame of the application, but this fixture's and the data source's, or of Spring Session. */
+    private static String asker(StackTraceElement[] frames) {
+        return Arrays.stream(frames)
+            .map(each -> each.getClassName() + "." + each.getMethodName())
+            .filter(each -> each.startsWith("org.springframework.session.") || each.startsWith("com.flowtivo.")
+                    && !each.startsWith("com.flowtivo.tinfirm.support.")
+                    && !each.startsWith("com.flowtivo.tinfirm.shared.tenant.")
+                    && !each.startsWith("com.flowtivo.tinfirm.shared.tx."))
+            .findFirst()
+            .orElse("?");
     }
 
     /** Before the pool is asked: a thread that holds a connection is recorded, whether or not it gets one. */

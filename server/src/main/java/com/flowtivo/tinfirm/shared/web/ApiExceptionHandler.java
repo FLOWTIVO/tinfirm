@@ -212,9 +212,27 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONTENT_TOO_LARGE).body(problem);
     }
 
+    /**
+     * Every answer of the base class passes here. One it would give as a 5xx goes through the rule of the answers for
+     * want of a database connection and after a commit ({@link ServerBusy}) first: the session's save when the
+     * response is about to be committed runs inside the write of an answer larger than the response's buffer, and its
+     * failure arrives as an {@code HttpMessageNotWritableException}. The dispatcher has reset the buffer before, so
+     * nothing of the unfinished answer goes out.
+     */
     @Override
     protected ResponseEntity<Object> handleExceptionInternal(Exception ex, @Nullable Object body,
             HttpHeaders headers, HttpStatusCode statusCode, WebRequest request) {
+        if (statusCode.is5xxServerError()) {
+            HttpServletRequest servlet = request instanceof NativeWebRequest nativeRequest
+                    ? nativeRequest.getNativeRequest(HttpServletRequest.class) : null;
+            ServerBusy.Answer answer = ServerBusy.decide(ex, servlet != null ? servlet.getMethod() : null);
+            if (answer != ServerBusy.Answer.NONE) {
+                ResponseEntity<ProblemDetail> busy = handleApiException(ServerBusy.exception(answer, ex));
+                HttpHeaders answerHeaders = new HttpHeaders();
+                answerHeaders.putAll(busy.getHeaders());
+                return super.handleExceptionInternal(ex, busy.getBody(), answerHeaders, busy.getStatusCode(), request);
+            }
+        }
         if (statusCode.value() == HttpStatus.BAD_REQUEST.value() && body instanceof ProblemDetail problem
                 && (problem.getProperties() == null || !problem.getProperties().containsKey(CODE))) {
             problem.setProperty(CODE, ProblemCode.VALIDATION_FAILED.name());
