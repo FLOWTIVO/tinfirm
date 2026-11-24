@@ -1518,6 +1518,38 @@ async fn files_go_in_and_come_back_through_a_front_and_a_readers_pipe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_put_whose_packing_fails_ends_at_once_with_the_hosts_own_error() {
+    let _one = SERIAL.lock().await;
+    let (front, session, bridge, _, _) = connected("run-front-pack").await;
+    let host = tempfile::tempdir().unwrap();
+    // What the host cannot pack: a file where it packs a directory.
+    let source = host.path().join("source");
+    std::fs::write(&source, "not a directory").unwrap();
+    let sandbox_dir = host.path().join("sandbox/work");
+    let dir = sandbox_dir.to_str().unwrap().to_string();
+    let files = session.files();
+    // The put has ten minutes, as a run's puts have: it must not wait them out.
+    let put = tokio::time::timeout(
+        WAIT,
+        files.put_dir(&source, &dir, Vec::new(), Duration::from_secs(600)),
+    )
+    .await
+    .expect("the put waited for the sandbox after its packing had failed");
+    let error = format!("{:#}", put.unwrap_err());
+    assert!(error.contains("cannot pack the files of"), "{error}");
+    assert!(!error.contains("the sandbox cannot unpack"), "{error}");
+    // Nothing of it stays, and the session goes on.
+    let out = files
+        .exec(&["echo", "still"], &[], None, None, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(out.stdout, "still\n");
+    assert_eq!(front.handle().bridge_waiting(), (0, 0));
+    assert!(front.handle().ended().is_none());
+    assert_eq!(finish(&session, bridge).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_put_or_a_get_cut_by_the_bridge_or_the_front_leaves_nothing_in_run() {
     let _one = SERIAL.lock().await;
     let host = tempfile::tempdir().unwrap();

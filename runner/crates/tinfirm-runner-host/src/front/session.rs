@@ -893,10 +893,12 @@ impl FrontFiles {
         let guard = ours.try_clone()?;
         let host_dir = host_dir.to_path_buf();
         let packing = tokio::task::spawn_blocking(move || {
+            let packed = tinfirm_bridge::files::pack(&host_dir, &[], &exclude, &ours).map(|_| ());
             // Its end is said with a shutdown, which the copy kept to stop it does not hold
-            // back.
-            let ours = tinfirm_bridge::files::pack(&host_dir, &[], &exclude, ours)?;
-            ours.shutdown(std::net::Shutdown::Write)
+            // back. A packing that failed ends the archive the same way: the sandbox would
+            // otherwise wait the put's whole time for the rest of it.
+            let shut = ours.shutdown(std::net::Shutdown::Write);
+            packed.and(shut)
         });
         let asked = self
             .front
@@ -912,7 +914,21 @@ impl FrontFiles {
             )
             .await;
         let _ = guard.shutdown(std::net::Shutdown::Both);
-        let packed = packing.await.map_err(|e| anyhow!("{e}"))?;
+        // An error of the packing itself (a file of the host's that cannot be read) comes
+        // first: it cut the archive short, and what the sandbox answers to the rest follows
+        // from it. A socket whose reader left is the other way round: the sandbox or the front
+        // stopped taking the archive, and the answer says why.
+        let packed = match packing.await.map_err(|e| anyhow!("{e}"))? {
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Err(e).with_context(|| format!("cannot pack the files of {dir}"));
+            }
+            packed => packed,
+        };
         match asked.with_context(|| format!("cannot put {dir} into the sandbox"))? {
             Reply::Done => {
                 packed.with_context(|| format!("cannot pack the files of {dir}"))?;
