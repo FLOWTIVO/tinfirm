@@ -22,7 +22,8 @@ import com.flowtivo.tinfirm.support.TestDatabase;
  * upgrade get their assignment's epoch, the version of their binding (0, every binding's at the upgrade), and a record
  * of their assignment with the host it went to; an ended run's rows and a row without a binding get neither. A fresh
  * database of its own, migrated to V086, seeded as the superuser with the foreign keys' triggers off (the rows the
- * migration reads and those its rows point at), then migrated on.
+ * migration reads and those its rows point at), then migrated on. And the index V087 gives the update at a run's end,
+ * since it narrows the one that update read through.
  */
 class GitRevocationMigrationTest {
 
@@ -85,6 +86,27 @@ class GitRevocationMigrationTest {
                            name
                       FROM run_assignment_repository"""))
                 .containsExactly(row(running, shop, 3L, 0L, host, null, binding, "acme/shop"));
+        }
+    }
+
+    /**
+     * A run's end completes its pending commands of either type in one update ({@code RunCommandStore.completeAll}),
+     * which names no type: neither {@code run_command_pending_uq}, on {@code CANCEL} from V087, nor
+     * {@code run_command_revoke_git_idx} can serve it. With sequential scans off, the planner reads through
+     * {@code run_command_pending_idx}, which it can only when the statement implies the index's predicate; without
+     * that index it has nothing but the scan of the whole table, which no run's end should pay for.
+     */
+    @Test
+    void theUpdateAtARunsEndReadsItsPendingCommandsThroughAnIndex() throws SQLException {
+        String url = TestDatabase.createDatabase("v087_plan");
+        migrate(url, "87");
+        try (Connection sql = TestDatabase.connectAsSuperuser(url)) {
+            sql.setAutoCommit(false);
+            update(sql, "SET LOCAL enable_seqscan = off");
+            // The statement of completeAll, with a run's id in place of its parameter.
+            List<List<Object>> plan = rows(sql, "EXPLAIN UPDATE run_command SET status = 'DONE', completed_at = now() "
+                    + "WHERE run_id = '00000000-0000-7000-8000-000000000000' AND status = 'PENDING'");
+            assertThat(plan.toString()).contains("run_command_pending_idx").doesNotContain("Seq Scan");
         }
     }
 

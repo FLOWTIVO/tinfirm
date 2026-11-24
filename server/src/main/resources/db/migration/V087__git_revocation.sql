@@ -62,6 +62,10 @@ ALTER TABLE run_command ADD CONSTRAINT run_command_revoke_git_ck CHECK (
 DROP INDEX run_command_pending_uq;
 CREATE UNIQUE INDEX run_command_pending_uq ON run_command (run_id, type) WHERE status = 'PENDING' AND type = 'CANCEL';
 CREATE INDEX run_command_revoke_git_idx ON run_command (run_id, epoch) WHERE type = 'REVOKE_GIT';
+-- The pending commands of a run, of either type: a run's end completes them in one update (run_id = ? AND
+-- status = 'PENDING'), which names no type and so can use neither index above. Commands are never deleted, so
+-- without this index every run's end would read the whole table.
+CREATE INDEX run_command_pending_idx ON run_command (run_id) WHERE status = 'PENDING';
 
 ALTER TABLE run_repository
     ADD COLUMN component_id    uuid,
