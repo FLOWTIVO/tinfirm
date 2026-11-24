@@ -15,12 +15,14 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import com.flowtivo.tinfirm.account.AccountEvents;
+import com.flowtivo.tinfirm.account.AccountInfo;
 import com.flowtivo.tinfirm.account.CredentialUses;
 import com.flowtivo.tinfirm.account.GrantInfo;
 import com.flowtivo.tinfirm.audit.AuditAction;
@@ -55,6 +57,7 @@ import com.flowtivo.tinfirm.shared.sql.Constraints;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
+import com.flowtivo.tinfirm.system.CallResult;
 import com.flowtivo.tinfirm.system.ChatSystems;
 import com.flowtivo.tinfirm.system.SystemInfo;
 import com.flowtivo.tinfirm.system.Systems;
@@ -67,7 +70,9 @@ import com.flowtivo.tinfirm.system.Systems;
  * groups ({@link Grants}). Connecting, signing in and removing go through {@link AccountService}, as a member's own
  * account does; what changes how a credential may be used (disabling it, enabling it, a lending) is announced as
  * {@link AccountEvents.CredentialChanged}, so that what uses it is checked again. A chat system's bot is a credential
- * too, changed only with the bot ({@code BOT_ACCOUNT_IN_USE}).
+ * too, changed only with the bot ({@code BOT_ACCOUNT_IN_USE}). An installation of a {@code GITHUB} system's GitHub App
+ * ({@code APP}, ADR-0116) takes no token or sign-in: when GitHub refused it, GitHub is asked for it again
+ * ({@link #checkApp}).
  */
 @Service
 class Credentials {
@@ -75,6 +80,8 @@ class Credentials {
     private final AccountStore store;
 
     private final AccountService accounts;
+
+    private final AccountCredentials credentials;
 
     private final Principals principals;
 
@@ -101,10 +108,12 @@ class Credentials {
     Credentials(AccountStore store, AccountService accounts, Principals principals, Systems systems,
             GroupMembership groups, CompanyAccessGuard guard, AuditLog auditLog, ApplicationEventPublisher events,
             TimeSource time, ChatSystems chatSystems, AccountMapper mapper,
-            PlatformTransactionManager transactionManager, List<CredentialUses> uses) {
+            PlatformTransactionManager transactionManager, List<CredentialUses> uses,
+            AccountCredentials credentials) {
         this.uses = List.copyOf(uses);
         this.store = store;
         this.accounts = accounts;
+        this.credentials = credentials;
         this.principals = principals;
         this.systems = systems;
         this.groups = groups;
@@ -208,6 +217,45 @@ class Credentials {
         AccountStore.AccountRow row = accounts.storeClient(
                 () -> accounts.credential(companyId, systemId, credentialId, null), clientId, clientSecret);
         return view(row);
+    }
+
+    /**
+     * Has GitHub asked again for the installation an {@code APP} credential is (ADR-0116, decision 7): the way back of
+     * one that turned {@code RECONNECT}, which takes no token or sign-in. Once GitHub mints a token for it, it is
+     * {@code OK} again in place, with its name, grants and lendings ({@code account.reconnected}); one that was
+     * {@code OK} stays so. While GitHub refuses, nothing changes and its reason is answered
+     * ({@code 400 GITHUB_APP_REFUSED}); GitHub not answering is {@code 502 GITHUB_UNREACHABLE}. Any other credential
+     * takes a token or a sign-in ({@code 400 SYSTEM_KIND_INVALID}). GitHub is asked after the transaction that
+     * authorises the caller, outside any ({@link AccountCredentials#checkInstallation}).
+     */
+    public SystemCredential checkApp(UUID companyId, UUID systemId, UUID credentialId) {
+        AccountStore.AccountRow credential = Objects.requireNonNull(transactions.execute(status -> {
+            AccountService.Holder holder = accounts.credential(companyId, systemId, credentialId, null);
+            if (holder.system().paused()) {
+                throw ApiException.conflict(ProblemCode.SYSTEM_PAUSED, holder.system().name()
+                        + " is paused by an admin");
+            }
+            accounts.requireNotBot(holder);
+            AccountStore.AccountRow found = store.find(companyId, credentialId)
+                .orElseThrow(AccountService::credentialNotFound);
+            if (found.kind() != AccountInfo.Kind.APP) {
+                throw ApiException.badRequest(ProblemCode.SYSTEM_KIND_INVALID, "This credential is no installation "
+                        + "of a GitHub App: store a new token for it, or sign it in again");
+            }
+            return found;
+        }));
+        CallResult.Failure refused = credentials.checkInstallation(companyId, credentialId,
+                "account-check:" + credentialId).failure();
+        if (refused != null) {
+            if (refused.retryable()) {
+                throw new ApiException(HttpStatus.BAD_GATEWAY, ProblemCode.GITHUB_UNREACHABLE,
+                        "Tinfirm could not ask GitHub for the installation: " + refused.message());
+            }
+            // GitHub's own words are the answer: "GitHub answered 401: Bad credentials".
+            throw ApiException.badRequest(ProblemCode.GITHUB_APP_REFUSED, refused.message());
+        }
+        // A credential removed while GitHub was asked is 404 here.
+        return view(credential);
     }
 
     @Transactional

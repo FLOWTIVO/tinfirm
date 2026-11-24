@@ -41,7 +41,8 @@ Adding, lending, storing again, disabling and removing credentials are in the pu
   `APP`, [ADR-0116](../adr/0116-short-lived-and-revocable-git-tokens.md); `POST
   …/credentials/app`, [systems.md, section 3.1](systems.md#31-the-github-app)). Its login is the
   account the App is installed on; its identity `installation:{id}`, one credential per
-  installation. It takes no token or sign-in. Tinfirm mints its tokens itself: for its own calls
+  installation. It takes no token or sign-in; one that GitHub refused is checked again in place
+  (`POST …/credentials/{credentialId}/app`). Tinfirm mints its tokens itself: for its own calls
   with the installation's permissions less `workflows`, and for each run one of its own, limited to
   the run's repositories and to `contents` and `pull_requests`, valid an hour. Members' own accounts
   on GitHub and GitLab keep their tokens: revocation of a run's token reaches them too

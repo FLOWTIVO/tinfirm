@@ -133,6 +133,8 @@ Before you start, ask your operator to upgrade the runner hosts: a run on an App
 
 To rotate the key, generate a new one at GitHub, choose **Replace the key** and paste it, then delete the old key at GitHub. To remove the App, or to set another App in its place, remove its installations' credentials first: each one stands for an installation of the App it was added for, so Tinfirm refuses another App ID while one remains. If the App is replaced while you add an installation, Tinfirm does not add it: pick the installation again from the new App's list.
 
+When GitHub refuses the App, an installation's credential shows **Check again**, with GitHub's answer under it. The conversations that act with it wait, and the triggers that act with it pause. This happens when the App's private key was deleted at GitHub before the new one was stored here, or when the server's clock is wrong. Put the cause right first: store the App's current key with **Replace the key**, or ask your operator to correct the clock. Then choose **Check again** on the credential. Tinfirm asks GitHub for the installation, and once GitHub accepts it the credential works again as it is, with its name and everything it is lent to; the conversations go on, and the triggers that paused are resumed by their author or an admin. While GitHub still refuses, the page shows GitHub's answer and nothing changes. Do not remove the credential to repair it: that removes its grants and lendings too. Only an installation that was removed at GitHub does not come back: installing the App again makes a new installation, which you add as a new credential.
+
 A revoked run loses the App's token on its runner host at once, but the token itself stays valid at GitHub until its hour ends: Tinfirm keeps no run's token, and does not ask GitHub to revoke it.
 
 A repository on another GitHub account, or one the installation does not include, cannot be worked on through it: the turn ends with a message that names the repository. Install the App there, and retry.
@@ -150,7 +152,7 @@ Members who connect their own GitHub accounts keep doing so: their tokens are no
 3. the system's only enabled, working credential;
 4. no account at all.
 
-With an account, Tinfirm asks the system who the account is, and the strip reads, for example, *Reached with the credential CI bot, as ci-bot.* Without one, it makes a request that needs no credential. A system that answers is reached; when it asks for a credential and none works yet, the strip offers **Add a credential**. A credential you pick that is disabled or must be signed in again is not sent: *Not tested: … is disabled, or must be signed in again.*
+With an account, Tinfirm asks the system who the account is, and the strip reads, for example, *Reached with the credential CI bot, as ci-bot.* GitHub does not answer that for a GitHub App installation, so Tinfirm asks which repositories the installation reaches, and names the account it is installed on. Without one, it makes a request that needs no credential. A system that answers is reached; when it asks for a credential and none works yet, the strip offers **Add a credential**. A credential you pick that is disabled or must be signed in again is not sent: *Not tested: … is disabled, or must be signed in again.*
 
 The result becomes the system's status and its **last test**, replacing the one before: *Tested 2 hours ago by Alex Rivera · passed with the credential CI bot*. Every member who sees the system can read when it was tested and how that ended; who ran the test and with which credential, only Owners and Admins. A failed test shows **Test failed**, the reason and **Test again**.
 
@@ -194,7 +196,7 @@ Each credential shows its state, how it was connected (**Token**, **Sign-in** or
 | State | Meaning | What to do |
 |---|---|---|
 | **Working** | The system accepts it | Nothing |
-| **Sign in again**, **Store a new token**, **Store new client credentials** | The system refused it, or its sign-in expired and could not be refreshed | The button of that name |
+| **Sign in again**, **Store a new token**, **Store new client credentials**, **Check again** | The system refused it, or its sign-in expired and could not be refreshed | The button of that name; for a GitHub App installation, see [Set up the GitHub App](#set-up-the-github-app) |
 | **Not working** | It failed otherwise; the last error is shown under it | Read the error, then store a new token or sign in again |
 | **Disabled** | You disabled it: nothing acts with it | **Enable** |
 

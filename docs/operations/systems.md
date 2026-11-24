@@ -102,7 +102,11 @@ Inside:
 - Tinfirm's own calls with the credential (tools, change requests, polls, write-back) use a token
   minted with the installation's permissions less `workflows`, kept in the credential's secret
   until five minutes before it expires. GitHub refusing the App, or not knowing the installation
-  any more, turns the credential **Sign in again** (`RECONNECT`): check the App and its installation.
+  any more, turns the credential **Check again** (`RECONNECT`): check the App and its installation
+  at GitHub, then press **Check again** on the credential (`POST …/credentials/{credentialId}/app`).
+  Tinfirm asks GitHub for the installation again, and once GitHub mints a token the credential is
+  **Working** again in place, with its grants and lendings; while GitHub refuses, it shows GitHub's
+  reason and nothing changes.
 - `run.assign` carries the token with its `expiresAt` and `mirrorKey`, the key the host names the
   repository's mirror by in place of the token, the same for every run of the credential. The host
   renews a token with `run.request` `GIT_TOKEN` when ten minutes or less are left, and before the
@@ -148,7 +152,7 @@ Adding a credential, its states and its menu, and lending it to groups and servi
 
 - **Who holds them**: a company Jira, GitHub, GitLab, Git or MCP server. A personal MCP server holds none (`400 PERSONAL_SYSTEM`: only its owner's own account acts there), nor does a webhook. A chat system's bot is a credential, marked **Chat bot** and managed only under **Bot** ([chats.md](chats.md)).
 - **Problems**: `409 DUPLICATE_CREDENTIAL_NAME` (a name the system has, ignoring case), `400 ACCOUNT_REFUSED` with the system's reason (a token the "who am I" of section 2 refuses), `409 IDENTITY_IN_USE` (the user is a member's own account: [accounts.md, section 7](accounts.md#7-one-identity-per-system)), `409 SYSTEM_PAUSED`, `409 DUPLICATE_GRANT` (a credential lent to a group twice).
-- **States**: **Working** is `OK`; **Sign in again** and **Store a new token** are `RECONNECT` (refused, or a sign-in that could not be refreshed); **Not working** is `ERROR`; **Disabled** is `enabled` false.
+- **States**: **Working** is `OK`; **Sign in again**, **Store a new token** and, for an installation of a GitHub App, **Check again** are `RECONNECT` (refused, or a sign-in that could not be refreshed); **Not working** is `ERROR`; **Disabled** is `enabled` false.
 - **Storing again keeps the credential's id**, so the triggers whose rows name it go on.
 - **Disable** stops every use by groups and service accounts at its next check; conversations that act with it wait for an admin.
 - **Remove** goes in this order: its grants (`grant.deleted`), its lendings (`credential.withdrawn`: the triggers that act with it pause until their authors name another), its token from the vault, and its sign-in at the system where the system revokes (`account.disconnected`). Conversations that act with it stop at their next use of it.

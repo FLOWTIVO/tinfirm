@@ -1,5 +1,6 @@
 package com.flowtivo.tinfirm.support;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.matching;
 import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
@@ -31,7 +32,9 @@ import tools.jackson.databind.json.JsonMapper;
  * A GitHub App at a fake GitHub (ADR-0116), under an API base of its own on {@link GitHubStub}'s server, as a GitHub
  * Enterprise Server's {@code https://{host}/api/v3} would be: {@code GET /app} for its id and key, its installations,
  * and {@code POST /app/installations/{id}/access_tokens}, each answered only for a JWT the App's key signed (RS256,
- * {@code iss} the App's id, at most ten minutes). Tokens are test values; the key is made for the test.
+ * {@code iss} the App's id, at most ten minutes); and what GitHub answers an installation's token itself, 403 to
+ * {@code GET /user} and its repositories to {@code GET /installation/repositories}. Tokens are test values; the key is
+ * made for the test.
  */
 public final class GitHubAppStub {
 
@@ -168,6 +171,48 @@ public final class GitHubAppStub {
             .withRequestBody(matchingJsonPath("$.repositories[?(@ == '" + repository + "')]"))
             .willReturn(GitHubStub.json(422, Map.of("message", "There is at least one repository that does not "
                     + "exist or is not accessible to the parent installation."))));
+    }
+
+    /**
+     * {@code POST …/access_tokens} answers 401, as GitHub does while it does not take the App's JWT (a key deleted at
+     * GitHub, a clock that runs ahead); replaces an earlier answer.
+     */
+    public StubMapping refusesTheApp(long installationId) {
+        return GitHubStub.server().stubFor(post(urlEqualTo(path + "/app/installations/" + installationId
+                + "/access_tokens"))
+            .willReturn(GitHubStub.json(401, Map.of("message", "Bad credentials"))));
+    }
+
+    /**
+     * An installation's token as GitHub treats one: {@code GET /user} answers it 403, since that endpoint is for a
+     * user's token, and {@code GET /installation/repositories} lists the account's repositories for it.
+     */
+    public void installationToken(String token, String login, List<String> repositories) {
+        GitHubStub.server().stubFor(get(urlEqualTo(path + "/user"))
+            .withHeader("Authorization", equalTo("Bearer " + token))
+            .willReturn(GitHubStub.json(403, Map.of("message", "Resource not accessible by integration"))));
+        List<Map<String, Object>> listed = repositories.stream()
+            .map(name -> Map.<String, Object>of("name", name, "full_name", login + "/" + name, "owner",
+                    Map.of("login", login, "type", "Organization")))
+            .toList();
+        GitHubStub.server().stubFor(get(urlPathEqualTo(path + "/installation/repositories"))
+            .withHeader("Authorization", equalTo("Bearer " + token))
+            .willReturn(GitHubStub.json(200, Map.of("total_count", listed.size(), "repository_selection", "all",
+                    "repositories", listed))));
+    }
+
+    /** GitHub takes the installation's token no longer: {@code GET /installation/repositories} answers it 401. */
+    public void refusesToken(String token) {
+        GitHubStub.server().stubFor(get(urlPathEqualTo(path + "/installation/repositories"))
+            .withHeader("Authorization", equalTo("Bearer " + token))
+            .willReturn(GitHubStub.json(401, Map.of("message", "Bad credentials"))));
+    }
+
+    /** A user's token at the App's fake GitHub: {@code GET /user} answers the login for it. */
+    public void user(String token, String login) {
+        GitHubStub.server().stubFor(get(urlEqualTo(path + "/user"))
+            .withHeader("Authorization", equalTo("Bearer " + token))
+            .willReturn(GitHubStub.json(200, Map.of("id", Math.abs((long) login.hashCode()) + 1, "login", login))));
     }
 
     /** The bodies of the mints of the installation so far, oldest first. */

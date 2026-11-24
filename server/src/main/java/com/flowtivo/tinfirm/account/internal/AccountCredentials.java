@@ -355,6 +355,74 @@ class AccountCredentials {
     }
 
     /**
+     * An admin has GitHub asked again for the installation an {@code APP} credential is (ADR-0116, decision 7). No
+     * reveal reads a credential that is not {@code OK}, so none mints for one that turned {@code RECONNECT}, and it
+     * takes no token or sign-in: this is its way back. The calls are those of {@link #mintedForServer}, for the
+     * credential in whatever state it is. A token GitHub mints proves the installation and is kept for the server's
+     * own calls: a credential that was {@code RECONNECT} is {@code OK} again in place ({@link #usableAgain}), with its
+     * grants and lendings. A failure changes nothing and is the caller's to answer. Outside any transaction, under the
+     * account's refresh lock, so that it never mints beside a reveal; the caller authorised the admin.
+     *
+     * @param purpose the reveal's purpose of the credential's secret, and of the App's key for the mint
+     * @return true once the token is kept; false when the credential is gone, or was removed while GitHub was asked;
+     *         else why no token was minted
+     * @throws IllegalStateException inside a transaction
+     */
+    CallResult<Boolean> checkInstallation(UUID companyId, UUID accountId, String purpose) {
+        NoTransaction.require("Asking GitHub for a credential's installation");
+        ReentrantLock lock = refreshLocks[Math.floorMod(accountId.hashCode(), REFRESH_STRIPES)];
+        lock.lock();
+        try {
+            Read read = transactions.execute(status -> readInstallation(companyId, accountId, purpose));
+            if (read == null) {
+                return CallResult.ok(false);
+            }
+            AppInstallationSecret app = AppInstallationSecret.fromJson(read.value());
+            if (app == null) {
+                return CallResult.failed(CallResult.Kind.INVALID, "The stored installation is not readable");
+            }
+            SystemInfo system = read.system();
+            // Outside any transaction: GitHub may take its time.
+            CallResult<GitHubApps.Installation> installation = gitHubApps.installation(system, app.installationId());
+            CallResult<GitHubApps.InstallationToken> fresh = installation.failure() != null
+                    ? CallResult.failed(installation.failure())
+                    : gitHubApps.mint(system, app.installationId(), null,
+                            withoutWorkflows(Objects.requireNonNull(installation.value()).permissions()), purpose);
+            if (fresh.failure() != null) {
+                return fresh.failedAs();
+            }
+            GitHubApps.InstallationToken token = Objects.requireNonNull(fresh.value());
+            String stored = app.minted(token.token(), token.expiresAt()).json();
+            return CallResult.ok(inTransaction(() -> storeRefreshed(read, system, stored, null, token.expiresAt())));
+        }
+        finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Reads an {@code APP} credential and reveals its secret for {@link #checkInstallation}, in the transaction before
+     * GitHub is asked: as {@link #read} does, but in whatever state the credential is, enabled or not, since the check
+     * is what makes one that turned {@code RECONNECT} usable again; null when it is gone or is no installation. It
+     * locks no account row, and is no use of the credential: its last use stays.
+     */
+    private @Nullable Read readInstallation(UUID companyId, UUID accountId, String purpose) {
+        AccountStore.AccountRow account = store.find(companyId, accountId)
+            .filter(row -> row.credential() && row.kind() == AccountInfo.Kind.APP && row.secretId() != null)
+            .orElse(null);
+        SystemInfo system = account != null ? systems.find(companyId, account.systemId()).orElse(null) : null;
+        if (account == null || system == null) {
+            return null;
+        }
+        String value;
+        try (RevealedSecret secret = secrets.reveal(companyId, null, Objects.requireNonNull(account.secretId()),
+                purpose)) {
+            value = secret.asString();
+        }
+        return new Read(account, null, value, system);
+    }
+
+    /**
      * ADR-0116, decision 8: a run's own token of an {@code APP} credential, for its repositories and access. Read and
      * revealed as any reveal is (the credential's state, its holder, the acting principal's right to it), outside any
      * transaction; minted at GitHub; never stored.

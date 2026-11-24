@@ -68,6 +68,12 @@ class CredentialsController implements CredentialsApi {
     }
 
     @Override
+    public ResponseEntity<SystemCredential> checkSystemCredentialApp(UUID companyId, UUID systemId,
+            UUID credentialId) {
+        return ResponseEntity.ok(credentials.checkApp(companyId, systemId, credentialId));
+    }
+
+    @Override
     public ResponseEntity<SystemCredential> storeSystemCredentialClient(UUID companyId, UUID systemId,
             UUID credentialId, AccountClientRequest body) {
         return ResponseEntity.ok(credentials.storeClient(companyId, systemId, credentialId, body.getClientId(),

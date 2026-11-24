@@ -256,6 +256,42 @@ class SystemClients {
     }
 
     /**
+     * Whether GitHub takes the token of an installation of the system's GitHub App (ADR-0116), for a test with a
+     * credential of kind {@code APP}. GitHub answers {@code GET /user} to a user's token only, and {@code 403}
+     * ("Resource not accessible by integration") to an installation's, so the token is sent to
+     * {@code GET /installation/repositories}, which only an installation's token may call. The login is that of the
+     * account the installation is on, as the repository GitHub lists names its owner; none while the installation
+     * covers no repository. The identity has no id: the credential's own is its installation.
+     */
+    CallResult<SystemCalls.Identity> installationIdentity(SystemStore.SystemRow system,
+            SystemCalls.Credential credential) {
+        String base = Objects.requireNonNull(system.baseUrl());
+        HttpRequest request = http(system).request(base + "/installation/repositories?per_page=1")
+            .header("Accept", "application/json")
+            .header("Authorization", "Bearer " + credential.token())
+            .GET()
+            .build();
+        CallResult<OutboundHttp.Response> sent = http(system).send(base, request);
+        if (sent.failure() != null) {
+            return sent.failedAs();
+        }
+        OutboundHttp.Response response = Objects.requireNonNull(sent.value());
+        if (!response.success()) {
+            return CallResult.failed(OutboundHttp.kindOf(response.status()), system.name() + " answered "
+                    + response.status() + " when asked what the installation's token reaches");
+        }
+        JsonNode body = Json.parse(response.body());
+        JsonNode repositories = body != null ? body.get("repositories") : null;
+        if (repositories == null || !repositories.isArray()) {
+            return CallResult.failed(CallResult.Kind.INVALID, system.name() + " answered without a list of the "
+                    + "installation's repositories");
+        }
+        JsonNode first = repositories.get(0);
+        return CallResult.ok(new SystemCalls.Identity(null, Json.text(first != null ? first.get("owner") : null,
+                "login"), null));
+    }
+
+    /**
      * An Atlassian access token: the account at Atlassian's {@code /me}, and the system's site among the sites the
      * grant may call, whose gateway URL the account calls Jira at.
      */

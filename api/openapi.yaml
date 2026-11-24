@@ -1923,9 +1923,12 @@ paths:
       description: |
         With the credential named (`credentialId`), else the caller's own `OK` account, else the system's only enabled
         `OK` credential (ADR-0072): its "who am I" (its token revealed for this call only, audited as
-        `secret.accessed`); without any, a request that needs no credential. The outcome is the system's status, and
-        is kept as its `lastTest`: when it ended, whether it passed and why not, who ran it (their principal, never
-        their name) and the account or credential it used, replacing the test before. Not audited.
+        `secret.accessed`); without any, a request that needs no credential. A credential of kind `APP` is asked
+        what its installation reaches instead (`GET {baseUrl}/installation/repositories`, ADR-0116): GitHub answers
+        "who am I" to a user's token only, and `login` is then the account the installation is on, where it covers a
+        repository. The outcome is the system's status, and is kept as its `lastTest`: when it ended, whether it
+        passed and why not, who ran it (their principal, never their name) and the account or credential it used,
+        replacing the test before. Not audited.
         Problems: 400 SYSTEM_KIND_INVALID (GIT, which has nothing to reach); 404 for a credential not of the system.
       parameters:
         - $ref: '#/components/parameters/ReachCredentialId'
@@ -2854,6 +2857,39 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/companies/{companyId}/systems/{systemId}/credentials/{credentialId}/app:
+    parameters:
+      - $ref: '#/components/parameters/CompanyId'
+      - $ref: '#/components/parameters/SystemId'
+      - $ref: '#/components/parameters/CredentialId'
+    post:
+      tags: [Credentials]
+      operationId: checkSystemCredentialApp
+      summary: Ask GitHub again for the installation a credential of kind APP is (OWNER, ADMIN)
+      description: |
+        ADR-0116, decision 7. A credential of kind `APP` takes no token or sign-in, and Tinfirm mints nothing for one
+        that is `RECONNECT`: this is its way back, once what GitHub refused is put right (the App's key set again,
+        the installation restored, the server's clock corrected). Tinfirm asks GitHub for the installation with the
+        App's current key and mints a token for its own calls, as it does when the credential is used. When GitHub
+        mints it, the credential is `OK` again in place, with its name, grants and lendings, audited as
+        `account.reconnected` with `refreshed`; one that was `OK` stays so, with the new token. When GitHub refuses,
+        the answer is 400 GITHUB_APP_REFUSED with GitHub's reason and nothing changes. Problems: 400
+        SYSTEM_KIND_INVALID (the credential is no installation of a GitHub App: it takes a token or a sign-in); 400
+        GITHUB_APP_REFUSED; 409 SYSTEM_PAUSED; 409 BOT_ACCOUNT_IN_USE; 502 GITHUB_UNREACHABLE (GitHub could not be
+        reached, or limited the rate; nothing changes).
+      responses:
+        '200':
+          description: The credential
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemCredential' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '502': { $ref: '#/components/responses/BadGateway' }
 
   /api/companies/{companyId}/systems/{systemId}/credentials/{credentialId}/service-accounts/{serviceIdentityId}:
     parameters:
@@ -8914,7 +8950,7 @@ components:
         status:
           type: string
           enum: [OK, RECONNECT, ERROR]
-          description: '`RECONNECT`: the system refused it or the grant expired; an admin stores a token or client credentials, or signs in again'
+          description: '`RECONNECT`: the system refused it or the grant expired; an admin stores a token or client credentials, or signs in again, or for kind `APP` has GitHub asked again (`checkSystemCredentialApp`)'
         enabled: { type: boolean, description: 'Disabled: nothing acts with it until it is enabled again' }
         login: { type: string, nullable: true, description: 'Who it is on the system, where the system says' }
         lastError: { type: string, nullable: true }

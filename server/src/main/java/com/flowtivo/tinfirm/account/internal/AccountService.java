@@ -285,7 +285,8 @@ class AccountService {
             .isPresent()) {
             // ADR-0116: an installation's credential mints its own tokens; it is never stored again with another kind.
             throw ApiException.badRequest(ProblemCode.SYSTEM_KIND_INVALID, "This credential is an installation of the "
-                    + "system's GitHub App: it takes no token or sign-in. Remove it and add the installation again");
+                    + "system's GitHub App: it takes no token or sign-in. When GitHub refused it, check it again on "
+                    + "the system's page");
         }
         SystemKind kind = holder.system().kind();
         if (kind.chat() || kind == SystemKind.WEBHOOK) {

@@ -15,6 +15,7 @@ import com.flowtivo.tinfirm.support.ApiResponse;
 import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.GitHubAppStub;
 import com.flowtivo.tinfirm.support.GitHubStub;
+import com.flowtivo.tinfirm.support.TestCredentials;
 import com.flowtivo.tinfirm.support.TestSettings;
 
 import tools.jackson.databind.JsonNode;
@@ -27,8 +28,10 @@ import tools.jackson.databind.JsonNode;
  * credential's mirror key, on a host that renews tokens; the host renews it with {@code GIT_TOKEN}; a credential
  * disabled refuses the renewal for good; a host that cannot renew never gets the run ({@code NO_HOST_FOR_APP_TOKENS});
  * a repository the installation does not cover ends the turn with a message that names it, and one it no longer
- * covers at a renewal is revoked alone, while the binding's other repositories are renewed. TEST FIXTURE ONLY: keys
- * and tokens are test values.
+ * covers at a renewal is revoked alone, while the binding's other repositories are renewed. A credential GitHub
+ * refused at a mint turns {@code RECONNECT} and is {@code OK} again in place once an admin has GitHub asked again and
+ * it mints; the system's test takes an installation's token, which GitHub answers no "who am I". TEST FIXTURE ONLY:
+ * keys and tokens are test values.
  */
 class GitHubAppIntegrationTest extends ConversationTestBench {
 
@@ -204,6 +207,131 @@ class GitHubAppIntegrationTest extends ConversationTestBench {
         // Nothing was stored: no credential of kind APP on the system.
         assertThat(bench.owner().get(bench.path("/systems/" + git[0] + "/credentials")).json().toString())
             .doesNotContain("\"APP\"");
+    }
+
+    // ---- A credential GitHub refused, and the system's test ---------------------------------------------------------
+
+    @Test
+    void aCredentialGitHubRefusedIsCheckedAgainAndWorksAgainWithItsGrantsAndLendings() {
+        Bench bench = bench(false);
+        GitHubAppStub app = GitHubAppStub.create(919191);
+        UUID[] git = gitHub(bench, app, "https://localhost/acme/shop");
+        UUID credential = appCredential(bench, app, git[0], 51, "WRITE");
+        UUID service = createServiceIdentity(bench.owner(), bench.company(), unique("svc-ci"));
+        TestCredentials.lend(bench.owner(), bench.path(""), git[0], credential, service, "READ");
+        String credentials = bench.path("/systems/" + git[0] + "/credentials");
+        String check = credentials + "/" + credential + "/app";
+
+        // GitHub answers 401 to the server's mint (a key deleted at GitHub, a clock that runs ahead): RECONNECT.
+        app.refusesTheApp(51);
+        JsonNode unusable = bench.owner().post(bench.path("/systems/" + git[0] + "/test?credentialId=" + credential),
+                Map.of()).json();
+        assertThat(unusable.get("ok").asBoolean()).as("%s", unusable).isFalse();
+        JsonNode refused = credentialOf(bench, credentials, credential);
+        assertThat(refused.get("status").asString()).isEqualTo("RECONNECT");
+        assertThat(refused.get("lastError").asString()).contains("Bad credentials");
+        assertThat(auditEvents(bench.owner(), bench.company(), "account.refused")).hasSize(1);
+
+        // Only whoever manages the system's credentials has GitHub asked again.
+        assertThat(bench.member().post(check, Map.of()).status()).isEqualTo(403);
+        // While GitHub still refuses, its reason is answered and the credential stays as it is.
+        ApiResponse still = bench.owner().post(check, Map.of());
+        assertThat(still.status()).as("%s", still).isEqualTo(400);
+        assertThat(still.problemCode()).isEqualTo("GITHUB_APP_REFUSED");
+        assertThat(still.json().get("detail").asString()).contains("401", "Bad credentials");
+        assertThat(credentialOf(bench, credentials, credential).get("status").asString()).isEqualTo("RECONNECT");
+        assertThat(auditEvents(bench.owner(), bench.company(), "account.reconnected")).isEmpty();
+
+        // Once GitHub mints again it is OK in place: the same credential, its grant and its lending as they were.
+        app.mints(51, "test-ghs-server");
+        ApiResponse checked = bench.owner().post(check, Map.of());
+        assertThat(checked.status()).as("%s", checked).isEqualTo(200);
+        assertThat(checked.json().get("id").asString()).isEqualTo(credential.toString());
+        assertThat(checked.json().get("status").asString()).isEqualTo("OK");
+        assertThat(checked.json().has("lastError")).isFalse();
+        assertThat(checked.json().get("grants")).isEqualTo(refused.get("grants")).hasSize(1);
+        assertThat(checked.json().get("serviceAccounts")).isEqualTo(refused.get("serviceAccounts")).hasSize(1);
+        assertThat(checked.json().get("serviceAccounts").get(0).get("serviceIdentityId").asString())
+            .isEqualTo(service.toString());
+        assertThat(checked.json().toString()).doesNotContain("test-ghs-server");
+        assertThat(auditEvents(bench.owner(), bench.company(), "account.reconnected")).singleElement()
+            .satisfies(event -> {
+                assertThat(event.get("targetId").asString()).isEqualTo(credential.toString());
+                assertThat(event.get("details").get("kind").asString()).isEqualTo("APP");
+                assertThat(event.get("details").get("refreshed").asBoolean()).isTrue();
+                assertThat(event.toString()).doesNotContain("test-ghs-server");
+            });
+        // What the check revealed, the credential's secret and the App's key for the mint, names it as the purpose.
+        assertThat(auditEvents(bench.owner(), bench.company(), "secret.accessed").stream()
+            .filter(event -> ("account-check:" + credential).equals(event.get("details").path("purpose").asString()))
+            .count()).isGreaterThanOrEqualTo(2);
+        // Asked again while it works, it stays OK, and nothing is audited as reconnected a second time.
+        assertThat(bench.owner().post(check, Map.of()).json().get("status").asString()).isEqualTo("OK");
+        assertThat(auditEvents(bench.owner(), bench.company(), "account.reconnected")).hasSize(1);
+
+        // A credential that is no installation takes a token or a sign-in, never this.
+        app.user("test-ghp-machine", "acme-machine");
+        UUID token = TestCredentials.add(bench.owner(), bench.path(""), git[0], unique("Machine user"),
+                "test-ghp-machine");
+        ApiResponse other = bench.owner().post(credentials + "/" + token + "/app", Map.of());
+        assertThat(other.status()).as("%s", other).isEqualTo(400);
+        assertThat(other.problemCode()).isEqualTo("SYSTEM_KIND_INVALID");
+        // Nothing is asked on a paused system.
+        assertThat(bench.owner().post(bench.path("/systems/" + git[0] + "/pause"), Map.of("reason", "Maintenance"))
+            .status()).isEqualTo(200);
+        assertThat(bench.owner().post(check, Map.of()).problemCode()).isEqualTo("SYSTEM_PAUSED");
+    }
+
+    @Test
+    void theSystemsTestTakesAnInstallationsCredentialAndStillFailsOneGitHubRefuses() {
+        Bench bench = bench(false);
+        GitHubAppStub app = GitHubAppStub.create(929292);
+        UUID[] git = gitHub(bench, app, "https://localhost/acme/shop");
+        UUID credential = appCredential(bench, app, git[0], 61, "WRITE");
+        String system = bench.path("/systems/" + git[0]);
+        // As GitHub answers an installation's token: 403 to "who am I", its repositories to what it reaches.
+        app.mints(61, "test-ghs-server");
+        app.installationToken("test-ghs-server", "acme", List.of("shop"));
+
+        JsonNode named = bench.owner().post(system + "/test?credentialId=" + credential, Map.of()).json();
+        assertThat(named.get("ok").asBoolean()).as("%s", named).isTrue();
+        assertThat(named.get("withAccount").asBoolean()).isTrue();
+        assertThat(named.get("credentialRequired").asBoolean()).isFalse();
+        assertThat(named.get("credentialId").asString()).isEqualTo(credential.toString());
+        assertThat(named.get("login").asString()).isEqualTo("acme");
+        assertThat(bench.owner().get(system).json().get("status").asString()).isEqualTo("OK");
+        // The system's only usable credential is taken when none is named.
+        JsonNode only = bench.owner().post(system + "/test", Map.of()).json();
+        assertThat(only.get("ok").asBoolean()).as("%s", only).isTrue();
+        assertThat(only.get("credentialId").asString()).isEqualTo(credential.toString());
+
+        // A user's token on the same system is still asked who it is.
+        app.user("test-ghp-machine", "acme-machine");
+        UUID token = TestCredentials.add(bench.owner(), bench.path(""), git[0], unique("Machine user"),
+                "test-ghp-machine");
+        JsonNode user = bench.owner().post(system + "/test?credentialId=" + token, Map.of()).json();
+        assertThat(user.get("ok").asBoolean()).as("%s", user).isTrue();
+        assertThat(user.get("login").asString()).isEqualTo("acme-machine");
+
+        // An installation's token GitHub takes no longer fails the test, and the system says so.
+        app.refusesToken("test-ghs-server");
+        JsonNode refused = bench.owner().post(system + "/test?credentialId=" + credential, Map.of()).json();
+        assertThat(refused.get("ok").asBoolean()).as("%s", refused).isFalse();
+        assertThat(refused.get("withAccount").asBoolean()).isTrue();
+        assertThat(refused.get("credentialRequired").asBoolean()).isTrue();
+        assertThat(refused.get("message").asString()).contains("The credential was not accepted", "401");
+        assertThat(refused.toString()).doesNotContain("test-ghs-server");
+        assertThat(bench.owner().get(system).json().get("status").asString()).isEqualTo("ERROR");
+    }
+
+    /** The credential as the system's page lists it. */
+    private static JsonNode credentialOf(Bench bench, String credentialsPath, UUID credentialId) {
+        for (JsonNode item : bench.owner().get(credentialsPath).json().get("items")) {
+            if (item.get("id").asString().equals(credentialId.toString())) {
+                return item;
+            }
+        }
+        throw new AssertionError("No credential " + credentialId);
     }
 
     // ---- A run's own tokens -----------------------------------------------------------------------------------------

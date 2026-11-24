@@ -961,8 +961,9 @@ class SystemService {
     /**
      * Reaches the system: with an account (the credential named, the caller's own {@code OK} account, the system's
      * only usable credential: {@link #reach}) its "who am I", else a request without a credential; the outcome becomes
-     * the system's status. The calls run outside any transaction, between the one that authorises the caller and the
-     * one that stores the status.
+     * the system's status. A credential that is an installation of the system's GitHub App has no "who am I" at
+     * GitHub: its token is asked what it reaches ({@link SystemClients#installationIdentity}). The calls run outside
+     * any transaction, between the one that authorises the caller and the one that stores the status.
      */
     public SystemTestResult test(UUID companyId, UUID systemId, @Nullable UUID credentialId) {
         Managed managed = managed(companyId, systemId);
@@ -985,8 +986,10 @@ class SystemService {
         SystemTestResult result;
         if (reach.credential() != null) {
             requireStill(system, reach.credential());
-            CallResult<SystemCalls.Identity> identity = clients.whoAmI(system, reach.credential().credential(),
-                    reach.credential().apiBaseUrl());
+            // GitHub answers "who am I" to a user's token only: an installation's is asked what it reaches.
+            CallResult<SystemCalls.Identity> identity = appInstallation(system, reach.credential().accountId())
+                    ? clients.installationIdentity(system, reach.credential().credential())
+                    : clients.whoAmI(system, reach.credential().credential(), reach.credential().apiBaseUrl());
             result = identity.failure() != null
                     ? new SystemTestResult(false, true, identity.failure().kind() == CallResult.Kind.UNAUTHORIZED,
                             (reach.own() ? "Your account" : "The credential") + " was not accepted: "
@@ -1071,6 +1074,16 @@ class SystemService {
             }
         }
         return new Reach(null, false, null, null, false);
+    }
+
+    /**
+     * Whether the account is a credential of the system that is an installation of its GitHub App (kind {@code APP},
+     * ADR-0116), read in a transaction of its own.
+     */
+    private boolean appInstallation(SystemStore.SystemRow system, UUID accountId) {
+        return system.kind() == SystemKind.GITHUB
+                && inTransaction(() -> accounts.appCredentials(system.companyId(), system.id())).stream()
+                    .anyMatch(credential -> credential.id().equals(accountId));
     }
 
     /**
