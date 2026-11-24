@@ -11,14 +11,20 @@ import java.util.UUID;
  * TEST FIXTURE: until closed, the database refuses every audit record of one action and one actor, as a record that
  * cannot be written (a trigger on {@code audit_event}, made by the schema's owner). What is refused is a row of a table
  * that the trigger's function reads, written with bind parameters: no statement here is built from a value. The table,
- * the function and the trigger go when the last fixture closes.
+ * the function and the trigger go when the last fixture closes; a fixture is made and closed in one transaction each,
+ * under one advisory lock, so that two fixtures never make and remove those shared objects at once.
  */
 public record RefusedAuditRecords(UUID id) implements AutoCloseable {
+
+    /** Held to the end of the transaction that makes or closes a fixture. */
+    private static final String ONE_AT_A_TIME = "SELECT pg_advisory_xact_lock(hashtext('test_refused_audit'))";
 
     public static RefusedAuditRecords of(String action, UUID actorId) throws SQLException {
         UUID id = UUID.randomUUID();
         try (Connection owner = TestDatabase.connectAsOwner()) {
+            owner.setAutoCommit(false);
             try (Statement statement = owner.createStatement()) {
+                statement.execute(ONE_AT_A_TIME);
                 statement.execute("""
                         CREATE TABLE IF NOT EXISTS test_refused_audit (
                             id uuid PRIMARY KEY, action text NOT NULL, actor_id text NOT NULL)""");
@@ -44,6 +50,7 @@ public record RefusedAuditRecords(UUID id) implements AutoCloseable {
                 insert.setString(3, actorId.toString());
                 insert.executeUpdate();
             }
+            owner.commit();
         }
         return new RefusedAuditRecords(id);
     }
@@ -51,6 +58,10 @@ public record RefusedAuditRecords(UUID id) implements AutoCloseable {
     @Override
     public void close() throws SQLException {
         try (Connection owner = TestDatabase.connectAsOwner()) {
+            owner.setAutoCommit(false);
+            try (Statement statement = owner.createStatement()) {
+                statement.execute(ONE_AT_A_TIME);
+            }
             try (PreparedStatement delete = owner.prepareStatement("DELETE FROM test_refused_audit WHERE id = ?")) {
                 delete.setObject(1, id);
                 delete.executeUpdate();
@@ -67,6 +78,7 @@ public record RefusedAuditRecords(UUID id) implements AutoCloseable {
                     statement.execute("DROP TABLE IF EXISTS test_refused_audit");
                 }
             }
+            owner.commit();
         }
     }
 }
