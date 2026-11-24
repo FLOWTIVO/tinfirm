@@ -2433,7 +2433,9 @@ new session (`resumeOutcome` `NO_SESSION`).
    a `warn` LOG event).
    Under protocol v2, the person's messages for the run that came before the prompt
    ([Steering](#steering-protocol-v2)) are appended to it, and those that come while it runs
-   go to the agent's steering.
+   go to the agent's steering. `session/prompt` carries one text block: the assignment's
+   `prompt` (or its `resumePrompt`, below) as the server rendered it. Nothing else of the
+   assignment goes to the agent as text, `workItem.title` included.
 6. Streams events to the server: text coalesced every 250 ms, tool calls with inputs and
    outputs truncated to the schema limits, plans, cumulative usage, rate limits. At
    `maxWallClockSeconds` (the agent's time limit of a turn, else the server's

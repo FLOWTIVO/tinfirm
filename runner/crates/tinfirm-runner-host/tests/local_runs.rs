@@ -1100,6 +1100,92 @@ async fn codex_per_request_usage_is_accumulated() {
     .await;
 }
 
+/// The first prompt of a conversation as the server renders it (CONVENTIONS §15.7), for a
+/// first message whose `# Request` quote is `quoted`: its title is not in the heading.
+fn first_prompt(quoted: &str) -> String {
+    format!(
+        "You build the shop.\n\n---\n# Conversation builder-1\nA conversation with Alice in \
+         Tinfirm. You are Builder, an AI agent working for Alice through Tinfirm.\n\n# Request\n\
+         {quoted}\n\n# Accounts\nThis conversation uses no system's account.\n\n# How to work\n\
+         - Do what the request asks, and nothing more; keep it focused.\n"
+    )
+}
+
+/// The content blocks of `session/prompt`, as the fake agent's `echo-prompt` reports them.
+fn prompt_blocks(t: &Transcript) -> serde_json::Value {
+    let text = t.agent_text();
+    let (_, blocks) = text
+        .split_once("Prompt blocks: ")
+        .unwrap_or_else(|| panic!("no prompt blocks in {text:?}"));
+    serde_json::from_str(blocks).unwrap_or_else(|e| panic!("{e}: {blocks:?}"))
+}
+
+/// The agent gets the assignment's prompt as it is, in one text block, and nothing else of
+/// the assignment: the conversation's title, which is the first line of a first message, does
+/// not reach it a second time. A resumed run gets the resume prompt alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_gets_the_prompt_once_and_not_the_title() {
+    with_timeout(120, async {
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(5).await;
+        let title = "Say hello [scenario:echo-prompt] [mark:one]";
+        let cases = [
+            // A one-line first message: the title is the message itself.
+            first_prompt("> Say hello [scenario:echo-prompt] [mark:one]"),
+            // A multi-line one: the title is its first line, without the `#`.
+            first_prompt("> # Say hello [scenario:echo-prompt] [mark:one]\n>\n> Then wave [mark:two]."),
+        ];
+        let mut session = None;
+        for prompt in cases {
+            let spec = AssignSpec::v2("echo-prompt", None);
+            let mut assign = spec.to_json();
+            assign["workItem"]["key"] = json!("builder-1");
+            assign["workItem"]["title"] = json!(title);
+            assign["prompt"] = json!(prompt);
+            conn.send(assign);
+            let t = conn.until_finished(spec.run_id).await;
+            assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+            assert_eq!(
+                prompt_blocks(&t),
+                json!([{"type": "text", "text": prompt}]),
+                "{}",
+                t.text()
+            );
+            assert_eq!(t.agent_text().matches("[mark:one]").count(), 1);
+            session = Some((spec, t.finished()["sessionId"].as_str().unwrap().to_string()));
+        }
+
+        // A later message in a resumed session: the resume prompt alone, without the title.
+        let (first, session_id) = session.unwrap();
+        let mut resumed = AssignSpec::v2("echo-prompt", None);
+        resumed.agent_id = first.agent_id;
+        resumed.task_id = first.task_id;
+        resumed.resume_session_id = Some(session_id);
+        let resume_prompt = "# Request\n> Wave again [scenario:echo-prompt] [mark:three]\n\n# Accounts\n\
+                             This conversation uses no system's account.\n\nContinue with this feedback.";
+        resumed.resume_prompt = Some(resume_prompt.into());
+        let mut assign = resumed.to_json();
+        assign["workItem"]["key"] = json!("builder-1");
+        assign["workItem"]["title"] = json!(title);
+        assign["prompt"] = json!(first_prompt("> Wave again [scenario:echo-prompt] [mark:three]"));
+        conn.send(assign);
+        let t = conn.until_finished(resumed.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert_eq!(t.finished()["resumed"], true, "{}", t.text());
+        assert_eq!(
+            prompt_blocks(&t),
+            json!([{"type": "text", "text": resume_prompt}]),
+            "{}",
+            t.text()
+        );
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
 /// OpenCode 2 reports the tokens of every model request of a turn, OpenCode 1 only the last
 /// one's; `initialize`'s `agentInfo.version` tells which runs, whatever the image (ADR-0061).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

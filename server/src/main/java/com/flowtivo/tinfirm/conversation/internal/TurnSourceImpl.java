@@ -662,7 +662,7 @@ class TurnSourceImpl implements TurnSource {
         // The instructions of the version the turn uses: the accepted one's while a change waits for acceptance
         // (ADR-0103).
         PromptRenderer.Context context = new PromptRenderer.Context(agent.name(), settings.agent().instructions(),
-                settings.instructions(), personName, conversation.key(), conversation.title(), about, projects,
+                settings.instructions(), personName, conversation.key(), about, projects,
                 requestMessages, requestText, recentMessages, Math.max(total, 0),
                 answersSection, accounts, "agent/" + conversation.key(), promptRepositories, !requestable.isEmpty(),
                 filesSection,

@@ -472,7 +472,8 @@
               "description": "The conversation's key, `{base}-{n}`, e.g. `shop-123-dev-1`; its branch is `agent/{key}`"
             },
             "title": {
-              "type": "string"
+              "type": "string",
+              "description": "The conversation's title, for people. The host does not hand it to the agent: the prompt holds the words it is made of (CONVENTIONS §15.7)."
             }
           }
         },
@@ -490,7 +491,7 @@
         },
         "prompt": {
           "type": "string",
-          "description": "The full prompt text, rendered by the server (CONVENTIONS §15.7). The host sends it unchanged as the ACP session/prompt text."
+          "description": "The full prompt text, rendered by the server (CONVENTIONS §15.7). The host sends it unchanged as the ACP session/prompt text, one text block, and nothing else of the assignment with it."
         },
         "resumeSessionId": {
           "type": [

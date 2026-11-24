@@ -44,6 +44,9 @@
 //   hang               one message, then silence: never answers, ignores session/cancel
 //   long-tool          one tool call running ~3 s that sends progress updates every 300 ms
 //   refusal            the model refuses (stopReason: refusal)
+//   echo-prompt        reports the content blocks of `session/prompt` exactly as they came, as
+//                      `Prompt blocks: <JSON>` on a line of their own, and ends the turn; it
+//                      applies no marker
 //   fetch              prints `origin`, waits for a new commit on main (git fetch through the
 //                      git proxy), reads its file, tries to push, and leaves an uncommitted file
 //   refetch            fetches `main` (through the git proxy), commits `refetch.txt`, reports and
@@ -810,6 +813,9 @@ async function prompt(msg) {
     case "refusal":
       chunk(sessionId, "I can't help with that.");
       return done({ stopReason: "refusal" });
+    case "echo-prompt":
+      chunk(sessionId, `\nPrompt blocks: ${JSON.stringify(msg.params.prompt)}`);
+      return done({ stopReason: "end_turn" });
     case "fetch": {
       const report = [];
       const failure = (e) => (e.stderr || e.message || "").toString().trim();
