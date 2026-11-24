@@ -455,6 +455,9 @@ async fn run_cancel_pushes_wip_and_reports_cancelled() {
             heartbeat["runs"],
             json!([{"runId": spec.run_id, "epoch": 1}])
         );
+        // A heartbeat goes out as soon as the run is active; the agent has written its file only
+        // once it speaks. A cancel before that would leave nothing to push.
+        conn.wait_running(spec.run_id).await;
         // The server resends pending cancels; duplicates are idempotent.
         conn.send(json!({"type": "run.cancel", "runId": spec.run_id, "epoch": 1}));
         conn.send(json!({"type": "run.cancel", "runId": spec.run_id, "epoch": 1}));

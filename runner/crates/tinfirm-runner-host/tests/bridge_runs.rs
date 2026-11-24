@@ -174,6 +174,9 @@ async fn a_cancel_stops_the_agent_over_the_bridge_and_pushes_its_work() {
         let spec = AssignSpec::new("slow", Some(&repo.url));
         conn.send(spec.to_json());
         conn.expect("run.heartbeat").await;
+        // A heartbeat goes out as soon as the run is active; the agent has written its file only
+        // once it speaks. A cancel before that would leave nothing to push.
+        conn.wait_running(spec.run_id).await;
         conn.send(json!({"type": "run.cancel", "runId": spec.run_id, "epoch": 1}));
         let t = conn.until_finished(spec.run_id).await;
         let finished = t.finished();

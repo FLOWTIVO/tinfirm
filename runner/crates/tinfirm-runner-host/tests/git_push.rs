@@ -38,6 +38,23 @@ fn bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(BIN))
 }
 const BRANCH: &str = "agent/TEST-1";
+
+/// Held shared by every test of this file for its whole body, and alone by a test that
+/// measures the memory of the whole process, which the tests of a file share: while one
+/// measures, no other runs.
+static QUIET: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// A test's body with an overall timeout, beside the file's other tests.
+async fn beside<F: std::future::Future<Output = ()>>(secs: u64, test: F) {
+    let _beside = QUIET.read().await;
+    with_timeout(secs, test).await
+}
+
+/// A test's body with an overall timeout, while no other test of this file runs.
+async fn alone<F: std::future::Future<Output = ()>>(secs: u64, test: F) {
+    let _alone = QUIET.write().await;
+    with_timeout(secs, test).await
+}
 const SETTINGS: PushSettings = PushSettings {
     client: PushClient::Host,
     allow_http: true,
@@ -275,7 +292,7 @@ fn assert_no_token(out: &GitOutput) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pushes_a_new_branch_and_an_update_with_the_lease() {
-    with_timeout(120, async {
+    beside(120, async {
         for packer in [Packer::Plain, Packer::Reader] {
             let scene = Scene::new("sha1", true).await;
             let host = scene.clone_host(packer);
@@ -339,7 +356,7 @@ async fn pushes_a_new_branch_and_an_update_with_the_lease() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pushes_to_sha256_repositories_and_to_an_empty_one() {
-    with_timeout(120, async {
+    beside(120, async {
         for (format, seeded, packer) in [
             ("sha256", true, Packer::Plain),
             ("sha256", true, Packer::Reader),
@@ -385,7 +402,7 @@ async fn pushes_to_sha256_repositories_and_to_an_empty_one() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_branch_that_moved_was_created_or_was_deleted_is_refused_before_anything_is_sent() {
-    with_timeout(120, async {
+    beside(120, async {
         // (whether the branch exists at clone time, what happens to it during the run)
         for (existed, deleted) in [(true, false), (false, false), (true, true)] {
             let scene = Scene::new("sha1", true).await;
@@ -424,7 +441,7 @@ async fn a_branch_that_moved_was_created_or_was_deleted_is_refused_before_anythi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_repository_checks_the_lease_again_when_the_branch_changes_after_the_discovery() {
-    with_timeout(120, async {
+    beside(120, async {
         for existed in [true, false] {
             let scene = Scene::new("sha1", true).await;
             if existed {
@@ -471,7 +488,7 @@ async fn the_repository_checks_the_lease_again_when_the_branch_changes_after_the
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_revoked_before_the_push_pushes_nothing() {
-    with_timeout(120, async {
+    beside(120, async {
         let scene = Scene::new("sha1", true).await;
         let host = scene.clone_host(Packer::Plain);
         scene.commit("work.txt", b"work\n");
@@ -490,7 +507,7 @@ async fn a_token_revoked_before_the_push_pushes_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repository_that_refuses_the_push_is_reported_as_git_reports_it() {
-    with_timeout(120, async {
+    beside(120, async {
         let scene = Scene::new("sha1", true).await;
         let hook = scene.bare.join("hooks/pre-receive");
         std::fs::write(
@@ -585,13 +602,12 @@ async fn push_large(size: usize) -> (f64, Option<u64>, SeenRequest) {
 }
 
 /// A pack of 48 MiB goes in chunks (no length), and this process (the client, and the test's
-/// server, which streams too) never holds it: its memory grows by less than half the pack.
-/// The bound is not tighter because the measure is the whole process's: alone, this test grows
-/// it by about 6 MiB, and the other tests of this file, which run beside it in the same
-/// process, add theirs (17 to 18 MiB together on a loaded machine).
+/// server, which streams too) never holds it: its memory grows by less than half the pack
+/// (by about 6 MiB when it was measured). The measure is the whole process's, so the test
+/// runs alone in it (`alone`): beside the file's other tests it counted their memory too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_pack_is_streamed_in_chunks_and_never_held_whole() {
-    with_timeout(300, async {
+    alone(300, async {
         let size = 48 << 20;
         let (seconds, growth, request) = push_large(size).await;
         assert!(
@@ -614,7 +630,7 @@ async fn a_large_pack_is_streamed_in_chunks_and_never_held_whole() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "pushes 2 GiB: run by hand for the time and memory it takes"]
 async fn a_pack_of_2_gib_is_streamed() {
-    with_timeout(3600, async {
+    alone(3600, async {
         let (seconds, growth, request) = push_large(2 << 30).await;
         assert!(request.chunked);
         eprintln!("2 GiB pushed in {seconds:.1} s; peak growth {growth:?} KiB");
@@ -629,7 +645,7 @@ async fn a_pack_of_2_gib_is_streamed() {
 /// request is broken off, and the repository takes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pack_cut_short_is_never_taken() {
-    with_timeout(120, async {
+    beside(120, async {
         let scene = Scene::new("sha1", true).await;
         let host = scene.clone_host(Packer::Plain);
         // The older commit has the blob that breaks, the newer one (HEAD) a large good one and
@@ -868,7 +884,7 @@ fn failed(outcome: &Outcome) -> &str {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_redirect_is_followed_nowhere_and_the_token_goes_nowhere_else() {
-    with_timeout(60, async {
+    beside(60, async {
         let elsewhere = fake_host(
             (
                 200,
@@ -910,7 +926,7 @@ async fn a_redirect_is_followed_nowhere_and_the_token_goes_nowhere_else() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn answers_that_are_no_ref_advertisement_are_refused_before_any_push() {
-    with_timeout(60, async {
+    beside(60, async {
         let cases: Vec<(&str, InfoAnswer)> = vec![
             (
                 "returned error: 401",
@@ -1007,7 +1023,7 @@ async fn answers_that_are_no_ref_advertisement_are_refused_before_any_push() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hostile_or_broken_reports_are_failures_and_never_a_push() {
-    with_timeout(60, async {
+    beside(60, async {
         let band = |b: u8, text: &str| {
             let mut data = vec![b];
             data.extend_from_slice(text.as_bytes());
@@ -1056,7 +1072,7 @@ async fn hostile_or_broken_reports_are_failures_and_never_a_push() {
 /// capabilities the repository named, and `object-format` and `agent` only when it named them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_command_names_the_lease_and_only_capabilities_the_repository_named() {
-    with_timeout(60, async {
+    beside(60, async {
         let ok = format!("ok refs/heads/{BRANCH}");
         let ok = sideband_report(&[], &["unpack ok", &ok]);
         for (caps, expected) in [
@@ -1102,7 +1118,7 @@ async fn the_command_names_the_lease_and_only_capabilities_the_repository_named(
 /// sends no pack.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_revoked_after_the_ref_discovery_sends_no_pack() {
-    with_timeout(60, async {
+    beside(60, async {
         let (_dir, host, main) = host_for("http://127.0.0.1:9/origin.git");
         // The fake host's URL is known once it listens: the clone's holder is made for it, and
         // the answer to the GET revokes its token.
@@ -1164,7 +1180,7 @@ fn fake_pack_reader(dir: &Path, pack_body: &str) -> PathBuf {
 /// writer has ended well: nothing is taken, and the run is told so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_writer_that_fails_after_a_whole_pack_never_sends_its_end() {
-    with_timeout(120, async {
+    beside(120, async {
         let scene = Scene::new("sha1", true).await;
         let mut host = scene.clone_host(Packer::Plain);
         let tmp = tempfile::tempdir().unwrap();
@@ -1195,7 +1211,7 @@ async fn a_writer_that_fails_after_a_whole_pack_never_sends_its_end() {
 /// through `push_outcome_within`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_writer_that_stalls_is_ended_by_the_pushs_deadline() {
-    with_timeout(60, async {
+    beside(60, async {
         let scene = Scene::new("sha1", true).await;
         let mut host = scene.clone_host(Packer::Plain);
         let tmp = tempfile::tempdir().unwrap();
@@ -1242,7 +1258,7 @@ async fn a_writer_that_stalls_is_ended_by_the_pushs_deadline() {
 /// The host's client pushes to it, as `git push` does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shallow_repository_on_the_code_host_takes_the_push_as_from_git() {
-    with_timeout(120, async {
+    beside(120, async {
         let scene = Scene::new("sha1", true).await;
         // `main` two commits deep, and the repository shallow at its tip.
         let tree = git(&scene.bare, &["rev-parse", "main^{tree}"]);
