@@ -898,6 +898,66 @@ async fn a_front_stays_on_sigterm_and_ends_with_its_handle() {
     assert!(gone(pid).await, "the front outlived its handle");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_out_of_the_wires_bounds_fails_its_sender_and_never_goes() {
+    use front::head::ResponseHead;
+    let handle = FrontHandle::spawn(&the_front(), uuid::Uuid::new_v4())
+        .await
+        .unwrap();
+    let descriptor = || Some(std::os::fd::OwnedFd::from(std::io::pipe().unwrap().1));
+    let long = "p".repeat(wire::MAX_FILES_PATH + 1);
+    for (message, descriptor, why) in [
+        (
+            ToFront::Response {
+                req: 1,
+                head: ResponseHead {
+                    status: 999,
+                    headers: Vec::new(),
+                },
+            },
+            None,
+            "an answer with the status 999",
+        ),
+        (
+            ToFront::Get {
+                id: 1,
+                dir: "/workspace".into(),
+                paths: vec![long.clone()],
+                exclude: Vec::new(),
+                timeout_ms: 1000,
+            },
+            descriptor(),
+            "a get's paths out of bounds",
+        ),
+        (
+            ToFront::Put {
+                id: 2,
+                dir: long.clone(),
+                timeout_ms: 1000,
+            },
+            descriptor(),
+            "a put's directory out of bounds",
+        ),
+        (
+            ToFront::Refused {
+                req: 1,
+                status: 200,
+                message: "no".into(),
+                off_allowlist: false,
+            },
+            None,
+            "a refusal with the status 200",
+        ),
+    ] {
+        let error = handle.send(&message, descriptor).await.unwrap_err();
+        assert!(format!("{error:#}").contains(why), "{error:#}");
+    }
+    // A front exits on any of them, and on an answer to nothing it asked: none went, and it
+    // still answers.
+    handle.ping().await.unwrap();
+    assert_eq!(handle.ended(), None);
+}
+
 /// The descriptors of this process that point at `path`.
 fn descriptors_of(path: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
@@ -1553,6 +1613,69 @@ async fn only_the_allowlists_refusal_says_denied_in_a_front() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn only_the_allowlists_refusal_says_denied_in_run() {
     only_the_allowlists_refusal_says_denied(None).await;
+}
+
+async fn a_destination_that_is_no_host_and_port_is_a_bad_request(front: Option<FrontCommand>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = echo_and_http().await;
+    let guard = egress_with(front, &[format!("127.0.0.1:{}", server.port())], true).await;
+    let auth = guard.proxy_authorization().to_string();
+    // The port 0, a host longer than a DNS name, and a host that is nothing but its dot: a
+    // front may not ask `run` for any of them, which would end it.
+    let long = "a".repeat(wire::MAX_HOST + 1);
+    for request_line in [
+        "CONNECT example.com:0 HTTP/1.1".to_string(),
+        format!("CONNECT {long}:443 HTTP/1.1"),
+        "CONNECT .:443 HTTP/1.1".to_string(),
+        "GET http://example.com:0/ HTTP/1.1".to_string(),
+    ] {
+        let (mut stream, head) = proxy_request(
+            &guard,
+            &format!("{request_line}\r\nHost: x\r\nProxy-Authorization: {auth}\r\n\r\n"),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{request_line}: {head}");
+        let length: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "tinfirm egress proxy: CONNECT needs host:port\n",
+            "{request_line}"
+        );
+    }
+    // The proxy goes on, and so does the front that serves it, where one does.
+    if let Some(front) = guard.front() {
+        assert!(front.ended().is_none(), "{:?}", front.ended());
+    }
+    let (mut tunnel, head) = proxy_request(
+        &guard,
+        &format!(
+            "CONNECT {server} HTTP/1.1\r\nHost: {server}\r\nProxy-Authorization: {auth}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    tunnel.write_all(b"still there").await.unwrap();
+    let mut echoed = [0u8; 11];
+    tunnel.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"still there");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destination_that_is_no_host_and_port_is_a_bad_request_in_a_front() {
+    a_destination_that_is_no_host_and_port_is_a_bad_request(Some(the_front())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destination_that_is_no_host_and_port_is_a_bad_request_in_run() {
+    a_destination_that_is_no_host_and_port_is_a_bad_request(None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -19,7 +19,8 @@
 //!   request that was forwarded before the revocation finishes: it carried the token already,
 //!   and cutting its response would only break the sandbox's clone.
 //! - Redirects are not followed, and an upstream 401 is not passed on (it would make git in
-//!   the sandbox ask for credentials).
+//!   the sandbox ask for credentials). Neither is a status that HTTP does not define (600 to
+//!   999): each is a 502.
 //!
 //! One listener serves every run. A run registers one route per repository when its
 //! workspace is ready; the [`RouteGuard`] removes it when the run ends. The route's secret
@@ -1363,6 +1364,15 @@ async fn forward(
             "the git server rejected the runner host's git credentials",
         );
     }
+    // HTTP defines the statuses 100 to 599, and an answer's head takes no other on its way to
+    // a sandbox's front (crate::front::wire): the client of the proxy gets none either.
+    if !(100..=599).contains(&status.as_u16()) {
+        tracing::warn!(run_id = %route.run_id, status = status.as_u16(), "git proxy: the git server answered with a status that HTTP does not define; not passing it on");
+        return text(
+            StatusCode::BAD_GATEWAY,
+            "the git server answered with a status that HTTP does not define",
+        );
+    }
     let (upstream_parts, upstream_body) = response.into_parts();
     let mut out = Response::new(
         upstream_body
@@ -2374,6 +2384,46 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, "upstream body");
+    }
+
+    async fn a_status_that_http_does_not_define_is_a_bad_gateway(mode: Mode) {
+        // hyper takes any status of three digits from the git server; a front takes 100 to 599
+        // from `run`, and exits on any other.
+        let odd = FakeUpstream::start(reply_status(
+            StatusCode::from_u16(999).unwrap(),
+            (header::CONTENT_TYPE, "text/plain"),
+        ))
+        .await;
+        let fine = FakeUpstream::start(reply_ok()).await;
+        let proxy = proxy_in(mode).await;
+        let refs = "/info/refs?service=git-upload-pack";
+        let route = register(&proxy, &odd, "/acme/widgets.git");
+        let (status, _, body) = request(
+            &proxy,
+            Method::GET,
+            &format!("{}{refs}", prefix(&route)),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body,
+            "the git server answered with a status that HTTP does not define\n"
+        );
+        // The proxy answers the next request, and in a front, the front has not ended.
+        let route = register(&proxy, &fine, "/acme/gadgets.git");
+        let (status, _, body) = request(
+            &proxy,
+            Method::GET,
+            &format!("{}{refs}", prefix(&route)),
+            &[],
+            b"",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "0000");
+        nothing_stays(&proxy).await;
     }
 
     async fn an_unreachable_upstream_is_a_bad_gateway(mode: Mode) {
@@ -3887,6 +3937,7 @@ mod tests {
         each_secret_reaches_only_its_own_repository_until_the_run_ends,
         oversized_request_bodies_are_refused,
         redirects_and_credential_challenges_are_not_passed_on,
+        a_status_that_http_does_not_define_is_a_bad_gateway,
         an_unreachable_upstream_is_a_bad_gateway,
         a_slow_git_body_is_cut_by_the_deadline,
         a_slow_mcp_body_is_cut_by_the_deadline,

@@ -820,6 +820,16 @@ impl Refusal {
             off_allowlist: false,
         }
     }
+
+    /// The answer to a destination that is no host and port to connect to: the port 0, no
+    /// host, or a host longer than a DNS name. The broker gives it, and so does a front before
+    /// it asks `run` (crate::front::serve), whose wire carries no such destination.
+    pub(crate) fn bad_destination() -> Refusal {
+        Refusal::new(
+            StatusCode::BAD_REQUEST,
+            "tinfirm egress proxy: CONNECT needs host:port\n",
+        )
+    }
 }
 
 impl RunState {
@@ -834,10 +844,7 @@ impl RunState {
     ) -> std::result::Result<(TcpStream, tokio::sync::OwnedSemaphorePermit), Refusal> {
         if port == 0 || host.is_empty() || host.len() > crate::front::wire::MAX_HOST {
             self.denied_count.fetch_add(1, Ordering::Relaxed);
-            return Err(Refusal::new(
-                StatusCode::BAD_REQUEST,
-                "tinfirm egress proxy: CONNECT needs host:port\n",
-            ));
+            return Err(Refusal::bad_destination());
         }
         let target = Target::new(host, port);
         if target.ip.is_none()

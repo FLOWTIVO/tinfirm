@@ -423,6 +423,10 @@ impl FrontHandle {
         if message.descriptors() != descriptors.len() {
             bail!("a message of the wire with descriptors it does not carry, or without them");
         }
+        // The front checks the same bounds and exits on a message out of them. A field that
+        // `run` did not make itself (a path of a tool call, an upstream's status) can be out of
+        // them: the message does not go, its caller fails, and the front lives.
+        message.check().map_err(wire::WireError::OutOfBounds)?;
         if let Some(ended) = self.ended() {
             bail!("{ended}");
         }

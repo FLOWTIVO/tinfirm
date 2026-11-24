@@ -57,7 +57,8 @@
 //!   `--model-proxy-local-gateway` names ([`local_gateway_origin`]) may be on loopback and this
 //!   machine's own addresses, such as a LiteLLM next to the runner host. The listener's own address
 //!   and the addresses no gateway has (cloud metadata, link-local, reserved) stay refused for it
-//!   too. Redirects are not followed (`502`).
+//!   too. Redirects are not followed (`502`), and an answer with a status that HTTP does not
+//!   define (600 to 999) is not passed on (`502`).
 //! - **Streaming.** The answer goes back as it arrives (SSE); nothing is buffered and a streaming
 //!   answer has no total timeout, only an idle one ([`IDLE_TIMEOUT`]) between two of its parts.
 //!   The request body streams too, up to [`MAX_REQUEST_BODY`]. At most [`MAX_CONNECTIONS`]
@@ -1089,6 +1090,15 @@ impl RunState {
             return error(
                 StatusCode::BAD_GATEWAY,
                 "the model gateway asked for proxy authentication",
+            );
+        }
+        // HTTP defines the statuses 100 to 599, and an answer's head takes no other on its way
+        // to a sandbox's front (crate::front::wire): the client of the proxy gets none either.
+        if !(100..=599).contains(&status.as_u16()) {
+            tracing::warn!(run_id = %state.run_id, status = status.as_u16(), "model proxy: the gateway answered with a status that HTTP does not define; not passing it on");
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "the model gateway answered with a status that HTTP does not define",
             );
         }
         let (mut head, body) = response.into_parts();
@@ -2313,6 +2323,38 @@ mod tests {
         assert!(body.contains("Budget has been exceeded"), "{body}");
     }
 
+    async fn a_status_that_http_does_not_define_is_a_bad_gateway(mode: Mode) {
+        // hyper takes any status of three digits from the gateway; a front takes 100 to 599
+        // from `run`, and exits on any other.
+        let gateway = FakeGateway::start(Arc::new(|seen: &Seen| {
+            if seen.body.as_ref() == b"{}" {
+                return Reply::ok("{}");
+            }
+            Reply {
+                status: StatusCode::from_u16(999).unwrap(),
+                headers: vec![("content-type", "application/json".into())],
+                parts: vec![Some(r#"{"error":{"message":"from the gateway"}}"#.into())],
+            }
+        }))
+        .await;
+        let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
+        let path = format!("{}/v1/messages", base_path(&guard));
+        let (status, _, body) =
+            request(&guard, Method::POST, &path, &[], r#"{"status":999}"#).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            body.contains("a status that HTTP does not define"),
+            "{body}"
+        );
+        assert!(!body.contains("from the gateway"), "{body}");
+        // The proxy answers the next request, and in a front, the front has not ended.
+        let (status, _, body) = request(&guard, Method::POST, &path, &[], "{}").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "{}");
+        assert_eq!(gateway.seen().len(), 2);
+        nothing_stays(&guard).await;
+    }
+
     async fn oversized_request_bodies_are_refused(mode: Mode) {
         let gateway = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
         let guard = start_in(mode, ModelFormat::Anthropic, &gateway.url("")).await;
@@ -3044,6 +3086,7 @@ mod tests {
         a_key_in_the_answer_never_reaches_the_sandbox,
         redirects_are_not_followed,
         gateway_errors_pass_through,
+        a_status_that_http_does_not_define_is_a_bad_gateway,
         oversized_request_bodies_are_refused,
         the_gateways_address_is_checked,
         only_the_named_local_gateway_may_be_on_this_machine,

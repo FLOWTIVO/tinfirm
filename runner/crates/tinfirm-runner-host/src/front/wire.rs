@@ -710,18 +710,7 @@ impl ToMain {
                 }
                 Ok(())
             }
-            ToMain::Connect { host, port, .. } => {
-                if host.is_empty() || host.len() > MAX_HOST {
-                    return Err(format!("a destination of {} bytes", host.len()));
-                }
-                if !host.bytes().all(|b| b.is_ascii_graphic()) {
-                    return Err("a destination with a byte that no host name has".into());
-                }
-                if *port == 0 {
-                    return Err("a destination with the port 0".into());
-                }
-                Ok(())
-            }
+            ToMain::Connect { host, port, .. } => check_destination(host, *port),
             ToMain::Request { head, .. } => head.check(),
             ToMain::Hello { hello, .. } => hello.check(),
             ToMain::Answer { reply, .. } => match reply {
@@ -767,6 +756,22 @@ impl ToMain {
             _ => MAX_TO_MAIN,
         }
     }
+}
+
+/// The bounds of a destination that a front asks `run` for ([`ToMain::Connect`]). A front
+/// checks them before it asks, and answers its client itself for one out of them: `run` ends a
+/// front whose message is out of its bounds.
+pub fn check_destination(host: &str, port: u16) -> Result<(), String> {
+    if host.is_empty() || host.len() > MAX_HOST {
+        return Err(format!("a destination of {} bytes", host.len()));
+    }
+    if !host.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err("a destination with a byte that no host name has".into());
+    }
+    if port == 0 {
+        return Err("a destination with the port 0".into());
+    }
+    Ok(())
 }
 
 /// What is wrong with a frame.
@@ -959,7 +964,10 @@ mod tests {
                 ),
                 "{host:?}:{port}"
             );
+            // What a front checks before it asks, so that it never sends such a message.
+            assert!(check_destination(host, port).is_err(), "{host:?}:{port}");
         }
+        assert!(check_destination(&"a".repeat(MAX_HOST), 443).is_ok());
     }
 
     #[test]

@@ -1550,6 +1550,42 @@ async fn a_put_whose_packing_fails_ends_at_once_with_the_hosts_own_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_path_longer_than_the_wire_takes_fails_its_call_and_the_front_goes_on() {
+    let _one = SERIAL.lock().await;
+    let (front, session, bridge, _, _) = connected("run-front-long-path").await;
+    let host = tempfile::tempdir().unwrap();
+    let source = host.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("in.txt"), "from the host\n").unwrap();
+    let dir = host.path().to_str().unwrap().to_string();
+    let files = session.files();
+    // As the upload tools ask for a file whose path the agent names: over 4096 bytes.
+    let long = format!("{}x", "a/".repeat(2100));
+    let got = files
+        .receive(&dir, vec![long.clone()], Vec::new(), WAIT, |input| {
+            reader().read_one_from(input, 1024, WAIT)
+        })
+        .await;
+    let error = format!("{:#}", got.unwrap_err());
+    assert!(error.contains("a get's paths out of bounds"), "{error}");
+    let put = files
+        .put_dir(&source, &format!("{dir}/{long}"), Vec::new(), WAIT)
+        .await;
+    let error = format!("{:#}", put.unwrap_err());
+    assert!(error.contains("a put's directory out of bounds"), "{error}");
+    // A front exits on a message out of its bounds: neither went, and the session goes on.
+    eventually("no reader stays", || children() == 1).await;
+    let out = files
+        .exec(&["echo", "still"], &[], None, None, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(out.stdout, "still\n");
+    assert_eq!(front.handle().bridge_waiting(), (0, 0));
+    assert!(front.handle().ended().is_none());
+    assert_eq!(finish(&session, bridge).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_put_or_a_get_cut_by_the_bridge_or_the_front_leaves_nothing_in_run() {
     let _one = SERIAL.lock().await;
     let host = tempfile::tempdir().unwrap();

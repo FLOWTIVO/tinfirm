@@ -215,6 +215,13 @@ impl Connector for WireConnector {
         host: String,
         port: u16,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Granted, Refusal>> + Send>> {
+        // The proxy's HTTP side hands on whatever host and port a client's request parses to:
+        // the port 0, no host, a host longer than a DNS name. `run` ends a front that asks it
+        // for such a destination, so the client is answered here, with the answer the broker
+        // has for it.
+        if wire::check_destination(&host, port).is_err() {
+            return Box::pin(async { Err(Refusal::bad_destination()) });
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (req, sent) = self.writer.send_new(|req| {
             self.waiting
