@@ -214,6 +214,8 @@ Count every connection against the database server's `max_connections`:
 | Each LiteLLM pod | Up to 10, its pool | `connection_limit` in `litellm.database.params` |
 | You | Your administrative sessions, backups and monitoring | |
 
+A request that finds no free connection of its pod's pool within `SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT` (30 seconds by default) is answered `503` with `Retry-After` when it is a read, or a write that cannot have saved anything yet: the client may send it again. A write that may already have saved a change before a later step found no connection is answered `500` with a detail that says so: the client looks at the result before it sends anything again. A larger pool serves more requests at once only while the database server keeps up.
+
 During an upgrade, a new server pod starts before the old one stops, so count one server pod more than `replicaCount`. With the defaults, one server pod and one LiteLLM pod on the same database server: 2 × (10 + a few) for the server during an upgrade, 10 for LiteLLM, plus PostgreSQL's `superuser_reserved_connections` and your own sessions. A server with `max_connections` of 100 has room to spare.
 
 ### Connection poolers

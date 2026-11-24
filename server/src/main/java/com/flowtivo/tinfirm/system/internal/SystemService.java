@@ -57,6 +57,7 @@ import com.flowtivo.tinfirm.shared.security.ActorType;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.sql.Constraints;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 import com.flowtivo.tinfirm.system.CallResult;
@@ -150,6 +151,9 @@ class SystemService {
 
     private final TransactionTemplate transactions;
 
+    /** The authorisation before a call to a system: bookkeeping, not the request's change. */
+    private final TransactionTemplate authorisations;
+
     /** The system's GitHub App (ADR-0116), looked up when used. */
     private final ObjectProvider<GitHubAppService> gitHubApps;
 
@@ -192,6 +196,8 @@ class SystemService {
         this.events = events;
         this.mapper = mapper;
         this.transactions = new TransactionTemplate(transactionManager);
+        this.authorisations = new TransactionTemplate(transactionManager);
+        this.authorisations.setName(AfterTransaction.BOOKKEEPING);
         this.time = time;
         this.chatSystems = chatSystems;
         this.chatEndpoints = chatEndpoints;
@@ -205,10 +211,10 @@ class SystemService {
 
     /** Authorises the caller to manage the system, in a transaction of its own before a call to it. */
     Managed managed(UUID companyId, UUID systemId) {
-        return inTransaction(() -> {
+        return Objects.requireNonNull(authorisations.execute(status -> {
             SystemAccess.Caller caller = access.caller(companyId);
             return new Managed(caller, access.managed(caller, systemId));
-        });
+        }));
     }
 
     /** Work in a transaction of its own, in the tenant context the request entered. */

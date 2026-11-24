@@ -18,8 +18,13 @@ public class SystemTransactions {
 
     private final TransactionTemplate transactions;
 
+    /** The same transactions, named {@link AfterTransaction#BOOKKEEPING}: lookups that are not a request's change. */
+    private final TransactionTemplate lookups;
+
     public SystemTransactions(PlatformTransactionManager transactionManager) {
         this.transactions = new TransactionTemplate(transactionManager);
+        this.lookups = new TransactionTemplate(transactionManager);
+        this.lookups.setName(AfterTransaction.BOOKKEEPING);
     }
 
     /** A transaction scoped to one company, as actor SYSTEM without instance-admin rights. */
@@ -45,5 +50,19 @@ public class SystemTransactions {
      */
     public <T> T unscoped(Supplier<T> work) {
         return SystemContext.callUnscoped(() -> transactions.execute(status -> work.get()));
+    }
+
+    /**
+     * {@link #inCompany}, for a lookup that is not the request's change (an authentication's, a routing's): its commit
+     * does not count as one ({@link AfterTransaction#savedInThisWork}). Only for work that changes nothing a client
+     * would call its request's.
+     */
+    public <T> T lookupInCompany(UUID companyId, Supplier<T> work) {
+        return SystemContext.callInCompany(companyId, () -> lookups.execute(status -> work.get()));
+    }
+
+    /** {@link #unscoped}, for a lookup that is not the request's change, as {@link #lookupInCompany}. */
+    public <T> T lookupUnscoped(Supplier<T> work) {
+        return SystemContext.callUnscoped(() -> lookups.execute(status -> work.get()));
     }
 }

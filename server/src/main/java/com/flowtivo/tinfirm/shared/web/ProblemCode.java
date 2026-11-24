@@ -7,6 +7,14 @@ package com.flowtivo.tinfirm.shared.web;
 public enum ProblemCode {
     VALIDATION_FAILED,
     RATE_LIMITED,
+    /**
+     * 503 with {@code Retry-After}: no database connection of the replica was free within
+     * {@code SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT}. Given to a read (GET, HEAD, OPTIONS), and to a write in which
+     * nothing can be saved yet (no transaction that was neither read-only nor bookkeeping had committed in it): both may
+     * be sent again. A write in which one had committed gets a 500 that says a change of it may already be saved
+     * instead, never this ({@link ServerBusy}).
+     */
+    SERVER_BUSY,
     DUPLICATE_EMAIL,
     DUPLICATE_SECRET_NAME,
     /**

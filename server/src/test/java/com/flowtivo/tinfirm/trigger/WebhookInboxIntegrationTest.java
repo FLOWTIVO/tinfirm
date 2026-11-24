@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 
 import com.flowtivo.tinfirm.chat.ChatTestBench;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 
 import tools.jackson.databind.JsonNode;
 
@@ -31,6 +32,10 @@ class WebhookInboxIntegrationTest extends ChatTestBench {
     private static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
     private int deliver(String systemId, String secret) {
+        return delivery(systemId, secret).statusCode();
+    }
+
+    private HttpResponse<String> delivery(String systemId, String secret) {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/hooks/" + systemId))
             .timeout(Duration.ofSeconds(20))
             .header("Content-Type", "application/json")
@@ -38,7 +43,7 @@ class WebhookInboxIntegrationTest extends ChatTestBench {
             .POST(HttpRequest.BodyPublishers.ofString("{\"id\":\"" + UUID.randomUUID() + "\"}"))
             .build();
         try {
-            return HTTP.send(request, HttpResponse.BodyHandlers.ofString()).statusCode();
+            return HTTP.send(request, HttpResponse.BodyHandlers.ofString());
         }
         catch (IOException ex) {
             throw new IllegalStateException(ex);
@@ -59,6 +64,28 @@ class WebhookInboxIntegrationTest extends ChatTestBench {
         assertThat(created.status()).as("%s", created).isEqualTo(201);
         return new Hook(UUID.fromString(created.json().get("id").asString()),
                 created.json().get("webhook").get("secret").asString());
+    }
+
+    /**
+     * A delivery whose own transaction finds no free connection: the lookups of its system before it (the secret's
+     * reveal with its record included) are no change of the request, so the sender is told the server is busy, and
+     * nothing is stored.
+     */
+    @Test
+    void aDeliveryThatFindsNoFreeConnectionForItsOwnTransactionIsToldTheServerIsBusy() throws Exception {
+        Bench bench = bench(false);
+        Hook hook = hook(bench);
+
+        HttpResponse<String> delivered;
+        try (AutoCloseable busy = ConnectionWatch.timeOutAt("com.flowtivo.tinfirm.trigger.internal.WebhookReceiver")) {
+            delivered = delivery(hook.id().toString(), hook.secret());
+        }
+
+        assertThat(delivered.statusCode()).as(delivered.body()).isEqualTo(503);
+        assertThat(delivered.body()).contains("SERVER_BUSY");
+        assertThat(delivered.headers().firstValue("Retry-After")).hasValue("2");
+        assertThat(bench.admin().get(bench.path("/systems/" + hook.id() + "/webhook/deliveries")).json().get("items"))
+            .isEmpty();
     }
 
     @Test

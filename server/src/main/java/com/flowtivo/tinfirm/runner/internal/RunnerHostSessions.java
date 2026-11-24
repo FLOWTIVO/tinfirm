@@ -75,7 +75,7 @@ class RunnerHostSessions {
     /** The host of the token: a company host, placed, or a machine with its presences, unplaced. */
     Optional<ConnectedHost> authenticate(String token) {
         String hash = RunnerTokens.hash(token);
-        List<RunnerHostStore.TokenOwner> owners = transactions.unscoped(() -> store.hostForToken(hash));
+        List<RunnerHostStore.TokenOwner> owners = transactions.lookupUnscoped(() -> store.hostForToken(hash));
         if (owners.isEmpty()) {
             return Optional.empty();
         }
@@ -94,7 +94,7 @@ class RunnerHostSessions {
 
     /** The company of a run, whatever company the host is in; empty for a run the server does not know. */
     Optional<UUID> runCompany(UUID runId) {
-        return transactions.unscoped(() -> store.runCompany(runId));
+        return transactions.lookupUnscoped(() -> store.runCompany(runId));
     }
 
     /**
@@ -104,7 +104,7 @@ class RunnerHostSessions {
      * again, and the placed host carries them ({@link ConnectedHost#presences()}).
      */
     Optional<ConnectedHost> placeForRun(ConnectedHost host, UUID runId) {
-        Optional<UUID> company = transactions.unscoped(() -> store.runCompany(runId));
+        Optional<UUID> company = transactions.lookupUnscoped(() -> store.runCompany(runId));
         if (company.isEmpty()) {
             return Optional.empty();
         }
@@ -119,7 +119,7 @@ class RunnerHostSessions {
     private ConnectedHost refreshed(ConnectedHost host) {
         UUID machine = Objects.requireNonNull(host.personalHostId());
         Map<UUID, UUID> presences = new LinkedHashMap<>();
-        transactions.unscoped(() -> store.presences(machine))
+        transactions.lookupUnscoped(() -> store.presences(machine))
             .forEach(presence -> presences.put(presence.companyId(), presence.runnerHostId()));
         return host.withPresences(presences);
     }

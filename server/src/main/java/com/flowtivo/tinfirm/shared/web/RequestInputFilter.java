@@ -13,6 +13,8 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.servlet.HandlerExceptionResolver;
 
+import com.flowtivo.tinfirm.shared.tx.FailedAfterCommit;
+
 /**
  * The first filter of every request, before Spring Security's chains and the MCP endpoint's filter. When the
  * request's input cannot be read, it answers the problem that {@link ApiExceptionHandler} gives in the dispatcher,
@@ -56,23 +58,47 @@ final class RequestInputFilter extends OncePerRequestFilter {
             chain.doFilter(new NulRefusingRequest(request, scanBody), response);
         }
         catch (IOException | ServletException | RuntimeException ex) {
-            Exception refusal = refusal(ex);
-            if (refusal == null || response.isCommitted()) {
+            if (response.isCommitted()) {
                 throw ex;
             }
-            response.resetBuffer();
-            if (resolver.resolveException(request, response, null, refusal) == null) {
-                response.sendError(HttpServletResponse.SC_BAD_REQUEST);
+            Exception refusal = refusal(ex);
+            ServerBusy.Answer answer = refusal == null ? ServerBusy.decide(ex, request.getMethod())
+                    : ServerBusy.Answer.NONE;
+            if (refusal == null && answer == ServerBusy.Answer.NONE) {
+                throw ex;
             }
+            answer(request, response, refusal != null ? refusal : ServerBusy.exception(answer, ex));
+        }
+        catch (Error error) {
+            // An Error a step after a saved change threw is still answered as such, and then thrown as it is.
+            ServerBusy.Answer answer = ServerBusy.decide(error, request.getMethod());
+            if (answer == ServerBusy.Answer.SAVED_THEN_FAILED && !response.isCommitted()) {
+                answer(request, response, ServerBusy.exception(answer, error));
+                response.flushBuffer();
+            }
+            throw error;
+        }
+    }
+
+    private void answer(HttpServletRequest request, HttpServletResponse response, Exception refusal)
+            throws IOException {
+        response.resetBuffer();
+        if (resolver.resolveException(request, response, null, refusal) == null) {
+            response.sendError(HttpServletResponse.SC_BAD_REQUEST);
         }
     }
 
     /**
      * The cause that says the request's input cannot be read, or null: Tomcat's, a NUL in a JSON body, or the
-     * {@link ApiException} of a NUL in a parameter, which a filter's {@code getParameter} may throw.
+     * {@link ApiException} of a NUL in a parameter, which a filter's {@code getParameter} may throw. The answers for
+     * want of a database connection and after a commit are {@link ServerBusy}'s.
      */
     private static @Nullable Exception refusal(Throwable thrown) {
-        for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
+        int depth = 0;
+        for (Throwable cause = thrown; cause != null && depth < 32; cause = cause.getCause(), depth++) {
+            if (cause instanceof FailedAfterCommit) {
+                return null;
+            }
             if (cause instanceof InvalidParameterException || cause instanceof ApiException) {
                 return (Exception) cause;
             }

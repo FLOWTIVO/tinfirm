@@ -163,7 +163,7 @@ class WebhookInbox {
             return status(HttpStatus.CONTENT_TOO_LARGE);
         }
         byte[] raw = read.get();
-        WebhookSystems.WebhookSystem system = transactions.inCompany(companyId,
+        WebhookSystems.WebhookSystem system = transactions.lookupInCompany(companyId,
                 () -> webhookSystems.find(companyId, id).orElse(null));
         if (system == null) {
             return status(HttpStatus.NOT_FOUND);
@@ -174,14 +174,14 @@ class WebhookInbox {
             return status(HttpStatus.UNAUTHORIZED);
         }
         WebhookVerifier.Signed signed = ((WebhookVerifier.Outcome.Verified) outcome).signed();
-        if (transactions.inCompany(companyId, () -> switches.runsStopped(companyId).isPresent())) {
+        if (transactions.lookupInCompany(companyId, () -> switches.runsStopped(companyId).isPresent())) {
             return stopped();
         }
         if (system.paused()) {
             return paused();
         }
         int perMinute = system.maxPerMinute() != null ? system.maxPerMinute()
-                : transactions.inCompany(companyId, () -> {
+                : transactions.lookupInCompany(companyId, () -> {
                     WebhookLimits found = limits.getIfAvailable();
                     return found != null ? found.defaultPerMinute(companyId) : 60;
                 });

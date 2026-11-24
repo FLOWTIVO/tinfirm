@@ -2,6 +2,8 @@ package com.flowtivo.tinfirm.company.internal;
 
 import java.util.Map;
 
+import jakarta.servlet.http.HttpServletRequest;
+
 import org.apache.tomcat.util.http.InvalidParameterException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +20,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 
 import com.flowtivo.tinfirm.company.scim.ScimException;
 import com.flowtivo.tinfirm.shared.web.ApiException;
+import com.flowtivo.tinfirm.shared.web.ServerBusy;
 
 /**
  * The SCIM endpoint's refusals in SCIM's own form (RFC 7644 §3.12), never {@code problem+json} (ADR-0087, decision
@@ -71,8 +74,16 @@ class ScimExceptionHandler {
         return scim(new ScimException(ex.status().value(), null, code));
     }
 
+    /**
+     * The same answers as outside SCIM ({@code ServerBusy}'s rule), in SCIM's form: a 503 with {@code Retry-After}, or
+     * a 500 that says a change of it may already be saved.
+     */
     @ExceptionHandler(RuntimeException.class)
-    ResponseEntity<Map<String, Object>> unexpected(RuntimeException ex) {
+    ResponseEntity<Map<String, Object>> unexpected(RuntimeException ex, HttpServletRequest request) {
+        ServerBusy.Answer answer = ServerBusy.decide(ex, request.getMethod());
+        if (answer != ServerBusy.Answer.NONE) {
+            return scim(ScimErrors.of(ServerBusy.exception(answer, ex)));
+        }
         log.error("A SCIM request failed", ex);
         return scim(new ScimException(500, null, "The request failed in Tinfirm"));
     }

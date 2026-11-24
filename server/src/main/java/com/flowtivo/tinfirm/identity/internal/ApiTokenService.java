@@ -27,6 +27,7 @@ import com.flowtivo.tinfirm.shared.security.AuthenticatedUser;
 import com.flowtivo.tinfirm.shared.security.BearerGrant;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 
@@ -272,7 +273,7 @@ class ApiTokenService {
      * malformed, unknown, revoked or expired, does not reach that company, or its user is deactivated. Records the use
      * at most once a minute per token.
      */
-    @Transactional
+    @Transactional(label = AfterTransaction.BOOKKEEPING)
     public Optional<ResolvedBearer> resolve(String presented, @Nullable UUID companyId) {
         if (!ApiTokens.isWellFormed(presented)) {
             return Optional.empty();

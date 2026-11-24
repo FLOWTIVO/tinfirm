@@ -540,6 +540,38 @@ class OAuthAuthorizationServerIntegrationTest extends IntegrationTest {
             .containsEntry("state", "s9");
     }
 
+    /**
+     * A consent whose own save finds no free connection: what committed before it (the session, the client's and the
+     * member's lookups) is no change of the request, so the person is told the server is busy, and nothing is saved:
+     * the request stays pending, and the same consent sent again is taken.
+     */
+    @Test
+    void aConsentWhoseSaveFindsNoFreeConnectionIsToldTheServerIsBusy() throws Exception {
+        UUID companyId = createCompany(admin(), unique("Busy Co"));
+        Member member = newMember(companyId, "OWNER");
+        String clientId = publishClient("Busy MCP Client", "http://localhost/callback", "http://127.0.0.1/callback");
+        String redirectUri = "http://localhost:43123/callback";
+        Map<String, String> consent = authorize(member, clientId, redirectUri, "tinfirm:read", companyId);
+        Map<String, Object> decision = Map.of("client_id", clientId, "state", consent.get("state"), "scope",
+                List.of("tinfirm:read"));
+
+        ApiResponse busy;
+        try (AutoCloseable ignored = ConnectionWatch
+            .timeOutAt(TransactionalAuthorizations.class.getName() + "$2.save")) {
+            busy = postForm(member.session(), "/oauth2/authorize", decision);
+        }
+
+        assertThat(busy.status()).as("%s", busy).isEqualTo(503);
+        assertThat(busy.problemCode()).isEqualTo("SERVER_BUSY");
+        assertThat(busy.header("Retry-After")).isEqualTo("2");
+        JsonNode company = member.session().get("/api/companies/" + companyId + "/audit-events?limit=50").json()
+            .get("items");
+        assertThat(events(company, "oauth.consent.granted")).isEmpty();
+        ApiResponse again = postForm(member.session(), "/oauth2/authorize", decision);
+        assertThat(again.status()).as("%s", again).isEqualTo(200);
+        assertThat(query(again.json().get("redirectUri").asString())).containsKey("code");
+    }
+
     @Test
     void theConsentNamesTheOwnersAndRefusesAnInstanceAdminWhoIsNoMember() {
         UUID companyId = createCompany(admin(), unique("Notice Co"));

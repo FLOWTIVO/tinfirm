@@ -90,7 +90,7 @@ class WebhookSystemsImpl implements WebhookSystems {
 
     @Override
     public Optional<UUID> companyOf(UUID systemId) {
-        return transactions.unscoped(() -> jdbc.sql("SELECT company_id FROM webhook_system_by_id(?)")
+        return transactions.lookupUnscoped(() -> jdbc.sql("SELECT company_id FROM webhook_system_by_id(?)")
             .param(systemId)
             .query(UUID.class)
             .optional());
@@ -113,7 +113,8 @@ class WebhookSystemsImpl implements WebhookSystems {
     @Override
     public Optional<Secrets> reveal(UUID companyId, UUID systemId, String purpose) {
         NoTransaction.require("Revealing a webhook system's secret");
-        return transactions.inCompany(companyId, () -> row(companyId, systemId, false).flatMap(row -> {
+        // The reveal marks the secret read and records it: bookkeeping, not a delivery's change.
+        return transactions.lookupInCompany(companyId, () -> row(companyId, systemId, false).flatMap(row -> {
             if (row.secretId() == null) {
                 return Optional.<Secrets>empty();
             }

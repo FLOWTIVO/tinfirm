@@ -37,6 +37,7 @@ import org.springframework.web.multipart.MaxUploadSizeExceededException;
 import org.springframework.web.multipart.MultipartException;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
+
 /**
  * Renders every error as {@code application/problem+json} with the {@code code} property of CONVENTIONS §6.
  * <p>
@@ -144,7 +145,12 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     }
 
     @ExceptionHandler(Exception.class)
-    ResponseEntity<ProblemDetail> handleUnexpected(Exception ex) {
+    ResponseEntity<ProblemDetail> handleUnexpected(Exception ex, HttpServletRequest request) {
+        // The rule of the answers after a commit and for want of a connection (ServerBusy); else as it always was.
+        ServerBusy.Answer answer = ServerBusy.decide(ex, request.getMethod());
+        if (answer != ServerBusy.Answer.NONE) {
+            return handleApiException(ServerBusy.exception(answer, ex));
+        }
         log.error("Unhandled exception", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
             .body(ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR, "Internal server error"));

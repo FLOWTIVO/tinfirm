@@ -7307,7 +7307,15 @@ components:
             `LICENCE_KEY_INVALID` (400), `LICENCE_KEY_EXPIRED`, `LICENCE_KEY_SUPERSEDED` and `LICENCE_SEATS_TOO_FEW`
             (409, `details.required`, `details.licensed`). SCIM (ADR-0087): `SCIM_NOT_ENABLED` and `SCIM_TOKEN_LIMIT`
             (409). Personal access tokens (ADR-0045): `TOKEN_LIMIT` and `TOKEN_EXPIRED` (409),
-            `RECENT_SIGN_IN_REQUIRED` (403).
+            `RECENT_SIGN_IN_REQUIRED` (403). Every operation of this document but the webhook
+            inbox's (which answers a delivery it could not store with a 503 of its own, without `Retry-After`):
+            `SERVER_BUSY` (503 with `Retry-After`) when the server found no free database connection in time, for a
+            GET, HEAD or OPTIONS, and for any other method only while no change of the request can be saved yet:
+            such a request may be sent again. Once a change of a write may be saved, a failure for want of a
+            connection, or of a step kept for after the commit, is a 500 without `Retry-After` whose detail is "The
+            request did not finish, but a change of it may already be saved. Look at the result before you send it
+            again."; any other failure is answered as it always is. An MCP tool's call, which this document does not
+            describe, answers in its tool error instead: `INTERNAL_ERROR` with that detail, or else "Try again later".
             OIDC login failures are not JSON: the server redirects to `/login?error=EMAIL_IN_USE`,
             to `/login?error=EMAIL_MISSING` when the IdP sent no usable email for a new user,
             to `/login?error=EMAIL_NOT_VERIFIED` when the provider's email trust does not accept
