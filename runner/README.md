@@ -935,7 +935,9 @@ The reader:
   then puts back the clone's `.git` configuration and reads `HEAD` again.
 - **git after the import.** The clone then holds objects a sandbox made, so every git command `run`
   runs on it afterwards (the ahead count, `HEAD`, the credential scan's listings) runs in a reader
-  too, read only. By default the push alone runs in `run`'s process tree, because it needs the run's
+  too, read only. A host that takes a run back after a restart reads the run's clone that way from
+  the start: the process before it may have made the import, also when the run's record does not
+  say so yet. By default the push alone runs in `run`'s process tree, because it needs the run's
   git token. It reads objects that `fsck` checked, from a clone whose configuration `run` restored,
   to the run's branch alone. A flaw in git's reading of such objects in the push would still reach
   that run's token and the files of `run`'s user: this is what is left of path C for the pack. With

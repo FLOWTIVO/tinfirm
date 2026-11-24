@@ -2052,28 +2052,34 @@ fn taken_back_dirs(run: &mut Run<'_>, collected: bool) -> TakenBackDirs {
 }
 
 /// The repositories of a run taken back, as its record keeps them: as cloned, with the
-/// holder's tokens, and how each came back from the sandbox when it did.
+/// holder's tokens, and how each came back from the sandbox when it did. Each reads through a
+/// reader from the start ([`Git::read_through`]): the earlier process may have taken a sandbox's
+/// objects into the clone, whether its record says so yet or not, and nothing else on this path
+/// would say so before git reads them.
 fn restore_repositories<'a>(
     run: &Run<'a>,
     record: &'a RunRecord,
     dirs: &TakenBackDirs,
 ) -> Vec<Repo<'a>> {
     let assign = &record.assign;
+    let reader = reader_of(run.shared);
     record
         .repos
         .iter()
         .filter_map(|kept| {
             let ws = assign.workspaces.iter().find(|ws| ws.dir == kept.dir)?;
+            let mut git = Git::restored(
+                dirs.workspace.join(&ws.dir),
+                ws,
+                git_identity(assign, Some(ws)),
+                kept.base_refs(),
+                kept.config_snapshot(),
+            )
+            .with_tokens(run.tokens.repo(ws.component_id));
+            git.read_through(reader.clone());
             Some(Repo {
                 ws,
-                git: Git::restored(
-                    dirs.workspace.join(&ws.dir),
-                    ws,
-                    git_identity(assign, Some(ws)),
-                    kept.base_refs(),
-                    kept.config_snapshot(),
-                )
-                .with_tokens(run.tokens.repo(ws.component_id)),
+                git,
                 cloned_head: kept.cloned_head.clone(),
                 cloned_commits: kept.cloned_commits,
                 collected: kept.collected.as_ref().map(CollectedRecord::restore),

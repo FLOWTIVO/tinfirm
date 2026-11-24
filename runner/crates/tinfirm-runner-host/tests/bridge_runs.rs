@@ -2285,6 +2285,68 @@ async fn a_host_killed_right_after_the_sandbox_stopped_has_its_run_pushed_and_re
     .await;
 }
 
+/// A reader program for a host in a process of its own that writes the job of each reader the
+/// host starts on a line of `reader-jobs` in `dir`, and then is the host's own reader.
+fn recording_reader(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let script = dir.join("recording-reader.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$2\" >> '{jobs}'\nexec '{real}' \"$@\"\n",
+            jobs = dir.join("reader-jobs").display(),
+            real = env!("CARGO_BIN_EXE_tinfirm-runner-host"),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_finishes_a_run_whose_work_came_back_reads_its_clone_through_readers() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let (dir, spec, _) =
+            a_host_killed_in_the_runs_end(&mut server, &repo.url, "stopped", "").await;
+        // Host B, in a process of its own, whose readers write down their jobs. It has no
+        // sandbox to collect from: the clone holds the sandbox's commits already.
+        let reader = recording_reader(dir.path());
+        let mut host_b = host_process_with(dir.path(), &server.url, true, Some(&reader), None);
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let t = conn.until_finished(spec.run_id).await;
+        assert_eq!(t.finished()["git"][0]["pushed"], true, "{}", t.text());
+        host_b.crash();
+        // What reads the sandbox's objects ran in a reader, on the run's clone: HEAD, the
+        // objects that are there, the count of commits ahead, and the scan of what the push
+        // sends.
+        let jobs = std::fs::read_to_string(dir.path().join("reader-jobs")).unwrap_or_default();
+        let clone = tinfirm_runner_host::paths::Paths::new(
+            dir.path().join("config"),
+            dir.path().join("data"),
+        )
+        .workspace(spec.run_id)
+        .join("repo");
+        let clone = serde_json::to_string(&clone).unwrap();
+        for args in [
+            r#"["rev-parse","HEAD"]"#,
+            r#"["cat-file","--batch-check"]"#,
+            r#"["rev-list","--count","--stdin"]"#,
+            r#"["cat-file","--batch"]"#,
+        ] {
+            assert!(
+                jobs.lines().any(|job| job.contains(r#""kind":"git""#)
+                    && job.contains(&clone)
+                    && job.contains(args)),
+                "no reader ran git {args} on the clone:\n{jobs}"
+            );
+        }
+    })
+    .await;
+}
+
 /// A run whose agent leaked a credential value, its host killed at `halt` of its end: the next
 /// host lets nothing of it leave, and reports the leak.
 async fn a_leak_survives_a_restart_in_the_runs_end(halt: &str) {
