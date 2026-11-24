@@ -515,6 +515,48 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
         }
     }
 
+    /** The first {@code run.git.revoke} the host got went before its first {@code run.cancel}. */
+    private void revokedBeforeTheCancel(FakeRunner runner) {
+        List<String> order = answerOrder(runner);
+        assertThat(order).as("%s", order).contains(REVOKE, "run.cancel");
+        assertThat(order.indexOf(REVOKE)).as("%s", order).isLessThan(order.indexOf("run.cancel"));
+    }
+
+    /**
+     * A revocation that another transaction committed and has not sent yet (a suspension's binding change, side by
+     * side with the suspension's cancel) goes before a live cancel of the run: a cancelled run pushes its work.
+     */
+    @Test
+    void aLiveCancelSendsFirstARevocationThatAnotherTransactionCommittedAndHasNotSentYet() throws SQLException {
+        Bench bench = bench(true);
+        UUID[] git = gitHost(bench, "Shop");
+        connectOwn(bench.member(), bench, git[0], "test-own-token");
+        UUID agentId = agent(bench.member(), bench, "Builder", "", List.<UUID[]>of(git), "WRITE", List.of());
+        try (FakeRunner runner = host(hostRef(bench), List.of(REVOKE), List.of())) {
+            JsonNode assign = running(bench, runner, agentId);
+            String runId = assign.get("runId").asString();
+            String componentId = assign.get("workspaces").get(0).get("componentId").asString();
+            try (TenantSql sql = TenantSql.in(bench.id())) {
+                sql.update("""
+                        INSERT INTO run_command (id, company_id, run_id, type, status, created_at, epoch,
+                                                 component_ids, reason, message, delivery)
+                        VALUES (gen_random_uuid(), ?, ?, 'REVOKE_GIT', 'PENDING', now(), ?, ARRAY[?]::uuid[],
+                                'SUSPENDED', 'Tinfirm revoked this run''s access: test.', 'ON_RECONNECT')""",
+                        bench.id(), UUID.fromString(runId), assign.get("epoch").asLong(), UUID.fromString(componentId));
+                sql.commit();
+            }
+            ApiResponse cancelled = bench.member().post(bench.path("/runs/" + runId + "/cancel"), null);
+            assertThat(cancelled.status()).as("%s", cancelled).isLessThan(300);
+            JsonNode revoke = runner.expect(REVOKE);
+            assertThat(revoke.get("componentIds")).singleElement()
+                .satisfies(id -> assertThat(id.asString()).isEqualTo(componentId));
+            assertThat(revoke.get("message").asString()).isEqualTo("Tinfirm revoked this run's access: test.");
+            runner.expect("run.cancel");
+            assertThat(answerOrder(runner)).containsExactly(DONE, REVOKE, "run.cancel");
+            runner.assertFramesValid();
+        }
+    }
+
     private List<String> answerOrder(FakeRunner runner) {
         return runner.received().stream().map(frame -> frame.get("type").asString())
             .filter(type -> type.equals(REVOKE) || type.equals("run.cancel") || type.equals(DONE))
@@ -1048,12 +1090,15 @@ class GitRevocationIntegrationTest extends ConversationTestBench {
             JsonNode revoke = runner.expect(REVOKE);
             assertThat(revoke.get("runId").asString()).isEqualTo(runId);
             assertThat(revoke.get("reason").asString()).isEqualTo("SUSPENDED");
+            assertThat(revoke.get("message").asString()).isEqualTo("Tinfirm revoked this run's access to "
+                    + assign.get("workspaces").get(0).get("name").asString() + ": the account's holder was suspended. "
+                    + "Fetching from and pushing to it no longer works in this run.");
             runner.expect("run.cancel");
-            // The cancel's run pushes its work: the token of the suspended member's account went first.
-            assertThat(answerOrder(runner)).containsExactly(DONE, REVOKE, "run.cancel");
-            // The binding's own change after the commit finds the repository revoked already.
-            runner.expectNone(REVOKE, Duration.ofSeconds(1));
-            assertThat(revocations(bench, runId)).hasSize(1);
+            // The cancel's run pushes its work: the token of the suspended member's account went first. The binding's
+            // own change after the commit, beside the cancel, may have recorded it (then the cancel sends it again
+            // first, and its own frame may come again after), but it is recorded once.
+            revokedBeforeTheCancel(runner);
+            await().pollDelay(Duration.ofSeconds(1)).atMost(WAIT).until(() -> revocations(bench, runId).size() == 1);
             runner.assertFramesValid();
         }
     }

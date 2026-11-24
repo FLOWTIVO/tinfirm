@@ -22,6 +22,8 @@ import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import com.flowtivo.tinfirm.audit.AuditAction;
@@ -220,6 +222,7 @@ class GitRevocationService implements RunGitRevocations {
         UUID commandId = commands.insertRevocation(run.companyId(), run.id(), run.epoch(), componentIds, reason,
                 message, currentUser(), now, lost ? run.finishedAt() : null,
                 delivery == Delivery.UNSUPPORTED ? Delivery.UNSUPPORTED.name() : Delivery.ON_RECONNECT.name());
+        writtenInThisTransaction().add(commandId);
         if (delivery == Delivery.SENT) {
             RunnerMessages.RunGitRevoke frame = new RunnerMessages.RunGitRevoke(run.id(), run.epoch(), componentIds,
                     reason, message);
@@ -287,6 +290,57 @@ class GitRevocationService implements RunGitRevocations {
             end--;
         }
         return message.substring(0, end) + "…";
+    }
+
+    /**
+     * The {@code run.git.revoke} frames that go right before a live {@code run.cancel} of the run, in the cancel's
+     * transaction, which holds the run's lock (ADR-0116, decision 2: a cancelled run pushes its work). Every revocation
+     * of the run's current assignment that another transaction recorded: that one sends its frame after its own commit,
+     * which a cancel committed after it could overtake (a suspension's cancel and its bindings' change run side by
+     * side). A revocation of this transaction is left out, since its frame is registered before the cancel's already.
+     * A frame the host has had already is applied once. None for a host that does not take revocations.
+     */
+    List<RunnerMessages.RunGitRevoke> beforeLiveCancel(RunStore.RunRow run) {
+        UUID hostId = run.runnerHostId();
+        if (hostId == null || !connections.isConnected(hostId) || !takesRevocations(hostId)) {
+            return List.of();
+        }
+        Set<UUID> here = writtenInThisTransaction();
+        List<RunnerMessages.RunGitRevoke> frames = new ArrayList<>();
+        for (RunCommandStore.GitRevocation revocation : commands.revocationsOf(run.id(), run.epoch())) {
+            if (!here.contains(revocation.id()) && !"UNSUPPORTED".equals(revocation.delivery())) {
+                frames.add(new RunnerMessages.RunGitRevoke(run.id(), run.epoch(), revocation.componentIds(),
+                        revocation.reason(), revocation.message()));
+            }
+        }
+        return frames;
+    }
+
+    /** The key of the ids of the revocations the current transaction wrote. */
+    private static final Object WRITTEN_HERE = new Object();
+
+    /**
+     * The ids of the revocations the current transaction wrote, bound to it until it completes; a set of its own
+     * outside a transaction.
+     */
+    @SuppressWarnings("unchecked")
+    private static Set<UUID> writtenInThisTransaction() {
+        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
+            return new HashSet<>();
+        }
+        Set<UUID> written = (Set<UUID>) TransactionSynchronizationManager.getResource(WRITTEN_HERE);
+        if (written == null) {
+            Set<UUID> bound = new HashSet<>();
+            TransactionSynchronizationManager.bindResource(WRITTEN_HERE, bound);
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    TransactionSynchronizationManager.unbindResourceIfPossible(WRITTEN_HERE);
+                }
+            });
+            written = bound;
+        }
+        return written;
     }
 
     /** Whether the host's connection takes {@code run.git.revoke}: protocol 2, and the feature in its hello. */
