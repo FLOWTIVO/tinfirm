@@ -668,6 +668,65 @@ async fn the_room_is_that_of_the_machines_that_answer_with_this_hosts_own_vms_th
     assert!(calls_of(&calls[from..], "list").is_empty(), "{calls:#?}");
 }
 
+/// A host that is running learns from the driver's `machinesChanged` that a machine stopped
+/// answering, and has the fewer slots at once: not at the node driver's next `verify` of its
+/// own (5 minutes) or at a create that fails. Without the notice, nothing asks the driver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_host_counts_its_room_again_when_the_driver_says_a_machine_stopped_answering() {
+    use tinfirm_runner_host::vm::Vms;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("driver.log");
+    let down = dir.path().join("nodes-down");
+    let down_path = down.to_string_lossy().into_owned();
+    for notice in [true, false] {
+        let mut env = vec![
+            ("FAKE_VM_SLOTS", "4"),
+            ("FAKE_VM_NODE_DOWN", down_path.as_str()),
+        ];
+        if notice {
+            env.push(("FAKE_VM_NOTICE", "1"));
+        }
+        let mut options = vm_options(&log, &env);
+        options.recheck = Duration::from_millis(200);
+        let vms = Vms::new(options);
+        vms.check(4, Some("host-a")).await.unwrap();
+        let mut room = vms.room_watch();
+        assert_eq!(*room.borrow_and_update(), None);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let follow = tokio::spawn({
+            let (vms, stop) = (vms.clone(), stop.clone());
+            async move { vms.follow_machines(stop).await }
+        });
+        // A healthy driver is asked nothing more while it sends no notice.
+        let verifies = || calls_of(&vm_driver_calls(&log), "verify").len();
+        let before = verifies();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(verifies(), before);
+
+        nodes_down(&down, 2);
+        let counted = tokio::time::timeout(
+            Duration::from_secs(5),
+            room.wait_for(|room| *room == Some(2)),
+        )
+        .await
+        .map(|seen| seen.map(|room| *room));
+        if notice {
+            counted
+                .expect("the host did not count its room at the driver's notice")
+                .unwrap();
+            let calls = vm_driver_calls(&log);
+            assert_eq!(calls_of(&calls, "noticed").len(), 1, "{calls:#?}");
+        } else {
+            // Without the notice the room waits for the host's next check of its own.
+            assert!(counted.is_err(), "{counted:?}");
+            assert_eq!(verifies(), before);
+        }
+        stop.cancel();
+        follow.await.unwrap();
+        std::fs::remove_file(&down).unwrap();
+    }
+}
+
 /// A host that starts while a node does not answer has the slots of the others: it tells the
 /// server so, a run beyond them waits in the server's queue with the cause and no VM is asked
 /// for it, and the host has its ceiling's slots again once the node answers.

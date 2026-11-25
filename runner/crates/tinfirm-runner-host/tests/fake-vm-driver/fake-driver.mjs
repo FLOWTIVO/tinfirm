@@ -19,6 +19,10 @@
 //                      content is a JSON object {"unreachable": [...], "slots": N}: `verify`
 //                      names those nodes as FAKE_VM_UNREACHABLE does, and counts the N slots
 //                      of the others in place of FAKE_VM_SLOTS
+//   FAKE_VM_NOTICE     when set, the driver tells the host when FAKE_VM_NODE_DOWN's file
+//                      appears, as the node driver does when a node's connection is lost:
+//                      the notification `machinesChanged` (no id, `params.why`), once for each
+//                      time the file appears; the log gets a line {method: "noticed"}
 //   FAKE_VM_BROKEN    a file: while it is there, the "nodes" are broken, as a node whose
 //                      firewall table is gone: verify answers its content (a JSON array) as
 //                      the problems and maxVms 0, and a create fails
@@ -119,6 +123,20 @@ if (env.FAKE_VM_DIE) {
     }
     save();
     unlinkSync(env.FAKE_VM_DIE);
+  }, 50).unref();
+}
+
+// FAKE_VM_NOTICE: `machinesChanged` when FAKE_VM_NODE_DOWN's file appears.
+if (env.FAKE_VM_NOTICE && env.FAKE_VM_NODE_DOWN) {
+  let wasDown = existsSync(env.FAKE_VM_NODE_DOWN);
+  setInterval(() => {
+    const isDown = existsSync(env.FAKE_VM_NODE_DOWN);
+    if (isDown && !wasDown) {
+      log("noticed", {});
+      const why = "node node-2: the connection to the node was lost";
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "machinesChanged", params: { why } }) + "\n");
+    }
+    wasDown = isDown;
   }, 50).unref();
 }
 

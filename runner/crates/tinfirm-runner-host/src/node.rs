@@ -695,6 +695,10 @@ impl std::error::Error for CallError {}
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CallError>>>>>;
 
+/// Where a node's connection says that it ended by itself, with why: the driver passes it on
+/// to the host as [`crate::vm::MACHINES_CHANGED`].
+type Gone = mpsc::UnboundedSender<String>;
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -710,7 +714,9 @@ struct Conn {
 }
 
 impl Conn {
-    fn open<S>(stream: S, failed: Arc<Mutex<HashSet<String>>>, node: String) -> Conn
+    /// `gone` hears of a connection that ends by itself (the node closed it, or TCP keepalive
+    /// gave up on it), with why, and not of one that the driver dropped.
+    fn open<S>(stream: S, failed: Arc<Mutex<HashSet<String>>>, node: String, gone: Gone) -> Conn
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -736,9 +742,15 @@ impl Conn {
                 loop {
                     let line = tokio::select! {
                         line = read_line(&mut reader) => line,
-                        _ = lost.cancelled() => None,
+                        // Dropped by the driver, or its writing failed: the reading tells the
+                        // rest, and the driver's own drop is no news.
+                        _ = lost.cancelled() => break,
                     };
-                    let Some(line) = line else { break };
+                    let Some(line) = line else {
+                        let _ =
+                            gone.send(format!("node {node}: the connection to the node was lost"));
+                        break;
+                    };
                     let Ok(message) = serde_json::from_slice::<Value>(&line) else {
                         continue;
                     };
@@ -853,10 +865,11 @@ struct Node {
     conn: tokio::sync::Mutex<Option<Arc<Conn>>>,
     /// The VMs (the agent's ids) whose VMM the agent reported dead.
     failed: Arc<Mutex<HashSet<String>>>,
+    gone: Gone,
 }
 
 impl Node {
-    fn new(spec: NodeSpec, policy: BuildPolicy, deadlines: Deadlines) -> Result<Node> {
+    fn new(spec: NodeSpec, policy: BuildPolicy, deadlines: Deadlines, gone: Gone) -> Result<Node> {
         let tls = match &spec.target {
             Target::Tls { pin, cert, key, .. } => {
                 Some(tls_config(*pin, cert.clone(), key.clone())?)
@@ -870,6 +883,7 @@ impl Node {
             tls,
             conn: tokio::sync::Mutex::new(None),
             failed: Arc::default(),
+            gone,
         })
     }
 
@@ -879,7 +893,11 @@ impl Node {
 
     async fn connect(&self) -> Result<Conn, CallError> {
         let lost = |why: String| CallError::Lost(format!("cannot reach the node: {why}"));
-        let (failed, node) = (self.failed.clone(), self.spec.name.clone());
+        let (failed, node, gone) = (
+            self.failed.clone(),
+            self.spec.name.clone(),
+            self.gone.clone(),
+        );
         let conn = match &self.spec.target {
             Target::Socket(path) => {
                 let stream = tokio::time::timeout(
@@ -889,7 +907,7 @@ impl Node {
                 .await
                 .map_err(|_| lost("no connection in time".into()))?
                 .map_err(|e| lost(e.kind().to_string()))?;
-                Conn::open(stream, failed, node)
+                Conn::open(stream, failed, node, gone)
             }
             Target::Tls { address, .. } => {
                 let tls = self.tls.clone().expect("a TLS node has its configuration");
@@ -915,7 +933,7 @@ impl Node {
                 let stream = tokio::time::timeout(self.deadlines.connect, connect)
                     .await
                     .map_err(|_| lost("no connection in time".into()))??;
-                Conn::open(stream, failed, node)
+                Conn::open(stream, failed, node, gone)
             }
         };
         let own = crate::images::build_id();
@@ -1041,6 +1059,8 @@ pub struct NodeDriver {
     /// The nodes whose last `verify` answer carried no hardening mark, so that the driver says
     /// so once for each, not at every `verify`.
     unmarked: Mutex<HashSet<String>>,
+    /// What the nodes' connections say when one ends by itself, for [`serve`] to pass on.
+    gone: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
 }
 
 /// A create under way on a node, counted in [`NodeDriver::creating`] until this is dropped.
@@ -1297,16 +1317,18 @@ impl NodeDriver {
     /// [`NodeDriver::new`], with the nodes' times (the tests wait seconds, not minutes).
     fn with(config: NodeConfig, deadlines: Deadlines) -> Result<NodeDriver> {
         let policy = config.peer_build;
+        let (gone, heard) = mpsc::unbounded_channel();
         let nodes = config
             .nodes
             .into_iter()
-            .map(|spec| Node::new(spec, policy, deadlines).map(Arc::new))
+            .map(|spec| Node::new(spec, policy, deadlines, gone.clone()).map(Arc::new))
             .collect::<Result<_>>()?;
         Ok(NodeDriver {
             nodes,
             deadlines,
             creating: Mutex::new(HashMap::new()),
             unmarked: Mutex::new(HashSet::new()),
+            gone: Mutex::new(Some(heard)),
         })
     }
 
@@ -1596,17 +1618,40 @@ impl NodeDriver {
 }
 
 /// Serves the driver protocol on `input` and `output` until `input` ends
-/// ([`crate::vm::serve_driver`]: a line that is not a request gets an error answer).
+/// ([`crate::vm::serve_driver`]: a line that is not a request gets an error answer). A node
+/// whose connection ends by itself is passed on to the host as
+/// [`crate::vm::MACHINES_CHANGED`], so that the host asks `verify` at once: within TCP
+/// keepalive's 25 s of a node that went down with its connection up, at once of one that
+/// closed it. A node to which the driver holds no connection, such as one that did not answer
+/// the last `verify`, sends nothing: the host's own checks find it.
 pub async fn serve<R, W>(driver: Arc<NodeDriver>, input: R, output: W) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    crate::vm::serve_driver(input, output, move |method, params| {
+    let mut gone = lock(&driver.gone).take();
+    let (notices, rx) = mpsc::unbounded_channel();
+    let tell = tokio::spawn(async move {
+        let Some(gone) = gone.as_mut() else { return };
+        while let Some(why) = gone.recv().await {
+            eprintln!("{why}: the host is told");
+            let notice = json!({
+                "jsonrpc": "2.0",
+                "method": crate::vm::MACHINES_CHANGED,
+                "params": { "why": why },
+            });
+            if notices.send(notice).is_err() {
+                return;
+            }
+        }
+    });
+    let served = crate::vm::serve_driver_with_notices(input, output, rx, move |method, params| {
         let driver = driver.clone();
         async move { driver.handle(&method, params).await }
     })
-    .await
+    .await;
+    tell.abort();
+    served
 }
 
 /// `vm-driver node`: serves the driver protocol on stdin and stdout.
@@ -2389,6 +2434,89 @@ mod tests {
         // One connection time (1 s), where two dials took two.
         assert!(took < Duration::from_millis(1900), "{took:?}");
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// The lines a driver's [`serve`] writes, one at a time.
+    async fn next_line(lines: &mut tokio::io::Lines<BufReader<tokio::io::DuplexStream>>) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("a line in time")
+            .unwrap()
+            .expect("a line");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_node_whose_connection_ends_by_itself_is_told_to_the_host_and_a_dropped_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        // A node that answers its hello and its verify, and closes the connection when told.
+        let closing = dir.path().join("closing.sock");
+        let listener = tokio::net::UnixListener::bind(&closing).unwrap();
+        let close = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn({
+            let close = close.clone();
+            async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                loop {
+                    tokio::select! {
+                        () = close.notified() => return,
+                        line = lines.next_line() => {
+                            let Ok(Some(line)) = line else { return };
+                            let request: Value = serde_json::from_str(&line).unwrap();
+                            let result = match request["method"].as_str() {
+                                Some("hello") => wire_hello(),
+                                _ => json!({ "problems": [], "maxVms": 1, "checked": [] }),
+                            };
+                            let answer = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
+                            write.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+                        }
+                    }
+                }
+            }
+        });
+        // A node that is silent after its hello: the driver drops its connection at the next
+        // call, which is no news for the host.
+        let silent = dir.path().join("silent.sock");
+        stand_in(&silent, |method| match method {
+            "hello" => Reply::Answer(wire_hello()),
+            _ => Reply::Silence,
+        });
+        let nodes = json!({ "nodes": [node_at("closing", &closing), node_at("silent", &silent)] });
+        let driver = Arc::new(NodeDriver::with(config(nodes).unwrap(), short()).unwrap());
+        let (mut host, input) = tokio::io::duplex(64 * 1024);
+        let (output, from_driver) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(serve(driver, input, output));
+        let mut lines = BufReader::new(from_driver).lines();
+        let verify = |id: u64| {
+            format!(
+                "{}\n",
+                json!({ "jsonrpc": "2.0", "id": id, "method": "verify", "params": { "template": "sandbox" } })
+            )
+        };
+        // Twice: the silent node's first connection is dropped by the driver at the second.
+        for id in [1, 2] {
+            host.write_all(verify(id).as_bytes()).await.unwrap();
+            let answer = next_line(&mut lines).await;
+            assert_eq!(answer["id"], id, "{answer}");
+            assert_eq!(answer["result"]["maxVms"], 1, "{answer}");
+        }
+        // The node closes its connection: the host is told, once, without asking.
+        close.notify_one();
+        let notice = next_line(&mut lines).await;
+        assert_eq!(notice["method"], crate::vm::MACHINES_CHANGED, "{notice}");
+        assert!(notice.get("id").is_none(), "{notice}");
+        assert_eq!(
+            notice["params"]["why"],
+            "node closing: the connection to the node was lost"
+        );
+        // Nothing else came meanwhile: the next line is the answer to the next call.
+        host.write_all(verify(3).as_bytes()).await.unwrap();
+        let answer = next_line(&mut lines).await;
+        assert_eq!(answer["id"], 3, "{answer}");
+        drop(host);
+        served.await.unwrap().unwrap();
     }
 
     #[tokio::test]

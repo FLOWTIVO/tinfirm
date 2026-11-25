@@ -1389,12 +1389,19 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   beyond those slots waits in the server's queue instead of failing with `INFRA` when its VM
   cannot be created. One that is assigned all the same is rejected with "no free slot (… part of
   the VM driver's machines do not answer …)". The host counts that room at each `verify` of the
-  driver (at its start, on the node driver's schedule of 5 minutes, after a create that failed),
-  so a host that is running when a node stops answering has the fewer slots from the next of
-  them, and a run may fail at its create before that. While a node does not answer the host asks
+  driver: at its start, on the node driver's schedule of 5 minutes, after a create that failed,
+  and when the driver says that a machine stopped answering (`machinesChanged`, below). The node
+  driver says so when its connection to a node ends by itself: at once for a node whose agent
+  closed it or whose machine refused it, and within TCP keepalive's 25 s for a node that lost
+  power or its network with the connection up. So a host that is running when a node stops
+  answering has the fewer slots within about half a minute; a run assigned in that time may
+  still fail at its create. The driver holds a connection to each node that answered its last
+  call, so a node that did not answer before sends no such word: the host's checks of every
+  30 s find it. A healthy host asks its nodes no more often for it. A node whose address answers
+  nothing costs a call one connection time (10 s): a failed connection is not tried a second
+  time in the same call. While a node does not answer the host asks
   `verify` every 30 s: it has its own slots again within about that time after the node answers,
-  with no restart. Its runs on the node that does not answer count as active until they end. A node whose address answers nothing costs a call one connection time
-  (10 s): a failed connection is not tried a second time in the same call. A
+  with no restart. Its runs on the node that does not answer count as active until they end. A
   node that does not answer is not a problem of `verify`, so this host goes on taking runs
   ([A driver that can make no VM](#a-vm-per-run)). A start at which no node answers is refused,
   as a problem.
@@ -1529,7 +1536,8 @@ VM's bridge at `address:port`; without one, at `address:--vm-port`. The bridge i
 `--vm-port` either way. A run's take-back record keeps the port, so that a restarted host dials the
 same; a record without one, such as one written before the field existed, means `--vm-port`. A
 request is a JSON object with `jsonrpc` `"2.0"`, a `method` and an `id` (a number or a string); the
-protocol has no notifications and no batches. `verify` answers `problems`, `maxVms` and `checked`,
+protocol has no batches, and one notification of the driver's (below). `verify` answers
+`problems`, `maxVms` and `checked`,
 and two optional fields that this host reads only from `vm-driver node`: `hardened` (`yes` or `no`,
 left out when the driver cannot tell; any other value reads as `no`) and `notHardened`, a list of
 why, for the log ([Isolation level](#isolation-level)). A driver of your own may leave both out: its
@@ -1538,6 +1546,14 @@ that names the driver's machines that did not answer this `verify`, each with wh
 node`: `node <name>: <why>`); `maxVms` is then the room of the others alone. This host reads it
 from any driver, at its start: with an entry, room below `--max-concurrent-runs` is a warning and
 no refusal ([Checked at start](#a-vm-per-run)). Left out or empty, every machine answered. The
+one notification of the protocol goes the other way: a driver that learns between this host's
+calls that one of its machines stopped answering may write `{"jsonrpc": "2.0", "method":
+"machinesChanged", "params": {"why": "…"}}`, without an `id`, and gets no answer. This host then
+asks `verify` at once, at most once every 5 s, and counts its room again ([Checked at
+start](#a-vm-per-run)); `why` goes to its log. `vm-driver node` sends it when its connection to a
+node ends by itself; `vm-driver digitalocean` and `vm-driver pod` send none (their room is a
+quota, which no machine takes away). A driver of your own may leave it out, and an older host
+ignores it, as any line without an `id` that answers none of its calls. The
 protocol's version stays 1. A method that fails is answered with an error of code
 -32000 and a message for this host's log, an unknown method too. A line that is not JSON is
 answered with -32700 and `id` `null`, JSON that is no request with -32600 (with its `id` when it has
