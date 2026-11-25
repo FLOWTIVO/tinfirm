@@ -1556,7 +1556,11 @@ against a node. Here, the driver is tested against node agents with their fake b
   agent's binary for its own.
 - **Placement.** A new VM goes to a node that reports itself hardened before one that does not, then to
   the node with the most free slots, by each node's `verify`, among the nodes that offer the template,
-  answer and report no problem; the first in the file's order on a tie.
+  answer and report no problem; the first in the file's order on a tie. The driver counts its own
+  creates that are under way on each node and takes them off that node's free slots, so creates that
+  overlap spread over the nodes and do not all go to the one that `verify` showed as the emptiest. A
+  node that then answers that it is full, because another host's VMs filled it meanwhile, is left
+  out, and the VM goes to the next choice among the others, once.
   When no node can take it, the `create`'s error names each node's cause: its problems (cut to 400
   bytes), that it did not answer, or that it has no free slot. Only when every such node is healthy
   and full is it "no node of the driver has a free slot".

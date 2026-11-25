@@ -32,7 +32,11 @@
 //!   not, then to the node with the most free slots, by each node's `verify`, asked at the
 //!   create, among the nodes that offer the template, answer and report no problem; the first
 //!   in the configuration's order on a tie. It spreads the runs, and the count is the agent's
-//!   own, which no other host's create can make stale for long.
+//!   own, which no other host's create can make stale for long. The driver's own creates that
+//!   are under way on a node are taken off its free slots, since its `verify` may not count
+//!   them yet: creates that overlap spread over the nodes too. A node that then answers that
+//!   it is full (another host's VMs filled it meanwhile) is left out, and the VM goes to the
+//!   next choice, once.
 //! - **Hardening** (ADR-0113, decision 5). Each node's `verify` carries its hardening mark,
 //!   `hardening: {hardened, lines}`. The driver's `verify` answers one mark for the template,
 //!   `hardened`: `yes` when every node that offers the template answered `yes`; `no` when any
@@ -111,6 +115,9 @@ const MAX_LINE: u64 = 1024 * 1024;
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const KEEPALIVE_PROBES: u32 = 3;
+/// The node agent's error code of a node that runs as many VMs as it may (`code::FULL` of the
+/// agent's wire).
+const NODE_FULL: i64 = -32006;
 /// The most nodes behind one driver.
 pub const MAX_NODES: usize = 64;
 
@@ -664,6 +671,9 @@ enum CallError {
     Lost(String),
     /// The node answered with an error, or out of form.
     Answer(String),
+    /// The node answered that it runs as many VMs as it may ([`NODE_FULL`]): the one refusal
+    /// after which a create goes to another node.
+    Full(String),
     /// No answer in the call's time, on a connection that is still up.
     Silent,
 }
@@ -671,13 +681,17 @@ enum CallError {
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CallError::Lost(why) | CallError::Answer(why) => f.write_str(why),
+            CallError::Lost(why) | CallError::Answer(why) | CallError::Full(why) => {
+                f.write_str(why)
+            }
             CallError::Silent => f.write_str("no answer in time"),
         }
     }
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+impl std::error::Error for CallError {}
+
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CallError>>>>>;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -732,12 +746,22 @@ impl Conn {
                         };
                         let answer = match (message.get("result"), message.get("error")) {
                             (Some(result), None) => Ok(result.clone()),
-                            (_, Some(error)) => Err(error
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("the node failed without a message")
-                                .to_string()),
-                            _ => Err("an answer with neither result nor error".to_string()),
+                            (_, Some(error)) => {
+                                let why = error
+                                    .get("message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("the node failed without a message")
+                                    .to_string();
+                                // The one code the driver reads; the others are their message.
+                                if error.get("code").and_then(Value::as_i64) == Some(NODE_FULL) {
+                                    Err(CallError::Full(why))
+                                } else {
+                                    Err(CallError::Answer(why))
+                                }
+                            }
+                            _ => Err(CallError::Answer(
+                                "an answer with neither result nor error".to_string(),
+                            )),
                         };
                         let _ = tx.send(answer);
                     } else if message.get("method").and_then(Value::as_str) == Some("vmFailed")
@@ -795,8 +819,7 @@ impl Conn {
                 return Err(CallError::Lost("the connection was lost".into()));
             }
             match rx.await {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(message)) => Err(CallError::Answer(message)),
+                Ok(answer) => answer,
                 Err(_) => Err(CallError::Lost(
                     "the connection was lost before the answer".into(),
                 )),
@@ -902,7 +925,9 @@ impl Node {
             )
             .await
             .map_err(|e| match e {
-                CallError::Answer(why) => CallError::Lost(format!("the node refused hello: {why}")),
+                CallError::Answer(why) | CallError::Full(why) => {
+                    CallError::Lost(format!("the node refused hello: {why}"))
+                }
                 CallError::Silent => lost("no answer to hello in time".into()),
                 lost => lost,
             })?;
@@ -983,6 +1008,11 @@ impl Node {
             match conn.call(method, params.clone(), deadline).await {
                 Ok(value) => return Ok(value),
                 Err(CallError::Answer(why)) => bail!("node {}: {why}", self.name()),
+                // Kept as what it is, for a create that then chooses again.
+                Err(CallError::Full(why)) => {
+                    let why = format!("node {}: {why}", self.name());
+                    return Err(CallError::Full(why).into());
+                }
                 Err(CallError::Lost(why)) => last = why,
                 Err(CallError::Silent) => {
                     last = silent();
@@ -1000,9 +1030,30 @@ impl Node {
 pub struct NodeDriver {
     nodes: Vec<Arc<Node>>,
     deadlines: Deadlines,
+    /// How many of this driver's creates are under way on each node, by its name: from the
+    /// choice of the node until the node's answer ([`NodeDriver::place`]).
+    creating: Mutex<HashMap<String, u64>>,
     /// The nodes whose last `verify` answer carried no hardening mark, so that the driver says
     /// so once for each, not at every `verify`.
     unmarked: Mutex<HashSet<String>>,
+}
+
+/// A create under way on a node, counted in [`NodeDriver::creating`] until this is dropped.
+struct Creating<'a> {
+    driver: &'a NodeDriver,
+    node: &'a str,
+}
+
+impl Drop for Creating<'_> {
+    fn drop(&mut self) {
+        let mut creating = lock(&self.driver.creating);
+        if let Some(count) = creating.get_mut(self.node) {
+            *count -= 1;
+            if *count == 0 {
+                creating.remove(self.node);
+            }
+        }
+    }
 }
 
 /// The driver's id of a VM: the node's name and the agent's id.
@@ -1044,8 +1095,19 @@ const NO_PLACE_MAX: usize = 2000;
 /// configuration's order: among those that answer with no problem and have a free slot, a node
 /// that reports itself hardened ([`node_hardening`]) before one that does not, then the node
 /// with the most free slots, the first on a tie; else why each node was skipped.
-fn choose(answers: &[(&str, Result<Value>)]) -> std::result::Result<usize, Vec<(String, Skipped)>> {
-    let mut best: Option<(usize, (bool, u64))> = None;
+///
+/// `creating` counts the driver's creates under way on each node, which the node's answer may
+/// not count yet: they are taken off its free slots, so that creates which choose from the same
+/// answers do not all go to one node. A node whose free slots they use up is the last choice
+/// and not skipped, since its answer may count some of them already: the agent's own answer to
+/// the create decides. `full` is a node that just answered a create that it is full, and is
+/// skipped.
+fn choose(
+    answers: &[(&str, Result<Value>)],
+    creating: &HashMap<String, u64>,
+    full: Option<usize>,
+) -> std::result::Result<usize, Vec<(String, Skipped)>> {
+    let mut best: Option<(usize, (bool, bool, i128))> = None;
     let mut skipped = Vec::new();
     for (i, (node, answer)) in answers.iter().enumerate() {
         let verified = match answer {
@@ -1072,10 +1134,12 @@ fn choose(answers: &[(&str, Result<Value>)]) -> std::result::Result<usize, Vec<(
             continue;
         }
         let free = verified["maxVms"].as_u64().unwrap_or(0);
-        // A hardened node first (ADR-0113, decision 4's order within one host), then the most
-        // free slots; `true` orders after `false`, and an equal key keeps the earlier node.
-        let key = (node_hardening(node, verified).is_ok(), free);
-        if free == 0 {
+        let left = i128::from(free) - i128::from(creating.get(*node).copied().unwrap_or(0));
+        // A node with a slot left after the creates under way first; then a hardened node
+        // (ADR-0113, decision 4's order within one host), then the most slots left; `true`
+        // orders after `false`, and an equal key keeps the earlier node.
+        let key = (left > 0, node_hardening(node, verified).is_ok(), left);
+        if free == 0 || full == Some(i) {
             skipped.push((node.to_string(), Skipped::Full));
         } else if best.is_none_or(|(_, most)| key > most) {
             best = Some((i, key));
@@ -1236,6 +1300,7 @@ impl NodeDriver {
         Ok(NodeDriver {
             nodes,
             deadlines,
+            creating: Mutex::new(HashMap::new()),
             unmarked: Mutex::new(HashSet::new()),
         })
     }
@@ -1376,23 +1441,21 @@ impl NodeDriver {
         Ok(verified)
     }
 
-    /// The node a new VM of `template` goes to, among the nodes that offer it, answer and report
-    /// no problem: a hardened node first, then the most free slots; the first on a tie
-    /// ([`choose`]). When there is none, the error says why for each node ([`no_place`]).
-    async fn place(&self, template: &str) -> Result<&Arc<Node>> {
-        let nodes = self.offering(template);
-        if nodes.is_empty() {
-            bail!("no node of the driver offers the template `{template}`");
-        }
-        let answers: Vec<(&str, Result<Value>)> = nodes
-            .iter()
-            .map(|node| node.name())
-            .zip(self.verify_each(&nodes, template).await)
-            .collect();
-        match choose(&answers) {
-            Ok(i) => Ok(nodes[i]),
-            Err(skipped) => bail!("{}", no_place(template, &skipped)),
-        }
+    /// The node a new VM goes to, by the nodes' `verify` answers: a node with a slot left after
+    /// the creates under way, a hardened node first, then the most slots left; the first on a
+    /// tie ([`choose`]). The create counts as under way on the node at once, in the same step,
+    /// so that the next create to choose sees it, until the [`Creating`] is dropped. When there
+    /// is no node: why each was skipped, for [`no_place`].
+    fn place<'a>(
+        &'a self,
+        answers: &[(&'a str, Result<Value>)],
+        full: Option<usize>,
+    ) -> std::result::Result<(usize, Creating<'a>), Vec<(String, Skipped)>> {
+        let mut creating = lock(&self.creating);
+        let chosen = choose(answers, &creating, full)?;
+        let node = answers[chosen].0;
+        *creating.entry(node.to_string()).or_insert(0) += 1;
+        Ok((chosen, Creating { driver: self, node }))
     }
 
     pub async fn create(
@@ -1407,17 +1470,41 @@ impl NodeDriver {
         }
         // The choice of the node is in the create's time: the node gets what is left of it.
         let deadline = tokio::time::Instant::now() + self.deadlines.create;
-        let node = self.place(template).await?;
-        // Not tried again: a create whose answer was lost may have made a VM, which the
-        // host's leftover cleanup then finds.
-        let created = node
-            .call(
-                "create",
-                json!({ "template": template, "name": name, "userData": user_data, "labels": labels }),
-                false,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await?;
+        let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+        let nodes = self.offering(template);
+        if nodes.is_empty() {
+            bail!("no node of the driver offers the template `{template}`");
+        }
+        let answers: Vec<(&str, Result<Value>)> = nodes
+            .iter()
+            .map(|node| node.name())
+            .zip(self.verify_each(&nodes, template).await)
+            .collect();
+        let params =
+            json!({ "template": template, "name": name, "userData": user_data, "labels": labels });
+        let (first, creating) = self
+            .place(&answers, None)
+            .map_err(|skipped| anyhow::anyhow!("{}", no_place(template, &skipped)))?;
+        let mut node = nodes[first];
+        // Not tried again on the same node: a create whose answer was lost may have made a VM,
+        // which the host's leftover cleanup then finds.
+        let mut created = node.call("create", params.clone(), false, left()).await;
+        drop(creating);
+        // A node that answers that it is full made no VM: the VMs of another host that shares it
+        // took its slots since its `verify`. The VM goes to the next choice among the others,
+        // once; with no other node, the refusal stands.
+        if let Err(e) = &created
+            && matches!(e.downcast_ref(), Some(CallError::Full(_)))
+            && let Ok((second, _creating)) = self.place(&answers, Some(first))
+        {
+            eprintln!(
+                "{e:#}: the VM {name} goes to node {} instead",
+                nodes[second].name()
+            );
+            node = nodes[second];
+            created = node.call("create", params, false, left()).await;
+        }
+        let created = created?;
         let id = created["id"]
             .as_str()
             .with_context(|| format!("node {}: a create without an id", node.name()))?;
@@ -1755,6 +1842,13 @@ mod tests {
 
     const TABLE: &str = "the node's own firewall table (inet tinfirm_node) is not loaded, and this node's configuration requires it";
 
+    /// [`super::choose`] with no create under way, and no node that just answered full.
+    fn choose(
+        answers: &[(&str, Result<Value>)],
+    ) -> std::result::Result<usize, Vec<(String, Skipped)>> {
+        super::choose(answers, &HashMap::new(), None)
+    }
+
     fn message(template: &str, answers: &[(&str, Result<Value>)]) -> String {
         no_place(template, &choose(answers).unwrap_err())
     }
@@ -2076,6 +2170,8 @@ mod tests {
         Answer(Value),
         /// The answer, after this long.
         Later(Duration, Value),
+        /// An error of the agent's wire: its code and message.
+        Error(i64, &'static str),
         /// Nothing, ever, with the connection left up.
         Silence,
     }
@@ -2099,16 +2195,20 @@ mod tests {
                     let mut lines = BufReader::new(read).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         let request: Value = serde_json::from_str(&line).unwrap();
-                        let (wait, result) = match reply(request["method"].as_str().unwrap()) {
-                            Reply::Answer(result) => (Duration::ZERO, result),
-                            Reply::Later(wait, result) => (wait, result),
+                        let (wait, mut answer) = match reply(request["method"].as_str().unwrap()) {
+                            Reply::Answer(result) => (Duration::ZERO, json!({ "result": result })),
+                            Reply::Later(wait, result) => (wait, json!({ "result": result })),
+                            Reply::Error(code, message) => (
+                                Duration::ZERO,
+                                json!({ "error": { "code": code, "message": message } }),
+                            ),
                             Reply::Silence => continue,
                         };
+                        answer["jsonrpc"] = json!("2.0");
+                        answer["id"] = request["id"].clone();
                         let write = write.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(wait).await;
-                            let answer =
-                                json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
                             let mut write = write.lock().await;
                             let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
                         });
@@ -2249,6 +2349,138 @@ mod tests {
         // The next call makes a new connection.
         driver.verify("sandbox").await.unwrap();
         assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    /// The creates under way, by node, as [`NodeDriver::creating`] counts them.
+    fn under_way(counts: &[(&str, u64)]) -> HashMap<String, u64> {
+        counts
+            .iter()
+            .map(|(node, count)| (node.to_string(), *count))
+            .collect()
+    }
+
+    #[test]
+    fn the_creates_under_way_take_their_slots_before_the_next_choice() {
+        let two = || [("a", healthy(2)), ("b", healthy(2))];
+        let pick = |counts: &[(&str, u64)]| super::choose(&two(), &under_way(counts), None);
+        // Four creates that choose from the same answers, one after the other: a, b, a, b.
+        assert_eq!(pick(&[]), Ok(0));
+        assert_eq!(pick(&[("a", 1)]), Ok(1));
+        assert_eq!(pick(&[("a", 1), ("b", 1)]), Ok(0));
+        assert_eq!(pick(&[("a", 2), ("b", 1)]), Ok(1));
+        // Every free slot is taken by a create under way: a node is chosen still, the one with
+        // the fewest creates over its slots, since its answer may count some of them already.
+        assert_eq!(pick(&[("a", 2), ("b", 2)]), Ok(0));
+        assert_eq!(pick(&[("a", 3), ("b", 2)]), Ok(1));
+        // A slot that is left counts before the hardening.
+        let mixed = || [("a", marked(1, yes())), ("b", marked(2, no()))];
+        assert_eq!(super::choose(&mixed(), &under_way(&[]), None), Ok(0));
+        assert_eq!(
+            super::choose(&mixed(), &under_way(&[("a", 1)]), None),
+            Ok(1)
+        );
+        // A node that is full by its own answer is skipped as before.
+        let full = [("a", healthy(0)), ("b", healthy(1))];
+        assert_eq!(super::choose(&full, &under_way(&[("b", 1)]), None), Ok(1));
+        // A node that just answered a create that it is full is skipped: the next choice, or
+        // none, and then the message is about free slots.
+        assert_eq!(super::choose(&two(), &under_way(&[]), Some(0)), Ok(1));
+        let skipped = super::choose(&[("a", healthy(1))], &under_way(&[]), Some(0)).unwrap_err();
+        assert_eq!(
+            no_place("t", &skipped),
+            "no node of the driver has a free slot for the template `t`"
+        );
+    }
+
+    /// A stand-in whose `verify` always answers `free` slots and whose `create` gets `create`,
+    /// at `dir/<name>.sock`: the node's entry for a configuration, and the count of its creates.
+    fn slots(
+        dir: &Path,
+        name: &str,
+        free: u64,
+        create: impl Fn() -> Reply + Send + Sync + 'static,
+    ) -> (Value, Arc<AtomicU64>) {
+        let socket = dir.join(format!("{name}.sock"));
+        let creates = Arc::new(AtomicU64::new(0));
+        let counted = creates.clone();
+        stand_in(&socket, move |method| match method {
+            "hello" => Reply::Answer(wire_hello()),
+            "verify" => Reply::Answer(json!({ "problems": [], "maxVms": free, "checked": [] })),
+            "create" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                create()
+            }
+            _ => Reply::Silence,
+        });
+        (node_at(name, &socket), creates)
+    }
+
+    #[tokio::test]
+    async fn creates_that_overlap_spread_over_the_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two nodes whose `verify` says 2 free slots whatever is under way, as a `verify` that
+        // was answered before the makes: each create takes a second.
+        let made = || Reply::Later(Duration::from_secs(1), json!({ "id": "vm-1" }));
+        let (a, on_a) = slots(dir.path(), "a", 2, made);
+        let (b, on_b) = slots(dir.path(), "b", 2, made);
+        let driver =
+            NodeDriver::with(config(json!({ "nodes": [a, b] })).unwrap(), short()).unwrap();
+        let labels = host_label();
+        let creates = (0..4).map(|_| driver.create("sandbox", "n", "{}", &labels));
+        for created in futures::future::join_all(creates).await {
+            created.unwrap();
+        }
+        assert_eq!(
+            (on_a.load(Ordering::SeqCst), on_b.load(Ordering::SeqCst)),
+            (2, 2)
+        );
+        // No create is under way any more.
+        assert!(lock(&driver.creating).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_node_that_answers_full_is_left_for_the_next_choice_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let full = || Reply::Error(NODE_FULL, "the node runs its 2 VMs");
+        let made = || Reply::Answer(json!({ "id": "vm-1" }));
+        // Two nodes that another host filled since their `verify`, which says 2 free slots,
+        // one whose create fails for another reason, and one with a free slot.
+        let (shared, on_shared) = slots(dir.path(), "shared", 2, full);
+        let (shared_too, on_shared_too) = slots(dir.path(), "shared-too", 2, full);
+        let failing = || Reply::Error(-32000, "cannot start the VMM");
+        let (broken, on_broken) = slots(dir.path(), "broken", 2, failing);
+        let (free, on_free) = slots(dir.path(), "free", 1, made);
+        let driver = |nodes: Value| {
+            NodeDriver::with(config(json!({ "nodes": nodes })).unwrap(), short()).unwrap()
+        };
+        let labels = host_label();
+        let count = |creates: &Arc<AtomicU64>| creates.load(Ordering::SeqCst);
+
+        // The node with the most free slots answers that it is full: the VM goes to the other.
+        let nodes = driver(json!([shared, free]));
+        let created = nodes.create("sandbox", "n", "{}", &labels).await.unwrap();
+        assert_eq!(created["id"], "free:vm-1");
+        assert_eq!((count(&on_shared), count(&on_free)), (1, 1));
+        assert!(lock(&nodes.creating).is_empty());
+
+        // With no other node, its refusal stands; with another that is full too, that one's:
+        // the choice is made again once.
+        let alone = driver(json!([shared]));
+        let error = alone.create("sandbox", "n", "{}", &labels).await;
+        let error = format!("{:#}", error.unwrap_err());
+        assert_eq!(error, "node shared: the node runs its 2 VMs");
+        let three = driver(json!([shared, shared_too, free]));
+        let error = three.create("sandbox", "n", "{}", &labels).await;
+        let error = format!("{:#}", error.unwrap_err());
+        assert_eq!(error, "node shared-too: the node runs its 2 VMs");
+        assert_eq!((count(&on_shared_too), count(&on_free)), (1, 1));
+
+        // A create that fails for another reason is the VM's own: no other node is asked.
+        let nodes = driver(json!([broken, free]));
+        let error = nodes.create("sandbox", "n", "{}", &labels).await;
+        let error = format!("{:#}", error.unwrap_err());
+        assert_eq!(error, "node broken: cannot start the VMM");
+        assert_eq!((count(&on_broken), count(&on_free)), (1, 1));
     }
 
     #[cfg(target_os = "linux")]

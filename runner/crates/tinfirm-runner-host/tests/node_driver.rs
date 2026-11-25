@@ -417,6 +417,58 @@ async fn two_nodes_take_the_vms_by_their_free_slots_and_a_restarted_driver_finds
     assert!(a.backend.vms().is_empty() && b.backend.vms().is_empty());
 }
 
+/// Creates that overlap choose from the same `verify` answers: the driver counts the creates
+/// under way on each node, so they spread over the nodes and none is refused by a node that is
+/// full while the other has a free slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creates_at_once_fill_both_nodes_and_none_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let client = client(tmp.path());
+    let (a, b) = (agent(2, &client.cert).await, agent(2, &client.cert).await);
+    let driver = driver(
+        tmp.path(),
+        vec![
+            tls_node("node-a", &a.tls_addr.to_string(), &a.node_pin, &client),
+            tls_node("node-b", &b.tls_addr.to_string(), &b.node_pin, &client),
+        ],
+    );
+    driver.hello().await.unwrap();
+    let data = user_data();
+    // Four creates at once on two nodes of two slots, several times over: each time every one
+    // of them gets a VM, two on each node.
+    for round in 0..5 {
+        assert_eq!(driver.verify(TEMPLATE).await.unwrap().max_vms, Some(4));
+        let creates = (0..4).map(|i| {
+            let (driver, data) = (&driver, &data);
+            async move {
+                let vm = format!("v{round}-{i}");
+                driver
+                    .create(TEMPLATE, &format!("n{i}"), data, &labels(&vm))
+                    .await
+            }
+        });
+        let ids: Vec<String> = futures::future::join_all(creates)
+            .await
+            .into_iter()
+            .map(|created| created.unwrap_or_else(|e| panic!("round {round}: {e:#}")))
+            .collect();
+        assert_eq!((a.backend.vms().len(), b.backend.vms().len()), (2, 2));
+        // A fifth has no slot anywhere: refused, and that is said.
+        let error = driver
+            .create(TEMPLATE, "n4", &data, &labels("v4"))
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("no node of the driver has a free slot"),
+            "{error}"
+        );
+        for id in &ids {
+            driver.delete(id, &host_only()).await.unwrap();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_that_is_down_is_not_counted_listed_or_described_as_gone() {
     let tmp = tempfile::tempdir().unwrap();
