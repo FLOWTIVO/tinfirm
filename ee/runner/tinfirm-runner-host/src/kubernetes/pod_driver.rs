@@ -22,13 +22,18 @@
 //! It never reads a Secret, and nothing it writes to its log or answers holds a run's user data.
 //!
 //! The protocol has one error code for a method that failed, and the host reads only its
-//! message. What makes the host stop taking runs is `verify`: problems and no room. A quota
-//! that run pods have filled is no problem: `verify` answers no room, the host bounds its runs
-//! by its own slots, and at its start it counts its own VMs to that room, so a host that starts
-//! again beside its run pods does start. A quota without room that no run pod holds is a
-//! problem: it is too small, or something else fills it. `verify` is not told which host asks,
-//! so every run pod of the namespace counts as one that may be the host's; the host's own count
-//! at its start tells them apart. A create refused for the quota says so in its message.
+//! message. What makes the host stop taking runs is `verify`: problems and no room. So `verify`
+//! answers no room, whatever the quota holds, with each problem for which `create` refuses
+//! every pod: a network policy that is missing, changed or added, an admission check that
+//! fails, a runner node that is not known.
+//!
+//! A quota that run pods have filled is no problem: `verify` answers no room, the host bounds
+//! its runs by its own slots, and at its start it counts its own VMs to that room, so a host
+//! that starts again beside its run pods does start. A quota without room that no run pod
+//! holds is a problem: it is too small, or something else fills it. `verify` is not told which
+//! host asks, so every run pod of the namespace counts as one that may be the host's; the
+//! host's own count at its start tells them apart. A create refused for the quota says so in
+//! its message.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -562,15 +567,19 @@ impl PodDriver {
     // ----- verify ---------------------------------------------------------------------
 
     /// What keeps the driver from making a sound run pod of `template`, and how many more pods
-    /// the namespace's quota holds.
+    /// the namespace's quota holds: none while `create` would refuse every pod.
     pub async fn verify(&self, template: &str) -> Result<Value> {
         self.config.template(template)?;
         let mut problems = Vec::new();
         let mut checked = Vec::new();
         let ns = self.namespace().to_string();
+        // Whether a problem is one for which `create` refuses every pod, whatever the quota
+        // holds: an unknown runner node, the network policies, the admission check.
+        let mut refuses = false;
 
         if self.runner_node.is_none() {
             problems.push(format!("{:#}", self.runner_node().unwrap_err()));
+            refuses = true;
         }
 
         // The quota: the driver's room.
@@ -601,6 +610,7 @@ impl PodDriver {
             // No create passes on an earlier check while they are not sound, whatever its
             // template.
             lock(&self.admission_checked).clear();
+            refuses = true;
         }
         problems.extend(found);
         checked.extend(seen);
@@ -644,6 +654,7 @@ impl PodDriver {
                 Ok(found) => {
                     lock(&self.admission_checked).remove(template);
                     problems.extend(found);
+                    refuses = true;
                 }
                 // The quota refused the dry run, and run pods hold its room: the namespace is
                 // full, not broken. Nothing is noted as passed, so the create that finds room
@@ -659,12 +670,18 @@ impl PodDriver {
                 Err(e) => {
                     lock(&self.admission_checked).remove(template);
                     problems.push(format!("{e:#}"));
+                    refuses = true;
                 }
             }
         }
 
-        // A driver that cannot see the quota cannot tell its room; with problems, the host
-        // then takes no run.
+        // The host stops taking runs for problems and no room (crate::vm::no_vms_cause). Where
+        // `create` refuses every pod there is no room, whatever the quota would hold: else
+        // the host would go on taking runs and fail each at its create. A driver that cannot
+        // see the quota cannot tell its room; with problems, the host then takes no run either.
+        if refuses {
+            max_vms = Some(0);
+        }
         Ok(json!({
             "problems": problems,
             "maxVms": max_vms,
@@ -2398,7 +2415,8 @@ mod tests {
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
-        assert!(verified["maxVms"].is_null());
+        // No quota to read, and a create would be refused: no room.
+        assert_eq!(verified["maxVms"], 0);
 
         // No namespace; no runner node.
         let mut c = cluster();
@@ -2414,6 +2432,98 @@ mod tests {
             text.contains("the runs' namespace tinfirm-runs does not exist"),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_answers_no_room_while_create_refuses_every_pod() {
+        let verify = json!({"template": "sandbox-4c8g"});
+        let create = json!({"template": "sandbox-4c8g", "userData": USER_DATA,
+                            "labels": {"tinfirm-host": HOST}});
+        // The host's reading: with problems and no room it takes no run, and reports why.
+        let no_vms = |verified: &Value| {
+            crate::vm::no_vms_cause(&serde_json::from_value(verified.clone()).unwrap())
+        };
+        type Change = Box<dyn Fn(&mut Cluster)>;
+        // Each in a namespace whose quota has room for eight pods.
+        let cases: Vec<(&str, Option<&str>, Change)> = vec![
+            (
+                "there is no NetworkPolicy tinfirm-runs-default-deny",
+                Some(NODE),
+                Box::new(|c| {
+                    c.policies.remove("tinfirm-runs-default-deny");
+                }),
+            ),
+            (
+                "holds the NetworkPolicy allow-all, which is not the chart's",
+                Some(NODE),
+                Box::new(|c| {
+                    c.policies.insert(
+                        "allow-all".into(),
+                        json!({"metadata": {"name": "allow-all"}}),
+                    );
+                }),
+            ),
+            (
+                "the driver may not read the network policies",
+                Some(NODE),
+                Box::new(|c| c.fail_policy_reads = true),
+            ),
+            (
+                "accepts a run pod with a hostPath volume",
+                Some(NODE),
+                Box::new(|c| c.admission = Admission::LetsHostPathIn),
+            ),
+            (
+                "the cluster refuses the correct run pod",
+                Some(NODE),
+                Box::new(|c| c.admission = Admission::RefusesAll),
+            ),
+            ("TINFIRM_NODE_NAME", None, Box::new(|_| {})),
+        ];
+        for (problem, node, change) in cases {
+            let mut c = cluster();
+            change(&mut c);
+            let t = start_with(c, good(), node).await;
+            let verified = t.ok("verify", verify.clone()).await;
+            assert!(
+                verified["problems"].to_string().contains(problem),
+                "{problem}: {verified}"
+            );
+            assert_eq!(verified["maxVms"], 0, "{problem}: {verified}");
+            assert!(
+                verified["checked"].to_string().contains("room for 8 more"),
+                "{problem}: the quota's own room is still said: {verified}"
+            );
+            assert!(
+                no_vms(&verified).is_some_and(|cause| cause.contains(problem)),
+                "{problem}"
+            );
+            // And `create` does refuse.
+            t.error("create", create.clone()).await;
+            assert!(t.cluster().pods.is_empty(), "{problem}");
+        }
+
+        // A problem that refuses no create leaves the room as the quota has it: a run pod
+        // that waits for a node.
+        let mut c = cluster();
+        c.pods.insert("tinfirm-vm-00112233445566778899aabbccddeeff".into(), json!({
+            "metadata": {"name": "tinfirm-vm-00112233445566778899aabbccddeeff",
+                         "labels": {"tinfirm.flowtivo.com/sandbox": "vm"}},
+            "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False",
+                "reason": "Unschedulable", "lastTransitionTime": "2026-01-01T00:00:00Z",
+                "message": "0/3 nodes are available"}]},
+        }));
+        let t = start(c).await;
+        let verified = t.ok("verify", verify.clone()).await;
+        assert!(
+            verified["problems"]
+                .to_string()
+                .contains("has found no node for"),
+            "{verified}"
+        );
+        assert_eq!(verified["maxVms"], 8, "{verified}");
+        assert!(no_vms(&verified).is_none());
+        t.ok("create", create.clone()).await;
     }
 
     /// A pod of the runs' namespace, as a list of it shows it.

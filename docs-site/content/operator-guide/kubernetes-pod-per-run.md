@@ -344,7 +344,7 @@ Its lines for this driver:
 
 `run` makes the same check at its start and does not start while it fails: the runner pod's container exits and is started again, and its log says why (`kubectl -n tinfirm logs deploy/tinfirm-runner -c runner`).
 
-**The driver's problems.** The driver checks the runs' namespace at its start, at each check, and before a create. Each problem stops new runs until it is gone:
+**The driver's problems.** The driver checks the runs' namespace at its start, at each check, and before a create. The runner pod does not start while there is a problem. While it runs, the host takes no new run and reports the problem, until a check finds it gone, whenever the driver can make no pod: with a problem of a network policy, of the admission check or of the runner pod's node, for which the driver refuses every pod and reports no room whatever the quota holds; and with a quota that is missing, that it cannot read, or that has no room while no run pod holds it.
 
 | Problem | What it means, and who fixes it |
 |---|---|
