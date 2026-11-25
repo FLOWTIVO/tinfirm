@@ -20,7 +20,7 @@
 ARG CACHE_SCOPE=pr
 
 # ---- 1. Web UI ------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM node:24-trixie-slim@sha256:54f84b4cf8432b21aaffd5d3ce8d41e12cea0d10d33c09d2f3c9879d49d6b446 AS web
+FROM --platform=$BUILDPLATFORM node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0 AS web
 ARG CACHE_SCOPE
 ENV CI=true \
     NG_CLI_ANALYTICS=false \
@@ -54,7 +54,7 @@ RUN npm run build \
 RUN find dist/tinfirm-web/browser -maxdepth 1 -type f \( -name '*.js' -o -name '*.css' \) -exec gzip -9 -k -n {} +
 
 # ---- 2. Server jar --------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM eclipse-temurin:25-jdk-resolute@sha256:422bf3f42dc7f967f36eb4196f6d7b683c415cb541583571833d865c807c2ea2 AS server
+FROM --platform=$BUILDPLATFORM eclipse-temurin:25-jdk-resolute@sha256:1ba05eab8e59bad9cbc9c6294b5c4a1d71150cfd00a5cdf04e67bb36a0a10916 AS server
 ARG CACHE_SCOPE
 WORKDIR /src/server
 # unzip: the Maven wrapper takes the distribution's .tar.gz where unzip is missing, and its digest
@@ -100,7 +100,7 @@ RUN --mount=type=cache,id=tinfirm-m2-${CACHE_SCOPE},target=/root/.m2,sharing=loc
              /build/extracted/snapshot-dependencies /build/extracted/application
 
 # ---- 3. Runtime -----------------------------------------------------------------------
-FROM eclipse-temurin:25-jre-resolute@sha256:b6e00330337143a2c1a20f1c1c693d4b6ce9a3c30ade8b9d03fc68cc9e3871e7 AS runtime
+FROM eclipse-temurin:25-jre-resolute@sha256:480ef64e4540d45b0301e8afb7873bd3fa61ce93c5f66273eb569420718f38e2 AS runtime
 ARG VERSION=0.1.0-SNAPSHOT
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="tinfirm-server" \
