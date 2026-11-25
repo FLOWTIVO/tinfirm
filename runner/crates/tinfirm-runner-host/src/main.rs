@@ -2743,11 +2743,16 @@ async fn probe_front(paths: &Paths) -> Result<tinfirm_runner_host::front::Probe>
 /// ([`check_reader_and_front`]).
 async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool, allow: bool) {
     const USED: &str = "`run` starts one per sandbox, for its bridge and the HTTP of its git proxy, platform tools, model and egress proxies, with --sandbox-bridge or --executor vm";
+    // The probe first, since `run` decides by it: it takes an unconfined front only where its
+    // probe of one was not confined at its start and --allow-unconfined-reader accepted that
+    // ([`check_reader_and_front`]). A probe that fails allows none.
+    let probe = probe_front(paths).await;
+    let unconfined = allow && probe.as_ref().is_ok_and(|probe| !probe.confined());
     // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed. A
     // front that cannot confine itself serves only where `run` would take it.
     let wire = async {
         let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?
-            .allowing_unconfined(allow);
+            .allowing_unconfined(unconfined);
         let front =
             tinfirm_runner_host::front::handle::FrontHandle::spawn(&command, uuid::Uuid::new_v4())
                 .await?;
@@ -2769,7 +2774,7 @@ async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool, allow: 
             format!("{e:#} (only used with --sandbox-bridge or --executor vm)"),
         ),
     }
-    match probe_front(paths).await {
+    match probe {
         Ok(probe) if probe.confined() => {
             checks.ok("front", format!("confined: {} ({USED})", probe.describe()))
         }
