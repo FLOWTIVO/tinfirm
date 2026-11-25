@@ -2240,11 +2240,14 @@ mod tests {
     }
 
     /// A second for a node where the driver's own times are a minute and more, and 5 s for a
-    /// whole create.
+    /// whole create. A connection and its `hello` have a fifth of a second each: as with the
+    /// driver's own times, both tries of a connection end well inside a method's time, so what
+    /// a call reports of a node that answers no `hello` does not hang on which of two times
+    /// that end together is seen first.
     fn short() -> Deadlines {
         let second = Duration::from_secs(1);
         Deadlines {
-            connect: second,
+            connect: second / 5,
             verify: second,
             create: 5 * second,
             describe: second,
@@ -2284,9 +2287,14 @@ mod tests {
         });
         // A node that takes the connection and answers nothing, not its hello either; then one
         // that is silent after its hello, as a node that lost power with the connection up.
-        for (after_hello, why) in [
-            (false, "cannot reach the node: no answer to hello in time"),
-            (true, "no answer within 1 s"),
+        // With each, the connections the four calls below make.
+        for (after_hello, why, dials) in [
+            (
+                false,
+                "cannot reach the node: no answer to hello in time",
+                8,
+            ),
+            (true, "no answer within 1 s", 4),
         ] {
             let silent = dir.path().join(format!("silent-{after_hello}.sock"));
             let connections = stand_in(&silent, move |method| match method {
@@ -2326,11 +2334,13 @@ mod tests {
             // A VM of the silent node: an error in the node's time, never `gone`.
             let error = format!("{:#}", driver.describe("silent:vm-9").await.unwrap_err());
             assert_eq!(error, format!("node silent: {why}"));
-            // Four calls, each with a second for the silent node.
+            // Four calls, each with a second for the silent node at most.
             let took = started.elapsed();
             assert!(took < Duration::from_secs(10), "{took:?}");
-            // A connection that gave a call no answer is not used again: each call made its own.
-            assert_eq!(connections.load(Ordering::SeqCst), 4);
+            // A connection that gave no answer is not used again. A call whose `hello` got none
+            // tries a second connection in its time, and a call that got no answer after the
+            // `hello` does not: each call made two connections, or one.
+            assert_eq!(connections.load(Ordering::SeqCst), dials);
         }
     }
 
