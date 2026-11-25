@@ -168,10 +168,11 @@
       bytes of a-z, 0-9 and -.
     quiet: true
 
-# The node's firewall admits SSH from the management address alone, to its SSH port. This
-# play's own connection stays up once the table is loaded (an established connection), but
-# the next one would not: stop before that.
-- name: Read the address and the port of this play's SSH connection
+# The node's firewall admits SSH from the management address alone, to the node's address and
+# its SSH port. This play's own connection may stay up once the table is loaded (an
+# established connection), but the next one would not: stop before that. A node with a second
+# address (a management interface) is reached on the address the firewall names, or not at all.
+- name: Read the addresses and the port of this play's SSH connection
   ansible.builtin.command:
     argv: [printenv, SSH_CONNECTION]
   become: false
@@ -180,18 +181,18 @@
   failed_when: false
   when: tinfirm_sandbox_node_check_ssh_source | bool
 
-- name: Check that this play comes from the management address to the SSH port
+- name: Check that this play comes from the management address to the node's address and SSH port
   ansible.builtin.assert:
     that:
-      - (_tinfirm_sandbox_node_ssh.stdout | split(' ') | first) == tinfirm_sandbox_node_management_address
-      - (_tinfirm_sandbox_node_ssh.stdout | split(' ') | last) == (tinfirm_sandbox_node_ssh_port | string)
+      - _tinfirm_sandbox_node_ssh_admitted | bool
     fail_msg: >-
-      This play's SSH connection comes from {{ _tinfirm_sandbox_node_ssh.stdout | split(' ') | first }}
-      to port {{ _tinfirm_sandbox_node_ssh.stdout | split(' ') | last }}, but the node's firewall
-      admits SSH from tinfirm_sandbox_node_management_address
-      ({{ tinfirm_sandbox_node_management_address }}) alone, to tinfirm_sandbox_node_ssh_port
-      ({{ tinfirm_sandbox_node_ssh_port }}): the next connection of this play would be dropped.
-      Run the play from that address, or set the variables to this connection's.
+      This play's SSH connection ({{ _tinfirm_sandbox_node_ssh.stdout | trim }}: the client's
+      address and port, then the node's) is not one the node's firewall will admit. It admits SSH
+      from tinfirm_sandbox_node_management_address ({{ tinfirm_sandbox_node_management_address }})
+      alone, to tinfirm_sandbox_node_address ({{ tinfirm_sandbox_node_address }}) and
+      tinfirm_sandbox_node_ssh_port ({{ tinfirm_sandbox_node_ssh_port }}): the next connection of
+      this play would be dropped, and the node reached from its console alone. Run the play from
+      that address and to that address, or set the variables to this connection's.
       tinfirm_sandbox_node_check_ssh_source: false skips this check.
     quiet: true
   when:

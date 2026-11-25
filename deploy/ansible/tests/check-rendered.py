@@ -375,6 +375,16 @@ def confinement(out):
               f"doctor's answer {case}: the play {'goes on' if case in goes_on else 'stops'}")
 
 
+def node_checks(out):
+    """What the sandbox node's checks.yml takes of the play's SSH connection, against the one
+    connection its firewall admits."""
+    judged = json.loads((out / "node-checks.json").read_text())
+    for case, admitted in {"admitted": True, "admitted-with-a-newline": True, "another-client": False,
+                           "another-address-of-the-node": False, "another-port": False, "malformed": False}.items():
+        check(judged.get("ssh " + case) is admitted,
+              f"SSH connection {case}: {'admitted' if admitted else 'the play stops before the firewall loads'}")
+
+
 def main():
     out = Path(sys.argv[1])
     h = json.loads((out / "helper.json").read_text())
@@ -403,6 +413,7 @@ def main():
     units((out / "tinfirm-runner-host.docker.service").read_text(), (out / "tinfirm-runner-host.vm.service").read_text())
     bridge_ports(out)
     confinement(out)
+    node_checks(out)
     for name in ("firewall.nft", "firewall-one-vm-static.nft"):
         nft_check(out / name)
     print(f"\n{len(failures)} failed" if failures else "\nall passed")

@@ -254,8 +254,11 @@ the runs on it, their files, prompts and tunnels, and what they hand back, but n
 - Only the people who administer the control host administer its nodes. The role cannot enforce
   that: give SSH keys and sudo on a node to those people alone.
 - The node's firewall admits SSH from one management address alone
-  (`tinfirm_sandbox_node_management_address`), to one port (`tinfirm_sandbox_node_ssh_port`), and
-  the role stops when its own SSH connection comes from another address or to another port.
+  (`tinfirm_sandbox_node_management_address`), to the node's address
+  (`tinfirm_sandbox_node_address`) and one port (`tinfirm_sandbox_node_ssh_port`), and the role
+  stops when its own SSH connection comes from another address, or goes to another address of
+  the node or to another port. Reach a node with two interfaces on the address the control host
+  dials, or set `tinfirm_sandbox_node_address` to the one you reach it on.
 - Re-image the nodes on a schedule. The role installs everything from its variables and keeps
   nothing on the node that a new image would lose, but the node's TLS identity, which it makes
   again on a new image ([Replace a node](#replace-a-node)).
@@ -303,7 +306,7 @@ The role `tinfirm_sandbox_node`:
 
 1. checks the target: Ubuntu, Debian or the RHEL family with systemd, `/dev/kvm`, the addresses
    and ports, the templates, that the play's SSH connection comes from the management address
-   to the SSH port,
+   to the node's address and SSH port,
    and that neither Docker, firewalld, `nftables.service` nor ufw runs (each would drop or flush
    what the VMs need);
 2. installs the tools the helper runs (`ip`, `nft`, `losetup`, `dmsetup` and the rest of "What a

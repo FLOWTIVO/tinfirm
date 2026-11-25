@@ -327,6 +327,31 @@
         dest: "{{ render_dir }}/confinement.json"
         mode: "0644"
 
+    # What checks.yml takes of this play's SSH connection, with example-vars.yml's addresses: the
+    # node's firewall admits SSH from 10.0.0.9 to 10.0.0.20, port 22, and nothing else.
+    - name: Judge this play's SSH connection
+      ansible.builtin.set_fact:
+        _node_checks: "{{ _node_checks | default({}) | combine({'ssh ' ~ item.case: _tinfirm_sandbox_node_ssh_admitted | bool}) }}"
+      loop:
+        - {case: admitted, connection: "10.0.0.9 51234 10.0.0.20 22"}
+        - {case: admitted-with-a-newline, connection: "10.0.0.9 51234 10.0.0.20 22\n"}
+        - {case: another-client, connection: "10.0.0.8 51234 10.0.0.20 22"}
+        # The node reached on its second address, a management interface's.
+        - {case: another-address-of-the-node, connection: "10.0.0.9 51234 192.168.50.20 22"}
+        - {case: another-port, connection: "10.0.0.9 51234 10.0.0.20 2222"}
+        - {case: malformed, connection: "10.0.0.9 51234"}
+      loop_control:
+        label: "{{ item.case }}"
+      vars:
+        _tinfirm_sandbox_node_ssh:
+          stdout: "{{ item.connection }}"
+
+    - name: Write what the node's checks take
+      ansible.builtin.copy:
+        content: "{{ _node_checks | to_nice_json }}\n"
+        dest: "{{ render_dir }}/node-checks.json"
+        mode: "0644"
+
     - name: Show the derived values the tasks use
       ansible.builtin.copy:
         content: "{{ _derived | to_nice_json }}\n"

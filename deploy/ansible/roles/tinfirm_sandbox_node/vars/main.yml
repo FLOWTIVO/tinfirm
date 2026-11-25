@@ -80,6 +80,16 @@ _tinfirm_sandbox_node_profile_text: >-
 _tinfirm_sandbox_node_profile_loaded: "tinfirm-vmm ({{ _tinfirm_sandbox_node_mac }})"
 # The group whose members keep sudo once its setuid bit is cut to the group (4750).
 _tinfirm_sandbox_node_admin_group: "{{ 'sudo' if ansible_facts['os_family'] == 'Debian' else 'wheel' }}"
+# This play's SSH connection as checks.yml reads it from SSH_CONNECTION (the client's address
+# and port, then the server's), and whether the node's firewall will admit the next one: SSH
+# from the management address, to the node's address, on the SSH port, and nothing else
+# (templates/firewall.nft.j2). A node reached on another of its addresses is not admitted.
+_tinfirm_sandbox_node_ssh_fields: "{{ _tinfirm_sandbox_node_ssh.stdout | default('') | trim | split(' ') }}"
+_tinfirm_sandbox_node_ssh_admitted: >-
+  {{ (_tinfirm_sandbox_node_ssh_fields | length == 4)
+     and _tinfirm_sandbox_node_ssh_fields[0] == tinfirm_sandbox_node_management_address
+     and _tinfirm_sandbox_node_ssh_fields[2] == tinfirm_sandbox_node_address
+     and _tinfirm_sandbox_node_ssh_fields[3] == (tinfirm_sandbox_node_ssh_port | string) }}
 # Where the setuid scan looks, as the helper's line `no-setuid` does.
 _tinfirm_sandbox_node_setuid_dirs: [/usr, /opt, /bin, /sbin]
 
