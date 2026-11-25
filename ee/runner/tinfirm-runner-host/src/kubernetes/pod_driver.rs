@@ -6,7 +6,8 @@
 //!
 //! - `create`: checks the admission policy (at most once a minute per template), creates the
 //!   pod, then the ticket's Secret, owned by the pod. The pod's Secret volume holds every
-//!   container back until the Secret exists. When the Secret cannot be made, the pod is deleted.
+//!   container back until the Secret exists. When the Secret cannot be made, the pod is deleted;
+//!   so is a pod whose create got no clear answer, since the cluster may hold it all the same.
 //! - `describe` and `list`: read pods. The first time a pod is seen ready, its ticket's Secret
 //!   is deleted: the VM has read it.
 //! - `delete`: reads the pod, refuses it unless it carries every label of the request, then
@@ -43,6 +44,8 @@ const ADMISSION_CHECK_TTL: Duration = Duration::from_secs(60);
 const UNSCHEDULABLE_AFTER_SECONDS: i64 = 60;
 /// The grace period of a deleted pod: Firecracker ends at SIGTERM.
 const GRACE_SECONDS: u32 = 5;
+/// How long the delete of a pod may take whose create got no clear answer.
+const UNSURE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest text of the cluster's that a problem quotes.
 const MAX_QUOTED: usize = 300;
 /// The most unschedulable pods that `verify` names.
@@ -134,11 +137,17 @@ impl PodDriver {
         let id = VmId::random();
         let name = id.pod_name();
         let pod = spec::pod(&self.config, template, &id, labels, node)?;
-        let created = self
+        let created = match self
             .api
             .create_pod(self.namespace(), &pod, DryRun::No)
             .await
-            .map_err(|e| create_error("the pod", &e))?;
+        {
+            Ok(created) => created,
+            Err(e) if maybe_stored(&e) => {
+                return Err(self.delete_unsure(&name, create_error("the pod", &e)).await);
+            }
+            Err(e) => return Err(create_error("the pod", &e)),
+        };
         let uid = created["metadata"]["uid"].as_str().unwrap_or_default();
         let secret = spec::ticket_secret(&self.config, &id, labels, user_data.as_bytes(), uid);
         let made = match secret {
@@ -161,6 +170,29 @@ impl PodDriver {
         }
         eprintln!("created pod {name}");
         Ok(json!({ "id": name }))
+    }
+
+    /// Deletes the pod `name` after a create whose answer does not tell whether the server
+    /// stored it ([`maybe_stored`]), and returns `why` with what became of the pod. Such a pod
+    /// has no ticket, so it never starts, and it would hold its share of the quota until the
+    /// host's cleanup of leftovers, which runs only when the host starts or connects again.
+    /// The delete has [`UNSURE_DELETE_TIMEOUT`]: the host waits for the create's answer.
+    async fn delete_unsure(&self, name: &str, why: anyhow::Error) -> anyhow::Error {
+        let delete = self.api.delete_pod(self.namespace(), name, Some(0));
+        let failed = match tokio::time::timeout(UNSURE_DELETE_TIMEOUT, delete).await {
+            Ok(Ok(())) => {
+                return why.context(format!(
+                    "the server had stored the pod {name}, which is deleted again"
+                ));
+            }
+            // The server did not store it.
+            Ok(Err(e)) if e.is_not_found() => return why,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("no answer within {UNSURE_DELETE_TIMEOUT:?}"),
+        };
+        why.context(format!(
+            "and the pod {name}, if the server stored it, could not be deleted ({failed}): the host's cleanup of leftovers deletes it, since it carries the host's label"
+        ))
     }
 
     /// Checks the network policies and the admission policy for `template`, unless they passed
@@ -654,6 +686,21 @@ fn unreachable(e: &ApiError) -> bool {
     }
 }
 
+/// A create whose answer does not tell whether the server stored the object: no answer in
+/// time, a broken connection, a 5xx, or a successful answer that cannot be read. A create is
+/// sent once, and the server may have acted on it (super::api). Any other failure is the
+/// server's refusal, and it stored nothing.
+fn maybe_stored(e: &ApiError) -> bool {
+    match &e.failure {
+        Failure::Transport(_)
+        | Failure::Timeout(_)
+        | Failure::Malformed
+        | Failure::TooLarge { .. } => true,
+        Failure::Status { code, .. } | Failure::Http { code } => *code >= 500,
+        _ => false,
+    }
+}
+
 /// A create in a namespace that does not exist.
 fn namespace_missing(e: &ApiError) -> bool {
     matches!(&e.failure, Failure::NotFound(m) if m.starts_with("namespaces "))
@@ -963,6 +1010,8 @@ mod tests {
         quota: Option<Value>,
         admission: Admission,
         quota_full: bool,
+        /// The pod's create stores the pod, and answers with this code and no pod.
+        lost_pod_answer: Option<u16>,
         fail_secret_create: bool,
         /// How many more of the Secrets' deletes fail.
         fail_secret_deletes: u32,
@@ -1001,6 +1050,7 @@ mod tests {
             quota: Some(quota()),
             admission: Admission::Sound,
             quota_full: false,
+            lost_pod_answer: None,
             fail_secret_create: false,
             fail_secret_deletes: 0,
             fail_pod_delete: false,
@@ -1184,7 +1234,15 @@ mod tests {
                 cluster.next_uid += 1;
                 pod["status"] = json!({"phase": "Pending"});
                 cluster.pods.insert(name, pod.clone());
-                Reply::Json(201, pod)
+                match cluster.lost_pod_answer {
+                    Some(500) => Reply::Json(
+                        500,
+                        status(500, "InternalError", "etcdserver: request timed out"),
+                    ),
+                    // Not a Status, or not the pod.
+                    Some(code) => Reply::Text(code, "upstream request timeout".into()),
+                    None => Reply::Json(201, pod),
+                }
             }
             ("GET", p) if p == pods => {
                 let wanted: Vec<(String, String)> = query
@@ -1646,6 +1704,112 @@ mod tests {
         assert!(error.contains("cleanup of leftovers"), "{error}");
         assert!(!error.contains("USER-DATA-CANARY"), "{error}");
         assert_eq!(t.cluster().pods.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pod_whose_create_got_no_clear_answer_is_deleted_again() {
+        let create = json!({"template": "sandbox-4c8g", "userData": USER_DATA,
+                            "labels": {"tinfirm-host": HOST}});
+        // The server stored the pod, and then: a 5xx, a proxy's page, an answer that is no pod.
+        for (code, failure) in [
+            (500, "HTTP 500 InternalError"),
+            (504, "HTTP 504, and the answer is not a Status"),
+            (201, "the answer is not a JSON object of the expected shape"),
+        ] {
+            let mut c = cluster();
+            c.lost_pod_answer = Some(code);
+            let t = start(c).await;
+            let error = t.error("create", create.clone()).await;
+            assert!(error.contains("cannot create the pod"), "{error}");
+            assert!(error.contains(failure), "{failure}: {error}");
+            assert!(
+                error.contains("the server had stored the pod tinfirm-vm-")
+                    && error.contains("which is deleted again"),
+                "{error}"
+            );
+            assert!(t.cluster().pods.is_empty(), "{code}: the pod is gone");
+            assert!(t.cluster().secrets.is_empty(), "{code}: no ticket was made");
+            // The pod's create, then its delete at once, and nothing after.
+            let calls = t.calls();
+            assert_eq!(
+                calls[calls.len() - 2],
+                format!("POST /api/v1/namespaces/{NS}/pods"),
+                "{calls:#?}"
+            );
+            let last = t.fake.seen().last().unwrap().target.clone();
+            assert!(
+                last.starts_with(&format!("/api/v1/namespaces/{NS}/pods/tinfirm-vm-"))
+                    && last.ends_with("?gracePeriodSeconds=0"),
+                "{calls:#?}"
+            );
+            assert_eq!(calls.last().unwrap().split(' ').next(), Some("DELETE"));
+        }
+
+        // When the delete fails too, the answer says that the cleanup takes the pod.
+        let mut c = cluster();
+        c.lost_pod_answer = Some(500);
+        c.fail_pod_delete = true;
+        let t = start(c).await;
+        let error = t.error("create", create.clone()).await;
+        assert!(error.contains("cannot create the pod"), "{error}");
+        assert!(
+            error.contains("if the server stored it, could not be deleted"),
+            "{error}"
+        );
+        assert!(error.contains("cleanup of leftovers"), "{error}");
+        assert_eq!(t.cluster().pods.len(), 1);
+
+        // A refusal stored nothing: no delete follows it.
+        let t = start(cluster()).await;
+        t.ok("create", create.clone()).await;
+        t.cluster().quota_full = true;
+        t.forget_calls();
+        let error = t.error("create", create.clone()).await;
+        assert!(error.contains("no room in the runs' namespace"), "{error}");
+        assert!(
+            !t.calls().iter().any(|call| call.starts_with("DELETE")),
+            "{:#?}",
+            t.calls()
+        );
+        assert_eq!(t.cluster().pods.len(), 1, "the first create's pod");
+    }
+
+    #[test]
+    fn only_a_create_without_a_clear_answer_may_have_stored_its_object() {
+        let error = |failure: &Failure| ApiError {
+            call: format!("POST /api/v1/namespaces/{NS}/pods"),
+            failure: failure.clone(),
+        };
+        let status = |code: u16, reason: &str| Failure::Status {
+            code,
+            reason: reason.into(),
+            message: String::new(),
+        };
+        for unclear in [
+            Failure::Timeout(Duration::from_secs(30)),
+            Failure::Transport("connection reset by peer".into()),
+            Failure::Malformed,
+            Failure::TooLarge { limit: 1 },
+            status(500, "InternalError"),
+            status(504, "Timeout"),
+            Failure::Http { code: 502 },
+        ] {
+            assert!(maybe_stored(&error(&unclear)), "{unclear}");
+        }
+        for refusal in [
+            Failure::Forbidden("exceeded quota".into()),
+            Failure::Invalid {
+                message: String::new(),
+                causes: Vec::new(),
+            },
+            Failure::AlreadyExists(String::new()),
+            Failure::NotFound("namespaces \"tinfirm-runs\" not found".into()),
+            status(429, "TooManyRequests"),
+            Failure::Http { code: 403 },
+            Failure::NotSent("the token file".into()),
+        ] {
+            assert!(!maybe_stored(&error(&refusal)), "{refusal}");
+        }
     }
 
     #[tokio::test]
