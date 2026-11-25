@@ -188,15 +188,15 @@
     quiet: false
 
 # `run` refuses to start while the nodes, every one of them answering, have fewer free VMs than
-# its ceiling; with a node that does not answer it starts on the others, and a run beyond their
-# free VMs fails. A host whose runs are in progress has fewer free: then this is the count of
-# the moment.
+# its ceiling; with a node that does not answer it starts on the others, with the slots they have
+# room for. A host whose runs are in progress has fewer free: then this is the count of the
+# moment.
 - name: Warn when the nodes have fewer free VMs than the host's ceiling
   ansible.builtin.debug:
     msg: >-
       WARNING: the nodes have {{ _tinfirm_runner_host_verified.result.maxVms }} free VMs and
       tinfirm_runner_host_max_concurrent_runs is {{ tinfirm_runner_host_max_concurrent_runs }}: `run`
       refuses to start while there are fewer free VMs than that and every node answers, and
-      while a node does not answer, a run beyond the others' free VMs fails. Lower it, or give
-      the nodes more (tinfirm_sandbox_node_max_vms).
+      while a node does not answer, it takes only as many runs at once as the others have room
+      for. Lower it, or give the nodes more (tinfirm_sandbox_node_max_vms).
   when: (_tinfirm_runner_host_verified.result.maxVms | int) < (tinfirm_runner_host_max_concurrent_runs | int)

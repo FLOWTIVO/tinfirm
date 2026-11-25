@@ -446,7 +446,8 @@ The two machines need each other's fingerprint. In this order:
 `run` refuses to start while the nodes, every one of them answering, have fewer free VMs than
 `--max-concurrent-runs`: keep `tinfirm_runner_host_max_concurrent_runs` at most the sum of the nodes'
 `tinfirm_sandbox_node_max_vms`. While a node does not answer, `run` starts on the others with a
-warning that names it, and a run beyond their free VMs fails until the node answers again
+warning that names it, and takes only as many runs at once as they have room for until the node
+answers again: a run beyond that waits in Tinfirm's queue
 ([runner/README.md](../../runner/README.md#a-vm-per-run), "Checked at start"). With no node that
 answers it does not start. The play warns when the ceiling is above what the nodes have free.
 

@@ -602,6 +602,169 @@ async fn a_host_starts_with_less_room_than_its_ceiling_only_when_a_node_did_not_
     assert!(error.contains("no node of the driver answered"), "{error}");
 }
 
+/// The fake driver's file that says which "nodes" do not answer, and the others' slots.
+fn nodes_down(path: &std::path::Path, slots: u32) {
+    let unreachable = ["node node-2: cannot reach the node: connection refused"];
+    let down = json!({"unreachable": unreachable, "slots": slots});
+    std::fs::write(path, down.to_string()).unwrap();
+}
+
+/// While part of the driver's machines do not answer, the host's room is the free VMs of the
+/// others and its own VMs there, counted at the start's check and at each check after it; with
+/// every machine answering there is none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_room_is_that_of_the_machines_that_answer_with_this_hosts_own_vms_there() {
+    use tinfirm_runner_host::vm::Vms;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("driver.log");
+    let down = dir.path().join("nodes-down");
+    let down_path = down.to_string_lossy().into_owned();
+    // Two nodes of 2 slots; `leftovers` are the VMs there from the start.
+    let vms = |leftovers: Option<String>| {
+        let mut env = vec![("FAKE_VM_SLOTS", "4"), ("FAKE_VM_NODE_DOWN", &down_path)];
+        if let Some(leftovers) = &leftovers {
+            env.push(("FAKE_VM_LEFTOVERS", leftovers));
+        }
+        let mut options = vm_options(&log, &env);
+        options.recheck = Duration::from_millis(200);
+        Vms::new(options)
+    };
+    // Every node answers: no room is set, whatever the ceiling.
+    let all = vms(None);
+    all.check(4, Some("host-a")).await.unwrap();
+    assert_eq!(*all.room_watch().borrow(), None);
+
+    // One node does not answer at the start: the other's 2 slots for a ceiling of 4.
+    nodes_down(&down, 2);
+    let one = vms(None);
+    one.check(4, Some("host-a")).await.unwrap();
+    let mut room = one.room_watch();
+    assert_eq!(*room.borrow_and_update(), Some(2));
+    // It answers again: the host asks on its own, and has no room set from then on.
+    std::fs::remove_file(&down).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), room.wait_for(Option::is_none))
+        .await
+        .expect("the host did not ask the driver again")
+        .unwrap();
+
+    // This host's own VM on the node that answers is in its room, beside the free slot.
+    nodes_down(&down, 2);
+    let own = vms(Some(vms_of("host-a", 1)));
+    own.check(4, Some("host-a")).await.unwrap();
+    assert_eq!(*own.room_watch().borrow(), Some(2));
+    // Another host's VM there is not: the free slot alone.
+    let other = vms(Some(vms_of("host-b", 1)));
+    other.check(4, Some("host-a")).await.unwrap();
+    assert_eq!(*other.room_watch().borrow(), Some(1));
+
+    // Room for the whole ceiling on the nodes that answer: their free VMs, and the driver is
+    // asked for no list of this host's own.
+    nodes_down(&down, 3);
+    let from = vm_driver_calls(&log).len();
+    let enough = vms(None);
+    enough.check(2, Some("host-a")).await.unwrap();
+    assert_eq!(*enough.room_watch().borrow(), Some(3));
+    let calls = vm_driver_calls(&log);
+    assert!(calls_of(&calls[from..], "list").is_empty(), "{calls:#?}");
+}
+
+/// A host that starts while a node does not answer has the slots of the others: it tells the
+/// server so, a run beyond them waits in the server's queue with the cause and no VM is asked
+/// for it, and the host has its ceiling's slots again once the node answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_has_the_slots_of_the_nodes_that_answer_and_its_own_again_when_all_do() {
+    with_timeout(180, async {
+        use tinfirm_runner_host::vm::Vms;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let down = dir.path().join("nodes-down");
+        let down_path = down.to_string_lossy().into_owned();
+        nodes_down(&down, 2);
+        let env = [
+            ("FAKE_VM_SLOTS", "4"),
+            ("FAKE_VM_NODE_DOWN", down_path.as_str()),
+        ];
+        let mut options = vm_options(&log, &env);
+        options.recheck = Duration::from_millis(200);
+        // As `run` does at its start: the driver's check, which finds the node that is down.
+        let vms = Vms::new(options);
+        vms.check(4, None).await.unwrap();
+        let setup = HostSetup {
+            executor: tinfirm_runner_host::sandbox::Executor::Vm(vms),
+            max_concurrent_runs: 4,
+            ..HostSetup::vm(&log, &[])
+        };
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, setup).await;
+        let mut conn = server.accept().await;
+        // The ceiling is the host's own, and its slots are those of the node that answers.
+        let (hello, applied) = conn
+            .handshake_with(1, Some(host_config(0, None, &[])))
+            .await;
+        let applied = applied.unwrap();
+        assert_eq!(hello["maxConcurrentRuns"], 4, "{hello}");
+        assert_eq!(applied["maxConcurrentRuns"], 2, "{applied}");
+        assert_eq!(applied["maxConcurrentRunsCeiling"], 4, "{applied}");
+        assert_eq!(applied["draining"], false, "{applied}");
+
+        // Two runs take the two slots, each in a VM on the node that answers.
+        let first = AssignSpec::new("slow", None);
+        let second = AssignSpec::new("slow", None);
+        for run in [&first, &second] {
+            conn.send(run.to_json());
+            conn.wait_running(run.run_id).await;
+        }
+        // The room is counted again meanwhile, with the host's own two VMs in it: 2 still.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(host.host.ready_vms_view().pool_size, 2);
+
+        // A third run is not failed when its VM is created: it waits, with the cause. (With
+        // another credential than the two, whose pool they fill.)
+        let mut third = AssignSpec::new("bridge-env", None);
+        third.runtime = "CODEX";
+        third.credential = "openai-test";
+        conn.send(third.to_json());
+        let rejected = conn.take_run("run.rejected", third.run_id).await;
+        assert_eq!(rejected["code"], "NO_FREE_SLOT", "{rejected}");
+        let reason = rejected["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("2 of 2 runs active")
+                && reason.contains("part of the VM driver's machines do not answer"),
+            "{reason}"
+        );
+        let calls = vm_driver_calls(&log);
+        assert_eq!(calls_of(&calls, "create").len(), 2, "{calls:#?}");
+
+        // The node answers again: the host's own recheck finds it and tells the server of its
+        // four slots, unprompted.
+        std::fs::remove_file(&down).unwrap();
+        let applied = conn
+            .take_where("the host's own slots again", |f| {
+                f["type"] == "host.config.applied" && f["maxConcurrentRuns"] == 4
+            })
+            .await;
+        assert_eq!(applied["maxConcurrentRunsCeiling"], 4, "{applied}");
+        // And the next run is taken beside the two.
+        let mut fourth = AssignSpec::new("bridge-env", None);
+        fourth.runtime = "CODEX";
+        fourth.credential = "openai-test";
+        conn.send(fourth.to_json());
+        let t = conn.until_finished(fourth.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+
+        for run in [&first, &second] {
+            conn.send(json!({"type": "run.cancel", "runId": run.run_id, "epoch": 1}));
+        }
+        for run in [&first, &second] {
+            let finished = conn.take_run("run.finished", run.run_id).await;
+            assert_eq!(finished["outcome"], "CANCELLED", "{finished}");
+        }
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_the_node_driver_only_own_vms_on_nodes_of_the_template_count_as_room() {
     use tinfirm_runner_host::vm::{Builtin, Vms};

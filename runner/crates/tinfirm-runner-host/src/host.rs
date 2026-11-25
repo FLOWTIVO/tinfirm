@@ -475,6 +475,11 @@ impl Shared {
         if opts.keeps_ready_vms() {
             capacity = capacity.with_pool(opts.ready_vms.max_ready);
         }
+        // What the start's check of the VM driver found of machines that do not answer: the
+        // host's first `host.config.applied` carries its slots ([`Host::set_vm_room`]).
+        if let Executor::Vm(vms) = &opts.executor {
+            capacity.set_vm_room(*vms.room_watch().borrow());
+        }
         let outbox = Arc::new(Outbox::with_retention(opts.finished_retention));
         // A statement that contradicts what the host sees is an error whatever the nodes'
         // hardening, so the start's derivation tells for every later one.
@@ -1682,6 +1687,34 @@ impl Shared {
         }
     }
 
+    /// With a VM per run: the room of the driver's machines that answer, while others do not
+    /// ([`crate::vm::Vms::room_watch`]); `None` once every machine answers. The host has at
+    /// most that many slots meanwhile, so that a run beyond them waits in the server's queue
+    /// instead of failing when its VM is created. Tells the server with `host.config.applied`
+    /// when its effective slots change, as a drain does, once a `host.config` was applied on
+    /// the current connection; otherwise the answer to the first one carries them.
+    pub fn set_vm_room(&self, room: Option<u32>) {
+        let mut capacity = lock(&self.capacity);
+        if !capacity.set_vm_room(room) {
+            return;
+        }
+        tracing::info!(
+            max_concurrent_runs = capacity.max_concurrent_runs(),
+            ceiling = capacity.host_ceiling(),
+            vm_room = ?room,
+            "the runs this host takes at once changed with the room of its VM driver's machines that answer"
+        );
+        if let Some(applied) = capacity.applied() {
+            self.outbox
+                .push_control(Message::HostConfigApplied(applied));
+        }
+        drop(capacity);
+        // The ready VMs count against the same slots.
+        if let Some(ready_vms) = &self.ready_vms {
+            ready_vms.poke();
+        }
+    }
+
     /// SIGHUP or `tinfirm-runner-host drain` (docs/archive/v1/CONVENTIONS.md §15.4 step 13): take no new run,
     /// let the active ones finish, deliver everything, then [`serve`] returns `Ok`. Tells the
     /// server with `host.config.applied` (`draining: true`, 0 slots) once a `host.config` was
@@ -1833,10 +1866,14 @@ impl Shared {
                     ),
                 ))
             } else if active >= slots as usize {
-                Some((
-                    reject_code::NO_FREE_SLOT,
-                    format!("no free slot ({active} of {slots} runs active)"),
-                ))
+                let why = match capacity.bounding_vm_room() {
+                    // The host's own slots would take the run: say why it has fewer now.
+                    Some(room) => format!(
+                        "no free slot ({active} of {slots} runs active; part of the VM driver's machines do not answer, and those that do have room for {room} of this runner host's runs)"
+                    ),
+                    None => format!("no free slot ({active} of {slots} runs active)"),
+                };
+                Some((reject_code::NO_FREE_SLOT, why))
             } else if let (Some(label), Some(pool)) = (label, pool)
                 && in_pool >= pool as usize
             {
@@ -2822,6 +2859,28 @@ fn hello_is_stale(sent: crate::vm::Mark, now: crate::vm::Streak) -> bool {
     }
 }
 
+/// Passes the room of the VM driver's machines that answer on to the host's capacity, from its
+/// value at the start and at each change, until `stop` ([`Host::set_vm_room`]). Nothing on a
+/// host without a VM per run.
+async fn follow_vm_room(host: Host, stop: CancellationToken) {
+    let Executor::Vm(vms) = &host.opts.executor else {
+        return;
+    };
+    let mut room = vms.room_watch();
+    loop {
+        let now = *room.borrow_and_update();
+        host.set_vm_room(now);
+        tokio::select! {
+            () = stop.cancelled() => return,
+            changed = room.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Tells the server of a change of the node driver's hardening mark (ADR-0113, decision 5)
 /// until `stop`: the protocol carries the mark in the hello alone, so the host asks the
 /// connection for a new hello, which it makes by a reconnect (crate::connection). Runs go on
@@ -2917,6 +2976,9 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
         _ => None,
     };
     let tell = tokio::spawn(tell_hardening(host.clone(), finish.clone()));
+    // With a VM per run: the slots this host has while part of its driver's machines do not
+    // answer ([`Host::set_vm_room`]).
+    let vm_room = tokio::spawn(follow_vm_room(host.clone(), finish.clone()));
     let ticker = {
         let host = host.clone();
         let stop = finish.clone();
@@ -2960,6 +3022,7 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     ticker.abort();
     health.abort();
     tell.abort();
+    vm_room.abort();
     if let Some(hardening) = hardening {
         hardening.abort();
     }

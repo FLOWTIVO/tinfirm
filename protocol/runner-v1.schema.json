@@ -2088,7 +2088,7 @@
       }
     },
     "HostConfigApplied": {
-      "description": "Runner host -> server: the capacity the host uses now. It answers every host.config the host applies, and is sent unprompted, once the host has applied a host.config on the current connection, whenever an effective value, a ceiling or `draining` changes for a local reason (today: when the host starts to drain). The server stores these values and dispatches with them (CONVENTIONS §14.8, §15.7).",
+      "description": "Runner host -> server: the capacity the host uses now. It answers every host.config the host applies, and is sent unprompted, once the host has applied a host.config on the current connection, whenever an effective value, a ceiling or `draining` changes for a local reason: when the host starts to drain, and on a host with a VM per run when part of its VM driver's machines stop answering or answer again. The server stores these values and dispatches with them (CONVENTIONS §14.8, §15.7).",
       "type": "object",
       "required": [
         "type",
@@ -2115,7 +2115,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 16,
-          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining."
+          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining. On a host with a VM per run, at most the room of its VM driver's machines that answer while others do not, which may be 0."
         },
         "maxConcurrentRunsCeiling": {
           "$ref": "#/$defs/Capacity",

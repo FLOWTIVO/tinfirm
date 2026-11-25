@@ -1377,12 +1377,20 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   nodes hold the ceiling cannot be told: `run` starts on the nodes that answer, with the warning
   "the VM driver has less room than the ceiling because part of its machines did not answer",
   which names each such node and why, as a host that is already running goes on when a node stops
-  answering. The ceiling stays `--max-concurrent-runs`: until the node answers, a run beyond the
-  room of the others fails with `INFRA` when its VM cannot be created ("no node of the driver can
-  take a VM …"), and the node's slots are used from the first create after it answers, with no
-  restart. A node that does not answer is not a problem of `verify`, so this host goes on taking
-  runs ([A driver that can make no VM](#a-vm-per-run)). A start at which no node answers is
-  refused, as a problem.
+  answering. The ceiling stays `--max-concurrent-runs`, and the host has fewer slots until the node
+  answers: the free VMs of the nodes that answer and its own VMs there. It tells the server so
+  (`host.config.applied`, unprompted, as for a drain), and the server dispatches by it: a run
+  beyond those slots waits in the server's queue instead of failing with `INFRA` when its VM
+  cannot be created. One that is assigned all the same is rejected with "no free slot (… part of
+  the VM driver's machines do not answer …)". The host counts that room at each `verify` of the
+  driver (at its start, on the node driver's schedule of 5 minutes, after a create that failed),
+  so a host that is running when a node stops answering has the fewer slots from the next of
+  them, and a run may fail at its create before that. While a node does not answer the host asks
+  `verify` every 30 s: it has its own slots again within about that time after the node answers,
+  with no restart. Its runs on the node that does not answer count as active until they end. A
+  node that does not answer is not a problem of `verify`, so this host goes on taking runs
+  ([A driver that can make no VM](#a-vm-per-run)). A start at which no node answers is refused,
+  as a problem.
 - **Leftovers.** After each connection to the server, this host lists its VMs and deletes those it does
   not hold: after a crash of this host, or a delete that failed. Each VM has the labels `tinfirm-host`
   (this host's id) and `tinfirm-vm` (the VM's own id); the run that takes it is in this host's log.

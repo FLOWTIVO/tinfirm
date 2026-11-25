@@ -85,7 +85,7 @@ sha256sum tinfirm-vm.img.zst
           sandbox-2c4g: {vcpus: 2, memoryMib: 4096, snapshotMib: 8192}
     ```
 
-    `tinfirm_sandbox_node_control_host` is the control host's address as the nodes see its connections. Keep `tinfirm_runner_host_max_concurrent_runs` at most the sum of the nodes' `tinfirm_sandbox_node_max_vms`: `run` refuses to start while the nodes, every one of them answering, have fewer free VMs. While a node does not answer, `run` starts on the others with a warning that names it, and a run beyond their free VMs fails until the node answers again.
+    `tinfirm_sandbox_node_control_host` is the control host's address as the nodes see its connections. Keep `tinfirm_runner_host_max_concurrent_runs` at most the sum of the nodes' `tinfirm_sandbox_node_max_vms`: `run` refuses to start while the nodes, every one of them answering, have fewer free VMs. While a node does not answer, `run` starts on the others with a warning that names it, and takes only as many runs at once as they have room for until the node answers again: a run beyond that waits in the queue, and the control host's page shows the lower number.
 
 3. **Run the control host's play.** It installs the host without Docker, logs it in, makes its client certificate on the host, and shows its fingerprint. With no node fingerprint yet, it stops before it starts the host. It refuses a machine with Docker, containerd or Kata, or whose service user is in the `docker` group ([A machine with Docker](#a-machine-with-docker)):
 

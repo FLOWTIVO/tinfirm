@@ -15,6 +15,10 @@
 //   FAKE_VM_PROBLEMS   verify's problems, a JSON array (default: none)
 //   FAKE_VM_UNREACHABLE  verify's unreachable, a JSON array that names the "nodes" that did
 //                      not answer, as the node driver names them (default: left out)
+//   FAKE_VM_NODE_DOWN  a file: while it is there, part of the "nodes" do not answer. Its
+//                      content is a JSON object {"unreachable": [...], "slots": N}: `verify`
+//                      names those nodes as FAKE_VM_UNREACHABLE does, and counts the N slots
+//                      of the others in place of FAKE_VM_SLOTS
 //   FAKE_VM_BROKEN    a file: while it is there, the "nodes" are broken, as a node whose
 //                      firewall table is gone: verify answers its content (a JSON array) as
 //                      the problems and maxVms 0, and a create fails
@@ -92,6 +96,12 @@ function hardening() {
   return JSON.parse(readFileSync(env.FAKE_VM_HARDENED, "utf8"));
 }
 
+// FAKE_VM_NODE_DOWN: the nodes that do not answer now and the others' slots, else null.
+function nodesDown() {
+  if (!env.FAKE_VM_NODE_DOWN || !existsSync(env.FAKE_VM_NODE_DOWN)) return null;
+  return JSON.parse(readFileSync(env.FAKE_VM_NODE_DOWN, "utf8"));
+}
+
 // FAKE_VM_DOWN: whether the "node" does not answer now.
 function down() {
   return Boolean(env.FAKE_VM_DOWN && existsSync(env.FAKE_VM_DOWN));
@@ -138,12 +148,15 @@ const methods = {
     const broken = brokenProblems();
     if (mode.startsWith("slow ")) await new Promise((resolve) => setTimeout(resolve, Number(mode.slice(5))));
     if (broken) return { problems: broken, maxVms: 0, checked: [`template ${template}`], ...hardening() };
+    const gone = nodesDown();
+    const slots = gone ? gone.slots : env.FAKE_VM_SLOTS;
     return {
       ...hardening(),
       ...(env.FAKE_VM_UNREACHABLE ? { unreachable: JSON.parse(env.FAKE_VM_UNREACHABLE) } : {}),
+      ...(gone ? { unreachable: gone.unreachable } : {}),
       problems: JSON.parse(env.FAKE_VM_PROBLEMS || "[]"),
-      maxVms: env.FAKE_VM_SLOTS
-        ? Math.max(0, Number(env.FAKE_VM_SLOTS) - [...vms.values()].filter((vm) => vm.state !== "gone").length)
+      maxVms: slots !== undefined && slots !== ""
+        ? Math.max(0, Number(slots) - [...vms.values()].filter((vm) => vm.state !== "gone").length)
         : env.FAKE_VM_LIMIT
           ? Number(env.FAKE_VM_LIMIT)
           : null,

@@ -980,6 +980,17 @@ pub struct Vms {
     hardening: tokio::sync::watch::Sender<Hardening>,
     /// The mark of each check that knew one, in a row ([`Vms::streak_watch`]).
     streak: tokio::sync::watch::Sender<Streak>,
+    /// This host's label on its VMs, from the start's check or its first create: what its own
+    /// VMs are counted by for [`Vms::room_watch`].
+    host: Mutex<Option<String>>,
+    /// The host's ceiling, as the start's check was given it (`u32::MAX` before one): while
+    /// the machines that answer have room for it, the host's own VMs need no count.
+    ceiling: std::sync::atomic::AtomicU32,
+    /// While part of the driver's machines do not answer: the most VMs this host can have on
+    /// those that do ([`Vms::room_watch`]). `None` while every machine answers.
+    room: tokio::sync::watch::Sender<Option<u32>>,
+    /// A task asks the driver's `verify` again every `recheck` while `room` is set.
+    room_rechecking: std::sync::atomic::AtomicBool,
 }
 
 /// The VMs whose delete failed, by id, and whether a task tries them again now.
@@ -1054,6 +1065,10 @@ impl Vms {
                 mark: Mark::No,
                 checks: 0,
             }),
+            host: Mutex::new(None),
+            ceiling: std::sync::atomic::AtomicU32::new(u32::MAX),
+            room: tokio::sync::watch::Sender::new(None),
+            room_rechecking: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1184,15 +1199,135 @@ impl Vms {
     // too ([`Vms::ask_hardening`]): an answer with problems and no room then puts it into the
     // state before a run's create fails for it.
 
-    /// Asks the driver's `verify`, within the driver's own [`VERIFY_TIMEOUT`].
-    async fn health(&self) -> Health {
+    /// Asks the driver's `verify`, within the driver's own [`VERIFY_TIMEOUT`]: what it says of
+    /// whether the driver can make a VM, and the answer itself where there is one.
+    async fn health(&self) -> (Health, Option<Verified>) {
         match self.driver.verify(&self.options.template).await {
             Ok(verified) => {
                 self.note_hardening(&verified, false);
-                no_vms_cause(&verified).map_or(Health::Clean, Health::NoVms)
+                let health = no_vms_cause(&verified).map_or(Health::Clean, Health::NoVms);
+                (health, Some(verified))
             }
-            Err(e) => Health::Unknown(format!("{e:#}")),
+            Err(e) => (Health::Unknown(format!("{e:#}")), None),
         }
+    }
+
+    // ----- the room while part of the driver's machines do not answer ----------------------
+    //
+    // A driver names the machines that did not answer its `verify` ([`Verified::unreachable`]),
+    // and its `maxVms` is then the free VMs of the others. The host can have that many more
+    // VMs and its own VMs on those machines, and no more: a run beyond them would fail when its
+    // VM is created. So the host has at most that many slots while a machine does not answer
+    // ([`Vms::room_watch`], which crate::host passes on to the server as its effective
+    // `maxConcurrentRuns`), and its own ceiling again once every machine answers. Each health
+    // check counts the room anew, and while it is set the host asks `verify` every `recheck`
+    // on its own, so that it has its slots back soon after the machine is. At the start the
+    // check of [`Vms::check`] sets it. The host's own VMs are counted with the driver's `list`
+    // only while the machines that answer have less room than the host's ceiling.
+
+    /// While part of the driver's machines do not answer: the most VMs this host can have on
+    /// those that do, which may be none. `None` while every machine answers, and with a driver
+    /// that names no limit.
+    pub fn room_watch(&self) -> tokio::sync::watch::Receiver<Option<u32>> {
+        self.room.subscribe()
+    }
+
+    /// Counts the room that a health check's `verify` found, and notes it ([`Vms::note_room`]).
+    /// `made` is the count of the VMs the driver had made before that `verify` was asked.
+    async fn count_room(self: &Arc<Vms>, verified: &Verified, made: u64) {
+        let free = match verified.max_vms {
+            Some(free) if !verified.unreachable.is_empty() => free,
+            _ => return self.note_room(None, verified),
+        };
+        // Room for the whole ceiling on the machines that answer: the count of this host's own
+        // VMs there changes nothing, and the driver is asked for no list.
+        let host = lock(&self.host).clone();
+        let own = match host {
+            Some(host) if free < self.ceiling.load(Ordering::Relaxed) => {
+                match self.own_vms(&host).await {
+                    Ok(own) => own,
+                    Err(e) => {
+                        tracing::debug!(
+                            template = %self.options.template,
+                            error = %format!("{e:#}"),
+                            "this host's own VMs cannot be listed; its room is counted at the next check"
+                        );
+                        // Not a guess in place of a room that is known; without one, the free
+                        // VMs alone, which is never too many.
+                        if self.room.borrow().is_some() {
+                            return;
+                        }
+                        0
+                    }
+                }
+            }
+            _ => 0,
+        };
+        let mut room = free.saturating_add(own);
+        // A VM that was made meanwhile may be among this host's own and not yet out of
+        // `verify`'s free ones: counted twice. Then no more than the room known before; the
+        // next check counts again.
+        if self.made.load(Ordering::SeqCst) != made
+            && let Some(known) = *self.room.borrow()
+        {
+            room = room.min(known);
+        }
+        self.note_room(Some(room), verified);
+    }
+
+    /// Notes the room while part of the driver's machines do not answer (`None`: every machine
+    /// answers), logs a change, and has `verify` asked again every `recheck` while it is set.
+    fn note_room(self: &Arc<Vms>, room: Option<u32>, verified: &Verified) {
+        let mut before = None;
+        self.room.send_if_modified(|known| {
+            before = *known;
+            *known = room;
+            before != room
+        });
+        let template = &self.options.template;
+        let unreachable = verified.unreachable.join("; ");
+        match (before, room) {
+            (None, Some(room)) => tracing::warn!(
+                %template,
+                room,
+                %unreachable,
+                "part of the VM driver's machines do not answer: this host has at most `room` runs at once, on the others, until they do"
+            ),
+            (Some(was), Some(room)) if was != room => tracing::info!(
+                %template,
+                room,
+                was,
+                %unreachable,
+                "the room on the VM driver's machines that answer has changed"
+            ),
+            (Some(_), None) => tracing::info!(
+                %template,
+                "every machine of the VM driver answers again: this host has the slots of its own ceiling"
+            ),
+            _ => {}
+        }
+        if room.is_some() && !self.room_rechecking.swap(true, Ordering::SeqCst) {
+            self.spawn_room_recheck();
+        }
+    }
+
+    /// While the room is set, asks the driver again every `recheck`, so that the host has its
+    /// own slots again soon after every machine answers, and the room of the moment meanwhile.
+    fn spawn_room_recheck(self: &Arc<Vms>) {
+        let (vms, every) = (Arc::downgrade(self), self.options.recheck);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(vms) = vms.upgrade() else { return };
+                if vms.room.borrow().is_none() {
+                    vms.room_rechecking.store(false, Ordering::SeqCst);
+                    return;
+                }
+                // Bounded by the driver's own time for `verify`.
+                vms.check_within(VERIFY_TIMEOUT + Duration::from_secs(5))
+                    .await;
+            }
+        });
     }
 
     /// The driver's state as it changes: the cause while it can make no VM, `None` while it can.
@@ -1261,7 +1396,8 @@ impl Vms {
             let vms = self.clone();
             tokio::spawn(async move {
                 let made = vms.made.load(Ordering::SeqCst);
-                let health = match vms.health().await {
+                let (health, verified) = vms.health().await;
+                let health = match health {
                     // A VM was made while `verify` ran: the driver can make VMs.
                     Health::NoVms(_) if vms.made.load(Ordering::SeqCst) != made => {
                         Health::Unknown("the driver made a VM while its verify ran".into())
@@ -1269,6 +1405,13 @@ impl Vms {
                     health => health,
                 };
                 vms.record(health);
+                // Whoever waits for this check has its answer now. The room may take the
+                // driver one more call, for this host's own VMs: the check is under way until
+                // that is counted, and whoever came meanwhile is told then.
+                vms.checks.send_modify(|n| *n += 1);
+                if let Some(verified) = verified {
+                    vms.count_room(&verified, made).await;
+                }
                 vms.checking.store(false, Ordering::SeqCst);
                 vms.checks.send_modify(|n| *n += 1);
             });
@@ -1362,14 +1505,14 @@ impl Vms {
     /// Too little room refuses the start only when every machine of the driver answered. When
     /// the driver names machines that did not ([`Verified::unreachable`]), the room is that of
     /// the others, and the host starts on them with a warning, as a host that is already
-    /// running goes on when a node stops answering. Its ceiling stays `max_concurrent_runs`:
-    /// until those machines answer, a run beyond the room fails when its VM is created, and
-    /// their slots are used again from the first create after they answer. A machine that does
-    /// not answer is no problem of `verify`, so it does not make the driver one that can make
-    /// no VM ([`no_vms_cause`]). A driver of which no machine answers reports that as a
+    /// running goes on when a node stops answering. Its ceiling stays `max_concurrent_runs`,
+    /// and it has at most the slots of that room until those machines answer
+    /// ([`Vms::room_watch`]): a run beyond them waits in the server's queue. A machine that
+    /// does not answer is no problem of `verify`, so it does not make the driver one that can
+    /// make no VM ([`no_vms_cause`]). A driver of which no machine answers reports that as a
     /// problem, which refuses the start as every problem does.
     pub async fn check(
-        &self,
+        self: &Arc<Vms>,
         max_concurrent_runs: u32,
         own: Option<&str>,
     ) -> Result<(DriverHello, Verified, u32)> {
@@ -1377,6 +1520,10 @@ impl Vms {
         let verified = self.driver.verify(&self.options.template).await?;
         // The start's value of the hardening: a driver that cannot tell gives `no`.
         self.note_hardening(&verified, true);
+        self.ceiling.store(max_concurrent_runs, Ordering::Relaxed);
+        if let Some(host) = own {
+            *lock(&self.host) = Some(host.to_string());
+        }
         if !verified.problems.is_empty() {
             bail!(
                 "the VM template `{}` breaks the contract of a sandbox VM (the VM driver `{}` found: {}); fix the setup, or name another template",
@@ -1426,10 +1573,17 @@ impl Vms {
                     own = held,
                     max_concurrent_runs,
                     unreachable = %verified.unreachable.join("; "),
-                    "the VM driver has less room than the ceiling because part of its machines did not answer: this host starts on the others, and until they answer a run beyond that room fails when its VM is created"
+                    "the VM driver has less room than the ceiling because part of its machines did not answer: this host starts on the others"
                 );
             }
         }
+        // The slots this host has while a machine does not answer: none of its own VMs was
+        // counted above where the others have room for the whole ceiling, and none is needed.
+        let room = match verified.max_vms {
+            Some(free) if !verified.unreachable.is_empty() => Some(free.saturating_add(held)),
+            _ => None,
+        };
+        self.note_room(room, &verified);
         Ok((hello, verified, held))
     }
 
@@ -1493,6 +1647,10 @@ impl Vms {
         let label = labels.get(VM_LABEL).cloned();
         if let Some(label) = &label {
             lock(&self.live).insert(label.clone());
+        }
+        // A host that registered after its start's check: its label, for its room's count.
+        if let Some(host) = labels.get(HOST_LABEL) {
+            lock(&self.host).get_or_insert_with(|| host.clone());
         }
         let id = match self
             .driver
