@@ -991,6 +991,9 @@ pub struct Vms {
     room: tokio::sync::watch::Sender<Option<u32>>,
     /// A task asks the driver's `verify` again every `recheck` while `room` is set.
     room_rechecking: std::sync::atomic::AtomicBool,
+    /// This host's own VMs on the machines that answer, as the last list counted them: what a
+    /// check whose list fails counts with ([`counted_room`]).
+    own_counted: std::sync::atomic::AtomicU32,
 }
 
 /// The VMs whose delete failed, by id, and whether a task tries them again now.
@@ -1018,6 +1021,33 @@ enum Health {
     NoVms(String),
     /// `verify` failed or did not answer in the driver's own time: this tells nothing.
     Unknown(String),
+}
+
+/// The room a check counts while part of the driver's machines do not answer, never more than
+/// the check can show: the `free` VMs of the machines that answer and this host's `own` VMs
+/// there. A VM that was made while the driver was asked (`made_meanwhile` of them) may be among
+/// the host's own and not yet out of the free ones, counted twice: each is taken off, which is
+/// never too many. Where the host's own VMs could not be listed (`own` is `None`), those of the
+/// last count stand in (`last_own`), and the room is no more than the one `known` before: the
+/// free VMs of this check count at once, as when one more machine has stopped answering, and
+/// nothing is guessed upward. The next check counts again.
+fn counted_room(
+    free: u32,
+    own: Option<u32>,
+    made_meanwhile: u64,
+    last_own: u32,
+    known: Option<u32>,
+) -> u32 {
+    match own {
+        Some(own) => free
+            .saturating_add(own)
+            .saturating_sub(u32::try_from(made_meanwhile).unwrap_or(u32::MAX)),
+        None => {
+            let with_last = free.saturating_add(last_own);
+            // Without a room known before, the free VMs alone.
+            known.map_or(free, |known| known.min(with_last))
+        }
+    }
 }
 
 /// Why the driver can make no VM, as its last `verify` found it, and when that was.
@@ -1069,6 +1099,7 @@ impl Vms {
             ceiling: std::sync::atomic::AtomicU32::new(u32::MAX),
             room: tokio::sync::watch::Sender::new(None),
             room_rechecking: std::sync::atomic::AtomicBool::new(false),
+            own_counted: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1245,33 +1276,29 @@ impl Vms {
         let own = match host {
             Some(host) if free < self.ceiling.load(Ordering::Relaxed) => {
                 match self.own_vms(&host).await {
-                    Ok(own) => own,
+                    Ok(own) => {
+                        self.own_counted.store(own, Ordering::Relaxed);
+                        Some(own)
+                    }
                     Err(e) => {
                         tracing::debug!(
                             template = %self.options.template,
                             error = %format!("{e:#}"),
-                            "this host's own VMs cannot be listed; its room is counted at the next check"
+                            "this host's own VMs cannot be listed; its room is counted with those of the last count"
                         );
-                        // Not a guess in place of a room that is known; without one, the free
-                        // VMs alone, which is never too many.
-                        if self.room.borrow().is_some() {
-                            return;
-                        }
-                        0
+                        None
                     }
                 }
             }
-            _ => 0,
+            _ => Some(0),
         };
-        let mut room = free.saturating_add(own);
-        // A VM that was made meanwhile may be among this host's own and not yet out of
-        // `verify`'s free ones: counted twice. Then no more than the room known before; the
-        // next check counts again.
-        if self.made.load(Ordering::SeqCst) != made
-            && let Some(known) = *self.room.borrow()
-        {
-            room = room.min(known);
-        }
+        let room = counted_room(
+            free,
+            own,
+            self.made.load(Ordering::SeqCst).saturating_sub(made),
+            self.own_counted.load(Ordering::Relaxed),
+            *self.room.borrow(),
+        );
         self.note_room(Some(room), verified);
     }
 
@@ -1321,7 +1348,14 @@ impl Vms {
                 let Some(vms) = vms.upgrade() else { return };
                 if vms.room.borrow().is_none() {
                     vms.room_rechecking.store(false, Ordering::SeqCst);
-                    return;
+                    // A check that noted a room between that look and the store found the
+                    // flag set and started no task. So one more look: this task goes on where
+                    // a room is set and no other task took the flag meanwhile.
+                    if vms.room.borrow().is_none()
+                        || vms.room_rechecking.swap(true, Ordering::SeqCst)
+                    {
+                        return;
+                    }
                 }
                 // Bounded by the driver's own time for `verify`.
                 vms.check_within(VERIFY_TIMEOUT + Duration::from_secs(5))
@@ -1583,6 +1617,7 @@ impl Vms {
             Some(free) if !verified.unreachable.is_empty() => Some(free.saturating_add(held)),
             _ => None,
         };
+        self.own_counted.store(held, Ordering::Relaxed);
         self.note_room(room, &verified);
         Ok((hello, verified, held))
     }
@@ -2076,6 +2111,29 @@ pub fn user_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checks_room_is_never_more_than_the_check_can_show() {
+        // The free VMs of the machines that answer and this host's own VMs there.
+        assert_eq!(counted_room(2, Some(1), 0, 0, None), 3);
+        assert_eq!(counted_room(2, Some(1), 0, 5, Some(9)), 3);
+        // A VM made while the driver was asked may be counted twice: each is taken off, with a
+        // room known before and at the first check that finds a machine silent alike.
+        assert_eq!(counted_room(2, Some(1), 1, 0, None), 2);
+        assert_eq!(counted_room(2, Some(1), 1, 0, Some(3)), 2);
+        assert_eq!(counted_room(0, Some(1), 3, 0, None), 0);
+        // The host's own VMs could not be listed: those of the last count stand in, and the
+        // room is no more than the one known before.
+        assert_eq!(counted_room(1, None, 0, 2, Some(3)), 3);
+        assert_eq!(counted_room(1, None, 0, 2, Some(2)), 2);
+        // One more machine stopped answering in that check: its free VMs are gone at once.
+        assert_eq!(counted_room(0, None, 0, 2, Some(4)), 2);
+        // No room known before and no list: the free VMs alone.
+        assert_eq!(counted_room(1, None, 0, 2, None), 1);
+        // Nothing overflows.
+        assert_eq!(counted_room(u32::MAX, Some(u32::MAX), u64::MAX, 0, None), 0);
+        assert_eq!(counted_room(u32::MAX, None, 0, u32::MAX, Some(7)), 7);
+    }
 
     #[test]
     fn a_failed_delete_is_tried_again_less_and_less_often_and_for_a_bounded_time() {
