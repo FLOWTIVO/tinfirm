@@ -747,10 +747,13 @@ runner:
         #         {"type": "tuning", "sysctl": {"net.ipv4.conf.IFNAME.forwarding": "0"}}
         #       ]}
         # The `tuning` plugin puts the tap's name, tap0, in place of IFNAME. The `tap` plugin
-        # gets no owner or group. Where the pods have IPv6, add
-        # "net.ipv6.conf.IFNAME.forwarding": "0" to the sysctl object; where they have none,
-        # leave it out, since the attachment then fails on it. On OKD the `tap` plugin also
-        # takes the container's SELinux label (selinuxcontext).
+        # gets no owner or group. IPv6 has no setting of the tap's own that turns forwarding
+        # off: Linux forwards it by net.ipv6.conf.all.forwarding of the pod's network
+        # namespace, which is 0 unless the workers or the network plugin set it, and the run
+        # pod's program does not start the VM while it reads 1. Where it does, add
+        # "net.ipv6.conf.all.forwarding": "0" to the sysctl object; where the pods have no
+        # IPv6, leave it out, since the attachment then fails on it. On OKD the `tap` plugin
+        # also takes the container's SELinux label (selinuxcontext).
         mode: multus
         networkAttachment: ""
         # The tap's /30: the pod's side has its first address, the guest the second.

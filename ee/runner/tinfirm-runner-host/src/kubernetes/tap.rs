@@ -8,10 +8,12 @@
 //!   (`TUNSETPERSIST`).
 //! - Its address and its up flag, and its IPv4 `forwarding` set to 0, go over rtnetlink: a
 //!   pod's `/proc/sys` is read-only, and forwarding is on in its network namespace, which the
-//!   pod cannot change. The interface's own setting is what the kernel reads for a packet that
-//!   arrives on it, so nothing from the guest is forwarded out of the pod.
-//! - IPv6 has no such setting over rtnetlink; the main program refuses to start while the tap's
-//!   IPv6 `forwarding` reads 1 (crate::kubernetes::vm_pod).
+//!   pod cannot change. For IPv4 the interface's own setting is what the kernel reads for a
+//!   packet that arrives on it, so nothing from the guest is forwarded out of the pod.
+//! - IPv6 has no such setting: the kernel forwards it by the namespace's
+//!   `net.ipv6.conf.all.forwarding` alone, whatever an interface's own `forwarding` reads, and
+//!   nothing here can change that one. The main program refuses to start the VM while it reads
+//!   1 (crate::kubernetes::vm_pod).
 
 use std::net::Ipv4Addr;
 use std::os::fd::AsFd;

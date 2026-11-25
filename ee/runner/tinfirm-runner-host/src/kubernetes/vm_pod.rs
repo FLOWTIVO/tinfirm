@@ -221,17 +221,48 @@ pub fn check_tap(root: &Path, env: &PodEnv) -> Result<()> {
             v4.trim()
         );
     }
-    // No such file: IPv6 is off in the pod.
-    let v6 = root.join(format!("proc/sys/net/ipv6/conf/{TAP_DEVICE}/forwarding"));
-    if let Ok(v6) = std::fs::read_to_string(&v6)
-        && v6.trim() != "0"
-    {
+    let all = ipv6_setting(root, "all/forwarding")?;
+    let forced = ipv6_setting(root, &format!("{TAP_DEVICE}/force_forwarding"))?;
+    if let Some(setting) = ipv6_forwards(all.as_deref(), forced.as_deref()) {
+        let who = if env.tap_mode == "init" {
+            "the pod cannot change it, and its init container has no means to: the workers or the cluster's network plugin must leave it 0 in a pod's network namespace"
+        } else {
+            "the network attachment must set it to 0 (the CNI `tuning` plugin's sysctl, after the `tap` plugin)"
+        };
         bail!(
-            "{TAP_DEVICE} would forward the guest's IPv6 packets out of the pod (net.ipv6.conf.{TAP_DEVICE}.forwarding is {}): the pod cannot change it; IPv6 forwarding must be off in the pod's network (the network attachment's `tuning` plugin, or the cluster's network plugin)",
-            v6.trim()
+            "{TAP_DEVICE} would forward the guest's IPv6 packets out of the pod ({setting}): {who}"
         );
     }
     Ok(())
+}
+
+/// A file of the pod's `/proc/sys/net/ipv6/conf`, trimmed; `None` when there is no such file.
+fn ipv6_setting(root: &Path, name: &str) -> Result<Option<String>> {
+    let path = root.join("proc/sys/net/ipv6/conf").join(name);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text.trim().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+}
+
+/// The setting by which the kernel would forward an IPv6 packet that arrives on the tap, as
+/// `name is value`, from what `all/forwarding` and the tap's `force_forwarding` read (`None`:
+/// no such file); `None` when it forwards none.
+///
+/// Linux forwards IPv6 by `net.ipv6.conf.all.forwarding` alone. An interface's own `forwarding`
+/// only makes it behave as a host or as a router there and turns no forwarding off, unlike
+/// IPv4's, which the kernel reads for the interface a packet arrives on. A kernel that has
+/// `force_forwarding` also forwards what arrives on an interface where it is on, whatever
+/// `all` reads. Without `all/forwarding` the pod has no IPv6.
+fn ipv6_forwards(all: Option<&str>, forced: Option<&str>) -> Option<String> {
+    let all = all?;
+    if all != "0" {
+        return Some(format!("net.ipv6.conf.all.forwarding is {all}"));
+    }
+    forced
+        .filter(|forced| *forced != "0")
+        .map(|forced| format!("net.ipv6.conf.{TAP_DEVICE}.force_forwarding is {forced}"))
 }
 
 fn tap_missing(mode: &str) -> String {
@@ -706,6 +737,7 @@ mod tests {
             ),
         );
         write("proc/sys/net/ipv4/conf/tap0/forwarding", "0\n");
+        write("proc/sys/net/ipv6/conf/all/forwarding", "0\n");
         write("proc/sys/net/ipv6/conf/tap0/forwarding", "0\n");
         write(
             "tinfirm/ticket/user-data",
@@ -757,10 +789,16 @@ mod tests {
                 "1\n",
                 "`vm-pod tap-setup`) sets net.ipv4.conf.tap0.forwarding to 0",
             ),
+            // The tap's own IPv6 `forwarding` reads 0 in both: the kernel does not forward by it.
             (
-                "proc/sys/net/ipv6/conf/tap0/forwarding",
+                "proc/sys/net/ipv6/conf/all/forwarding",
                 "1\n",
-                "IPv6 forwarding must be off",
+                "(net.ipv6.conf.all.forwarding is 1): the pod cannot change it",
+            ),
+            (
+                "proc/sys/net/ipv6/conf/tap0/force_forwarding",
+                "1\n",
+                "(net.ipv6.conf.tap0.force_forwarding is 1)",
             ),
         ];
         for (path, text, word) in cases {
@@ -792,9 +830,28 @@ mod tests {
         .unwrap();
         let error = format!("{:#}", check_tap(dir.path(), &multus).unwrap_err());
         assert!(error.contains("the network attachment must set"), "{error}");
-        // No IPv6 at all is fine.
+        let dir = pod_tree(&multus);
+        std::fs::write(
+            dir.path().join("proc/sys/net/ipv6/conf/all/forwarding"),
+            "1",
+        )
+        .unwrap();
+        let error = format!("{:#}", check_tap(dir.path(), &multus).unwrap_err());
+        assert!(
+            error.contains(
+                "(net.ipv6.conf.all.forwarding is 1): the network attachment must set it to 0"
+            ),
+            "{error}"
+        );
+        // The tap's own IPv6 `forwarding` turns nothing on, and a `force_forwarding` that reads 0
+        // nothing either.
         let dir = pod_tree(&env);
-        std::fs::remove_file(dir.path().join("proc/sys/net/ipv6/conf/tap0/forwarding")).unwrap();
+        let conf = dir.path().join("proc/sys/net/ipv6/conf");
+        std::fs::write(conf.join("tap0/forwarding"), "1\n").unwrap();
+        std::fs::write(conf.join("tap0/force_forwarding"), "0\n").unwrap();
+        check_tap(dir.path(), &env).unwrap();
+        // No IPv6 at all is fine.
+        std::fs::remove_dir_all(dir.path().join("proc/sys/net/ipv6")).unwrap();
         check_tap(dir.path(), &env).unwrap();
         // A device that is missing, or refused.
         std::fs::remove_file(dir.path().join("dev/kvm")).unwrap();
@@ -812,6 +869,43 @@ mod tests {
             refused.contains("the cluster's admin sets mode 0666 on the workers' /dev/kvm"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn ipv6_is_forwarded_by_the_namespaces_setting_not_the_taps() {
+        let all = "net.ipv6.conf.all.forwarding";
+        let forced = "net.ipv6.conf.tap0.force_forwarding";
+        for (all_reads, forced_reads, expected) in [
+            // No IPv6 in the pod.
+            (None, None, None),
+            (None, Some("1"), None),
+            // Off, on a kernel without `force_forwarding` and on one with it.
+            (Some("0"), None, None),
+            (Some("0"), Some("0"), None),
+            // On for the whole namespace, whatever the tap's own settings read.
+            (Some("1"), None, Some(format!("{all} is 1"))),
+            (Some("1"), Some("0"), Some(format!("{all} is 1"))),
+            // On for the tap alone.
+            (Some("0"), Some("1"), Some(format!("{forced} is 1"))),
+            // What is not 0 is not off.
+            (Some(""), None, Some(format!("{all} is "))),
+            (Some("2"), Some("0"), Some(format!("{all} is 2"))),
+        ] {
+            assert_eq!(
+                ipv6_forwards(all_reads, forced_reads),
+                expected,
+                "{all_reads:?} {forced_reads:?}"
+            );
+        }
+        // A file that is there and cannot be read is an error, not "no IPv6".
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(ipv6_setting(dir.path(), "all/forwarding").unwrap(), None);
+        std::fs::create_dir_all(dir.path().join("proc/sys/net/ipv6/conf/all/forwarding")).unwrap();
+        let error = format!(
+            "{:#}",
+            ipv6_setting(dir.path(), "all/forwarding").unwrap_err()
+        );
+        assert!(error.contains("cannot read"), "{error}");
     }
 
     #[test]

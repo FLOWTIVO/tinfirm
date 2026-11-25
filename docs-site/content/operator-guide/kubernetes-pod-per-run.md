@@ -162,7 +162,7 @@ Each item says what privilege it needs or adds. Apply them in this order.
 
     - The `tap` plugin makes the VM's tap with the pod's side of the /30. It gets no `owner` or `group`: the pod has one user.
     - The `tuning` plugin turns the tap's own IPv4 forwarding off, which the pod cannot do itself; the pod's program starts no VM while the tap forwards. It puts the tap's name, `tap0`, in place of `IFNAME`. The check ran the `tap` plugin without `tuning`, so this chain has not run yet.
-    - Where pods have IPv6, add `"net.ipv6.conf.IFNAME.forwarding": "0"` to the `sysctl` object; where they have none, leave it out, since the attachment then fails on it.
+    - IPv6 has no setting of the tap's own that turns forwarding off: Linux forwards IPv6 by `net.ipv6.conf.all.forwarding` of the pod's network namespace, and an interface's `forwarding` changes nothing of that. It is 0 in a pod unless the workers or the network plugin set it (`net.core.devconf_inherit_init_net` on a worker that routes IPv6, or an option of the plugin), and the pod's program starts no VM while it reads 1. Where it does, add `"net.ipv6.conf.all.forwarding": "0"` to the `sysctl` object; where pods have no IPv6, leave it out, since the attachment then fails on it.
     - Another `cidr` in the chart needs the pod's side of it here (its first address).
 
     Without Multus, use the `init` variant: the run pod's init container makes the tap itself, with `NET_ADMIN` in the pod's own network namespace and the device plugin's `tun` device. That needs nothing of this item, but the pod then passes no Pod Security level but `privileged`.
@@ -375,7 +375,7 @@ The admission check is a set of server-side dry runs: the correct pod, which mus
 | `… the init container tap makes tap0 with that address` | With `init`: the init container did not make the tap; its own message says why |
 | `cannot make the tap tap0 (TUNSETIFF): the init container needs NET_ADMIN` | With `init`: the cluster's admin, if another engine strips the capability |
 | `tap0 would forward the guest's packets out of the pod (net.ipv4.conf.tap0.forwarding is 1): …` | With `multus`: the cluster's admin adds the `tuning` plugin with that sysctl to the attachment. With `init`: report it; the init container sets it to 0 |
-| `tap0 would forward the guest's IPv6 packets out of the pod …` | The cluster's admin: the attachment's `tuning` plugin with the IPv6 sysctl, or the network plugin |
+| `tap0 would forward the guest's IPv6 packets out of the pod (net.ipv6.conf.all.forwarding is 1): …` | The cluster's admin. With `multus`: add `"net.ipv6.conf.all.forwarding": "0"` to the `tuning` plugin's sysctl in the attachment. With `init`: the pod cannot change it, so the workers or the network plugin must leave it 0 in a pod's network namespace |
 | `the VM image /tinfirm/vm/rootfs.ext4 is … MiB, larger than the template's disk of … MiB` | The operator: a template's `diskMib` at least the image's size |
 | `cannot read the VM image …`, `cannot start /tinfirm/vm/firecracker` | The operator: the image is not one `pod-image.sh` built |
 | `the VM ended: firecracker exited with …` | The VM stopped by itself; the runner host's log has the run |

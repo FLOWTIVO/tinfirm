@@ -94,10 +94,13 @@ pub const TICKET_PREFIX: &str = "tinfirm-ticket-";
 ///
 /// The `tuning` plugin puts the interface's name, `tap0`, in place of `IFNAME`. The `tap`
 /// plugin gets no `owner` or `group`: any process of the pod's network namespace may then open
-/// the tap, and the pod has only its own user. Where the pods have IPv6, the same sysctl
-/// object also takes `"net.ipv6.conf.IFNAME.forwarding": "0"`; where they have none, that key
-/// would fail the attachment, since its file does not exist. On OKD the `tap` plugin also takes
-/// the container's SELinux label (`selinuxcontext`).
+/// the tap, and the pod has only its own user. IPv6 has no setting of the tap's own that turns
+/// forwarding off: Linux forwards it by `net.ipv6.conf.all.forwarding` of the pod's network
+/// namespace, which reads 0 unless the workers or the network plugin set it, and `vm-pod` does
+/// not start the VM while it reads 1. Where it does, the same sysctl object also takes
+/// `"net.ipv6.conf.all.forwarding": "0"`; where the pods have no IPv6, that key would fail the
+/// attachment, since its file does not exist. On OKD the `tap` plugin also takes the
+/// container's SELinux label (`selinuxcontext`).
 pub const MULTUS_ANNOTATION: &str = "k8s.v1.cni.cncf.io/networks";
 /// The largest user data: as DigitalOcean's driver allows.
 pub const MAX_USER_DATA: usize = 64 * 1024;
