@@ -51,6 +51,22 @@ fn the_hardening_unit_runs_harden_once_after_the_modules_firewall_and_kdump() {
 }
 
 #[test]
+fn the_hardening_waits_for_the_network_and_does_not_require_it() {
+    // Module loading goes off only once the network, which loads modules of its own, is up.
+    let network = "network-online.target".to_string();
+    assert!(directive(HARDENING, "After").contains(&network));
+    // The target is passive: without `Wants=` nothing would wait for the network.
+    assert!(directive(HARDENING, "Wants").contains(&network));
+    // A network that does not come up delays the hardening and does not fail it.
+    for name in ["Requires", "Requisite", "BindsTo"] {
+        assert!(directive(HARDENING, name).is_empty(), "{name}");
+    }
+    // With the default dependencies the unit is also after sysinit.target, and so after
+    // systemd-modules-load.service: a site's own list in /etc/modules-load.d is loaded first.
+    assert!(directive(HARDENING, "DefaultDependencies").is_empty());
+}
+
+#[test]
 fn the_helper_wants_the_hardening_and_does_not_require_it() {
     let unit = "tinfirm-node-agent-hardening.service".to_string();
     assert!(directive(HELPER, "Wants").contains(&unit));
