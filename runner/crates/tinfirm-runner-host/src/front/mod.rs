@@ -30,7 +30,8 @@
 //!   of a process (threads still start), no `connect`, `bind` or `listen`, and no signal
 //!   outside its own process group, not even the signal 0. A pair of Unix sockets
 //!   (`socketpair`) stays allowed: tokio's signal driver makes one, and it reaches no other
-//!   process.
+//!   process. `sendmsg` and `sendmmsg` are refused, so a front passes no descriptor to anyone
+//!   and can leave none on its way on such a pair ([`confine::raise_descriptor_limit`]).
 //!
 //! It confines itself before it builds its tokio runtime, whose threads inherit all of it. The
 //! runtime gets a fixed number of workers: counting the CPUs reads cgroup files that Landlock
@@ -69,8 +70,9 @@ const MAX_ANSWER: u64 = 64 * 1024;
 /// The data a front may use: the link's buffers (12 MiB), its streams' (16 MiB at most) and
 /// the HTTP servers', with room.
 pub const FRONT_MEMORY: u64 = 512 * 1024 * 1024;
-/// The descriptors a front may hold.
-pub const FRONT_FILES: u64 = 1024;
+/// The descriptors a front may hold, which also bounds what all the fronts can leave on their
+/// way over Unix sockets, far below `run`'s own limit ([`confine::raise_descriptor_limit`]).
+pub const FRONT_FILES: u64 = confine::CONFINED_FILES;
 /// The worker threads of a front's runtime.
 pub const FRONT_WORKERS: usize = 2;
 
@@ -106,6 +108,8 @@ pub struct Probe {
     /// Per process of `signal`: what got through (`signal 0`, `SIGCONT`, `prlimit64`,
     /// `pidfd_open`).
     pub reached: Vec<Vec<String>>,
+    /// A descriptor could be passed over a pair of Unix sockets of its own (`sendmsg`).
+    pub passed: bool,
     /// A program could be started (`fork` or `clone`, and `execve`).
     pub spawn: bool,
     /// This process could replace itself with a program (`execve`). Where it could, there is no
@@ -128,6 +132,7 @@ impl Probe {
         !self.read.contains(&true)
             && !self.socket
             && self.reached.iter().all(Vec::is_empty)
+            && !self.passed
             && !self.spawn
             && !self.exec
     }
@@ -145,6 +150,9 @@ impl Probe {
             }
             if !self.reached.iter().all(Vec::is_empty) {
                 got.push("reached another process");
+            }
+            if self.passed {
+                got.push("passed a descriptor");
             }
             if self.spawn || self.exec {
                 got.push("started a program");
@@ -230,6 +238,7 @@ fn run_probe(status: Status, job: &ProbeJob) -> Probe {
         .collect();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").is_ok();
     let reached = job.signal.iter().map(|&pid| reach(pid)).collect();
+    let passed = pass_a_descriptor();
     let own_group = own_group();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(FRONT_WORKERS)
@@ -262,11 +271,23 @@ fn run_probe(status: Status, job: &ProbeJob) -> Probe {
         read,
         socket,
         reached,
+        passed,
         spawn,
         exec,
         own_group,
         runtime,
     }
+}
+
+/// Whether this front can pass a descriptor over a pair of Unix sockets of its own, as `run`
+/// passes one to a front: a front must not, or it could leave descriptors on their way that
+/// count against `run` ([`confine::raise_descriptor_limit`]).
+fn pass_a_descriptor() -> bool {
+    use std::os::fd::{AsFd, OwnedFd};
+    let Ok((ours, theirs)) = std::os::unix::net::UnixStream::pair() else {
+        return false;
+    };
+    wire::send_with(ours.as_fd(), b"x", &[OwnedFd::from(theirs)]).is_ok()
 }
 
 /// What gets through to `pid`, a process outside this front's group.
@@ -420,6 +441,7 @@ mod tests {
             read: vec![false, false],
             socket: false,
             reached: vec![Vec::new()],
+            passed: false,
             spawn: false,
             exec: false,
             own_group: true,
@@ -437,6 +459,10 @@ mod tests {
             },
             Probe {
                 reached: vec![vec!["signal 0".into()]],
+                ..clean.clone()
+            },
+            Probe {
+                passed: true,
                 ..clean.clone()
             },
             Probe {

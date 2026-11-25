@@ -951,7 +951,8 @@ The reader:
     user reads its memory;
   - it runs in a process group of its own, which `run` kills when the reading is over or its time
     is up, with everything the reader started. An unpacking may write no file larger than its
-    limit and use at most 1 GiB of memory.
+    limit and use at most 1 GiB of memory. Every reader, with the git it runs, may hold at most
+    1024 descriptors.
 - **What `run` takes back from it.** One line of JSON of a fixed form, at most 1 MiB (and, for the
   platform tools' file, that file's bytes). `run` treats the answer as hostile too: every field is
   bounded and checked, and once the reader is gone, `run` walks what it wrote, without following
@@ -1002,8 +1003,11 @@ The front:
   Landlock with no directory at all (only `/dev/null` and `/dev/urandom`), and where the kernel has
   them no TCP `bind` or `connect` and no signal or abstract socket outside its domain; and the
   reader's seccomp filter, with on top of it no `execve`, no new process (threads only), no
-  `connect`, `bind` or `listen`, and no signal outside its own process group, the signal 0
-  included. A pair of Unix sockets stays allowed, which reaches no other process. It runs as
+  `connect`, `bind` or `listen`, no signal outside its own process group, the signal 0
+  included, and no `sendmsg` or `sendmmsg`, the calls that pass a descriptor: `run` passes it
+  every descriptor and takes none back, and it writes with `write` and `sendto`. A pair of Unix
+  sockets stays allowed (its runtime makes one), which reaches no other process and on which it
+  can so leave no descriptor on its way (below). It runs as
   `run`'s user, in a process group of its own, with an empty environment and no descriptor but its
   control channel on stdin, `/dev/null` on stdout and a pipe to `run` for its stderr.
 - **How this is tested** (ADR-0112 decision 8, path C: `tests/path_c.rs`). Two runs over the bridge
@@ -1056,6 +1060,22 @@ Both:
     programs and can end `run` and its runs with a signal.
 
   A Docker host without the bridge uses no reader and no front, and checks neither.
+- **Descriptors on their way.** `run` passes a front every connection as a descriptor over a Unix
+  socket. Linux refuses that (`ETOOMANYREFS`) while more descriptors of `run`'s user are on their
+  way over Unix sockets, sent and not yet received, than `run`'s own soft limit of open files
+  (`RLIMIT_NOFILE`). The count is the user's, and each of its processes may add to it while it
+  is not above that process's own limit, at most 253 a message (seen so on Linux 6.18). With the
+  default of 1024 for all, one front or reader that a flaw took over could leave descriptors
+  there and keep every sandbox of the host from its connections, request bodies and starts. So a
+  host with the bridge raises its soft limit to its hard limit at its start (524288 under
+  systemd; what it starts inherits that, but for the readers and the fronts), every reader and
+  front holds a limit of 1024, so all of them together bring the count to 1277 at most, and a
+  front cannot pass a descriptor at all. Where the hard limit is below 4096, `run` warns at its
+  start: set `LimitNOFILE=` in its unit. This does not hold back another program of `run`'s
+  user, which has a limit of its own; on a Docker host, a sandbox whose user (`1000`) is `run`'s
+  own is such a program unless Docker maps its users to a namespace (not tried). Should the
+  kernel refuse `run`, the message does not go and its caller fails with that reason, a warning
+  says so at most once a minute, and no front is ended for it: the kernel names no process.
 - **`doctor`** runs a reader, which confines itself as one that runs git does and tries to open
   the config and data directories, its parent's memory and a socket, and says
   `reader: confined: Landlock ABI 7 (files,

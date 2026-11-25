@@ -841,6 +841,38 @@ fn a_reader_gets_no_environment_but_path_and_no_descriptor_but_its_three() {
     assert!(fds.contains(&0) && fds.contains(&1) && fds.contains(&2));
 }
 
+#[test]
+fn a_reader_and_its_git_may_hold_no_more_descriptors_than_a_confined_process() {
+    use rustix::process::{Resource, getrlimit};
+    use tinfirm_runner_host::confine::CONFINED_FILES;
+    // In git's place, a script that says its limits of open files, soft and hard.
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    let script = fake.join("git");
+    std::fs::write(&script, "#!/bin/sh\necho \"$(ulimit -Sn) $(ulimit -Hn)\"\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let mut command = reader().git_command(repo.path(), &["rev-parse", "HEAD"]);
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    command.env("PATH", path);
+    let (out, ok, stderr) = run_pack(command);
+    assert!(ok, "{stderr}");
+    // Whatever this process, which stands for `run`, may hold: a reader cannot leave more
+    // descriptors on their way over Unix sockets than its own limit and one message.
+    let own = getrlimit(Resource::Nofile).maximum.unwrap_or(u64::MAX);
+    let limit = CONFINED_FILES.min(own);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        format!("{limit} {limit}\n"),
+        "this process may hold {own}"
+    );
+}
+
 // ----- the confinement ------------------------------------------------------------------------
 
 #[test]

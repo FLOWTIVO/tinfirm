@@ -210,6 +210,41 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How often at most `run` warns that the kernel refuses it to pass descriptors.
+const IN_FLIGHT_WARNING_EVERY: Duration = Duration::from_secs(60);
+
+/// A first write of a message that failed. With `ETOOMANYREFS`, Linux refused to pass the
+/// message's descriptors: more descriptors of this user are on their way over Unix sockets
+/// than `run` may have open ([`confine::raise_descriptor_limit`]). No byte of the message went,
+/// so the channel is still in step, and its caller fails. The front is not ended for it: the
+/// kernel counts by user and names no process, so the front this message was for is as likely
+/// held up by another process as the cause, and ending it would let one process have `run` end
+/// every sandbox's front. A warning, at most once a minute, tells the operator, for every
+/// sandbox of the host is held up alike.
+fn not_written(error: std::io::Error) -> anyhow::Error {
+    if error.raw_os_error() != Some(libc::ETOOMANYREFS) {
+        return error.into();
+    }
+    static WARNED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    if due(&mut lock(&WARNED), std::time::Instant::now()) {
+        tracing::warn!(
+            "Linux refuses `run` to pass a descriptor to a sandbox's front (ETOOMANYREFS): more descriptors of this host's user are on their way over Unix sockets than `run` may have open (RLIMIT_NOFILE). Some process of that user holds them there, and until it ends no sandbox of this host gets a connection, a request's body or a start: raise `run`'s limit of open files, and look for the process"
+        );
+    }
+    anyhow::anyhow!(
+        "Linux refuses to pass a descriptor: more descriptors of this host's user are on their way over Unix sockets than `run` may have open (ETOOMANYREFS)"
+    )
+}
+
+/// Whether a warning is due at `now`, and then `last` is `now`.
+fn due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    if last.is_some_and(|last| now.duration_since(last) < IN_FLIGHT_WARNING_EVERY) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
 /// The front's process group while it may be signalled, and why `run` broke its wire.
 struct Life {
     /// `Some` until the front is about to be reaped; signals go only under this lock.
@@ -443,6 +478,7 @@ impl FrontHandle {
                     wire::send_with(stream.as_fd(), &frame, &descriptors)
                 })
                 .await
+                .map_err(not_written)
                 .context("cannot write to the front")?;
             writer
                 .write_all(&frame[written..])
@@ -1114,4 +1150,33 @@ async fn read_loop(
     pending.hellos.clear();
     drop(pending);
     let _ = ended.send(Some(how));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_to_pass_a_descriptor_fails_its_message_with_the_reason_and_warns_once_a_minute() {
+        let refused = not_written(std::io::Error::from_raw_os_error(libc::ETOOMANYREFS));
+        let text = refused.to_string();
+        assert!(
+            text.contains("ETOOMANYREFS") && text.contains("on their way"),
+            "{text}"
+        );
+        // Any other failure is passed on as it is.
+        let other = not_written(std::io::Error::from_raw_os_error(libc::EPIPE));
+        assert_eq!(
+            other
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(libc::EPIPE)
+        );
+        let start = std::time::Instant::now();
+        let mut last = None;
+        assert!(due(&mut last, start));
+        assert!(!due(&mut last, start + IN_FLIGHT_WARNING_EVERY / 2));
+        assert!(due(&mut last, start + IN_FLIGHT_WARNING_EVERY));
+        assert!(!due(&mut last, start + IN_FLIGHT_WARNING_EVERY * 3 / 2));
+    }
 }

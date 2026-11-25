@@ -95,6 +95,10 @@ fn a_front_reads_no_file_of_the_host_reaches_no_other_process_and_starts_nothing
     assert_eq!(probe.read, vec![false; deny.len()], "{probe:?}");
     assert!(!probe.socket, "{probe:?}");
     assert_eq!(probe.reached, vec![Vec::<String>::new(); 3], "{probe:?}");
+    assert!(
+        !probe.passed,
+        "a front passes no descriptor, so it leaves none on its way: {probe:?}"
+    );
     assert!(!probe.spawn && !probe.exec, "{probe:?}");
     assert!(probe.own_group, "a front still signals its own group");
     assert!(
@@ -1144,6 +1148,7 @@ fn without_landlock_the_fronts_seccomp_filter_still_refuses_sockets_signals_and_
     assert!(!probe.status.confined());
     assert!(!probe.socket, "{probe:?}");
     assert_eq!(probe.reached, vec![Vec::<String>::new(); 2], "{probe:?}");
+    assert!(!probe.passed, "{probe:?}");
     assert!(!probe.spawn && !probe.exec, "{probe:?}");
     assert!(probe.own_group && probe.runtime, "{probe:?}");
     ended(bystander);

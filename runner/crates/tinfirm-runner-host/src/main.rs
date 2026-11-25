@@ -2468,6 +2468,7 @@ async fn run(
     // The reader of what the sandboxes send back and a probe of their front, before any image
     // is built: a host that cannot confine either is refused at once.
     let reader = if sandbox_args.sandbox_bridge || vm_options.is_some() {
+        make_room_to_pass_descriptors();
         Some(check_reader_and_front(paths, sandbox_args.allow_unconfined_reader).await?)
     } else {
         None
@@ -2574,6 +2575,25 @@ fn check_ceiling(max_concurrent_runs: u32, vm: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Before a host with fronts starts its first process: `run` raises its own limit of open files
+/// to its hard limit, so that no reader or front that a flaw took over can keep it from passing
+/// descriptors to its fronts ([`tinfirm_runner_host::confine::raise_descriptor_limit`]). Where
+/// the hard limit leaves no room for that, a warning says so and what to set.
+fn make_room_to_pass_descriptors() {
+    use tinfirm_runner_host::confine::{
+        CONFINED_FILES, FILES_TO_PASS_DESCRIPTORS, MAX_PASSED_AT_ONCE, raise_descriptor_limit,
+    };
+    if let Some(files) = raise_descriptor_limit()
+        && files < FILES_TO_PASS_DESCRIPTORS
+    {
+        tracing::warn!(
+            files,
+            "this process may have at most {files} files open (RLIMIT_NOFILE, the hard limit), and Linux lets it pass a descriptor to a sandbox's front only while fewer descriptors of its user are on their way over Unix sockets. A reader or a front that a flaw took over can leave {} there, and keep every sandbox of this host from its connections: start it with a hard limit of {FILES_TO_PASS_DESCRIPTORS} or more (LimitNOFILE= in a systemd unit)",
+            CONFINED_FILES + MAX_PASSED_AT_ONCE
+        );
+    }
 }
 
 /// The reader of what the sandboxes send back (ADR-0112, open question 1) and the front process

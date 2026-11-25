@@ -54,7 +54,10 @@
 //!
 //! The runner host makes itself not dumpable at its start ([`protect_host_process`]), so that
 //! no other process of its user (a git it starts, a process that a flaw of one gave someone)
-//! reads its memory through `/proc/<pid>/mem` or `ptrace`. Root still can.
+//! reads its memory through `/proc/<pid>/mem` or `ptrace`. Root still can. A host with fronts
+//! also raises its own limit of open files, which Linux measures the descriptors on their way
+//! over Unix sockets against, far above what its readers and fronts may hold
+//! ([`raise_descriptor_limit`]).
 //!
 //! Elsewhere (macOS, Windows, a Linux kernel without Landlock 2) nothing of this exists, and
 //! [`confine`] says so: the host decides what to do with such a reader ([`crate::reader`]).
@@ -105,7 +108,12 @@ pub enum Profile {
     /// and `vfork`, `clone` without `CLONE_THREAD` (threads still start), `connect`, `bind` and
     /// `listen`, and every signal outside its own process group, the signal 0 (a check that a
     /// process exists) included. `socketpair` stays: tokio's signal driver makes one, and a pair
-    /// of Unix sockets reaches no other process. Its plan reads and writes nothing.
+    /// of Unix sockets reaches no other process. `sendmsg` and `sendmmsg` are refused, the
+    /// calls that pass a descriptor: `run` passes a front every descriptor and takes none back
+    /// ([`crate::front::wire`]), and a front that left descriptors on their way on a pair of its
+    /// own would count against `run` ([`raise_descriptor_limit`]). A filter cannot read the
+    /// message that a call points to, so it cannot refuse only those that carry a descriptor:
+    /// a front writes with `write` and `sendto`. Its plan reads and writes nothing.
     Front,
 }
 
@@ -436,6 +444,63 @@ pub fn protect_host_process() -> Result<(), String> {
     Err("only Linux can keep a process of the same user from reading this one".into())
 }
 
+/// The descriptors a reader or a front may hold: the limit of open files (`RLIMIT_NOFILE`, soft
+/// and hard) that each sets for itself before it reads a byte.
+pub const CONFINED_FILES: u64 = 1024;
+
+/// The most descriptors one message passes over a Unix socket (the kernel's `SCM_MAX_FD`).
+pub const MAX_PASSED_AT_ONCE: u64 = 253;
+
+/// The limit of open files from which `run` has room to pass descriptors whatever its readers
+/// and fronts do ([`raise_descriptor_limit`]): what they can leave on their way, and as much
+/// again and more for what `run` itself has on its way to its fronts.
+pub const FILES_TO_PASS_DESCRIPTORS: u64 = 4 * CONFINED_FILES;
+
+const _: () = assert!(FILES_TO_PASS_DESCRIPTORS >= 2 * (CONFINED_FILES + MAX_PASSED_AT_ONCE));
+
+/// Raises this process's soft limit of open files (`RLIMIT_NOFILE`) to its hard limit, and
+/// gives the limit it then has; `None` where no such rule exists (not Linux).
+///
+/// `run` hands a front every connection as a descriptor over a Unix socket. Linux refuses to
+/// pass one (`ETOOMANYREFS`) while more descriptors of the sender's user are on their way over
+/// Unix sockets, sent and not yet received, than the sender's own soft limit of open files. The
+/// count is the user's, of descriptors of any kind, and each process of the user may add to it
+/// while it is not above that process's own limit, a message of at most
+/// [`MAX_PASSED_AT_ONCE`] at a time. A reader and a front run as `run`'s user, and one that a
+/// flaw took over can leave descriptors on their way for as long as it lives. Each has a limit
+/// of [`CONFINED_FILES`], so all of them together bring the count to that and one message
+/// more, and no further. That was above the 1024 that `run` itself starts with by default, and
+/// every descriptor `run` then passed was refused, for every sandbox of the host. With its soft
+/// limit at its hard limit (524288 under systemd) `run` stays above what they can reach; a
+/// front is refused the passing itself as well ([`Profile::Front`]).
+///
+/// The rule as seen on Linux 6.18 with processes of one user without `CAP_SYS_RESOURCE` or
+/// `CAP_SYS_ADMIN` (a sender with either is never refused): a process with a soft limit of 64
+/// left 120 descriptors on their way, and a second one was then refused with a soft limit of up
+/// to 119 and passed its descriptor with 120 or more.
+///
+/// What `run` starts afterwards inherits the raised limit, but for the readers and the fronts,
+/// which set their own.
+#[cfg(target_os = "linux")]
+pub fn raise_descriptor_limit() -> Option<u64> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limits = getrlimit(Resource::Nofile);
+    // Up to the hard limit, a process may always raise its own soft limit.
+    let _ = setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: limits.maximum,
+            maximum: limits.maximum,
+        },
+    );
+    Some(getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn raise_descriptor_limit() -> Option<u64> {
+    None
+}
+
 /// Whether this process is dumpable (`PR_GET_DUMPABLE`): `None` where that cannot be told.
 #[cfg(target_os = "linux")]
 pub fn host_dumpable() -> Option<bool> {
@@ -728,13 +793,20 @@ mod seccomp {
     }
 
     /// Refused to a front whatever their arguments: it runs no program and makes no connection
-    /// or listener of its own (`run` hands it the descriptors it needs).
+    /// or listener of its own (`run` hands it the descriptors it needs), and it passes no
+    /// descriptor to anyone.
     const FRONT_DENIED: &[i64] = &[
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_connect,
         libc::SYS_bind,
         libc::SYS_listen,
+        // The two calls that can carry a descriptor (`SCM_RIGHTS`); `io_uring`, which could
+        // too, is refused to every profile. Whether a message carries one is behind a pointer,
+        // which seccomp cannot read, so both go whole: a front writes its frames and its
+        // streams with `write` and `sendto`.
+        libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
         #[cfg(target_arch = "x86_64")]
         libc::SYS_fork,
         #[cfg(target_arch = "x86_64")]
@@ -947,6 +1019,28 @@ mod seccomp {
         }
 
         #[test]
+        fn a_front_is_refused_the_calls_that_pass_a_descriptor() {
+            let front = filters(ARCH.unwrap(), 4242, 4242, Profile::Front).unwrap();
+            assert_eq!(decision(&front, libc::SYS_sendmsg), EPERM);
+            assert_eq!(decision(&front, libc::SYS_sendmmsg), EPERM);
+            // What it writes with, and what it takes `run`'s descriptors with.
+            for call in [
+                libc::SYS_write,
+                libc::SYS_writev,
+                libc::SYS_sendto,
+                libc::SYS_recvmsg,
+            ] {
+                assert_eq!(decision(&front, call), ALLOW, "{call}");
+            }
+            // Its runtime's signal driver makes a pair of Unix sockets after the filter is on.
+            assert_eq!(decision(&front, libc::SYS_socketpair), ALLOW);
+            // A reader is not refused them: its limit of open files bounds what it can leave on
+            // its way.
+            let reader = filters(ARCH.unwrap(), 4242, 4242, Profile::Reader).unwrap();
+            assert_eq!(decision(&reader, libc::SYS_sendmsg), ALLOW);
+        }
+
+        #[test]
         fn a_file_is_truncated_through_a_descriptor_and_never_by_its_path() {
             for profile in [Profile::Reader, Profile::Front] {
                 let programs = filters(ARCH.unwrap(), 4242, 4242, profile).unwrap();
@@ -1038,6 +1132,16 @@ mod tests {
         let none = Status::none("macOS");
         assert!(!none.confined());
         assert_eq!(none.describe(), "not confined: macOS");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_hosts_soft_limit_of_open_files_goes_to_its_hard_limit() {
+        use rustix::process::{Resource, getrlimit};
+        let hard = getrlimit(Resource::Nofile).maximum;
+        let now = raise_descriptor_limit().unwrap();
+        assert_eq!(getrlimit(Resource::Nofile).current, hard);
+        assert_eq!(Some(now), hard);
     }
 
     /// A host of the user `u` with its directories where they are by default.

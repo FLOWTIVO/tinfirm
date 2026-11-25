@@ -1135,7 +1135,10 @@ fn plan(work: &Work) -> Plan {
 }
 
 /// The kernel's own bounds for an unpacking: no file larger than its limit, and a bounded heap,
-/// whatever the code in the reader then does.
+/// whatever the code in the reader then does. And for every reader, git's too, a bound of the
+/// descriptors it may hold, which is also the bound of what it can leave on its way over a pair
+/// of Unix sockets: `run` has raised its own limit, and a reader that kept it could keep `run`
+/// from passing descriptors to its fronts ([`confine::raise_descriptor_limit`]).
 #[cfg(target_os = "linux")]
 fn limit_resources(work: &Work) {
     use rustix::process::{Resource, Rlimit, setrlimit};
@@ -1148,6 +1151,7 @@ fn limit_resources(work: &Work) {
             },
         );
     };
+    limit(Resource::Nofile, confine::CONFINED_FILES);
     match work {
         Work::Unpack { limits, .. } => {
             limit(Resource::Fsize, limits.max_file_bytes.max(1));

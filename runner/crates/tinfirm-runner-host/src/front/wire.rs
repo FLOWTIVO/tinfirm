@@ -9,7 +9,9 @@
 //!
 //! Descriptors go one way only, from `run` to the front, with `SCM_RIGHTS` on the first byte
 //! of the frame they belong to ([`send_frame`]). `run` reads its end with plain reads: a
-//! descriptor that a front sends the other way is closed by the kernel, never received.
+//! descriptor that a front sends the other way is closed by the kernel, never received. A
+//! confined front cannot send one at all: its seccomp filter refuses it `sendmsg`
+//! ([`crate::confine::Profile`]), and it writes its frames with plain writes.
 //!
 //! The messages of this version: the front's [`ToMain::Ready`] with its confinement, then a
 //! round trip ([`ToFront::Ping`]) and a check that descriptors arrive ([`ToFront::Check`]);
@@ -849,7 +851,9 @@ pub fn send_frame(
 /// The most descriptors one message carries.
 pub const MAX_DESCRIPTORS: usize = 3;
 
-/// One `sendmsg` of `frame`, with `descriptors` attached: how many bytes it took.
+/// One write of `frame`, with `descriptors` attached: how many bytes it took. With descriptors
+/// it is a `sendmsg`; without, a plain `write`, which is all a front has: its seccomp filter
+/// refuses it `sendmsg`, the call that could pass a descriptor ([`crate::confine::Profile`]).
 pub fn send_with(
     socket: BorrowedFd<'_>,
     frame: &[u8],
@@ -869,12 +873,17 @@ pub fn send_with(
         return Err(std::io::Error::other("no room for the descriptors"));
     }
     loop {
-        match sendmsg(
-            socket,
-            &[IoSlice::new(frame)],
-            &mut control,
-            SendFlags::empty(),
-        ) {
+        let sent = if fds.is_empty() {
+            rustix::io::write(socket, frame)
+        } else {
+            sendmsg(
+                socket,
+                &[IoSlice::new(frame)],
+                &mut control,
+                SendFlags::empty(),
+            )
+        };
+        match sent {
             Ok(written) => return Ok(written),
             Err(rustix::io::Errno::INTR) => continue,
             Err(e) => return Err(e.into()),
