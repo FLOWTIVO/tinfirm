@@ -43,6 +43,8 @@ const READY_POLL: Duration = Duration::from_millis(200);
 const READY_DIAL: Duration = Duration::from_secs(1);
 /// How long Firecracker has to end after SIGTERM before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(4);
+/// How often, at most, the log says how many connections from the tap's network were refused.
+const REFUSALS_LOGGED_EVERY: Duration = Duration::from_secs(60);
 
 /// A path of [`crate::kubernetes::spec::vm_pod`] under `root` (`/` in a pod).
 fn at(root: &Path, path: &str) -> PathBuf {
@@ -415,12 +417,17 @@ pub fn firecracker_config(env: &PodEnv) -> Value {
 /// Relays each connection to `listener` to `guest`, bytes only. A peer from the tap's /30 (the
 /// guest itself) is closed at once.
 pub async fn relay(listener: TcpListener, guest: SocketAddr, network: Ipv4Addr) {
+    let mut refusals = Refusals::default();
     loop {
         let Ok((mut client, peer)) = listener.accept().await else {
             continue;
         };
         if in_tap(peer.ip(), network) {
-            eprintln!("vm-pod: refused a connection from {peer}, in the tap's network");
+            if let Some(count) = refusals.due(std::time::Instant::now()) {
+                eprintln!(
+                    "vm-pod: refused {count} connection(s) from the tap's network, the last from {peer}"
+                );
+            }
             continue;
         }
         tokio::spawn(async move {
@@ -430,6 +437,30 @@ pub async fn relay(listener: TcpListener, guest: SocketAddr, network: Ipv4Addr) 
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
             }
         });
+    }
+}
+
+/// The connections refused since the last line about them in the log. The guest sets their
+/// rate, and the pod's log counts against its storage: the first gets a line at once, and after
+/// that one line every [`REFUSALS_LOGGED_EVERY`] says how many came.
+#[derive(Default)]
+struct Refusals {
+    unlogged: u64,
+    logged: Option<std::time::Instant>,
+}
+
+impl Refusals {
+    /// One more refusal at `now`; how many a line in the log is due for, if one is.
+    fn due(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.unlogged += 1;
+        if self
+            .logged
+            .is_some_and(|at| now.duration_since(at) < REFUSALS_LOGGED_EVERY)
+        {
+            return None;
+        }
+        self.logged = Some(now);
+        Some(std::mem::take(&mut self.unlogged))
     }
 }
 
@@ -990,6 +1021,22 @@ mod tests {
             "172.30.0.4".parse().unwrap(),
             Ipv4Addr::new(172, 30, 0, 0)
         ));
+    }
+
+    #[test]
+    fn refused_connections_get_a_line_at_first_and_then_one_a_minute() {
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut refusals = Refusals::default();
+        assert_eq!(refusals.due(at(0)), Some(1), "the first, at once");
+        // A guest that dials without end: nothing for a minute, whatever their number.
+        for _ in 0..10_000 {
+            assert_eq!(refusals.due(at(59)), None);
+        }
+        assert_eq!(refusals.due(at(60)), Some(10_001));
+        assert_eq!(refusals.due(at(61)), None);
+        // One after a long quiet gets its line, with what came since the last.
+        assert_eq!(refusals.due(at(600)), Some(2));
     }
 
     /// A stand-in for Firecracker: a script that notes its arguments and then does `body`.
