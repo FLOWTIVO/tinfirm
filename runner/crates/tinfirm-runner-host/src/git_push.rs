@@ -27,7 +27,10 @@
 //!    not exist at clone time), so the repository checks it again when it updates the ref. Never
 //!    a plain force.
 //! 5. It parses the report-status ([`ReportParser`]), out of the side-band when the repository
-//!    speaks it, bounded and checked as the advertisement is.
+//!    speaks it, bounded and checked as the advertisement is. The report decides the push. `run`
+//!    then reads what is left of the answer to its end and keeps none of it ([`Tail`]): a
+//!    receive-pack runs the repository's post-receive hooks after its report, and `git push`
+//!    waits for the answer's end too.
 //!
 //! The outcome is given back as `git push --porcelain` would give it ([`Outcome::output`]), so
 //! that the reasons a person sees stay the same set (`push_failure` in [`crate::run`]).
@@ -626,7 +629,7 @@ impl ReportParser {
     }
 
     /// Takes the next bytes of the answer; `Ok(true)` once the report is whole. Whatever comes
-    /// after it is not read.
+    /// after it is no part of the report: [`ReportParser::after_report`] reads on from there.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<bool, String> {
         if self.state == ReportState::Done {
             return Ok(true);
@@ -798,6 +801,16 @@ impl ReportParser {
         Ok(())
     }
 
+    /// What reads on after the whole report: it starts with the bytes that this parser took and
+    /// did not read, and has what is left of the answer's bound.
+    pub fn after_report(&mut self) -> AfterReport {
+        AfterReport {
+            sideband: self.sideband,
+            pending: std::mem::take(&mut self.outer),
+            room: MAX_REPORT_BYTES.saturating_sub(self.total),
+        }
+    }
+
     /// The report, once it is whole; an error when the answer ended before.
     pub fn finish(mut self) -> Result<Report, String> {
         if !self.partial.is_empty() {
@@ -812,6 +825,47 @@ impl ReportParser {
             status: self.status,
             messages: self.messages.into(),
         })
+    }
+}
+
+/// The bytes of an answer that follow its report. None is kept: only where they end matters.
+///
+/// git's receive-pack writes the report, then runs the repository's post-receive hooks and its
+/// housekeeping, and only then ends its answer; inside the side-band it sends the hooks' words
+/// (band 2) and at last the side-band's own flush.
+pub struct AfterReport {
+    sideband: bool,
+    /// The bytes of a packet that is not whole yet.
+    pending: Vec<u8>,
+    /// How many more bytes the answer may have ([`MAX_REPORT_BYTES`] in all).
+    room: usize,
+}
+
+impl AfterReport {
+    /// Takes the next bytes. `Ok(true)` once the answer is over as far as its bytes tell: at the
+    /// side-band's own flush, or at bytes that are no packet of it. Without the side-band only the
+    /// answer's own end tells. `Err` when the answer is larger than its bound.
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<bool, String> {
+        self.room = self.room.checked_sub(chunk.len()).ok_or_else(|| {
+            format!(
+                "the answer to the push is larger than {} MiB",
+                MAX_REPORT_BYTES >> 20
+            )
+        })?;
+        if !self.sideband {
+            return Ok(false);
+        }
+        self.pending.extend_from_slice(chunk);
+        let mut at = 0;
+        let over = loop {
+            match next_pkt(&self.pending[at..]) {
+                Ok(Some((Pkt::Flush, _))) | Err(_) => break true,
+                Ok(Some((Pkt::Data(_), len))) => at += len,
+                Ok(None) => break false,
+            }
+        };
+        self.pending.drain(..at);
+        Ok(over)
     }
 }
 
@@ -1347,6 +1401,49 @@ impl Stream for PackBody {
     }
 }
 
+/// What is left of the answer to a push once its report is whole, and the connection it comes
+/// on. The report has decided the push; this is read to its end and dropped ([`Tail::read`]).
+/// A client that hung up at the report could have the server end the repository's post-receive
+/// hooks with the connection, after the branch moved: the hooks run after the report, and
+/// `git push` waits for the answer's end.
+struct Tail {
+    after: AfterReport,
+    body: Incoming,
+    _connection: Connection,
+}
+
+impl Tail {
+    /// Reads the answer to its end (the side-band's own flush, or the end of the body) and keeps
+    /// nothing, for at most `left` and within the answer's bound. An answer that breaks off,
+    /// does not end in that time or is larger than its bound changes nothing of the push, which
+    /// is what its report said: the log says so, in fixed words, and the connection goes.
+    async fn read(mut self, left: Duration) {
+        let reading = async {
+            let mut over = self.after.feed(&[])?;
+            while !over {
+                let Some(frame) = self.body.frame().await else {
+                    break;
+                };
+                let frame = frame.map_err(|e| format!("it broke off: {e}"))?;
+                if let Some(data) = frame.data_ref() {
+                    over = self.after.feed(data)?;
+                }
+            }
+            Ok::<(), String>(())
+        };
+        match tokio::time::timeout(left, reading).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::info!(
+                error,
+                "push: the git server's answer did not end well after its report; the push is what the report said"
+            ),
+            Err(_) => tracing::warn!(
+                "push: the git server's answer did not end within the push's time after its report; the push is what the report said, and the connection was closed"
+            ),
+        }
+    }
+}
+
 /// The push of `head` to `refs/heads/<branch>` of `git`'s repository, with the lease of the
 /// branch's tip at clone time ([`crate::git::Git::push`] states the rule), by this client. A
 /// revoked token is an `Err` (`not pushed: …`), as with `git push`; everything else is an
@@ -1385,7 +1482,9 @@ pub async fn push_outcome(
 /// [`push_outcome`] with `deadline` for the whole push, from the first reading of the token to
 /// the report ([`PUSH_TIMEOUT`] in a run; the tests give a short one). Once it passes, whatever
 /// is still going (the ref discovery, the pack's writer and its group, the request) is ended,
-/// and the push failed.
+/// and the push failed. Once the report is whole it has decided the push: what is left of the
+/// answer is read to its end within what is left of `deadline`, and changes no outcome
+/// ([`Tail`]).
 pub async fn push_outcome_within(
     git: &crate::git::Git,
     branch: &str,
@@ -1393,6 +1492,7 @@ pub async fn push_outcome_within(
     allow_http: bool,
     deadline: Duration,
 ) -> Result<Outcome> {
+    let started = std::time::Instant::now();
     let url = git.repo_url();
     let refname = format!("refs/heads/{branch}");
     let scheme = url::Url::parse(url)
@@ -1427,6 +1527,8 @@ pub async fn push_outcome_within(
     let authorization = git
         .authorization()
         .map_err(|revocation| anyhow!("not pushed: {revocation}"))?;
+    // What is left of the answer once its report is whole, to be read after the outcome is known.
+    let tail = Mutex::new(None);
     let work = async {
         let ad = match advertise(&upstream, url, authorization.as_ref(), branch, &known).await {
             Ok(ad) => ad,
@@ -1589,12 +1691,16 @@ pub async fn push_outcome_within(
                 if let Some(data) = frame.data_ref()
                     && parser.feed(data)?
                 {
+                    // The report decides the push. The rest of the answer is read below, once
+                    // the outcome is known, and can no longer fail the push.
+                    *tail.lock().unwrap_or_else(|p| p.into_inner()) = Some(Tail {
+                        after: parser.after_report(),
+                        body,
+                        _connection: connection,
+                    });
                     break;
                 }
             }
-            // Nothing after the report is read.
-            drop(body);
-            drop(connection);
             parser.finish()
         };
         let report = match exchange.await {
@@ -1619,13 +1725,18 @@ pub async fn push_outcome_within(
             },
         })
     };
-    match tokio::time::timeout(deadline, work).await {
+    let outcome = match tokio::time::timeout(deadline, work).await {
         Ok(outcome) => outcome,
         Err(_) => Ok(Outcome::failed(format!(
             "the push did not end within {}",
             duration_words(deadline)
         ))),
+    };
+    let tail = tail.into_inner().unwrap_or_else(|p| p.into_inner());
+    if let Some(tail) = tail {
+        tail.read(deadline.saturating_sub(started.elapsed())).await;
     }
+    outcome
 }
 
 /// `60 min`, or `2 s`.
@@ -1986,6 +2097,62 @@ mod tests {
         out.extend(pkt_line(&band));
         out.extend_from_slice(b"0000");
         out
+    }
+
+    #[test]
+    fn what_follows_a_report_ends_at_the_side_bands_flush_and_is_bounded() {
+        let lines = ["unpack ok", "ok refs/heads/agent/X-1"];
+        // The answer as a receive-pack with a post-receive hook writes it: the report, the
+        // hook's words, and then the side-band's own flush.
+        let whole = report(&lines, true);
+        let (to_report, flush) = whole.split_at(whole.len() - 4);
+        let hook = pkt_line(b"\x02post-receive: a pipeline was started\n");
+        // Split anywhere, the report is whole before the hook speaks, and the answer is over at
+        // the flush and not before.
+        for cut in 0..=hook.len() {
+            let mut parser = ReportParser::new("agent/X-1", true);
+            assert!(parser.feed(to_report).unwrap());
+            let mut after = parser.after_report();
+            assert!(!after.feed(&[]).unwrap());
+            assert!(!after.feed(&hook[..cut]).unwrap(), "{cut}");
+            assert!(!after.feed(&hook[cut..]).unwrap(), "{cut}");
+            assert!(!after.feed(&flush[..2]).unwrap());
+            assert!(after.feed(&flush[2..]).unwrap());
+            // The report is the report, whatever follows it.
+            let report = parser.finish().unwrap();
+            assert_eq!(report.status, Some(RefStatus::Ok));
+            assert_eq!(report.messages.len(), 1, "the hook's words are not kept");
+        }
+        // The flush came in the bytes that held the report's end.
+        let mut parser = ReportParser::new("agent/X-1", true);
+        assert!(parser.feed(&whole).unwrap());
+        assert!(parser.after_report().feed(&[]).unwrap());
+        // Bytes that are no packet end the reading too: there is nothing more to wait for.
+        let mut parser = ReportParser::new("agent/X-1", true);
+        assert!(parser.feed(to_report).unwrap());
+        assert!(parser.after_report().feed(b"<html>").unwrap());
+        // Without the side-band only the answer's own end tells.
+        let plain = report(&lines, false);
+        let mut parser = ReportParser::new("agent/X-1", false);
+        assert!(parser.feed(&plain).unwrap());
+        let mut after = parser.after_report();
+        assert!(!after.feed(&[]).unwrap());
+        assert!(!after.feed(b"0000").unwrap());
+        // The answer's bound is one for the report and what follows it.
+        let mut parser = ReportParser::new("agent/X-1", true);
+        assert!(parser.feed(to_report).unwrap());
+        let mut after = parser.after_report();
+        let keepalive = pkt_line(b"\x02").repeat(1 << 10);
+        let mut taken = to_report.len();
+        let refused = loop {
+            match after.feed(&keepalive) {
+                Ok(over) => assert!(!over),
+                Err(refused) => break refused,
+            }
+            taken += keepalive.len();
+        };
+        assert!(refused.contains("larger than 16 MiB"), "{refused}");
+        assert!(taken + keepalive.len() > MAX_REPORT_BYTES && taken <= MAX_REPORT_BYTES);
     }
 
     #[test]

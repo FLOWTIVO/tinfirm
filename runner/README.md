@@ -1220,7 +1220,12 @@ over https:
    most 16 MiB in all, of which 1 MiB of report. The newest 16 KiB of the repository's messages
    are kept (its errors come last), and of a progress meter only its last state. A fatal message
    (band 3), an `unpack` line that is not `ok`, an `ng` line, and a status for another ref or for
-   none each fail the push.
+   none each fail the push. The report decides the push. `run` then reads what is left of the
+   answer to its end, the side-band's own flush or the end of the body, and keeps none of it: a
+   receive-pack runs the repository's post-receive hooks after its report, and a client that
+   hung up there could have a server end them with the connection. That reading has what is left
+   of the 60 minutes and of the 16 MiB; an answer that breaks off, does not end in time or is
+   larger changes nothing of the push, and the host's log says so.
 
 The outcome is worded as `git push --porcelain` words it, so a run reports the same reasons as with
 `git push` ("the remote branch changed during the run …", "the push was rejected …", "the
@@ -1243,6 +1248,9 @@ Where it differs from `git push`, which an operator can meet:
 - **Limits that can refuse a push** that `git push` makes: a repository whose ref advertisement
   is over 32 MiB or 262,144 refs, and a push that takes more than 60 minutes. Switch back to
   `--push-client git` for such a repository.
+- **After the report.** It waits for the end of the repository's answer as `git push` does, so a
+  slow post-receive hook holds the run as long. What the repository says after its report (its
+  post-receive hooks' `remote:` lines) is read and not kept.
 - **The log.** When it fails, the host's log says so in fixed words; what the repository and the
   pack's writer said reaches only the run's events, redacted as everything there.
 

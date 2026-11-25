@@ -1068,6 +1068,212 @@ async fn hostile_or_broken_reports_are_failures_and_never_a_push() {
     .await;
 }
 
+/// What a code host does with its answer to a push once the report is out, as a receive-pack that
+/// runs the repository's post-receive hooks after its report.
+#[derive(Clone)]
+enum Then {
+    /// After `wait` (the hooks), these bytes, and the end of the answer.
+    End {
+        wait: std::time::Duration,
+        bytes: Vec<u8>,
+    },
+    /// These bytes, and then neither more nor the end of the answer.
+    Hold(Vec<u8>),
+    /// The answer breaks off.
+    Break,
+}
+
+/// A code host that answers the push with `report` and then goes on as `then` says.
+struct SlowHost {
+    url: String,
+    /// For [`Then::End`], once the wait is over: the client was still there to take the rest.
+    stayed: Arc<Mutex<Option<bool>>>,
+}
+
+async fn slow_host(advertisement: Vec<u8>, report: Vec<u8>, then: Then) -> SlowHost {
+    use http_body_util::{BodyExt, Full, StreamBody};
+    use hyper::body::{Bytes, Frame};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/origin.git", listener.local_addr().unwrap());
+    let stayed = Arc::new(Mutex::new(None));
+    let parts = Arc::new((advertisement, report, then, stayed.clone()));
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let parts = parts.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let parts = parts.clone();
+                        async move {
+                            let get = req.method() == hyper::Method::GET;
+                            let _ = req.into_body().collect().await;
+                            let (advertisement, report, then, stayed) = &*parts;
+                            let (content_type, body) = if get {
+                                let body = Full::new(Bytes::from(advertisement.clone()))
+                                    .map_err(|never| match never {})
+                                    .boxed_unsync();
+                                (ADVERTISEMENT, body)
+                            } else {
+                                let (tx, rx) = futures::channel::mpsc::unbounded();
+                                let frame = |bytes: Vec<u8>| {
+                                    Ok::<_, std::io::Error>(Frame::data(Bytes::from(bytes)))
+                                };
+                                let _ = tx.unbounded_send(frame(report.clone()));
+                                let (then, stayed) = (then.clone(), stayed.clone());
+                                tokio::spawn(async move {
+                                    match then {
+                                        Then::End { wait, bytes } => {
+                                            tokio::time::sleep(wait).await;
+                                            // hyper drops an answer whose client hung up, and
+                                            // with it the receiving end of this channel.
+                                            let there = tx.unbounded_send(frame(bytes)).is_ok();
+                                            *stayed.lock().unwrap() = Some(there);
+                                        }
+                                        Then::Hold(bytes) => {
+                                            let _ = tx.unbounded_send(frame(bytes));
+                                            while !tx.is_closed() {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(50),
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        Then::Break => {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                200,
+                                            ))
+                                            .await;
+                                            let _ = tx.unbounded_send(Err(std::io::Error::other(
+                                                "the hook was ended",
+                                            )));
+                                        }
+                                    }
+                                });
+                                (RESULT, StreamBody::new(rx).boxed_unsync())
+                            };
+                            let mut response = hyper::Response::new(body);
+                            response
+                                .headers_mut()
+                                .insert("content-type", content_type.parse().unwrap());
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    SlowHost { url, stayed }
+}
+
+/// A push that the code host reports as taken, after which the host goes on as `then` says:
+/// the outcome, how long the push took, and what the host saw of the client ([`SlowHost`]).
+async fn pushed_and_then(
+    caps: &str,
+    then: Then,
+    deadline: std::time::Duration,
+) -> (Outcome, std::time::Duration, Option<bool>) {
+    let (_dir, host, main) = host_for("http://127.0.0.1:9/origin.git");
+    let ok = format!("ok refs/heads/{BRANCH}");
+    let lines = ["unpack ok", ok.as_str()];
+    let report = if caps.contains("side-band-64k") {
+        // Without the side-band's own flush: a receive-pack sends it last, after its hooks.
+        let mut report = sideband_report(&[], &lines);
+        report.truncate(report.len() - 4);
+        report
+    } else {
+        let mut report: Vec<u8> = lines
+            .iter()
+            .flat_map(|line| pkt(format!("{line}\n").as_bytes()))
+            .collect();
+        report.extend_from_slice(b"0000");
+        report
+    };
+    let slow = slow_host(advertisement(&main, caps), report, then).await;
+    let host = Git::restored(
+        host.dir(),
+        &spec(&slow.url),
+        ("T".into(), "t@tinfirm.invalid".into()),
+        host.base_refs().to_vec(),
+        None,
+    );
+    let head = head(host.dir());
+    let started = Instant::now();
+    let outcome =
+        tinfirm_runner_host::git_push::push_outcome_within(&host, BRANCH, &head, true, deadline)
+            .await
+            .unwrap();
+    let took = started.elapsed();
+    let stayed = *slow.stayed.lock().unwrap();
+    (outcome, took, stayed)
+}
+
+/// git's receive-pack writes its report before it runs the repository's post-receive hooks, and
+/// ends its answer after them; `git push` waits for that end. A client that hung up at the report
+/// could have a server end the hooks with the connection, after the branch moved. The host's
+/// client reads to the answer's end, and nothing that happens there changes the push's outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_answer_is_read_to_its_end_after_the_report_and_the_report_decides() {
+    use std::time::Duration;
+    beside(120, async {
+        let pushed = |outcome: &Outcome| matches!(outcome, Outcome::Pushed { created: true, .. });
+        let long = Duration::from_secs(60);
+        let hook_time = Duration::from_millis(700);
+        let band = |b: u8, text: &str| {
+            let mut data = vec![b];
+            data.extend_from_slice(text.as_bytes());
+            pkt(&data)
+        };
+        // The hooks' words and the side-band's own flush come after a while: the client is
+        // still there to take them, and the push ends when the answer does.
+        let mut rest = band(2, "post-receive: a pipeline was started\n");
+        rest.extend_from_slice(b"0000");
+        let then = Then::End {
+            wait: hook_time,
+            bytes: rest,
+        };
+        let (outcome, took, stayed) = pushed_and_then(CAPS, then, long).await;
+        assert!(pushed(&outcome), "{outcome:?}");
+        assert_eq!(stayed, Some(true), "the client hung up at the report");
+        assert!(took >= hook_time, "{took:?}");
+        // Without the side-band only the answer's end tells that the repository is done.
+        let then = Then::End {
+            wait: hook_time,
+            bytes: Vec::new(),
+        };
+        let plain = "report-status quiet ofs-delta agent=fake/1";
+        let (outcome, took, stayed) = pushed_and_then(plain, then, long).await;
+        assert!(pushed(&outcome), "{outcome:?}");
+        assert_eq!(stayed, Some(true), "the client hung up at the report");
+        assert!(took >= hook_time, "{took:?}");
+        // The side-band's flush ends the reading, also where the answer itself never ends.
+        let (outcome, took, _) = pushed_and_then(CAPS, Then::Hold(b"0000".to_vec()), long).await;
+        assert!(pushed(&outcome), "{outcome:?}");
+        assert!(took < Duration::from_secs(20), "{took:?}");
+        // An answer that breaks off after its report, and one that goes on past its bound of
+        // 16 MiB: the push is what the report said.
+        let (outcome, took, _) = pushed_and_then(CAPS, Then::Break, long).await;
+        assert!(pushed(&outcome), "{outcome:?}");
+        assert!(took < Duration::from_secs(20), "{took:?}");
+        let endless = Then::Hold(pkt(b"\x02").repeat((16 << 20) / 5 + 1));
+        let (outcome, took, _) = pushed_and_then(CAPS, endless, long).await;
+        assert!(pushed(&outcome), "{outcome:?}");
+        assert!(took < Duration::from_secs(20), "{took:?}");
+        // An answer that never ends is read for what is left of the push's time, here 3 s, and
+        // the push is still what the report said, not one that "did not end".
+        let short = Duration::from_secs(3);
+        let (outcome, took, _) = pushed_and_then(CAPS, Then::Hold(Vec::new()), short).await;
+        assert!(pushed(&outcome), "{outcome:?}");
+        assert!(
+            took >= Duration::from_secs(2) && took < Duration::from_secs(20),
+            "{took:?}"
+        );
+    })
+    .await;
+}
+
 /// The command is `<old> <new> <ref>\0 <capabilities>` as git's send-pack writes it, with only
 /// capabilities the repository named, and `object-format` and `agent` only when it named them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
