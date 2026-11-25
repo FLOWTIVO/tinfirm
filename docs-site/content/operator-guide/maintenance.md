@@ -199,6 +199,7 @@ The stack itself speaks plain HTTP on `127.0.0.1:8080`. Where your own reverse p
 TINFIRM_TLS_HOST=tinfirm.example.com
 TINFIRM_PUBLIC_URL=https://tinfirm.example.com
 TINFIRM_HTTP_BIND=127.0.0.1
+TINFIRM_COMPOSE_OVERLAYS=compose.tls.yaml
 ```
 
 ```sh
@@ -206,7 +207,7 @@ dig +short tinfirm.example.com          # must be this host's public address
 docker compose -f compose.yaml -f compose.tls.yaml up -d --no-build
 ```
 
-Before the first start, the name must resolve to the host and ports 80 and 443 must be open from the internet: Let's Encrypt limits failed attempts for a name. Open no other port: PostgreSQL, LiteLLM and the server's own port stay on `127.0.0.1`. Name `compose.tls.yaml` in every later `docker compose` command too, or Compose removes Caddy as an orphan with `--remove-orphans`. The certificate and its account key are in the volume `tinfirm_caddy-data`. `.env.example`'s values are public: generate every secret before a host is on the internet, as `deploy/compose/deploy-host.sh` does.
+Before the first start, the name must resolve to the host and ports 80 and 443 must be open from the internet: Let's Encrypt limits failed attempts for a name. Open no other port: PostgreSQL, LiteLLM and the server's own port stay on `127.0.0.1`. Name `compose.tls.yaml` in every later `docker compose` command too, or Compose removes Caddy as an orphan with `--remove-orphans`. `deploy/compose/deploy-host.sh` and `tinfirm-auto-deploy` name the files that `TINFIRM_COMPOSE_OVERLAYS` lists in `.env` (file names with blanks between them, `compose.entra.yaml` too), so set it on a host that either of them deploys: without it, the next deploy removes Caddy and still reports success, since the server answers on loopback. The certificate and its account key are in the volume `tinfirm_caddy-data`. `.env.example`'s values are public: generate every secret before a host is on the internet, as `deploy/compose/deploy-host.sh` does.
 
 The overlay was tried once: the certificate came at the first start, and a runner host's WebSocket and a conversation's event stream passed through Caddy. Not tried through it: a model request's long stream, an upload of 25 MB, and a renewal.
 

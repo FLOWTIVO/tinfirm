@@ -5,7 +5,9 @@
 #   docker compose -f compose.yaml -f compose.tls.yaml up -d --no-build
 #
 # In .env: TINFIRM_TLS_HOST=tinfirm.example.com, TINFIRM_PUBLIC_URL=https://tinfirm.example.com
-# and TINFIRM_HTTP_BIND=127.0.0.1, so that only Caddy reaches the server's port.
+# and TINFIRM_HTTP_BIND=127.0.0.1, so that only Caddy reaches the server's port; and
+# TINFIRM_COMPOSE_OVERLAYS=compose.tls.yaml, so that deploy-host.sh and tinfirm-auto-deploy name
+# this file at every deploy. Without it their `up --remove-orphans` removes Caddy.
 # Before the first start: the name must resolve to this host, and ports 80 and 443 must be
 # open from the internet. Let's Encrypt limits failed attempts for a name: check the name
 # with `dig +short` first.
