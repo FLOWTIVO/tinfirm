@@ -102,6 +102,10 @@ pub const TICKET_PREFIX: &str = "tinfirm-ticket-";
 /// attachment, since its file does not exist. On OKD the `tap` plugin also takes the
 /// container's SELinux label (`selinuxcontext`).
 pub const MULTUS_ANNOTATION: &str = "k8s.v1.cni.cncf.io/networks";
+/// Multus' annotation that names another network as the pod's first. No run pod carries it:
+/// the admission policy refuses it, as it refuses every attachment but the tap's, since such a
+/// network need not be under the namespace's NetworkPolicies.
+pub const MULTUS_DEFAULT_NETWORK: &str = "v1.multus-cni.io/default-network";
 /// The largest user data: as DigitalOcean's driver allows.
 pub const MAX_USER_DATA: usize = 64 * 1024;
 /// Memory beside the guest's: Firecracker's own (the node agent's figure), `vm-pod`'s, and the
@@ -607,6 +611,50 @@ pub fn admission_battery(
             "another image",
             false,
             Box::new(move |p| container(p)["image"] = json!(other_image)),
+        ),
+        // The image holds the whole runner host, with its other subcommands.
+        (
+            "another command",
+            false,
+            Box::new(|p| container(p)["command"] = json!([vm_pod::BINARY, "run"])),
+        ),
+        (
+            "arguments to its command",
+            false,
+            Box::new(|p| container(p)["args"] = json!(["--help"])),
+        ),
+        (
+            "one more environment variable",
+            false,
+            Box::new(|p| {
+                container(p)["env"]
+                    .as_array_mut()
+                    .expect("env")
+                    .push(json!({"name": "TINFIRM_RUNNER_LOG", "value": "trace"}));
+            }),
+        ),
+        // Multus attaches what these annotations name, outside the namespace's NetworkPolicies:
+        // one more attachment beside the tap's (the only one, in tap mode `init`), and another
+        // network as the pod's first.
+        (
+            "another network attachment",
+            false,
+            Box::new(|p| {
+                let annotations = &mut p["metadata"]["annotations"];
+                let networks = match annotations[MULTUS_ANNOTATION].as_str() {
+                    Some(tap) => format!("{tap}, default/another-network"),
+                    None => "default/another-network".to_string(),
+                };
+                annotations[MULTUS_ANNOTATION] = json!(networks);
+            }),
+        ),
+        (
+            "another default network",
+            false,
+            Box::new(|p| {
+                p["metadata"]["annotations"][MULTUS_DEFAULT_NETWORK] =
+                    json!("default/another-network");
+            }),
         ),
         // A claim with a source would copy any claim or snapshot of the namespace into the pod.
         (
@@ -1229,6 +1277,12 @@ mod tests {
                 vec![".spec.containers[0].securityContext.capabilities.add"],
             ),
             ("another image", vec![".spec.containers[0].image"]),
+            ("another command", vec![".spec.containers[0].command[1]"]),
+            ("arguments to its command", vec![".spec.containers[0].args"]),
+            (
+                "one more environment variable",
+                vec![".spec.containers[0].env"],
+            ),
             (
                 "an ephemeral volume with a dataSource",
                 vec![".spec.volumes"],
@@ -1268,8 +1322,15 @@ mod tests {
             ("a claim of another access mode", "accessModes[0]"),
             ("a block claim", "volumeMode"),
         ];
+        // Multus's annotations: beside the tap's with tap mode `multus`, and where the pod has
+        // no annotation at all with `init`.
+        let annotations = [
+            ("another network attachment", MULTUS_ANNOTATION),
+            ("another default network", MULTUS_DEFAULT_NETWORK),
+        ];
         for config in [config(&good()), init_ephemeral()] {
             let ephemeral = config.disk.volume == DiskVolume::Ephemeral;
+            let multus = config.tap.mode == TapMode::Multus;
             let mut expected: BTreeMap<&str, Vec<String>> = common
                 .iter()
                 .map(|(name, paths)| (*name, paths.iter().map(|p| p.to_string()).collect()))
@@ -1279,6 +1340,14 @@ mod tests {
                     format!(".spec.volumes[2].ephemeral.volumeClaimTemplate.spec.{field}")
                 } else {
                     ".spec.volumes".to_string()
+                };
+                expected.insert(name, vec![path]);
+            }
+            for (name, key) in annotations {
+                let path = if multus {
+                    format!(".metadata.annotations.{key}")
+                } else {
+                    ".metadata.annotations".to_string()
                 };
                 expected.insert(name, vec![path]);
             }
@@ -1322,6 +1391,96 @@ mod tests {
                 image.contains("@sha256:") && image != config.image,
                 "{image}"
             );
+            // The tap's attachment stays, where there is one: the pod would still start.
+            let tap = if multus { "tinfirm-tap@tap0, " } else { "" };
+            assert_eq!(
+                pod_of("another network attachment")["metadata"]["annotations"],
+                json!({MULTUS_ANNOTATION: format!("{tap}default/another-network")})
+            );
+            let mut with_default = battery.accepted["metadata"]["annotations"].clone();
+            with_default[MULTUS_DEFAULT_NETWORK] = json!("default/another-network");
+            assert_eq!(
+                pod_of("another default network")["metadata"]["annotations"],
+                with_default
+            );
+            assert_eq!(
+                pod_of("another command")["spec"]["containers"][0]["command"],
+                json!(["/tinfirm/tinfirm-runner-host", "run"])
+            );
+        }
+    }
+
+    /// The chart's admission policy (deploy/helm/tinfirm/templates/run-pod-admission.yaml)
+    /// names, word for word, what [`pod`] sets and its rules pin: each container's command, the
+    /// names of its environment variables, Multus' two annotations and the tap's name. The
+    /// chart cannot read this file, and a change here that the policy lacks would have the
+    /// cluster refuse every run pod: so this test reads the template's text.
+    #[test]
+    fn the_charts_admission_policy_names_what_the_pod_sets() {
+        const POLICY: &str =
+            include_str!("../../../../../deploy/helm/tinfirm/templates/run-pod-admission.yaml");
+        // An expression may break its lines anywhere.
+        let policy = POLICY.split_whitespace().collect::<Vec<_>>().join(" ");
+        // A list of texts as a CEL expression writes it.
+        let cel = |texts: Vec<&str>| {
+            let quoted: Vec<String> = texts.iter().map(|text| format!("'{text}'")).collect();
+            format!("[{}]", quoted.join(", "))
+        };
+        let texts = |list: &Value| -> Vec<String> {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        let names = |container: &Value| -> Vec<String> {
+            container["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let pinned = |container: &Value| {
+            let (command, env) = (texts(&container["command"]), names(container));
+            [
+                format!(
+                    "c.command == {}",
+                    cel(command.iter().map(String::as_str).collect())
+                ),
+                format!(
+                    "c.env.map(e, e.name) == {}",
+                    cel(env.iter().map(String::as_str).collect())
+                ),
+            ]
+        };
+        let multus = pod(&config(&good()), "sandbox-4c8g", &id(), &labels(), NODE).unwrap();
+        let init = pod(&init_ephemeral(), "sandbox-4c8g", &id(), &labels(), NODE).unwrap();
+        let mut expected = Vec::new();
+        expected.extend(pinned(&multus["spec"]["containers"][0]));
+        expected.extend(pinned(&init["spec"]["containers"][0]));
+        expected.extend(pinned(&init["spec"]["initContainers"][0]));
+        expected.extend([
+            format!("'{MULTUS_ANNOTATION}' in object.metadata.annotations"),
+            format!("'{MULTUS_DEFAULT_NETWORK}' in object.metadata.annotations"),
+            // The tap's attachment, as `pod` writes it for the configured name.
+            format!(
+                "object.metadata.annotations['{MULTUS_ANNOTATION}'] == '{{{{ $p.tap.networkAttachment }}}}@{}'",
+                vm_pod::TAP_DEVICE
+            ),
+        ]);
+        for expected in expected {
+            assert!(policy.contains(&expected), "{expected}");
+        }
+        assert_eq!(
+            multus["metadata"]["annotations"],
+            json!({MULTUS_ANNOTATION: format!("tinfirm-tap@{}", vm_pod::TAP_DEVICE)})
+        );
+        // No argument anywhere: the policy refuses any.
+        for pod in [&multus, &init] {
+            for (_, container) in containers(pod) {
+                assert!(container.get("args").is_none(), "{container}");
+            }
         }
     }
 

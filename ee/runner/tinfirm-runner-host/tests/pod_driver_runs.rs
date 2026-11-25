@@ -73,7 +73,8 @@ impl Cluster {
         }
     }
 
-    /// Whether the pod is exactly the one the driver's specification makes for its name.
+    /// Whether the pod is exactly the one the driver's specification makes for its name: its
+    /// `spec`, and its annotations, by which Multus attaches the tap.
     fn is_the_specs(&self, pod: &Value) -> bool {
         let Ok(id) = VmId::parse(pod["metadata"]["name"].as_str().unwrap_or_default()) else {
             return false;
@@ -81,6 +82,7 @@ impl Cluster {
         let expected = spec::pod(&self.config, TEMPLATE, &id, &BTreeMap::new(), RUNNER_NODE)
             .expect("the configuration's template");
         pod["spec"] == expected["spec"]
+            && pod["metadata"]["annotations"] == expected["metadata"]["annotations"]
     }
 
     /// The kubelet, as far as the driver sees it: a pod waits for its Secret, then runs, then is

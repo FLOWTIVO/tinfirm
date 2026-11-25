@@ -55,10 +55,11 @@ count() { grep -c -E '^kind: ValidatingAdmissionPolicy(Binding)?$' || true; }
 [ "$(render -f "$chart/ci/runner-pod-init-values.yaml" "${vap[@]}" | count)" = 0 ] \
   || fail "Admission policies with runner.vm.cluster.admission: external"
 
-# The pod policy's rules of placement and of the disk's claim, in every configuration of the
-# two ci/ files: the battery's pods for them (spec.rs, admission_battery) are refused each by
-# its rule only in a cluster, which the kind test shows; here each rule is there, with the
-# configured values in it.
+# The pod policy's rules of placement, of the disk's claim, of Multus's annotations and of
+# what a container runs, in every configuration of the two ci/ files: the battery's pods for
+# them (spec.rs, admission_battery) are refused each by its rule only in a cluster, which the
+# kind test shows; here each rule is there, with the configured values in it. The commands and
+# the environment's names are spec.rs's, whose own test reads them in the template.
 has_rule() { # <what> <fixed string of the rendered policy>
   grep -q -F -e "$2" <<< "$policy" || fail "$name: the pod policy lacks its rule on $1 ($2)"
 }
@@ -81,6 +82,20 @@ for name in multus ephemeral init init-emptydir; do
   has_rule "the anti-affinity's topology" "t.topologyKey == 'kubernetes.io/hostname'"
   has_rule "a pod affinity" "!has(object.spec.affinity.podAffinity)"
   has_rule "the node affinity" "f.key == 'metadata.name' && f.operator == 'NotIn'"
+  has_rule "the container's command" "c.command == ['/tinfirm/tinfirm-runner-host', 'vm-pod']"
+  has_rule "the container's arguments" "(!has(c.args) || c.args.size() == 0)"
+  has_rule "the container's environment" "c.env.map(e, e.name) == ['TINFIRM_POD_NAME', 'TINFIRM_POD_IP', 'TINFIRM_TAP_MODE', 'TINFIRM_TAP_CIDR', 'TINFIRM_BRIDGE_PORT', 'TINFIRM_VCPUS', 'TINFIRM_MEMORY_MIB', 'TINFIRM_DISK_MIB', 'TINFIRM_DISK_VARIANT']"
+  has_rule "another default network" "!('v1.multus-cni.io/default-network' in object.metadata.annotations)"
+  case "$name" in
+    multus | ephemeral)
+      has_rule "the tap's attachment" "object.metadata.annotations['k8s.v1.cni.cncf.io/networks'] == 'kube-system/tinfirm-tap@tap0'"
+      ;;
+    *)
+      has_rule "no network attachment" "!('k8s.v1.cni.cncf.io/networks' in object.metadata.annotations)"
+      has_rule "the init container's command" "c.command == ['/tinfirm/tinfirm-runner-host', 'vm-pod', 'tap-setup']"
+      has_rule "the init container's environment" "c.env.map(e, e.name) == ['TINFIRM_TAP_CIDR']"
+      ;;
+  esac
   case "$name" in
     ephemeral | init)
       has_rule "one claim" 'object.spec.volumes.filter(v, has(v.ephemeral)).size() == 1'

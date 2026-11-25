@@ -18,13 +18,15 @@ does not start.
 # any ServiceAccount there: RBAC alone is no boundary. Every pod of the namespace, whoever
 # creates or changes it, must be what the driver builds (spec.rs, `pod`): its name, the runs'
 # ServiceAccount, no token, a user namespace, no host namespace, no pull Secret, no ephemeral
-# container; as volumes only emptyDirs, its own ticket's Secret and, with disk.volume
+# container; of Multus's annotations its tap's attachment alone (tap mode `multus`) or none
+# (`init`); as volumes only emptyDirs, its own ticket's Secret and, with disk.volume
 # `ephemeral`, one empty claim of the configured class and of a template's disk size; in every
-# container the image by digest, no Secret in the environment, no privilege, every capability
-# dropped, none added but NET_ADMIN in the init container of tap mode `init`, and no host
-# port; placed by the default scheduler on the workers for runs, off the runner pod's node. A
-# rule whose field is missing fails closed (failurePolicy Fail). The driver's own check creates
-# refused pods with dryRun at each check and starts no VM while one is admitted.
+# container the image by digest, the run pod's program as its command with no arguments, the
+# driver's environment variables by name, no Secret in the environment, no privilege, every
+# capability dropped, none added but NET_ADMIN in the init container of tap mode `init`, and
+# no host port; placed by the default scheduler on the workers for runs, off the runner pod's
+# node. A rule whose field is missing fails closed (failurePolicy Fail). The driver's own check
+# creates refused pods with dryRun at each check and starts no VM while one is admitted.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -52,6 +54,24 @@ spec:
   validations:
     - expression: "object.metadata.name.matches('^tinfirm-vm-[0-9a-f]{32}$')"
       message: "a run pod's name is tinfirm-vm- and 32 hex digits"
+    # Multus attaches a network for each name in its `networks` annotation and takes the pod's
+    # first network from `default-network`, neither of which the namespace's NetworkPolicies
+    # need cover: a run pod names its tap's attachment and nothing else. Other annotations are
+    # the cluster's own (a network plugin's status, say) and are left alone.
+    {{- if eq $p.tap.mode "multus" }}
+    - expression: >-
+        has(object.metadata.annotations)
+        && 'k8s.v1.cni.cncf.io/networks' in object.metadata.annotations
+        && object.metadata.annotations['k8s.v1.cni.cncf.io/networks'] == '{{ $p.tap.networkAttachment }}@tap0'
+        && !('v1.multus-cni.io/default-network' in object.metadata.annotations)
+      message: "a run pod's one network attachment is its tap, {{ $p.tap.networkAttachment }}@tap0 (the annotation k8s.v1.cni.cncf.io/networks), and it names no default network (v1.multus-cni.io/default-network)"
+    {{- else }}
+    - expression: >-
+        !has(object.metadata.annotations)
+        || (!('k8s.v1.cni.cncf.io/networks' in object.metadata.annotations)
+        && !('v1.multus-cni.io/default-network' in object.metadata.annotations))
+      message: "a run pod names no network attachment and no default network (the annotations k8s.v1.cni.cncf.io/networks and v1.multus-cni.io/default-network): its init container makes its tap (tap mode init)"
+    {{- end }}
     - expression: >-
         has(object.spec.serviceAccountName)
         && object.spec.serviceAccountName == '{{ $c.runServiceAccount }}'
@@ -158,6 +178,17 @@ spec:
       message: "a run pod's containers take nothing from a Secret into their environment"
     - expression: "variables.containers.all(c, has(c.image) && c.image == '{{ $image }}')"
       message: "a run pod's containers run the image {{ $image }}"
+    # The image holds the whole runner host: a container runs the run pod's program of it, with
+    # the environment the driver gives it, and no other command (spec.rs, `vm_pod`).
+    - expression: >-
+        object.spec.containers.all(c, has(c.command)
+        && c.command == ['/tinfirm/tinfirm-runner-host', 'vm-pod']
+        && (!has(c.args) || c.args.size() == 0))
+      message: "a run pod's container runs /tinfirm/tinfirm-runner-host vm-pod, with no arguments"
+    - expression: >-
+        object.spec.containers.all(c, has(c.env)
+        && c.env.map(e, e.name) == ['TINFIRM_POD_NAME', 'TINFIRM_POD_IP', 'TINFIRM_TAP_MODE', 'TINFIRM_TAP_CIDR', 'TINFIRM_BRIDGE_PORT', 'TINFIRM_VCPUS', 'TINFIRM_MEMORY_MIB', 'TINFIRM_DISK_MIB', 'TINFIRM_DISK_VARIANT'])
+      message: "a run pod's container has the driver's nine environment variables, in the driver's order, and no other"
     - expression: >-
         variables.containers.all(c, has(c.securityContext)
         && has(c.securityContext.allowPrivilegeEscalation)
@@ -183,6 +214,12 @@ spec:
         || !has(c.securityContext.capabilities.add)
         || c.securityContext.capabilities.add.all(a, a == 'NET_ADMIN'))
       message: "a run pod's init container adds no capability but NET_ADMIN, which makes the tap"
+    - expression: >-
+        !has(object.spec.initContainers) || object.spec.initContainers.all(c, has(c.command)
+        && c.command == ['/tinfirm/tinfirm-runner-host', 'vm-pod', 'tap-setup']
+        && (!has(c.args) || c.args.size() == 0)
+        && has(c.env) && c.env.map(e, e.name) == ['TINFIRM_TAP_CIDR'])
+      message: "a run pod's init container runs /tinfirm/tinfirm-runner-host vm-pod tap-setup, with no arguments and TINFIRM_TAP_CIDR as its one environment variable"
     {{- else }}
     - expression: "!has(object.spec.initContainers) || object.spec.initContainers.size() == 0"
       message: "a run pod has no init container: the network plugin hands it its tap (tap mode multus)"

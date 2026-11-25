@@ -1241,7 +1241,19 @@ mod tests {
                     && c["securityContext"]["privileged"] != json!(true)
                     && c["securityContext"]["capabilities"].get("add").is_none()
                     && c["image"] == json!(config.image)
+                    && c["command"] == json!([spec::vm_pod::BINARY, spec::vm_pod::COMMAND])
+                    && c.get("args").is_none()
+                    && c["env"].as_array().is_some_and(|env| env.len() == 9)
             });
+        // Of Multus's annotations, the tap's attachment alone, where the tap comes from it.
+        let annotations = &pod["metadata"]["annotations"];
+        let tap = config
+            .tap
+            .network_attachment
+            .as_ref()
+            .map(|attachment| json!(format!("{attachment}@tap0")));
+        let annotations_ok = annotations.get(spec::MULTUS_ANNOTATION) == tap.as_ref()
+            && annotations.get(spec::MULTUS_DEFAULT_NETWORK).is_none();
         // Every ephemeral claim: no way to another volume, and a template's size.
         let sizes: Vec<Value> = config
             .templates
@@ -1303,6 +1315,7 @@ mod tests {
             && spec["automountServiceAccountToken"] == false
             && spec["hostUsers"] == false
             && spec.get("hostNetwork").is_none()
+            && annotations_ok
             && volumes_ok
             && claims_ok
             && containers_ok
