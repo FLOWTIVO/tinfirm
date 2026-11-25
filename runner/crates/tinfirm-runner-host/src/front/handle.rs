@@ -77,6 +77,18 @@ impl FrontCommand {
             tap: None,
         })
     }
+
+    /// Whether a front that cannot confine itself serves anyway: the host's decision at its
+    /// start (`--allow-unconfined-reader`, where a front's probe was not confined), which the
+    /// front is told in its arguments ([`super::ALLOW_UNCONFINED`]). Without it such a front
+    /// ends before it is ready, with the reason, and [`FrontHandle::spawn`] fails with it.
+    pub fn allowing_unconfined(mut self, allow: bool) -> FrontCommand {
+        self.args.retain(|arg| arg != super::ALLOW_UNCONFINED);
+        if allow {
+            self.args.push(super::ALLOW_UNCONFINED.to_string());
+        }
+        self
+    }
 }
 
 /// How a front ended.

@@ -1059,6 +1059,12 @@ Both:
     credentials among them; where seccomp is missing too, it also reaches the network, starts
     programs and can end `run` and its runs with a signal.
 
+  On a host whose probes were confined, a reader or a front that cannot confine itself later
+  (the kernel refuses it Landlock or the filter then) does not work unconfined: the reader
+  refuses its job, and the front serves nothing and ends with the reason, which fails its
+  sandbox's start. Only where the flag accepted an unconfined reader or front at the start is
+  each one told that it may work so.
+
   A Docker host without the bridge uses no reader and no front, and checks neither.
 - **Descriptors on their way.** `run` passes a front every connection as a descriptor over a Unix
   socket. Linux refuses that (`ETOOMANYREFS`) while more descriptors of `run`'s user are on their

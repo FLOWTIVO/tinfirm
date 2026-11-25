@@ -213,6 +213,10 @@ enum Command {
         /// Confine as a front does, try what a front must be refused, and answer on stdout.
         #[arg(long, allow_hyphen_values = true)]
         probe: Option<String>,
+        /// Serve also where this front cannot confine itself: `run` says so where it took
+        /// unconfined fronts at its start (--allow-unconfined-reader).
+        #[arg(long)]
+        allow_unconfined: bool,
     },
     /// The reader of what a sandbox sends back (ADR-0112, open question 1): `run` starts one
     /// for each archive and git bundle of a run, with no credential, confined to that run's
@@ -884,8 +888,12 @@ fn main() -> ExitCode {
         return tinfirm_runner_host::reader::child_main(job);
     }
     // So does a front.
-    if let Command::Front { probe } = &cli.command {
-        return tinfirm_runner_host::front::child_main(probe.as_deref());
+    if let Command::Front {
+        probe,
+        allow_unconfined,
+    } = &cli.command
+    {
+        return tinfirm_runner_host::front::child_main(probe.as_deref(), *allow_unconfined);
     }
     // A run pod's program writes its own lines, and its readiness probe runs every second.
     if let Command::VmPod { step } = &cli.command {
@@ -2467,7 +2475,7 @@ async fn run(
     secure_fs::ensure_private_dir(&paths.config_dir)?;
     // The reader of what the sandboxes send back and a probe of their front, before any image
     // is built: a host that cannot confine either is refused at once.
-    let reader = if sandbox_args.sandbox_bridge || vm_options.is_some() {
+    let reader_and_front = if sandbox_args.sandbox_bridge || vm_options.is_some() {
         make_room_to_pass_descriptors();
         Some(check_reader_and_front(paths, sandbox_args.allow_unconfined_reader).await?)
     } else {
@@ -2523,8 +2531,8 @@ async fn run(
     };
     let (mut opts, endpoint) = started;
     if let Some(bridge) = opts.bridge.as_mut() {
-        bridge.reader = reader.context("a host with the bridge has a reader")?;
-        bridge.front = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
+        (bridge.reader, bridge.front) =
+            reader_and_front.context("a host with the bridge has a reader")?;
     }
     opts.egress = egress;
     // The model proxy is always on: a setup where its listeners could never serve a sandbox is
@@ -2605,11 +2613,18 @@ fn make_room_to_pass_descriptors() {
 /// to start a program ([`probe_front`]). Where either cannot be confined, every host that uses
 /// the bridge (`--sandbox-bridge`, `--executor vm`) is refused unless `allow`
 /// (`--allow-unconfined-reader`, whose one policy covers both); with it, a warning says what
-/// is given up.
+/// is given up. The host's readers and the command of its fronts come back with that decision
+/// in them: each takes an unconfined one only where its probe was not confined here, so that a
+/// reader or a front that cannot confine itself later, on a host whose probes were confined,
+/// refuses its work.
 async fn check_reader_and_front(
     paths: &Paths,
     allow: bool,
-) -> Result<tinfirm_runner_host::reader::Reader> {
+) -> Result<(
+    tinfirm_runner_host::reader::Reader,
+    tinfirm_runner_host::front::handle::FrontCommand,
+)> {
+    let front = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
     let reader = host_reader(paths)?;
     let reader_probe = probe_reader(paths, &reader).await?;
     let front_probe = probe_front(paths)
@@ -2644,7 +2659,7 @@ async fn check_reader_and_front(
         cost.push(format!("the fronts' confinement: {UNCONFINED_FRONT_COST}"));
     }
     if cannot.is_empty() {
-        return Ok(reader);
+        return Ok((reader, front));
     }
     let cannot = format!("this system cannot confine {}", cannot.join(" nor "));
     let cost = cost.join("; and ");
@@ -2654,7 +2669,10 @@ async fn check_reader_and_front(
         );
     }
     tracing::warn!("{cannot}. --allow-unconfined-reader accepts this and gives up {cost}");
-    Ok(reader.allowing_unconfined(!reader_probe.confined()))
+    Ok((
+        reader.allowing_unconfined(!reader_probe.confined()),
+        front.allowing_unconfined(!front_probe.confined()),
+    ))
 }
 
 /// What `--allow-unconfined-reader` gives up, for the refusal, the warning and `doctor`.
@@ -2725,9 +2743,11 @@ async fn probe_front(paths: &Paths) -> Result<tinfirm_runner_host::front::Probe>
 /// ([`check_reader_and_front`]).
 async fn doctor_front(checks: &mut Checks, paths: &Paths, bridged: bool, allow: bool) {
     const USED: &str = "`run` starts one per sandbox, for its bridge and the HTTP of its git proxy, platform tools, model and egress proxies, with --sandbox-bridge or --executor vm";
-    // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed.
+    // Its wire to `run`, as `run` will start it: ready, a round trip, a descriptor passed. A
+    // front that cannot confine itself serves only where `run` would take it.
     let wire = async {
-        let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?;
+        let command = tinfirm_runner_host::front::handle::FrontCommand::this_binary()?
+            .allowing_unconfined(allow);
         let front =
             tinfirm_runner_host::front::handle::FrontHandle::spawn(&command, uuid::Uuid::new_v4())
                 .await?;

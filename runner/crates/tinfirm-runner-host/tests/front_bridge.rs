@@ -36,6 +36,8 @@ const WAIT: Duration = Duration::from_secs(20);
 /// The tests of this file count this process's descriptors: one runs at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The real front. These tests are about the bridge in it: on a kernel that confines no front
+/// it serves, as on a host with --allow-unconfined-reader.
 fn the_front() -> FrontCommand {
     FrontCommand {
         program: PathBuf::from(BIN),
@@ -43,6 +45,7 @@ fn the_front() -> FrontCommand {
         env: Vec::new(),
         tap: None,
     }
+    .allowing_unconfined(true)
 }
 
 fn link_timing() -> Timing {

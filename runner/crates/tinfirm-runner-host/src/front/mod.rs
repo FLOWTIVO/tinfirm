@@ -19,7 +19,10 @@
 //! one line of JSON on stdout ([`Probe`]). `run` runs it at its start and refuses to start
 //! where it is not confined, unless `--allow-unconfined-reader`; `doctor` runs it too
 //! ([`probe`]). `front` alone serves the control channel on its stdin ([`wire`]); `run`'s side
-//! of it is [`handle::FrontHandle`].
+//! of it is [`handle::FrontHandle`]. A front that cannot confine itself serves nothing, as a
+//! reader refuses its job: it says why and ends, and its sandbox does not start. Only a host
+//! that took unconfined fronts at its start has them serve, and tells each so in its
+//! arguments ([`ALLOW_UNCONFINED`]).
 //!
 //! What a front applies to itself, before it builds any runtime or reads a byte:
 //! - resource limits: 512 MiB of data, 1024 descriptors, no core file;
@@ -63,6 +66,11 @@ pub mod wire;
 
 /// The hidden subcommand that starts a front.
 pub const SUBCOMMAND: &str = "front";
+
+/// The argument that tells a front that the host takes an unconfined one
+/// (`run --allow-unconfined-reader`, where the probe of a front was not confined at the host's
+/// start): without it, a front that cannot confine itself serves nothing.
+pub const ALLOW_UNCONFINED: &str = "--allow-unconfined";
 
 /// The most a front's answer to its probe may be.
 const MAX_ANSWER: u64 = 64 * 1024;
@@ -174,14 +182,22 @@ impl Probe {
 
 // ----- the front's side --------------------------------------------------------------------
 
-/// `front [--probe JOB]`: the front process. Confines itself first. Never run by hand.
-pub fn child_main(probe: Option<&str>) -> ExitCode {
+/// `front [--probe JOB] [--allow-unconfined]`: the front process. Confines itself first. One
+/// that could not serves nothing unless `allow_unconfined` ([`ALLOW_UNCONFINED`]): it ends with
+/// the reason on its stderr, which fails its sandbox's start in `run`. Never run by hand.
+pub fn child_main(probe: Option<&str>, allow_unconfined: bool) -> ExitCode {
     let job = probe.map(serde_json::from_str::<ProbeJob>);
     limit_resources();
     let status = confine::confine(&Plan::front());
     let job = match job {
         Some(Ok(job)) => job,
         Some(Err(e)) => return fail(&format!("the probe's job is not valid: {e}")),
+        None if !status.confined() && !allow_unconfined => {
+            return fail(&format!(
+                "the front cannot be confined here, and the host takes no unconfined front: {}",
+                status.describe()
+            ));
+        }
         None => return serve::serve(status),
     };
     if let Some(attempts) = &job.inside {
@@ -414,7 +430,9 @@ mod tests {
             report(info);
             std::process::exit(101);
         }));
-        let code = super::child_main(None);
+        // The library's tests are about the services: where no kernel confines a front, it
+        // serves as on a host that takes unconfined fronts.
+        let code = super::child_main(None, true);
         std::process::exit(if code == std::process::ExitCode::SUCCESS {
             0
         } else {

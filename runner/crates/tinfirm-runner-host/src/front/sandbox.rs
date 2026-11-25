@@ -169,7 +169,9 @@ impl std::fmt::Debug for SandboxFront {
 impl SandboxFront {
     /// Starts a sandbox's front. `run` refuses to start where a front's probe is not confined,
     /// unless `--allow-unconfined-reader` accepts it; a front that cannot confine itself then
-    /// serves, with a warning in the log.
+    /// serves, with a warning in the log. On any other host such a front serves nothing
+    /// ([`FrontCommand::allowing_unconfined`]): it ends with its reason, and the start fails
+    /// with it.
     pub async fn start(command: &FrontCommand) -> Result<Arc<SandboxFront>> {
         let handle = FrontHandle::spawn(command, uuid::Uuid::nil())
             .await

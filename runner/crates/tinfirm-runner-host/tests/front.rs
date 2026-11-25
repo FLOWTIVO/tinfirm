@@ -117,7 +117,7 @@ fn a_front_reads_no_file_of_the_host_reaches_no_other_process_and_starts_nothing
 #[test]
 fn a_front_whose_stdin_is_not_its_channel_serves_nothing() {
     let out = Command::new(BIN)
-        .arg(front::SUBCOMMAND)
+        .args([front::SUBCOMMAND, front::ALLOW_UNCONFINED])
         .env_clear()
         .stdin(Stdio::null())
         .output()
@@ -147,7 +147,8 @@ fn a_front_whose_stdin_is_not_its_channel_serves_nothing() {
 use front::handle::{Ended, FrontCommand, FrontHandle};
 use front::wire::{self, ToFront, ToMain};
 
-/// The real front: this binary's `front`.
+/// The real front: this binary's `front`. These tests are about its wire and its services:
+/// on a kernel that confines no front it serves, as on a host with --allow-unconfined-reader.
 fn the_front() -> FrontCommand {
     FrontCommand {
         program: PathBuf::from(BIN),
@@ -155,6 +156,7 @@ fn the_front() -> FrontCommand {
         env: Vec::new(),
         tap: None,
     }
+    .allowing_unconfined(true)
 }
 
 /// Where [`hostile_front`] tells [`hostile_front_child`] what to do.
@@ -857,7 +859,7 @@ fn a_front_exits_when_its_channel_closes() {
     use std::io::Read;
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
     let mut child = Command::new(BIN)
-        .arg(front::SUBCOMMAND)
+        .args([front::SUBCOMMAND, front::ALLOW_UNCONFINED])
         .env_clear()
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(theirs)))
         .stdout(Stdio::null())
@@ -1072,6 +1074,9 @@ async fn a_hostile_front_ends_only_its_own_handle_and_run_gets_no_descriptor_of_
 
 /// Where [`front_without_landlock`] hands the probe's job to [`launch_front_without_landlock`].
 const WITHOUT_LANDLOCK: &str = "TINFIRM_TEST_FRONT_WITHOUT_LANDLOCK";
+/// Where [`serving_front_without_landlock`] tells [`launch_front_without_landlock`] to start a
+/// front that serves, with these arguments after `front` (none, or the host's allowance).
+const SERVING_WITHOUT_LANDLOCK: &str = "TINFIRM_TEST_FRONT_SERVING_WITHOUT_LANDLOCK";
 
 /// A front on a kernel without Landlock: this test binary starts itself again, and
 /// [`launch_front_without_landlock`] refuses Landlock to its thread, as such a kernel does, and
@@ -1107,8 +1112,13 @@ fn launch_front_without_landlock() {
 
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
 
-    let Ok(job) = std::env::var(WITHOUT_LANDLOCK) else {
-        return;
+    let args = match (
+        std::env::var(WITHOUT_LANDLOCK),
+        std::env::var(SERVING_WITHOUT_LANDLOCK),
+    ) {
+        (Ok(job), _) => vec!["--probe".to_string(), job],
+        (_, Ok(args)) => args.split_whitespace().map(String::from).collect(),
+        _ => return,
     };
     let arch = TargetArch::try_from(std::env::consts::ARCH).unwrap();
     let filter: BpfProgram = SeccompFilter::new(
@@ -1122,11 +1132,58 @@ fn launch_front_without_landlock() {
     .unwrap();
     seccompiler::apply_filter(&filter).unwrap();
     let error = Command::new(BIN)
-        .args([front::SUBCOMMAND, "--probe", &job])
+        .arg(front::SUBCOMMAND)
+        .args(args)
         .env_clear()
         .process_group(0)
         .exec();
     panic!("cannot start the front: {error}");
+}
+
+/// A front that serves, as `run` starts one, on a kernel without Landlock
+/// ([`launch_front_without_landlock`] in this test binary's place): told that the host takes an
+/// unconfined front (`allowed`), or not.
+fn serving_front_without_landlock(allowed: bool) -> FrontCommand {
+    let args = if allowed { front::ALLOW_UNCONFINED } else { "" };
+    FrontCommand {
+        program: std::env::current_exe().unwrap(),
+        args: [
+            "--exact",
+            "launch_front_without_landlock",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .map(String::from)
+        .to_vec(),
+        env: vec![(SERVING_WITHOUT_LANDLOCK.to_string(), args.to_string())],
+        tap: None,
+    }
+}
+
+/// A host whose probes were confined at its start takes no unconfined front. Should one front
+/// then fail to confine itself (the kernel refuses it Landlock), it serves nothing, as a reader
+/// refuses its job: it ends with the reason, and its sandbox's start fails with it. Where the
+/// host took unconfined fronts at its start, it serves, and says what it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_front_that_cannot_confine_itself_serves_only_where_the_host_takes_one() {
+    let error = SandboxFront::start(&serving_front_without_landlock(false))
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("cannot start the sandbox's front process")
+            && error.contains("the host takes no unconfined front")
+            && error.contains("no Landlock"),
+        "{error}"
+    );
+    // The same front, where the host takes one: it serves, with its seccomp filter alone.
+    let front = SandboxFront::start(&serving_front_without_landlock(true))
+        .await
+        .unwrap();
+    let status = front.handle().status();
+    assert!(!status.landlock && !status.confined(), "{status:?}");
+    assert!(status.seccomp, "{status:?}");
+    front.handle().ping().await.unwrap();
 }
 
 #[test]

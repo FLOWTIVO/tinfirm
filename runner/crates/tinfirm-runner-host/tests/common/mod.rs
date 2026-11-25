@@ -1391,13 +1391,14 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
         // unconfined reader.
         bridge.reader = bridge.reader.clone().allowing_unconfined(true);
         // The fronts are this host's own binary, as `run` sets them, whatever runs as the
-        // sandbox's bridge.
+        // sandbox's bridge; and as the readers, they serve on a kernel that confines none.
         bridge.front = tinfirm_runner_host::front::handle::FrontCommand {
             program: PathBuf::from(env!("CARGO_BIN_EXE_tinfirm-runner-host")),
             args: vec![tinfirm_runner_host::front::SUBCOMMAND.to_string()],
             env: Vec::new(),
             tap: None,
-        };
+        }
+        .allowing_unconfined(true);
         opts.bridge = Some(bridge);
     }
     if let Some(timeout) = setup.inactivity_timeout {
