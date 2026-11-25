@@ -1,0 +1,36 @@
+---
+# The tools that the helper runs (the agent's README, "What a node needs": ip, nft, sysctl,
+# losetup, dmsetup, blockdev, mknod), and what the role itself needs: openssl for the release's
+# signature, tar and zstd for the archives, python3 for the helper's check. Once the node's
+# firewall is loaded the node reaches no mirror, so nothing is asked of one while every package
+# is there.
+- name: Read the installed packages
+  ansible.builtin.package_facts:
+
+- name: Install the node's packages (Ubuntu, Debian)
+  ansible.builtin.apt:
+    name: "{{ _missing }}"
+    update_cache: true
+  vars:
+    _missing: "{{ _tinfirm_sandbox_node_packages | difference(ansible_facts['packages'].keys() | list) }}"
+  when:
+    - ansible_facts['os_family'] == 'Debian'
+    - _missing | length > 0
+
+- name: Install the node's packages (RHEL family)
+  ansible.builtin.dnf:
+    name: "{{ _missing }}"
+  vars:
+    _missing: "{{ _tinfirm_sandbox_node_packages | difference(ansible_facts['packages'].keys() | list) }}"
+  when:
+    - ansible_facts['os_family'] == 'RedHat'
+    - _missing | length > 0
+
+# The distribution's nftables.service loads /etc/nftables.conf, which flushes the whole ruleset:
+# the VMs' tables would go with it under running VMs (the agent's README, "The list"). The
+# node's own table has a unit of its own.
+- name: Keep the distribution's nftables.service from flushing the ruleset
+  ansible.builtin.systemd_service:
+    name: nftables.service
+    enabled: false
+    masked: true

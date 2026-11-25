@@ -11,6 +11,7 @@
 //! isolation at all and exists only for the host's own tests; the CLI never selects it.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -19,16 +20,20 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bollard::Docker;
 use bollard::container::LogOutput;
-use bollard::models::{ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum};
+use bollard::models::{
+    ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum, ResourcesUlimits,
+};
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, LogsOptionsBuilder,
     StartContainerOptions, StopContainerOptionsBuilder, WaitContainerOptions,
 };
 use futures::StreamExt;
 use tinfirm_bridge::control::{Hidden, ProbeCheck, Start};
-use tinfirm_bridge::host::{
-    Exit, HostIo, HostSession, Output, Registration, SandboxFiles, TunnelTarget,
-};
+use tinfirm_bridge::host::{ExecOutput, Exit, HostSession, Output, Registration, SandboxFiles};
+
+use crate::front::session::{BridgeRegistration, FrontFiles, FrontSession};
+use crate::front::wire::Service;
+use crate::reader::Input;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 
@@ -41,12 +46,19 @@ pub struct Bind {
     pub read_only: bool,
 }
 
+/// A sandbox container's limit of open files (`nofile`, soft and hard), unless the host's own
+/// limit asks for less ([`crate::confine::sandbox_files`]): the container does not take the
+/// Docker daemon's, which is often a million or none.
+pub const SANDBOX_FILES: u64 = 65536;
+
 /// Resource limits of a sandbox (docs/archive/v1/CONVENTIONS.md §15.3 defaults).
 #[derive(Debug, Clone, Copy)]
 pub struct Resources {
     pub memory_bytes: i64,
     pub nano_cpus: i64,
     pub pids_limit: i64,
+    /// The limit of open files of each process in the container (`nofile`, soft and hard).
+    pub files: u64,
 }
 
 impl Default for Resources {
@@ -55,6 +67,7 @@ impl Default for Resources {
             memory_bytes: 4 * 1024 * 1024 * 1024,
             nano_cpus: 2_000_000_000,
             pids_limit: 1024,
+            files: SANDBOX_FILES,
         }
     }
 }
@@ -98,32 +111,28 @@ pub const DOCKER_ENV: &str = "TINFIRM_SANDBOX_DOCKER";
 /// has started as root: [`USER`].
 pub const AGENT_USER_ENV: &str = "TINFIRM_SANDBOX_AGENT_USER";
 
-/// Isolation tier of the sandboxes (ADR-0006), given by the Docker runtime (ADR-0025).
+/// What runs the sandboxes (ADR-0006, ADR-0025): the technology, for the logs and the rules
+/// of these settings. The level of isolation that the host reports is crate::isolation's: a
+/// Kata host reports `container`, since its VMM is root on the machine with the credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
+pub enum RuntimeFamily {
     /// runc or another runtime that shares the host kernel.
-    Container,
+    Runc,
     /// gVisor (`runsc…`).
     Gvisor,
     /// Kata Containers (`kata…`): every sandbox is a microVM with its own kernel.
-    Microvm,
+    Kata,
+    /// A VM per run (the VM executor, crate::vm): no Docker runtime on this host.
+    Vm,
 }
 
-impl Tier {
+impl RuntimeFamily {
     pub fn as_str(self) -> &'static str {
         match self {
-            Tier::Container => "container",
-            Tier::Gvisor => "gvisor",
-            Tier::Microvm => "microvm",
-        }
-    }
-
-    /// The tier as `hello.isolationTiers` names it.
-    pub fn isolation_tier(self) -> tinfirm_protocol::IsolationTier {
-        match self {
-            Tier::Container => tinfirm_protocol::IsolationTier::Container,
-            Tier::Gvisor => tinfirm_protocol::IsolationTier::Gvisor,
-            Tier::Microvm => tinfirm_protocol::IsolationTier::Microvm,
+            RuntimeFamily::Runc => "runc",
+            RuntimeFamily::Gvisor => "gvisor",
+            RuntimeFamily::Kata => "kata",
+            RuntimeFamily::Vm => "vm",
         }
     }
 }
@@ -211,15 +220,15 @@ impl SandboxSettings {
                 .is_some_and(|r| r.starts_with("kata"))
     }
 
-    /// The isolation tier that the runtime gives.
-    pub fn tier(&self) -> Tier {
+    /// What runs the sandboxes, by the runtime's name.
+    pub fn family(&self) -> RuntimeFamily {
         if self.per_run_vm {
-            return Tier::Microvm;
+            return RuntimeFamily::Vm;
         }
         match self.runtime.as_deref() {
-            Some(r) if r.starts_with("kata") => Tier::Microvm,
-            Some(r) if r.starts_with("runsc") => Tier::Gvisor,
-            _ => Tier::Container,
+            Some(r) if r.starts_with("kata") => RuntimeFamily::Kata,
+            Some(r) if r.starts_with("runsc") => RuntimeFamily::Gvisor,
+            _ => RuntimeFamily::Runc,
         }
     }
 
@@ -428,6 +437,35 @@ pub struct SandboxIo {
     pub output: mpsc::Receiver<SandboxOutput>,
 }
 
+/// The attached stdin of a container without the bridge. Its shutdown only flushes: the end of
+/// the agent's phase leaves the container's stdin open until the container stops, as a drop of
+/// it always did.
+struct AttachedStdin(Pin<Box<dyn AsyncWrite + Send>>);
+
+impl AsyncWrite for AttachedStdin {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.as_mut().poll_flush(cx)
+    }
+}
+
 /// Chunks of a sandbox's output waiting for their reader ([`SandboxIo::output`]).
 pub const OUTPUT_QUEUE: usize = 1024;
 
@@ -449,29 +487,294 @@ enum SandboxKind {
         vm: crate::vm::VmGuard,
         busy: Option<crate::pool::Busy>,
     },
-    /// A sandbox whose adapter runs over the bridge (ADR-0095); `inner` is its container or
-    /// its local bridge process.
+    /// A sandbox whose adapter runs over the bridge (ADR-0095); `inner` is its container, its
+    /// local bridge process or its VM.
     Bridged {
-        session: HostSession,
+        session: Session,
         exit: watch::Receiver<Option<Exit>>,
         inner: Box<SandboxKind>,
+        /// The bridge's identity, and how it and its front meet, when the sandbox's front holds
+        /// its bridge: what a new front, or a host that restarted, takes the session back with.
+        /// `None` only for a run taken back through the shared listener.
+        keep: Option<BridgeKeep>,
     },
     /// The local test executor's bridge process of the process that this host restarted from
     /// (ADR-0101): this one has no handle of it, and the bridge ends it.
     Adopted,
 }
 
-/// What a sandbox started with the bridge needs: its registration with the host's listener,
-/// the address the sandbox connects to, the binary that runs the bridge there, the tunnels to
-/// the host's listeners that the run uses, and the directories it gets before the adapter
-/// starts.
+/// What a sandbox started with the bridge needs: its registration with the sandbox's front,
+/// the bridge's own settings (where it connects, its run's name, its ticket and the pin), the
+/// binary that runs the bridge there, the tunnels that the run uses, and the directories it
+/// gets before the adapter starts.
 pub struct Bridged {
-    pub registration: Registration,
-    pub addr: String,
+    pub registration: BridgeRegistration,
+    pub bootstrap: Vec<(String, String)>,
     pub binary: PathBuf,
     pub connect_timeout: Duration,
-    pub tunnels: Vec<TunnelTarget>,
+    pub tunnels: Vec<(std::net::SocketAddr, Service)>,
     pub puts: Vec<Put>,
+    /// The address the sandbox's bridge connects from, for its front's check.
+    pub peer: BridgePeer,
+    /// The bridge's identity and listener.
+    pub keep: BridgeKeep,
+}
+
+/// Where a sandbox's bridge connects from, as this host sees it ([`crate::host::Shared::bridge_peer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgePeer {
+    /// From this machine's loopback: the local executor's process.
+    Loopback,
+    /// From the container's own address on this Docker network, known once it has started.
+    Container(String),
+    /// From any address: where every sandbox comes from one address.
+    Any,
+}
+
+/// What a host keeps of a sandbox's bridge that its front holds, to take the session back
+/// with a new front: the identity that the bridge pins, and how the bridge and the front meet.
+#[derive(Clone)]
+pub struct BridgeKeep {
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+    pub reach: BridgeReach,
+}
+
+/// How a sandbox's bridge and its front meet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeReach {
+    /// The bridge dials the listener at `ip` and `port`, from `peer` (unspecified: any): a
+    /// Docker sandbox's, the local executor's.
+    Listen {
+        ip: std::net::IpAddr,
+        port: u16,
+        peer: std::net::IpAddr,
+    },
+    /// `run` dials the bridge at `target` and passes the connection: a VM's, whose bridge
+    /// listens.
+    Dial { target: String },
+}
+
+impl std::fmt::Debug for BridgeKeep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeKeep")
+            .field("reach", &self.reach)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BridgeKeep {
+    pub fn identity(&self) -> Result<tinfirm_bridge::tls::Identity> {
+        tinfirm_bridge::tls::Identity::from_der(self.cert.clone(), self.key.clone())
+    }
+
+    /// A new front for the bridge of `run_id`, waiting for the bridge to come back with the
+    /// session's `key`: on the kept port, or dialing the kept target.
+    pub async fn register_again(
+        &self,
+        options: &crate::bridge::BridgeOptions,
+        run_id: &str,
+        key: Hidden,
+        port_wait: Duration,
+    ) -> Result<Registered> {
+        let front = crate::front::sandbox::SandboxFront::start(&options.front).await?;
+        let (peer, allow) = match &self.reach {
+            BridgeReach::Listen { ip, port, peer } => {
+                // The port of a front that just ended is free a moment later.
+                let deadline = tokio::time::Instant::now() + port_wait;
+                let listener = loop {
+                    match crate::bridge::bind_sandbox_listener(*ip, Some(*port), None).await {
+                        Ok(listener) => break listener,
+                        Err(_) if tokio::time::Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
+                (crate::front::session::Peer::Listen(listener), Some(*peer))
+            }
+            BridgeReach::Dial { target } => {
+                (crate::front::session::Peer::Dial(target.clone()), None)
+            }
+        };
+        let registration = front
+            .bridge(
+                &self.identity()?,
+                &options.timing,
+                peer,
+                run_id,
+                crate::front::session::Expected::Reclaim(key),
+            )
+            .await?;
+        if let Some(peer) = allow {
+            registration.allow_peer(peer).await?;
+        }
+        Ok(Registered::Front(registration))
+    }
+}
+
+/// The bridge of a run that this host takes back (ADR-0101), registered and not yet connected
+/// again.
+pub enum Registered {
+    /// With this process's shared listener: a run taken back from a record of the version
+    /// before each sandbox's bridge was its front's, whose bridge pins that listener's identity
+    /// ([`crate::host::Shared::take_back_runs`]).
+    Shared(Registration),
+    /// With a new front of the sandbox: a run taken back from a record that keeps its bridge
+    /// ([`BridgeKeep::register_again`]).
+    Front(BridgeRegistration),
+}
+
+impl Registered {
+    /// Waits for the bridge's first connection.
+    pub async fn connected(self, timeout: Duration) -> Result<Session> {
+        match self {
+            Registered::Shared(registration) => {
+                registration.connected(timeout).await.map(Session::Shared)
+            }
+            Registered::Front(registration) => {
+                registration.connected(timeout).await.map(Session::Front)
+            }
+        }
+    }
+}
+
+/// A run's bridge, connected.
+pub enum Session {
+    /// In this process's shared listener: a run taken back from a record of the version before
+    /// each sandbox's bridge was its front's ([`Registered::Shared`]). Such a session is only
+    /// reclaimed, its work taken and closed.
+    Shared(HostSession),
+    /// In the sandbox's front: every sandbox that starts on this host (each with a front of
+    /// its own, a VM's from its create), and a run taken back through a new front.
+    Front(FrontSession),
+}
+
+impl Session {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Session::Shared(session) => session.run_id(),
+            Session::Front(session) => session.run_id(),
+        }
+    }
+
+    pub fn session_key(&self) -> &Hidden {
+        match self {
+            Session::Shared(session) => session.session_key(),
+            Session::Front(session) => session.session_key(),
+        }
+    }
+
+    pub fn bridge_build(&self) -> Option<&str> {
+        match self {
+            Session::Shared(session) => session.bridge_build(),
+            Session::Front(session) => session.bridge_build(),
+        }
+    }
+
+    pub fn exit(&self) -> watch::Receiver<Option<Exit>> {
+        match self {
+            Session::Shared(session) => session.exit(),
+            Session::Front(session) => session.exit(),
+        }
+    }
+
+    pub fn has_ended(&self) -> bool {
+        match self {
+            Session::Shared(session) => session.has_ended(),
+            Session::Front(session) => session.has_ended(),
+        }
+    }
+
+    pub fn files(&self) -> Files {
+        match self {
+            Session::Shared(session) => Files::Shared(session.files()),
+            Session::Front(session) => Files::Front(session.files()),
+        }
+    }
+
+    /// Whether the sandbox's front ended by itself (it crashed, or broke the wire), with the
+    /// session in it.
+    pub fn front_ended(&self) -> bool {
+        match self {
+            Session::Shared(_) => false,
+            Session::Front(session) => session.front().handle().ended().is_some(),
+        }
+    }
+
+    async fn stop(&self, grace: Duration) -> Result<()> {
+        match self {
+            Session::Shared(session) => session.stop(grace).await,
+            Session::Front(session) => session.stop(grace).await,
+        }
+    }
+
+    async fn close(&self, timeout: Duration) {
+        match self {
+            Session::Shared(session) => session.close(timeout).await,
+            Session::Front(session) => session.close(timeout).await,
+        }
+    }
+
+    async fn reclaim(&mut self, timeout: Duration) -> Result<bool> {
+        match self {
+            Session::Shared(session) => session.reclaim(timeout).await,
+            Session::Front(session) => session.reclaim(timeout).await,
+        }
+    }
+}
+
+/// The sandbox's files and the host's commands there, over either kind of [`Session`]: the
+/// work of a run comes back so whichever holds its bridge. A sandbox's files go in, and its
+/// network is probed, only as it starts, in its front ([`FrontFiles`]). Clones share the
+/// session.
+#[derive(Clone)]
+pub enum Files {
+    Shared(SandboxFiles),
+    Front(FrontFiles),
+}
+
+impl Files {
+    pub async fn exec(
+        &self,
+        argv: &[&str],
+        env: &[(&str, &str)],
+        cwd: Option<&str>,
+        stdin: Option<String>,
+        timeout: Duration,
+    ) -> Result<ExecOutput> {
+        match self {
+            Files::Shared(files) => files.exec(argv, env, cwd, stdin, timeout).await,
+            Files::Front(files) => files.exec(argv, env, cwd, stdin, timeout).await,
+        }
+    }
+
+    /// Asks the sandbox for `paths` of its directory `dir` (all of it when empty), without
+    /// `exclude`, as a tar archive, which `consume` reads: through this process from the
+    /// shared listener, or on a pipe straight from the front ([`Input`]).
+    pub async fn receive<T, F>(
+        &self,
+        dir: &str,
+        paths: Vec<String>,
+        exclude: Vec<String>,
+        timeout: Duration,
+        consume: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(Input<'a>) -> Result<T> + Send + 'static,
+    {
+        match self {
+            Files::Shared(files) => {
+                files
+                    .receive(dir, paths, exclude, timeout, move |input| {
+                        consume(Input::Read(input))
+                    })
+                    .await
+            }
+            Files::Front(files) => files.receive(dir, paths, exclude, timeout, consume).await,
+        }
+    }
 }
 
 /// A directory of the host's that goes into the sandbox, in place of a mount (ADR-0095).
@@ -537,10 +840,10 @@ impl Executor {
     pub async fn start_bridged(
         &self,
         spec: &SandboxSpec,
-        bridged: Bridged,
+        mut bridged: Bridged,
     ) -> Result<(Sandbox, SandboxIo)> {
         let (settings, run_env) = crate::bridge::split_env(&spec.env);
-        let bootstrap = crate::bridge::bootstrap_env(&bridged.registration, &bridged.addr);
+        let bootstrap = bridged.bootstrap.clone();
         match self {
             Executor::Docker(docker) => {
                 let argv = match &spec.command {
@@ -558,10 +861,28 @@ impl Executor {
                     let _ = remove_container(docker, &container.name).await;
                     return Err(e).context("cannot start the container");
                 }
-                let inner = SandboxKind::Docker {
+                let mut inner = SandboxKind::Docker {
                     docker: docker.clone(),
                     name: container.name.clone(),
                 };
+                // The sandbox's front takes its bridge's connection only from the container's
+                // address, now that the container has one.
+                let peer = match &bridged.peer {
+                    BridgePeer::Container(network) => {
+                        match container_address(docker, &container.name, network).await {
+                            Ok(ip) => ip,
+                            Err(e) => return Err(stopped(&mut inner, e).await),
+                        }
+                    }
+                    BridgePeer::Loopback => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    BridgePeer::Any => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                };
+                if let Err(e) = bridged.registration.allow_peer(peer).await {
+                    return Err(stopped(&mut inner, e).await);
+                }
+                if let BridgeReach::Listen { peer: kept, .. } = &mut bridged.keep.reach {
+                    *kept = peer;
+                }
                 let start = Start {
                     argv,
                     env: hide(run_env),
@@ -573,6 +894,13 @@ impl Executor {
                 bail!("a VM sandbox comes from the VM pool: the run claims it first")
             }
             Executor::Local { program, args } => {
+                // The local executor's bridge is a process of this machine: it connects from
+                // loopback.
+                let peer = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+                bridged.registration.allow_peer(peer).await?;
+                if let BridgeReach::Listen { peer: kept, .. } = &mut bridged.keep.reach {
+                    *kept = peer;
+                }
                 let mut cmd = tokio::process::Command::new(&bridged.binary);
                 cmd.arg("bridge")
                     .env_clear()
@@ -602,6 +930,31 @@ impl Executor {
     }
 }
 
+/// The container's address on the Docker network `network`, which its bridge connects from.
+async fn container_address(docker: &Docker, name: &str, network: &str) -> Result<IpAddr> {
+    let inspected = docker
+        .inspect_container(
+            name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+        .context("cannot inspect the sandbox's container")?;
+    let address = inspected
+        .network_settings
+        .and_then(|settings| settings.networks)
+        .and_then(|mut networks| networks.remove(network))
+        .and_then(|endpoint| endpoint.ip_address)
+        .filter(|ip| !ip.is_empty())
+        .with_context(|| {
+            format!("the sandbox's container has no address on the Docker network `{network}`")
+        })?;
+    address.parse().with_context(|| {
+        format!(
+            "the sandbox's container has the address `{address}` on `{network}`, which is not one"
+        )
+    })
+}
+
 fn hide(env: Vec<(String, String)>) -> Vec<(String, Hidden)> {
     env.into_iter().map(|(k, v)| (k, Hidden::new(v))).collect()
 }
@@ -629,7 +982,7 @@ impl Executor {
         spec: &SandboxSpec,
         claimed: crate::pool::Claimed,
         reprobe_after: Duration,
-        tunnels: Vec<TunnelTarget>,
+        tunnels: Vec<(std::net::SocketAddr, Service)>,
         puts: Vec<Put>,
     ) -> Result<(Sandbox, SandboxIo)> {
         let Executor::Vm(vms) = self else {
@@ -666,15 +1019,19 @@ impl Executor {
             env: hide(env),
             cwd: Some(cwd),
         };
-        // A VM that has waited a while is probed again: the provider's firewall may have
-        // changed since its first probe.
-        let probe = if claimed.ready_at.elapsed() >= reprobe_after {
+        // A VM that has waited a while since it came up is probed again: the provider's
+        // firewall may have changed since its first probe.
+        let probe = if claimed.up_at.elapsed() >= reprobe_after {
             options.probe.clone()
         } else {
             Vec::new()
         };
         let crate::pool::Claimed {
-            vm, session, busy, ..
+            vm,
+            session,
+            keep,
+            busy,
+            ..
         } = claimed;
         finish_session(
             SandboxKind::Vm {
@@ -686,6 +1043,7 @@ impl Executor {
             puts,
             start,
             &probe,
+            keep,
         )
         .await
     }
@@ -693,14 +1051,11 @@ impl Executor {
 
 /// Probes the sandbox's network from inside with `checks`, all at once: anything that gets
 /// through is an error that names it.
-pub async fn probe(session: &HostSession, checks: &[ProbeCheck]) -> Result<()> {
+pub async fn probe(files: &FrontFiles, checks: &[ProbeCheck]) -> Result<()> {
     if checks.is_empty() {
         return Ok(());
     }
-    let open = session
-        .files()
-        .probe(checks.to_vec(), PROBE_TIMEOUT)
-        .await?;
+    let open = files.probe(checks.to_vec(), PROBE_TIMEOUT).await?;
     if open.is_empty() {
         return Ok(());
     }
@@ -726,7 +1081,16 @@ async fn finish_bridged(
     };
     match connected {
         Ok(session) => {
-            finish_session(inner, session, bridged.tunnels, bridged.puts, start, probe).await
+            finish_session(
+                inner,
+                session,
+                bridged.tunnels,
+                bridged.puts,
+                start,
+                probe,
+                bridged.keep,
+            )
+            .await
         }
         Err(e) => Err(stopped(&mut inner, e).await),
     }
@@ -742,19 +1106,20 @@ async fn stopped(inner: &mut SandboxKind, e: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// With the sandbox's bridge connected: probes the sandbox's network with `probe` (when there
-/// is any), opens the tunnels, puts the run's directories in, starts the adapter over it and
-/// hands its stdio to the run.
+/// With the sandbox's bridge connected in its front: probes the sandbox's network with `probe`
+/// (when there is any), opens the tunnels, puts the run's directories in, starts the adapter
+/// over it and hands its stdio to the run.
 async fn finish_session(
     mut inner: SandboxKind,
-    mut session: HostSession,
-    tunnels: Vec<TunnelTarget>,
+    mut session: FrontSession,
+    tunnels: Vec<(std::net::SocketAddr, Service)>,
     puts: Vec<Put>,
     start: Start,
     probe: &[ProbeCheck],
+    keep: BridgeKeep,
 ) -> Result<(Sandbox, SandboxIo)> {
     let started = async {
-        self::probe(&session, probe).await?;
+        self::probe(&session.files(), probe).await?;
         if !tunnels.is_empty() {
             session.open_tunnels(&tunnels, TUNNELS_TIMEOUT).await?;
         }
@@ -766,11 +1131,8 @@ async fn finish_session(
         Ok(started) => started,
         Err(e) => return Err(stopped(&mut inner, e).await),
     };
-    let HostIo {
-        stdin,
-        mut output,
-        exit,
-    } = io;
+    let stdin: Pin<Box<dyn AsyncWrite + Send>> = Box::pin(io.stdin);
+    let (mut output, exit) = (io.output, io.exit);
     let (tx, rx) = mpsc::channel(OUTPUT_QUEUE);
     tokio::spawn(async move {
         while let Some(item) = output.recv().await {
@@ -788,20 +1150,18 @@ async fn finish_session(
     Ok((
         Sandbox {
             kind: SandboxKind::Bridged {
-                session,
+                session: Session::Front(session),
                 exit,
                 inner: Box::new(inner),
+                keep: Some(keep),
             },
         },
-        SandboxIo {
-            stdin: Box::pin(stdin),
-            output: rx,
-        },
+        SandboxIo { stdin, output: rx },
     ))
 }
 
 /// Puts the run's directories into the sandbox, in order.
-async fn put_all(files: &SandboxFiles, puts: &[Put]) -> Result<()> {
+async fn put_all(files: &FrontFiles, puts: &[Put]) -> Result<()> {
     for put in puts {
         files
             .put_dir(&put.host, &put.sandbox, put.exclude.clone(), PUT_TIMEOUT)
@@ -948,6 +1308,17 @@ pub fn container_body(spec: &SandboxSpec) -> ContainerCreateBody {
             memory_swap: Some(spec.resources.memory_bytes),
             nano_cpus: Some(spec.resources.nano_cpus),
             pids_limit: Some(spec.resources.pids_limit),
+            // A limit of the container's own, soft and hard. The sandbox's processes are uid
+            // 1000, which on a Docker host without user namespaces may be the user of `run`
+            // itself: the descriptors they leave on their way over Unix sockets then count
+            // against `run`'s passing of connections to its fronts, up to this limit
+            // (crate::confine, `sandbox_files`). A sandbox with a Docker of its own has every
+            // capability and can raise it: that one belongs in a VM runtime.
+            ulimits: Some(vec![ResourcesUlimits {
+                name: Some("nofile".to_string()),
+                soft: Some(i64::try_from(spec.resources.files).unwrap_or(i64::MAX)),
+                hard: Some(i64::try_from(spec.resources.files).unwrap_or(i64::MAX)),
+            }]),
             network_mode: spec.network_mode.clone(),
             extra_hosts: (!spec.extra_hosts.is_empty()).then(|| spec.extra_hosts.clone()),
             dns: (!spec.dns.is_empty()).then(|| spec.dns.clone()),
@@ -1017,7 +1388,7 @@ async fn start_docker(docker: &Docker, spec: &SandboxSpec) -> Result<(Sandbox, S
             },
         },
         SandboxIo {
-            stdin: attach.input,
+            stdin: Box::pin(AttachedStdin(attach.input)),
             output: rx,
         },
     ))
@@ -1133,9 +1504,18 @@ impl TakenBack {
                     host,
                     label,
                     address,
+                    port,
                 },
             ) => SandboxKind::Vm {
-                vm: vms.adopt(id, host, label.as_deref(), address),
+                vm: vms.adopt(
+                    id,
+                    host,
+                    label.as_deref(),
+                    crate::vm::Reach {
+                        address: address.clone(),
+                        port: *port,
+                    },
+                ),
                 busy: None,
             },
             (Executor::Local { .. }, SandboxRecord::Local) => SandboxKind::Adopted,
@@ -1146,14 +1526,16 @@ impl TakenBack {
         Ok(TakenBack { inner })
     }
 
-    /// The sandbox, now that its bridge `session` has come back.
-    pub fn connected(self, session: HostSession) -> Sandbox {
+    /// The sandbox, now that its bridge `session` has come back; `keep` when its front holds
+    /// the bridge.
+    pub fn connected(self, session: Session, keep: Option<BridgeKeep>) -> Sandbox {
         let exit = session.exit();
         Sandbox {
             kind: SandboxKind::Bridged {
                 session,
                 exit,
                 inner: Box::new(self.inner),
+                keep,
             },
         }
     }
@@ -1166,11 +1548,26 @@ impl TakenBack {
 
 impl Sandbox {
     /// What a host that restarted needs to take the sandbox's run back (ADR-0101): the
-    /// sandbox, its bridge's name with the listener, and its session's key. `None` without
-    /// the bridge, and for a VM whose address is not known.
-    pub fn take_back_record(&self) -> Option<(crate::takeback::SandboxRecord, String, Hidden)> {
+    /// sandbox, its bridge's name with the listener, its session's key, and what its front
+    /// holds of the bridge, when a front holds it. `None` without the bridge, and for a VM
+    /// whose address is not known.
+    #[allow(clippy::type_complexity)]
+    pub fn take_back_record(
+        &self,
+    ) -> Option<(
+        crate::takeback::SandboxRecord,
+        String,
+        Hidden,
+        Option<BridgeKeep>,
+    )> {
         use crate::takeback::SandboxRecord;
-        let SandboxKind::Bridged { session, inner, .. } = &self.kind else {
+        let SandboxKind::Bridged {
+            session,
+            inner,
+            keep,
+            ..
+        } = &self.kind
+        else {
             return None;
         };
         let record = match inner.as_ref() {
@@ -1185,7 +1582,82 @@ impl Sandbox {
             record,
             session.run_id().to_string(),
             session.session_key().clone(),
+            keep.clone(),
         ))
+    }
+
+    /// Whether the sandbox's front ended by itself, with the bridge's session in it.
+    pub fn front_ended(&self) -> bool {
+        matches!(&self.kind, SandboxKind::Bridged { session, .. } if session.front_ended())
+    }
+
+    /// Once the agent's output has ended: whether the sandbox's front ended with it. A front's
+    /// end is known a moment after its sockets end, and the adapter's own end comes with its
+    /// exit, so this waits up to `wait` for the one or the other.
+    pub async fn front_ended_after(&self, wait: Duration) -> bool {
+        let SandboxKind::Bridged { session, exit, .. } = &self.kind else {
+            return false;
+        };
+        let Session::Front(front) = session else {
+            return false;
+        };
+        let deadline = tokio::time::Instant::now() + wait;
+        while tokio::time::Instant::now() < deadline {
+            if front.front().handle().ended().is_some() {
+                return true;
+            }
+            if matches!(*exit.borrow(), Some(Exit::Exited { .. })) {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        front.front().handle().ended().is_some()
+    }
+
+    /// Once the agent's output has ended without the run asking, for a VM's sandbox: why the
+    /// sandbox was lost, when its VM ended under the run ([`crate::vm::Vms::lost`]). The
+    /// adapter's own exit status comes a moment after its output ends, so this waits up to
+    /// `wait` for it; after an adapter that exited by itself, the driver is not asked. `None`
+    /// for any other sandbox, and while the driver describes the VM as up.
+    pub async fn vm_lost(&self, wait: Duration) -> Option<String> {
+        let SandboxKind::Bridged { exit, inner, .. } = &self.kind else {
+            return None;
+        };
+        let SandboxKind::Vm { vm, .. } = inner.as_ref() else {
+            return None;
+        };
+        let mut exit = exit.clone();
+        let _ = tokio::time::timeout(wait, exit.wait_for(Option::is_some)).await;
+        if matches!(*exit.borrow(), Some(Exit::Exited { .. })) {
+            return None;
+        }
+        vm.vms().lost(&vm.id).await
+    }
+
+    /// After its front ended: one new front takes the bridge's session back, as a host that
+    /// restarted does, within `timeout`.
+    pub async fn take_back_from_a_new_front(
+        &mut self,
+        options: &crate::bridge::BridgeOptions,
+        timeout: Duration,
+    ) -> Result<()> {
+        let SandboxKind::Bridged {
+            session,
+            exit,
+            keep: Some(keep),
+            ..
+        } = &mut self.kind
+        else {
+            bail!("the sandbox's bridge is not in a front");
+        };
+        let (run_id, key) = (session.run_id().to_string(), session.session_key().clone());
+        let registration = keep
+            .register_again(options, &run_id, key, Duration::from_secs(10))
+            .await?;
+        let taken = registration.connected(timeout).await?;
+        *exit = taken.exit();
+        *session = taken;
+        Ok(())
     }
 
     /// For a sandbox taken back: the agent that the earlier process started stops. Whether it
@@ -1198,7 +1670,7 @@ impl Sandbox {
     }
 
     /// The sandbox's files over the bridge (ADR-0095); `None` for a sandbox without it.
-    pub fn files(&self) -> Option<SandboxFiles> {
+    pub fn files(&self) -> Option<Files> {
         match &self.kind {
             SandboxKind::Bridged { session, .. } => Some(session.files()),
             _ => None,
@@ -1348,10 +1820,10 @@ mod tests {
     }
 
     #[test]
-    fn a_vm_per_run_is_a_microvm_that_may_run_docker_and_names_no_runtime() {
+    fn a_vm_per_run_is_a_vm_that_may_run_docker_and_names_no_runtime() {
         let settings = SandboxSettings::for_vms(None, true, Vec::new()).unwrap();
         assert!(settings.is_vm() && settings.docker && settings.per_run_vm);
-        assert_eq!(settings.tier(), Tier::Microvm);
+        assert_eq!(settings.family(), RuntimeFamily::Vm);
         assert_eq!(settings.runtime, None);
         let plain = SandboxSettings::for_vms(Some(" ".into()), false, Vec::new()).unwrap();
         assert!(!plain.docker && plain.is_vm());
@@ -1383,22 +1855,20 @@ mod tests {
         }
         for runtime in ["kata", "kata-clh", "kata-qemu"] {
             let settings = SandboxSettings::new(Some(runtime.into()), true, Vec::new()).unwrap();
+            // A Kata host still runs every sandbox as a VM and takes --sandbox-docker; it
+            // reports `container` (crate::isolation).
             assert!(settings.is_vm() && settings.docker);
-            assert_eq!(settings.tier(), Tier::Microvm);
-            assert_eq!(
-                settings.tier().isolation_tier(),
-                tinfirm_protocol::IsolationTier::Microvm
-            );
+            assert_eq!(settings.family(), RuntimeFamily::Kata);
         }
         // Without Docker in the sandbox any runtime goes.
         let runc = SandboxSettings::new(Some(" runc ".into()), false, Vec::new()).unwrap();
         assert_eq!(runc.runtime.as_deref(), Some("runc"));
-        assert_eq!(runc.tier(), Tier::Container);
+        assert_eq!(runc.family(), RuntimeFamily::Runc);
         let gvisor = SandboxSettings::new(Some("runsc".into()), false, Vec::new()).unwrap();
-        assert_eq!(gvisor.tier(), Tier::Gvisor);
+        assert_eq!(gvisor.family(), RuntimeFamily::Gvisor);
         let default = SandboxSettings::new(Some("  ".into()), false, Vec::new()).unwrap();
         assert_eq!(default, SandboxSettings::default());
-        assert_eq!(default.tier().as_str(), "container");
+        assert_eq!(default.family().as_str(), "runc");
     }
 
     #[test]
@@ -1566,6 +2036,11 @@ mod tests {
         assert_eq!(host.init, Some(true));
         assert_eq!(host.memory, Some(4 * 1024 * 1024 * 1024));
         assert_eq!(host.pids_limit, Some(1024));
+        // Its own limit of open files, soft and hard, and not the Docker daemon's.
+        let limits = host.ulimits.unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert_eq!(limits[0].name.as_deref(), Some("nofile"));
+        assert_eq!((limits[0].soft, limits[0].hard), (Some(65536), Some(65536)));
     }
 
     #[test]
@@ -1613,6 +2088,8 @@ mod tests {
         assert_eq!(host.memory, Some(4 * 1024 * 1024 * 1024));
         assert_eq!(host.nano_cpus, Some(2_000_000_000));
         assert_eq!(host.pids_limit, Some(1024));
+        let limits = host.ulimits.clone().unwrap();
+        assert_eq!((limits[0].soft, limits[0].hard), (Some(65536), Some(65536)));
         assert_eq!(host.init, Some(true));
         assert_eq!(
             host.binds,

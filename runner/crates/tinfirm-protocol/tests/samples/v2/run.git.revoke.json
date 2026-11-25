@@ -1,0 +1,8 @@
+{
+  "type": "run.git.revoke",
+  "runId": "0192f1a4-7c1e-7b3a-9d2e-1f2a3b4c5d6e",
+  "epoch": 1,
+  "componentIds": ["0192f1a4-7c1e-7b3a-9d2e-000000000010"],
+  "reason": "GRANT_REMOVED",
+  "message": "Tinfirm revoked this run's access to acme/shop: the credential 'CI bot' was disabled."
+}

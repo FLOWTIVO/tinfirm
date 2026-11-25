@@ -68,6 +68,10 @@ While it is paused:
 - every trigger that watches it, or acts with an account on it, pauses (**An admin paused its system**), and its write-backs wait;
 - a webhook system answers deliveries `200` with `{"paused": true}`: nothing is stored, and they never fire later.
 
+The turns running now lose their git access to the system's repositories at once, whether or not you cancel them: the agent's next fetch fails, and Tinfirm does not push those repositories when the turn ends. A turn that had commits to push there ends failed, and its run page shows **Git access revoked** on the repository. Resuming the system does not give a running turn its access back; the conversation's next turn has it. A runner host of an older release cannot drop a token: its turns keep their access until they end, and their conversation says so.
+
+Pausing an agent or a trigger, and stopping every run, do not revoke git access: those turns finish, or are cancelled, as above.
+
 ### Resume a system
 
 Choose **Resume** beside it. Its accounts work again and waiting turns go on. When its pause paused triggers, the dialog lists them, with **Resume its triggers too** ticked. Each trigger resumes from now on: nothing that happened during the pause fires it. A trigger you leave out stays paused until its author or an admin resumes it.
@@ -77,6 +81,7 @@ Choose **Resume** beside it. Its accounts work again and waiting turns go on. Wh
 A suspended member or service account acts, pays and decides for nothing until resumed:
 
 - every running turn that acts as them, with their accounts or on their budget is cancelled;
+- a turn that works with their account on a code host loses its git access first, so Tinfirm does not push what its agent committed there: its run page shows **Git access revoked** on the repository, with the reason (for a deactivated user, *the account's holder was suspended because their Tinfirm account was deactivated*). Stopping every run, by contrast, pushes the work of the turns it cancels;
 - their model key is blocked;
 - they decide no question or approval, neither as a conversation's person nor as a trigger's approver;
 - a suspended member opens nothing in the company but its **Kill switches** page, and their tokens and AI clients stop working there.
@@ -85,7 +90,9 @@ Suspend a member on **Members**: [Suspend and resume a member](members.md#suspen
 
 Triggers written by a suspended member pause, and stay paused after the resume until they or an admin resume each. A trigger that acts with a suspended person's account pauses too. A trigger paid by a suspended service account waits, and goes on by itself once it is resumed.
 
-When an instance admin deactivates a person's Tinfirm user, they are suspended in every company, with *Their Tinfirm account was deactivated; reactivating the user resumes them.* No Owner or Admin can resume such a suspension: an instance admin reactivates the user.
+When an instance admin deactivates a person's Tinfirm user, they are suspended in every company, with *Their Tinfirm account was deactivated; an instance admin reactivates the user, which resumes them.* No Owner or Admin can resume such a suspension: an instance admin reactivates the user.
+
+When the company's identity provider deactivates a member through SCIM, they are suspended here with *The company’s identity provider deactivated them; the identity provider reactivates them, which resumes them.* No Owner or Admin can resume that suspension either: the identity provider reactivates them. An admin's own suspension says *An admin suspended them; an admin resumes them.*
 
 ## Pause an agent
 

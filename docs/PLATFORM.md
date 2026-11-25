@@ -294,7 +294,7 @@ Built since, on `main`:
 - Personal runner hosts that serve their owner in every company ([ADR-0092](adr/0092-personal-runner-hosts-in-every-company.md)).
 - Jira Cloud credentials from an Atlassian service account's client credentials ([ADR-0093](adr/0093-jira-cloud-service-accounts-by-client-credentials.md)).
 - More than one model gateway: an adapter per vendor, and a company's gateway whose keys its gateway team provides ([ADR-0094](adr/0094-more-than-one-model-gateway.md)).
-- Elastic runners for Pro and Enterprise: the sandbox bridge, a VM per run, session bundles, ready VMs and their schedule ([ADR-0095](adr/0095-sandbox-bridge.md) to [ADR-0100](adr/0100-elastic-runners-in-pro.md)).
+- The sandbox bridge, a VM per run and its driver protocol, in every edition; elastic runners for Pro and Enterprise: a provider's VMs per run (DigitalOcean's driver), session bundles, ready VMs and their schedule ([ADR-0095](adr/0095-sandbox-bridge.md) to [ADR-0100](adr/0100-elastic-runners-in-pro.md), [ADR-0114](adr/0114-the-secure-sandbox-is-in-the-core.md)).
 - The company's own services at the bundled LiteLLM's own port, where the operator admits them ([ADR-0110](adr/0110-no-model-port.md)).
 
 The scenarios that validate the design (V1 to V11) are in [the record](reviews/2026-10-12-platform-redesign.md#validation-scenarios).

@@ -4,16 +4,8 @@ description = "Tinfirm sandbox bridge: one pinned TLS stream per run between the
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-# The Tinfirm Enterprise licence (ee/LICENSE): its code is under ee/runner/tinfirm-bridge.
-license = "LicenseRef-Tinfirm-Enterprise"
+license.workspace = true
 publish.workspace = true
-
-[lib]
-path = "../../../ee/runner/tinfirm-bridge/src/lib.rs"
-
-[[test]]
-name = "bridge"
-path = "../../../ee/runner/tinfirm-bridge/tests/bridge.rs"
 
 [dependencies]
 anyhow.workspace = true

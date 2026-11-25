@@ -156,6 +156,98 @@ class SessionBundleIntegrationTest extends RunTestBench {
         }
     }
 
+    @Autowired
+    SessionBundlesImpl bundles;
+
+    /**
+     * ADR-0113, decision 4: a kept bundle of the session moves an automatic agent's conversation from the weaker host
+     * of its session to a host of the strongest level that restores it, with no note; {@code carries} answers for that
+     * session and runtime only.
+     */
+    @Test
+    void aKeptBundleMovesTheConversationToTheStrongerLevel() throws Exception {
+        Bench bench = bench(true);
+        RunnerHostRef weak = registerRunnerHost(bench.owner(), bench.companyId(), unique("docker"), "COMPANY");
+        RunnerHostRef strong = registerRunnerHost(bench.owner(), bench.companyId(), unique("vm"), "COMPANY");
+        try (FakeRunner container = bundleHost(weak)) {
+            Turn first = start(bench);
+            JsonNode assign = expectAssign(container, first.runId());
+            long epoch = assign.get("epoch").asLong();
+            container.accepted(first.runId(), epoch);
+            awaitRun(bench, first.runId(), "RUNNING");
+            byte[] bundle = gzip("the session of turn one " + UUID.randomUUID());
+            assertThat(upload(weak.token(), first.runId(), epoch, "session-1", bundle).get("status").asString())
+                .isEqualTo("STORED");
+            container.send(finished(first, epoch, "session-1", "STORED"));
+            awaitRun(bench, first.runId(), "SUCCEEDED");
+            assertThat(transactions.inCompany(bench.companyId(), () -> bundles.carries(first.conversationId(),
+                    bench.agentId(), "CLAUDE_CODE", "session-1"))).isTrue();
+            assertThat(transactions.inCompany(bench.companyId(), () -> bundles.carries(first.conversationId(),
+                    bench.agentId(), "CODEX", "session-1"))).isFalse();
+            assertThat(transactions.inCompany(bench.companyId(), () -> bundles.carries(first.conversationId(),
+                    bench.agentId(), "CLAUDE_CODE", "session-2"))).isFalse();
+
+            try (FakeRunner machine = FakeRunner.connect(port, strong.token())) {
+                Map<String, Object> hello = FakeRunner.helloWithIsolation("machine", "none");
+                hello.put("features", List.of("session.bundle"));
+                machine.send(hello);
+                machine.expect("welcome");
+                awaitConfigured(strong.id());
+
+                UUID secondRun = next(bench, first, 2);
+                JsonNode second = expectAssign(machine, secondRun);
+                assertThat(second.get("resumeSessionId").asString()).isEqualTo("session-1");
+                assertThat(second.get("sessionBundle").get("sha256").asString())
+                    .isEqualTo(SessionBundlesImpl.sha256(bundle));
+                JsonNode run = getRun(bench, secondRun);
+                assertThat(run.get("isolationLevel").asString()).isEqualTo("MACHINE");
+                assertThat(run.has("placementNote")).isFalse();
+                machine.assertFramesValid();
+            }
+            container.assertFramesValid();
+        }
+    }
+
+    /**
+     * The review of 2026-11-18, finding 1: with a kept bundle but no host of the stronger level that restores it, the
+     * turn stays on its session's host, with the session, rather than start a fresh one elsewhere.
+     */
+    @Test
+    void noRestorerAtTheTargetLevelTheTurnStaysOnItsSessionsHost() throws Exception {
+        Bench bench = bench(true);
+        RunnerHostRef weak = registerRunnerHost(bench.owner(), bench.companyId(), unique("docker"), "COMPANY");
+        RunnerHostRef strong = registerRunnerHost(bench.owner(), bench.companyId(), unique("vm"), "COMPANY");
+        try (FakeRunner container = bundleHost(weak)) {
+            Turn first = start(bench);
+            JsonNode assign = expectAssign(container, first.runId());
+            long epoch = assign.get("epoch").asLong();
+            container.accepted(first.runId(), epoch);
+            awaitRun(bench, first.runId(), "RUNNING");
+            byte[] bundle = gzip("the session of turn one " + UUID.randomUUID());
+            assertThat(upload(weak.token(), first.runId(), epoch, "session-1", bundle).get("status").asString())
+                .isEqualTo("STORED");
+            container.send(finished(first, epoch, "session-1", "STORED"));
+            awaitRun(bench, first.runId(), "SUCCEEDED");
+
+            // The machine host restores no bundle (no session.bundle in its hello).
+            try (FakeRunner machine = FakeRunner.connect(port, strong.token())) {
+                machine.send(FakeRunner.helloWithIsolation("machine", "none"));
+                machine.expect("welcome");
+                awaitConfigured(strong.id());
+
+                UUID secondRun = next(bench, first, 2);
+                JsonNode second = expectAssign(container, secondRun);
+                assertThat(second.get("resumeSessionId").asString()).isEqualTo("session-1");
+                JsonNode run = getRun(bench, secondRun);
+                assertThat(run.get("isolationLevel").asString()).isEqualTo("CONTAINER");
+                assertThat(run.get("placementNote").asString()).isEqualTo("STAYED_ON_WEAKER_HOST");
+                machine.expectNone("run.assign", java.time.Duration.ofMillis(300));
+                machine.assertFramesValid();
+            }
+            container.assertFramesValid();
+        }
+    }
+
     @Test
     void aRefusedBundleOrASessionWithoutItsBundleLeavesNoneBehind() throws Exception {
         Bench bench = bench(true);

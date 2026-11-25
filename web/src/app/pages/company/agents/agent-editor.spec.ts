@@ -681,6 +681,60 @@ describe('AgentEditor', () => {
     expect(notify.success).toHaveBeenCalledWith('Business analyst saved', 'Version 5.');
   });
 
+  it('chooses a level of isolation the hosts report, saying what it costs first (ADR-0113)', async () => {
+    const isolation = {
+      setting: 'AUTOMATIC' as const,
+      level: 'MACHINE' as const,
+      offered: ['MACHINE' as const, 'CONTAINER' as const],
+      chosenUnavailable: false,
+      outsideStarts: false,
+      containerWarning: false,
+    };
+    await open(anAgent({ editableByMe: true, isolation }));
+    const select = el.querySelector<HTMLSelectElement>('#agent-isolation-select')!;
+    expect([...select.options].map((o) => o.textContent?.trim())).toEqual([
+      'Automatic: the strongest level your company’s hosts report (now: machine)',
+      'Only hosts that report machine',
+      'Only hosts that report container',
+    ]);
+    expect(el.querySelector('[data-testid=agent-isolation-warning]')).toBeNull();
+    select.value = 'CONTAINER';
+    select.dispatchEvent(new Event('change'));
+    await settle();
+    expect(text(el.querySelector('[data-testid=agent-isolation-warning]'))).toContain(
+      'start a new session of the runtime on their next turn',
+    );
+    click('[data-testid=save-agent]');
+    await settle();
+    const about = http.expectOne({ method: 'PATCH', url: `${API}/agents/${IDS.agent}` });
+    expect(about.request.body).toEqual({ isolation: 'CONTAINER' });
+    about.flush(
+      anAgent({
+        editableByMe: true,
+        version: 5,
+        isolation: { ...isolation, setting: 'CONTAINER' },
+      }),
+    );
+    await settle();
+  });
+
+  it('offers no choice of isolation where the hosts report one level', async () => {
+    await open(
+      anAgent({
+        editableByMe: true,
+        isolation: {
+          setting: 'AUTOMATIC',
+          level: 'CONTAINER',
+          offered: ['CONTAINER'],
+          chosenUnavailable: false,
+          outsideStarts: false,
+          containerWarning: false,
+        },
+      }),
+    );
+    expect(el.querySelector('[data-testid=agent-isolation]')).toBeNull();
+  });
+
   it('checks the name and handle before it sends anything', async () => {
     await open(null);
     typeInto(el.querySelector('#agent-handle'), '-bad-');

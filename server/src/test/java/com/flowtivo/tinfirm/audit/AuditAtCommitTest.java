@@ -29,6 +29,7 @@ import com.flowtivo.tinfirm.shared.tenant.TenantContextHolder;
 import com.flowtivo.tinfirm.shared.tenant.TenantScope;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 import com.flowtivo.tinfirm.support.ApiClient;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 import com.flowtivo.tinfirm.support.TenantSql;
 
@@ -126,11 +127,13 @@ class AuditAtCommitTest extends IntegrationTest {
         catch (IllegalStateException expected) {
             // The transaction rolled back.
         }
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         transactions.runInCompany(id, () -> {
             auditLog.record(event(id, "one"));
             sleep(20);
             auditLog.record(event(id, "two"));
-            // Recorded after the commit, on its thread: appended in a transaction of its own.
+            // Recorded after the commit, on its thread: appended in a transaction of its own, once this one has
+            // released its connection.
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
@@ -139,6 +142,8 @@ class AuditAtCommitTest extends IntegrationTest {
             });
         });
 
+        assertThat(mark.at("com.flowtivo.tinfirm.audit.internal.JdbcAuditLog")).as("second connections asked for")
+            .isZero();
         ApiClient owner = loginAs(company.email("OWNER"));
         List<String> steps = steps(owner, company);
         assertThat(steps).doesNotContain("rolled back").endsWith("one", "two", "after");
@@ -148,6 +153,46 @@ class AuditAtCommitTest extends IntegrationTest {
         assertThat(events.get(1).get("occurredAt").asString()).isGreaterThan(events.get(2).get("occurredAt")
             .asString());
         assertThat(owner.get(company.path("/audit-events/verification")).json().get("valid").asBoolean()).isTrue();
+    }
+
+    /**
+     * An event recorded in a transaction's {@code afterCompletion}, where the transaction is still active and its
+     * synchronizations are cleared: after a commit and after a rollback alike, appended once, in a transaction of its
+     * own once the connection was released, under the tenant context it was recorded in.
+     */
+    @Test
+    void anEventRecordedInAfterCompletionIsAppendedOnceUnderItsTenantContext() {
+        TestCompany company = companyWithRoles();
+        UUID id = company.id();
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
+        transactions.runInCompany(id, () -> recordInAfterCompletion(id, "after commit"));
+        try {
+            transactions.runInCompany(id, () -> {
+                recordInAfterCompletion(id, "after rollback");
+                throw new IllegalStateException("roll back");
+            });
+        }
+        catch (IllegalStateException expected) {
+            // The transaction rolled back.
+        }
+
+        assertThat(mark.at("com.flowtivo.tinfirm.audit.internal.JdbcAuditLog")).as("second connections asked for")
+            .isZero();
+        ApiClient owner = loginAs(company.email("OWNER"));
+        List<String> steps = steps(owner, company);
+        assertThat(steps.stream().filter("after commit"::equals)).hasSize(1);
+        assertThat(steps.stream().filter("after rollback"::equals)).hasSize(1);
+        assertThat(steps).endsWith("after commit", "after rollback");
+        assertThat(owner.get(company.path("/audit-events/verification")).json().get("valid").asBoolean()).isTrue();
+    }
+
+    private void recordInAfterCompletion(UUID companyId, String step) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCompletion(int status) {
+                auditLog.record(event(companyId, step));
+            }
+        });
     }
 
     @Test

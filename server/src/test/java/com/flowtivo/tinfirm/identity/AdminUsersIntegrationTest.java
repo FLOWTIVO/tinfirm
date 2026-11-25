@@ -13,12 +13,17 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import com.flowtivo.tinfirm.ee.licence.EnterpriseLicence;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 
 import tools.jackson.databind.JsonNode;
 
 @ExtendWith(EnterpriseLicence.class)
 class AdminUsersIntegrationTest extends IntegrationTest {
+
+    private static final String SESSIONS = "com.flowtivo.tinfirm.identity.internal.UserSessions";
+
+    private static final String SPRING_SESSION = "org.springframework.session.jdbc.JdbcIndexedSessionRepository";
 
     @Test
     void adminEndpointsAreForInstanceAdminsOnly() {
@@ -114,9 +119,13 @@ class AdminUsersIntegrationTest extends IntegrationTest {
         UUID userId = createUser(admin, email, false);
         ApiClient oldSession = loginAs(email);
 
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         ApiResponse set = admin.put("/api/admin/users/" + userId + "/password", Map.of("newPassword", "brand-new-password"));
 
         assertThat(set.status()).isEqualTo(204);
+        // The sessions were deleted once the change released its connection, one connection at a time.
+        assertThat(mark.at(SESSIONS)).as("second connections asked for to delete sessions").isZero();
+        assertThat(mark.at(SPRING_SESSION)).as("second and third connections asked for by Spring Session").isZero();
         assertThat(client().login(email, PASSWORD).status()).isEqualTo(401);
         assertThat(loginAs(email, "brand-new-password").get("/api/me").status()).isEqualTo(200);
         // The user's existing sessions were logged out.
@@ -137,9 +146,12 @@ class AdminUsersIntegrationTest extends IntegrationTest {
         assertThat(wrong.status()).isEqualTo(400);
         assertThat(wrong.problemCode()).isEqualTo("WRONG_PASSWORD");
 
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         ApiResponse changed = user.put("/api/me/password",
                 Map.of("currentPassword", PASSWORD, "newPassword", "another-good-password"));
         assertThat(changed.status()).isEqualTo(204);
+        assertThat(mark.at(SESSIONS)).as("second connections asked for to delete sessions").isZero();
+        assertThat(mark.at(SPRING_SESSION)).as("second and third connections asked for by Spring Session").isZero();
         assertThat(user.get("/api/me").status()).isEqualTo(200);
         assertThat(otherDevice.get("/api/me").status()).isEqualTo(401);
         assertThat(loginAs(email, "another-good-password").get("/api/me").status()).isEqualTo(200);

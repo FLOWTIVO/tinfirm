@@ -239,8 +239,8 @@ jobs:
             rm -rf "$DOCKER_CONFIG"
           fi
 
-  # The downloadable assets of the release (runner host binaries, deploy/compose, REVISION,
-  # SHA256SUMS), built from the release tag and attached to the GitHub Release that the
+  # The downloadable assets of the release (runner host binaries, the node agent's,
+  # deploy/compose, REVISION, SHA256SUMS), built from the release tag and attached to the GitHub Release that the
   # reusable release created; the same definition as `rolling` (runner-artifacts.yml). It
   # also runs when a later part of the reusable release failed (the charts, the next version,
   # the merge-back pull request), as long as the Release exists; otherwise re-run this job

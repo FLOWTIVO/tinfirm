@@ -13,6 +13,7 @@ use common::*;
 use tinfirm_protocol::{GitCredentials, Secret, WorkspaceSpec};
 use tinfirm_runner_host::git::Git;
 use tinfirm_runner_host::git_proxy::{Endpoint, GitProxy};
+use tinfirm_runner_host::git_tokens::RunGitTokens;
 use tinfirm_runner_host::mirror::Mirrors;
 use uuid::Uuid;
 
@@ -70,10 +71,7 @@ async fn the_sandbox_fetches_through_the_proxy_and_cannot_push() {
             repo_url: repo_url.clone(),
             default_branch: "main".into(),
             branch: "agent/TEST-1".into(),
-            git: Some(GitCredentials {
-                username: "x-access-token".into(),
-                token: Secret::new(TEST_GIT_TOKEN),
-            }),
+            git: Some(GitCredentials::new("x-access-token", Secret::new(TEST_GIT_TOKEN))),
             author_name: None,
             author_email: None,
             read_only: false,
@@ -88,7 +86,7 @@ async fn the_sandbox_fetches_through_the_proxy_and_cannot_push() {
         );
         let mirrors = Mirrors::new(scratch.path().join("mirrors"));
         let mirror = mirrors
-            .update(&repo_url, host_git.authorization())
+            .update(&repo_url, host_git.authorization().unwrap().as_ref())
             .await
             .unwrap();
         host_git
@@ -97,7 +95,7 @@ async fn the_sandbox_fetches_through_the_proxy_and_cannot_push() {
             .unwrap();
         drop(mirror);
         assert_eq!(
-            host_git.authorization().unwrap().expose(),
+            host_git.authorization().unwrap().unwrap().expose(),
             authorization,
             "the proxy sends the same header as host-side git"
         );
@@ -116,7 +114,7 @@ async fn the_sandbox_fetches_through_the_proxy_and_cannot_push() {
             .register(
                 Uuid::new_v4(),
                 &repo_url,
-                host_git.authorization().cloned(),
+                host_git.tokens().clone(),
                 &spec.branch,
             )
             .unwrap();
@@ -199,6 +197,34 @@ async fn the_sandbox_fetches_through_the_proxy_and_cannot_push() {
             repo.file_at("agent/TEST-1", "agent.txt").as_deref(),
             Some("agent work\n")
         );
+
+        // ADR-0116: once the server revokes the run's token, git in the sandbox shows the
+        // server's message for the next fetch, and nothing reaches the repository.
+        let tokens = RunGitTokens::standalone(&spec);
+        let route = proxy
+            .register(Uuid::new_v4(), &repo_url, tokens.clone(), &spec.branch)
+            .unwrap();
+        host_git.set_origin_url(route.sandbox_url()).await.unwrap();
+        sandbox_git_ok(&home, &workspace, &["fetch", "origin", "main"]).await;
+        let message = "Tinfirm revoked this run's access to acme/origin: the credential 'CI bot' was disabled.";
+        tokens.run().revoke(&[spec.component_id], "GRANT_REMOVED", message);
+        let before = server.seen().len();
+        let fetch = sandbox_git(&home, &workspace, &["fetch", "origin", "main"]).await;
+        let fetch_err = String::from_utf8_lossy(&fetch.stderr);
+        assert!(!fetch.status.success());
+        assert!(fetch_err.contains(message), "git shows the message: {fetch_err}");
+        assert!(fetch_err.contains("403"), "{fetch_err}");
+        assert_eq!(server.seen().len(), before, "nothing reached the server");
+        // The host's own push with that holder is refused too.
+        let revoked_git = Git::new(
+            &workspace,
+            &spec,
+            ("Tinfirm agent Tester".into(), "agent@tinfirm.invalid".into()),
+        )
+        .with_tokens(tokens);
+        let err = revoked_git.push("agent/TEST-1").await.unwrap_err();
+        assert!(format!("{err:#}").contains(message), "{err:#}");
+        assert_eq!(server.seen().len(), before);
         proxy.shutdown();
     })
     .await;

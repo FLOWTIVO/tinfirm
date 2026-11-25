@@ -15,9 +15,10 @@ import org.jspecify.annotations.Nullable;
  * resumes the agent's session.
  * <ul>
  * <li>The sections, in order: the agent's instructions; the person's added instructions, headed "Added by {person}";
- * {@code ---}; {@code # Conversation {key}: {title}} with the place, the subject (a reference the agent reads with its
- * own tool, open point 4) and the person's usual projects; {@code # Memory} while memory is in effect (ADR-0063, the
- * full prompt only); {@code # Request}; {@code # Conversation so far} (the newest
+ * {@code ---}; {@code # Conversation {key}} with the place, the subject (a reference the agent reads with its own
+ * tool, open point 4) and the person's usual projects, without the conversation's title: it is the first message's
+ * first line (or a trigger's subject or mention), which would reach the agent a second time; {@code # Memory} while
+ * memory is in effect (ADR-0063, the full prompt only); {@code # Request}; {@code # Conversation so far} (the newest
  * {@value #RECENT_MESSAGES} messages, oldest first); {@code # Answers} (part 2); {@code # Accounts};
  * {@code # Repositories}; {@code # Files} (part 3); {@code # Tools}; {@code # Outputs} (part 3); {@code # How to
  * work}.</li>
@@ -125,7 +126,7 @@ final class PromptRenderer {
      * @param memory            {@code # Memory} ({@link MemoryPrompt}, ADR-0063); null while memory is not in effect
      */
     record Context(String agentName, String instructions, @Nullable String addedInstructions, String personName,
-            String key, String title, @Nullable String about, List<String> projects, List<Message> request,
+            String key, @Nullable String about, List<String> projects, List<Message> request,
             @Nullable String requestText, List<Message> conversation, long totalMessages, @Nullable String answers,
             List<Account> accounts, String branch, List<Repository> repositories, boolean requestable,
             @Nullable String files, List<Tool> tools, @Nullable String outputs, @Nullable Trigger trigger,
@@ -133,23 +134,23 @@ final class PromptRenderer {
 
         /** A context without memory. */
         Context(String agentName, String instructions, @Nullable String addedInstructions, String personName,
-                String key, String title, @Nullable String about, List<String> projects, List<Message> request,
+                String key, @Nullable String about, List<String> projects, List<Message> request,
                 @Nullable String requestText, List<Message> conversation, long totalMessages,
                 @Nullable String answers, List<Account> accounts, String branch, List<Repository> repositories,
                 boolean requestable, @Nullable String files, List<Tool> tools, @Nullable String outputs,
                 @Nullable Trigger trigger, @Nullable String where) {
-            this(agentName, instructions, addedInstructions, personName, key, title, about, projects, request,
+            this(agentName, instructions, addedInstructions, personName, key, about, projects, request,
                     requestText, conversation, totalMessages, answers, accounts, branch, repositories, requestable,
                     files, tools, outputs, trigger, where, null);
         }
 
         /** A personal conversation's context (package 3). */
         Context(String agentName, String instructions, @Nullable String addedInstructions, String personName,
-                String key, String title, @Nullable String about, List<String> projects, List<Message> request,
+                String key, @Nullable String about, List<String> projects, List<Message> request,
                 @Nullable String requestText, List<Message> conversation, long totalMessages,
                 @Nullable String answers, List<Account> accounts, String branch, List<Repository> repositories,
                 boolean requestable, @Nullable String files, List<Tool> tools, @Nullable String outputs) {
-            this(agentName, instructions, addedInstructions, personName, key, title, about, projects, request,
+            this(agentName, instructions, addedInstructions, personName, key, about, projects, request,
                     requestText, conversation, totalMessages, answers, accounts, branch, repositories, requestable,
                     files, tools, outputs, null, null, null);
         }
@@ -186,7 +187,7 @@ final class PromptRenderer {
         }
         Trigger trigger = context.trigger();
         prompt.append("---\n");
-        prompt.append("# Conversation ").append(context.key()).append(": ").append(context.title()).append('\n');
+        prompt.append("# Conversation ").append(context.key()).append('\n');
         if (trigger != null) {
             prompt.append(trigger.started().strip()).append(" You are ").append(context.agentName())
                 .append(", an AI agent working for ").append(context.personName()).append(" through Tinfirm.");

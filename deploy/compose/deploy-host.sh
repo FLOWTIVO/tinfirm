@@ -105,7 +105,22 @@ add_secret LITELLM_DB_PASSWORD "$(openssl rand -hex 24)"
 if ! grep -q '^TINFIRM_COMPANY_NAME=' .env && grep -q '^TINFIRM_BOOTSTRAP_COMPANY_NAME=' .env; then
   add_secret TINFIRM_COMPANY_NAME "$(sed -n 's/^TINFIRM_BOOTSTRAP_COMPANY_NAME=//p' .env | tail -n 1)"
 fi
-sudo -n docker compose -f compose.yaml --env-file .env up -d --no-build --remove-orphans
+# The host's overlays: TINFIRM_COMPOSE_OVERLAYS in .env, file names beside compose.yaml with
+# blanks between them (compose.tls.yaml, compose.entra.yaml). They are named in every `up`:
+# --remove-orphans would otherwise remove their services, the TLS overlay's Caddy among them.
+files=(-f compose.yaml)
+overlays="$(sed -n 's/^TINFIRM_COMPOSE_OVERLAYS=//p' .env | tail -n 1 | tr -d "\"'\r")"
+for overlay in $overlays; do
+  case "$overlay" in
+    compose.yaml | */* | *[!A-Za-z0-9._-]*)
+      echo "TINFIRM_COMPOSE_OVERLAYS in .env names '$overlay': give file names of deploy/compose, such as compose.tls.yaml" >&2
+      exit 1
+      ;;
+  esac
+  [ -f "$overlay" ] || { echo "TINFIRM_COMPOSE_OVERLAYS in .env names $overlay, which deploy/compose does not have" >&2; exit 1; }
+  files+=(-f "$overlay")
+done
+sudo -n docker compose "${files[@]}" --env-file .env up -d --no-build --remove-orphans
 for _ in $(seq 1 60); do
   port="$(grep '^TINFIRM_HTTP_HOST_PORT=' .env | cut -d= -f2)"
   if curl -fs -o /dev/null "http://127.0.0.1:${port}/api/system/info"; then echo "server is up on port ${port}"; exit 0; fi

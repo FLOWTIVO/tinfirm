@@ -197,7 +197,7 @@ describe('bindingCardText (plan §4.1)', () => {
     ${'PICK_GRANT'}        | ${'Act on Jira through:'}                     | ${true}
     ${'CHOOSE'}            | ${'Your Jira account needs signing in again'} | ${true}
     ${'RECONNECT_COMPANY'} | ${'Jira waits for an admin'}                  | ${false}
-    ${'SUSPENDED'}         | ${'Jira waits for an admin'}                  | ${false}
+    ${'SUSPENDED'}         | ${'Jira waits until a suspension is lifted'}  | ${false}
     ${'SYSTEM_OFF'}        | ${'Jira is switched off'}                     | ${false}
     ${'NOT_ENTITLED'}      | ${'Jira waits for the trigger’s author'}      | ${false}
   `('a waiting binding of reason $reason', ({ reason, title, actionable }) => {
@@ -246,6 +246,23 @@ describe('bindingCardText (plan §4.1)', () => {
     expect(
       bindingCardText(waiting({ reason: 'NONE' }), { ...ctx, mine: false, personName: 'Alice' }),
     ).toMatchObject({ title: 'Waiting for Alice', actionable: false });
+  });
+
+  it('says a suspension in the server’s words, which know the holder and the cause', () => {
+    for (const text of [
+      'Jira: the service account svc-reader it acts through is suspended; an admin resumes it.',
+      'Jira: Ana, whose account it acts through, is suspended in this company; an admin resumes them.',
+      'Jira: Ana, whose account it acts through, is suspended because their Tinfirm account was deactivated; an instance admin reactivates the user, which resumes them.',
+      'Jira: Ana, whose account it acts through, is suspended because the company’s identity provider deactivated them; the identity provider reactivates them, which resumes them.',
+    ]) {
+      expect(
+        bindingCardText(waiting({ reason: 'SUSPENDED', holderName: 'Ana', text }), ctx),
+      ).toEqual({
+        title: 'Jira waits until a suspension is lifted',
+        body: text,
+        actionable: false,
+      });
+    }
   });
 
   it('offers the grant in the CHOOSE sentence', () => {

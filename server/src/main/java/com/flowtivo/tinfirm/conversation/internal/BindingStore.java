@@ -34,7 +34,7 @@ class BindingStore {
 
     private static final String COLUMNS = "id, company_id, conversation_id, system_id, state, how, account_id,"
             + " holder_principal_id, external_id, grant_id, reason, choices, "
-            + PARKED.formatted("waiting_calls") + " AS parked, waiting_since, bound_at, run_id";
+            + PARKED.formatted("waiting_calls") + " AS parked, waiting_since, bound_at, run_id, version";
 
     private final JdbcClient jdbc;
 
@@ -154,7 +154,7 @@ class BindingStore {
                 SELECT b.id, b.company_id, b.conversation_id, b.system_id, b.state, b.how, b.account_id,
                        b.holder_principal_id, b.external_id, b.grant_id, b.reason, b.choices,
                        """ + PARKED.formatted("b.waiting_calls") + """
-                        AS parked, b.waiting_since, b.bound_at, b.run_id
+                        AS parked, b.waiting_since, b.bound_at, b.run_id, b.version
                   FROM conversation_binding b
                   JOIN conversation c ON c.id = b.conversation_id AND c.company_id = b.company_id
                  WHERE b.company_id = ? AND b.state <> 'GONE' AND c.state = 'OPEN'
@@ -245,7 +245,7 @@ class BindingStore {
                 rs.getString("external_id"), rs.getObject("grant_id", UUID.class),
                 reason != null ? BindingInfo.Reason.valueOf(reason) : null, uuids(rs.getArray("choices")),
                 ConversationStore.nullableInstant(rs, "waiting_since"),
-                ConversationStore.nullableInstant(rs, "bound_at"));
+                ConversationStore.nullableInstant(rs, "bound_at"), rs.getLong("version"));
         return new BindingRow(info, rs.getInt("parked"), rs.getObject("run_id", UUID.class));
     }
 

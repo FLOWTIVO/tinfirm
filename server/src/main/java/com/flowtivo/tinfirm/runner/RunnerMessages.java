@@ -3,6 +3,11 @@ package com.flowtivo.tinfirm.runner;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
@@ -76,11 +81,19 @@ public final class RunnerMessages {
     public static final String UNKNOWN_CREDENTIAL_KIND = "UNKNOWN_CREDENTIAL_KIND";
 
     /**
-     * A {@code hello} that lists a feature the licence in force does not hold, before {@code welcome}: the sandbox
-     * bridge ({@link #FEATURE_SANDBOX_BRIDGE}) without elastic runners (ADR-0100). The connection is closed with 1008,
-     * and the host does not reconnect.
+     * A {@code hello} that lists a feature the licence in force does not hold, before {@code welcome}: ready sandboxes
+     * ({@link #FEATURE_SANDBOX_POOL}) or a paid VM driver ({@link #FEATURE_SANDBOX_ELASTIC}) without elastic runners
+     * (ADR-0100, ADR-0114). The connection is closed with 1008, and the host does not reconnect.
      */
     public static final String EDITION_REQUIRED = "EDITION_REQUIRED";
+
+    /**
+     * A {@code hello} of protocol 2 whose {@code isolationTiers} carry {@code microvm}, before {@code welcome}: a Kata
+     * host or a host with a VM per run of a release before ADR-0113's levels, which must be upgraded to the server's
+     * release (ADR-0113, decision 2). The connection is closed with 1008, and the host does not reconnect: a released
+     * host logs the {@code error}'s code and message, whatever the code, and stops at a close of 1008.
+     */
+    public static final String UPGRADE_REQUIRED = "UPGRADE_REQUIRED";
 
     /**
      * The {@code error} code, and the {@code run.request.ack} code, of a frame refused because its host, its company or
@@ -156,16 +169,68 @@ public final class RunnerMessages {
     /**
      * The optional feature of protocol 2 ({@code hello.features}) whose host keeps ready sandboxes (ADR-0098) and takes
      * Tinfirm's count of them (ADR-0099): it sends {@code hello.pool} and {@link HostPoolStatus}, takes
-     * {@code host.config.pool} and reports {@code host.config.applied.pool}.
+     * {@code host.config.pool} and reports {@code host.config.applied.pool}. A server whose licence does not hold
+     * elastic runners refuses the hello with {@link #EDITION_REQUIRED} (ADR-0100).
      */
     public static final String FEATURE_SANDBOX_POOL = "sandbox.pool";
 
     /**
      * The optional feature of protocol 2 ({@code hello.features}) whose host runs its agents over the sandbox bridge
-     * (ADR-0095): with {@code run --sandbox-bridge}, and always with a VM per run (ADR-0096). It adds no frame; a
-     * server whose licence does not hold elastic runners refuses the hello with {@link #EDITION_REQUIRED} (ADR-0100).
+     * (ADR-0095): with {@code run --sandbox-bridge}, and always with a VM per run (ADR-0096). It adds no frame. The
+     * bridge is in the core (ADR-0114): every edition accepts it.
      */
     public static final String FEATURE_SANDBOX_BRIDGE = "sandbox.bridge";
+
+    /**
+     * The optional feature of protocol 2 ({@code hello.features}) whose host's VM driver is one of the runner binary's
+     * paid ones: a provider's, DigitalOcean's today (ADR-0114, decision 3). It adds no frame; a server whose licence
+     * does not hold elastic runners refuses the hello with {@link #EDITION_REQUIRED}. A driver an operator wrote for
+     * the open driver protocol lists no such feature.
+     */
+    public static final String FEATURE_SANDBOX_ELASTIC = "sandbox.elastic";
+
+    /**
+     * The optional feature of protocol 2 ({@code hello.features}) whose host takes {@link RunGitRevoke} and
+     * {@link WelcomeDone} (ADR-0116): it
+     * drops the named repositories' git tokens from its git proxy, its own git and its take-back record. The server
+     * sends the frame only to such a host; a run on another keeps its tokens until it ends.
+     */
+    public static final String FEATURE_RUN_GIT_REVOKE = "run.git.revoke";
+
+    /**
+     * The optional feature of protocol 2 ({@code hello.features}) whose host reads {@code workspaces[].git.expiresAt}
+     * and {@code mirrorKey} and renews a token that expires with a {@code run.request} of kind {@code GIT_TOKEN}
+     * (ADR-0116). A run whose git token a GitHub App mints goes only to a host that lists it and
+     * {@link #FEATURE_RUN_GIT_REVOKE}.
+     */
+    public static final String FEATURE_RUN_GIT_REFRESH = "run.git.refresh";
+
+    /**
+     * The optional feature of protocol 2 whose host reports with {@link HostHealth} that it can take no run, and when it
+     * can again (ADR-0117). The server lists it in {@code welcome.features}; a host sends the frame only then.
+     */
+    public static final String FEATURE_HOST_HEALTH = "host.health";
+
+    /** The most problems one {@link HostHealth} names ({@code $defs/HostHealth.problems}). */
+    public static final int MAX_HOST_PROBLEMS = 8;
+
+    /** The longest {@code host.health.problems[].message}, in characters. */
+    public static final int MAX_HOST_PROBLEM_MESSAGE = 1000;
+
+    /**
+     * The codes of {@code host.health.problems[]}, a closed list (ADR-0117, decision 2): {@code VM_DRIVER_NO_VM}, the
+     * host's VM driver can make no VM.
+     */
+    public static final String HOST_PROBLEM_CODES = "^(VM_DRIVER_NO_VM)$";
+
+    /** One line of text: no control character of ASCII ({@code $defs/HostProblem.message}). */
+    private static final String ONE_LINE = "^[^\\x00-\\x1F\\x7F]*$";
+
+    /** The most repositories one {@link RunGitRevoke} names ({@code $defs/RunGitRevoke.componentIds}). */
+    public static final int MAX_GIT_REVOKE_COMPONENTS = 20;
+
+    /** The longest {@code run.git.revoke.message}, in characters. */
+    public static final int MAX_GIT_REVOKE_MESSAGE = 1000;
 
     /** The largest session bundle, compressed ({@code run.assign.sessionBundle.sizeBytes} maximum): 32 MiB. */
     public static final int MAX_SESSION_BUNDLE_BYTES = 32 * 1024 * 1024;
@@ -206,6 +271,9 @@ public final class RunnerMessages {
             @JsonSubTypes.Type(value = RunHeartbeat.class, name = "run.heartbeat"),
             @JsonSubTypes.Type(value = RunFinished.class, name = "run.finished"),
             @JsonSubTypes.Type(value = RunCancel.class, name = "run.cancel"),
+            @JsonSubTypes.Type(value = RunGitRevoke.class, name = "run.git.revoke"),
+            @JsonSubTypes.Type(value = RunGitRevoked.class, name = "run.git.revoked"),
+            @JsonSubTypes.Type(value = WelcomeDone.class, name = "welcome.done"),
             @JsonSubTypes.Type(value = RunRepositoryRequest.class, name = "run.repository_request"),
             @JsonSubTypes.Type(value = RunRepositoryRequestAck.class, name = "run.repository_request.ack"),
             @JsonSubTypes.Type(value = RunTaskCreate.class, name = "run.task_create"),
@@ -220,6 +288,7 @@ public final class RunnerMessages {
             @JsonSubTypes.Type(value = HostConfig.class, name = "host.config"),
             @JsonSubTypes.Type(value = HostConfigApplied.class, name = "host.config.applied"),
             @JsonSubTypes.Type(value = HostPoolStatus.class, name = "host.pool.status"),
+            @JsonSubTypes.Type(value = HostHealth.class, name = "host.health"),
             @JsonSubTypes.Type(value = PslUpdate.class, name = "psl.update"),
             @JsonSubTypes.Type(value = ProtocolError.class, name = "error") })
     public sealed interface Message {
@@ -249,34 +318,81 @@ public final class RunnerMessages {
      * The first frame of a runner host after connecting. {@code maxConcurrentRuns} and each credential's
      * {@code poolSize} are the host's ceilings (archived v1 CONVENTIONS §14.8): 1 to 16 for a credential and a host
      * with Docker, up to 1000 for a host that creates a sandbox per run. {@code pool} comes with the feature
-     * {@link #FEATURE_SANDBOX_POOL}.
+     * {@link #FEATURE_SANDBOX_POOL}, as the schema says.
+     * <p>
+     * In protocol 2, {@code isolationTiers} carries the host's level of isolation and {@code hardened} and
+     * {@code isolationStated} what goes with it (ADR-0113, decisions 1 to 3); the server stores and shows them as
+     * reported and checks none. {@code microvm} is accepted here only so that the server can refuse it by name
+     * ({@link #UPGRADE_REQUIRED}); {@code machine} and {@code vm-jail} are no tiers of protocol 1
+     * ({@code RunnerMessageCodec}). An explicit {@code null} of either optional field, which the schema refuses, is
+     * read as absent.
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Hello(@NotNull Integer protocolVersion,
             @NotBlank @Size(max = 100) String runnerVersion, @Nullable @Size(max = 255) String hostname,
             @Nullable @Size(max = 64) String os, @Nullable @Size(max = 64) String arch,
             @NotEmpty List<@NotNull @Pattern(regexp = "docker") String> executors,
-            @NotEmpty List<@NotNull @Pattern(regexp = "container|gvisor|microvm") String> isolationTiers,
+            @NotEmpty List<@NotNull @Pattern(regexp = "machine|vm-jail|container|gvisor|microvm") String> isolationTiers,
             @NotNull @Min(1) @Max(MAX_HOST_CAPACITY) Integer maxConcurrentRuns,
             @NotNull @Size(max = 100) List<@Valid @NotNull HelloCredential> credentials,
             @NotNull List<@Valid @NotNull HelloRuntime> runtimes,
             @Nullable List<@Valid @NotNull ActiveRun> activeRuns,
             @Nullable @Valid PublicSuffixListVersion publicSuffixList,
             @Nullable @Size(max = 50) List<@NotNull @Pattern(regexp = "^[a-z][a-z0-9._-]{0,63}$") String> features,
-            @Nullable @Valid HelloPool pool) implements Inbound {
+            @Nullable @Valid HelloPool pool, @Nullable Hardening hardened, @Nullable Boolean isolationStated)
+            implements Inbound {
 
-        /** A hello of a host before {@code hello.pool}. */
+        /** A hello of a host before {@code hello.hardened} and {@code hello.isolationStated}. */
         public Hello(Integer protocolVersion, String runnerVersion, @Nullable String hostname, @Nullable String os,
                 @Nullable String arch, List<String> executors, List<String> isolationTiers, Integer maxConcurrentRuns,
                 List<HelloCredential> credentials, List<HelloRuntime> runtimes, @Nullable List<ActiveRun> activeRuns,
-                @Nullable PublicSuffixListVersion publicSuffixList, @Nullable List<String> features) {
+                @Nullable PublicSuffixListVersion publicSuffixList, @Nullable List<String> features,
+                @Nullable HelloPool pool) {
             this(protocolVersion, runnerVersion, hostname, os, arch, executors, isolationTiers, maxConcurrentRuns,
-                    credentials, runtimes, activeRuns, publicSuffixList, features, null);
+                    credentials, runtimes, activeRuns, publicSuffixList, features, pool, null, null);
         }
 
         /** The optional features the host lists; empty when it lists none. */
         public Set<String> featureSet() {
             return features != null ? Set.copyOf(features) : Set.of();
+        }
+
+        /** The tiers of {@code isolationTiers}, which the constraints allow only by name. */
+        public Set<IsolationTier> tiers() {
+            Set<IsolationTier> tiers = EnumSet.noneOf(IsolationTier.class);
+            isolationTiers.forEach(tier -> tiers.add(IsolationTier.ofWire(tier)));
+            return tiers;
+        }
+
+        /**
+         * The host's tier: the weakest of {@code isolationTiers}. A host sends one value; one that sends several is
+         * placed by the weakest wall it reports (ADR-0113).
+         */
+        public IsolationTier tier() {
+            return tiers().stream().max(Comparator.naturalOrder()).orElseThrow();
+        }
+
+        /** Whether this is a hello of protocol 2 that carries {@code microvm}, which the server refuses. */
+        public boolean carriesMicrovm() {
+            return protocolVersion != null && protocolVersion == PROTOCOL_V2
+                    && tiers().contains(IsolationTier.MICROVM);
+        }
+
+        /**
+         * The hardening the host reports: {@code hardened} in protocol 2, absent {@link Hardening#NO}; always
+         * {@code NO} in protocol 1, which has no such field.
+         */
+        public Hardening hardening() {
+            return v2() && hardened != null ? hardened : Hardening.NO;
+        }
+
+        /** Whether the operator stated the level: {@code isolationStated} in protocol 2, absent false. */
+        public boolean stated() {
+            return v2() && Boolean.TRUE.equals(isolationStated);
+        }
+
+        private boolean v2() {
+            return protocolVersion != null && protocolVersion == PROTOCOL_V2;
         }
 
         /** The operator's ceiling of ready sandboxes of a host with {@link #FEATURE_SANDBOX_POOL}; else null. */
@@ -313,11 +429,31 @@ public final class RunnerMessages {
     /**
      * The answer to {@code hello}. {@code protocolVersion} is the host's version, which the server speaks on this
      * connection: required under v2, ignored by a v1 host.
+     *
+     * @param features v2: the optional features of protocol 2 this server implements ({@link #SERVER_FEATURES});
+     *                 null for a v1 host. A host that took a run back waits for {@link WelcomeDone} only when it lists
+     *                 {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116)
      */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Welcome(int protocolVersion, UUID runnerHostId, UUID companyId, @Nullable String serverVersion,
-            long heartbeatIntervalSeconds, long leaseTtlSeconds) implements Outbound {
+            long heartbeatIntervalSeconds, long leaseTtlSeconds, @Nullable List<String> features) implements Outbound {
+
+        public Welcome {
+            features = features != null ? List.copyOf(features) : null;
+        }
+
+        /** A welcome without features (a v1 host's). */
+        public Welcome(int protocolVersion, UUID runnerHostId, UUID companyId, @Nullable String serverVersion,
+                long heartbeatIntervalSeconds, long leaseTtlSeconds) {
+            this(protocolVersion, runnerHostId, companyId, serverVersion, heartbeatIntervalSeconds, leaseTtlSeconds,
+                    null);
+        }
     }
+
+    /** Every optional feature of protocol 2 this server implements, as {@code welcome.features} names them. */
+    public static final List<String> SERVER_FEATURES = List.of(FEATURE_RUN_STEER, FEATURE_RUN_SKILLS,
+            FEATURE_SESSION_BUNDLE, FEATURE_SANDBOX_POOL, FEATURE_SANDBOX_BRIDGE, FEATURE_SANDBOX_ELASTIC,
+            FEATURE_RUN_GIT_REVOKE, FEATURE_RUN_GIT_REFRESH, FEATURE_HOST_HEALTH);
 
     // ---- run.assign --------------------------------------------------------------------------------------------
 
@@ -666,12 +802,37 @@ public final class RunnerMessages {
     public record RequestableRepository(UUID componentId, String name, String repoUrl, boolean pendingRequest) {
     }
 
-    /** HTTPS credentials for clone and push, used only by the runner host, never inside the sandbox. */
-    public record GitCredentials(String username, String token) {
+    /**
+     * HTTPS credentials for clone and push, used only by the runner host, never inside the sandbox.
+     *
+     * @param expiresAt v2, the feature {@link #FEATURE_RUN_GIT_REFRESH} (ADR-0116): when a token a GitHub App minted
+     *                  for the run expires, RFC 3339; null for a token that lives until the run ends
+     * @param mirrorKey with {@code expiresAt}: the stable key of the credential that minted it, which names the host's
+     *                  mirror in place of the token; null otherwise
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record GitCredentials(String username, String token, @Nullable String expiresAt,
+            @Nullable String mirrorKey) {
+
+        public GitCredentials {
+            if ((expiresAt == null) != (mirrorKey == null)) {
+                throw new IllegalArgumentException("expiresAt and mirrorKey come together");
+            }
+        }
+
+        /** A token that lives until the run ends. */
+        public GitCredentials(String username, String token) {
+            this(username, token, null, null);
+        }
+
+        /** The same token without its expiry and mirror key, for a host without {@link #FEATURE_RUN_GIT_REFRESH}. */
+        public GitCredentials withoutRefresh() {
+            return new GitCredentials(username, token);
+        }
 
         @Override
         public String toString() {
-            return "GitCredentials[username=" + username + ", token=***]";
+            return "GitCredentials[username=" + username + ", token=***, expiresAt=" + expiresAt + "]";
         }
     }
 
@@ -788,6 +949,60 @@ public final class RunnerMessages {
     }
 
     public record RunCancel(UUID runId, long epoch) implements Outbound {
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116): the last frame of the server's answer to a host's
+     * {@code hello}, once per connection, after everything it sends again for the runs the hello listed. Every pending
+     * revocation of those runs went on this connection before it; a host that took a run back pushes the run's work
+     * only after it.
+     */
+    public record WelcomeDone() implements Outbound {
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116): the host drops the git tokens of the repositories
+     * named ({@code workspaces[].componentId}) for the run's assignment of {@code epoch}, and confirms it with
+     * {@link RunGitRevoked}. The server sends it after the change's commit and again at every {@code hello} that lists
+     * the run, until the run ends.
+     *
+     * @param reason  a code: the binding's reason, {@code SYSTEM_PAUSED}, {@code CREDENTIAL_REPLACED} or
+     *                {@code REFRESH_REFUSED}
+     * @param message the text for the run's log and the agent, at most {@value #MAX_GIT_REVOKE_MESSAGE} characters
+     */
+    public record RunGitRevoke(UUID runId, long epoch, List<UUID> componentIds, String reason, String message)
+            implements Outbound {
+
+        public RunGitRevoke {
+            componentIds = List.copyOf(componentIds);
+            if (componentIds.isEmpty() || componentIds.size() > MAX_GIT_REVOKE_COMPONENTS || message.isEmpty()
+                    || message.length() > MAX_GIT_REVOKE_MESSAGE) {
+                throw new IllegalArgumentException("A run.git.revoke names 1 to " + MAX_GIT_REVOKE_COMPONENTS
+                        + " repositories, with a message of 1 to " + MAX_GIT_REVOKE_MESSAGE + " characters");
+            }
+        }
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_RUN_GIT_REVOKE} (ADR-0116): the host applied a {@link RunGitRevoke} for a run of
+     * its current epoch; the tokens of these repositories, those of that frame the run has, are dropped from its holder
+     * and its take-back record was written again. The same answer for a frame that comes twice. The server takes it
+     * only from the run's host for the run's epoch, and ignores any other without an {@code error}.
+     *
+     * @param componentIds 1 to {@value #MAX_GIT_REVOKE_COMPONENTS} repositories, each once
+     */
+    public record RunGitRevoked(@NotNull UUID runId, @NotNull Long epoch,
+            @NotNull @Size(min = 1, max = MAX_GIT_REVOKE_COMPONENTS) List<@NotNull UUID> componentIds)
+            implements OneRunMessage {
+
+        public RunGitRevoked {
+            if (componentIds != null) {
+                if (new HashSet<>(componentIds).size() != componentIds.size()) {
+                    throw new IllegalArgumentException("A run.git.revoked names each repository once");
+                }
+                componentIds = Collections.unmodifiableList(new ArrayList<>(componentIds));
+            }
+        }
     }
 
     // ---- steering (the protocol 2 feature run.steer) ---------------------------------------------------------------
@@ -924,7 +1139,12 @@ public final class RunnerMessages {
         /** A server-executed tool of {@code run.assign.tools}. */
         TOOL,
         /** {@code request_network_access}: an ACCESS decision of a network host. */
-        NETWORK
+        NETWORK,
+        /**
+         * The host's own request for new git tokens of repositories whose token a GitHub App minted (ADR-0116, the
+         * feature {@link #FEATURE_RUN_GIT_REFRESH}).
+         */
+        GIT_TOKEN
     }
 
     /**
@@ -984,7 +1204,44 @@ public final class RunnerMessages {
     }
 
     /** The payload of a {@link RunRequestAck}. */
-    public sealed interface AckPayload permits DecisionPayload, ArtifactPayload, ToolResult {
+    public sealed interface AckPayload permits DecisionPayload, ArtifactPayload, ToolResult, GitTokens {
+    }
+
+    /** {@code run.request.ack} code: a repository's token is refused for good (ADR-0116, decision 9). */
+    public static final String GIT_REVOKED = "GIT_REVOKED";
+
+    /** {@code run.request.ack} code: a kill switch holds the run's systems; ask again later. */
+    public static final String GIT_HELD = "GIT_HELD";
+
+    /** {@code run.request.ack} code: GitHub could not mint now; ask again later. */
+    public static final String GIT_UNAVAILABLE = "GIT_UNAVAILABLE";
+
+    /**
+     * DONE of a GIT_TOKEN request (ADR-0116, decision 9): every repository the request named is in exactly one of
+     * {@code git} and {@code refused}.
+     *
+     * @param refused null for none
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record GitTokens(List<GitToken> git, @Nullable List<GitRefused> refused) implements AckPayload {
+
+        public GitTokens {
+            git = List.copyOf(git);
+            refused = refused != null && !refused.isEmpty() ? List.copyOf(refused) : null;
+        }
+    }
+
+    /** A renewed git token of one repository of the run, valid until {@code expiresAt} (RFC 3339). Never log it. */
+    public record GitToken(UUID componentId, String username, String token, String expiresAt) {
+
+        @Override
+        public String toString() {
+            return "GitToken[componentId=" + componentId + ", token=***, expiresAt=" + expiresAt + "]";
+        }
+    }
+
+    /** A repository of a GIT_TOKEN request the server did not renew, with the code and the server's message. */
+    public record GitRefused(UUID componentId, String code, String message) {
     }
 
     /** PENDING: the decision the request stored. */
@@ -1106,6 +1363,41 @@ public final class RunnerMessages {
     public record HostPoolStatus(@NotNull @Min(0) @Max(1024) Integer ready, @NotNull @Min(0) @Max(1024) Integer starting,
             @NotNull @Min(0) @Max(1024) Integer busy, @Nullable @Min(0) Long coldStartP90Seconds,
             @NotNull @Min(0) Integer servedReady, @NotNull @Min(0) Integer servedCold) implements Inbound {
+    }
+
+    /**
+     * v2, the feature {@link #FEATURE_HOST_HEALTH} (ADR-0117), host to server: why the host takes no run now; an empty
+     * list, that it takes runs again. The server keeps it with the connection; it answers nothing.
+     *
+     * @param since when the host's current problems began, by its clock (RFC 3339); null with none
+     */
+    public record HostHealth(@NotNull @Size(max = MAX_HOST_PROBLEMS) List<@NotNull @Valid HostProblem> problems,
+            @Nullable String since) implements Inbound {
+
+        public HostHealth {
+            problems = problems != null ? List.copyOf(problems) : null;
+        }
+
+        /** {@code since} as an instant; null when absent or unreadable, which costs only the page's "since". */
+        public @Nullable Instant sinceInstant() {
+            if (since == null) {
+                return null;
+            }
+            try {
+                return OffsetDateTime.parse(since).toInstant();
+            }
+            catch (DateTimeParseException ex) {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * One reason why a host takes no run: a code of {@link #HOST_PROBLEM_CODES}, and the host's own words on one line,
+     * shown to people as text and never interpreted.
+     */
+    public record HostProblem(@NotNull @Pattern(regexp = HOST_PROBLEM_CODES) String code,
+            @NotNull @Size(min = 1, max = MAX_HOST_PROBLEM_MESSAGE) @Pattern(regexp = ONE_LINE) String message) {
     }
 
     /** The effective pool of one credential of {@code hello}, with its ceiling. */

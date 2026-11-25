@@ -1,0 +1,19 @@
+{{- if and .Values.runner.enabled (eq .Values.runner.vm.driver "pod") .Values.runner.vm.cluster.createNamespace }}
+{{- include "tinfirm.runner.validate" . }}
+{{- $c := .Values.runner.vm.cluster }}
+# The runs' namespace (ADR-0115, decision 2): a pod per run, each with its ticket's Secret, and
+# nothing else. Pod Security enforces `restricted` where the network plugin hands the pod its
+# tap device (multus). The init container of mode init needs NET_ADMIN, which neither
+# `restricted` nor `baseline` allows: no enforce label then, and `warn` and `audit` show it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $c.namespace }}
+  labels:
+    {{- include "tinfirm.runner.labels" . | nindent 4 }}
+    {{- if eq .Values.runner.vm.pod.tap.mode "multus" }}
+    pod-security.kubernetes.io/enforce: restricted
+    {{- end }}
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+{{- end }}

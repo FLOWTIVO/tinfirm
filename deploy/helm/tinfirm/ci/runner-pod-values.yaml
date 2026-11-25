@@ -1,0 +1,54 @@
+# The runner pod with the pod driver (ADR-0115, decision 2): a pod per run in the runs' own
+# namespace, the tap from Multus, the disk in an emptyDir, and the chart's admission policy.
+# expected/ holds the runs' two network policies' specs and the driver's configuration for
+# these values; the pod driver's tests read the same files.
+publicUrl: https://tinfirm.example.com
+companies:
+  - key: main
+    name: My Company
+runner:
+  enabled: true
+  name: k8s-pods
+  maxConcurrentRuns: 8
+  vm:
+    driver: pod
+    template: sandbox-4c8g
+    cluster:
+      isolationStatement: the workers for runs hold nothing else
+      namespace: tinfirm-runs
+    pod:
+      image:
+        repository: registry.example.com:5000/tinfirm/vm-pod
+        digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      templates:
+        sandbox-4c8g:
+          vcpus: 4
+          memoryMib: 8192
+          diskMib: 32768
+        sandbox-8c16g:
+          vcpus: 8
+          memoryMib: 16384
+          diskMib: 65536
+      tap:
+        mode: multus
+        networkAttachment: kube-system/tinfirm-tap
+      devices:
+        kvm: devices.example.com/kvm
+        tun: devices.example.com/tun
+      nodeSelector:
+        tinfirm.flowtivo.com/kvm: "true"
+      tolerations:
+        - key: tinfirm.flowtivo.com/kvm
+          operator: Exists
+          effect: NoSchedule
+  pool:
+    maxReady: 2
+networkPolicy:
+  runner:
+    egress:
+      apiServer:
+        to:
+          - ipBlock:
+              cidr: 10.0.0.10/32
+        ports:
+          - 6443

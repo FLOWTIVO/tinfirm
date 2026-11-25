@@ -25,6 +25,7 @@ import com.flowtivo.tinfirm.shared.tenant.TenantContext;
 import com.flowtivo.tinfirm.shared.tenant.TenantContextHolder;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
+import com.flowtivo.tinfirm.shared.web.ServerBusy;
 
 import io.modelcontextprotocol.common.McpTransportContext;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
@@ -167,6 +168,13 @@ class ToolInvoker {
         catch (RuntimeException ex) {
             outcome = "failed";
             log.warn("MCP tool {} failed", tool, ex);
+            // The API's rule (ServerBusy): a tool that changes something, whose change may already be saved when a
+            // later step failed, is never told to try again. A tool that only reads is decided as a GET.
+            boolean changes = writes || catalogue.requiredScope(tool).filter(scope -> scope != ApiScope.READ)
+                .isPresent();
+            if (ServerBusy.decide(ex, changes ? "POST" : "GET") == ServerBusy.Answer.SAVED_THEN_FAILED) {
+                return error("INTERNAL_ERROR", ServerBusy.SAVED_THEN_FAILED);
+            }
             return error("INTERNAL_ERROR", "The tool failed on the server. Try again later.");
         }
         finally {

@@ -85,7 +85,7 @@ async function capture(page: Page, testInfo: TestInfo, name: string): Promise<vo
  * Opens a section of the editor by its tab, which shows one section at a time; on a phone the
  * tabs are the first screen, and "All sections" goes back to them from a section. A tab is named
  * by its content, the label and then how the section stands: the tab is the one whose label reads
- * `name`.
+ * `name`. It returns once the section shows.
  */
 async function openSection(page: Page, name: string): Promise<void> {
   const tab = page.getByRole('tab').filter({ has: page.getByText(name, { exact: true }) });
@@ -94,6 +94,9 @@ async function openSection(page: Page, name: string): Promise<void> {
   await expect(tab.or(back).first()).toBeVisible();
   if (!(await tab.isVisible())) await back.click();
   await tab.click();
+  // Until the editor has drawn the section (a frame after the click), a phone still shows the
+  // tabs: a next call would see its tab visible, click it as it hides, and wait for it forever.
+  await expect(page.getByRole('tabpanel', { name, exact: true })).toBeVisible();
 }
 
 /** The editor's instruction, in its Markdown source. */

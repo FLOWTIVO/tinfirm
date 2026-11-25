@@ -1,5 +1,6 @@
 package com.flowtivo.tinfirm.run;
 
+import java.util.List;
 import java.util.UUID;
 
 import org.jspecify.annotations.Nullable;
@@ -35,5 +36,20 @@ public final class RunEvents {
 
     /** A run lost by lease expiry runs again: its host still ran it ({@link TurnEnded#turnResumed}). */
     public record RunResumed(UUID companyId, UUID runId, UUID conversationId) {
+    }
+
+    /**
+     * ADR-0116: a revocation of the run's git tokens was recorded while the run's host is connected and does not take
+     * {@code run.git.revoke} ({@code delivery UNSUPPORTED}): the run keeps the tokens of these repositories until it
+     * ends. Published once per revocation, in its transaction, which holds the conversation's lock, whatever the cause:
+     * the conversation says so.
+     *
+     * @param repositories the repositories' names, as the run was assigned them
+     */
+    public record GitTokensKept(UUID companyId, UUID runId, UUID conversationId, List<String> repositories) {
+
+        public GitTokensKept {
+            repositories = List.copyOf(repositories);
+        }
     }
 }

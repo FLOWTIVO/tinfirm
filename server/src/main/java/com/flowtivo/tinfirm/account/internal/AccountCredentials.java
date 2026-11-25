@@ -2,6 +2,9 @@ package com.flowtivo.tinfirm.account.internal;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -17,6 +20,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import com.flowtivo.tinfirm.account.AccountEvents;
 import com.flowtivo.tinfirm.account.AccountInfo;
 import com.flowtivo.tinfirm.account.Accounts;
+import com.flowtivo.tinfirm.account.GrantInfo;
 import com.flowtivo.tinfirm.audit.AuditAction;
 import com.flowtivo.tinfirm.audit.AuditLog;
 import com.flowtivo.tinfirm.audit.AuditRecord;
@@ -29,6 +33,7 @@ import com.flowtivo.tinfirm.shared.tx.NoTransaction;
 import com.flowtivo.tinfirm.system.CallCredential;
 import com.flowtivo.tinfirm.system.CallResult;
 import com.flowtivo.tinfirm.system.ClientCredentials;
+import com.flowtivo.tinfirm.system.GitHubApps;
 import com.flowtivo.tinfirm.system.OAuthTokens;
 import com.flowtivo.tinfirm.system.SystemCalls;
 import com.flowtivo.tinfirm.system.SystemInfo;
@@ -63,6 +68,9 @@ class AccountCredentials {
     /** An access token that expires within this is refreshed before it is used. */
     static final Duration REFRESH_MARGIN = Duration.ofMinutes(1);
 
+    /** An App installation's token for the server's own calls is minted again when it expires within this. */
+    static final Duration APP_REFRESH_MARGIN = Duration.ofMinutes(5);
+
     /** The stripes of the refresh locks: accounts that share one refresh one after the other. */
     private static final int REFRESH_STRIPES = 64;
 
@@ -79,6 +87,8 @@ class AccountCredentials {
 
     private final SystemCalls calls;
 
+    private final GitHubApps gitHubApps;
+
     private final AuditLog auditLog;
 
     private final ApplicationEventPublisher events;
@@ -89,7 +99,8 @@ class AccountCredentials {
 
     AccountCredentials(AccountStore store, AccountSecrets secrets, Principals principals, Systems systems,
             SystemCalls calls, AuditLog auditLog, ApplicationEventPublisher events,
-            PlatformTransactionManager transactionManager, TimeSource time) {
+            PlatformTransactionManager transactionManager, TimeSource time, GitHubApps gitHubApps) {
+        this.gitHubApps = gitHubApps;
         this.store = store;
         this.secrets = secrets;
         this.principals = principals;
@@ -165,6 +176,10 @@ class AccountCredentials {
             OAuthTokens minted = client != null ? client.tokens() : null;
             return minted != null && !minted.expiresWithin(time.now(), REFRESH_MARGIN) ? oauth(minted, read) : null;
         }
+        if (account.kind() == AccountInfo.Kind.APP) {
+            AppInstallationSecret app = AppInstallationSecret.fromJson(read.value());
+            return app != null && app.usable(time.now(), APP_REFRESH_MARGIN) ? bearer(app.accessToken(), read) : null;
+        }
         OAuthTokens tokens = OAuthTokens.fromJson(read.value());
         return tokens != null && !tokens.expiresWithin(time.now(), REFRESH_MARGIN) ? oauth(tokens, read) : null;
     }
@@ -202,6 +217,9 @@ class AccountCredentials {
         AccountStore.AccountRow account = read.account();
         if (account.kind() == AccountInfo.Kind.CLIENT) {
             return minted(read, companyId, accountId, actingPrincipalId, purpose, mayReadAgain);
+        }
+        if (account.kind() == AccountInfo.Kind.APP) {
+            return mintedForServer(read, purpose);
         }
         OAuthTokens tokens = OAuthTokens.fromJson(read.value());
         if (tokens == null) {
@@ -288,6 +306,177 @@ class AccountCredentials {
                     : Optional.empty();
         }
         return Optional.of(oauth(next, read));
+    }
+
+    /**
+     * Under the account's refresh lock: an App installation's token for the server's own calls (ADR-0116, decision
+     * 7), minted with the installation's permissions less {@code workflows}, for every repository it covers, and kept
+     * in the credential's secret until it expires within {@link #APP_REFRESH_MARGIN}. GitHub refusing the App or not
+     * knowing the installation any more ({@code UNAUTHORIZED}, {@code NOT_FOUND}) turns the credential
+     * {@code RECONNECT}; any other failure leaves it as it is, and the token minted last is used while it has not
+     * expired.
+     */
+    private Optional<Accounts.RevealedCredential> mintedForServer(Read read, String purpose) {
+        AccountStore.AccountRow account = read.account();
+        AppInstallationSecret app = AppInstallationSecret.fromJson(read.value());
+        if (app == null) {
+            inTransaction(() -> needsReconnectUnlessChanged(account, "The stored installation is not readable"));
+            return Optional.empty();
+        }
+        SystemInfo system = read.system();
+        CallResult<GitHubApps.Installation> installation = gitHubApps.installation(system, app.installationId());
+        CallResult<GitHubApps.InstallationToken> fresh = installation.failure() != null
+                ? CallResult.failed(installation.failure())
+                : gitHubApps.mint(system, app.installationId(), null,
+                        withoutWorkflows(Objects.requireNonNull(installation.value()).permissions()), purpose);
+        if (fresh.failure() != null) {
+            CallResult.Kind kind = fresh.failure().kind();
+            if (kind == CallResult.Kind.UNAUTHORIZED || kind == CallResult.Kind.NOT_FOUND) {
+                inTransaction(() -> needsReconnectUnlessChanged(account, "GitHub refused to mint a token of the "
+                        + "installation: " + fresh.failureMessage()));
+                return Optional.empty();
+            }
+            return app.usable(time.now(), Duration.ZERO) ? Optional.of(bearer(app.accessToken(), read))
+                    : Optional.empty();
+        }
+        GitHubApps.InstallationToken token = Objects.requireNonNull(fresh.value());
+        String stored = app.minted(token.token(), token.expiresAt()).json();
+        if (!inTransaction(() -> storeRefreshed(read, system, stored, null, token.expiresAt()))) {
+            return Optional.empty();
+        }
+        return Optional.of(bearer(token.token(), read));
+    }
+
+    /** The installation's permissions without {@code workflows}: no token Tinfirm mints carries it (Q11). */
+    static Map<String, String> withoutWorkflows(Map<String, String> permissions) {
+        Map<String, String> kept = new java.util.TreeMap<>(permissions);
+        kept.remove(GitHubApps.WORKFLOWS);
+        return kept;
+    }
+
+    /**
+     * An admin has GitHub asked again for the installation an {@code APP} credential is (ADR-0116, decision 7). No
+     * reveal reads a credential that is not {@code OK}, so none mints for one that turned {@code RECONNECT}, and it
+     * takes no token or sign-in: this is its way back. The calls are those of {@link #mintedForServer}, for the
+     * credential in whatever state it is. A token GitHub mints proves the installation and is kept for the server's
+     * own calls: a credential that was {@code RECONNECT} is {@code OK} again in place ({@link #usableAgain}), with its
+     * grants and lendings. A failure changes nothing and is the caller's to answer. Outside any transaction, under the
+     * account's refresh lock, so that it never mints beside a reveal; the caller authorised the admin.
+     *
+     * @param purpose the reveal's purpose of the credential's secret, and of the App's key for the mint
+     * @return true once the token is kept; false when the credential is gone, or was removed while GitHub was asked;
+     *         else why no token was minted
+     * @throws IllegalStateException inside a transaction
+     */
+    CallResult<Boolean> checkInstallation(UUID companyId, UUID accountId, String purpose) {
+        NoTransaction.require("Asking GitHub for a credential's installation");
+        ReentrantLock lock = refreshLocks[Math.floorMod(accountId.hashCode(), REFRESH_STRIPES)];
+        lock.lock();
+        try {
+            Read read = transactions.execute(status -> readInstallation(companyId, accountId, purpose));
+            if (read == null) {
+                return CallResult.ok(false);
+            }
+            AppInstallationSecret app = AppInstallationSecret.fromJson(read.value());
+            if (app == null) {
+                return CallResult.failed(CallResult.Kind.INVALID, "The stored installation is not readable");
+            }
+            SystemInfo system = read.system();
+            // Outside any transaction: GitHub may take its time.
+            CallResult<GitHubApps.Installation> installation = gitHubApps.installation(system, app.installationId());
+            CallResult<GitHubApps.InstallationToken> fresh = installation.failure() != null
+                    ? CallResult.failed(installation.failure())
+                    : gitHubApps.mint(system, app.installationId(), null,
+                            withoutWorkflows(Objects.requireNonNull(installation.value()).permissions()), purpose);
+            if (fresh.failure() != null) {
+                return fresh.failedAs();
+            }
+            GitHubApps.InstallationToken token = Objects.requireNonNull(fresh.value());
+            String stored = app.minted(token.token(), token.expiresAt()).json();
+            return CallResult.ok(inTransaction(() -> storeRefreshed(read, system, stored, null, token.expiresAt())));
+        }
+        finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Reads an {@code APP} credential and reveals its secret for {@link #checkInstallation}, in the transaction before
+     * GitHub is asked: as {@link #read} does, but in whatever state the credential is, enabled or not, since the check
+     * is what makes one that turned {@code RECONNECT} usable again; null when it is gone or is no installation. It
+     * locks no account row, and is no use of the credential: its last use stays.
+     */
+    private @Nullable Read readInstallation(UUID companyId, UUID accountId, String purpose) {
+        AccountStore.AccountRow account = store.find(companyId, accountId)
+            .filter(row -> row.credential() && row.kind() == AccountInfo.Kind.APP && row.secretId() != null)
+            .orElse(null);
+        SystemInfo system = account != null ? systems.find(companyId, account.systemId()).orElse(null) : null;
+        if (account == null || system == null) {
+            return null;
+        }
+        String value;
+        try (RevealedSecret secret = secrets.reveal(companyId, null, Objects.requireNonNull(account.secretId()),
+                purpose)) {
+            value = secret.asString();
+        }
+        return new Read(account, null, value, system);
+    }
+
+    /**
+     * ADR-0116, decision 8: a run's own token of an {@code APP} credential, for its repositories and access. Read and
+     * revealed as any reveal is (the credential's state, its holder, the acting principal's right to it), outside any
+     * transaction; minted at GitHub; never stored.
+     */
+    Accounts.RunGitToken mintForRun(UUID companyId, UUID accountId, @Nullable UUID actingPrincipalId, String purpose,
+            List<String> repositoryUrls, GrantInfo.Access access) {
+        NoTransaction.require("Minting a run's git token");
+        Read read = readInTransaction(companyId, accountId, actingPrincipalId, purpose);
+        if (read == null) {
+            return new Accounts.RunGitToken.Refused("The credential can no longer be used");
+        }
+        AccountStore.AccountRow account = read.account();
+        AppInstallationSecret app = account.kind() == AccountInfo.Kind.APP
+                ? AppInstallationSecret.fromJson(read.value()) : null;
+        if (app == null) {
+            return new Accounts.RunGitToken.Refused("The credential is not an installation of a GitHub App");
+        }
+        String owner = account.externalLogin();
+        List<String> names = new ArrayList<>();
+        for (String url : repositoryUrls) {
+            String[] parts = AppInstallationSecret.ownerAndName(url);
+            if (parts == null || owner == null || !parts[0].equalsIgnoreCase(owner)) {
+                return new Accounts.RunGitToken.NotCovered("The GitHub App's installation on " + owner
+                        + " (credential " + account.name() + ") does not cover " + url + ": install the App there, "
+                        + "or give the repository another account");
+            }
+            if (!names.contains(parts[1])) {
+                names.add(parts[1]);
+            }
+        }
+        String level = access == GrantInfo.Access.WRITE ? "write" : "read";
+        Map<String, String> permissions = new java.util.TreeMap<>();
+        permissions.put("contents", level);
+        permissions.put("pull_requests", level);
+        CallResult<GitHubApps.InstallationToken> minted = gitHubApps.mint(read.system(), app.installationId(),
+                names, permissions, purpose);
+        if (minted.failure() == null) {
+            GitHubApps.InstallationToken token = Objects.requireNonNull(minted.value());
+            return new Accounts.RunGitToken.Minted(token.token(), token.expiresAt());
+        }
+        return switch (minted.failure().kind()) {
+            case INVALID, NOT_FOUND -> new Accounts.RunGitToken.NotCovered("The GitHub App's installation on "
+                    + owner + " (credential " + account.name() + ") does not cover " + String.join(", ", names)
+                    + ": install the App on " + (names.size() == 1 ? "it" : "them") + " (GitHub: "
+                    + minted.failureMessage() + ")");
+            case UNAUTHORIZED -> {
+                inTransaction(() -> needsReconnectUnlessChanged(account, "GitHub refused to mint a token of the "
+                        + "installation: " + minted.failureMessage()));
+                yield new Accounts.RunGitToken.Refused("GitHub refused the GitHub App's installation: "
+                        + minted.failureMessage());
+            }
+            default -> new Accounts.RunGitToken.Unavailable("GitHub could not mint a token now: "
+                    + minted.failureMessage());
+        };
     }
 
     /**
@@ -379,6 +568,12 @@ class AccountCredentials {
      * the grant.
      */
     private boolean storeRefreshed(Read read, SystemInfo system, String secretValue, OAuthTokens next) {
+        return storeRefreshed(read, system, secretValue, next.scope(), next.expiresAt());
+    }
+
+    /** As {@link #storeRefreshed(Read, SystemInfo, String, OAuthTokens)}, with the scope and expiry stored. */
+    private boolean storeRefreshed(Read read, SystemInfo system, String secretValue, @Nullable String scope,
+            @Nullable Instant expiresAt) {
         AccountStore.AccountRow before = read.account();
         AccountStore.AccountRow now = store.lock(before.companyId(), before.id()).orElse(null);
         if (now == null || !now.connectedAt().equals(before.connectedAt())
@@ -386,7 +581,7 @@ class AccountCredentials {
             return false;
         }
         secrets.store(now.companyId(), read.holder(), now.secretId(), system.handle(), secretValue);
-        store.refreshed(now.companyId(), now.id(), next.expiresAt(), next.scope(), time.now());
+        store.refreshed(now.companyId(), now.id(), expiresAt, scope, time.now());
         if (now.status() == AccountInfo.Status.RECONNECT) {
             usableAgain(now, read.holder());
         }
@@ -454,6 +649,12 @@ class AccountCredentials {
             .build());
         events.publishEvent(new AccountEvents.AccountNeedsReconnect(account.companyId(), account.id(),
                 account.systemId(), account.principalId()));
+    }
+
+    /** An installation token, sent as a bearer token. */
+    private static Accounts.RevealedCredential bearer(@Nullable String token, Read read) {
+        return new Accounts.RevealedCredential(new SystemCalls.Credential(Objects.requireNonNull(token), true),
+                read.account().apiBaseUrl(), CallCredential.Endpoint.of(read.system()));
     }
 
     private static Accounts.RevealedCredential oauth(OAuthTokens tokens, Read read) {

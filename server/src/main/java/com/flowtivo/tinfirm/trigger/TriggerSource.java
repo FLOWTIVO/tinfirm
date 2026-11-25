@@ -7,5 +7,13 @@ package com.flowtivo.tinfirm.trigger;
  * deliveries ({@code WEBHOOK}), neither with a row on its source.
  */
 public enum TriggerSource {
-    TRACKER, SCHEDULE, CHANNEL, WEBHOOK
+    TRACKER, SCHEDULE, CHANNEL, WEBHOOK;
+
+    /**
+     * Whether anyone may write to the source: a tracker, a chat's channels, a webhook; every source but a schedule
+     * (the security review of 2026-10-27, D2; ADR-0113, decision 4).
+     */
+    public boolean openToWriters() {
+        return this != SCHEDULE;
+    }
 }

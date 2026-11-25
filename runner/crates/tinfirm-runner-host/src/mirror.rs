@@ -15,6 +15,12 @@
 //! and tags, and a run whose token no longer works fails instead of getting stale content.
 //! A workspace is then a plain local copy of the mirror ([`crate::git::Git::clone_from_mirror`]).
 //!
+//! A token that the server minted for one run (`git.expiresAt`, ADR-0116) is new for every
+//! run, so its mirror is named by the credential it was minted for instead: `git.mirrorKey`, a
+//! stable key the server derives from the credential's id ([`credential_mirror_key`]). One
+//! credential's runs then share a mirror, and two credentials still never do. Such a mirror
+//! looks like any other (`<key>.git`), and maintenance treats it like any other.
+//!
 //! - A mirror is created in a temporary directory next to its final place and renamed into
 //!   place once the first fetch succeeded, so a mirror that exists is complete.
 //! - `gc.auto=0`: git never collects garbage in a mirror on its own, so a clone never races
@@ -78,6 +84,30 @@ pub fn mirror_key(repo_url: &str, authorization: Option<&Secret>) -> String {
     let mut key = hex(ctx.finish().as_ref());
     key.truncate(KEY_LEN);
     key
+}
+
+/// The mirror key of `repo_url` fetched with a token of the credential whose key is
+/// `credential` (`git.mirrorKey`): like [`mirror_key`], with the credential's key in place of
+/// the token's hash, marked so that the two never meet. Every run of that credential gets the
+/// same mirror, whatever token it holds.
+pub fn credential_mirror_key(repo_url: &str, credential: &str) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(b"tinfirm-mirror-v2\0");
+    ctx.update(repo_url.as_bytes());
+    ctx.update(b"\0credential:");
+    ctx.update(credential.as_bytes());
+    let mut key = hex(ctx.finish().as_ref());
+    key.truncate(KEY_LEN);
+    key
+}
+
+/// The key of a repository's mirror: by the credential's key when the token has one
+/// (`git.mirrorKey`), else by the `Authorization` header ([`mirror_key`]).
+pub fn key_for(repo_url: &str, credential: Option<&str>, authorization: Option<&Secret>) -> String {
+    match credential {
+        Some(credential) => credential_mirror_key(repo_url, credential),
+        None => mirror_key(repo_url, authorization),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -273,7 +303,8 @@ impl Mirrors {
         self.path_of(&mirror_key(repo_url, authorization))
     }
 
-    fn path_of(&self, key: &str) -> PathBuf {
+    /// Where mirror `key` is (or will be).
+    pub fn path_of(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{key}.git"))
     }
 
@@ -328,8 +359,26 @@ impl Mirrors {
         repo_url: &str,
         authorization: Option<&Secret>,
     ) -> Result<MirrorLease> {
+        self.update_keyed(
+            &mirror_key(repo_url, authorization),
+            repo_url,
+            authorization,
+        )
+        .await
+    }
+
+    /// [`Mirrors::update`] of mirror `key` ([`key_for`]).
+    pub async fn update_keyed(
+        &self,
+        key: &str,
+        repo_url: &str,
+        authorization: Option<&Secret>,
+    ) -> Result<MirrorLease> {
         secure_fs::ensure_private_dir(&self.dir)?;
-        let key = mirror_key(repo_url, authorization);
+        if key_of(&format!("{key}.git")) != Some(key) {
+            bail!("`{key}` is not a mirror key");
+        }
+        let key = key.to_string();
         let lock = self.lock_key(&key).await;
         let path = self.path_of(&key);
         match std::fs::symlink_metadata(&path) {
@@ -364,6 +413,17 @@ impl Mirrors {
         authorization: Option<&Secret>,
     ) -> Result<Vec<MirrorRef>> {
         let lease = self.update(repo_url, authorization).await?;
+        Ok(lease.refs)
+    }
+
+    /// [`Mirrors::refresh`] of mirror `key` ([`key_for`]).
+    pub async fn refresh_keyed(
+        &self,
+        key: &str,
+        repo_url: &str,
+        authorization: Option<&Secret>,
+    ) -> Result<Vec<MirrorRef>> {
+        let lease = self.update_keyed(key, repo_url, authorization).await?;
         Ok(lease.refs)
     }
 
@@ -689,6 +749,35 @@ mod tests {
         assert_ne!(anonymous, url_only[..KEY_LEN]);
         // The key holds no part of the credential.
         assert!(!of_alice.contains("YWxp"));
+    }
+
+    /// ADR-0116: a credential's tokens share one mirror per repository, whatever the token.
+    #[test]
+    fn a_credentials_key_names_one_mirror_for_every_token() {
+        let url = "https://github.com/acme/widgets.git";
+        let credential = "3f".repeat(32);
+        let key = credential_mirror_key(url, &credential);
+        assert_eq!(key_of(&format!("{key}.git")), Some(key.as_str()));
+        let first = Secret::new("Basic eC1hY2Nlc3MtdG9rZW46Z2hzX29uZQ==");
+        let second = Secret::new("Basic eC1hY2Nlc3MtdG9rZW46Z2hzX3R3bw==");
+        assert_eq!(key_for(url, Some(&credential), Some(&first)), key);
+        assert_eq!(key_for(url, Some(&credential), Some(&second)), key);
+        assert_eq!(
+            key_for(url, None, Some(&first)),
+            mirror_key(url, Some(&first))
+        );
+        assert_ne!(key, credential_mirror_key(url, &"4e".repeat(32)));
+        assert_ne!(
+            key,
+            credential_mirror_key("https://github.com/acme/other.git", &credential)
+        );
+        // Never the key of a token whose hash happened to be the credential's key.
+        let hashed = Secret::new("x");
+        let digest = hex(ring::digest::digest(&ring::digest::SHA256, b"x").as_ref());
+        assert_ne!(
+            mirror_key(url, Some(&hashed)),
+            credential_mirror_key(url, &digest)
+        );
     }
 
     #[test]

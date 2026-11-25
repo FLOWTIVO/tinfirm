@@ -753,7 +753,7 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "driver": { "type": "string", "enum": ["digitalocean"] },
+            "driver": { "description": "digitalocean (Pro and Enterprise), node (every edition) or pod (paid; not in the runner host's binary yet)", "type": "string", "enum": ["digitalocean", "node", "pod"] },
             "template": { "type": "string", "minLength": 1 },
             "port": { "$ref": "#/definitions/port" },
             "startTimeout": { "type": "integer", "minimum": 30, "maximum": 3600 },
@@ -788,8 +788,163 @@
                   }
                 }
               }
+            },
+            "node": {
+              "description": "The node driver: sandbox nodes outside the cluster (ADR-0112), and this host's client certificate and key from a Secret",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "existingSecret": { "$ref": "#/definitions/secretName" },
+                "secretKeys": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "certificate": { "$ref": "#/definitions/secretKey" },
+                    "key": { "$ref": "#/definitions/secretKey" }
+                  }
+                },
+                "peerBuild": { "type": "string", "enum": ["warn", "refuse"] },
+                "publishedPorts": {
+                  "description": "The nodes' published bridge ports: firstPort to firstPort + maxVms - 1 of the node agents' helper.json",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["first", "last"],
+                  "properties": {
+                    "first": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+                    "last": { "type": "integer", "minimum": 1024, "maximum": 65535 }
+                  }
+                },
+                "nodes": {
+                  "type": "array",
+                  "maxItems": 64,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "address", "nodeSha256", "templates"],
+                    "properties": {
+                      "name": { "description": "1 to 32 of a-z, 0-9 and -", "type": "string", "pattern": "^[a-z0-9-]{1,32}$" },
+                      "address": { "description": "HOST:PORT of the node agent's TLS listener; an IPv6 address in brackets", "type": "string", "pattern": "^(\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9.-]+):[1-9][0-9]{0,4}$" },
+                      "nodeSha256": { "description": "The SHA-256 of the node's certificate, 64 hex digits", "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+                      "templates": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" } }
+                    }
+                  }
+                }
+              }
+            },
+            "cluster": {
+              "description": "Driver pod: the runs' namespace and what the chart installs there (ADR-0115, decision 2)",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "isolationStatement": { "description": "Word for word: the workers for runs hold nothing else", "type": "string" },
+                "namespace": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" },
+                "createNamespace": { "type": "boolean" },
+                "runServiceAccount": { "type": "string", "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$", "not": { "const": "default" } },
+                "admission": { "type": "string", "enum": ["validatingAdmissionPolicy", "external"] },
+                "quota": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "hard": { "description": "The ResourceQuota's hard; empty = derived from the template", "type": "object", "additionalProperties": { "type": ["string", "integer"] } }
+                  }
+                }
+              }
+            },
+            "pod": {
+              "description": "Driver pod: the run pod, as the driver's configuration takes it",
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": { "description": "No tag: the image is named by its digest alone", "type": "string", "pattern": "^([a-z0-9]([a-z0-9._-]*[a-z0-9])?(:[0-9]{1,5})?/)?[a-z0-9]([a-z0-9._-]*[a-z0-9])?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*$|^$" },
+                    "digest": { "type": "string", "pattern": "^(sha256:[a-f0-9]{64})?$" }
+                  }
+                },
+                "templates": {
+                  "type": "object",
+                  "maxProperties": 32,
+                  "propertyNames": { "pattern": "^[a-z0-9]([-a-z0-9]{0,30}[a-z0-9])?$" },
+                  "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["vcpus", "memoryMib", "diskMib"],
+                    "properties": {
+                      "vcpus": { "type": "integer", "minimum": 1, "maximum": 32 },
+                      "memoryMib": { "type": "integer", "minimum": 128, "maximum": 262144 },
+                      "diskMib": { "type": "integer", "minimum": 1024, "maximum": 1048576 }
+                    }
+                  }
+                },
+                "tap": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "mode": { "type": "string", "enum": ["multus", "init"] },
+                    "networkAttachment": { "description": "multus only: the NetworkAttachmentDefinition, name or namespace/name", "type": "string", "pattern": "^(([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?/)?[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$" },
+                    "cidr": { "description": "An IPv4 /30", "type": "string", "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/30$" }
+                  }
+                },
+                "devices": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kvm": { "description": "A device plugin's resource name, domain/name", "type": "string", "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$" },
+                    "tun": { "description": "A device plugin's resource name, domain/name", "type": "string", "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$" }
+                  }
+                },
+                "nodeSelector": { "type": "object", "maxProperties": 16, "additionalProperties": { "type": "string" } },
+                "tolerations": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "key": { "description": "A label key", "type": "string", "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$" },
+                      "operator": { "type": "string", "enum": ["Equal", "Exists"] },
+                      "value": { "description": "A label value", "type": "string", "pattern": "^([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$" },
+                      "effect": { "type": "string", "enum": ["NoSchedule", "PreferNoSchedule", "NoExecute"] },
+                      "tolerationSeconds": { "type": "integer" }
+                    }
+                  }
+                },
+                "disk": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "variant": { "description": "copy, the only one built", "type": "string", "enum": ["copy"] },
+                    "volume": { "type": "string", "enum": ["emptyDir", "ephemeral"] },
+                    "storageClassName": { "description": "volume ephemeral only; empty = the cluster's default", "type": "string", "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$" }
+                  }
+                }
+              }
             }
-          }
+          },
+          "allOf": [
+            {
+              "description": "driver node: the DigitalOcean driver's templates are not used, so none may be set",
+              "if": { "required": ["driver"], "properties": { "driver": { "const": "node" } } },
+              "then": { "properties": { "digitalocean": { "properties": { "templates": { "maxProperties": 0 } } } } }
+            },
+            {
+              "description": "driver digitalocean: the node driver's nodes are not used, so none may be set",
+              "if": { "required": ["driver"], "properties": { "driver": { "const": "digitalocean" } } },
+              "then": { "properties": { "node": { "properties": { "nodes": { "maxItems": 0 } } } } }
+            },
+            {
+              "description": "driver pod: neither the DigitalOcean driver's templates nor the node driver's nodes are used, so none may be set",
+              "if": { "required": ["driver"], "properties": { "driver": { "const": "pod" } } },
+              "then": { "properties": { "digitalocean": { "properties": { "templates": { "maxProperties": 0 } } }, "node": { "properties": { "nodes": { "maxItems": 0 } } } } }
+            },
+            {
+              "description": "driver digitalocean or node: the pod driver's templates are not used, so none may be set",
+              "if": { "required": ["driver"], "properties": { "driver": { "enum": ["digitalocean", "node"] } } },
+              "then": { "properties": { "pod": { "properties": { "templates": { "maxProperties": 0 } } } } }
+            }
+          ]
         },
         "pool": {
           "type": "object",
@@ -834,7 +989,20 @@
         "nodeSelector": { "type": "object" },
         "tolerations": { "type": "array" },
         "affinity": { "type": "object" }
-      }
+      },
+      "allOf": [
+        {
+          "description": "enabled with driver node: at least one node, each with its address and the SHA-256 of its certificate",
+          "if": {
+            "required": ["enabled", "vm"],
+            "properties": {
+              "enabled": { "const": true },
+              "vm": { "required": ["driver"], "properties": { "driver": { "const": "node" } } }
+            }
+          },
+          "then": { "properties": { "vm": { "properties": { "node": { "required": ["nodes"], "properties": { "nodes": { "minItems": 1 } } } } } } }
+        }
+      ]
     },
     "serviceAccount": {
       "type": "object",
@@ -1039,6 +1207,25 @@
                   "required": ["to"],
                   "properties": {
                     "to": { "type": "array", "items": { "type": "object" } }
+                  }
+                },
+                "nodes": {
+                  "description": "driver node: the peers of the nodes' agent ports and published bridge ports. Empty = each node's own address (an IP address; a host name needs peers here)",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["to"],
+                  "properties": {
+                    "to": { "type": "array", "items": { "type": "object" } }
+                  }
+                },
+                "apiServer": {
+                  "description": "driver pod: the API server's own addresses and ports, which the driver calls. Required with driver pod",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["to", "ports"],
+                  "properties": {
+                    "to": { "type": "array", "items": { "type": "object" } },
+                    "ports": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/port" } }
                   }
                 },
                 "extra": { "type": "array", "items": { "type": "object" } }

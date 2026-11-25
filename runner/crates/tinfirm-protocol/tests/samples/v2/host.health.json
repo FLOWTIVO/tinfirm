@@ -1,0 +1,10 @@
+{
+  "type": "host.health",
+  "problems": [
+    {
+      "code": "VM_DRIVER_NO_VM",
+      "message": "node sandbox-1: the nftables table inet tinfirm is missing"
+    }
+  ],
+  "since": "2026-11-20T09:15:00.000Z"
+}

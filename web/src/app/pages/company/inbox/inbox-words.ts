@@ -198,8 +198,10 @@ export const WAITING_TEXTS: Record<QueueReasonCode, string> = {
   MODEL_ACCESS_UNAVAILABLE: 'Nobody can pay for it as your settings stand.',
   NO_HOST_FOR_CREDENTIALS: 'No runner host may carry its credentials.',
   NO_RUNNER_HOST: 'No runner host can run it.',
+  NO_HOST_OF_LEVEL: 'No runner host reports the level of isolation chosen for its agent.',
   RUNNER_HOST_OFFLINE: 'Its runner host is offline.',
   RUNNER_HOST_DRAINING: 'Its runner host is restarting.',
+  RUNNER_HOST_UNHEALTHY: 'Its runner host reports that it can take no run now.',
   CREDENTIAL_POOL_FULL: 'Its subscription is busy with other turns.',
   RUNNER_HOST_FULL: 'Every slot of the runner host is in use.',
   PREVIOUS_RUN_ACTIVE: 'The host still finishes an earlier turn of it.',
@@ -207,6 +209,7 @@ export const WAITING_TEXTS: Record<QueueReasonCode, string> = {
   ASSIGNED: 'Sent to a runner host, waiting for it to start.',
   TRIGGER_PAUSED: 'Its trigger is paused; its turns wait until it is resumed.',
   NO_HOST_FOR_SKILLS: 'No connected runner host can give its agent its skills yet.',
+  NO_HOST_FOR_APP_TOKENS: 'No connected runner host can renew the tokens of its GitHub App yet.',
   RETRY_SCHEDULED: 'Its turn failed for a reason that may pass; it is retried by itself soon.',
   OTHER: 'It waits for a runner host.',
 };
@@ -314,15 +317,16 @@ export function inboxRowView(item: InboxItem, reader: InboxReader): InboxRowView
       const system = a.systemName ?? 'a system';
       const waiting = `It keeps ${plural(a.conversations, 'conversation')} waiting.`;
       if (a.reason === 'SUSPENDED') {
-        const holder = a.holderName ?? 'A service account';
+        // A member or a service account, suspended by an admin, by the user's deactivation or by the
+        // identity provider: the item carries none of these, so it says what holds whatever the cause,
+        // and Kill switches says which and who lifts it.
+        const holder = a.holderName ?? 'The account’s holder';
         return {
           kind: 'Suspended',
           title: `${holder} is suspended`,
-          body: `The credential it borrows on ${system} acts for nothing through it until an admin resumes it. ${waiting}`,
+          body: `Nothing acts on ${system} through ${a.holderName ?? 'them'} until the suspension is lifted. Kill switches shows why and who lifts it. ${waiting}`,
           tone: 'human',
-          link: a.holderPrincipalId
-            ? { label: `Open ${holder}`, commands: ['service-identities', a.holderPrincipalId] }
-            : null,
+          link: { label: 'Open Kill switches', commands: ['kill-switches'] },
           action: null,
         };
       }
@@ -371,6 +375,16 @@ export function inboxRowView(item: InboxItem, reader: InboxReader): InboxRowView
           body: `${waiting} Store new client credentials for it on ${system}’s page.`,
           tone: 'human',
           link: { label: 'Store new client credentials', ...atIt },
+          action: null,
+        };
+      }
+      if (c.kind === 'APP') {
+        return {
+          kind: 'GitHub App installation',
+          title: `${credential} cannot mint tokens`,
+          body: `${waiting} GitHub refused the App’s installation: check the App and its installation on ${system}’s page.`,
+          tone: 'human',
+          link: { label: `Open ${system}`, ...atIt },
           action: null,
         };
       }

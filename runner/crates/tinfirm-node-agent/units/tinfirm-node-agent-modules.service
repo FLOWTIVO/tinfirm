@@ -1,0 +1,27 @@
+# The kernel modules a sandbox node needs, loaded once at boot, so that the helper may load
+# none (its unit has ProtectKernelModules=yes, and a hardened node sets
+# kernel.modules_disabled=1 after this unit).
+[Unit]
+Description=Tinfirm node agent: the kernel modules of a sandbox node
+Before=tinfirm-node-agent-helper.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# KVM for the processor that is there: one of the two fails, by design. On aarch64 both do:
+# KVM is built into that kernel.
+ExecStart=-/usr/sbin/modprobe kvm_intel
+ExecStart=-/usr/sbin/modprobe kvm_amd
+# The snapshot over the shared image; the veth and the tap device of a VM; the two firewall
+# tables of a VM with their connection tracking and their DNAT.
+ExecStart=/usr/sbin/modprobe -a dm_snapshot loop tun veth nf_tables nft_ct nft_chain_nat nft_nat nf_nat
+
+# The kernel's list of built-in modules, where the helper can read it: its own unit hides
+# /lib/modules, and a module that is built in has no entry under /sys/module to count by.
+# A kernel without the list (none is built in, or its package ships none) is no failure.
+RuntimeDirectory=tinfirm-node-agent-modules
+RuntimeDirectoryMode=0755
+ExecStart=-/usr/bin/install -m 0444 /lib/modules/%v/modules.builtin /run/tinfirm-node-agent-modules/modules.builtin
+
+[Install]
+WantedBy=multi-user.target

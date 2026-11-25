@@ -1,0 +1,38 @@
+---
+# Renders the hardening's three files for one case of render.yml into render_dir/hardening/<case>/.
+# The case's switches come as the include's vars.
+- name: Create the case's directory
+  ansible.builtin.file:
+    path: "{{ render_dir }}/hardening/{{ _case }}"
+    state: directory
+    mode: "0755"
+
+- name: Render the case's files
+  ansible.builtin.template:
+    src: "{{ _node }}/templates/{{ item.src }}"
+    dest: "{{ render_dir }}/hardening/{{ _case }}/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - {src: hardening.sysctl.conf.j2, dest: 61-tinfirm-node-hardening.conf}
+    - {src: hardening.json.j2, dest: hardening.json}
+    - {src: helper.json.j2, dest: helper.json}
+
+- name: Render the profile as the role installs it
+  ansible.builtin.copy:
+    content: "{{ _tinfirm_sandbox_node_profile_text }}"
+    dest: "{{ render_dir }}/hardening/{{ _case }}/tinfirm-vmm"
+    mode: "0644"
+  when: _tinfirm_sandbox_node_harden_on.mac | bool
+
+- name: Write what the tasks derive for the case
+  ansible.builtin.copy:
+    content: "{{ _derived | to_nice_json }}\n"
+    dest: "{{ render_dir }}/hardening/{{ _case }}/derived.json"
+    mode: "0644"
+  vars:
+    _derived:
+      mark_lines: "{{ _tinfirm_sandbox_node_mark_lines }}"
+      pending: "{{ _tinfirm_sandbox_node_hardening_pending }}"
+      packages: "{{ _tinfirm_sandbox_node_packages }}"
+      mac: "{{ _tinfirm_sandbox_node_mac }}"
+      profile_loaded: "{{ _tinfirm_sandbox_node_profile_loaded }}"

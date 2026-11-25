@@ -1,0 +1,40 @@
+---
+# Handlers run in this order. Restarting the helper leaves its VMs running (each VMM is in a
+# cgroup of its own); restarting the modules' unit restarts the helper and the listener too,
+# which require it.
+- name: Apply the node's sysctl settings
+  ansible.builtin.command:
+    argv: [sysctl, -p, /etc/sysctl.d/60-tinfirm-node-agent.conf]
+  changed_when: true
+
+- name: Restart the node's kernel modules
+  ansible.builtin.systemd_service:
+    name: tinfirm-node-agent-modules.service
+    state: restarted
+    daemon_reload: true
+
+- name: Reload the node's firewall
+  ansible.builtin.systemd_service:
+    name: tinfirm-node-agent-firewall.service
+    state: reloaded
+    daemon_reload: true
+
+# A oneshot: a restart runs `harden` again, with the new hardening.json. What it set stays set
+# until a reboot, whatever the file now says.
+- name: Run the node's hardening again
+  ansible.builtin.systemd_service:
+    name: tinfirm-node-agent-hardening.service
+    state: restarted
+    daemon_reload: true
+
+- name: Restart the node agent's helper
+  ansible.builtin.systemd_service:
+    name: tinfirm-node-agent-helper.service
+    state: restarted
+    daemon_reload: true
+
+- name: Restart the node agent's listener
+  ansible.builtin.systemd_service:
+    name: tinfirm-node-agent-listener.service
+    state: restarted
+    daemon_reload: true

@@ -25,17 +25,27 @@
 //! While the agent runs, the workspace's `origin` points at the runner host's fetch-only
 //! git proxy ([`crate::git_proxy`]), so the agent can fetch without credentials. `sanitize`
 //! puts the clone-time `origin` back.
+//!
+//! With the sandbox bridge the host's clone is one the agent never touched, and a sandbox's
+//! commits come into it through a reader that holds no credential ([`crate::reader`]): the
+//! fetch from the sandbox's bundle with every object checked, and the checkout. From then on
+//! the clone holds objects a sandbox made, so every command on it runs in a reader too
+//! ([`Git::read_through`]), but the push, which needs the run's git token ([`Git::push`]).
+//!
+//! A `Git` holds no token of its own: it reads its repository's from the run's holder
+//! ([`crate::git_tokens`]) when a command needs it, so a token the server revoked is never
+//! used again (ADR-0116).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
 use tinfirm_protocol::{Secret, WorkspaceSpec};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::git_tokens::{RepoTokens, Revocation, RunGitTokens};
 use crate::redact::Redactor;
 
 /// Output of a finished git command.
@@ -45,9 +55,6 @@ pub struct GitOutput {
     pub stdout: String,
     pub stderr: String,
 }
-
-/// Where [`Git::import_bundle`] fetches the sandbox's HEAD to, for a moment.
-const IMPORTED_REF: &str = "refs/tinfirm/sandbox";
 
 /// What `git config` writes as `origin` before [`Git::set_origin_url`] puts the real URL
 /// into `.git/config`.
@@ -76,7 +83,8 @@ const SAFE_SETTINGS: [&str; 12] = [
 /// second time once a fetch from a bundle has updated the refs, and by then the new pack can
 /// hold that number: a later read past the pack's first window (1 GiB by default) then failed
 /// with "packfile … cannot be mapped: Bad file descriptor", and a sandbox's commits of over
-/// 1 GiB did not come back ([`Git::import_bundle`]). A bundle has 8 GiB at most
+/// 1 GiB did not come back (the reader's import, [`crate::reader::Reader::import_bundle`]). A
+/// bundle has 8 GiB at most
 /// (`BUNDLE_LIMITS` of the sandbox bridge), plus the bases `index-pack --fix-thin` appends;
 /// 1 TiB leaves room for both. git maps at most the pack's size, so the value costs only
 /// address space. Not on Windows, whose git reads the value into a 32-bit `unsigned long`.
@@ -98,13 +106,24 @@ pub(crate) fn low_priority_command(cwd: &Path) -> Command {
     configure(cmd, cwd, None)
 }
 
-fn configure(mut cmd: Command, cwd: &Path, authorization: Option<&Secret>) -> Command {
+/// The `-c` arguments of [`SAFE_SETTINGS`] and the pack window, as every host-side git command
+/// starts, the reader's included ([`crate::reader`]).
+pub(crate) fn safe_config_args() -> Vec<String> {
+    let mut args = Vec::with_capacity(2 * SAFE_SETTINGS.len() + 2);
     for setting in SAFE_SETTINGS {
-        cmd.arg("-c").arg(setting);
+        args.push("-c".to_string());
+        args.push(setting.to_string());
     }
     #[cfg(not(windows))]
-    cmd.arg("-c")
-        .arg(format!("core.packedGitWindowSize={PACK_WINDOW_BYTES}"));
+    {
+        args.push("-c".to_string());
+        args.push(format!("core.packedGitWindowSize={PACK_WINDOW_BYTES}"));
+    }
+    args
+}
+
+fn configure(mut cmd: Command, cwd: &Path, authorization: Option<&Secret>) -> Command {
+    cmd.args(safe_config_args());
     cmd.current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "true")
@@ -173,37 +192,70 @@ pub(crate) async fn run_ok(
     Ok(out.stdout)
 }
 
-/// Runs git with `input` on stdin (revision lists that can be long).
-async fn run_with_input(cwd: &Path, args: &[&str], input: String) -> Result<GitOutput> {
-    let mut child = command(cwd, None)
-        .args(args)
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("cannot run git; is it installed?")?;
-    let mut stdin = child.stdin.take().context("no stdin")?;
-    let writer = tokio::spawn(async move {
-        let _ = stdin.write_all(input.as_bytes()).await;
-        let _ = stdin.shutdown().await;
+/// Runs `cmd` (git, or a reader that runs git: `group`) with `input` on stdin, and collects
+/// its output. A reader runs in a process group of its own, which is killed once the reader
+/// has ended: whatever it started, which could hold its output open, goes with it.
+async fn collect(mut cmd: Command, input: Option<String>, group: bool) -> Result<GitOutput> {
+    use tokio::io::AsyncReadExt;
+    if input.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("cannot run git; is it installed?")?;
+    let pgid = child.id();
+    let writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => Some(tokio::spawn(async move {
+            let _ = stdin.write_all(input.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        })),
+        _ => None,
+    };
+    let mut stdout = child.stdout.take().context("no stdout")?;
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let out = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf).await;
+        buf
     });
-    let output = child.wait_with_output().await?;
-    let _ = writer.await;
+    let err = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+    // A reader's group goes while its leader is not reaped yet, so that its id is its own.
+    let status = match pgid.filter(|_| group) {
+        Some(pgid) => {
+            let waited = tokio::task::spawn_blocking(move || crate::confine::wait_unreaped(pgid))
+                .await
+                .unwrap_or(false);
+            if waited {
+                crate::confine::kill_group(pgid);
+                child.wait().await
+            } else {
+                let status = child.wait().await;
+                crate::confine::kill_group(pgid);
+                status
+            }
+        }
+        None => child.wait().await,
+    };
+    let status = status?;
+    if let Some(writer) = writer {
+        let _ = writer.await;
+    }
+    let stdout = out.await.unwrap_or_default();
+    let stderr = err.await.unwrap_or_default();
     Ok(GitOutput {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        status,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
 }
 
 /// The `Authorization` header value (`Basic …`) for a repository's credentials.
 pub fn authorization_for(spec: &WorkspaceSpec) -> Option<Secret> {
-    spec.git.as_ref().map(|g| {
-        let basic = base64::engine::general_purpose::STANDARD.encode(format!(
-            "{}:{}",
-            g.username,
-            g.token.expose()
-        ));
-        Secret::new(format!("Basic {basic}"))
-    })
+    spec.git
+        .as_ref()
+        .map(|g| crate::git_tokens::basic_authorization(&g.username, &g.token))
 }
 
 /// A branch or tag of a mirror and the object it points at.
@@ -235,26 +287,32 @@ pub fn branch_tip<'a>(refs: &'a [MirrorRef], branch: &str) -> Option<&'a str> {
 pub struct Git {
     dir: PathBuf,
     repo_url: String,
-    /// Value of the `Authorization` header (`Basic …`).
-    authorization: Option<Secret>,
+    /// The repository's token, read from the run's holder at each use.
+    tokens: RepoTokens,
     author_name: String,
     author_email: String,
     config_snapshot: Option<Vec<u8>>,
     /// The mirror's refs when the workspace was cloned (host-controlled).
     base: Vec<MirrorRef>,
+    /// Set once the clone holds objects that a sandbox sent ([`Git::read_through`]): every
+    /// command that reads them runs in a reader.
+    reader: Option<crate::reader::Reader>,
 }
 
 impl Git {
-    /// `identity` is the (name, email) for commits the host makes (the WIP commit).
+    /// `identity` is the (name, email) for commits the host makes (the WIP commit). The token
+    /// is `spec`'s, in a holder of its own; a run's repository reads its run's holder instead
+    /// ([`Git::with_tokens`]).
     pub fn new(dir: impl Into<PathBuf>, spec: &WorkspaceSpec, identity: (String, String)) -> Git {
         Git {
             dir: dir.into(),
             repo_url: spec.repo_url.clone(),
-            authorization: authorization_for(spec),
+            tokens: RunGitTokens::standalone(spec),
             author_name: identity.0,
             author_email: identity.1,
             config_snapshot: None,
             base: Vec::new(),
+            reader: None,
         }
     }
 
@@ -274,6 +332,17 @@ impl Git {
         }
     }
 
+    /// Reads the token from `tokens`, the run's holder, from now on.
+    pub fn with_tokens(mut self, tokens: RepoTokens) -> Git {
+        self.tokens = tokens;
+        self
+    }
+
+    /// The holder this repository reads its token from.
+    pub fn tokens(&self) -> &RepoTokens {
+        &self.tokens
+    }
+
     /// `.git/config` as the clone wrote it.
     pub fn config_snapshot(&self) -> Option<&[u8]> {
         self.config_snapshot.as_deref()
@@ -287,9 +356,15 @@ impl Git {
         &self.repo_url
     }
 
-    /// The `Authorization` header value, for the redactor, the mirror and the git proxy.
-    pub fn authorization(&self) -> Option<&Secret> {
-        self.authorization.as_ref()
+    /// The `Authorization` header value now, for the mirror: `Ok(None)` for a public
+    /// repository, `Err` once the run's token for it was revoked.
+    pub fn authorization(&self) -> Result<Option<Secret>, Revocation> {
+        self.tokens.authorization()
+    }
+
+    /// Why the run's token for this repository is gone, if it is.
+    pub fn revocation(&self) -> Option<Revocation> {
+        self.tokens.revocation()
     }
 
     /// The mirror's refs at clone time.
@@ -297,13 +372,52 @@ impl Git {
         &self.base
     }
 
+    /// From now on, every git command on this clone but the push runs in a reader of
+    /// `reader` that may only read the clone ([`crate::reader::Reader::git_command`]): with the
+    /// sandbox bridge, the clone takes objects that a sandbox sent (ADR-0112, open question 1).
+    pub fn read_through(&mut self, reader: crate::reader::Reader) {
+        self.reader = Some(reader);
+    }
+
+    /// Whether the clone's git commands run in readers ([`Git::read_through`]).
+    pub fn reads_through_reader(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    /// The readers this clone's git commands run in, once it holds a sandbox's objects.
+    pub(crate) fn reader(&self) -> Option<&crate::reader::Reader> {
+        self.reader.as_ref()
+    }
+
+    /// git with `args` on this clone: with the token for `auth` (the push alone), in a reader
+    /// once the clone holds a sandbox's objects, and otherwise in this host's process tree.
+    async fn run_input(
+        &self,
+        auth: bool,
+        args: &[&str],
+        input: Option<String>,
+    ) -> Result<GitOutput> {
+        match (&self.reader, auth) {
+            (Some(reader), false) => {
+                collect(reader.git_command(&self.dir, args), input, true).await
+            }
+            _ => {
+                let authorization = if auth {
+                    self.tokens
+                        .authorization()
+                        .map_err(|revocation| anyhow!("not pushed: {revocation}"))?
+                } else {
+                    None
+                };
+                let mut cmd = command(&self.dir, authorization.as_ref());
+                cmd.args(args);
+                collect(cmd, input, false).await
+            }
+        }
+    }
+
     async fn run(&self, auth: bool, args: &[&str]) -> Result<GitOutput> {
-        let authorization = if auth {
-            self.authorization.as_ref()
-        } else {
-            None
-        };
-        run(&self.dir, authorization, args).await
+        self.run_input(auth, args, None).await
     }
 
     async fn run_ok(&self, auth: bool, args: &[&str]) -> Result<String> {
@@ -519,7 +633,9 @@ impl Git {
             input.push_str(sha);
             input.push('\n');
         }
-        let out = run_with_input(&self.dir, &["cat-file", "--batch-check"], input).await?;
+        let out = self
+            .run_input(false, &["cat-file", "--batch-check"], Some(input))
+            .await?;
         if !out.status.success() {
             bail!("git cat-file failed: {}", out.stderr.trim());
         }
@@ -532,58 +648,23 @@ impl Git {
             .collect())
     }
 
-    /// With the sandbox bridge (ADR-0095): takes the commits of a bundle that the sandbox made
-    /// into this clone, which the agent never touched, every object checked (`fsckObjects`),
-    /// and moves HEAD (the task branch) and the work tree to `head`, which must be the
-    /// bundle's HEAD.
-    pub async fn import_bundle(&self, bundle: &Path, head: &str) -> Result<()> {
-        if !is_object_name(head) {
-            bail!("`{head}` is not an object name");
-        }
-        let bundle = bundle.to_string_lossy().into_owned();
-        self.run_ok(
-            false,
-            &[
-                "-c",
-                "fetch.fsckObjects=true",
-                "-c",
-                "transfer.fsckObjects=true",
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--",
-                &bundle,
-                &format!("+HEAD:{IMPORTED_REF}"),
-            ],
-        )
-        .await
-        .context("the sandbox's commits do not fetch")?;
-        let fetched = self
-            .run_ok(false, &["rev-parse", "--verify", IMPORTED_REF])
-            .await?;
-        let _ = self.run(false, &["update-ref", "-d", IMPORTED_REF]).await;
-        if fetched.trim() != head {
-            bail!("the sandbox's bundle holds another HEAD than it reported");
-        }
-        self.import_head(head).await
-    }
-
-    /// Moves HEAD (the task branch) and the work tree to `head`, a commit this clone has.
+    /// Moves HEAD (the task branch) and the work tree to `head`, a commit this clone has: the
+    /// sandbox made no commit the clone lacks. The clone holds only the host's objects here, so
+    /// this runs in the host's process tree, as before the reader; a sandbox's commits come in
+    /// through a reader ([`crate::reader::Reader::import_bundle`]).
     pub async fn import_head(&self, head: &str) -> Result<()> {
         if !is_object_name(head) {
             bail!("`{head}` is not an object name");
         }
         let commit = format!("{head}^{{commit}}");
-        if !self
-            .run(false, &["cat-file", "-e", &commit])
+        if !run(&self.dir, None, &["cat-file", "-e", &commit])
             .await?
             .status
             .success()
         {
             bail!("the sandbox's HEAD {head} is not in the repository");
         }
-        self.run_ok(false, &["reset", "--hard", "--quiet", head])
-            .await?;
+        run_ok(&self.dir, None, &["reset", "--hard", "--quiet", head]).await?;
         Ok(())
     }
 
@@ -593,12 +674,13 @@ impl Git {
         if !is_object_name(base) {
             bail!("`{base}` is not an object name");
         }
-        let out = run_with_input(
-            &self.dir,
-            &["rev-list", "--count", "--stdin"],
-            format!("HEAD\n^{base}\n"),
-        )
-        .await?;
+        let out = self
+            .run_input(
+                false,
+                &["rev-list", "--count", "--stdin"],
+                Some(format!("HEAD\n^{base}\n")),
+            )
+            .await?;
         if !out.status.success() {
             bail!("git rev-list failed: {}", out.stderr.trim());
         }
@@ -625,37 +707,41 @@ impl Git {
             revisions.push_str(sha);
             revisions.push('\n');
         }
-        let messages = run_with_input(
-            &self.dir,
-            &["log", "--format=%an%n%ae%n%cn%n%ce%n%B", "--stdin"],
-            revisions.clone(),
-        )
-        .await?;
+        let messages = self
+            .run_input(
+                false,
+                &["log", "--format=%an%n%ae%n%cn%n%ce%n%B", "--stdin"],
+                Some(revisions.clone()),
+            )
+            .await?;
         if !messages.status.success() {
             bail!("git log failed: {}", messages.stderr.trim());
         }
         if redactor.contains(&messages.stdout) {
             return Ok(true);
         }
-        let objects = run_with_input(
-            &self.dir,
-            &[
-                "rev-list",
-                "--objects",
-                "--no-object-names",
-                "--missing=allow-promisor",
-                "--stdin",
-            ],
-            revisions,
-        )
-        .await?;
+        let objects = self
+            .run_input(
+                false,
+                &[
+                    "rev-list",
+                    "--objects",
+                    "--no-object-names",
+                    "--missing=allow-promisor",
+                    "--stdin",
+                ],
+                Some(revisions),
+            )
+            .await?;
         if !objects.status.success() {
             bail!("git rev-list failed: {}", objects.stderr.trim());
         }
         if objects.stdout.trim().is_empty() {
             return Ok(false);
         }
-        let content = run_with_input(&self.dir, &["cat-file", "--batch"], objects.stdout).await?;
+        let content = self
+            .run_input(false, &["cat-file", "--batch"], Some(objects.stdout))
+            .await?;
         if !content.status.success() {
             bail!("git cat-file failed: {}", content.stderr.trim());
         }
@@ -671,6 +757,16 @@ impl Git {
     /// repository checks the expected value again when it updates the ref. Never a plain
     /// force. The URL is named explicitly, so nothing in `.git/config` decides where the push
     /// goes.
+    ///
+    /// This push (`run --push-client git`, the default) runs in the host's process tree with
+    /// the token, also when the clone reads through a reader: git's `pack-objects` then reads
+    /// objects that a sandbox sent. They were checked by `fsck` in the reader, the clone's
+    /// `.git` was put back by [`Git::sanitize`], and the refspec names the run's branch alone.
+    /// What a flaw of git's in reading such objects would still reach from here is the
+    /// process's environment (this run's git token) and the files of the host's user; not the
+    /// host's memory, which is not dumpable ([`crate::confine::protect_host_process`]).
+    /// runner/README.md, "The reader". The runner host's own client closes that
+    /// ([`Git::push_with`], [`crate::git_push`]).
     pub async fn push(&self, branch: &str) -> Result<GitOutput> {
         let refname = format!("refs/heads/{branch}");
         let expected = match branch_tip(&self.base, branch) {
@@ -693,6 +789,44 @@ impl Git {
             ],
         )
         .await
+    }
+}
+
+impl Git {
+    /// The push of `head` (HEAD, as the run checked it; read again when `None`) to
+    /// `refs/heads/<branch>`, by the client `settings` names, with the same lease as
+    /// [`Git::push`]. `run --push-client host` ([`crate::git_push`]): the runner host's own
+    /// receive-pack client, for http(s) repositories; the pack is made in a process that holds
+    /// no token (a reader, once the clone holds a sandbox's objects), and the token stays in
+    /// this process. A repository of another scheme (`file://`, the tests and local
+    /// development) is pushed by git, which needs no token for it. The output is in
+    /// `git push --porcelain`'s words either way.
+    pub async fn push_with(
+        &self,
+        branch: &str,
+        head: Option<String>,
+        settings: &crate::git_push::PushSettings,
+    ) -> Result<GitOutput> {
+        if settings.client == crate::git_push::PushClient::Git {
+            return self.push(branch).await;
+        }
+        // The scheme as `url` reads it (case-insensitive), as the client's own parse does; a
+        // plain http repository the client refuses unless the host takes it.
+        let scheme = url::Url::parse(&self.repo_url)
+            .map(|u| u.scheme().to_string())
+            .unwrap_or_default();
+        if scheme == "https" || scheme == "http" {
+            let head = match head {
+                Some(head) => head,
+                None => self.head().await?,
+            };
+            return crate::git_push::push(self, branch, &head, settings.allow_http).await;
+        }
+        tracing::info!(
+            scheme = %scheme,
+            "--push-client host takes http(s) repositories alone: git push pushes this one"
+        );
+        self.push(branch).await
     }
 }
 

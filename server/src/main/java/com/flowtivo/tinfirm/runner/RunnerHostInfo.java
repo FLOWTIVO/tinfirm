@@ -23,14 +23,31 @@ import org.jspecify.annotations.Nullable;
  * @param runnerVersion            the version of its latest {@code hello}; null before it connected. Shown and logged
  *                                 only: what a host can do is its protocol and its features (ADR-0109)
  * @param lastSeenAt               when the host was last connected, or null if it never was
+ * @param isolationLevel           the level of isolation its latest {@code hello} reported in
+ *                                 {@code isolationTiers} (ADR-0113); null before its first hello to a server of this
+ *                                 release, and such a host is placed as {@link IsolationLevel#CONTAINER} (decision 2).
+ *                                 Reported, never checked (decision 3)
+ * @param hardened                 the hardening it reported with the level; null exactly when the level is
+ * @param stated                   whether the level rests on its operator's statement rather than on what the host can
+ *                                 see; false without a level
  */
 public record RunnerHostInfo(UUID id, UUID companyId, String name, HostScope scope, @Nullable UUID ownerPrincipalId,
         @Nullable UUID personalHostId, int maxConcurrentRuns, int maxConcurrentRunsCeiling, @Nullable Integer desiredMaxConcurrentRuns,
         boolean draining, @Nullable Set<RuntimeKind> runtimes, @Nullable String runnerVersion,
-        @Nullable Instant lastSeenAt) {
+        @Nullable Instant lastSeenAt, @Nullable IsolationLevel isolationLevel, @Nullable Hardening hardened,
+        boolean stated) {
 
     public RunnerHostInfo {
         runtimes = runtimes != null ? Set.copyOf(runtimes) : null;
+    }
+
+    /** A host whose isolation is not known: it reports no level. */
+    public RunnerHostInfo(UUID id, UUID companyId, String name, HostScope scope, @Nullable UUID ownerPrincipalId,
+            @Nullable UUID personalHostId, int maxConcurrentRuns, int maxConcurrentRunsCeiling,
+            @Nullable Integer desiredMaxConcurrentRuns, boolean draining, @Nullable Set<RuntimeKind> runtimes,
+            @Nullable String runnerVersion, @Nullable Instant lastSeenAt) {
+        this(id, companyId, name, scope, ownerPrincipalId, personalHostId, maxConcurrentRuns, maxConcurrentRunsCeiling,
+                desiredMaxConcurrentRuns, draining, runtimes, runnerVersion, lastSeenAt, null, null, false);
     }
 
     /** Whether the host can run the runtime: it reported its image, or reported no runtimes at all yet. */
@@ -44,7 +61,7 @@ public record RunnerHostInfo(UUID id, UUID companyId, String name, HostScope sco
             boolean draining, @Nullable Set<RuntimeKind> runtimes, @Nullable String runnerVersion,
             @Nullable Instant lastSeenAt) {
         this(id, companyId, name, scope, ownerPrincipalId, null, maxConcurrentRuns, maxConcurrentRunsCeiling,
-                desiredMaxConcurrentRuns, draining, runtimes, runnerVersion, lastSeenAt);
+                desiredMaxConcurrentRuns, draining, runtimes, runnerVersion, lastSeenAt, null, null, false);
     }
 
     /** Whether this is a company host. */

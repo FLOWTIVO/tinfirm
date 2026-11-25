@@ -1,5 +1,7 @@
 package com.flowtivo.tinfirm.run.internal;
 
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -61,9 +63,12 @@ class TurnStarter implements Turns {
 
     private final TimeSource time;
 
+    private final GitRevocationService revocations;
+
     TurnStarter(RunStore runs, RunPorts ports, RunCommandStore commands, RunCompletion completion,
             RunnerConnections connections, RunEventHub hub, ApplicationEventPublisher publisher, AuditLog auditLog,
-            TimeSource time) {
+            TimeSource time, GitRevocationService revocations) {
+        this.revocations = revocations;
         this.runs = runs;
         this.ports = ports;
         this.commands = commands;
@@ -102,14 +107,32 @@ class TurnStarter implements Turns {
             .detail("turnReason", turn.reason().name())
             .detail("payerPrincipalId", turn.payerPrincipalId().toString())
             .detail("modelAccess", modelAccess(turn.modelAccess()))
-            .details(scheduled != null ? Map.of("automatic", true, "attempt", scheduled.attempt(), "retryAt",
-                    scheduled.at().toString()) : Map.of())
+            .details(automatic(scheduled))
             .build());
         log.info("Run {} created for turn {} of conversation {} ({}{})", run.id(), turn.number(),
                 turn.conversationKey(), turn.reason(), scheduled != null ? ", automatic " + scheduled.attempt()
                         + " of " + scheduled.attempts() + " at " + scheduled.at() : "");
         publisher.publishEvent(new DispatchNeeded(run.id()));
         return Optional.of(run.id());
+    }
+
+    /**
+     * An automatic retry's details of {@code run.started} (ADR-0073): {@code automatic}, {@code attempt} and
+     * {@code retryAt}; and {@code beforePrompt} for a run lost before its agent got a prompt, started again without
+     * its owner's choice.
+     */
+    private static Map<String, Object> automatic(NewTurn.@Nullable Scheduled scheduled) {
+        if (scheduled == null) {
+            return Map.of();
+        }
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("automatic", true);
+        details.put("attempt", scheduled.attempt());
+        details.put("retryAt", scheduled.at().toString());
+        if (scheduled.beforePrompt()) {
+            details.put("beforePrompt", true);
+        }
+        return details;
     }
 
     @Override
@@ -172,7 +195,13 @@ class TurnStarter implements Turns {
                 UUID hostId = run.runnerHostId();
                 if (hostId != null) {
                     RunnerMessages.RunCancel cancel = new RunnerMessages.RunCancel(run.id(), run.epoch());
-                    AfterCommit.run(() -> connections.send(hostId, cancel));
+                    // ADR-0116: a cancelled run pushes its work, so its host hears the run's revocations first, also
+                    // one that another transaction committed and has not sent yet (a suspension's binding change).
+                    List<RunnerMessages.RunGitRevoke> first = revocations.beforeLiveCancel(run);
+                    AfterCommit.run(() -> {
+                        first.forEach(revoke -> connections.send(hostId, revoke));
+                        connections.send(hostId, cancel);
+                    });
                 }
                 hub.changedAfterCommit(run.id());
                 return true;

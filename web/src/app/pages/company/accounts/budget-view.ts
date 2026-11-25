@@ -73,7 +73,7 @@ function notice(access: ModelAccessView, resetsDay: string | null): BudgetNotice
       return {
         key: 'blocked',
         title: 'Your budget is blocked',
-        body: 'Your access to this company is suspended, so nothing is paid by your budget until an admin resumes it.',
+        body: 'Your access to this company is suspended, so nothing is paid by your budget until the suspension is lifted.',
       };
     case 'ERROR':
       return {

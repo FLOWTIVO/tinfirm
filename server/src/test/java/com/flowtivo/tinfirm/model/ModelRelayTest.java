@@ -36,6 +36,7 @@ import com.flowtivo.tinfirm.runner.RuntimeKind;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.FakeLiteLlm;
 import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.IntegrationTest;
@@ -222,6 +223,34 @@ class ModelRelayTest extends IntegrationTest {
         // Only the token's hash is kept.
         assertThat(transactions.inCompany(setup.company().id(), () -> relay.usage(setup.company().id(), runId)))
             .isEqualTo(new ModelRelay.RelayUsage(0, 0, 0));
+    }
+
+    /**
+     * A request whose own first transaction, its admission, finds no free connection: the token's lookup and the
+     * request's authorization before it, the key's reveal with its record included, are no change of the request, so
+     * the runtime is told the server is busy, nothing is counted and nothing reaches the gateway.
+     */
+    @Test
+    void aRequestThatFindsNoFreeConnectionForItsAdmissionIsToldTheServerIsBusy() throws Exception {
+        Setup setup = setUp();
+        UUID runId = UUID.randomUUID();
+        String token = running(setup, runId);
+        int before = litellm.requests("/v1/messages").size();
+
+        HttpResponse<String> answer;
+        try (AutoCloseable busy = ConnectionWatch
+            .timeOutAt("com.flowtivo.tinfirm.model.internal.ModelRelayService.forward")) {
+            answer = post(MESSAGES, token, message("claude-sonnet-4-5"));
+        }
+
+        assertThat(answer.statusCode()).as(answer.body()).isEqualTo(503);
+        assertThat(json(answer).get("code").asString()).isEqualTo("SERVER_BUSY");
+        assertThat(answer.headers().firstValue("Retry-After")).hasValue("2");
+        assertThat(litellm.requests("/v1/messages")).hasSize(before);
+        try (TenantSql sql = TenantSql.in(setup.company().id())) {
+            assertThat(sql.count("SELECT admitted_count FROM run_model_token WHERE company_id = ?",
+                    setup.company().id())).isZero();
+        }
     }
 
     @Test

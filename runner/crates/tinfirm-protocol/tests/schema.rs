@@ -290,6 +290,8 @@ fn constructed_messages() -> Vec<Message> {
             public_suffix_list: None,
             features: vec![],
             pool: None,
+            hardened: None,
+            isolation_stated: false,
         }),
         Message::Welcome(Welcome {
             protocol_version: None,
@@ -298,6 +300,7 @@ fn constructed_messages() -> Vec<Message> {
             server_version: None,
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         }),
         Message::RunAssign(RunAssign {
             run_id: run_id(),
@@ -366,10 +369,7 @@ fn constructed_messages() -> Vec<Message> {
                     repo_url: "https://github.com/o/server.git".into(),
                     default_branch: "main".into(),
                     branch: "agent/X-1".into(),
-                    git: Some(GitCredentials {
-                        username: "x-access-token".into(),
-                        token: Secret::new("t"),
-                    }),
+                    git: Some(GitCredentials::new("x-access-token", Secret::new("t"))),
                     author_name: Some("Tinfirm agent A".into()),
                     author_email: Some("a@tinfirm.invalid".into()),
                     read_only: false,
@@ -1454,7 +1454,7 @@ fn every_v2_message_and_event_type_has_a_sample() {
         .collect();
     assert_eq!(
         kinds,
-        ["ACCESS", "ARTIFACT", "ASK", "NETWORK", "TOOL"]
+        ["ACCESS", "ARTIFACT", "ASK", "GIT_TOKEN", "NETWORK", "TOOL"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -1504,7 +1504,7 @@ fn constructed_messages_v2() -> Vec<Message> {
             os: None,
             arch: None,
             executors: vec![Executor::Docker],
-            isolation_tiers: vec![IsolationTier::Microvm],
+            isolation_tiers: vec![IsolationTier::Container],
             max_concurrent_runs: 4,
             credentials: vec![],
             runtimes: vec![],
@@ -1514,6 +1514,8 @@ fn constructed_messages_v2() -> Vec<Message> {
             }),
             features: vec![feature::RUN_STEER.into(), feature::RUN_SKILLS.into()],
             pool: None,
+            hardened: None,
+            isolation_stated: false,
         }),
         // A host that keeps ready sandboxes (ADR-0098, ADR-0099), above the 16 of a host with
         // Docker (D12).
@@ -1524,7 +1526,7 @@ fn constructed_messages_v2() -> Vec<Message> {
             os: None,
             arch: None,
             executors: vec![Executor::Docker],
-            isolation_tiers: vec![IsolationTier::Microvm],
+            isolation_tiers: vec![IsolationTier::Machine],
             max_concurrent_runs: MAX_HOST_CAPACITY,
             credentials: vec![],
             runtimes: vec![],
@@ -1532,6 +1534,64 @@ fn constructed_messages_v2() -> Vec<Message> {
             public_suffix_list: None,
             features: vec![feature::SANDBOX_POOL.into()],
             pool: Some(HelloPool { max_ready: 4 }),
+            hardened: Some(Hardened::None),
+            isolation_stated: false,
+        }),
+        // Each level of isolation (ADR-0113): a node host's `vm-jail`, gVisor, and a level
+        // that the operator stated.
+        Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION_V2,
+            runner_version: "1.0.0".into(),
+            hostname: None,
+            os: None,
+            arch: None,
+            executors: vec![Executor::Docker],
+            isolation_tiers: vec![IsolationTier::VmJail],
+            max_concurrent_runs: 4,
+            credentials: vec![],
+            runtimes: vec![],
+            active_runs: None,
+            public_suffix_list: None,
+            features: vec![],
+            pool: None,
+            hardened: None,
+            isolation_stated: false,
+        }),
+        Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION_V2,
+            runner_version: "1.0.0".into(),
+            hostname: None,
+            os: None,
+            arch: None,
+            executors: vec![Executor::Docker],
+            isolation_tiers: vec![IsolationTier::Gvisor],
+            max_concurrent_runs: 2,
+            credentials: vec![],
+            runtimes: vec![],
+            active_runs: None,
+            public_suffix_list: None,
+            features: vec![],
+            pool: None,
+            hardened: None,
+            isolation_stated: false,
+        }),
+        Message::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION_V2,
+            runner_version: "1.0.0".into(),
+            hostname: None,
+            os: None,
+            arch: None,
+            executors: vec![Executor::Docker],
+            isolation_tiers: vec![IsolationTier::VmJail],
+            max_concurrent_runs: 4,
+            credentials: vec![],
+            runtimes: vec![],
+            active_runs: None,
+            public_suffix_list: None,
+            features: vec![],
+            pool: None,
+            hardened: Some(Hardened::Yes),
+            isolation_stated: true,
         }),
         Message::HostConfig(HostConfig {
             version: 9,
@@ -1573,6 +1633,17 @@ fn constructed_messages_v2() -> Vec<Message> {
             served_ready: 31,
             served_cold: 4,
         }),
+        Message::HostHealth(HostHealth {
+            problems: vec![HostProblem {
+                code: HostProblemCode::VmDriverNoVm,
+                message: "the table is missing".into(),
+            }],
+            since: Some(Utc.with_ymd_and_hms(2026, 11, 20, 9, 15, 0).unwrap()),
+        }),
+        Message::HostHealth(HostHealth {
+            problems: vec![],
+            since: None,
+        }),
         Message::HostPoolStatus(HostPoolStatus {
             ready: 0,
             starting: 0,
@@ -1588,6 +1659,7 @@ fn constructed_messages_v2() -> Vec<Message> {
             server_version: Some("0.2.0".into()),
             heartbeat_interval_seconds: 10,
             lease_ttl_seconds: 30,
+            features: Vec::new(),
         }),
         Message::RunAssign(RunAssign {
             run_id: run_id(),
@@ -1749,6 +1821,49 @@ fn constructed_messages_v2() -> Vec<Message> {
         )));
     }
     out.push(Message::RunSteer(steer));
+    out.push(Message::WelcomeDone(WelcomeDone {}));
+    out.push(request(RequestPayload::GitToken(GitTokenRequest {
+        component_ids: vec![component_id()],
+    })));
+    out.push(ack(
+        RequestStatus::Done,
+        Some(
+            serde_json::to_value(GitTokens {
+                git: vec![GitToken {
+                    component_id: component_id(),
+                    username: "x-access-token".into(),
+                    token: Secret::new("ghs_renewed"),
+                    expires_at: at,
+                }],
+                refused: vec![GitTokenRefused {
+                    component_id: Uuid::new_v4(),
+                    code: request_code::GIT_UNAVAILABLE.into(),
+                    message: "GitHub could not be reached.".into(),
+                }],
+            })
+            .unwrap(),
+        ),
+        None,
+    ));
+    for code in [
+        request_code::GIT_REVOKED,
+        request_code::GIT_HELD,
+        request_code::GIT_UNAVAILABLE,
+    ] {
+        out.push(ack(RequestStatus::Rejected, None, Some(code)));
+    }
+    out.push(Message::RunGitRevoke(RunGitRevoke {
+        run_id: run_id(),
+        epoch: 1,
+        component_ids: vec![component_id(), Uuid::new_v4()],
+        reason: "SYSTEM_PAUSED".into(),
+        message: "Tinfirm revoked this run's access: the system was paused.".into(),
+    }));
+    out.push(Message::RunGitRevoked(RunGitRevoked {
+        run_id: run_id(),
+        epoch: 1,
+        component_ids: vec![component_id(), Uuid::new_v4()],
+    }));
     for (i, event) in all_payloads(true).into_iter().enumerate() {
         out.push(Message::RunEvent(RunEvent {
             run_id: run_id(),
@@ -1835,10 +1950,13 @@ fn the_versions_refuse_each_others_frames() {
     assert_eq!(assign.platform_tools, None);
     let out = serde_json::to_value(Message::RunAssign(assign)).unwrap();
     assert!(out.get("platformTools").is_none());
-    // `microvm` is a v2 tier, and an additive change of the v1 schema.
+    // The v1 schema still has `microvm` (an additive change of protocol v2's first release),
+    // which no host of this release sends, and this crate no longer reads (ADR-0113, decision
+    // 2): a v1 host reports `container`.
     let mut hello = sample("hello.json");
     hello["isolationTiers"] = json!(["microvm"]);
-    assert_valid(&v1, &hello, "microvm in v1");
+    assert_valid(&v1, &hello, "microvm in the v1 schema");
+    assert!(Message::from_value(hello.clone()).is_err());
     hello["isolationTiers"] = json!(["vm"]);
     assert!(!v1.is_valid(&hello));
     assert!(Message::from_value(hello).is_err());
@@ -2465,6 +2583,217 @@ fn steer_bounds_and_versions() {
 }
 
 #[test]
+fn git_refresh_shapes() {
+    let v = validator_v2();
+    // run.assign: expiresAt and mirrorKey come together, read into the types and back.
+    let assign = sample_v2("run.assign-git-refresh.json");
+    assert_valid(&v, &assign, "run.assign with expiresAt and mirrorKey");
+    let Message::RunAssign(parsed) = Message::from_value(assign.clone()).unwrap() else {
+        panic!("not run.assign");
+    };
+    let git = parsed.workspaces[0].git.as_ref().unwrap();
+    assert_eq!(
+        git.expires_at,
+        Some(Utc.with_ymd_and_hms(2026, 11, 19, 15, 0, 0).unwrap())
+    );
+    assert!(is_valid_mirror_key(git.mirror_key.as_deref().unwrap()));
+    for field in ["expiresAt", "mirrorKey"] {
+        let mut alone = assign.clone();
+        alone["workspaces"][0]["git"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            !v.is_valid(&alone),
+            "one without the other ({field} removed)"
+        );
+    }
+    for bad in ["3F".repeat(32), "3f".repeat(31), "g".repeat(64)] {
+        let mut frame = assign.clone();
+        frame["workspaces"][0]["git"]["mirrorKey"] = json!(bad);
+        assert!(!v.is_valid(&frame), "mirrorKey {bad}");
+        assert!(!is_valid_mirror_key(&bad));
+    }
+    // A token without them reads as one that lives until the run ends, and writes neither.
+    let plain = sample_v2("run.assign.json");
+    let Message::RunAssign(plain) = Message::from_value(plain).unwrap() else {
+        panic!("not run.assign");
+    };
+    let git = plain.workspaces[0].git.as_ref().unwrap();
+    assert_eq!((git.expires_at, git.mirror_key.as_deref()), (None, None));
+    let out = serde_json::to_value(git).unwrap();
+    assert!(out.get("expiresAt").is_none() && out.get("mirrorKey").is_none());
+    // The request and its answers.
+    let request = sample_v2("run.request-git-token.json");
+    let Message::RunRequest(parsed) = Message::from_value(request.clone()).unwrap() else {
+        panic!("not run.request");
+    };
+    assert_eq!(parsed.request.kind(), RequestKind::GitToken);
+    let mut empty = request.clone();
+    empty["payload"]["componentIds"] = json!([]);
+    assert!(!v.is_valid(&empty), "no repository");
+    let done = sample_v2("run.request.ack-git-tokens.json");
+    let Message::RunRequestAck(ack) = Message::from_value(done).unwrap() else {
+        panic!("not run.request.ack");
+    };
+    let tokens = ack.git_tokens().unwrap();
+    assert_eq!(tokens.git.len(), 1);
+    assert_eq!(tokens.git[0].token.expose(), "ghs_TEST_ONLY_renewed_token");
+    assert!(!format!("{tokens:?}").contains("ghs_TEST_ONLY_renewed_token"));
+    assert_eq!(tokens.refused[0].code, request_code::GIT_HELD);
+    let revoked = sample_v2("run.request.ack-git-revoked.json");
+    assert_valid(&v, &revoked, "GIT_REVOKED");
+    // The feature is a valid feature name.
+    let mut hello = sample_v2("hello.json");
+    hello["features"] = json!([feature::RUN_GIT_REVOKE, feature::RUN_GIT_REFRESH]);
+    assert_valid(&v, &hello, "hello with run.git.refresh");
+}
+
+#[test]
+fn git_revoke_bounds_and_versions() {
+    let v1 = validator();
+    let v2 = validator_v2();
+    let revoke = sample_v2("run.git.revoke.json");
+    assert_valid(&v2, &revoke, "run.git.revoke");
+    // A v2 feature (ADR-0116): v1 knows no such frame.
+    assert!(!v1.is_valid(&revoke), "run.git.revoke is not a v1 frame");
+    assert!(Message::from_value_version(revoke.clone(), PROTOCOL_VERSION).is_err());
+    let Message::RunGitRevoke(parsed) =
+        Message::from_value_version(revoke.clone(), PROTOCOL_VERSION_V2).unwrap()
+    else {
+        panic!("not run.git.revoke");
+    };
+    assert_eq!(parsed.component_ids, vec![component_id()]);
+    assert_eq!(parsed.reason, "GRANT_REMOVED");
+    for field in ["runId", "epoch", "componentIds", "reason", "message"] {
+        let mut frame = revoke.clone();
+        frame.as_object_mut().unwrap().remove(field);
+        assert!(!v2.is_valid(&frame), "run.git.revoke without {field}");
+        assert!(
+            Message::from_value(frame).is_err(),
+            "run.git.revoke without {field}"
+        );
+    }
+    // Always named, never "every repository"; at most one per workspace.
+    let mut none = revoke.clone();
+    none["componentIds"] = json!([]);
+    assert!(!v2.is_valid(&none), "no repository");
+    let mut many = revoke.clone();
+    many["componentIds"] = json!(
+        (0..=GIT_REVOKE_MAX_COMPONENTS)
+            .map(|_| Uuid::new_v4().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(!v2.is_valid(&many), "too many repositories");
+    many["componentIds"] = json!(
+        (0..GIT_REVOKE_MAX_COMPONENTS)
+            .map(|_| Uuid::new_v4().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_valid(&v2, &many, "repositories at the limit");
+    // A reason is a code; one the host does not know is no error.
+    let mut later = revoke.clone();
+    later["reason"] = json!("SOME_LATER_REASON");
+    assert_valid(&v2, &later, "an unknown reason code");
+    assert!(Message::from_value(later).is_ok());
+    let mut lower = revoke.clone();
+    lower["reason"] = json!("grant_removed");
+    assert!(!v2.is_valid(&lower), "a reason is upper case");
+    // The message: 1 to 1000 characters.
+    let mut empty = revoke.clone();
+    empty["message"] = json!("");
+    assert!(!v2.is_valid(&empty), "empty message");
+    let mut long = revoke.clone();
+    long["message"] = json!("x".repeat(GIT_REVOKE_MESSAGE_MAX_CHARS));
+    assert_valid(&v2, &long, "message at the limit");
+    long["message"] = json!("x".repeat(GIT_REVOKE_MESSAGE_MAX_CHARS + 1));
+    assert!(!v2.is_valid(&long), "message above the limit");
+    // welcome.features: the server's own features, optional; an older server sends none.
+    let welcome = sample_v2("welcome-features.json");
+    assert_valid(&v2, &welcome, "welcome with features");
+    let Message::Welcome(parsed) = Message::from_value(welcome.clone()).unwrap() else {
+        panic!("not welcome");
+    };
+    assert!(parsed.lists(feature::RUN_GIT_REVOKE) && parsed.lists(feature::RUN_GIT_REFRESH));
+    let Message::Welcome(older) = Message::from_value(sample_v2("welcome.json")).unwrap() else {
+        panic!("not welcome");
+    };
+    assert!(older.features.is_empty() && !older.lists(feature::RUN_GIT_REVOKE));
+    assert!(
+        serde_json::to_value(Message::Welcome(older))
+            .unwrap()
+            .get("features")
+            .is_none()
+    );
+    let mut bad = welcome.clone();
+    bad["features"] = json!(["Run.Git.Revoke"]);
+    assert!(!v2.is_valid(&bad));
+    // welcome.done: the type alone, v2 only.
+    let done = sample_v2("welcome.done.json");
+    assert_valid(&v2, &done, "welcome.done");
+    assert!(!v1.is_valid(&done), "welcome.done is not a v1 frame");
+    assert!(Message::from_value_version(done.clone(), PROTOCOL_VERSION).is_err());
+    assert_eq!(
+        Message::from_value_version(done.clone(), PROTOCOL_VERSION_V2).unwrap(),
+        Message::WelcomeDone(WelcomeDone {})
+    );
+    assert_eq!(
+        serde_json::to_value(Message::WelcomeDone(WelcomeDone {})).unwrap(),
+        json!({"type": "welcome.done"})
+    );
+    // The feature's name is a valid feature.
+    let mut hello = sample_v2("hello.json");
+    hello["features"] = json!([feature::RUN_STEER, feature::RUN_GIT_REVOKE]);
+    assert_valid(&v2, &hello, "hello with run.git.revoke");
+}
+
+#[test]
+fn git_revoked_names_one_to_twenty_distinct_repositories_and_only_in_v2() {
+    let v1 = validator();
+    let v2 = validator_v2();
+    let revoked = sample_v2("run.git.revoked.json");
+    assert_valid(&v2, &revoked, "run.git.revoked");
+    // A v2 feature (ADR-0116): v1 knows no such frame.
+    assert!(!v1.is_valid(&revoked), "run.git.revoked is not a v1 frame");
+    assert!(Message::from_value_version(revoked.clone(), PROTOCOL_VERSION).is_err());
+    let Message::RunGitRevoked(parsed) =
+        Message::from_value_version(revoked.clone(), PROTOCOL_VERSION_V2).unwrap()
+    else {
+        panic!("not run.git.revoked");
+    };
+    assert_eq!(parsed.component_ids, vec![component_id()]);
+    assert_eq!(parsed.epoch, 1);
+    for field in ["runId", "epoch", "componentIds"] {
+        let mut frame = revoked.clone();
+        frame.as_object_mut().unwrap().remove(field);
+        assert!(!v2.is_valid(&frame), "run.git.revoked without {field}");
+        assert!(
+            Message::from_value(frame).is_err(),
+            "run.git.revoked without {field}"
+        );
+    }
+    let mut none = revoked.clone();
+    none["componentIds"] = json!([]);
+    assert!(!v2.is_valid(&none), "no repository");
+    let ids: Vec<String> = (0..GIT_REVOKE_MAX_COMPONENTS)
+        .map(|_| Uuid::new_v4().to_string())
+        .collect();
+    let mut many = revoked.clone();
+    many["componentIds"] = json!(ids);
+    assert_valid(&v2, &many, "repositories at the limit");
+    let mut more = ids.clone();
+    more.push(Uuid::new_v4().to_string());
+    many["componentIds"] = json!(more);
+    assert!(!v2.is_valid(&many), "too many repositories");
+    let mut twice = revoked.clone();
+    twice["componentIds"] = json!([component_id(), component_id()]);
+    assert!(!v2.is_valid(&twice), "a repository named twice");
+    let mut not_an_id = revoked.clone();
+    not_an_id["componentIds"] = json!(["shop"]);
+    assert!(!v2.is_valid(&not_an_id), "not a uuid");
+}
+
+#[test]
 fn run_assign_skills_are_an_optional_v2_list() {
     let v = validator_v2();
     // Named: read into the frame and written back as it came.
@@ -2574,4 +2903,115 @@ fn skill_name_helper_matches_the_schema() {
             "the helper and the schema disagree on {name:?}"
         );
     }
+}
+
+#[test]
+fn hello_reports_its_level_of_isolation_in_its_tiers() {
+    let v2 = validator_v2();
+    let hello = sample_v2("hello-isolation.json");
+    assert_valid(&v2, &hello, "hello with machine and hardened none");
+    let Message::Hello(parsed) = Message::from_value(hello.clone()).unwrap() else {
+        panic!("not hello");
+    };
+    assert_eq!(parsed.isolation_tiers, vec![IsolationTier::Machine]);
+    assert_eq!(parsed.hardened, Some(Hardened::None));
+    assert!(!parsed.isolation_stated);
+    // `isolationStated` is left out when false, and written when true; `hardened` is left
+    // out when absent.
+    let out = serde_json::to_value(Message::Hello(parsed.clone())).unwrap();
+    assert_eq!(out["isolationTiers"], json!(["machine"]));
+    assert_eq!(out["hardened"], json!("none"));
+    assert!(out.get("isolationStated").is_none(), "{out}");
+    let mut stated = parsed.clone();
+    stated.isolation_tiers = vec![IsolationTier::VmJail];
+    stated.hardened = Some(Hardened::No);
+    stated.isolation_stated = true;
+    let out = serde_json::to_value(Message::Hello(stated)).unwrap();
+    assert_eq!(out["isolationTiers"], json!(["vm-jail"]));
+    assert_eq!(out["hardened"], json!("no"));
+    assert_eq!(out["isolationStated"], json!(true));
+    assert_valid(&v2, &out, "a stated level");
+    let mut container = parsed;
+    container.isolation_tiers = vec![IsolationTier::Container];
+    container.hardened = None;
+    let out = serde_json::to_value(Message::Hello(container)).unwrap();
+    assert!(out.get("hardened").is_none(), "{out}");
+    assert_valid(&v2, &out, "container, hardened left out");
+
+    // Every level, `gvisor` included, and each hardening.
+    for tier in ["machine", "vm-jail", "container", "gvisor"] {
+        for hardened in ["yes", "no", "none"] {
+            let mut frame = hello.clone();
+            frame["isolationTiers"] = json!([tier]);
+            frame["hardened"] = json!(hardened);
+            assert_valid(&v2, &frame, &format!("{tier}, hardened {hardened}"));
+            assert!(Message::from_value(frame).is_ok(), "{tier} {hardened}");
+        }
+    }
+    // `microvm` is no value any more (ADR-0113, decision 2).
+    let mut microvm = hello.clone();
+    microvm["isolationTiers"] = json!(["microvm"]);
+    microvm.as_object_mut().unwrap().remove("hardened");
+    assert!(!v2.is_valid(&microvm), "microvm");
+    assert!(Message::from_value(microvm).is_err(), "microvm");
+    // Only the schema's values of `hardened` and `isolationStated`.
+    for bad in [json!("maybe"), json!("No"), json!(true), json!(null)] {
+        let mut frame = hello.clone();
+        frame["hardened"] = bad.clone();
+        assert!(!v2.is_valid(&frame), "hardened {bad}");
+    }
+    let mut frame = hello.clone();
+    frame["hardened"] = json!("maybe");
+    assert!(Message::from_value(frame).is_err(), "hardened maybe");
+    let mut frame = hello.clone();
+    frame["isolationStated"] = json!("yes");
+    assert!(!v2.is_valid(&frame), "isolationStated yes");
+}
+
+/// `host.health` (ADR-0117): at most 8 problems, a code of the closed list, a message of one
+/// line of at most 1000 characters; an empty list is a healthy host.
+#[test]
+fn host_health_is_bounded() {
+    let v2 = validator_v2();
+    let unhealthy = sample_v2("host.health.json");
+    assert_valid(&v2, &unhealthy, "host.health");
+    let healthy = sample_v2("host.health-healthy.json");
+    assert_valid(&v2, &healthy, "host.health without problems");
+    let Message::HostHealth(parsed) = Message::from_value(unhealthy.clone()).unwrap() else {
+        panic!("not host.health");
+    };
+    assert_eq!(parsed.problems[0].code, HostProblemCode::VmDriverNoVm);
+    assert!(parsed.since.is_some());
+
+    let problem = unhealthy["problems"][0].clone();
+    let mut eight = unhealthy.clone();
+    eight["problems"] = json!(vec![problem.clone(); HOST_PROBLEMS_MAX]);
+    assert_valid(&v2, &eight, "eight problems");
+    let mut nine = unhealthy.clone();
+    nine["problems"] = json!(vec![problem; HOST_PROBLEMS_MAX + 1]);
+    assert!(!v2.is_valid(&nine), "nine problems");
+
+    let mut longest = unhealthy.clone();
+    longest["problems"][0]["message"] = json!("x".repeat(HOST_PROBLEM_MESSAGE_MAX));
+    assert_valid(&v2, &longest, "the longest message");
+    let mut too_long = unhealthy.clone();
+    too_long["problems"][0]["message"] = json!("x".repeat(HOST_PROBLEM_MESSAGE_MAX + 1));
+    assert!(!v2.is_valid(&too_long), "a message too long");
+    for text in ["two\nlines", "a\ttab", "", "bell\u{7}"] {
+        let mut frame = unhealthy.clone();
+        frame["problems"][0]["message"] = json!(text);
+        assert!(!v2.is_valid(&frame), "message {text:?}");
+    }
+    for code in ["SOMETHING_ELSE", "vm_driver_no_vm", ""] {
+        let mut frame = unhealthy.clone();
+        frame["problems"][0]["code"] = json!(code);
+        assert!(!v2.is_valid(&frame), "code {code}");
+        assert!(Message::from_value(frame).is_err(), "code {code}");
+    }
+    let mut no_problems = healthy;
+    no_problems.as_object_mut().unwrap().remove("problems");
+    assert!(!v2.is_valid(&no_problems));
+    assert!(Message::from_value(no_problems).is_err());
+    // Not a frame of protocol 1.
+    assert!(Message::parse_version(&unhealthy.to_string(), PROTOCOL_VERSION).is_err());
 }

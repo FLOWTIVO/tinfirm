@@ -1,0 +1,16 @@
+== io.max from the template, on a real VM (guest: the image's boot, Docker's start and the bridge's)
+-- no ioMax in the template
+no-limit: the guest's bridge answers 3614 ms after the create was sent
+cat: /sys/fs/cgroup/tinfirm-vms/tfvm-00000000007d-0000/io.max: No such file or directory
+cat: /sys/fs/cgroup/tinfirm-vms/tfvm-00000000007d-0000/io.stat: No such file or directory
+  the snapshot's device 252:0; io.max of the VM's cgroup: ; io.stat:
+  delete: delete: ({}, 58)
+-- ioMax: readBytesPerSecond 4 MiB, writeBytesPerSecond 4 MiB, readsPerSecond 200, writesPerSecond 200
+verify: 19 ms, problems [], maxVms 2
+limited: the guest's bridge answers 181905 ms after the create was sent
+  the snapshot's device 252:0; io.max of the VM's cgroup: 252:0 rbps=4194304 wbps=4194304 riops=200 wiops=200;; io.stat: 7:1 rbytes=0 wbytes=1441792 rios=0 wios=352 dbytes=0 dios=0;259:0 rbytes=0 wbytes=65536 rios=0 wios=7 dbytes=0 dios=0;7:0 rbytes=180547584 wbytes=0 rios=44079 wios=0 dbytes=0 dios=0;252:0 rbytes=180707328 wbytes=7712768 rios=44079 wios=1883 dbytes=0 dios=0;
+  delete: delete: ({}, 2736)
+-- back to no limit
+no-limit-again: the guest's bridge answers 3164 ms after the create was sent
+  delete: delete: ({}, 94)
+left: jails 0, VMMs 0, device-mapper 0, cgroups 0

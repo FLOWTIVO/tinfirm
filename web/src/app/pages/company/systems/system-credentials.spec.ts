@@ -35,6 +35,7 @@ import {
 import { words } from '../../../testing/words';
 import { formatDay } from '../../../shared/time';
 import {
+  checkMessages,
   credentialProblem,
   credentialState,
   memberAccountsLine,
@@ -62,12 +63,24 @@ const CI_BOT = aSystemCredential({
   serviceAccounts: [],
 });
 
+/** An installation of GitHub's App that GitHub refused at a mint, lent as svc-reader is. */
+const ACME_APP = aSystemCredential({
+  id: 'cred-app',
+  name: 'Acme App',
+  kind: 'APP',
+  status: 'RECONNECT',
+  login: 'acme',
+  lastError:
+    'GitHub refused to mint a token of the installation: GitHub answered 401: Bad credentials',
+});
+
 describe('credential words', () => {
   it.each`
     case                    | credential                                                    | label                  | tone
     ${'working'}            | ${aSystemCredential()}                                        | ${'Working'}           | ${'success'}
     ${'a refused sign-in'}  | ${CI_BOT}                                                     | ${'Sign in again'}     | ${'human'}
     ${'a refused token'}    | ${aSystemCredential({ status: 'RECONNECT' })}                 | ${'Store a new token'} | ${'human'}
+    ${'a refused App'}      | ${ACME_APP}                                                   | ${'Check again'}       | ${'human'}
     ${'broken'}             | ${aSystemCredential({ status: 'ERROR' })}                     | ${'Not working'}       | ${'destructive'}
     ${'disabled, whatever'} | ${aSystemCredential({ status: 'RECONNECT', enabled: false })} | ${'Disabled'}          | ${'neutral'}
   `('a credential $case reads “$label”', ({ credential, label, tone }) => {
@@ -159,6 +172,21 @@ describe('credential words', () => {
       error: problem(400, 'ACCOUNT_REFUSED', 'GitHub answered 401'),
     });
     expect(credentialProblem(refused, 'GitHub')).toBe('GitHub answered 401.');
+  });
+
+  it('says why an installation does not work yet in GitHub’s own words', () => {
+    const failed = (status: number, code: string, detail?: string) =>
+      new HttpErrorResponse({ status, error: problem(status, code, detail) });
+    expect(
+      checkMessages(failed(400, 'GITHUB_APP_REFUSED', 'GitHub answered 401: Bad credentials'))[
+        'GITHUB_APP_REFUSED'
+      ],
+    ).toBe('GitHub answered 401: Bad credentials.');
+    // Without a reason, and for any other problem, the codes' own words.
+    expect(checkMessages(failed(400, 'GITHUB_APP_REFUSED'))['GITHUB_APP_REFUSED']).toBeUndefined();
+    expect(
+      checkMessages(failed(502, 'GITHUB_UNREACHABLE', 'GitHub answered 503'))['GITHUB_APP_REFUSED'],
+    ).toBeUndefined();
   });
 });
 
@@ -717,6 +745,64 @@ describe('SystemCredentials', () => {
       .flush(null);
     await reread([aSystemCredential({ serviceAccounts: [] }), CI_BOT]);
     expect(notify.success).toHaveBeenCalledWith('svc-reader is withdrawn from svc-reader');
+  });
+
+  it('has GitHub asked again for an installation it refused, which then works as it was lent', async () => {
+    await open([ACME_APP, CI_BOT]);
+    // It takes no token or sign-in: the one thing to do is to have GitHub asked again.
+    expect(words(inRow(ACME_APP.id, 'credential-state'))).toBe('Check again');
+    expect(inRow(ACME_APP.id, 'credential-fix')).toBeNull();
+    expect(inRow(CI_BOT.id, 'credential-check')).toBeNull();
+    inRow(ACME_APP.id, 'credential-menu')!.click();
+    await settle();
+    expect(inOverlay('[data-testid=credential-reconnect]')).toBeNull();
+    overlay().replaceChildren();
+
+    // While GitHub refuses: its own answer, and the credential stays as it is.
+    const check = { method: 'POST', url: `${GITHUB}/credentials/${ACME_APP.id}/app` };
+    inRow(ACME_APP.id, 'credential-check')!.click();
+    await settle();
+    http
+      .expectOne(check)
+      .flush(problem(400, 'GITHUB_APP_REFUSED', 'GitHub answered 401: Bad credentials'), {
+        status: 400,
+        statusText: 'Bad Request',
+      });
+    await settle();
+    harness.detectChanges();
+    expect(notify.error).toHaveBeenCalledWith(
+      'Acme App does not work yet',
+      expect.anything(),
+      expect.objectContaining({ GITHUB_APP_REFUSED: 'GitHub answered 401: Bad credentials.' }),
+    );
+    expect(words(inRow(ACME_APP.id, 'credential-state'))).toBe('Check again');
+
+    // Once GitHub mints for it again, it works, with the grant and the lending it had.
+    inRow(ACME_APP.id, 'credential-check')!.click();
+    await settle();
+    const works = aSystemCredential({ ...ACME_APP, status: 'OK', lastError: null });
+    const asked = http.expectOne(check);
+    expect(asked.request.body).toBeNull();
+    asked.flush(works);
+    await reread([works, CI_BOT]);
+    expect(notify.success).toHaveBeenCalledWith('Acme App works again', 'As acme.');
+    expect(words(inRow(ACME_APP.id, 'credential-state'))).toBe('Working');
+    expect(inRow(ACME_APP.id, 'credential-check')).toBeNull();
+    expect(inRow(ACME_APP.id, 'credential-grant')?.getAttribute('data-group')).toBe('Analysts');
+    expect(inRow(ACME_APP.id, 'credential-lending')).not.toBeNull();
+  });
+
+  it('offers no check of a disabled installation, and none while the system is paused', async () => {
+    const off = aSystemCredential({
+      ...ACME_APP,
+      id: 'cred-app-off',
+      name: 'Old App',
+      enabled: false,
+    });
+    await open([ACME_APP, off], aSystem({ paused: true }));
+    expect(words(inRow(off.id, 'credential-state'))).toBe('Disabled');
+    expect(inRow(off.id, 'credential-check')).toBeNull();
+    expect(inRow(ACME_APP.id, 'credential-check')?.hasAttribute('disabled')).toBe(true);
   });
 
   it('disables and removes a credential from its menu', async () => {

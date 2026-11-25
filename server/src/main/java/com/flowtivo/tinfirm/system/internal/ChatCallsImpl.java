@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.tx.NoTransaction;
 import com.flowtivo.tinfirm.system.CallResult;
 import com.flowtivo.tinfirm.system.ChatCalls;
@@ -231,6 +232,11 @@ class ChatCallsImpl implements ChatCalls {
                 }
                 catch (RuntimeException ex) {
                     log.warn("A Socket Mode frame was not handled ({})", ex.getClass().getSimpleName());
+                }
+                finally {
+                    // The safety net of work kept for after a transaction (CONVENTIONS §10): the WebSocket client's
+                    // threads take the next frame.
+                    AfterTransaction.endOfWork("a Socket Mode frame");
                 }
             }
             webSocket.request(1);

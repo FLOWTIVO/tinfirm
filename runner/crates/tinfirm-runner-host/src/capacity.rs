@@ -7,6 +7,9 @@
 //!   a later `credential add` or `remove` does not change them.
 //! - The effective value is [`effective_capacity`] of the desired value and the ceiling. The
 //!   host has 0 slots while it drains (§15.4 step 13).
+//! - A host with a VM per run has at most the room of its driver's machines that answer while
+//!   others do not ([`Capacity::set_vm_room`], crate::vm): a local reason for a lower effective
+//!   value, which the host tells the server as it tells it of a drain. The ceiling stays.
 //! - `host.config` is the full desired state. On one connection, a `version` lower than the
 //!   last one applied is ignored; every new connection forgets that version. The desired
 //!   values themselves stay until the next `host.config` replaces them.
@@ -52,10 +55,13 @@ pub struct Capacity {
     /// The version applied last on the current connection; `None` before the first one.
     applied_version: Option<u64>,
     draining: bool,
-    /// A host with ready sandboxes (crate::pool): the operator's `maxReady`.
+    /// A host with ready sandboxes (crate::ready_vms): the operator's `maxReady`.
     pool_ceiling: Option<u32>,
     /// Tinfirm's count of ready sandboxes, as the last `host.config` gave it.
     desired_pool: Option<PoolConfig>,
+    /// With a VM per run, while part of the driver's machines do not answer: the most VMs this
+    /// host can have on those that do. `None` while every machine answers.
+    vm_room: Option<u32>,
 }
 
 impl Capacity {
@@ -70,6 +76,7 @@ impl Capacity {
             draining: false,
             pool_ceiling: None,
             desired_pool: None,
+            vm_room: None,
         }
     }
 
@@ -104,13 +111,30 @@ impl Capacity {
         self.credentials.iter().find(|c| c.label == label)
     }
 
-    /// The host's effective slots: 0 while draining.
+    /// The host's effective slots: 0 while draining, and at most the VM driver's room while
+    /// part of its machines do not answer ([`Capacity::set_vm_room`]).
     pub fn max_concurrent_runs(&self) -> u32 {
         if self.draining {
-            0
-        } else {
-            effective_capacity(self.desired_max_concurrent_runs, self.host_ceiling)
+            return 0;
         }
+        let slots = effective_capacity(self.desired_max_concurrent_runs, self.host_ceiling);
+        self.vm_room.map_or(slots, |room| slots.min(room))
+    }
+
+    /// The VM driver's room while part of its machines do not answer (crate::vm, `Vms::room`):
+    /// the most VMs this host can have on those that do, which may be none; `None` once every
+    /// machine answers again. Returns whether the host's effective slots changed.
+    pub fn set_vm_room(&mut self, room: Option<u32>) -> bool {
+        let before = self.max_concurrent_runs();
+        self.vm_room = room;
+        self.max_concurrent_runs() != before
+    }
+
+    /// The VM driver's room while it is what bounds the host's slots: fewer than the desired
+    /// value and the ceiling give.
+    pub fn bounding_vm_room(&self) -> Option<u32> {
+        let slots = effective_capacity(self.desired_max_concurrent_runs, self.host_ceiling);
+        self.vm_room.filter(|room| *room < slots && !self.draining)
     }
 
     /// The effective pool of `label`; `None` for a credential `run` did not start with.
@@ -381,6 +405,44 @@ mod tests {
         assert_eq!(applied.max_concurrent_runs, 0);
         assert_eq!(applied.max_concurrent_runs_ceiling, 4);
         assert_eq!(applied.credentials[0].pool_size, 2);
+    }
+
+    #[test]
+    fn the_vm_drivers_room_bounds_the_slots_while_it_is_set_and_never_the_ceiling() {
+        let mut c = capacity();
+        // Room above the slots changes nothing, and is not what bounds them.
+        assert!(!c.set_vm_room(Some(6)));
+        assert_eq!((c.max_concurrent_runs(), c.bounding_vm_room()), (4, None));
+        // Room for 2: the host has 2 slots, and its ceiling is what `run` started with.
+        assert!(c.set_vm_room(Some(2)));
+        assert!(!c.set_vm_room(Some(2)), "the same room changes nothing");
+        assert_eq!(c.max_concurrent_runs(), 2);
+        assert_eq!(c.bounding_vm_room(), Some(2));
+        let applied = answer(c.apply(&config(1, None, &[])));
+        assert_eq!(
+            (
+                applied.max_concurrent_runs,
+                applied.max_concurrent_runs_ceiling
+            ),
+            (2, 4)
+        );
+        // A desired value below the room is what counts, and one above it is bounded by it.
+        let applied = answer(c.apply(&config(2, Some(1), &[])));
+        assert_eq!(applied.max_concurrent_runs, 1);
+        assert_eq!(c.bounding_vm_room(), None);
+        let applied = answer(c.apply(&config(3, Some(3), &[])));
+        assert_eq!(applied.max_concurrent_runs, 2);
+        // No machine that answers has a free VM: no slot, and the host does not drain.
+        assert!(c.set_vm_room(Some(0)));
+        let applied = c.applied().unwrap();
+        assert_eq!((applied.max_concurrent_runs, applied.draining), (0, false));
+        // Every machine answers again: the slots of the desired value and the ceiling.
+        assert!(c.set_vm_room(None));
+        assert_eq!(c.applied().unwrap().max_concurrent_runs, 3);
+        // A draining host has no slot whatever the room, and the room changes none.
+        assert!(c.start_drain());
+        assert!(!c.set_vm_room(Some(1)));
+        assert_eq!((c.max_concurrent_runs(), c.bounding_vm_room()), (0, None));
     }
 
     #[test]

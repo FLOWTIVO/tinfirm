@@ -12,6 +12,7 @@
 //! turn and before the workspace is cleaned up, the files there are saved as artifacts of the
 //! job ([`crate::output`]) and listed in `run.finished.artifacts`.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,12 +32,15 @@ use crate::acp::{
     self, AcpControl, AcpInbound, AcpLine, AcpParams, AcpResult, AcpTransport, NotResumed,
     ThoughtLevel,
 };
-use crate::attachments::{self, AttachmentsDir, Upload, UploadSource};
+use crate::attachments::{self, AttachmentsDir, Upload, UploadResponse, UploadSource};
 use crate::credentials::Credential;
 use crate::docker;
 use crate::egress_proxy::{EgressGuard, Rule};
+use crate::front::sandbox::Serving;
+use crate::front::wire::Service;
 use crate::git::{self, Git, branch_tip, ref_shas};
 use crate::git_proxy::{GitProxy, McpGuard, RouteGuard};
+use crate::git_tokens::RunGitTokens;
 use crate::host::{Shared, StopRequest};
 use crate::limits::{self, AgentError, DEFAULT_COOLDOWN_MINUTES};
 use crate::mapper::{EventMapper, Signal};
@@ -49,7 +53,9 @@ use crate::sandbox_files::{self, Layout};
 use crate::session_bundles;
 use crate::skills::{self, ProvidedSkill};
 use crate::steer::Steering;
-use crate::takeback::{RecordHandle, RepoRecord, RunRecord};
+use crate::takeback::{
+    CollectedRecord, OutcomeRecord, RecordHandle, RepoRecord, RunRecord, SessionRecord,
+};
 use crate::usage::{UsageMode, prompt_usage};
 use crate::util::{
     EVENT_PAYLOAD_MAX, LOG_MESSAGE_MAX, SUMMARY_MAX, shrink_json, truncate_with_marker,
@@ -139,8 +145,14 @@ pub struct EventSink {
     shared: Arc<Shared>,
     run_id: Uuid,
     epoch: i64,
+    /// Shared with the run's other sinks ([`EventSink::side`]): one numbering per run.
+    numbering: Arc<std::sync::Mutex<Numbering>>,
+}
+
+/// The numbers of a run's events.
+struct Numbering {
     seq: u64,
-    /// The run's record while its sandbox lives (ADR-0101): it reserves the event numbers.
+    /// The run's record while it has one (ADR-0101): it reserves the event numbers.
     record: Option<Arc<RecordHandle>>,
 }
 
@@ -156,26 +168,51 @@ impl EventSink {
             shared,
             run_id,
             epoch,
-            seq,
-            record: None,
+            numbering: Arc::new(std::sync::Mutex::new(Numbering { seq, record: None })),
         }
+    }
+
+    /// A second sink of the same run, which numbers its events in the same sequence: for what
+    /// happens to the run outside its task, such as a revocation of its git tokens.
+    pub fn side(&self) -> EventSink {
+        EventSink {
+            shared: self.shared.clone(),
+            run_id: self.run_id,
+            epoch: self.epoch,
+            numbering: self.numbering.clone(),
+        }
+    }
+
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
+    fn numbering(&self) -> std::sync::MutexGuard<'_, Numbering> {
+        self.numbering.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps the run's record up to date from now on.
     pub fn keep_record(&mut self, record: Arc<RecordHandle>) {
-        self.record = Some(record);
+        self.numbering().record = Some(record);
     }
 
-    /// The sandbox is gone: its record too.
+    /// The run's record, while it has one.
+    pub fn record(&self) -> Option<Arc<RecordHandle>> {
+        self.numbering().record.clone()
+    }
+
+    /// Nothing is left to take back: the record goes.
     pub fn drop_record(&mut self) {
-        if let Some(record) = self.record.take() {
+        let record = self.numbering().record.take();
+        if let Some(record) = record {
             record.remove();
         }
     }
 
     /// The agent's session is open.
     pub fn session_opened(&self, session_id: &str) {
-        if let Some(record) = &self.record {
+        let record = self.numbering().record.clone();
+        if let Some(record) = record {
             record.session_opened(session_id);
         }
     }
@@ -213,17 +250,21 @@ impl EventSink {
         } else {
             payload
         };
-        self.seq += 1;
-        if let Some(record) = &self.record {
-            record.numbered(self.seq);
+        // Numbered and queued under one lock, so that the run's sinks queue in order.
+        let mut numbering = self.numbering();
+        numbering.seq += 1;
+        let seq = numbering.seq;
+        if let Some(record) = &numbering.record {
+            record.numbered(seq);
         }
         self.shared.outbox.push_event(RunEvent {
             run_id: self.run_id,
             epoch: self.epoch,
-            seq: self.seq,
+            seq,
             at: Utc::now(),
             event: payload,
         });
+        drop(numbering);
         hit
     }
 
@@ -257,7 +298,7 @@ impl EventSink {
     }
 
     pub fn last_seq(&self) -> u64 {
-        self.seq
+        self.numbering().seq
     }
 
     fn redact(&self, text: &str) -> String {
@@ -294,6 +335,57 @@ impl Failure {
 
     fn force(&mut self, class: FailureClass, message: impl Into<String>) {
         self.0 = Some((class, message.into()));
+    }
+}
+
+/// A moment of a run's end (tests only, [`HaltAt`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndStep {
+    /// The work came back and the record says so, or is gone; the sandbox is about to stop.
+    Stopping,
+    /// The work came back and the sandbox stopped; the agent's outcome is not in the record yet.
+    Stopped,
+    /// The agent's outcome is in the record.
+    Decided,
+    /// The first file of `/output` is saved, and the record says so.
+    OutputFileSaved,
+    /// The repositories are pushed (finalized).
+    Pushed,
+    /// The session bundle is stored; the abort is not looked at yet.
+    SessionStored,
+    /// The report is made, and not yet kept.
+    Reported,
+    /// The report is kept ([`RecordHandle::report_made`]) and the record is gone; the report
+    /// is not queued yet.
+    ReportKept,
+}
+
+/// Tests only, and no flag of `run` sets it ([`crate::host::HostOptions::halt_at`]): at `step`
+/// of a run's end, the run's task writes `marker` and waits for good, so that a test kills the
+/// host at that moment; with `resume`, it waits only until the test removes `marker`.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct HaltAt {
+    pub step: EndStep,
+    pub marker: PathBuf,
+    pub resume: bool,
+}
+
+/// Waits for good at `step` when the host's test options say so ([`HaltAt`]); otherwise returns
+/// at once.
+async fn halt_at(shared: &Shared, step: EndStep) {
+    if let Some(halt) = &shared.opts.halt_at
+        && halt.step == step
+    {
+        tracing::warn!(?step, "halted at a moment of a run's end, as the test asks");
+        let _ = std::fs::write(&halt.marker, format!("{step:?}"));
+        if !halt.resume {
+            std::future::pending::<()>().await;
+        }
+        while halt.marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -342,21 +434,70 @@ fn repo_label(ws: &WorkspaceSpec) -> String {
     format!("`{}` ({WORKSPACE_ROOT}/{})", ws.name, ws.dir)
 }
 
-/// Executes a run. Returns `None` when the run was aborted (stale epoch) and must not
-/// report anything.
+/// A run while this host executes it ([`execute`]) or takes it back ([`take_back`]): what each
+/// of its stages reads, the events it sends, its first failure, and the server's stop.
+struct Run<'a> {
+    shared: &'a Arc<Shared>,
+    assign: &'a RunAssign,
+    /// The run's git tokens (ADR-0116), which its repositories, its git proxy routes and its
+    /// take-back record read.
+    tokens: &'a Arc<RunGitTokens>,
+    sink: EventSink,
+    failure: Failure,
+    stop_rx: watch::Receiver<Option<StopRequest>>,
+}
+
+impl Run<'_> {
+    /// The run's report, with its failure ([`finish`]).
+    fn finish(&mut self, cancelled: bool, report: Report) -> RunFinished {
+        finish(
+            &mut self.sink,
+            self.assign,
+            std::mem::take(&mut self.failure),
+            cancelled,
+            report,
+        )
+    }
+}
+
+/// Executes a run. Its repositories read their git tokens from `tokens`, the run's holder
+/// (ADR-0116). Returns `None` when the run was aborted (stale epoch) and must not report
+/// anything.
+///
+/// The stages are the steps of the README's "What a run does": the run's directories, the
+/// clone of its repositories, its files and skills, its sandbox (a VM from the pool, the
+/// sandbox's access to the host, the start), the agent's turn in it, the work that comes back
+/// before the sandbox goes, then the outcome of the agent's phase, `/output`, the git finalize,
+/// the session bundle and the report. With a take-back record, that end is the record's too
+/// (ADR-0101): it says that the work came back before the sandbox stops, keeps the agent's
+/// outcome and the files of `/output` saved as each is known, and goes once the report is
+/// made, so that a host that restarts in the end finishes the run ([`take_back`]). A stage that
+/// ends the run early returns
+/// [`ControlFlow::Break`] with what this function returns. What lives until the run ends is
+/// held here, and goes when this function returns, in the reverse of the order in which it was
+/// made: the VM the sandbox did not take, the sandbox's reader (which holds the sandbox's front
+/// once the sandbox has started), the skills' leases, the attachments, the clones, the tokens'
+/// renewal, the handle of `/output` and the home's lease.
 pub async fn execute(
     shared: &Arc<Shared>,
     assign: &RunAssign,
     credential: &RunCredential,
-    mut stop_rx: watch::Receiver<Option<StopRequest>>,
+    tokens: &Arc<RunGitTokens>,
+    stop_rx: watch::Receiver<Option<StopRequest>>,
     steering: &Arc<Steering>,
 ) -> Option<RunFinished> {
     let started = Instant::now();
-    let paths = shared.opts.paths.clone();
-    let mut sink = EventSink::new(shared.clone(), assign.run_id, assign.epoch);
-    let mut failure = Failure::default();
-    let mut cancelled = false;
-    sink.status(Phase::Preparing, None);
+    let mut run = Run {
+        shared,
+        assign,
+        tokens,
+        sink: EventSink::new(shared.clone(), assign.run_id, assign.epoch),
+        failure: Failure::default(),
+        stop_rx,
+    };
+    // A revocation of the run's git tokens is a warning in the run's events.
+    tokens.attach_log(run.sink.side());
+    run.sink.status(Phase::Preparing, None);
 
     let mut wall_clock = Duration::from_secs(assign.limits.max_wall_clock_seconds);
     if let Some(cap) = shared.opts.max_wall_clock_cap {
@@ -365,14 +506,313 @@ pub async fn execute(
     let deadline = started + wall_clock;
 
     // --- directories ------------------------------------------------------------------
+    let mut dirs = match prepare_directories(&mut run) {
+        ControlFlow::Continue(dirs) => dirs,
+        ControlFlow::Break(end) => return end,
+    };
+
+    // --- git: mirror and clone, per repository ------------------------------------------
+    // Every repository's token, and the key of model access, is redacted from the first git
+    // command on.
+    redact_the_runs_secrets(shared, assign, credential.run_secrets());
+    // Tokens that expire are renewed while the run works (ADR-0116); the renewal stops when
+    // this function returns.
+    let _renewal = crate::git_refresh::spawn(shared, tokens);
+    let mut repos = match clone_repositories(&mut run, &dirs).await {
+        ControlFlow::Continue(repos) => repos,
+        ControlFlow::Break(end) => return end,
+    };
+
+    // --- attachments (ADR-0014) ---------------------------------------------------------
+    // Removed when this function returns, whichever way.
+    let attachments_dir = download_attachments(&mut run).await;
+
+    // --- session bundle (ADR-0097) -------------------------------------------------------
+    // The conversation's session from the server, when another host ran its last turn.
+    restore_the_session(&mut run, &mut dirs).await;
+
+    // --- skills (ADR-0064) --------------------------------------------------------------
+    // Held until this function returns, so maintenance never deletes a skill a run mounts.
+    let run_skills = provide_skills(&mut run, &dirs).await;
+
+    // --- a Claude login (ADR-0085) ------------------------------------------------------
+    make_the_login_mount_point(&mut run, credential, &dirs);
+
+    // --- a Codex login's file as the run starts (ADR-0085, decision 5) ------------------
+    let codex_auth_at_start = codex_auth_at_start(shared, credential);
+
+    // --- sandbox ------------------------------------------------------------------------
+    let layout = sandbox_layout(shared, assign, &dirs);
+    // Where `upload_attachment` reads files (ADR-0021); with the bridge, from the sandbox,
+    // once it is there. Once set, it holds the sandbox's front, until this function returns.
+    let sandbox_reader = SandboxReader::default();
+    let roots = file_roots(shared, &layout, &dirs, &sandbox_reader);
+    // A VM per run (ADR-0096) comes before the run's listeners; one that the sandbox does not
+    // take goes when this function returns.
+    let (mut claimed, starting) = claim_a_vm(&mut run).await;
+    let serving = serving(shared, claimed.as_ref()).await;
+    // The sandbox's way to fetch and to the platform tools; dropping it (at the latest when
+    // this function returns) removes the run's routes from the listener.
+    let mut access = sandbox_access(shared, &mut run.sink, assign, &repos, roots, serving).await;
+    let mut phase = None;
+    if run.stop_rx.borrow().is_none() && run.failure.0.is_none() {
+        let contents = SandboxContents {
+            dirs: &dirs,
+            layout: &layout,
+            attachments: attachments_dir.as_ref().map(AttachmentsDir::path),
+            skills: &run_skills,
+        };
+        let started = start_the_sandbox(
+            &mut run,
+            credential,
+            &contents,
+            &mut access,
+            &mut claimed,
+            starting,
+        )
+        .await;
+        match started {
+            Ok(started) => {
+                if let Some(files) = started.sandbox.files() {
+                    sandbox_reader.set(files, reader_of(shared));
+                }
+                // From now until the run's report is made, a host that restarts takes the run
+                // back (ADR-0101).
+                keep_a_take_back_record(&mut run, &started, &repos);
+                run.sink.status(Phase::Running, None);
+                let params = agent_params(&run, &started.spec, &access, dirs.new_home, steering);
+                let mut agent = run_agent(
+                    shared,
+                    assign,
+                    &mut run.sink,
+                    started.io,
+                    params,
+                    &mut run.stop_rx,
+                    deadline,
+                )
+                .await;
+                bring_the_work_back(
+                    &mut run,
+                    started.sandbox,
+                    &mut agent,
+                    &contents,
+                    &mut repos,
+                    started.home_exclude,
+                )
+                .await;
+                phase = Some(agent);
+            }
+            Err(e) => {
+                run.failure.set(
+                    FailureClass::Infra,
+                    run.sink.redact(&format!("cannot start the sandbox: {e:#}")),
+                );
+            }
+        }
+    }
+    let result = close_the_access(&mut run, access);
+
+    // --- outcome of the agent phase -----------------------------------------------------
+    let mut outcome = match agent_outcome(
+        &mut run,
+        credential,
+        phase,
+        codex_auth_at_start,
+        &dirs.workspace,
+    )
+    .await
+    {
+        ControlFlow::Continue(outcome) => outcome,
+        ControlFlow::Break(end) => {
+            // Aborted: nothing is left to take back.
+            forget_the_record(&mut run);
+            return end;
+        }
+    };
+    // A host that restarts from now on reports this outcome ([`take_back`]).
+    keep_the_outcome(&mut run, &outcome, result.as_ref());
+    halt_at(shared, EndStep::Decided).await;
+
+    // An abort (a stale epoch: the server gave the run to a newer execution) that comes in the
+    // run's end is looked at between its steps: no further step begins, and the run makes no
+    // report. A step under way finishes: the rest of its files of /output, the push of its
+    // remaining repositories, or its session bundle.
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
+
+    // --- /output (protocol v2) ----------------------------------------------------------
+    // Before the git finalize and the cleanup: what the agent left in /output becomes the
+    // artifacts of the job. After a leak nothing leaves the host, as with the push.
+    let artifacts = save_the_output(&mut run, dirs.output_root.as_ref(), outcome.leak).await;
+    if dirs.output_root.is_some()
+        && let Some(record) = run.sink.record()
+    {
+        record.output_saved(&artifacts);
+    }
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
+
+    // --- git finalize -------------------------------------------------------------------
+    let results = finalize_repositories(&mut run, &repos, &mut outcome).await;
+    halt_at(shared, EndStep::Pushed).await;
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
+
+    // --- session bundle (ADR-0097) -------------------------------------------------------
+    let session_bundle = store_the_session(&mut run, &dirs, &outcome).await;
+    halt_at(shared, EndStep::SessionStored).await;
+    if aborted_in_the_end(&mut run, &dirs.workspace) {
+        return None;
+    }
+
+    let failed_git = results
+        .iter()
+        .any(|g| !g.pushed && g.commits.unwrap_or(0) > 0);
+    let report = Report {
+        summary: outcome.summary,
+        result,
+        session_id: outcome.session_id,
+        not_resumed: outcome.not_resumed,
+        git: Some(results),
+        usage: outcome.usage,
+        artifacts,
+        session_bundle,
+    };
+    let finished = run.finish(outcome.cancelled, report);
+    halt_at(shared, EndStep::Reported).await;
+    // The report is made, and the caller queues it at once. It is kept until it cannot be lost
+    // any more, in place of the record, before the workspace goes, so that no record names
+    // work that is gone.
+    keep_the_report(&mut run, &finished);
+    halt_at(shared, EndStep::ReportKept).await;
+    // The workspace's path is the run's, whatever its epoch: one that a newer execution of the
+    // run on this host uses already is left to it.
+    if shared.no_newer_execution(assign.run_id, assign.epoch) {
+        cleanup_workspace(
+            shared,
+            &dirs.workspace,
+            finished.outcome == Outcome::Failed || failed_git,
+        );
+    }
+    Some(finished)
+}
+
+/// The run's record goes, if it has one: nothing is left to take back.
+fn forget_the_record(run: &mut Run<'_>) {
+    run.tokens.drop_record();
+    run.sink.drop_record();
+}
+
+/// The run's report is made: a run with a record keeps the report in its place
+/// ([`RecordHandle::report_made`]) until the outbox has delivered it
+/// ([`crate::host::Shared::forget_delivered_reports`]); then the record goes.
+fn keep_the_report(run: &mut Run<'_>, finished: &RunFinished) {
+    if let Some(record) = run.sink.record() {
+        record.report_made(finished);
+    }
+    forget_the_record(run);
+}
+
+/// An abort came in the run's end: nothing more of the run leaves the host, its record goes,
+/// its workspace too, and it reports nothing.
+fn aborted_in_the_end(run: &mut Run<'_>, workspace: &Path) -> bool {
+    if *run.stop_rx.borrow() != Some(StopRequest::Abort) {
+        return false;
+    }
+    let (run_id, epoch) = (run.assign.run_id, run.assign.epoch);
+    tracing::info!(%run_id, epoch, "the run's end stops: a newer execution of the run took it over");
+    forget_the_record(run);
+    // The workspace's path is the run's, whatever its epoch: a newer execution on this host
+    // that uses it already keeps it.
+    if run.shared.no_newer_execution(run_id, epoch) {
+        cleanup_workspace(run.shared, workspace, false);
+    }
+    true
+}
+
+/// How each repository came back from the sandbox, as a record keeps it.
+fn collected_repos(repos: &[Repo<'_>]) -> Vec<(String, CollectedRecord)> {
+    repos
+        .iter()
+        .filter_map(|repo| {
+            let collected = repo.collected.as_ref()?;
+            Some((repo.ws.dir.clone(), CollectedRecord::of(collected)))
+        })
+        .collect()
+}
+
+/// The agent's outcome, into the run's record: what the report says of it, redacted as the
+/// report is, before `/output`, the push and the session bundle. A record that cannot be
+/// written is a warning: a restart then reports the run as taken back.
+fn keep_the_outcome(run: &mut Run<'_>, outcome: &AgentOutcome, result: Option<&RunResult>) {
+    let Some(record) = run.sink.record() else {
+        return;
+    };
+    let (failure_class, failure_message) = match &run.failure.0 {
+        Some((class, message)) => (Some(*class), Some(run.sink.redact(message))),
+        None => (None, None),
+    };
+    let session = match &outcome.not_resumed {
+        None => SessionRecord::NotOpened,
+        Some(None) => SessionRecord::Resumed,
+        Some(Some(why)) => SessionRecord::NotResumed {
+            outcome: why.outcome,
+        },
+    };
+    let kept = OutcomeRecord {
+        failure_class,
+        failure_message,
+        cancelled: outcome.cancelled,
+        leak: outcome.leak,
+        summary: outcome.summary.as_deref().map(|s| run.sink.redact(s)),
+        result: result.map(|r| RunResult {
+            outcome: r.outcome,
+            summary: run.sink.redact(&r.summary),
+            next_steps: r.next_steps.iter().map(|s| run.sink.redact(s)).collect(),
+            open_questions: r
+                .open_questions
+                .iter()
+                .map(|s| run.sink.redact(s))
+                .collect(),
+        }),
+        usage: outcome.usage.clone(),
+        session_id: outcome.session_id.clone(),
+        session,
+    };
+    if !record.outcome_decided(kept) {
+        run.sink.log(
+            LogLevel::Warn,
+            "the runner host cannot write the agent's outcome in its record of the run, so a restart before the run's end is reported would report the run as taken back",
+        );
+    }
+}
+
+/// The run's directories on this host ([`prepare_directories`]).
+struct RunDirs {
+    workspace: PathBuf,
+    /// Protocol v2: the documents folder, anchored here and saved as artifacts when the run
+    /// ends (crate::output). It goes before the home's lease: the fields drop in this order.
+    output_root: Option<OutputRoot>,
+    output: Option<PathBuf>,
+    /// Held until the run ends, so maintenance never deletes the home under it.
+    _home_lease: crate::homes::HomeLease,
+    home: PathBuf,
+    /// A new home holds no earlier session: a failed session/load there is NO_SESSION.
+    new_home: bool,
+}
+
+/// The run's workspace, its session home, which it leases, and under protocol v2 its `/output`
+/// ([`prepare_dirs`]). Directories that cannot be made fail the run with `INFRA`.
+fn prepare_directories(run: &mut Run<'_>) -> ControlFlow<Option<RunFinished>, RunDirs> {
+    let (shared, assign) = (run.shared, run.assign);
+    let paths = &shared.opts.paths;
     let workspace_dir = paths.workspace(assign.run_id);
-    // Held until the run ends, so maintenance never deletes the home under it.
     let home_lease = shared.homes.lease(assign.agent.id, assign.work_item().id);
     let home_dir = home_lease.path().to_path_buf();
-    // A new home holds no earlier session: a failed session/load there is NO_SESSION.
-    let mut new_home = !home_dir.exists();
-    // Protocol v2: the documents folder, anchored here and saved as artifacts when the run
-    // ends (crate::output).
+    let new_home = !home_dir.exists();
     let output_root = match prepare_dirs(
         &workspace_dir,
         &home_dir,
@@ -384,19 +824,27 @@ pub async fn execute(
     ) {
         Ok(output_root) => output_root,
         Err(e) => {
-            failure.set(
+            run.failure.set(
                 FailureClass::Infra,
                 format!("cannot prepare the workspace: {e:#}"),
             );
-            return Some(finish(&mut sink, assign, failure, false, Report::default()));
+            return ControlFlow::Break(Some(run.finish(false, Report::default())));
         }
     };
     let output_dir: Option<PathBuf> = output_root.as_ref().map(|root| root.path().to_path_buf());
+    ControlFlow::Continue(RunDirs {
+        workspace: workspace_dir,
+        _home_lease: home_lease,
+        home: home_dir,
+        new_home,
+        output_root,
+        output: output_dir,
+    })
+}
 
-    // --- git: mirror and clone, per repository ------------------------------------------
-    // Every repository's token, and the key of model access, is redacted from the first git
-    // command on.
-    let mut secrets = credential.run_secrets();
+/// Adds every repository's token and authorization to `secrets`, the values only this run
+/// knows besides, and has the host's redaction cover them.
+fn redact_the_runs_secrets(shared: &Arc<Shared>, assign: &RunAssign, mut secrets: Vec<String>) {
     for ws in &assign.workspaces {
         if let Some(creds) = &ws.git {
             secrets.push(creds.token.expose().to_string());
@@ -408,39 +856,54 @@ pub async fn execute(
     if !secrets.is_empty() {
         shared.add_run_secrets(assign.run_id, assign.epoch, secrets);
     }
+}
+
+/// The mirror fetch and the clone of each repository ([`clone_all`]). A repository that cannot
+/// be cloned fails the run with `GIT_ERROR`; a stop meanwhile ends it, cancelled, or with no
+/// report after an abort. A run that ends here reports the repositories cloned so far,
+/// unchanged.
+async fn clone_repositories<'a>(
+    run: &mut Run<'a>,
+    dirs: &RunDirs,
+) -> ControlFlow<Option<RunFinished>, Vec<Repo<'a>>> {
+    let (shared, assign) = (run.shared, run.assign);
     let mut repos: Vec<Repo> = Vec::new();
     if !assign.workspaces.is_empty() {
-        sink.status(Phase::Cloning, None);
+        run.sink.status(Phase::Cloning, None);
         let cloned = tokio::select! {
-            result = clone_all(shared, &mut sink, assign, &workspace_dir, &mut repos) => Some(result),
-            _ = wait_for_stop(&mut stop_rx) => None,
+            result = clone_all(shared, &mut run.sink, assign, run.tokens, &dirs.workspace, &mut repos) => Some(result),
+            _ = wait_for_stop(&mut run.stop_rx) => None,
         };
         if let Some(Err(message)) = &cloned {
-            failure.set(FailureClass::GitError, message.clone());
+            run.failure.set(FailureClass::GitError, message.clone());
         }
         if !matches!(cloned, Some(Ok(()))) {
-            if *stop_rx.borrow() == Some(StopRequest::Abort) {
-                cleanup_workspace(shared, &workspace_dir, false);
-                return None;
+            if *run.stop_rx.borrow() == Some(StopRequest::Abort) {
+                cleanup_workspace(shared, &dirs.workspace, false);
+                return ControlFlow::Break(None);
             }
-            let was_cancelled = failure.0.is_none();
+            let was_cancelled = run.failure.0.is_none();
             // The repositories cloned so far, unchanged; none cloned is no git result.
             let report = Report {
                 git: (!repos.is_empty())
                     .then(|| repos.iter().map(Repo::unfinalized_result).collect()),
                 ..Report::default()
             };
-            let finished = finish(&mut sink, assign, failure, was_cancelled, report);
-            cleanup_workspace(shared, &workspace_dir, finished.outcome == Outcome::Failed);
-            return Some(finished);
+            let finished = run.finish(was_cancelled, report);
+            cleanup_workspace(shared, &dirs.workspace, finished.outcome == Outcome::Failed);
+            return ControlFlow::Break(Some(finished));
         }
     }
+    ControlFlow::Continue(repos)
+}
 
-    // --- attachments (ADR-0014) ---------------------------------------------------------
-    // Removed when this function returns, whichever way.
+/// Downloads the run's files (ADR-0014) into a directory of its own, which goes when the run
+/// ends, whichever way. A file that cannot be downloaded fails the run with `INFRA`.
+async fn download_attachments(run: &mut Run<'_>) -> Option<AttachmentsDir> {
+    let (shared, assign) = (run.shared, run.assign);
     let mut attachments_dir: Option<AttachmentsDir> = None;
-    if !assign.attachments.is_empty() && stop_rx.borrow().is_none() && failure.0.is_none() {
-        match AttachmentsDir::create(paths.attachments(assign.run_id)) {
+    if !assign.attachments.is_empty() && run.stop_rx.borrow().is_none() && run.failure.0.is_none() {
+        match AttachmentsDir::create(shared.opts.paths.attachments(assign.run_id)) {
             Ok(dir) => {
                 let downloaded = tokio::select! {
                     result = attachments::download_all(
@@ -449,11 +912,11 @@ pub async fn execute(
                         assign,
                         dir.path(),
                     ) => Some(result),
-                    _ = wait_for_stop(&mut stop_rx) => None,
+                    _ = wait_for_stop(&mut run.stop_rx) => None,
                 };
                 match downloaded {
                     Some(Ok(downloaded)) => {
-                        sink.log(
+                        run.sink.log(
                             LogLevel::Info,
                             format!(
                                 "{} attachment(s) in {}",
@@ -462,7 +925,7 @@ pub async fn execute(
                             ),
                         );
                         if !downloaded.skipped.is_empty() {
-                            sink.log(
+                            run.sink.log(
                                 LogLevel::Warn,
                                 format!(
                                     "attachments deleted before the run started: {}",
@@ -472,40 +935,48 @@ pub async fn execute(
                         }
                     }
                     Some(Err(e)) => {
-                        let message = sink.redact(&format!("{e:#}"));
-                        failure.set(FailureClass::Infra, message);
+                        let message = run.sink.redact(&format!("{e:#}"));
+                        run.failure.set(FailureClass::Infra, message);
                     }
                     None => {}
                 }
                 attachments_dir = Some(dir);
             }
-            Err(e) => failure.set(
+            Err(e) => run.failure.set(
                 FailureClass::Infra,
                 format!("cannot prepare the attachments: {e:#}"),
             ),
         }
     }
+    attachments_dir
+}
 
-    // --- session bundle (ADR-0097) -------------------------------------------------------
-    // The conversation's session from the server, when another host ran its last turn.
+/// The conversation's session bundle (ADR-0097) into the home, when the server has one for
+/// the run ([`restore_session_bundle`]): the home then holds the session to resume.
+async fn restore_the_session(run: &mut Run<'_>, dirs: &mut RunDirs) {
+    let (shared, assign) = (run.shared, run.assign);
     if let Some((sha256, size)) = assign
         .session_bundle
         .as_ref()
         .and_then(|bundle| bundle.restore())
-        && stop_rx.borrow().is_none()
-        && failure.0.is_none()
-        && restore_session_bundle(shared, &mut sink, assign, &home_dir, sha256, size).await
+        && run.stop_rx.borrow().is_none()
+        && run.failure.0.is_none()
+        && restore_session_bundle(shared, &mut run.sink, assign, &dirs.home, sha256, size).await
     {
-        new_home = false;
+        dirs.new_home = false;
     }
+}
 
-    // --- skills (ADR-0064) --------------------------------------------------------------
+/// The run's skills (ADR-0064), from the host's cache, with their mount points in the home.
+/// A skill that cannot be provided fails the run with `INFRA`. The skills hold their leases
+/// until they are dropped.
+async fn provide_skills(run: &mut Run<'_>, dirs: &RunDirs) -> Vec<ProvidedSkill> {
+    let (shared, assign) = (run.shared, run.assign);
     // The empty mount points that the previous run of this home got go first: a skill the
     // agent no longer has leaves no empty folder for its runtime to list.
-    skills::remove_earlier_mount_points(&home_dir);
-    // Held until this function returns, so maintenance never deletes a skill a run mounts.
+    skills::remove_earlier_mount_points(&dirs.home);
     let mut run_skills: Vec<ProvidedSkill> = Vec::new();
-    if !assign.skills.is_empty() && stop_rx.borrow().is_none() && failure.0.is_none() {
+    if !assign.skills.is_empty() && run.stop_rx.borrow().is_none() && run.failure.0.is_none() {
         let provided = tokio::select! {
             result = skills::provide(
                 &shared.skills,
@@ -513,109 +984,137 @@ pub async fn execute(
                 shared.config.token.expose(),
                 assign,
             ) => Some(result),
-            _ = wait_for_stop(&mut stop_rx) => None,
+            _ = wait_for_stop(&mut run.stop_rx) => None,
         };
         match provided {
             Some(Ok(provided)) => {
                 let names: Vec<&str> = provided.iter().map(|s| s.name.as_str()).collect();
-                match skills::create_mount_points(&home_dir, assign.agent.runtime, &names) {
+                match skills::create_mount_points(&dirs.home, assign.agent.runtime, &names) {
                     Ok(()) => {
-                        sink.log(
+                        run.sink.log(
                             LogLevel::Info,
                             skills::summary(assign.agent.runtime, &provided),
                         );
                         run_skills = provided;
                     }
-                    Err(message) => failure.set(FailureClass::Infra, sink.redact(&message)),
+                    Err(message) => run
+                        .failure
+                        .set(FailureClass::Infra, run.sink.redact(&message)),
                 }
             }
-            Some(Err(message)) => failure.set(FailureClass::Infra, sink.redact(&message)),
+            Some(Err(message)) => run
+                .failure
+                .set(FailureClass::Infra, run.sink.redact(&message)),
             None => {}
         }
     }
+    run_skills
+}
 
-    // --- a Claude login (ADR-0085) ------------------------------------------------------
-    // Its credentials file is mounted at a plain file of the home, which the host makes.
+/// A Claude login's credentials file (ADR-0085) is mounted at a plain file of the home, which
+/// the host makes. One that cannot be made fails the run with `INFRA`.
+fn make_the_login_mount_point(run: &mut Run<'_>, credential: &RunCredential, dirs: &RunDirs) {
     if let RunCredential::Host(host_credential) = credential
         && host_credential.kind == CredentialKind::ClaudeLogin
-        && failure.0.is_none()
-        && let Err(message) = crate::credentials::claude_login_mount_point(&home_dir)
+        && run.failure.0.is_none()
+        && let Err(message) = crate::credentials::claude_login_mount_point(&dirs.home)
     {
-        failure.set(FailureClass::Infra, sink.redact(&message));
+        run.failure
+            .set(FailureClass::Infra, run.sink.redact(&message));
     }
+}
 
-    // --- a Codex login's file as the run starts (ADR-0085, decision 5) ------------------
-    // Compared again when the run loses a renewal race: unchanged, nothing on this host
-    // renewed the login, so it is stale (classify_agent_end).
-    let codex_auth_at_start = match credential {
+/// A Codex login's file as the run starts: compared again when the run loses a renewal race.
+/// Unchanged, nothing on this host renewed the login, so it is stale (classify_agent_end).
+fn codex_auth_at_start(
+    shared: &Shared,
+    credential: &RunCredential,
+) -> crate::credentials::FileStamp {
+    match credential {
         RunCredential::Host(c) if c.kind == CredentialKind::CodexChatgptAuth => {
             crate::credentials::codex_auth_stamp(&shared.credentials.codex_home(&c.label))
         }
         _ => None,
-    };
+    }
+}
 
-    // --- sandbox ------------------------------------------------------------------------
-    // Where the sandbox's directories are: a container's; with the local test executor, which
-    // has no mounts, the host's own; with the bridge (ADR-0095), whose sandbox gets no mounts,
-    // a directory of its own that stands for the sandbox's (crate::sandbox_files).
+/// Where the sandbox's directories are: a container's; with the local test executor, which has
+/// no mounts, the host's own; with the bridge (ADR-0095), whose sandbox gets no mounts, a
+/// directory of its own that stands for the sandbox's (crate::sandbox_files).
+fn sandbox_layout(shared: &Shared, assign: &RunAssign, dirs: &RunDirs) -> Layout {
+    let paths = &shared.opts.paths;
     let bridged = shared.opts.bridge.is_some();
-    let layout = match (&shared.opts.executor, bridged) {
+    match (&shared.opts.executor, bridged) {
         (crate::sandbox::Executor::Docker(_), _) => Layout::container(),
         (crate::sandbox::Executor::Vm(vms), _) if !vms.options.on_this_machine => {
             Layout::container()
         }
         (crate::sandbox::Executor::Vm(_), _) | (crate::sandbox::Executor::Local { .. }, true) => {
-            Layout::local(&workspace_dir)
+            Layout::local(&dirs.workspace)
         }
         (crate::sandbox::Executor::Local { .. }, false) => Layout::host(
-            &workspace_dir,
-            &home_dir,
+            &dirs.workspace,
+            &dirs.home,
             &paths.attachments(assign.run_id),
             &paths.output(assign.run_id),
         ),
-    };
-    // Where `upload_attachment` reads files (ADR-0021); with the bridge, from the sandbox,
-    // once it is there.
-    let sandbox_reader = SandboxReader::default();
+    }
+}
+
+/// The directories whose files `upload_attachment` reads (ADR-0021): the workspace and the
+/// home, from the sandbox through `sandbox_reader` with the bridge, else from this host.
+fn file_roots(
+    shared: &Shared,
+    layout: &Layout,
+    dirs: &RunDirs,
+    sandbox_reader: &SandboxReader,
+) -> Vec<FileRoot> {
+    let bridged = shared.opts.bridge.is_some();
     let reader = bridged.then(|| sandbox_reader.clone());
-    let roots = vec![
+    vec![
         FileRoot {
             container: layout.workspace.clone(),
-            host: workspace_dir.clone(),
+            host: dirs.workspace.clone(),
             sandbox: reader.clone(),
         },
         FileRoot {
             container: layout.home.clone(),
-            host: home_dir.clone(),
+            host: dirs.home.clone(),
             sandbox: reader,
         },
-    ];
-    // A VM per run (ADR-0096) comes from the VM pool (crate::pool, ADR-0098): a ready VM of
-    // the run's shape, or the next one that comes up. The VM's tunnels and its egress proxy
-    // listener are its own, so the run takes it before it sets up its listeners.
+    ]
+}
+
+/// A VM per run (ADR-0096) comes from the VM pool (crate::pool): one that its keeper holds
+/// (ready VMs, ADR-0098), or the next one of the run's shape that comes up. The VM's tunnels
+/// and its egress proxy listener are its own, so the run takes it before it sets up its
+/// listeners. A VM that does not come fails the run with `INFRA`. Also whether the run said
+/// that its sandbox is starting.
+async fn claim_a_vm(run: &mut Run<'_>) -> (Option<crate::pool::Claimed>, bool) {
+    let (shared, assign) = (run.shared, run.assign);
     let mut claimed: Option<crate::pool::Claimed> = None;
     let mut starting = false;
     if let Some(pool) = shared.pool()
-        && stop_rx.borrow().is_none()
-        && failure.0.is_none()
+        && run.stop_rx.borrow().is_none()
+        && run.failure.0.is_none()
     {
-        sink.status(Phase::Starting, None);
+        run.sink.status(Phase::Starting, None);
         starting = true;
         let shape = crate::pool::Shape::for_runtime(&shared.opts, assign.agent.runtime);
         let deadline = tokio::time::Instant::now() + pool.start_timeout();
         let got = tokio::select! {
             got = pool.claim(shared, shape, deadline) => Some(got),
-            _ = wait_for_stop(&mut stop_rx) => None,
+            _ = wait_for_stop(&mut run.stop_rx) => None,
         };
         match got {
             Some(Ok(vm)) => {
-                sink.log(
+                run.sink.log(
                     LogLevel::Info,
                     match vm.served {
                         crate::pool::Served::Ready => format!(
                             "the run took a ready sandbox VM ({}), which waited {} s for it",
                             vm.vm.id,
-                            vm.ready_at.elapsed().as_secs()
+                            vm.up_at.elapsed().as_secs()
                         ),
                         crate::pool::Served::Cold => format!(
                             "the run started cold: no sandbox VM was ready, and it waited {} s for {}",
@@ -626,237 +1125,451 @@ pub async fn execute(
                 );
                 claimed = Some(vm);
             }
-            Some(Err(e)) => failure.set(
+            Some(Err(e)) => run.failure.set(
                 FailureClass::Infra,
-                sink.redact(&format!("cannot start the sandbox: {e:#}")),
+                run.sink.redact(&format!("cannot start the sandbox: {e:#}")),
             ),
             None => {}
         }
     }
-    // A local test executor's sandbox over the bridge shares this machine's network: it
-    // reaches the listeners on a loopback address of its own (crate::bridge); a VM of the VM
-    // executor's test mode has one of its own.
-    let sandbox_host = match &claimed {
-        Some(vm) => vm.sandbox_host.clone(),
-        None => (bridged && shared.opts.executor.on_this_machine())
-            .then(|| crate::bridge::local_sandbox_loopback().to_string()),
+    (claimed, starting)
+}
+
+/// What the run puts in its sandbox: its directories, where the sandbox sees them, its
+/// attachments and its skills. The stages from the sandbox's start to the return of its work
+/// read it.
+struct SandboxContents<'a> {
+    dirs: &'a RunDirs,
+    layout: &'a Layout,
+    attachments: Option<&'a Path>,
+    skills: &'a [ProvidedSkill],
+}
+
+/// The run's sandbox once it has started ([`start_the_sandbox`]).
+struct StartedSandbox {
+    sandbox: crate::sandbox::Sandbox,
+    io: SandboxIo,
+    /// The settings it started with; the agent's working directory is theirs.
+    spec: SandboxSpec,
+    /// What of the home stays out of the sandbox's copy of it, and out of what comes back
+    /// (crate::sandbox_files).
+    home_exclude: Vec<String>,
+}
+
+/// Starts the run's sandbox: its model proxy, its settings, with the bridge the directories
+/// that go into it, its egress proxy, and then the sandbox itself ([`start_sandbox`]). Any of
+/// them that cannot start is a sandbox that cannot start: the caller fails the run with `INFRA`.
+/// The model proxy's and the egress proxy's guards go into `access`. `claimed`, the run's VM,
+/// is taken by the sandbox as it starts; the caller holds it until the run ends when it is not.
+async fn start_the_sandbox(
+    run: &mut Run<'_>,
+    credential: &RunCredential,
+    contents: &SandboxContents<'_>,
+    access: &mut SandboxAccess,
+    claimed: &mut Option<crate::pool::Claimed>,
+    starting: bool,
+) -> anyhow::Result<StartedSandbox> {
+    let (shared, assign) = (run.shared, run.assign);
+    let SandboxContents {
+        dirs,
+        layout,
+        attachments,
+        skills: run_skills,
+    } = *contents;
+    if !starting {
+        run.sink.status(Phase::Starting, None);
+    }
+    // A gateway's key stays on the host (the model proxy is always on): the runtime gets the
+    // run's model proxy as its base URL and a dummy key.
+    let model_proxy =
+        start_model_proxy(shared, &mut run.sink, assign, credential, &access.serving).await;
+    let proxy_url = match &model_proxy {
+        Ok(Some(guard)) => Some(guard.base_url().to_string()),
+        _ => None,
     };
-    // The sandbox's way to fetch and to the platform tools; dropping it (at the latest when
-    // this function returns) removes the run's routes from the listener.
-    let mut access = sandbox_access(shared, &mut sink, assign, &repos, roots, sandbox_host).await;
-    let mut phase = None;
-    if stop_rx.borrow().is_none() && failure.0.is_none() {
-        if !starting {
-            sink.status(Phase::Starting, None);
-        }
-        // A gateway's key stays on the host (the model proxy is always on): the runtime gets the
-        // run's model proxy as its base URL and a dummy key.
-        let model_proxy = start_model_proxy(
-            shared,
-            &mut sink,
-            assign,
-            credential,
-            access.sandbox_host.as_deref(),
-        )
-        .await;
-        let proxy_url = match &model_proxy {
-            Ok(Some(guard)) => Some(guard.base_url().to_string()),
-            _ => None,
-        };
-        let model = match &proxy_url {
-            Some(url) => credential.access().through_model_proxy(url),
-            None => credential.access(),
-        };
-        let mut spec = sandbox_spec(
-            shared,
-            assign,
-            credential,
-            model,
-            &layout,
-            &workspace_dir,
-            &home_dir,
-            attachments_dir.as_ref().map(AttachmentsDir::path),
-            output_dir.as_deref(),
-            &run_skills,
-        );
-        spec.extra_hosts = access.extra_hosts.clone();
-        // With the bridge, the run's directories go into the sandbox in place of the mounts,
-        // and the same paths of the home come back (crate::sandbox_files).
-        let skill_dirs: Vec<String> = run_skills
-            .iter()
-            .map(|skill| format!("{}/{}", skills::mount_dir(assign.agent.runtime), skill.name))
-            .collect();
-        let home_exclude =
-            sandbox_files::home_exclude(&skill_dirs, mounted_login(shared, credential));
-        let puts = if bridged {
-            sandbox_files::puts(
-                &layout,
-                &workspace_dir,
-                &home_dir,
-                home_exclude.clone(),
-                run_skills
-                    .iter()
-                    .map(|skill| {
-                        (
-                            skill.path.clone(),
-                            format!(
-                                "{}/{}/{}",
-                                layout.home,
-                                skills::mount_dir(assign.agent.runtime),
-                                skill.name
-                            ),
-                        )
-                    })
-                    .collect(),
-                attachments_dir.as_ref().map(AttachmentsDir::path),
-                output_dir.as_deref(),
+    let model = match &proxy_url {
+        Some(url) => credential.access().through_model_proxy(url),
+        None => credential.access(),
+    };
+    let mut spec = sandbox_spec(
+        shared,
+        assign,
+        credential,
+        model,
+        layout,
+        &dirs.workspace,
+        &dirs.home,
+        attachments,
+        dirs.output.as_deref(),
+        run_skills,
+    );
+    spec.extra_hosts = access.extra_hosts.clone();
+    // With the bridge, the run's directories go into the sandbox in place of the mounts,
+    // and the same paths of the home come back (crate::sandbox_files).
+    let skill_dirs: Vec<String> = run_skills
+        .iter()
+        .map(|skill| format!("{}/{}", skills::mount_dir(assign.agent.runtime), skill.name))
+        .collect();
+    let home_exclude = sandbox_files::home_exclude(&skill_dirs, mounted_login(shared, credential));
+    let puts = bridge_puts(run, contents, &home_exclude);
+    // A proxy that cannot start is a run that cannot start. An egress proxy that is not there
+    // leaves the sandbox on a network with no other way out, so it could not reach its model;
+    // a model proxy that is not there would leave a gateway's key to the sandbox, which no
+    // host may do (ADR-0059). The spec built above is then never started.
+    let started = match model_proxy {
+        Ok(model_proxy) => {
+            access.model_proxy = model_proxy;
+            let slot = claimed.as_mut().and_then(|vm| vm.egress.take());
+            let started_egress = start_egress(
+                shared,
+                &mut run.sink,
+                assign,
+                model,
+                &mut spec,
+                slot,
+                &access.serving,
             )
-        } else {
-            Vec::new()
-        };
-        // A proxy that cannot start is a run that cannot start. An egress proxy that is not there
-        // leaves the sandbox on a network with no other way out, so it could not reach its model;
-        // a model proxy that is not there would leave a gateway's key to the sandbox, which no
-        // host may do (ADR-0059). The spec built above is then never started.
-        let started = match model_proxy {
-            Ok(model_proxy) => {
-                access.model_proxy = model_proxy;
-                let host = access.sandbox_host.clone();
-                let slot = claimed.as_mut().and_then(|vm| vm.egress.take());
-                match start_egress(
-                    shared,
-                    &mut sink,
-                    assign,
-                    model,
-                    &mut spec,
-                    host.as_deref(),
-                    slot,
-                )
-                .await
-                {
-                    Ok(egress) => {
-                        access.egress = egress;
-                        start_sandbox(
-                            shared,
-                            &mut sink,
-                            assign,
-                            &mut spec,
-                            &access,
-                            puts,
-                            claimed.take(),
-                        )
-                        .await
-                    }
-                    Err(error) => Err(anyhow::anyhow!(error)),
-                }
-            }
-            Err(error) => Err(anyhow::anyhow!(error)),
-        };
-        match started {
-            Ok((mut sandbox, io)) => {
-                if let Some(files) = sandbox.files() {
-                    sandbox_reader.set(files);
-                }
-                // While the sandbox lives, a host that restarts takes the run back (ADR-0101).
-                if let Some((kind, bridge_id, session_key)) = sandbox.take_back_record() {
-                    let record = RunRecord {
-                        version: crate::takeback::RECORD_VERSION,
-                        assign: assign.clone(),
-                        sandbox: kind,
-                        bridge_id,
-                        session_key,
-                        repos: repos
-                            .iter()
-                            .map(|repo| {
-                                RepoRecord::new(
-                                    &repo.ws.dir,
-                                    &repo.cloned_head,
-                                    repo.cloned_commits,
-                                    repo.git.base_refs(),
-                                    repo.git.config_snapshot(),
-                                )
-                            })
-                            .collect(),
-                        home_exclude: home_exclude.clone(),
-                        session_id: None,
-                        seq_floor: sink.last_seq() + crate::takeback::SEQ_BLOCK,
-                    };
-                    match RecordHandle::create(&shared.records, record) {
-                        Ok(record) => sink.keep_record(Arc::new(record)),
-                        Err(e) => sink.log(
-                            LogLevel::Warn,
-                            format!(
-                                "cannot keep the run's record, so a restart of the host would lose the run: {e:#}"
-                            ),
-                        ),
-                    }
-                }
-                sink.status(Phase::Running, None);
-                let params = AcpParams {
-                    cwd: shared.opts.executor.agent_cwd(&spec),
-                    prompt: assign.prompt.clone(),
-                    resume_session_id: assign.resume_session_id.clone(),
-                    resume_prompt: assign.resume_prompt.clone(),
-                    new_home,
-                    client_version: shared.opts.runner_version.clone(),
-                    mcp_url: access.mcp.as_ref().map(|m| m.url().to_string()),
-                    session_meta: crate::runtime_env::session_meta(assign.agent.runtime),
-                    steering: steering.clone(),
-                    thought_level: if effort_in_env(assign.agent.runtime) {
-                        ThoughtLevel::Untouched
-                    } else {
-                        assign
-                            .agent
-                            .effort
-                            .map_or(ThoughtLevel::Default, ThoughtLevel::Effort)
-                    },
-                };
-                let agent = run_agent(
-                    shared,
-                    assign,
-                    &mut sink,
-                    io,
-                    params,
-                    &mut stop_rx,
-                    deadline,
-                )
-                .await;
-                sandbox.stop_agent(Duration::from_secs(5)).await;
-                // With the bridge, the agent's work comes back before the sandbox goes.
-                if let Some(files) = sandbox.files()
-                    && !matches!(agent.stop, Some(StopCause::Abort))
-                {
-                    collect_from_sandbox(
-                        &mut sink,
+            .await;
+            match started_egress {
+                Ok(egress) => {
+                    access.egress = egress;
+                    start_sandbox(
+                        shared,
+                        &mut run.sink,
                         assign,
-                        &files,
-                        &layout,
-                        &mut repos,
-                        &home_dir,
-                        home_exclude,
-                        output_dir.as_deref(),
+                        &mut spec,
+                        access,
+                        puts,
+                        claimed.take(),
                     )
-                    .await;
+                    .await
                 }
-                sandbox.stop(Duration::from_secs(5)).await;
-                sink.drop_record();
-                phase = Some(agent);
+                Err(error) => Err(anyhow::anyhow!(error)),
             }
-            Err(e) => {
-                failure.set(
+        }
+        Err(error) => Err(anyhow::anyhow!(error)),
+    };
+    let (sandbox, io) = started?;
+    Ok(StartedSandbox {
+        sandbox,
+        io,
+        spec,
+        home_exclude,
+    })
+}
+
+/// With the bridge, the run's directories go into the sandbox in place of the mounts
+/// (crate::sandbox_files): the workspace, the home without `home_exclude`, the skills at the
+/// runtime's skill directory, the attachments and `/output`. Nothing without the bridge.
+fn bridge_puts(
+    run: &Run<'_>,
+    contents: &SandboxContents<'_>,
+    home_exclude: &[String],
+) -> Vec<crate::sandbox::Put> {
+    let (shared, assign) = (run.shared, run.assign);
+    let SandboxContents {
+        dirs,
+        layout,
+        attachments,
+        skills: run_skills,
+    } = *contents;
+    let bridged = shared.opts.bridge.is_some();
+    if bridged {
+        sandbox_files::puts(
+            layout,
+            &dirs.workspace,
+            &dirs.home,
+            home_exclude.to_vec(),
+            run_skills
+                .iter()
+                .map(|skill| {
+                    (
+                        skill.path.clone(),
+                        format!(
+                            "{}/{}/{}",
+                            layout.home,
+                            skills::mount_dir(assign.agent.runtime),
+                            skill.name
+                        ),
+                    )
+                })
+                .collect(),
+            attachments,
+            dirs.output.as_deref(),
+        )
+    } else {
+        Vec::new()
+    }
+}
+
+/// From the sandbox's start until the run's report is made, a host that restarts takes the run
+/// back (ADR-0101): the run's record, for a sandbox on the bridge. A record that cannot be
+/// written is a warning.
+fn keep_a_take_back_record(run: &mut Run<'_>, started: &StartedSandbox, repos: &[Repo<'_>]) {
+    let (shared, assign) = (run.shared, run.assign);
+    let Some((kind, bridge_id, session_key, keep)) = started.sandbox.take_back_record() else {
+        return;
+    };
+    let repos = repos
+        .iter()
+        .map(|repo| {
+            RepoRecord::new(
+                &repo.ws.dir,
+                &repo.cloned_head,
+                repo.cloned_commits,
+                repo.git.base_refs(),
+                repo.git.config_snapshot(),
+            )
+        })
+        .collect();
+    let seq_floor = run.sink.last_seq() + crate::takeback::SEQ_BLOCK;
+    // The tokens as the run's holder has them, none that was revoked: the holder writes the
+    // record and keeps it in step from then on, in one step that a revocation waits for.
+    let made = run
+        .tokens
+        .make_record(&shared.records, assign, |kept, revoked| RunRecord {
+            version: crate::takeback::RECORD_VERSION,
+            assign: kept,
+            sandbox: kind,
+            bridge_id,
+            session_key,
+            repos,
+            home_exclude: started.home_exclude.clone(),
+            session_id: None,
+            seq_floor,
+            revoked,
+            collected: false,
+            // The holder sets it ([`RunGitTokens::make_record`]).
+            redaction: None,
+            bridge: keep.as_ref().map(crate::takeback::BridgeRecord::of),
+            end: None,
+        });
+    match made {
+        Ok(record) => run.sink.keep_record(record),
+        Err(e) => run.sink.log(
+            LogLevel::Warn,
+            format!(
+                "cannot keep the run's record, so a restart of the host would lose the run: {e:#}"
+            ),
+        ),
+    }
+}
+
+/// What the agent's ACP session starts with (crate::acp): its working directory, the prompt
+/// and the session to resume, the run's platform tools and the steering of its messages.
+fn agent_params(
+    run: &Run<'_>,
+    spec: &SandboxSpec,
+    access: &SandboxAccess,
+    new_home: bool,
+    steering: &Arc<Steering>,
+) -> AcpParams {
+    let (shared, assign) = (run.shared, run.assign);
+    AcpParams {
+        cwd: shared.opts.executor.agent_cwd(spec),
+        prompt: assign.prompt.clone(),
+        resume_session_id: assign.resume_session_id.clone(),
+        resume_prompt: assign.resume_prompt.clone(),
+        new_home,
+        client_version: shared.opts.runner_version.clone(),
+        mcp_url: access.mcp.as_ref().map(|m| m.url().to_string()),
+        session_meta: crate::runtime_env::session_meta(assign.agent.runtime),
+        steering: steering.clone(),
+        thought_level: if effort_in_env(assign.agent.runtime) {
+            ThoughtLevel::Untouched
+        } else {
+            assign
+                .agent
+                .effort
+                .map_or(ThoughtLevel::Default, ThoughtLevel::Effort)
+        },
+    }
+}
+
+/// After the agent's turn: a front that ended during the run is replaced once
+/// ([`a_new_front_takes_the_sandbox_back`]), a VM that ended under the run fails it with
+/// `INFRA`, the agent stops, and with the bridge its work comes back before the sandbox goes.
+/// The take-back record says so before the sandbox goes ([`RecordHandle::collected_at_the_end`])
+/// and stays until the run's report is made: a host that restarts meanwhile finishes the run
+/// from this host's disk. A record that cannot say so goes before the sandbox stops, as does
+/// the record of a run whose work did not come back (an abort).
+async fn bring_the_work_back(
+    run: &mut Run<'_>,
+    mut sandbox: crate::sandbox::Sandbox,
+    agent: &mut AgentPhase,
+    contents: &SandboxContents<'_>,
+    repos: &mut [Repo<'_>],
+    home_exclude: Vec<String>,
+) {
+    let (shared, assign) = (run.shared, run.assign);
+    // A sandbox's front that ended during the run (it crashed, or broke its wire) took the
+    // bridge's session with it: one new front takes the session back, as a host that
+    // restarted does, the agent stops and its work comes back. A second front that ends too
+    // is not replaced.
+    let front_ended = sandbox.front_ended_after(Duration::from_secs(2)).await;
+    let mut taken_back = false;
+    if front_ended {
+        taken_back = a_new_front_takes_the_sandbox_back(run, &mut sandbox).await;
+        // A front that ended while the host stops ended with that stop, and the agent's turn
+        // with the front. The stop cancels every run: this turn was stopped by it too, and is
+        // not looked at as one that ended by itself (an agent that lost its output would
+        // fail the run).
+        if shared.is_shutting_down() && agent_lost_its_output(agent) {
+            agent.stop = Some(StopCause::Cancel);
+        }
+    }
+    // A VM's bridge session that ended without the adapter's exit status may have ended with
+    // the VM (its VMM died, its node rebooted): no fault of the agent's. Only then is the
+    // driver asked, once.
+    if !front_ended
+        && agent_lost_its_output(agent)
+        && let Some(cause) = sandbox.vm_lost(Duration::from_secs(2)).await
+    {
+        let cause = run.sink.redact(&cause);
+        tracing::warn!(run_id = %assign.run_id, %cause, "the run's sandbox VM ended during the run");
+        run.failure.set(
+            FailureClass::Infra,
+            format!(
+                "The sandbox VM ended during the run ({cause}); the agent's session in it was lost."
+            ),
+        );
+    }
+    sandbox.stop_agent(Duration::from_secs(5)).await;
+    // With the bridge, the agent's work comes back before the sandbox goes.
+    let mut collection = None;
+    if let Some(files) = sandbox.files()
+        && !matches!(agent.stop, Some(StopCause::Abort))
+    {
+        collection = Some(
+            collect_from_sandbox(
+                &mut run.sink,
+                assign,
+                &files,
+                &reader_of(shared),
+                contents.layout,
+                repos,
+                &contents.dirs.home,
+                home_exclude,
+                contents.dirs.output.as_deref(),
+            )
+            .await,
+        );
+    }
+    // The run said that the new front saved the work: so it must have, all of it. A part that
+    // did not come back (the new front ended too, and is not replaced, or the part failed)
+    // says what was saved and what was not.
+    if taken_back
+        && let Some(collection) = &collection
+        && let Some(message) = collection.after_a_new_front(sandbox.front_ended())
+    {
+        run.failure.force(FailureClass::Infra, message);
+    }
+    // The work is on this host now. The record says so before the sandbox goes, so that a
+    // restart at any moment finds the work where the record says it is: in the sandbox until
+    // the mark is on disk, here after it.
+    // A record that is not kept goes before the sandbox stops: until then it is the record of a
+    // sandbox that still holds the work, and a host that restarted meanwhile would take the run
+    // back from it, a run that leaked included. Without it, a restart loses the run.
+    let kept = collection.is_some() && keep_the_record_for_the_end(run, repos, agent);
+    if !kept {
+        forget_the_record(run);
+    }
+    halt_at(shared, EndStep::Stopping).await;
+    sandbox.stop(Duration::from_secs(5)).await;
+    halt_at(shared, EndStep::Stopped).await;
+}
+
+/// Marks the run's record collected in the run's own end, with what is known already: a leak
+/// of the agent's output (it was stopped for it), and the server's cancel. A host that restarts
+/// keeps to them even when the agent's outcome never reaches the record. Whether the record
+/// stays: `false` without a record, or when the mark cannot be written (a warning: a restart
+/// before the run's end is reported then loses the run, as without a record, which is the safe
+/// side for a run that leaked: nothing of it leaves the host).
+fn keep_the_record_for_the_end(run: &mut Run<'_>, repos: &[Repo<'_>], agent: &AgentPhase) -> bool {
+    let Some(record) = run.sink.record() else {
+        return false;
+    };
+    let leak = matches!(agent.stop, Some(StopCause::Leak));
+    let cancelled = matches!(agent.stop, Some(StopCause::Cancel))
+        || *run.stop_rx.borrow() == Some(StopRequest::Cancel);
+    if record.collected_at_the_end(&collected_repos(repos), leak, cancelled) {
+        return true;
+    }
+    run.sink.log(
+        LogLevel::Warn,
+        "the runner host cannot write in its record that the run's work came back from the sandbox, so a restart before the run's end is reported would lose the run",
+    );
+    false
+}
+
+/// The sandbox's front ended during the run: one new front takes the bridge's session back
+/// ([`crate::sandbox::Sandbox::take_back_from_a_new_front`]) and the agent stops. Either way
+/// the run fails with `INFRA`, saying whether its work can come back, with one exception: a
+/// front that ended while the host stops, and whose sandbox the new front took back, fails no
+/// run. That run ends cancelled, as every run of a host that stops. Whether the new front took
+/// the sandbox back.
+async fn a_new_front_takes_the_sandbox_back(
+    run: &mut Run<'_>,
+    sandbox: &mut crate::sandbox::Sandbox,
+) -> bool {
+    let (shared, assign) = (run.shared, run.assign);
+    let mut taken_back = false;
+    let bridge = shared
+        .opts
+        .bridge
+        .as_ref()
+        .expect("a front holds the bridge");
+    match sandbox
+        .take_back_from_a_new_front(bridge, TAKE_BACK_WAIT)
+        .await
+    {
+        Ok(()) => {
+            taken_back = true;
+            tracing::warn!(run_id = %assign.run_id, "the sandbox's front ended during the run; a new one took the sandbox back");
+            if let Err(e) = sandbox.reclaim(RECLAIM_TIMEOUT).await {
+                run.sink.log(
+                    LogLevel::Warn,
+                    format!(
+                        "the agent did not stop as asked: {}",
+                        run.sink.redact(&format!("{e:#}"))
+                    ),
+                );
+            }
+            // A front that ended while the host stops is the stop's doing, not a fault of the
+            // run's: a service manager may signal the fronts with `run` (systemd without
+            // `KillMode=mixed`). The run then ends as the stop ends every run, cancelled, with
+            // the work that the new front brings back.
+            if !shared.is_shutting_down() {
+                run.failure.set(
                     FailureClass::Infra,
-                    sink.redact(&format!("cannot start the sandbox: {e:#}")),
+                    "The sandbox's front process ended during the run; a new front took the sandbox back, the agent was stopped, and its work so far was saved.",
                 );
             }
         }
+        Err(e) => {
+            let error = run.sink.redact(&format!("{e:#}"));
+            tracing::warn!(run_id = %assign.run_id, %error, "the sandbox's front ended during the run, and a new one could not take the sandbox back");
+            run.failure.set(
+                FailureClass::Infra,
+                format!(
+                    "The sandbox's front process ended during the run, and a new front could not take the sandbox back ({error}); the work of the run is lost."
+                ),
+            );
+        }
     }
-    // The sandbox is gone, and with it the need to fetch or to call the platform tools. The
-    // agent's last `finish_run` is the run's result (docs/archive/v1/CONVENTIONS.md §15.6).
+    taken_back
+}
+
+/// The sandbox is gone, and with it the need to fetch or to call the platform tools: the
+/// run's access goes ([`SandboxAccess`], in the order of its fields). The agent's last
+/// `finish_run` is the run's result (docs/archive/v1/CONVENTIONS.md §15.6); the hosts that the
+/// egress proxy refused are a warning.
+fn close_the_access(run: &mut Run<'_>, access: SandboxAccess) -> Option<RunResult> {
     let result = access.tools.as_ref().and_then(|tools| tools.result());
     if let Some(egress) = &access.egress {
         let denied = egress.denied();
         if !denied.is_empty() {
-            sink.log(
+            run.sink.log(
                 LogLevel::Warn,
                 format!(
                     "the egress proxy refused the sandbox's connections to: {}. If the run needs one of them, the operator adds it with `run --egress-allow HOST[:PORT]`",
@@ -866,41 +1579,66 @@ pub async fn execute(
         }
     }
     drop(access);
+    result
+}
 
-    // --- outcome of the agent phase -----------------------------------------------------
-    let mut session_id = None;
-    let mut not_resumed = None;
-    let mut summary = None;
-    let mut usage = None;
-    let mut leak = false;
-    match *stop_rx.borrow() {
+/// What the agent's phase leaves for the rest of the run ([`agent_outcome`]).
+#[derive(Debug, Default)]
+struct AgentOutcome {
+    session_id: Option<String>,
+    not_resumed: Option<Option<NotResumed>>,
+    summary: Option<String>,
+    usage: Option<tinfirm_protocol::UsagePayload>,
+    /// The agent's output contained a credential value: nothing of the run leaves the host.
+    leak: bool,
+    /// The server cancelled the run.
+    cancelled: bool,
+}
+
+/// The outcome of the agent's phase: the server's stop, then why the agent's turn ended, which
+/// sets the run's failure ([`classify_agent_end`] for a turn that ended on its own). An abort
+/// ends the run here: its workspace goes, and it reports nothing.
+async fn agent_outcome(
+    run: &mut Run<'_>,
+    credential: &RunCredential,
+    phase: Option<AgentPhase>,
+    codex_auth_at_start: crate::credentials::FileStamp,
+    workspace_dir: &Path,
+) -> ControlFlow<Option<RunFinished>, AgentOutcome> {
+    let shared = run.shared;
+    let mut outcome = AgentOutcome::default();
+    // Copied out of the channel first. A `match` on the borrow itself keeps the channel's lock
+    // until the match ends, so through the removal of the workspace: a second stop that the
+    // server sends meanwhile would block the thread that passes it on.
+    let stop = *run.stop_rx.borrow();
+    match stop {
         Some(StopRequest::Abort) => {
-            cleanup_workspace(shared, &workspace_dir, false);
-            return None;
+            cleanup_workspace(shared, workspace_dir, false);
+            return ControlFlow::Break(None);
         }
-        Some(StopRequest::Cancel) => cancelled = true,
+        Some(StopRequest::Cancel) => outcome.cancelled = true,
         None => {}
     }
     if let Some(agent) = phase {
-        session_id = agent.session_id.clone();
-        not_resumed = agent.not_resumed.clone();
-        summary = agent.summary.clone();
-        usage = agent.usage.clone();
+        outcome.session_id = agent.session_id.clone();
+        outcome.not_resumed = agent.not_resumed.clone();
+        outcome.summary = agent.summary.clone();
+        outcome.usage = agent.usage.clone();
         match agent.stop.clone() {
             Some(StopCause::Abort) => {
-                cleanup_workspace(shared, &workspace_dir, false);
-                return None;
+                cleanup_workspace(shared, workspace_dir, false);
+                return ControlFlow::Break(None);
             }
-            Some(StopCause::Cancel) => cancelled = true,
+            Some(StopCause::Cancel) => outcome.cancelled = true,
             Some(StopCause::Leak) => {
-                leak = true;
-                failure.set(
+                outcome.leak = true;
+                run.failure.set(
                     FailureClass::CredentialLeak,
                     "the agent's output contained a credential value; the run was stopped and nothing was pushed",
                 );
             }
-            Some(StopCause::Guard(message)) => failure.set(FailureClass::GuardStopped, message),
-            Some(StopCause::TimeLimit(message)) => failure.set(
+            Some(StopCause::Guard(message)) => run.failure.set(FailureClass::GuardStopped, message),
+            Some(StopCause::TimeLimit(message)) => run.failure.set(
                 if shared.speaks_v2() {
                     FailureClass::TimeLimit
                 } else {
@@ -911,8 +1649,8 @@ pub async fn execute(
             Some(StopCause::UsageLimit { resets_at, window }) => {
                 usage_limit(
                     shared,
-                    &mut sink,
-                    &mut failure,
+                    &mut run.sink,
+                    &mut run.failure,
                     credential,
                     resets_at,
                     window,
@@ -922,8 +1660,8 @@ pub async fn execute(
             None => {
                 classify_agent_end(
                     shared,
-                    &mut sink,
-                    &mut failure,
+                    &mut run.sink,
+                    &mut run.failure,
                     credential,
                     &agent,
                     codex_auth_at_start,
@@ -932,81 +1670,96 @@ pub async fn execute(
             }
         }
     }
+    ControlFlow::Continue(outcome)
+}
 
-    // --- /output (protocol v2) ----------------------------------------------------------
-    // Before the git finalize and the cleanup: what the agent left in /output becomes the
-    // artifacts of the job. After a leak nothing leaves the host, as with the push.
+/// Under protocol v2, the files the agent left in `/output` become the artifacts of the job
+/// ([`collect_output`]); after a leak none does.
+async fn save_the_output(
+    run: &mut Run<'_>,
+    output_root: Option<&OutputRoot>,
+    leak: bool,
+) -> Vec<ArtifactResult> {
     let mut artifacts = Vec::new();
-    if let Some(output_root) = &output_root {
+    if let Some(output_root) = output_root {
         if leak {
-            sink.log(
+            run.sink.log(
                 LogLevel::Warn,
                 "not saving the files of /output: the run leaked a credential value",
             );
         } else {
-            artifacts = collect_output(shared, &mut sink, assign, output_root).await;
+            let record = run.sink.record();
+            artifacts =
+                collect_output(run.shared, &mut run.sink, run.assign, output_root, record).await;
         }
     }
+    artifacts
+}
 
-    // --- git finalize -------------------------------------------------------------------
+/// The git finalize of every repository ([`finalize_git`]): a commit that contains a credential
+/// value fails the run with `CREDENTIAL_LEAK`, cancelled or not; a repository that fails fails
+/// a run that was not cancelled with `GIT_ERROR`, and is an error in the log of one that was.
+async fn finalize_repositories(
+    run: &mut Run<'_>,
+    repos: &[Repo<'_>],
+    outcome: &mut AgentOutcome,
+) -> Vec<GitResult> {
+    let (shared, assign) = (run.shared, run.assign);
     let mut results = Vec::new();
     if !repos.is_empty() {
-        sink.status(Phase::Finalizing, None);
-        let finalized = finalize_git(shared, &mut sink, &repos, assign.run_id, leak).await;
+        run.sink.status(Phase::Finalizing, None);
+        let finalized = finalize_git(
+            shared,
+            &mut run.sink,
+            repos,
+            run.tokens,
+            assign.run_id,
+            outcome.leak,
+            false,
+        )
+        .await;
         if finalized.outgoing_leak {
-            failure.force(
+            run.failure.force(
                 FailureClass::CredentialLeak,
                 "a commit contains a credential value; no repository was pushed",
             );
-            cancelled = false;
+            outcome.cancelled = false;
         }
         if !finalized.errors.is_empty() {
             let message = git_failure_message(&finalized.errors, repos.len());
-            if !cancelled {
-                failure.set(FailureClass::GitError, message);
+            if !outcome.cancelled {
+                run.failure.set(FailureClass::GitError, message);
             } else {
-                sink.log(LogLevel::Error, message);
+                run.sink.log(LogLevel::Error, message);
             }
         }
         results = finalized.results;
     }
+    results
+}
 
-    // --- session bundle (ADR-0097) -------------------------------------------------------
-    let session_bundle = match &assign.session_bundle {
+/// The run's session bundle (ADR-0097), when the assignment asks for one: the session the
+/// agent left in the home, stored on the server ([`store_session_bundle`]); after a leak, none.
+async fn store_the_session(
+    run: &mut Run<'_>,
+    dirs: &RunDirs,
+    outcome: &AgentOutcome,
+) -> Option<tinfirm_protocol::SessionBundleOutcome> {
+    let (shared, assign) = (run.shared, run.assign);
+    match &assign.session_bundle {
         Some(_) => Some(
             store_session_bundle(
                 shared,
-                &mut sink,
+                &mut run.sink,
                 assign,
-                &home_dir,
-                session_id.as_deref(),
-                leak,
+                &dirs.home,
+                outcome.session_id.as_deref(),
+                outcome.leak,
             )
             .await,
         ),
         None => None,
-    };
-
-    let failed_git = results
-        .iter()
-        .any(|g| !g.pushed && g.commits.unwrap_or(0) > 0);
-    let report = Report {
-        summary,
-        result,
-        session_id,
-        not_resumed,
-        git: Some(results),
-        usage,
-        artifacts,
-        session_bundle,
-    };
-    let finished = finish(&mut sink, assign, failure, cancelled, report);
-    cleanup_workspace(
-        shared,
-        &workspace_dir,
-        finished.outcome == Outcome::Failed || failed_git,
-    );
-    Some(finished)
+    }
 }
 
 /// How long a run taken back waits for its sandbox's bridge to come back.
@@ -1014,61 +1767,282 @@ const TAKE_BACK_WAIT: Duration = Duration::from_secs(120);
 /// How long the agent of the earlier process has to stop.
 const RECLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Takes back a run of the process this host restarted from (ADR-0101): its sandbox
-/// (`sandbox`, held since the host started) comes back over `registration` with the session
-/// key. The agent stops, and the run ends as a run that the host stopped does: the work comes
-/// back from the sandbox and is pushed, the session's bundle is stored, and the run is reported
-/// failed with `INFRA`, or cancelled when the server cancels it meanwhile. Returns `None` when
-/// the run was aborted (stale epoch) and must not report anything.
+/// How a run taken back ends ([`take_back`]).
+pub enum TakenBackEnd {
+    /// The run ends, and this is its report.
+    Finished(Box<RunFinished>),
+    /// Aborted (a stale epoch): it pushes and reports nothing, and its record and work go.
+    Aborted,
+    /// The host shuts down while the run waits for the server before its push: the record and
+    /// the work stay on this host, and the next start takes the run back from them. A sandbox
+    /// that still holds the work (its record could not be marked collected) comes with it: the
+    /// host keeps it until the process ends, so that its session is not ended.
+    Left(Option<Box<crate::sandbox::Sandbox>>),
+}
+
+/// Takes back a run of the process this host restarted from (ADR-0101). `sandbox` is the
+/// run's sandbox (held since the host started) and the registration over which it comes back
+/// with the session key; `None` for a run whose work came back from its sandbox already
+/// ([`RunRecord::collected`]), before an earlier restart. The agent stops, and the run ends as a
+/// run that the host stopped does: the work comes back from the sandbox and is pushed, once the
+/// server has answered the hello (ADR-0116, decision 10), the session's bundle is stored, and
+/// the run is reported failed with `INFRA`, or cancelled when the server cancels it meanwhile.
+/// The record stays until the run ends, so a restart while the run waits takes it back again.
+///
+/// A run whose host restarted in the run's own end ([`RunRecord::end`]) is finished the same
+/// way, from this host's disk: what its end saved already (`/output`) is not saved again, a
+/// push or a session bundle that the earlier process made is made again harmlessly (a branch
+/// at the run's head is up to date), and the run reports the outcome its record keeps, the
+/// failure of a push included, as [`execute`] would have; without one, it is reported failed
+/// with `INFRA`, saying that the agent's turn had ended.
+///
+/// The stages: the run's redaction from its record, its directories and repositories as the
+/// earlier process left them, the sandbox's bridge coming back with the work, the wait for the
+/// server, the stop, and what the run leaves (`save_the_work`, `say_what_was_saved`).
 pub async fn take_back(
     shared: &Arc<Shared>,
     record: RunRecord,
-    sandbox: crate::sandbox::TakenBack,
-    registration: tinfirm_bridge::host::Registration,
-    mut stop_rx: watch::Receiver<Option<StopRequest>>,
-) -> Option<RunFinished> {
+    kept: Arc<RecordHandle>,
+    tokens: &Arc<RunGitTokens>,
+    sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
+    stop_rx: watch::Receiver<Option<StopRequest>>,
+) -> TakenBackEnd {
     let assign = &record.assign;
-    let paths = shared.opts.paths.clone();
-    let mut sink = EventSink::after(
-        shared.clone(),
-        assign.run_id,
-        assign.epoch,
-        record.seq_floor,
-    );
-    sink.keep_record(Arc::new(RecordHandle::kept(
-        &shared.records,
-        record.clone(),
-    )));
+    let paths = &shared.opts.paths;
+    let mut run = Run {
+        shared,
+        assign,
+        tokens,
+        sink: EventSink::after(
+            shared.clone(),
+            assign.run_id,
+            assign.epoch,
+            record.seq_floor,
+        ),
+        failure: Failure::default(),
+        stop_rx,
+    };
+    // The holder keeps `kept` in step since the run was registered: a revocation that the
+    // server sends again at the hello writes the record again.
+    run.sink.keep_record(kept.clone());
+    tokens.attach_log(run.sink.side());
     let mut secrets = Vec::new();
     if let Some(tinfirm_protocol::AssignedCredential::Model(access)) = assign.credential() {
         secrets.push(access.api_key.expose().to_string());
     }
-    for ws in &assign.workspaces {
-        if let Some(creds) = &ws.git {
-            secrets.push(creds.token.expose().to_string());
-        }
-        if let Some(authorization) = git::authorization_for(ws) {
-            secrets.push(authorization.expose().to_string());
-        }
-    }
-    if !secrets.is_empty() {
-        shared.add_run_secrets(assign.run_id, assign.epoch, secrets);
-    }
-    sink.log(
+    redact_the_runs_secrets(shared, assign, secrets);
+    let unsafe_record = redact_the_earlier_tokens(&run, &record);
+    run.sink.log(
         LogLevel::Warn,
-        "the runner host restarted during the run and takes it back: the agent stops, and its work and its session are saved",
+        if record.end.is_some() {
+            "the runner host restarted at the end of the run, after the agent's turn and once the work had come back from the sandbox: the run's end is finished from this host"
+        } else if record.collected {
+            "the runner host restarted again before it pushed the run's work: the work it took from the sandbox is pushed from this host"
+        } else {
+            "the runner host restarted during the run and takes it back: the agent stops, and its work and its session are saved"
+        },
     );
-    sink.status(Phase::Finalizing, None);
+    run.sink.status(Phase::Finalizing, None);
 
+    let dirs = taken_back_dirs(&mut run, record.collected);
+    let mut repos = restore_repositories(&run, &record, &dirs);
+
+    // --- the sandbox's bridge comes back --------------------------------------------------
+    let CameBack {
+        work: came_back,
+        mut held,
+    } = bring_the_sandbox_back(&mut run, &record, &kept, sandbox, &dirs, &mut repos).await;
+
+    // The push waits for the server (ADR-0116, decision 10): this process pushes nothing and
+    // uses no git token of the run before the server has welcomed it, and, from a server that
+    // lists `run.git.revoke`, before `welcome.done`, which comes after every revocation it
+    // held for the run. There is no cap: the work and the record stay on this host while it
+    // waits. Then every token of the run that expires is renewed, an expired one included
+    // (an older server never sent `expiresAt`, so `git_refresh::renew` asks for nothing then).
+    // The stop is looked at after this, so that an abort meanwhile pushes and reports nothing.
+    if came_back && !repos.is_empty() {
+        match wait_for_the_server(shared, &mut run.sink, &mut run.stop_rx).await {
+            Waited::Answered | Waited::Aborted => {}
+            Waited::Left => {
+                tracing::info!(run_id = %assign.run_id, epoch = assign.epoch, "the host stops while a run taken back waits for the server; the next start takes it back");
+                // The record stays, and so does the work: neither is removed here. A sandbox
+                // kept for want of the mark is left too: its bridge waits for the next start.
+                tokens.drop_record();
+                return TakenBackEnd::Left(held.map(Box::new));
+            }
+        }
+        // A run that leaked pushes nothing, so it asks for no new token either.
+        if *run.stop_rx.borrow() != Some(StopRequest::Abort)
+            && shared.speaks_v2()
+            && !leaked_at_the_end(&record)
+        {
+            crate::git_refresh::renew(shared, tokens, None).await;
+        }
+    }
+
+    let stop = *run.stop_rx.borrow();
+    let outcome = record.end.as_ref().and_then(|end| end.outcome.as_ref());
+    let cancelled = match stop {
+        Some(StopRequest::Abort) => {
+            if let Some(mut sandbox) = held.take() {
+                sandbox.stop(Duration::from_secs(5)).await;
+            }
+            tokens.drop_record();
+            run.sink.drop_record();
+            let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
+            cleanup_workspace(shared, &dirs.workspace, false);
+            return TakenBackEnd::Aborted;
+        }
+        // The outcome that the run's own end decided stands: a cancel that comes after it
+        // changes it no more than it would have in that end. Without it, the cancel that the
+        // record's mark kept stands.
+        _ if outcome.is_some() => outcome.is_some_and(|o| o.cancelled),
+        _ if record.end.as_ref().is_some_and(|end| end.cancelled) => true,
+        Some(StopRequest::Cancel) => true,
+        None => false,
+    };
+
+    // --- what the run leaves ---------------------------------------------------------------
+    let saved = save_the_work(
+        &mut run,
+        &record,
+        &kept,
+        came_back,
+        unsafe_record.as_deref(),
+        &repos,
+        &dirs,
+    )
+    .await;
+    // An abort that came while the work was saved: the run makes no report, and nothing more
+    // of it is done here (what was under way has finished).
+    if *run.stop_rx.borrow() == Some(StopRequest::Abort) {
+        if let Some(mut sandbox) = held.take() {
+            sandbox.stop(Duration::from_secs(5)).await;
+        }
+        forget_the_record(&mut run);
+        let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
+        if shared.no_newer_execution(assign.run_id, assign.epoch) {
+            cleanup_workspace(shared, &dirs.workspace, false);
+        }
+        return TakenBackEnd::Aborted;
+    }
+    let failed_git = saved
+        .results
+        .iter()
+        .any(|g| !g.pushed && g.commits.unwrap_or(0) > 0);
+    let cancelled = say_what_was_saved(
+        &mut run,
+        &record,
+        cancelled,
+        unsafe_record.as_deref(),
+        &saved,
+        failed_git,
+    );
+    let report = match outcome {
+        Some(outcome) => Report {
+            summary: outcome.summary.clone(),
+            result: outcome.result.clone(),
+            session_id: outcome.session_id.clone().or(record.session_id.clone()),
+            not_resumed: match outcome.session {
+                SessionRecord::NotOpened => None,
+                SessionRecord::Resumed => Some(None),
+                SessionRecord::NotResumed { outcome } => Some(Some(NotResumed {
+                    outcome,
+                    error: None,
+                })),
+            },
+            git: Some(saved.results),
+            usage: outcome.usage.clone(),
+            artifacts: saved.artifacts,
+            session_bundle: saved.session_bundle,
+        },
+        None => Report {
+            session_id: record.session_id.clone(),
+            git: Some(saved.results),
+            artifacts: saved.artifacts,
+            session_bundle: saved.session_bundle,
+            ..Report::default()
+        },
+    };
+    let finished = run.finish(cancelled, report);
+    halt_at(shared, EndStep::Reported).await;
+    // The run has ended: its report is kept in place of the record until it is delivered, and
+    // a sandbox kept so far goes.
+    if let Some(mut sandbox) = held.take() {
+        sandbox.stop(Duration::from_secs(5)).await;
+    }
+    keep_the_report(&mut run, &finished);
+    halt_at(shared, EndStep::ReportKept).await;
+    let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
+    if shared.no_newer_execution(assign.run_id, assign.epoch) {
+        cleanup_workspace(
+            shared,
+            &dirs.workspace,
+            finished.outcome == Outcome::Failed || failed_git,
+        );
+    }
+    TakenBackEnd::Finished(Box::new(finished))
+}
+
+/// Every token the run has held, those the record no longer holds included (a revoked one,
+/// a GitHub App's earlier ones), by the salted hashes the record keeps: the events, the
+/// host's log lines of the run, and the scans before the push, of the session bundle and
+/// of `/output` find them as they find the live ones.
+/// A record without hashes (an earlier version's) reads as before. A record whose hashes
+/// are there but cannot be used is unsafe: an earlier token could then leave in a commit,
+/// the session bundle or `/output`, so nothing of the run's work leaves the host. `Some` with
+/// why for such a record.
+fn redact_the_earlier_tokens(run: &Run<'_>, record: &RunRecord) -> Option<String> {
+    let (shared, assign) = (run.shared, run.assign);
+    let mut unsafe_record = None;
+    if record.redaction.is_some() {
+        match crate::secret_hashes::HashedMatcher::new(&run.tokens.hashes()) {
+            Ok(matcher) => {
+                shared.add_run_hashed(assign.run_id, assign.epoch, Arc::new(matcher));
+            }
+            Err(e) => {
+                tracing::error!(run_id = %assign.run_id, error = %format!("{e:#}"), "the take-back record's hashes of the run's earlier git tokens cannot be used; the run's work is not pushed");
+                unsafe_record = Some(format!("{e:#}"));
+            }
+        }
+    }
+    unsafe_record
+}
+
+/// The directories of a run taken back, as the earlier process left them
+/// ([`taken_back_dirs`]).
+struct TakenBackDirs {
+    workspace: PathBuf,
+    /// The run's `/output`, when the earlier process made it. It goes before the home's lease:
+    /// the fields drop in this order.
+    output_root: Option<OutputRoot>,
+    /// Held until the run ends, so maintenance never deletes the home under it.
+    _home_lease: crate::homes::HomeLease,
+    home: PathBuf,
+    layout: Layout,
+}
+
+/// The workspace, the leased home and the `/output` of a run taken back, and where its
+/// sandbox has them. An `/output` that cannot be anchored is a warning. The `/output` of a run
+/// whose work came back already (`collected`) holds that work, and is anchored as it is;
+/// otherwise it is anchored empty, and the work comes back into it.
+fn taken_back_dirs(run: &mut Run<'_>, collected: bool) -> TakenBackDirs {
+    let (shared, assign) = (run.shared, run.assign);
+    let paths = &shared.opts.paths;
     let workspace_dir = paths.workspace(assign.run_id);
     let home_lease = shared.homes.lease(assign.agent.id, assign.work_item().id);
     let home_dir = home_lease.path().to_path_buf();
     let output_path = paths.output(assign.run_id);
     let output_root = if output_path.is_dir() {
-        match OutputRoot::create(&output_path) {
+        let anchored = if collected {
+            OutputRoot::open(&output_path)
+        } else {
+            OutputRoot::create(&output_path)
+        };
+        match anchored {
             Ok(root) => Some(root),
             Err(e) => {
-                sink.log(
+                run.sink.log(
                     LogLevel::Warn,
                     format!("cannot prepare the run's {}: {e:#}", crate::sandbox::OUTPUT),
                 );
@@ -1083,120 +2057,261 @@ pub async fn take_back(
         crate::sandbox::Executor::Vm(vms) if !vms.options.on_this_machine => Layout::container(),
         _ => Layout::local(&workspace_dir),
     };
-    let mut repos: Vec<Repo> = record
+    TakenBackDirs {
+        workspace: workspace_dir,
+        _home_lease: home_lease,
+        home: home_dir,
+        output_root,
+        layout,
+    }
+}
+
+/// The repositories of a run taken back, as its record keeps them: as cloned, with the
+/// holder's tokens, and how each came back from the sandbox when it did. Each reads through a
+/// reader from the start ([`Git::read_through`]): the earlier process may have taken a sandbox's
+/// objects into the clone, whether its record says so yet or not, and nothing else on this path
+/// would say so before git reads them.
+fn restore_repositories<'a>(
+    run: &Run<'a>,
+    record: &'a RunRecord,
+    dirs: &TakenBackDirs,
+) -> Vec<Repo<'a>> {
+    let assign = &record.assign;
+    let reader = reader_of(run.shared);
+    record
         .repos
         .iter()
         .filter_map(|kept| {
             let ws = assign.workspaces.iter().find(|ws| ws.dir == kept.dir)?;
+            let mut git = Git::restored(
+                dirs.workspace.join(&ws.dir),
+                ws,
+                git_identity(assign, Some(ws)),
+                kept.base_refs(),
+                kept.config_snapshot(),
+            )
+            .with_tokens(run.tokens.repo(ws.component_id));
+            git.read_through(reader.clone());
             Some(Repo {
                 ws,
-                git: Git::restored(
-                    workspace_dir.join(&ws.dir),
-                    ws,
-                    git_identity(assign, Some(ws)),
-                    kept.base_refs(),
-                    kept.config_snapshot(),
-                ),
+                git,
                 cloned_head: kept.cloned_head.clone(),
                 cloned_commits: kept.cloned_commits,
-                collected: None,
+                collected: kept.collected.as_ref().map(CollectedRecord::restore),
             })
         })
-        .collect();
+        .collect()
+}
 
-    // --- the sandbox's bridge comes back --------------------------------------------------
-    // A cancel meanwhile still saves the work, as a run's cancel does; only an abort (a stale
-    // epoch) stops the wait.
-    let mut failure = Failure::default();
-    let mut came_back = false;
-    let connected = tokio::select! {
-        session = registration.connected(TAKE_BACK_WAIT) => Some(session),
-        _ = wait_for_abort(&mut stop_rx) => None,
-    };
-    match connected {
-        Some(Ok(session)) => {
-            came_back = true;
-            let mut sandbox = sandbox.connected(session);
-            match sandbox.reclaim(RECLAIM_TIMEOUT).await {
-                Ok(true) => sink.log(
-                    LogLevel::Info,
-                    "the agent of the host before its restart was stopped",
-                ),
-                Ok(false) => sink.log(
-                    LogLevel::Info,
-                    "the agent had stopped already: its host was gone for too long",
-                ),
-                Err(e) => sink.log(
-                    LogLevel::Warn,
+/// What came back of a run taken back ([`bring_the_sandbox_back`]).
+struct CameBack {
+    /// The run's work is on this host: it came back now, or before an earlier restart.
+    work: bool,
+    /// A sandbox whose work came back but that the record cannot yet call collected: it lives
+    /// until the run ends.
+    held: Option<crate::sandbox::Sandbox>,
+}
+
+/// The sandbox's bridge comes back, and with it the run's work
+/// ([`collect_the_work_taken_back`]). A cancel meanwhile still saves the work, as a run's
+/// cancel does; only an abort (a stale epoch) stops the wait. A sandbox that does not come
+/// back is removed, and its work is lost. When nothing came back, nothing is left to take back
+/// either: the record goes.
+async fn bring_the_sandbox_back(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    kept: &RecordHandle,
+    sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
+    dirs: &TakenBackDirs,
+    repos: &mut [Repo<'_>],
+) -> CameBack {
+    let mut came_back = record.collected;
+    let mut held: Option<crate::sandbox::Sandbox> = None;
+    if let Some((sandbox, registration)) = sandbox {
+        let connected = tokio::select! {
+            session = registration.connected(TAKE_BACK_WAIT) => Some(session),
+            _ = wait_for_abort(&mut run.stop_rx) => None,
+        };
+        match connected {
+            Some(Ok(session)) => {
+                came_back = true;
+                let keep = run.shared.kept_bridge(record).and_then(Result::ok);
+                let sandbox = sandbox.connected(session, keep);
+                held = collect_the_work_taken_back(run, record, kept, sandbox, dirs, repos).await;
+            }
+            Some(Err(e)) => {
+                run.failure.set(
+                    FailureClass::Infra,
                     format!(
-                        "the agent did not stop as asked: {}",
-                        sink.redact(&format!("{e:#}"))
+                        "The runner host restarted during the run, and the run's sandbox did not come back to it ({}); the work of the run is lost.",
+                        run.sink.redact(&format!("{e:#}"))
                     ),
-                ),
+                );
+                sandbox.discard(Duration::from_secs(5)).await;
             }
-            if let Some(files) = sandbox.files()
-                && *stop_rx.borrow() != Some(StopRequest::Abort)
-            {
-                collect_from_sandbox(
-                    &mut sink,
-                    assign,
-                    &files,
-                    &layout,
-                    &mut repos,
-                    &home_dir,
-                    record.home_exclude.clone(),
-                    output_root.as_ref().map(OutputRoot::path),
-                )
-                .await;
-            }
-            sandbox.stop(Duration::from_secs(5)).await;
+            None => sandbox.discard(Duration::from_secs(5)).await,
         }
-        Some(Err(e)) => {
-            failure.set(
-                FailureClass::Infra,
-                format!(
-                    "The runner host restarted during the run, and the run's sandbox did not come back to it ({}); the work of the run is lost.",
-                    sink.redact(&format!("{e:#}"))
-                ),
-            );
-            sandbox.discard(Duration::from_secs(5)).await;
-        }
-        None => sandbox.discard(Duration::from_secs(5)).await,
     }
-    sink.drop_record();
+    if !came_back {
+        // Nothing came back: there is nothing left to take back either.
+        run.tokens.drop_record();
+        run.sink.drop_record();
+    }
+    CameBack {
+        work: came_back,
+        held,
+    }
+}
 
-    let cancelled = match *stop_rx.borrow() {
-        Some(StopRequest::Abort) => {
-            let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
-            cleanup_workspace(shared, &workspace_dir, false);
-            return None;
-        }
-        Some(StopRequest::Cancel) => true,
-        None => false,
-    };
+/// The sandbox of a run taken back is connected: the agent of the earlier process stops, the
+/// work comes back from the sandbox, and the record says so before the sandbox goes. The
+/// sandbox when it must stay until the run ends, because the record cannot say so.
+async fn collect_the_work_taken_back(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    kept: &RecordHandle,
+    mut sandbox: crate::sandbox::Sandbox,
+    dirs: &TakenBackDirs,
+    repos: &mut [Repo<'_>],
+) -> Option<crate::sandbox::Sandbox> {
+    let (shared, assign) = (run.shared, run.assign);
+    match sandbox.reclaim(RECLAIM_TIMEOUT).await {
+        Ok(true) => run.sink.log(
+            LogLevel::Info,
+            "the agent of the host before its restart was stopped",
+        ),
+        Ok(false) => run.sink.log(
+            LogLevel::Info,
+            "the agent had stopped already: its host was gone for too long",
+        ),
+        Err(e) => run.sink.log(
+            LogLevel::Warn,
+            format!(
+                "the agent did not stop as asked: {}",
+                run.sink.redact(&format!("{e:#}"))
+            ),
+        ),
+    }
+    if let Some(files) = sandbox.files()
+        && *run.stop_rx.borrow() != Some(StopRequest::Abort)
+    {
+        collect_from_sandbox(
+            &mut run.sink,
+            assign,
+            &files,
+            &reader_of(shared),
+            &dirs.layout,
+            repos,
+            &dirs.home,
+            record.home_exclude.clone(),
+            dirs.output_root.as_ref().map(OutputRoot::path),
+        )
+        .await;
+    }
+    if *run.stop_rx.borrow() == Some(StopRequest::Abort) {
+        sandbox.stop(Duration::from_secs(5)).await;
+        return None;
+    }
+    // The work is on this host now. The record says so before the sandbox goes, so that a
+    // restart at any moment finds the work where the record says it is: in the sandbox until
+    // the mark is on disk, here after it.
+    if kept.collected(&collected_repos(repos)) {
+        sandbox.stop(Duration::from_secs(5)).await;
+        None
+    } else {
+        run.sink.log(
+            LogLevel::Warn,
+            "the runner host cannot write in its record that the run's work came back from the sandbox, so it keeps the sandbox until the run ends: a restart meanwhile takes the work from the sandbox again",
+        );
+        Some(sandbox)
+    }
+}
 
-    // --- what the run leaves ---------------------------------------------------------------
+/// What a run taken back leaves ([`save_the_work`]).
+struct Saved {
+    artifacts: Vec<ArtifactResult>,
+    /// One per repository: pushed, or as it was cloned when it was not finalized.
+    results: Vec<GitResult>,
+    /// The repositories that failed, in the words of [`git_failure_message`].
+    git_error: Option<String>,
+    session_bundle: Option<tinfirm_protocol::SessionBundleOutcome>,
+}
+
+/// What a run taken back leaves, once its work came back: the files of `/output`, the push of
+/// its repositories and its session bundle. After a leak in a commit the session bundle is not
+/// stored; from a damaged record (`unsafe_record`, with why) nothing leaves the host. A run
+/// whose own end decided its outcome ([`RunRecord::end`]) keeps to it: after a leak of the
+/// agent's nothing leaves the host either, and the files of `/output` that end saved are
+/// listed, not saved again; those it had not are saved, and `kept` says so.
+async fn save_the_work(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    kept: &Arc<RecordHandle>,
+    came_back: bool,
+    unsafe_record: Option<&str>,
+    repos: &[Repo<'_>],
+    dirs: &TakenBackDirs,
+) -> Saved {
+    let (shared, assign) = (run.shared, run.assign);
+    let end = record.end.as_ref();
+    let agent_leak = leaked_at_the_end(record);
+    if unsafe_record.is_some() {
+        run.sink.log(
+            LogLevel::Error,
+            "the runner host's record of the run cannot say which earlier git tokens to look for, so nothing of the run's work leaves the host: no push, no session bundle, no files of /output",
+        );
+    }
     let mut artifacts = Vec::new();
-    if came_back && let Some(output_root) = &output_root {
-        artifacts = collect_output(shared, &mut sink, assign, output_root).await;
+    if let Some(end) = end.filter(|end| end.output_saved) {
+        artifacts = end.artifacts.clone();
+    } else if came_back
+        && unsafe_record.is_none()
+        && let Some(output_root) = &dirs.output_root
+    {
+        if agent_leak {
+            run.sink.log(
+                LogLevel::Warn,
+                "not saving the files of /output: the run leaked a credential value",
+            );
+        } else {
+            // The files that the run's end saved already are listed, not saved again.
+            let record = end.is_some().then(|| kept.clone());
+            artifacts = collect_output(shared, &mut run.sink, assign, output_root, record).await;
+        }
+        if end.is_some() {
+            kept.output_saved(&artifacts);
+        }
     }
-    let mut leak = false;
-    let results = if came_back && !repos.is_empty() {
-        sink.status(Phase::Finalizing, None);
-        let finalized = finalize_git(shared, &mut sink, &repos, assign.run_id, false).await;
+    // A damaged record refuses the session bundle as a leak does.
+    let mut leak = unsafe_record.is_some() || agent_leak;
+    let mut git_error = None;
+    let results = if came_back && !repos.is_empty() && unsafe_record.is_none() {
+        run.sink.status(Phase::Finalizing, None);
+        let finalized = finalize_git(
+            shared,
+            &mut run.sink,
+            repos,
+            run.tokens,
+            assign.run_id,
+            agent_leak,
+            end.is_some(),
+        )
+        .await;
         if finalized.outgoing_leak {
             leak = true;
-            failure.force(
+            run.failure.force(
                 FailureClass::CredentialLeak,
                 "a commit contains a credential value; no repository was pushed",
             );
         }
         if !finalized.errors.is_empty() {
-            sink.log(
-                LogLevel::Error,
-                git_failure_message(&finalized.errors, repos.len()),
-            );
+            let message = git_failure_message(&finalized.errors, repos.len());
+            if end.and_then(|end| end.outcome.as_ref()).is_none() {
+                run.sink.log(LogLevel::Error, message.clone());
+            }
+            git_error = Some(message);
         }
+        halt_at(shared, EndStep::Pushed).await;
         finalized.results
     } else {
         repos.iter().map(Repo::unfinalized_result).collect()
@@ -1205,9 +2320,9 @@ pub async fn take_back(
         Some(_) if came_back => Some(
             store_session_bundle(
                 shared,
-                &mut sink,
+                &mut run.sink,
                 assign,
-                &home_dir,
+                &dirs.home,
                 record.session_id.as_deref(),
                 leak,
             )
@@ -1215,48 +2330,163 @@ pub async fn take_back(
         ),
         _ => None,
     };
-    let failed_git = results
-        .iter()
-        .any(|g| !g.pushed && g.commits.unwrap_or(0) > 0);
-    if !cancelled {
-        let mut saved = vec!["the agent was stopped"];
-        if results.iter().any(|g| g.pushed) {
-            saved.push(if failed_git {
+    Saved {
+        artifacts,
+        results,
+        git_error,
+        session_bundle,
+    }
+}
+
+/// The failure of a run taken back: `INFRA`, saying what was saved, unless the server
+/// cancelled it; from a damaged record (`unsafe_record`, with why) `INFRA` whatever came
+/// before, cancelled or not, since its work stays on the host. Whether the run ends cancelled.
+/// A run whose own end decided its outcome ([`RunRecord::end`]) fails as that end would have:
+/// with the agent's failure, or with `GIT_ERROR` for a repository that failed, unless it was
+/// cancelled; a run whose end had not decided it yet says that the agent's turn had ended.
+fn say_what_was_saved(
+    run: &mut Run<'_>,
+    record: &RunRecord,
+    cancelled: bool,
+    unsafe_record: Option<&str>,
+    saved: &Saved,
+    failed_git: bool,
+) -> bool {
+    let assign = run.assign;
+    if let Some(outcome) = record.end.as_ref().and_then(|end| end.outcome.as_ref()) {
+        if let (Some(class), Some(message)) = (outcome.failure_class, &outcome.failure_message) {
+            run.failure.set(class, message.clone());
+        }
+        if let Some(message) = &saved.git_error {
+            if cancelled {
+                run.sink.log(LogLevel::Error, message.clone());
+            } else {
+                run.failure.set(FailureClass::GitError, message.clone());
+            }
+        }
+    }
+    let decided = record.end.as_ref().is_some_and(|end| end.outcome.is_some());
+    // A leak that the record's mark kept, without the outcome: the leak's failure, and nothing
+    // of the run left the host.
+    if !decided && record.end.as_ref().is_some_and(|end| end.leak) {
+        run.failure.set(
+            FailureClass::CredentialLeak,
+            "The runner host restarted at the end of the run, after the agent's output contained a credential value; the run was stopped and nothing of it left the host.",
+        );
+    }
+    if !cancelled && !decided {
+        let at_the_end = record.end.is_some();
+        let mut saved_parts = vec![if at_the_end {
+            "the agent's turn had ended"
+        } else {
+            "the agent was stopped"
+        }];
+        if saved.results.iter().any(|g| g.pushed) {
+            saved_parts.push(if failed_git {
                 "some of its work was pushed (the log names what was not)"
+            } else if at_the_end {
+                "its work was pushed"
             } else {
                 "its work so far was pushed"
             });
         }
         if matches!(
-            session_bundle,
+            saved.session_bundle,
             Some(tinfirm_protocol::SessionBundleOutcome::Stored)
         ) || (assign.session_bundle.is_none() && record.session_id.is_some())
         {
-            saved.push("its session was kept, so the next message goes on from it");
+            saved_parts.push("its session was kept, so the next message goes on from it");
         }
-        failure.set(
+        run.failure.set(
+            FailureClass::Infra,
+            if at_the_end {
+                format!(
+                    "The runner host restarted at the end of the run and took the run back: {}; the agent's own outcome was not kept.",
+                    saved_parts.join(", ")
+                )
+            } else {
+                format!(
+                    "The runner host restarted during the run and took the run back: {}.",
+                    saved_parts.join(", ")
+                )
+            },
+        );
+    }
+    // A damaged record fails the run, cancelled or not: its work stays on the host.
+    let cancelled = cancelled && unsafe_record.is_none();
+    if let Some(why) = unsafe_record {
+        run.failure.force(
             FailureClass::Infra,
             format!(
-                "The runner host restarted during the run and took the run back: {}.",
-                saved.join(", ")
+                "The runner host restarted during the run, and its record of the run is damaged ({}); the work was not pushed and stays on the runner host.",
+                run.sink.redact(why)
             ),
         );
     }
-    let report = Report {
-        session_id: record.session_id.clone(),
-        git: Some(results),
-        artifacts,
-        session_bundle,
-        ..Report::default()
-    };
-    let finished = finish(&mut sink, assign, failure, cancelled, report);
-    let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
-    cleanup_workspace(
-        shared,
-        &workspace_dir,
-        finished.outcome == Outcome::Failed || failed_git,
-    );
-    Some(finished)
+    cancelled
+}
+
+/// Whether the record says that the run's own end leaked a credential value: by its mark, or by
+/// the agent's outcome. Nothing of such a run leaves the host.
+fn leaked_at_the_end(record: &RunRecord) -> bool {
+    record
+        .end
+        .as_ref()
+        .is_some_and(|end| end.leak || end.outcome.as_ref().is_some_and(|outcome| outcome.leak))
+}
+
+/// How [`wait_for_the_server`] ended.
+enum Waited {
+    /// The server has answered: the run may use its tokens and push.
+    Answered,
+    /// An abort came: the caller pushes and reports nothing.
+    Aborted,
+    /// The host shuts down: the run stays for the next start.
+    Left,
+}
+
+/// Before a run taken back uses its git tokens or pushes (ADR-0116, decision 10): waits until
+/// this process has had the server's answer to its hello. A server that lists `run.git.revoke`
+/// in `welcome.features` sends `welcome.done` after every pending `run.git.revoke` of the runs
+/// the hello listed, and the host has applied those by then, since it handles the server's
+/// frames in order; the run waits for it. An older server (no such feature in `welcome`) keeps
+/// no revocation and sends no `welcome.done`: the run goes on once it is welcomed. There is no
+/// cap: without a connection the run waits, its work and its record on this host, and says so
+/// once in the host's log and in the run's events. An abort stops the wait, and so does the
+/// host's shutdown, which leaves the run for the next start; a cancel from the server does
+/// not, since it comes before `welcome.done`. The caller looks at the stop again.
+async fn wait_for_the_server(
+    shared: &Arc<Shared>,
+    sink: &mut EventSink,
+    stop_rx: &mut watch::Receiver<Option<StopRequest>>,
+) -> Waited {
+    let mut answer = shared.hello_answer();
+    let mut said = false;
+    loop {
+        let stop = *stop_rx.borrow_and_update();
+        if stop == Some(StopRequest::Abort) {
+            return Waited::Aborted;
+        }
+        if answer.borrow_and_update().complete() {
+            return Waited::Answered;
+        }
+        if stop == Some(StopRequest::Cancel) && shared.is_shutting_down() {
+            return Waited::Left;
+        }
+        if !said {
+            said = true;
+            tracing::warn!(run_id = %sink.run_id(), "a run taken back waits for the server's answer to the hello before it pushes; its work stays on this host until then");
+            sink.log(
+                LogLevel::Info,
+                "the run's work waits on the runner host until the server has answered the host's hello, so that no git token the server revoked meanwhile is used; it is pushed then",
+            );
+        }
+        tokio::select! {
+            Ok(()) = answer.changed() => {}
+            Ok(()) = stop_rx.changed() => {}
+            else => return Waited::Left,
+        }
+    }
 }
 
 /// Restores the conversation's session bundle into the home, unless the home holds it already.
@@ -1297,11 +2527,14 @@ async fn restore_session_bundle(
         }
     };
     let (home, runtime) = (home_dir.to_path_buf(), assign.agent.runtime);
-    let restored =
-        tokio::task::spawn_blocking(move || session_bundles::restore(&home, runtime, &bundle))
-            .await
-            .map_err(|e| anyhow::anyhow!("the restore stopped: {e}"))
-            .and_then(|restored| restored);
+    // With the bridge, a reader unpacks it (crate::reader); without, this process, as before.
+    let reader = shared.opts.bridge.as_ref().map(|b| b.reader.clone());
+    let restored = tokio::task::spawn_blocking(move || {
+        session_bundles::restore(&home, runtime, &bundle, reader.as_ref())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("the restore stopped: {e}"))
+    .and_then(|restored| restored);
     match restored {
         Ok(restored) => {
             if let Err(e) = session_bundles::record(home_dir, sha256) {
@@ -1315,11 +2548,15 @@ async fn restore_session_bundle(
                     restored.dirs.join(", ")
                 ),
             );
-            if !restored.left_out.is_empty() {
+            if !restored.left_out.is_empty() || restored.left_out_more > 0 {
+                let more = match restored.left_out_more {
+                    0 => String::new(),
+                    more => format!(" and {more} more"),
+                };
                 sink.log(
                     LogLevel::Warn,
                     format!(
-                        "left out of the session bundle (not the runtime's session folders, or not plain files): {}",
+                        "left out of the session bundle (not the runtime's session folders, or not plain files): {}{more}",
                         restored.left_out.join(", ")
                     ),
                 );
@@ -1363,7 +2600,7 @@ async fn store_session_bundle(
         return Outcome::Refused;
     }
     let (home, runtime) = (home_dir.to_path_buf(), assign.agent.runtime);
-    let redactor = shared.redactor();
+    let redactor = shared.run_redactor(assign.run_id, assign.epoch);
     let packed = tokio::task::spawn_blocking(move || {
         let packed = session_bundles::pack(&home, runtime)?;
         // The run's own credentials, which the server's scan does not know. Its URL secrets
@@ -1507,6 +2744,7 @@ async fn clone_all<'a>(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     assign: &'a RunAssign,
+    tokens: &Arc<RunGitTokens>,
     workspace_dir: &Path,
     repos: &mut Vec<Repo<'a>>,
 ) -> Result<(), String> {
@@ -1515,13 +2753,25 @@ async fn clone_all<'a>(
             workspace_dir.join(&ws.dir),
             ws,
             git_identity(assign, Some(ws)),
-        );
+        )
+        .with_tokens(tokens.repo(ws.component_id));
+        // A token the server revoked before the clone (ADR-0116): no fetch is attempted.
+        let authorization = match git.authorization() {
+            Ok(authorization) => authorization,
+            Err(revocation) => {
+                return Err(sink.redact(&format!("cannot clone {}: {revocation}", repo_label(ws))));
+            }
+        };
         let cloned = async {
             // The mirror is fetched with this repository's credentials first, so a token
             // that no longer works fails the run instead of serving stale content.
+            // A token minted for the run names its credential's mirror (ADR-0116).
+            let key = git
+                .tokens()
+                .mirror_key(&ws.repo_url, authorization.as_ref());
             let mirror = shared
                 .mirrors
-                .update(&ws.repo_url, git.authorization())
+                .update_keyed(&key, &ws.repo_url, authorization.as_ref())
                 .await
                 .map_err(|e| e.context("cannot update the host's mirror"))?;
             git.clone_from_mirror(&mirror.path, &mirror.refs, ws).await
@@ -1552,7 +2802,6 @@ async fn clone_all<'a>(
 
 /// What the sandbox reaches on the host: one git proxy route per HTTP(S) repository and the
 /// platform MCP endpoint. Dropping it removes them.
-#[derive(Default)]
 struct SandboxAccess {
     routes: Vec<RouteGuard>,
     mcp: Option<McpGuard>,
@@ -1564,9 +2813,51 @@ struct SandboxAccess {
     egress: Option<EgressGuard>,
     /// The run's model proxy listener, when its model access is a gateway.
     model_proxy: Option<ModelProxyGuard>,
-    /// Where the sandbox reaches the listeners when it is not the endpoint's host: a local
-    /// test executor's sandbox over the bridge, on a loopback address of its own.
-    sandbox_host: Option<String>,
+    /// The run's own listener of the git proxy and the platform tools, which its sandbox's
+    /// front serves on a host with the bridge; `None` where the shared listener serves them.
+    git_listener: Option<crate::git_proxy::FrontListenerGuard>,
+    /// What serves the sandbox's proxies ([`serving`]): with the bridge, the sandbox's front,
+    /// which ends with the run's access (and its listeners' guards); `Err` with why the front
+    /// did not start.
+    serving: Result<Serving, String>,
+}
+
+/// What serves the run's sandbox's proxies, decided once for the run: this process without the
+/// bridge; with it, the sandbox's front, for the sandbox's tunnels to it on its loopback. A
+/// claimed VM's front came with the VM and holds its bridge; any other sandbox's front starts
+/// here, the one place a run's sandbox gets its front. A front that cannot start is `Err` with
+/// why: each proxy that needs it fails with that, and so does the sandbox's start.
+async fn serving(
+    shared: &Shared,
+    claimed: Option<&crate::pool::Claimed>,
+) -> Result<Serving, String> {
+    if let Some(vm) = claimed {
+        return Ok(Serving::Tunnels {
+            front: vm.session.front().clone(),
+            loopback: vm.loopback,
+        });
+    }
+    let front = match shared.sandbox_front().await {
+        Ok(Some(front)) => front,
+        Ok(None) => return Ok(Serving::Host),
+        Err(e) => return Err(format!("{e:#}")),
+    };
+    // A local test executor's sandbox over the bridge shares this machine's network: its
+    // tunnels listen on a loopback address of its own (crate::bridge).
+    let loopback = if shared.opts.executor.on_this_machine() {
+        crate::bridge::local_sandbox_loopback()
+    } else {
+        crate::bridge::SANDBOX_LOOPBACK
+    };
+    Ok(Serving::Tunnels {
+        front,
+        loopback: std::net::IpAddr::V4(loopback),
+    })
+}
+
+/// The error of a sandbox's front that did not start ([`serving`]), for each use of it.
+fn no_front(why: &str) -> anyhow::Error {
+    anyhow::anyhow!("{why}")
 }
 
 /// An address of the sandbox network's reserved test range (RFC 5737) on which nothing answers.
@@ -1581,7 +2872,7 @@ async fn start_model_proxy(
     sink: &mut EventSink,
     assign: &RunAssign,
     credential: &RunCredential,
-    sandbox_host: Option<&str>,
+    serving: &Result<Serving, String>,
 ) -> Result<Option<ModelProxyGuard>, String> {
     let RunCredential::Model(model) = credential else {
         return Ok(None);
@@ -1598,7 +2889,11 @@ async fn start_model_proxy(
         Ok(proxy) => proxy,
         Err(e) => return Err(unavailable(sink, e)),
     };
-    let guard = match proxy.start_run_at(assign.run_id, model, sandbox_host).await {
+    let serving = match serving {
+        Ok(serving) => serving,
+        Err(why) => return Err(unavailable(sink, no_front(why))),
+    };
+    let guard = match proxy.start_run_at(assign.run_id, model, serving).await {
         Ok(guard) => guard,
         Err(e) => return Err(unavailable(sink, e)),
     };
@@ -1624,17 +2919,17 @@ async fn start_model_proxy(
 /// reach the host-wide hosts and the run's model (`model`: what the runtime reaches it with; a
 /// gateway behind the model proxy needs no host), and points the sandbox's tools at it. The
 /// sandbox is on an internal network, so a run whose proxy cannot start has no network: it
-/// fails closed, and the log says why. A VM from the pool brings its own listener (`slot`),
-/// which its container's settings name already: the run binds its rules to that one.
-#[allow(clippy::too_many_arguments)]
+/// fails closed, and the log says why. A VM from the pool (crate::pool) brings its own
+/// listener (`slot`), which its container's settings name already: the run binds its rules to
+/// that one.
 async fn start_egress(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     assign: &RunAssign,
     model: Access<'_>,
     spec: &mut SandboxSpec,
-    sandbox_host: Option<&str>,
     slot: Option<EgressGuard>,
+    serving: &Result<Serving, String>,
 ) -> Result<Option<EgressGuard>, String> {
     if shared.opts.egress.is_none() {
         return Ok(None);
@@ -1678,10 +2973,16 @@ async fn start_egress(
             slot.bind(assign.run_id, rules);
             slot
         }
-        (None, Some(proxy)) => match proxy.start_run_at(assign.run_id, rules, sandbox_host).await {
-            Ok(guard) => guard,
-            Err(e) => return Err(unavailable(sink, e)),
-        },
+        (None, Some(proxy)) => {
+            let serving = match serving {
+                Ok(serving) => serving,
+                Err(why) => return Err(unavailable(sink, no_front(why))),
+            };
+            match proxy.start_run_at(assign.run_id, rules, serving).await {
+                Ok(guard) => guard,
+                Err(e) => return Err(unavailable(sink, e)),
+            }
+        }
         (None, None) => return Ok(None),
     };
     // The proxy URL carries the run's credential: masked before it can appear anywhere.
@@ -1754,14 +3055,35 @@ async fn sandbox_access(
     assign: &RunAssign,
     repos: &[Repo<'_>],
     file_roots: Vec<FileRoot>,
-    sandbox_host: Option<String>,
+    serving: Result<Serving, String>,
 ) -> SandboxAccess {
     let mut access = SandboxAccess {
-        sandbox_host,
-        ..SandboxAccess::default()
+        routes: Vec::new(),
+        mcp: None,
+        tools: None,
+        extra_hosts: Vec::new(),
+        egress: None,
+        model_proxy: None,
+        git_listener: None,
+        serving,
     };
-    let proxy = match shared.git_proxy().await {
-        Ok(Some(proxy)) => proxy,
+    // Where the sandbox's front serves the run's git proxy for its tunnels alone, the host's
+    // shared listener is not started for it.
+    let shared_proxy = if shared.opts.bridge.is_some() {
+        shared
+            .proxies_endpoint()
+            .await
+            .map(|endpoint| endpoint.map(|endpoint| (None, endpoint)))
+    } else {
+        shared.git_proxy().await.map(|proxy| {
+            proxy.map(|proxy| {
+                let endpoint = proxy.endpoint().clone();
+                (Some(proxy), endpoint)
+            })
+        })
+    };
+    let (proxy, endpoint) = match shared_proxy {
+        Ok(Some(found)) => found,
         Ok(None) => {
             sink.log(
                 LogLevel::Warn,
@@ -1781,10 +3103,38 @@ async fn sandbox_access(
             return access;
         }
     };
-    access.extra_hosts = proxy.endpoint().extra_hosts.clone();
+    access.extra_hosts = endpoint.extra_hosts.clone();
+    // On a host with the bridge the run gets a listener of its own, which its sandbox's front
+    // serves: the front reads the sandbox's requests, and this process attaches the tokens.
+    let proxy = match run_listener(shared, &endpoint, &access.serving).await {
+        Ok(Some((own, guard))) => {
+            access.git_listener = Some(guard);
+            own
+        }
+        Ok(None) => match proxy {
+            Some(proxy) => proxy,
+            None => {
+                sink.log(
+                    LogLevel::Warn,
+                    "the Tinfirm platform tools and git fetch are not available in this run: the sandbox has no front",
+                );
+                return access;
+            }
+        },
+        Err(e) => {
+            let error = sink.redact(&format!("{e:#}"));
+            tracing::warn!(run_id = %assign.run_id, %error, "the sandbox's front cannot serve its git proxy");
+            sink.log(
+                LogLevel::Warn,
+                format!(
+                    "the Tinfirm platform tools and git fetch are not available in this run: {error}"
+                ),
+            );
+            return access;
+        }
+    };
     for repo in repos {
-        let host = access.sandbox_host.as_deref();
-        if let Some(route) = route_git_proxy(shared, sink, &proxy, repo, assign, host).await {
+        if let Some(route) = route_git_proxy(shared, sink, &proxy, repo, assign).await {
             access.routes.push(route);
         }
     }
@@ -1810,7 +3160,7 @@ async fn sandbox_access(
         .with_public_suffix(shared.public_suffix().clone())
         .with_upload_max_bytes(shared.opts.upload_max_bytes),
     );
-    match proxy.register_mcp_at(tools.clone(), access.sandbox_host.as_deref()) {
+    match proxy.register_mcp(tools.clone()) {
         Ok(mcp) => {
             // Before the URL can appear anywhere: the agent may print its MCP settings.
             shared.add_run_masked(
@@ -1829,7 +3179,38 @@ async fn sandbox_access(
             );
         }
     }
+    if let Err(e) = proxy.publish().await {
+        let error = sink.redact(&format!("{e:#}"));
+        tracing::warn!(run_id = %assign.run_id, %error, "the sandbox's front did not get its routes");
+        sink.log(
+            LogLevel::Warn,
+            format!(
+                "the Tinfirm platform tools and git fetch are not available in this run: {error}"
+            ),
+        );
+    }
     access
+}
+
+/// The run's own listener of the git proxy and the platform tools in its sandbox's front, on a
+/// host with the bridge; `Ok(None)` elsewhere, where the shared listener serves the run.
+async fn run_listener(
+    shared: &Arc<Shared>,
+    endpoint: &crate::git_proxy::Endpoint,
+    serving: &Result<Serving, String>,
+) -> anyhow::Result<Option<(GitProxy, crate::git_proxy::FrontListenerGuard)>> {
+    let serving = serving.as_ref().map_err(|why| no_front(why))?;
+    if serving.front().is_none() {
+        return Ok(None);
+    }
+    let (proxy, guard) = GitProxy::start_in_front(
+        endpoint.clone(),
+        shared.opts.allow_insecure_repo_urls,
+        crate::git_proxy::ListenerLimits::default(),
+        serving,
+    )
+    .await?;
+    Ok(Some((proxy, guard)))
 }
 
 /// Registers one repository with the git proxy and points its `origin` at it, so the agent
@@ -1840,7 +3221,6 @@ async fn route_git_proxy(
     proxy: &GitProxy,
     repo: &Repo<'_>,
     assign: &RunAssign,
-    sandbox_host: Option<&str>,
 ) -> Option<RouteGuard> {
     let ws = repo.ws;
     // Only HTTP(S) repositories; `file://` ones exist in tests only.
@@ -1861,12 +3241,12 @@ async fn route_git_proxy(
             ),
         );
     };
-    let route = match proxy.register_at(
+    // The route reads the token from the run's holder at each request (ADR-0116).
+    let route = match proxy.register(
         assign.run_id,
         &ws.repo_url,
-        repo.git.authorization().cloned(),
+        repo.git.tokens().clone(),
         &ws.branch,
-        sandbox_host,
     ) {
         Ok(route) => route,
         Err(e) => {
@@ -1905,9 +3285,9 @@ fn git_identity(assign: &RunAssign, ws: Option<&WorkspaceSpec>) -> (String, Stri
 
 /// Starts the run's sandbox: attached to its stdio, or with the bridge (ADR-0095,
 /// `run --sandbox-bridge`), where the run's credentials reach the adapter in the bridge's
-/// `start` frame instead of the sandbox's settings, and the sandbox reaches the listeners of
-/// `access` through tunnels of the bridge.
-#[allow(clippy::too_many_arguments)]
+/// `start` frame instead of the sandbox's settings, and the sandbox reaches the proxies of
+/// `access` through tunnels of the bridge to its front: in the VM it claimed, whose front holds
+/// its bridge already, or in a sandbox that starts here ([`start_in_front`]).
 async fn start_sandbox(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
@@ -1917,62 +3297,131 @@ async fn start_sandbox(
     puts: Vec<crate::sandbox::Put>,
     claimed: Option<crate::pool::Claimed>,
 ) -> anyhow::Result<(crate::sandbox::Sandbox, SandboxIo)> {
-    use anyhow::Context as _;
     let Some(options) = shared.opts.bridge.clone() else {
         return shared.opts.executor.start(spec).await;
     };
-    // The listeners the run uses, on this host's loopback: the sandbox reaches each through a
-    // tunnel on its own loopback, at the same port.
-    let mut listeners = Vec::new();
-    if (access.mcp.is_some() || !access.routes.is_empty())
-        && let Some(proxy) = shared.git_proxy().await?
-    {
-        listeners.push(proxy.local_addr());
-    }
-    listeners.extend(access.model_proxy.as_ref().map(|m| m.local_addr()));
-    listeners.extend(access.egress.as_ref().map(|e| e.local_addr()));
-    let loopback = match access.sandbox_host.as_deref().map(str::parse) {
-        Some(Ok(ip)) => ip,
-        _ => std::net::IpAddr::V4(crate::bridge::SANDBOX_LOOPBACK),
+    let Some(claimed) = claimed else {
+        return start_in_front(shared, sink, assign, spec, access, puts, options).await;
     };
-    let tunnels = crate::bridge::tunnels(&listeners, loopback);
-    let bridge_note =
-        "the agent runs over the sandbox bridge; its credentials are not in the sandbox's settings";
-    if let Some(claimed) = claimed {
-        // The VM's ticket is in its user data, used up when its bridge connected; it is no
-        // credential, but it never leaves the host.
-        shared.add_run_masked(assign.run_id, assign.epoch, vec![claimed.ticket.clone()]);
-        sink.log(LogLevel::Debug, bridge_note);
-        return shared
-            .opts
-            .executor
-            .start_claimed(spec, claimed, shared.opts.pool.reprobe_after, tunnels, puts)
-            .await;
+    let serving = access.serving.as_ref().map_err(|why| no_front(why))?;
+    // The VM's ticket is in its user data, used up when its bridge connected; it is no
+    // credential, but it never leaves the host.
+    shared.add_run_masked(assign.run_id, assign.epoch, vec![claimed.ticket.clone()]);
+    sink.log(
+        LogLevel::Debug,
+        "the agent runs over the sandbox bridge, in the sandbox's front; its credentials are not in the sandbox's settings",
+    );
+    shared
+        .opts
+        .executor
+        .start_claimed(
+            spec,
+            claimed,
+            shared.opts.vm_reprobe_after,
+            front_tunnels(access, serving),
+            puts,
+        )
+        .await
+}
+
+/// The tunnels of a run whose sandbox's front serves its proxies: each service the run uses,
+/// on its fixed port of the sandbox's loopback.
+fn front_tunnels(
+    access: &SandboxAccess,
+    serving: &Serving,
+) -> Vec<(std::net::SocketAddr, Service)> {
+    let mut services = Vec::new();
+    if access.git_listener.is_some() && (access.mcp.is_some() || !access.routes.is_empty()) {
+        services.push(Service::Git);
     }
-    let listener = shared.bridge().await?.context(
+    if access.model_proxy.is_some() {
+        services.push(Service::Model);
+    }
+    if access.egress.is_some() {
+        services.push(Service::Egress);
+    }
+    serving.tunnels(&services)
+}
+
+/// Starts the run's sandbox with its bridge in the sandbox's front (ADR-0112, path C, part 2):
+/// the bridge gets a TLS identity and a listener of its own, which only its front holds; the
+/// front takes a connection only from the sandbox's address where this host can tell it, and
+/// `run` decides the bridge's `hello` with the ticket it keeps. The sandbox reaches its git
+/// proxy, model proxy and egress proxy only through tunnels to its front, on fixed ports of its
+/// own loopback: this host binds no listener for them.
+async fn start_in_front(
+    shared: &Arc<Shared>,
+    sink: &mut EventSink,
+    assign: &RunAssign,
+    spec: &mut SandboxSpec,
+    access: &SandboxAccess,
+    puts: Vec<crate::sandbox::Put>,
+    options: crate::bridge::BridgeOptions,
+) -> anyhow::Result<(crate::sandbox::Sandbox, SandboxIo)> {
+    use anyhow::Context as _;
+    let endpoint = shared.bridge_endpoint().await?.context(
         "the sandbox has no network, so its bridge cannot reach this host (--sandbox-bridge)",
     )?;
+    let serving = access.serving.as_ref().map_err(|why| no_front(why))?;
+    let front = serving.front().context("the sandbox has no front")?.clone();
+    let tunnels = front_tunnels(access, serving);
     if spec.extra_hosts.is_empty() {
-        spec.extra_hosts = listener.extra_hosts.clone();
+        spec.extra_hosts = endpoint.extra_hosts.clone();
     }
-    // A run assigned again with a newer epoch gets a new sandbox and a new registration.
-    let registration = listener
-        .server
-        .register(&format!("{}.{}", assign.run_id, assign.epoch))?;
+    let identity = tinfirm_bridge::tls::Identity::generate()?;
+    let listener =
+        crate::bridge::bind_sandbox_listener(endpoint.bind.ip(), None, options.ports).await?;
+    let port = listener.local_addr()?.port();
+    // A run assigned again with a newer epoch gets a new sandbox and a new bridge.
+    let bridge_id = format!("{}.{}", assign.run_id, assign.epoch);
+    let expected = crate::front::session::Expected::new_ticket()?;
+    let crate::front::session::Expected::Ticket(ticket) = &expected else {
+        unreachable!("a new ticket");
+    };
+    let ticket = ticket.expose().to_string();
     // The ticket is in the sandbox's settings; it is no credential, but it never leaves the host.
-    shared.add_run_masked(
-        assign.run_id,
-        assign.epoch,
-        vec![registration.ticket().to_string()],
+    shared.add_run_masked(assign.run_id, assign.epoch, vec![ticket.clone()]);
+    let registration = front
+        .bridge(
+            &identity,
+            &options.timing,
+            crate::front::session::Peer::Listen(listener),
+            &bridge_id,
+            expected,
+        )
+        .await
+        .context("the sandbox's front cannot take its bridge")?;
+    tracing::info!(run_id = %assign.run_id, ip = %endpoint.bind.ip(), port, "the sandbox's bridge listens in its front");
+    sink.log(
+        LogLevel::Debug,
+        "the agent runs over the sandbox bridge, in the sandbox's front; its credentials are not in the sandbox's settings",
     );
-    sink.log(LogLevel::Debug, bridge_note);
+    let bootstrap = crate::bridge::bootstrap_env(
+        &bridge_id,
+        &ticket,
+        &identity.pin_hex(),
+        &crate::git_proxy::host_port(&endpoint.sandbox_host, port),
+    );
+    let (cert, key) = identity.to_der();
+    let keep = crate::sandbox::BridgeKeep {
+        cert: cert.to_vec(),
+        key: key.to_vec(),
+        reach: crate::sandbox::BridgeReach::Listen {
+            ip: endpoint.bind.ip(),
+            port,
+            // Set once the sandbox's address is known.
+            peer: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        },
+    };
     let bridged = crate::sandbox::Bridged {
         registration,
-        addr: listener.sandbox_addr(),
+        bootstrap,
         binary: options.binary,
         connect_timeout: options.connect_timeout,
         tunnels,
         puts,
+        peer: shared.bridge_peer(&endpoint),
+        keep,
     };
     shared.opts.executor.start_bridged(spec, bridged).await
 }
@@ -2172,20 +3621,76 @@ fn mounted_login(shared: &Shared, credential: &RunCredential) -> Option<&'static
     }
 }
 
+/// The readers of what this host's sandboxes send back (crate::reader): the bridge's.
+fn reader_of(shared: &Shared) -> crate::reader::Reader {
+    match &shared.opts.bridge {
+        Some(bridge) => bridge.reader.clone(),
+        // Only a bridged sandbox has files to read.
+        None => crate::reader::Reader::from_current_exe()
+            .unwrap_or_else(|_| crate::reader::Reader::new("tinfirm-runner-host")),
+    }
+}
+
+/// What came back from the sandbox at the run's end, part by part.
+#[derive(Debug, Default)]
+struct Collection {
+    saved: Vec<String>,
+    missed: Vec<String>,
+}
+
+impl Collection {
+    fn part(&mut self, name: String, saved: bool) {
+        if saved {
+            self.saved.push(name);
+        } else {
+            self.missed.push(name);
+        }
+    }
+
+    /// The run's message when a new front took the sandbox back after its first one ended
+    /// during the run and not all of the work came back; `None` when it all did. With
+    /// `ended`, the new front ended too.
+    fn after_a_new_front(&self, ended: bool) -> Option<String> {
+        if self.missed.is_empty() {
+            return None;
+        }
+        let first = if ended {
+            "The sandbox's front process ended during the run, and the new front that took the sandbox back ended too"
+        } else {
+            "The sandbox's front process ended during the run; a new front took the sandbox back and the agent was stopped, but not all of its work came back"
+        };
+        Some(if self.saved.is_empty() {
+            format!(
+                "{first}; the work of the run is lost (not saved: {}).",
+                self.missed.join(", ")
+            )
+        } else {
+            format!(
+                "{first}; saved: {}; not saved: {}.",
+                self.saved.join(", "),
+                self.missed.join(", ")
+            )
+        })
+    }
+}
+
 /// With the bridge (ADR-0095), after the agent and before the sandbox goes: each repository's
-/// commits, the session home and `/output` come back (crate::sandbox_files). A repository that
-/// does not come back fails in the finalize; a home or an `/output` that does not is logged.
+/// commits, the session home and `/output` come back (crate::sandbox_files), each read by a
+/// reader that holds no credential (crate::reader). A repository that does not come back fails
+/// in the finalize; a home or an `/output` that does not is logged. Says which parts came back.
 #[allow(clippy::too_many_arguments)]
 async fn collect_from_sandbox(
     sink: &mut EventSink,
     assign: &RunAssign,
-    files: &tinfirm_bridge::host::SandboxFiles,
+    files: &crate::sandbox::Files,
+    reader: &crate::reader::Reader,
     layout: &Layout,
     repos: &mut [Repo<'_>],
     home_dir: &Path,
     home_exclude: Vec<String>,
     output_dir: Option<&Path>,
-) {
+) -> Collection {
+    let mut collection = Collection::default();
     let tag = format!("{}.{}", assign.run_id, assign.epoch);
     if !repos.is_empty() {
         let temp = home_dir
@@ -2214,7 +3719,8 @@ async fn collect_from_sandbox(
             let (name, email) = git_identity(assign, Some(repo.ws));
             let collected = sandbox_files::collect_repository(
                 &sandbox_repo,
-                &repo.git,
+                &mut repo.git,
+                reader,
                 &message,
                 (&name, &email),
                 &candidates,
@@ -2224,16 +3730,20 @@ async fn collect_from_sandbox(
             if let Err(e) = &collected {
                 tracing::warn!(run_id = %assign.run_id, dir = %repo.ws.dir, error = %sink.redact(&format!("{e:#}")), "a repository did not come back from the sandbox");
             }
+            collection.part(format!("the repository {}", repo.ws.dir), collected.is_ok());
             repo.collected = Some(collected.map_err(|e| sink.redact(&format!("{e:#}"))));
         }
         let _ = std::fs::remove_dir_all(&temp);
     }
-    match sandbox_files::collect_home(files, layout, home_exclude, home_dir, &tag).await {
-        Ok(home) if !home.left_out.is_empty() => sink.log(
+    let home =
+        sandbox_files::collect_home(files, reader, layout, home_exclude, home_dir, &tag).await;
+    collection.part("the session home".to_string(), home.is_ok());
+    match home {
+        Ok(home) if !home.left_out.is_empty() || home.left_out_more > 0 => sink.log(
             LogLevel::Debug,
             format!(
                 "left out of the session home, as links or devices: {}",
-                sink.redact(&home.left_out.join(", "))
+                sink.redact(&home.left_out_list())
             ),
         ),
         Ok(_) => {}
@@ -2246,13 +3756,18 @@ async fn collect_from_sandbox(
         ),
     }
     if let Some(output_dir) = output_dir {
-        match sandbox_files::collect_output(files, layout, output_dir).await {
-            Ok(output) if !output.left_out.is_empty() => sink.log(
+        let output = sandbox_files::collect_output(files, reader, layout, output_dir).await;
+        collection.part(
+            format!("the files of {}", crate::sandbox::OUTPUT),
+            output.is_ok(),
+        );
+        match output {
+            Ok(output) if !output.left_out.is_empty() || output.left_out_more > 0 => sink.log(
                 LogLevel::Warn,
                 format!(
                     "not saved from {}: {} (a link, a device, or a file larger than {} MiB)",
                     crate::sandbox::OUTPUT,
-                    sink.redact(&output.left_out.join(", ")),
+                    sink.redact(&output.left_out_list()),
                     crate::output::MAX_FILE_BYTES / (1024 * 1024)
                 ),
             ),
@@ -2267,6 +3782,7 @@ async fn collect_from_sandbox(
             ),
         }
     }
+    collection
 }
 
 /// The agent's model, when it has one.
@@ -2450,27 +3966,51 @@ fn spawn_output_splitter(
     });
 }
 
-async fn run_agent(
-    shared: &Arc<Shared>,
-    assign: &RunAssign,
-    sink: &mut EventSink,
-    io: SandboxIo,
-    params: AcpParams,
-    stop_rx: &mut watch::Receiver<Option<StopRequest>>,
-    deadline: Instant,
-) -> AgentPhase {
+/// The agent's phase is over: its stdin ends, on purpose. The bridge passes that end on
+/// only when it is said; a stdin that `run` just dropped (with the bridge in the sandbox's
+/// front) would stay open until the agent was stopped.
+async fn end_input(
+    stdin: &tokio::sync::Mutex<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>,
+) {
+    // The transport is gone: nothing else holds the lock.
+    if let Err(e) = stdin.lock().await.shutdown().await {
+        tracing::debug!(error = %e, "the agent's stdin did not end as asked");
+    }
+}
+
+/// The agent's stdio as the run loop takes it ([`connect_the_agent`]).
+struct AgentIo {
+    /// The agent's stdin as a sink of lines, and its stdout's ACP lines.
+    transport: AcpTransport,
+    /// The agent's stderr, and the lines of its stdout that are no ACP message.
+    logs: mpsc::Receiver<String>,
+    activity: Activity,
+    /// The agent's stdin, which the transport writes to as well: the phase ends it on purpose
+    /// ([`end_input`]).
+    stdin: Arc<tokio::sync::Mutex<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>>,
+}
+
+/// The agent's ACP transport over the sandbox's stdio: its output split into ACP lines and log
+/// lines ([`spawn_output_splitter`]), and its stdin as a sink of lines.
+fn connect_the_agent(io: SandboxIo) -> AgentIo {
     // Bounded like the sandbox's output, the ACP lines by the run's budget of lines in flight
     // as well: a run loop that falls behind holds the agent's output back in the sandbox,
     // never in this process without bound.
     let (line_tx, line_rx) = mpsc::channel::<std::io::Result<AcpLine>>(acp::ACP_LINE_QUEUE);
     let budget = acp::inbound_budget();
-    let (log_tx, mut log_rx) = mpsc::channel::<String>(crate::sandbox::OUTPUT_QUEUE);
+    let (log_tx, log_rx) = mpsc::channel::<String>(crate::sandbox::OUTPUT_QUEUE);
     let activity: Activity = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
     spawn_output_splitter(io.output, line_tx, budget.clone(), log_tx, activity.clone());
-    let outgoing = futures::sink::unfold(io.stdin, async |mut stdin, line: String| {
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
+    // The agent's stdin stays here as well as in the transport: the phase ends it on purpose
+    // ([`end_input`]), which a drop does not do with the bridge in the sandbox's front.
+    let stdin = Arc::new(tokio::sync::Mutex::new(io.stdin));
+    let outgoing = futures::sink::unfold(stdin.clone(), async |stdin, line: String| {
+        {
+            let mut stdin = stdin.lock().await;
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.write_all(b"\n").await?;
+            stdin.flush().await?;
+        }
         Ok::<_, std::io::Error>(stdin)
     });
     let transport = AcpTransport {
@@ -2478,38 +4018,65 @@ async fn run_agent(
         lines: line_rx,
         budget,
     };
+    AgentIo {
+        transport,
+        logs: log_rx,
+        activity,
+        stdin,
+    }
+}
 
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let acp_future = acp::run_session(transport, params, inbound_tx, control_rx);
-    tokio::pin!(acp_future);
+/// The run loop's state of the agent's turn ([`run_agent`]).
+struct AgentTurn {
+    mapper: EventMapper,
+    /// Events that the mapper made and the sink has not taken yet.
+    out: Vec<EventPayload>,
+    session_id: Option<String>,
+    not_resumed: Option<Option<NotResumed>>,
+    /// Why the run stopped the agent: the first cause, or an abort, which overrides it.
+    stop: Option<StopCause>,
+    /// When the agent has to have ended its turn after `session/cancel`.
+    cancel_deadline: Option<tokio::time::Instant>,
+    stderr_events: usize,
+    stderr_tail: Vec<String>,
+    /// To the ACP session: `session/cancel`.
+    control_tx: mpsc::UnboundedSender<AcpControl>,
+    /// How long the agent has to end its turn after `session/cancel`.
+    grace: Duration,
+}
 
-    let mut mapper = EventMapper::new(
-        assign.limits.max_turns,
-        UsageMode::for_runtime(assign.agent.runtime),
-    )
-    .with_redactor({
-        let shared = shared.clone();
-        Arc::new(move || shared.redactor())
-    });
-    let mut session_id: Option<String> = None;
-    let mut not_resumed: Option<Option<NotResumed>> = None;
-    let mut stop: Option<StopCause> = None;
-    let mut cancel_deadline: Option<tokio::time::Instant> = None;
-    let mut stderr_events = 0usize;
-    let mut stderr_tail: Vec<String> = Vec::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(50));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let wall_clock = tokio::time::Instant::from_std(deadline);
-    let inactivity = shared.opts.inactivity_timeout;
-    let grace = shared.opts.cancel_grace;
-    let mut out: Vec<EventPayload> = Vec::new();
+impl AgentTurn {
+    fn new(
+        shared: &Arc<Shared>,
+        assign: &RunAssign,
+        control_tx: mpsc::UnboundedSender<AcpControl>,
+    ) -> AgentTurn {
+        let mapper = EventMapper::new(
+            assign.limits.max_turns,
+            UsageMode::for_runtime(assign.agent.runtime),
+        )
+        .with_redactor({
+            let shared = shared.clone();
+            Arc::new(move || shared.redactor())
+        });
+        AgentTurn {
+            mapper,
+            out: Vec::new(),
+            session_id: None,
+            not_resumed: None,
+            stop: None,
+            cancel_deadline: None,
+            stderr_events: 0,
+            stderr_tail: Vec::new(),
+            control_tx,
+            grace: shared.opts.cancel_grace,
+        }
+    }
 
-    let request_stop = |cause: StopCause,
-                        stop: &mut Option<StopCause>,
-                        cancel_deadline: &mut Option<tokio::time::Instant>,
-                        sink: &mut EventSink| {
-        if stop.is_some() {
+    /// Asks the agent to end its turn (`session/cancel`), once: a later cause does not replace
+    /// the first.
+    fn request_stop(&mut self, cause: StopCause, sink: &mut EventSink) {
+        if self.stop.is_some() {
             return;
         }
         let message = match &cause {
@@ -2523,24 +4090,206 @@ async fn run_agent(
         if cause != StopCause::Abort {
             sink.status(Phase::Cancelling, Some(message));
         }
-        *stop = Some(cause);
-        let _ = control_tx.send(AcpControl::Cancel);
-        *cancel_deadline = Some(tokio::time::Instant::now() + grace);
-    };
+        self.stop = Some(cause);
+        let _ = self.control_tx.send(AcpControl::Cancel);
+        self.cancel_deadline = Some(tokio::time::Instant::now() + self.grace);
+    }
 
-    // Emits mapped events; a redaction hit in agent output is a credential leak, whether the
-    // mapper (which redacts before it truncates) or the sink found it.
-    fn emit_all(
-        sink: &mut EventSink,
-        mapper: &mut EventMapper,
-        out: &mut Vec<EventPayload>,
-    ) -> bool {
-        let mut leak = mapper.take_leak();
-        for event in out.drain(..) {
+    /// Emits mapped events; a redaction hit in agent output is a credential leak, whether the
+    /// mapper (which redacts before it truncates) or the sink found it.
+    fn emit_all(&mut self, sink: &mut EventSink) -> bool {
+        let mut leak = self.mapper.take_leak();
+        for event in self.out.drain(..) {
             leak |= sink.emit(event);
         }
         leak
     }
+
+    /// A message of the agent's session while its turn runs.
+    fn inbound(&mut self, item: AcpInbound, sink: &mut EventSink, assign: &RunAssign) {
+        let now = Instant::now();
+        match item {
+            AcpInbound::Update { params, permit } => {
+                let signals = self.mapper.handle_update(&params, now, &mut self.out);
+                // Mapped: the line's share of the budget goes back to the splitter.
+                drop((params, permit));
+                if self.emit_all(sink) {
+                    self.request_stop(StopCause::Leak, sink);
+                }
+                for signal in signals {
+                    match signal {
+                        Signal::Guard(message) => {
+                            self.request_stop(StopCause::Guard(message), sink)
+                        }
+                        Signal::UsageLimit { resets_at, window } => {
+                            self.request_stop(StopCause::UsageLimit { resets_at, window }, sink)
+                        }
+                    }
+                }
+            }
+            AcpInbound::Prompting {
+                session_id: id,
+                not_resumed: why,
+                agent_version,
+            } => {
+                self.mapper.set_usage_mode(UsageMode::for_agent(
+                    assign.agent.runtime,
+                    agent_version.as_deref(),
+                ));
+                open_session(&mut self.mapper, sink, &id, why.as_ref());
+                sink.session_opened(&id);
+                self.session_id = Some(id);
+                self.not_resumed = Some(why);
+            }
+            AcpInbound::PermissionGranted { title, option } => {
+                sink.log(
+                    LogLevel::Debug,
+                    format!("auto-approved permission ({option}): {title}"),
+                );
+            }
+            AcpInbound::Warning(message) => {
+                tracing::warn!(run_id = %assign.run_id, %message, "agent session");
+                sink.log(LogLevel::Warn, message);
+            }
+            AcpInbound::Info(message) => {
+                sink.log(LogLevel::Info, message);
+            }
+        }
+    }
+
+    /// A log line of the agent while its turn runs: kept in its stderr tail, and the first
+    /// [`MAX_STDERR_EVENTS`] lines in the run's events.
+    fn log_line(&mut self, line: String, sink: &mut EventSink) {
+        if self.stderr_tail.len() >= STDERR_TAIL {
+            self.stderr_tail.remove(0);
+        }
+        self.stderr_tail.push(line.clone());
+        if self.stderr_events < MAX_STDERR_EVENTS {
+            self.stderr_events += 1;
+            sink.log(LogLevel::Debug, line);
+        }
+    }
+
+    /// Drains what arrived before the prompt response: the session, the last updates (a leak
+    /// or a usage limit in them stops the run, unless it stopped already), and the last log
+    /// lines.
+    fn drain(
+        &mut self,
+        inbound_rx: &mut mpsc::UnboundedReceiver<AcpInbound>,
+        log_rx: &mut mpsc::Receiver<String>,
+        sink: &mut EventSink,
+        assign: &RunAssign,
+    ) {
+        while let Ok(item) = inbound_rx.try_recv() {
+            if let AcpInbound::Prompting {
+                session_id: id,
+                not_resumed: why,
+                agent_version,
+            } = item
+            {
+                self.mapper.set_usage_mode(UsageMode::for_agent(
+                    assign.agent.runtime,
+                    agent_version.as_deref(),
+                ));
+                open_session(&mut self.mapper, sink, &id, why.as_ref());
+                sink.session_opened(&id);
+                self.session_id = Some(id);
+                self.not_resumed = Some(why);
+            } else if let AcpInbound::Update { params, .. } = item {
+                let signals = self
+                    .mapper
+                    .handle_update(&params, Instant::now(), &mut self.out);
+                if self.emit_all(sink) && self.stop.is_none() {
+                    self.stop = Some(StopCause::Leak);
+                }
+                for signal in signals {
+                    if self.stop.is_none()
+                        && let Signal::UsageLimit { resets_at, window } = signal
+                    {
+                        self.stop = Some(StopCause::UsageLimit { resets_at, window });
+                    }
+                }
+            }
+        }
+        while let Ok(line) = log_rx.try_recv() {
+            if self.stderr_events < MAX_STDERR_EVENTS {
+                self.stderr_events += 1;
+                sink.log(LogLevel::Debug, line.clone());
+            }
+            if self.stderr_tail.len() >= STDERR_TAIL {
+                self.stderr_tail.remove(0);
+            }
+            self.stderr_tail.push(line);
+        }
+    }
+
+    /// The end of the turn: the prompt's usage and the last events, the agent's summary, and
+    /// the reset of a usage limit that the agent reported earlier when its stop named none.
+    fn end(mut self, result: Option<AcpResult>, sink: &mut EventSink) -> AgentPhase {
+        let usage_value = result
+            .as_ref()
+            .and_then(|r| r.outcome.as_ref().ok())
+            .and_then(|o| prompt_usage(o.usage.as_ref(), o.meta.as_ref()).cloned());
+        self.mapper
+            .finish_prompt(usage_value.as_ref(), &mut self.out);
+        if self.emit_all(sink) && self.stop.is_none() {
+            self.stop = Some(StopCause::Leak);
+        }
+        let summary = self.mapper.summary().map(|s| sink.redact(&s));
+        let (known_reset, known_window) = self.mapper.last_rate_limit_reset();
+        if let Some(StopCause::UsageLimit { resets_at, window }) = &mut self.stop {
+            if resets_at.is_none() {
+                *resets_at = known_reset;
+            }
+            if window.is_none() {
+                *window = known_window;
+            }
+        }
+        AgentPhase {
+            session_id: self
+                .session_id
+                .or_else(|| result.as_ref().and_then(|r| r.session_id.clone())),
+            not_resumed: self.not_resumed,
+            stop: self.stop,
+            result,
+            summary,
+            usage: self.mapper.usage(),
+            stderr_tail: self.stderr_tail,
+        }
+    }
+}
+
+/// The agent's turn (README "What a run does", steps 5 and 6): its ACP session over the
+/// sandbox's stdio ([`connect_the_agent`], [`acp::run_session`]), whose updates become the
+/// run's events, until the turn ends or the run stops it: a cancel or an abort from the server,
+/// a guard, the inactivity timeout, the wall clock (`deadline`), a credential in the agent's
+/// output, or a usage limit. An agent that does not end its turn within the cancel grace is
+/// left; the caller stops its sandbox.
+async fn run_agent(
+    shared: &Arc<Shared>,
+    assign: &RunAssign,
+    sink: &mut EventSink,
+    io: SandboxIo,
+    params: AcpParams,
+    stop_rx: &mut watch::Receiver<Option<StopRequest>>,
+    deadline: Instant,
+) -> AgentPhase {
+    let AgentIo {
+        transport,
+        mut logs,
+        activity,
+        stdin,
+    } = connect_the_agent(io);
+
+    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let mut acp_future = Box::pin(acp::run_session(transport, params, inbound_tx, control_rx));
+
+    let mut turn = AgentTurn::new(shared, assign, control_tx);
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let wall_clock = tokio::time::Instant::from_std(deadline);
+    let inactivity = shared.opts.inactivity_timeout;
 
     // An initial stop (cancel before the agent started) is honoured right away.
     if let Some(request) = *stop_rx.borrow() {
@@ -2549,63 +4298,19 @@ async fn run_agent(
         } else {
             StopCause::Cancel
         };
-        request_stop(cause, &mut stop, &mut cancel_deadline, sink);
+        turn.request_stop(cause, sink);
     }
 
     let result = loop {
         tokio::select! {
             biased;
             result = &mut acp_future => break Some(result),
-            Some(item) = inbound_rx.recv() => {
-                let now = Instant::now();
-                match item {
-                    AcpInbound::Update { params, permit } => {
-                        let signals = mapper.handle_update(&params, now, &mut out);
-                        // Mapped: the line's share of the budget goes back to the splitter.
-                        drop((params, permit));
-                        if emit_all(sink, &mut mapper, &mut out) {
-                            request_stop(StopCause::Leak, &mut stop, &mut cancel_deadline, sink);
-                        }
-                        for signal in signals {
-                            match signal {
-                                Signal::Guard(message) => request_stop(StopCause::Guard(message), &mut stop, &mut cancel_deadline, sink),
-                                Signal::UsageLimit { resets_at, window } => request_stop(StopCause::UsageLimit { resets_at, window }, &mut stop, &mut cancel_deadline, sink),
-                            }
-                        }
-                    }
-                    AcpInbound::Prompting { session_id: id, not_resumed: why, agent_version } => {
-                        mapper.set_usage_mode(UsageMode::for_agent(assign.agent.runtime, agent_version.as_deref()));
-                        open_session(&mut mapper, sink, &id, why.as_ref());
-                        sink.session_opened(&id);
-                        session_id = Some(id);
-                        not_resumed = Some(why);
-                    }
-                    AcpInbound::PermissionGranted { title, option } => {
-                        sink.log(LogLevel::Debug, format!("auto-approved permission ({option}): {title}"));
-                    }
-                    AcpInbound::Warning(message) => {
-                        tracing::warn!(run_id = %assign.run_id, %message, "agent session");
-                        sink.log(LogLevel::Warn, message);
-                    }
-                    AcpInbound::Info(message) => {
-                        sink.log(LogLevel::Info, message);
-                    }
-                }
-            }
-            Some(line) = log_rx.recv() => {
-                if stderr_tail.len() >= STDERR_TAIL {
-                    stderr_tail.remove(0);
-                }
-                stderr_tail.push(line.clone());
-                if stderr_events < MAX_STDERR_EVENTS {
-                    stderr_events += 1;
-                    sink.log(LogLevel::Debug, line);
-                }
-            }
+            Some(item) = inbound_rx.recv() => turn.inbound(item, sink, assign),
+            Some(line) = logs.recv() => turn.log_line(line, sink),
             _ = tick.tick() => {
-                mapper.flush_due(Instant::now(), &mut out);
-                if emit_all(sink, &mut mapper, &mut out) {
-                    request_stop(StopCause::Leak, &mut stop, &mut cancel_deadline, sink);
+                turn.mapper.flush_due(Instant::now(), &mut turn.out);
+                if turn.emit_all(sink) {
+                    turn.request_stop(StopCause::Leak, sink);
                 }
             }
             _ = async {
@@ -2618,30 +4323,26 @@ async fn run_agent(
                     }
                     tokio::time::sleep_until(due).await;
                 }
-            }, if stop.is_none() => {
-                request_stop(
+            }, if turn.stop.is_none() => {
+                turn.request_stop(
                     StopCause::Guard(format!(
                         "the agent sent no ACP message for {} s (inactivity timeout) and seems hung",
                         inactivity.as_secs()
                     )),
-                    &mut stop,
-                    &mut cancel_deadline,
                     sink,
                 );
             }
-            _ = tokio::time::sleep_until(wall_clock), if stop.is_none() => {
+            _ = tokio::time::sleep_until(wall_clock), if turn.stop.is_none() => {
                 let limit = shared
                     .opts
                     .max_wall_clock_cap
                     .map(|cap| cap.as_secs().min(assign.limits.max_wall_clock_seconds))
                     .unwrap_or(assign.limits.max_wall_clock_seconds);
-                request_stop(
+                turn.request_stop(
                     StopCause::TimeLimit(format!(
                         "the run reached its time limit ({})",
                         duration_words(limit)
                     )),
-                    &mut stop,
-                    &mut cancel_deadline,
                     sink,
                 );
             }
@@ -2651,17 +4352,17 @@ async fn run_agent(
                     match request {
                         Some(StopRequest::Abort) => {
                             // Abort overrides any earlier cause.
-                            stop = None;
-                            request_stop(StopCause::Abort, &mut stop, &mut cancel_deadline, sink);
+                            turn.stop = None;
+                            turn.request_stop(StopCause::Abort, sink);
                             break None;
                         }
-                        Some(StopRequest::Cancel) => request_stop(StopCause::Cancel, &mut stop, &mut cancel_deadline, sink),
+                        Some(StopRequest::Cancel) => turn.request_stop(StopCause::Cancel, sink),
                         None => {}
                     }
                 }
             }
             _ = async {
-                match cancel_deadline {
+                match turn.cancel_deadline {
                     Some(t) => tokio::time::sleep_until(t).await,
                     None => std::future::pending().await,
                 }
@@ -2671,73 +4372,11 @@ async fn run_agent(
             }
         }
     };
+    drop(acp_future);
+    end_input(&stdin).await;
 
-    // Drain what arrived before the prompt response.
-    while let Ok(item) = inbound_rx.try_recv() {
-        if let AcpInbound::Prompting {
-            session_id: id,
-            not_resumed: why,
-            agent_version,
-        } = item
-        {
-            mapper.set_usage_mode(UsageMode::for_agent(
-                assign.agent.runtime,
-                agent_version.as_deref(),
-            ));
-            open_session(&mut mapper, sink, &id, why.as_ref());
-            session_id = Some(id);
-            not_resumed = Some(why);
-        } else if let AcpInbound::Update { params, .. } = item {
-            let signals = mapper.handle_update(&params, Instant::now(), &mut out);
-            if emit_all(sink, &mut mapper, &mut out) && stop.is_none() {
-                stop = Some(StopCause::Leak);
-            }
-            for signal in signals {
-                if stop.is_none()
-                    && let Signal::UsageLimit { resets_at, window } = signal
-                {
-                    stop = Some(StopCause::UsageLimit { resets_at, window });
-                }
-            }
-        }
-    }
-    while let Ok(line) = log_rx.try_recv() {
-        if stderr_events < MAX_STDERR_EVENTS {
-            stderr_events += 1;
-            sink.log(LogLevel::Debug, line.clone());
-        }
-        if stderr_tail.len() >= STDERR_TAIL {
-            stderr_tail.remove(0);
-        }
-        stderr_tail.push(line);
-    }
-    let usage_value = result
-        .as_ref()
-        .and_then(|r| r.outcome.as_ref().ok())
-        .and_then(|o| prompt_usage(o.usage.as_ref(), o.meta.as_ref()).cloned());
-    mapper.finish_prompt(usage_value.as_ref(), &mut out);
-    if emit_all(sink, &mut mapper, &mut out) && stop.is_none() {
-        stop = Some(StopCause::Leak);
-    }
-    let summary = mapper.summary().map(|s| sink.redact(&s));
-    let (known_reset, known_window) = mapper.last_rate_limit_reset();
-    if let Some(StopCause::UsageLimit { resets_at, window }) = &mut stop {
-        if resets_at.is_none() {
-            *resets_at = known_reset;
-        }
-        if window.is_none() {
-            *window = known_window;
-        }
-    }
-    AgentPhase {
-        session_id: session_id.or_else(|| result.as_ref().and_then(|r| r.session_id.clone())),
-        not_resumed,
-        stop,
-        result,
-        summary,
-        usage: mapper.usage(),
-        stderr_tail,
-    }
+    turn.drain(&mut inbound_rx, &mut logs, sink, assign);
+    turn.end(result, sink)
 }
 
 /// The session is open and the prompt about to be sent: logs the session the agent got, and
@@ -2790,6 +4429,16 @@ fn open_session(
 /// takes an unchanged file as proof that the refresh token was used elsewhere: the provider may
 /// refuse the loser while the winner still handles its answer (ADR-0085, decision 5).
 const REFRESH_RACE_GRACE: Duration = Duration::from_secs(2);
+
+/// Whether the agent's turn ended without the run asking and without the agent's answer: its
+/// output ended under it, or it never answered.
+fn agent_lost_its_output(agent: &AgentPhase) -> bool {
+    agent.stop.is_none()
+        && match &agent.result {
+            None => true,
+            Some(result) => matches!(&result.outcome, Err((_, error)) if error.transport_closed),
+        }
+}
 
 /// Decides the failure (if any) of an agent turn that ended on its own.
 async fn classify_agent_end(
@@ -3026,14 +4675,26 @@ fn git_failure_message(errors: &[String], total: usize) -> String {
 /// of its default branch, with a lease on the task branch's clone-time tip ([`Git::push`]).
 /// A read-only repository (ADR-0017) is never pushed, so its commits are not scanned either.
 /// A failed repository does not stop the others.
+///
+/// With `recheck` (the end of a run that a host took back after it died in that end), a push
+/// that the repository refuses is checked again: a branch that is at the run's head already was
+/// pushed, by the earlier process's own push (a `git push` it started may outlive it) or by an
+/// earlier take-back, and counts as pushed.
 async fn finalize_git(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     repos: &[Repo<'_>],
+    tokens: &Arc<RunGitTokens>,
     run_id: Uuid,
     leak: bool,
+    recheck: bool,
 ) -> Finalized {
     let mut finalized = Finalized::default();
+    // A token that expires is renewed before the mirror fetch and the push use it, when it
+    // has 20 minutes or less left (ADR-0116, decision 10).
+    if !leak {
+        crate::git_refresh::renew(shared, tokens, Some(crate::git_refresh::BEFORE_PUSH)).await;
+    }
     // Per repository: the ahead count, when it is ready to push.
     let mut ready: Vec<Option<u64>> = Vec::with_capacity(repos.len());
     let mut leaking = Vec::new();
@@ -3046,7 +4707,17 @@ async fn finalize_git(
             commits: None,
         };
         let scan = !leak && !repo.ws.read_only;
-        match prepare_repository(shared, sink, repo, run_id, scan, &mut result).await {
+        match prepare_repository(
+            shared,
+            sink,
+            repo,
+            run_id,
+            tokens.epoch(),
+            scan,
+            &mut result,
+        )
+        .await
+        {
             Ok(outgoing_leak) => {
                 if outgoing_leak {
                     leaking.push(repo.label());
@@ -3103,9 +4774,33 @@ async fn finalize_git(
             );
             continue;
         }
-        match repo.git.push(&repo.ws.branch).await {
+        // The server revoked the run's token for this repository (ADR-0116): its commits
+        // stay on this host.
+        if let Some(revocation) = repo.git.revocation() {
+            let reason = sink.redact(&revocation.message);
+            finalized
+                .errors
+                .push(format!("{}: not pushed: {reason}", repo.label()));
+            continue;
+        }
+        match repo
+            .git
+            .push_with(&repo.ws.branch, head.clone(), &shared.opts.push_settings())
+            .await
+        {
             Ok(out) if out.status.success() => {
                 finalized.results[i].pushed = true;
+                sink.git(repo.ws, GitAction::Pushed, head, Some(commits));
+            }
+            Ok(_) if recheck && branch_is_at(shared, repo, head.as_deref()).await => {
+                finalized.results[i].pushed = true;
+                sink.log(
+                    LogLevel::Info,
+                    format!(
+                        "{} is at the run's head already: an earlier push of the run's work reached it",
+                        repo.label()
+                    ),
+                );
                 sink.git(repo.ws, GitAction::Pushed, head, Some(commits));
             }
             Ok(out) => {
@@ -3124,6 +4819,29 @@ async fn finalize_git(
     finalized
 }
 
+/// Whether the remote branch of `repo` is at `head` now, as the host's mirror of the repository
+/// fetches it again. `false` when it cannot be read.
+async fn branch_is_at(shared: &Arc<Shared>, repo: &Repo<'_>, head: Option<&str>) -> bool {
+    let (Some(head), Ok(authorization)) = (head, repo.git.authorization()) else {
+        return false;
+    };
+    let key = repo
+        .git
+        .tokens()
+        .mirror_key(repo.git.repo_url(), authorization.as_ref());
+    match shared
+        .mirrors
+        .refresh_keyed(&key, repo.git.repo_url(), authorization.as_ref())
+        .await
+    {
+        Ok(refs) => branch_tip(&refs, &repo.ws.branch) == Some(head),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "cannot read the repository again after a refused push");
+            false
+        }
+    }
+}
+
 /// Sanitize, WIP commit, ahead count and (with `scan`) the credential scan of one repository.
 /// Fills `result`; `Ok(true)` when an outgoing commit contains a credential value.
 async fn prepare_repository(
@@ -3131,6 +4849,7 @@ async fn prepare_repository(
     sink: &mut EventSink,
     repo: &Repo<'_>,
     run_id: Uuid,
+    epoch: i64,
     scan: bool,
     result: &mut GitResult,
 ) -> anyhow::Result<bool> {
@@ -3155,10 +4874,15 @@ async fn prepare_repository(
     }
     // What the host knows the repository has: the mirror's refs at clone time and, fetched
     // again now, its current refs. Never the workspace's own refs, which the agent controls.
-    let current = if scan {
+    // A revoked token (ADR-0116) fetches nothing: the scan compares with the clone's refs.
+    let authorization = git.authorization().ok();
+    let current = if let (true, Some(authorization)) = (scan, authorization) {
+        let key = git
+            .tokens()
+            .mirror_key(git.repo_url(), authorization.as_ref());
         match shared
             .mirrors
-            .refresh(git.repo_url(), git.authorization())
+            .refresh_keyed(&key, git.repo_url(), authorization.as_ref())
             .await
         {
             Ok(refs) => refs,
@@ -3199,7 +4923,7 @@ async fn prepare_repository(
     if !scan {
         return Ok(false);
     }
-    git.outgoing_contains_secret(&shared.redactor(), &exclude)
+    git.outgoing_contains_secret(&shared.run_redactor(run_id, epoch), &exclude)
         .await
 }
 
@@ -3224,23 +4948,43 @@ struct Report {
 /// each one scanned with the run's redactor and posted with the host token and
 /// `artifact=true&source=output`. The log lines go out as LOG events; the run goes on
 /// whatever happens.
+///
+/// With the run's record of its own end (`record`), each file saved is written in the record at
+/// once ([`RecordHandle::output_file_saved`]), and a file that the record names as saved (by a
+/// process before a restart) is listed with its attachment, not uploaded again: after a
+/// restart, at most the one file whose upload was under way is uploaded twice.
 async fn collect_output(
     shared: &Arc<Shared>,
     sink: &mut EventSink,
     assign: &RunAssign,
     output_root: &OutputRoot,
+    record: Option<Arc<RecordHandle>>,
 ) -> Vec<ArtifactResult> {
-    let redactor = shared.redactor();
+    let redactor = shared.run_redactor(assign.run_id, assign.epoch);
     let server_url = shared.config.server_url.clone();
     let token = shared.config.token.expose().to_string();
     let (run_id, epoch) = (assign.run_id, assign.epoch);
+    let saved_before = record
+        .as_ref()
+        .map(|record| record.saved_artifacts())
+        .unwrap_or_default();
     let collected = output::collect(
         output_root,
         shared.opts.upload_max_bytes,
         &|content| redactor.contains_any(content),
         |file: OutputFile| {
             let (server_url, token) = (server_url.clone(), token.clone());
+            let (shared, record) = (shared.clone(), record.clone());
+            let before = saved_before.iter().find(|a| a.name == file.name).cloned();
             async move {
+                if let Some(before) = before {
+                    return Ok(UploadResponse::Answered {
+                        stored: true,
+                        message: "saved before the runner host restarted".into(),
+                        attachment_id: Some(before.attachment_id),
+                    });
+                }
+                let (name, size_bytes) = (file.name.clone(), file.content.len() as u64);
                 let upload = Upload {
                     run_id,
                     epoch,
@@ -3250,12 +4994,29 @@ async fn collect_output(
                     content: file.content,
                     source: UploadSource::Output,
                 };
-                attachments::upload(&server_url, &token, upload)
+                let answer = attachments::upload(&server_url, &token, upload)
                     .await
                     .map_err(|e| {
                         tracing::warn!(%run_id, error = %format!("{e:#}"), "cannot upload a file of /output");
                         "Tinfirm could not be reached, or did not answer.".to_string()
-                    })
+                    });
+                if let (
+                    Some(record),
+                    Ok(UploadResponse::Answered {
+                        stored: true,
+                        attachment_id: Some(attachment_id),
+                        ..
+                    }),
+                ) = (&record, &answer)
+                {
+                    record.output_file_saved(&ArtifactResult {
+                        name,
+                        attachment_id: *attachment_id,
+                        size_bytes,
+                    });
+                    halt_at(&shared, EndStep::OutputFileSaved).await;
+                }
+                answer
             }
         },
     )
@@ -3429,6 +5190,13 @@ fn prune_failed(shared: &Shared) {
     }
 }
 
+/// The workspace of a run whose report the process before this one kept, if it is still there
+/// (that process ended between the report and the cleanup): cleaned as the run's end would
+/// have, kept for inspection when the run `failed`.
+pub fn cleanup_kept_workspace(shared: &Arc<Shared>, run_id: Uuid, failed: bool) {
+    cleanup_workspace(shared, &shared.opts.paths.workspace(run_id), failed);
+}
+
 /// Startup: workspaces, `/output` folders and attachments left by a previous process belong
 /// to no run any more.
 pub fn recover_workspaces(shared: &Arc<Shared>) {
@@ -3471,6 +5239,38 @@ pub fn recover_workspaces(shared: &Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn after_a_new_front_the_run_says_what_came_back_and_claims_no_more() {
+        let mut all = Collection::default();
+        all.part("the repository app".into(), true);
+        all.part("the session home".into(), true);
+        assert_eq!(all.after_a_new_front(true), None);
+        let mut some = Collection::default();
+        some.part("the repository app".into(), true);
+        some.part("the session home".into(), false);
+        some.part("the files of /output".into(), false);
+        let message = some.after_a_new_front(true).unwrap();
+        assert!(message.contains("ended too"), "{message}");
+        assert!(
+            message.ends_with(
+                "saved: the repository app; not saved: the session home, the files of /output."
+            ),
+            "{message}"
+        );
+        let message = some.after_a_new_front(false).unwrap();
+        assert!(
+            message.contains("not all of its work came back"),
+            "{message}"
+        );
+        let mut none = Collection::default();
+        none.part("the session home".into(), false);
+        let message = none.after_a_new_front(false).unwrap();
+        assert!(
+            message.ends_with("the work of the run is lost (not saved: the session home)."),
+            "{message}"
+        );
+    }
 
     type Split = (
         mpsc::Sender<SandboxOutput>,
@@ -4124,5 +5924,46 @@ mod tests {
             git_failure_message(&two, 3),
             "git failed in 2 of 3 repositories: `Server` (/workspace/server): a; `Web` (/workspace/web): b"
         );
+    }
+
+    /// A session that the agent opened just before its turn ended is found by the drain, and
+    /// the take-back record keeps it as the loop's own handling does.
+    #[tokio::test]
+    async fn a_session_that_the_drain_finds_is_kept_in_the_take_back_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let records = crate::takeback::Records::new(&paths);
+        let local = crate::sandbox::Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        // TEST-ONLY token, no real credential.
+        let config = crate::config::HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYdrainsessiontesthosttoken0123456789"),
+        );
+        let shared = Shared::new(crate::host::HostOptions::new(paths, local), config);
+        let assign = test_assign();
+        let mut sink = EventSink::new(shared.clone(), assign.run_id, assign.epoch);
+        let handle = RecordHandle::create(&records, crate::takeback::tests::record()).unwrap();
+        sink.keep_record(Arc::new(handle));
+
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let mut turn = AgentTurn::new(&shared, &assign, control_tx);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        inbound_tx
+            .send(AcpInbound::Prompting {
+                session_id: "session-1".into(),
+                not_resumed: None,
+                agent_version: None,
+            })
+            .unwrap();
+        let (_log_tx, mut log_rx) = mpsc::channel::<String>(1);
+        turn.drain(&mut inbound_rx, &mut log_rx, &mut sink, &assign);
+
+        assert_eq!(turn.session_id.as_deref(), Some("session-1"));
+        let kept = records.load_all();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].session_id.as_deref(), Some("session-1"));
     }
 }

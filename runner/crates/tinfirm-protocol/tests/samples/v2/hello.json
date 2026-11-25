@@ -6,7 +6,7 @@
   "os": "macos",
   "arch": "aarch64",
   "executors": ["docker"],
-  "isolationTiers": ["microvm"],
+  "isolationTiers": ["container"],
   "maxConcurrentRuns": 2,
   "credentials": [
     {"label": "claude-main", "kind": "CLAUDE_LOGIN", "runtimes": ["CLAUDE_CODE"], "poolSize": 3},

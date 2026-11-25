@@ -22,13 +22,19 @@ import { HlmSpinner } from '@spartan-ng/helm/spinner';
 import { Api } from '../../../api/generated/api';
 import {
   addSystemCredential,
+  addSystemCredentialApp,
   addSystemCredentialClient,
+  listSystemGitHubAppInstallations,
   startSystemCredentialSignIn,
   startSystemCredentialSignInAgain,
   storeSystemCredentialClient,
   storeSystemCredentialToken,
 } from '../../../api/generated/functions';
-import type { ExternalSystem, SystemCredential } from '../../../api/generated/models';
+import type {
+  ExternalSystem,
+  GitHubAppInstallation,
+  SystemCredential,
+} from '../../../api/generated/models';
 import { toProblem } from '../../../api/problem';
 import { BrowserNavigation } from '../../../core/browser-navigation';
 import { Segmented, type SegmentedOption } from '../../../shared/segmented';
@@ -44,16 +50,18 @@ export const MAX_CREDENTIAL_NAME = 100;
 export const MAX_CLIENT_ID = 500;
 export const MAX_CLIENT_SECRET = 2000;
 
-type Method = 'token' | 'sign-in' | 'client';
+type Method = 'token' | 'sign-in' | 'client' | 'app';
 
-const METHODS: readonly Method[] = ['token', 'sign-in', 'client'];
+const METHODS: readonly Method[] = ['token', 'sign-in', 'client', 'app'];
 
 /**
  * Add a credential to a company system, or give one a new token or sign it in again (ADR-0072): a
  * name, unique on the system, then a token of the user the credential is at the system (checked
  * with the system before it is kept), a sign-in with the system's app as that user, which comes
  * back to this page (`?account=`), or, on Jira Cloud, an Atlassian service account's OAuth 2.0
- * credential (its client id and secret), which mints its own access tokens. A new credential is
+ * credential (its client id and secret), which mints its own access tokens; or, on a GitHub
+ * system with a GitHub App, one of the App's installations (ADR-0116), whose tokens Tinfirm mints
+ * itself, an hour at a time. A new credential is
  * lent to nobody yet. The tools section opens
  * it too, when the server asks for a credential none was given for.
  */
@@ -212,6 +220,34 @@ const METHODS: readonly Method[] = ['token', 'sign-in', 'client'];
                 }}</hlm-field-error>
               }
             </div>
+          } @else if (method() === 'app') {
+            <div hlmField>
+              <label hlmFieldLabel for="credential-installation">Installation</label>
+              <select
+                id="credential-installation"
+                class="border-input bg-background h-9 rounded-md border px-3 text-sm"
+                data-testid="credential-installation"
+                [value]="installationId()"
+                (change)="installationId.set($any($event.target).value)"
+              >
+                <option value="">Choose an installation</option>
+                @for (i of freeInstallations(); track i.id) {
+                  <option [value]="i.id">
+                    {{ i.accountLogin }} ({{ i.accountType }}, {{ i.repositorySelection }})
+                  </option>
+                }
+              </select>
+              <p hlmFieldDescription>
+                An installation of {{ system().name }}’s GitHub App. Tinfirm mints its tokens
+                itself: for each run one limited to the run’s repositories, valid an hour, never
+                with Workflows.
+              </p>
+              @if (installationError(); as message) {
+                <hlm-field-error forceShow data-testid="credential-installation-error">{{
+                  message
+                }}</hlm-field-error>
+              }
+            </div>
           } @else if (method() === 'sign-in') {
             <p class="text-muted-foreground text-sm text-pretty" data-testid="credential-sign-in">
               You sign in at {{ system().name }} as the user the credential should be, then come
@@ -272,6 +308,13 @@ export class CredentialDialog {
   protected readonly clientId = signal('');
   protected readonly clientSecret = signal('');
   protected readonly method = signal<Method | ''>('');
+  /** The installations of the system's GitHub App; null without an App (ADR-0116). */
+  protected readonly installations = signal<GitHubAppInstallation[] | null>(null);
+  protected readonly installationId = signal('');
+  /** The installations no credential of the system is yet. */
+  protected readonly freeInstallations = computed(() =>
+    (this.installations() ?? []).filter((i) => !i.credentialId),
+  );
   protected readonly submitted = signal(false);
   protected readonly busy = signal(false);
   protected readonly error = signal<string | null>(null);
@@ -285,6 +328,7 @@ export class CredentialDialog {
     if (takesToken(system)) methods.push('token');
     if (takesSignIn(system)) methods.push('sign-in');
     if (takesClient(system)) methods.push('client');
+    if (!this.credential() && this.installations() !== null) methods.push('app');
     return methods;
   });
   protected readonly methodOptions = computed<SegmentedOption[]>(() =>
@@ -295,7 +339,9 @@ export class CredentialDialog {
           ? 'Paste a token'
           : m === 'client'
             ? 'Service account (OAuth 2.0)'
-            : `Sign in to ${this.system().name}`,
+            : m === 'app'
+              ? 'GitHub App installation'
+              : `Sign in to ${this.system().name}`,
     })),
   );
   protected readonly title = computed(() => {
@@ -340,6 +386,10 @@ export class CredentialDialog {
     if (!this.submitted() || this.method() !== 'client') return null;
     return this.clientId().trim() ? null : 'Paste the client ID.';
   });
+  protected readonly installationError = computed(() => {
+    if (!this.submitted() || this.method() !== 'app') return null;
+    return this.installationId() ? null : 'Choose an installation.';
+  });
   protected readonly clientSecretError = computed(() => {
     if (!this.submitted() || this.method() !== 'client') return null;
     return this.clientSecret().trim() ? null : 'Paste the client secret.';
@@ -358,6 +408,19 @@ export class CredentialDialog {
               ? 'client'
               : 'token';
         this.method.set(methods.includes(preferred) ? preferred : (methods[0] ?? ''));
+        this.installationId.set('');
+        this.installations.set(null);
+        const system = this.system();
+        if (!credential && system.githubApp) {
+          this.api
+            .invoke(listSystemGitHubAppInstallations, {
+              companyId: this.companyId(),
+              systemId: system.id,
+            })
+            .then((list) => this.installations.set(list.items))
+            // No App on the system, or GitHub not answering: no installation to offer.
+            .catch(() => this.installations.set(null));
+        }
         this.name.set('');
         this.token.set('');
         this.clientId.set('');
@@ -388,6 +451,7 @@ export class CredentialDialog {
       this.tokenError() ||
       this.clientIdError() ||
       this.clientSecretError() ||
+      this.installationError() ||
       !this.method()
     ) {
       return;
@@ -409,6 +473,16 @@ export class CredentialDialog {
               body: { name, returnTo },
             });
         this.browser.assign(start.authorizationUrl);
+        return;
+      }
+      if (this.method() === 'app') {
+        const saved = await this.api.invoke(addSystemCredentialApp, {
+          ...key,
+          body: { name, installationId: Number(this.installationId()) },
+        });
+        this.open.set(false);
+        this.saved.emit(saved);
+        this.busy.set(false);
         return;
       }
       if (this.method() === 'client') {

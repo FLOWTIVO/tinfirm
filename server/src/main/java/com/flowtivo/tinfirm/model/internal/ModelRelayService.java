@@ -414,7 +414,7 @@ class ModelRelayService {
     private Plan plan(Endpoint endpoint, @Nullable String authorization, @Nullable String hostToken) {
         String token = RelayTokenStore.fromAuthorization(authorization).orElseThrow(Refusal::unauthorized);
         String hash = RelayTokenStore.hash(token);
-        UUID companyId = transactions.unscoped(() -> tokens.companyOf(hash)).orElseThrow(Refusal::unauthorized);
+        UUID companyId = transactions.lookupUnscoped(() -> tokens.companyOf(hash)).orElseThrow(Refusal::unauthorized);
         RunModelTokens active = runTokens.getIfUnique();
         if (active == null) {
             throw Refusal.unauthorized();
@@ -429,7 +429,9 @@ class ModelRelayService {
                 .orElseThrow(Refusal::unauthorized);
         }
         UUID presented = presentedHost;
-        return transactions.inCompany(companyId, () -> {
+        // The request's authorization, with the reveal of its key (marked read and recorded): bookkeeping, not the
+        // request's change, which begins with its admission (forward).
+        return transactions.lookupInCompany(companyId, () -> {
             RelayTokenStore.TokenRow row = tokens.find(companyId, hash)
                 .filter(candidate -> candidate.revokedAt() == null && candidate.format() == endpoint.format)
                 .orElseThrow(Refusal::unauthorized);

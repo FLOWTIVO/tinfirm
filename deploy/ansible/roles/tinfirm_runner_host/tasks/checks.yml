@@ -9,6 +9,15 @@
       {{ ansible_facts['distribution'] }} on {{ ansible_facts['architecture'] }}.
     quiet: true
 
+- name: Check the kind of host
+  ansible.builtin.assert:
+    that:
+      - tinfirm_runner_host_executor in ['docker', 'vm']
+    fail_msg: >-
+      tinfirm_runner_host_executor is `docker` (Docker and Kata on this machine) or `vm` (a control
+      host whose VMs run on sandbox nodes), not {{ tinfirm_runner_host_executor }}.
+    quiet: true
+
 - name: Check the runner host binary source
   ansible.builtin.assert:
     that:
@@ -24,11 +33,14 @@
       tinfirm_runner_host_kata_runtime_name must start with `kata`: `run --sandbox-docker` refuses any
       other runtime.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
+# A control host runs no VM: it needs no KVM (ADR-0112 decision 3).
 - name: Look for /dev/kvm
   ansible.builtin.stat:
     path: /dev/kvm
   register: _tinfirm_runner_host_kvm
+  when: not (_tinfirm_runner_host_vm | bool)
 
 - name: Check that the VM can run VMs (nested virtualisation)
   ansible.builtin.assert:
@@ -40,6 +52,7 @@
       start a VM per sandbox. Enable nested virtualisation for the VM in the hypervisor
       (deploy/ansible/README.md); without it, Kata and `--sandbox-docker` are out.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
 # L27 of the security review of 2026-10-27: nothing the role downloads is trusted on TLS alone.
 - name: Check the checksum of the runner host's release archive
@@ -64,6 +77,7 @@
       {{ tinfirm_runner_host_kata_version }} on {{ _tinfirm_runner_host_kata_arch }}, and downloads the
       release only against one.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
 - name: Check the fingerprint of Docker's key
   ansible.builtin.assert:
@@ -73,6 +87,7 @@
       tinfirm_runner_host_docker_key_fingerprint must be the 40 hex digits (upper case, no spaces) of
       the key that signs Docker's packages.
     quiet: true
+  when: not (_tinfirm_runner_host_vm | bool)
 
 - name: Check the user's uid against the sandbox bridge
   ansible.builtin.assert:
@@ -83,7 +98,26 @@
       mounts that the sandbox writes as uid 1000: set tinfirm_runner_host_uid to 1000, or keep the
       bridge on.
     quiet: true
-  when: tinfirm_runner_host_create_user | bool
+  when:
+    - tinfirm_runner_host_create_user | bool
+    - not (_tinfirm_runner_host_vm | bool)
+
+# `run --sandbox-bridge-ports`: FROM-TO (or one port), 1 to 65535, with a port for every run at
+# once. It is a setting of the sandbox bridge on a Docker host; a control host's VMs do not use it.
+- name: Check the sandbox bridge's ports
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_runner_host_bridge_ports_ok | bool
+    fail_msg: >-
+      tinfirm_runner_host_sandbox_bridge_ports is FROM-TO, two ports from 1 to 65535 with FROM at
+      most TO, holding at least tinfirm_runner_host_max_concurrent_runs
+      ({{ tinfirm_runner_host_max_concurrent_runs }}) ports, not "{{ _range }}"; and it is a
+      setting of the sandbox bridge on a Docker host (tinfirm_runner_host_sandbox_bridge: true,
+      not a control host). Leave it empty to let the system pick each port.
+    quiet: true
+  vars:
+    _range: "{{ tinfirm_runner_host_sandbox_bridge_ports | string | trim }}"
+  when: tinfirm_runner_host_sandbox_bridge_ports | string | trim | length > 0
 
 # The unit's ProtectHome hides /home, /root and /run/user from the service.
 - name: Check that the runner host's directories are outside the hidden homes
@@ -99,3 +133,118 @@
     - "{{ tinfirm_runner_host_home }}"
     - "{{ tinfirm_runner_host_config_dir }}"
     - "{{ tinfirm_runner_host_data_dir }}"
+
+# A control host (ADR-0112): its nodes and their template, as runner/README.md's "Sandbox
+# nodes" defines the driver's configuration. The driver checks the same again at `run`'s start.
+- name: Check the sandbox nodes
+  when: _tinfirm_runner_host_vm | bool
+  block:
+    - name: Check that there are nodes and a template
+      ansible.builtin.assert:
+        that:
+          - tinfirm_runner_host_nodes | length >= 1
+          - tinfirm_runner_host_nodes | length <= 64
+          - tinfirm_runner_host_nodes | map(attribute='name') | unique | length == tinfirm_runner_host_nodes | length
+          - tinfirm_runner_host_vm_template is match('^[a-z0-9][a-z0-9-]{0,62}$')
+          # The nodes that have a pin are the driver's; with none yet, there is nothing to offer.
+          - >-
+            _tinfirm_runner_host_nodes_pinned | length == 0
+            or _tinfirm_runner_host_nodes_pinned | selectattr('templates', 'contains', tinfirm_runner_host_vm_template) | list | length >= 1
+          - tinfirm_runner_host_node_peer_build in ['warn', 'refuse']
+          - tinfirm_runner_host_vm_port | int >= 1
+          - tinfirm_runner_host_vm_port | int <= 65535
+        fail_msg: >-
+          A control host needs tinfirm_runner_host_nodes (1 to 64 nodes, each name once),
+          tinfirm_runner_host_vm_template (a template that at least one node with a nodeSha256 offers), and
+          tinfirm_runner_host_node_peer_build warn or refuse.
+        quiet: true
+
+    - name: Check each node
+      ansible.builtin.assert:
+        that:
+          - item.keys() | difference(['name', 'address', 'nodeSha256', 'templates', 'publishedPorts']) | length == 0
+          - item.name | default('') is match('^[a-z0-9-]{1,32}$')
+          - item.address | default('') is match('^.+:[0-9]{1,5}$')
+          - (item.address | default(':0') | split(':') | last | int) >= 1
+          - (item.address | default(':0') | split(':') | last | int) <= 65535
+          - not (item.address | default('') is match('^(127\\.|localhost:|\\[::1\\]:|0\\.0\\.0\\.0:)'))
+          - item.templates | default([]) | length >= 1
+          - item.templates | select('match', '^[a-z0-9][a-z0-9-]{0,62}$') | list | length == item.templates | length
+          - (item.nodeSha256 | default('')) | length == 0 or item.nodeSha256 is match('^[0-9a-fA-F]{64}$')
+        fail_msg: >-
+          Node {{ item.name | default('?') }}: name (1 to 32 bytes of a-z, 0-9 and -), address
+          (HOST:PORT of the node agent's TLS listener, not this machine's loopback: the single
+          machine is planned), templates (names of the node's helper.json), and nodeSha256 (64 hex
+          digits, or empty until the node's play has shown it); optionally publishedPorts.
+        quiet: true
+      loop: "{{ tinfirm_runner_host_nodes }}"
+      loop_control:
+        label: "{{ item.name | default('?') }}"
+
+# A control host runs no Docker socket and no hypervisor (ADR-0112 decision 3). A Kata host is
+# not converted into one in place: ADR-0112 decision 7 makes the old machine a node and puts
+# the control host elsewhere. So the `vm` form refuses a machine with Docker, containerd or
+# Kata, or whose runner host user is in the docker group, before it changes anything: a
+# runner host of the Docker form that runs there keeps running, with its runs, untouched.
+- name: Refuse a machine with Docker for a control host
+  when: _tinfirm_runner_host_vm | bool
+  block:
+    - name: Read the machine's services
+      ansible.builtin.service_facts:
+
+    - name: Read the docker group
+      ansible.builtin.getent:
+        database: group
+        key: docker
+        fail_key: false
+
+    - name: Look for Docker's socket and Kata
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        get_checksum: false
+      # Kata where this role's Docker form puts it (/opt/kata) and where a distribution's packages do.
+      loop:
+        - /var/run/docker.sock
+        - /run/containerd/containerd.sock
+        - /usr/bin/dockerd
+        - /usr/bin/containerd
+        - /opt/kata
+        - /usr/bin/containerd-shim-kata-v2
+        - /usr/local/bin/containerd-shim-kata-v2
+        - /usr/bin/kata-runtime
+        - /usr/share/defaults/kata-containers
+        - /usr/share/kata-containers
+        - /etc/kata-containers
+      register: _tinfirm_runner_host_docker_paths
+
+    - name: Look for a runner host of the Docker form
+      ansible.builtin.slurp:
+        src: /etc/systemd/system/tinfirm-runner-host.service
+      register: _tinfirm_runner_host_old_unit
+      failed_when: false
+
+    - name: Refuse Docker, containerd, Kata or the docker group on a control host
+      ansible.builtin.assert:
+        that:
+          - _found | length == 0
+        fail_msg: >-
+          This machine has {{ _found | join(', ') }}. A control host runs no Docker socket and no
+          hypervisor (ADR-0112 decision 3), and its user reaches no Docker: use a fresh machine for
+          it, or remove Docker, containerd and Kata first and take {{ tinfirm_runner_host_user }}
+          out of the docker group. A Kata host becomes a sandbox node instead, with a new image
+          (ADR-0112 decision 7). {{ _old_form }}
+        quiet: true
+      vars:
+        _services: "{{ ansible_facts['services'] | default({}) }}"
+        _docker_members: "{{ ((ansible_facts['getent_group'] | default({}))['docker'] | default(['', '', '', '']))[2] | default('') | split(',') }}"
+        _found: >-
+          {{ (['docker.service'] if 'docker.service' in _services else [])
+             + (['containerd.service'] if 'containerd.service' in _services else [])
+             + (_tinfirm_runner_host_docker_paths.results | selectattr('stat.exists') | map(attribute='item') | list)
+             + ([tinfirm_runner_host_user ~ ' in the docker group'] if tinfirm_runner_host_user in _docker_members else []) }}
+        _old_form: >-
+          {{ 'The runner host of the Docker form here was left alone and still runs with its runs: drain it
+              (systemctl reload tinfirm-runner-host, until it runs again with none) and stop it before you
+              re-image the machine.'
+             if (_tinfirm_runner_host_old_unit.content | default('') | b64decode) is search('--sandbox-runtime')
+             else '' }}

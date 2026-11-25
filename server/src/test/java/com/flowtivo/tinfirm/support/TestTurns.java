@@ -65,6 +65,9 @@ public class TestTurns implements TurnSource, TurnEnded, RunRequests {
 
         public volatile boolean takesBack = true;
 
+        /** What the assignment's third phase finds of the workspace's bindings (ADR-0116); empty: they hold. */
+        public volatile java.util.Optional<String> revoked = java.util.Optional.empty();
+
         /** Answers {@code ASK}, {@code ACCESS}, {@code ARTIFACT} and {@code NETWORK}; null: the stand-in's. */
         public volatile RequestHandler requests;
 
@@ -119,6 +122,45 @@ public class TestTurns implements TurnSource, TurnEnded, RunRequests {
                 grantedHosts, List.of());
     }
 
+    /**
+     * What runs right after the conversation module's own {@code content} of a turn of the agent, on the delivery's
+     * thread, before the assignment's third phase: a test's change between the reveal and the send.
+     */
+    private static final Map<UUID, java.util.function.Consumer<TurnRef>> AFTER_CONTENT = new ConcurrentHashMap<>();
+
+    /** Runs {@code then} once after the next content of a (not scripted) turn of the agent; null: nothing. */
+    public static void afterAnyContent(UUID agentId,
+            java.util.function.@org.jspecify.annotations.Nullable Consumer<TurnRef> then) {
+        if (then == null) {
+            AFTER_CONTENT.remove(agentId);
+        }
+        else {
+            AFTER_CONTENT.put(agentId, then);
+        }
+    }
+
+    @Override
+    public java.util.Optional<String> workspaceRevoked(UUID companyId, UUID conversationId,
+            List<Workspace> workspaces) {
+        TurnSource real = real(TurnSource.class);
+        if (!scripted(conversationId) && real != null) {
+            return real.workspaceRevoked(companyId, conversationId, workspaces);
+        }
+        return conversation(conversationId).revoked;
+    }
+
+    @Override
+    public List<UUID> bindingsHeldBy(UUID companyId, UUID principalId) {
+        TurnSource real = real(TurnSource.class);
+        return real != null ? real.bindingsHeldBy(companyId, principalId) : List.of();
+    }
+
+    @Override
+    public List<GitAccessGone> gitAccessGone(UUID companyId, List<ClonedRepository> repositories) {
+        TurnSource real = real(TurnSource.class);
+        return real != null ? real.gitAccessGone(companyId, repositories) : List.of();
+    }
+
     @Override
     public java.util.Optional<String> pausedWorkspaceSystem(TurnRef turn) {
         TurnSource real = real(TurnSource.class);
@@ -142,7 +184,12 @@ public class TestTurns implements TurnSource, TurnEnded, RunRequests {
     public TurnContent content(TurnRef turn, Placement placement, EffectiveSettings settings) {
         TurnSource real = real(TurnSource.class);
         if (!scripted(turn.conversationId()) && real != null) {
-            return real.content(turn, placement, settings);
+            TurnContent content = real.content(turn, placement, settings);
+            java.util.function.Consumer<TurnRef> then = AFTER_CONTENT.remove(turn.agentId());
+            if (then != null) {
+                then.accept(turn);
+            }
+            return content;
         }
         Script script = conversation(turn.conversationId());
         script.contentInTransaction.add(TransactionSynchronizationManager.isActualTransactionActive());
@@ -199,5 +246,12 @@ public class TestTurns implements TurnSource, TurnEnded, RunRequests {
         return handler != null ? handler.answer(run, "TOOL", requestId, payload)
                 : RunnerMessages.RunRequestAck.rejected(run.runId(), requestId, "UNKNOWN_TOOL",
                         "This run has no server-executed tools.");
+    }
+
+    @Override
+    public GitTokenAnswer gitTokens(ActiveRun run, List<GitTokenRepository> repositories) {
+        RunRequests real = real(RunRequests.class);
+        return !scripted(run.conversationId()) && real != null ? real.gitTokens(run, repositories)
+                : RunRequests.super.gitTokens(run, repositories);
     }
 }

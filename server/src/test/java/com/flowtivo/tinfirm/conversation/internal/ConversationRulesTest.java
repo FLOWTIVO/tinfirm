@@ -48,7 +48,7 @@ class ConversationRulesTest {
     @Test
     void thePromptHasItsSectionsInTheContractsOrder() {
         PromptRenderer.Context context = new PromptRenderer.Context("Builder", "You build the shop.",
-                "Prefer small commits.", "Alice", "shop-123-builder-1", "Fix the checkout",
+                "Prefer small commits.", "Alice", "shop-123-builder-1",
                 "About Jira SHOP-123: Cart loses items; read it with `jira_get`.", List.of("Jira SHOP"),
                 List.of(new PromptRenderer.Message("Alice", Instant.parse("2026-10-12T10:00:00Z"), "Fix it.")), null,
                 List.of(new PromptRenderer.Message("Builder (you)", Instant.parse("2026-10-12T09:00:00Z"),
@@ -60,7 +60,7 @@ class ConversationRulesTest {
                 "A change request.");
         String prompt = PromptRenderer.prompt(context);
         List<String> headings = List.of("You build the shop.", "## Added by Alice", "---",
-                "# Conversation shop-123-builder-1: Fix the checkout", "# Request", "# Conversation so far",
+                "# Conversation shop-123-builder-1\n", "# Request", "# Conversation so far",
                 "# Answers", "# Accounts", "# Repositories", "# Files", "# Tools", "# Outputs", "# How to work");
         List<Integer> positions = new ArrayList<>();
         headings.forEach(heading -> positions.add(prompt.indexOf(heading)));
@@ -68,11 +68,11 @@ class ConversationRulesTest {
         assertThat(prompt).contains("> Fix it.", "read-only (the account of this conversation may only read it)",
                 "`jira_get`: Reads an issue.", "Alice's own account", "Alice's usual projects: Jira SHOP.");
         // Without part 2's and part 3's sections they are left out.
-        PromptRenderer.Context bare = new PromptRenderer.Context("Builder", "", null, "Alice", "builder-1", "Hi",
-                null, List.of(), List.of(), "Go on.", List.of(), 0, null, List.of(), "agent/builder-1", List.of(),
-                false, null, List.of(), null);
+        PromptRenderer.Context bare = new PromptRenderer.Context("Builder", "", null, "Alice", "builder-1", null,
+                List.of(), List.of(), "Go on.", List.of(), 0, null, List.of(), "agent/builder-1", List.of(), false,
+                null, List.of(), null);
         assertThat(PromptRenderer.prompt(bare)).doesNotContain("# Answers", "# Files", "# Tools", "# Outputs",
-                "Added by").startsWith("---\n# Conversation builder-1: Hi");
+                "Added by").startsWith("---\n# Conversation builder-1\nA conversation with Alice in Tinfirm.");
         assertThat(PromptRenderer.resumePrompt(context, List.of())).endsWith(PromptRenderer.RESUME_LINE);
     }
 

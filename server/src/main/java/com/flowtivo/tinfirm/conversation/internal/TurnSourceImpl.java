@@ -22,6 +22,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.flowtivo.tinfirm.account.AccountInfo;
+import com.flowtivo.tinfirm.account.Accounts;
 import com.flowtivo.tinfirm.account.GrantInfo;
 import com.flowtivo.tinfirm.agent.AgentInfo;
 import com.flowtivo.tinfirm.agent.EffectiveSettings;
@@ -30,6 +32,7 @@ import com.flowtivo.tinfirm.conversation.ConversationBindings;
 import com.flowtivo.tinfirm.conversation.ConversationInfo;
 import com.flowtivo.tinfirm.model.Hosts;
 import com.flowtivo.tinfirm.principal.Principals;
+import com.flowtivo.tinfirm.run.RunGitRevocations;
 import com.flowtivo.tinfirm.run.RunInfo;
 import com.flowtivo.tinfirm.run.RunPlacementStale;
 import com.flowtivo.tinfirm.run.RunReads;
@@ -105,6 +108,10 @@ class TurnSourceImpl implements TurnSource {
 
     private final ConversationHolds holds;
 
+    private final Accounts accounts;
+
+    private final BindingStore bindingStore;
+
     TurnSourceImpl(ConversationStore store, WorkspaceService workspace, ConversationBindings bindings,
             BindingTexts texts, Principals principals, Systems systems, RunReads runs,
             SystemTransactions transactions, ObjectProvider<TurnTools> tools,
@@ -112,7 +119,9 @@ class TurnSourceImpl implements TurnSource {
             ObjectProvider<PromptSection.Files> files, ObjectProvider<PromptSection.Outputs> outputs,
             DecisionStore decisions, TriggerPorts triggers,
             ObjectProvider<com.flowtivo.tinfirm.conversation.PlacePrompts> places, MemoryPrompt memory,
-            ConversationHolds holds) {
+            ConversationHolds holds, Accounts accounts, BindingStore bindingStore) {
+        this.bindingStore = bindingStore;
+        this.accounts = accounts;
         this.holds = holds;
         this.memory = memory;
         this.triggers = triggers;
@@ -159,6 +168,7 @@ class TurnSourceImpl implements TurnSource {
         List<ConversationWorkspace.Repository> repositories = resolved(conversation, settings, turn.runId());
         Set<UUID> holders = new HashSet<>();
         Set<String> cards = new LinkedHashSet<>();
+        boolean appTokens = false;
         for (ConversationWorkspace.Repository repository : repositories) {
             BindingInfo binding = repository.binding();
             if (binding == null || binding.waiting()) {
@@ -170,12 +180,16 @@ class TurnSourceImpl implements TurnSource {
                 if (holder != null) {
                     holders.add(holder);
                 }
+                // ADR-0116, decision 8: a run that holds an App installation's tokens needs a host that renews them.
+                appTokens |= binding.accountId() != null && accounts.find(conversation.companyId(), binding.accountId())
+                    .filter(account -> account.kind() == AccountInfo.Kind.APP)
+                    .isPresent();
             }
         }
         if (!cards.isEmpty()) {
             return new TurnPlan.AccountRequired(String.join(" ", cards));
         }
-        return new TurnPlan.Ready(holders);
+        return new TurnPlan.Ready(holders, appTokens);
     }
 
     /**
@@ -229,6 +243,103 @@ class TurnSourceImpl implements TurnSource {
             .map(SystemInfo::name)
             .sorted()
             .findFirst();
+    }
+
+    /**
+     * ADR-0116, decision 2: in the third phase's transaction, the workspace's systems locked {@code FOR SHARE} in the
+     * order of their ids, then the conversation's row; a binding a git token came from that is no longer
+     * {@code BOUND}, or a paused or removed system, means the assignment is not sent.
+     */
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public java.util.Optional<String> workspaceRevoked(UUID companyId, UUID conversationId,
+            List<Workspace> workspaces) {
+        java.util.SortedSet<UUID> systemIds = new java.util.TreeSet<>();
+        workspaces.forEach(repository -> systemIds.add(repository.systemId()));
+        Map<UUID, SystemInfo> locked = new java.util.HashMap<>();
+        for (UUID systemId : systemIds) {
+            systems.lockShared(companyId, systemId).ifPresent(system -> locked.put(systemId, system));
+        }
+        store.lock(companyId, conversationId);
+        for (Workspace repository : workspaces) {
+            SystemInfo system = locked.get(repository.systemId());
+            if (system == null) {
+                return java.util.Optional.of(repository.name() + ": its system was removed.");
+            }
+            if (system.paused()) {
+                return java.util.Optional.of(repository.name() + ": " + system.name() + " was paused.");
+            }
+            if (repository.bindingId() == null) {
+                continue;
+            }
+            BindingInfo binding = bindings.find(companyId, repository.bindingId()).orElse(null);
+            if (binding == null || !binding.bound()) {
+                return java.util.Optional.of(repository.name() + ": "
+                        + (binding != null ? texts.text(binding) : system.name() + " is not connected."));
+            }
+            if (repository.bindingVersion() != null && repository.bindingVersion() != binding.version()) {
+                // The token is the one the gate revealed: the binding followed another credential, or waited and was
+                // bound again, since (ADR-0116). The next pass reveals the binding's token as it is now.
+                return java.util.Optional.of(repository.name() + ": the conversation's account on " + system.name()
+                        + " changed while the turn was prepared; it is prepared again.");
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public List<UUID> bindingsHeldBy(UUID companyId, UUID principalId) {
+        return bindingStore.concerned(companyId, Set.of(), Set.of(), Set.of(), Set.of(principalId), Set.of())
+            .stream()
+            .map(BindingStore.BindingRow::info)
+            .filter(binding -> binding.bound() && principalId.equals(binding.holderPrincipalId()))
+            .map(BindingInfo::id)
+            .toList();
+    }
+
+    /**
+     * ADR-0116, decision 1: what the server would refuse a run's host now, for a run it no longer tracks. Reads the
+     * systems and the bindings without a lock: the caller's hello holds the run, and a change that commits after this
+     * read concerns a cancelled run that its host reports again at its next hello.
+     */
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public List<GitAccessGone> gitAccessGone(UUID companyId, List<ClonedRepository> repositories) {
+        Set<UUID> systemIds = new HashSet<>();
+        repositories.stream().map(ClonedRepository::systemId).filter(Objects::nonNull).forEach(systemIds::add);
+        Map<UUID, SystemInfo> found = systems.findAll(companyId, systemIds);
+        List<GitAccessGone> gone = new ArrayList<>();
+        for (ClonedRepository repository : repositories) {
+            SystemInfo system = repository.systemId() != null ? found.get(repository.systemId()) : null;
+            if (system == null) {
+                gone.add(new GitAccessGone(repository.componentId(), BindingInfo.Reason.SYSTEM_REMOVED.name(),
+                        "the repository's system was removed", null, repository.systemId()));
+                continue;
+            }
+            if (system.paused()) {
+                gone.add(new GitAccessGone(repository.componentId(), RunGitRevocations.SYSTEM_PAUSED,
+                        system.name() + " was paused by an admin", null, system.id()));
+                continue;
+            }
+            BindingInfo binding = bindings.find(companyId, repository.bindingId()).orElse(null);
+            if (binding == null) {
+                gone.add(new GitAccessGone(repository.componentId(), BindingInfo.Reason.ACCOUNT_REMOVED.name(),
+                        "the conversation's account on " + system.name() + " is gone", repository.bindingId(),
+                        null));
+            }
+            else if (!binding.bound()) {
+                BindingInfo.Reason reason = binding.reason() != null ? binding.reason() : BindingInfo.Reason.NONE;
+                gone.add(new GitAccessGone(repository.componentId(), reason.name(), texts.revoked(binding),
+                        binding.id(), null));
+            }
+            else if (repository.bindingVersion() != null && repository.bindingVersion() != binding.version()) {
+                gone.add(new GitAccessGone(repository.componentId(), RunGitRevocations.BINDING_CHANGED,
+                        "the conversation's account on " + system.name() + " changed after the run cloned it",
+                        binding.id(), null));
+            }
+        }
+        return gone;
     }
 
     /**
@@ -292,12 +403,19 @@ class TurnSourceImpl implements TurnSource {
             .filter(BindingInfo::bound)
             .toList());
         List<Workspace> workspaces = new ArrayList<>();
+        // ADR-0116: an App installation's binding mints once for all its repositories of the run, one token per access.
+        Map<UUID, ConversationBindings.BindingUse> minted = new HashMap<>();
         for (ConversationWorkspace.Repository repository : prepared.repositories()) {
             BindingInfo binding = repository.binding();
             if (binding == null || !binding.bound()) {
                 return notReady(companyId, binding, repository);
             }
-            ConversationBindings.BindingUse use = bindings.use(companyId, binding.id(), "run:" + turn.runId());
+            ConversationBindings.BindingUse use = minted.containsKey(binding.id()) ? minted.get(binding.id())
+                    : bindings.use(companyId, binding.id(), "run:" + turn.runId(), scope(binding,
+                            prepared.repositories()));
+            if (use instanceof ConversationBindings.BindingUse.AppTokens) {
+                minted.put(binding.id(), use);
+            }
             if (use instanceof ConversationBindings.BindingUse.Held held) {
                 // D5: a kill switch went on since the plan; the dispatcher's next pass says which.
                 return held.hold() == ConversationBindings.Hold.TRIGGER_PAUSED
@@ -310,6 +428,23 @@ class TurnSourceImpl implements TurnSource {
                         repository.systemId()));
                 return new TurnContent.Later("Tinfirm could not get a token for " + system + " right now; the turn "
                         + "is tried again shortly.");
+            }
+            if (use instanceof ConversationBindings.BindingUse.NotCovered notCovered) {
+                // ADR-0116, decision 7: an admin installs the App there, and the person retries.
+                return new TurnContent.NotReady(new TurnPlan.Cancel(notCovered.message() + "."));
+            }
+            if (use instanceof ConversationBindings.BindingUse.AppTokens app) {
+                requireCarried(placement, turn.payerPrincipalId(), List.of(app.binding()));
+                Accounts.RunGitToken.Minted token = Objects.requireNonNull(app.tokens().get(repository.repositoryId()));
+                boolean readOnly = repository.readOnly() || app.access() == GrantInfo.Access.READ;
+                ReadOnlyCause cause = repository.readOnlyCause() != null ? repository.readOnlyCause()
+                        : readOnly ? ReadOnlyCause.GRANT : null;
+                workspaces.add(new Workspace(repository.repositoryId(), repository.systemId(), binding.id(),
+                        repository.name(), repository.url(), repository.defaultBranch(), readOnly, cause,
+                        new RunnerMessages.GitCredentials(gitUsername(SystemKind.GITHUB), token.token(),
+                                token.expiresAt().toString(), mirrorKey(companyId, app.account().id())),
+                        authorName, authorEmail, app.binding().version()));
+                continue;
             }
             if (!(use instanceof ConversationBindings.BindingUse.Token token)) {
                 return notReady(companyId, use.binding(), repository);
@@ -324,7 +459,7 @@ class TurnSourceImpl implements TurnSource {
                     repository.name(), repository.url(), repository.defaultBranch(), readOnly, cause,
                     new RunnerMessages.GitCredentials(gitUsername(system != null ? system.kind() : SystemKind.GIT),
                             token.credential().credential().token()),
-                    authorName, authorEmail));
+                    authorName, authorEmail, token.binding().version()));
         }
 
         PromptRenderer.Context promptContext = prepared.context();
@@ -344,6 +479,33 @@ class TurnSourceImpl implements TurnSource {
                 turnTools.size() > TurnContent.Content.MAX_TOOLS
                         ? turnTools.subList(0, TurnContent.Content.MAX_TOOLS) : turnTools,
                 null, grantedHosts, turnAttachments);
+    }
+
+    /** The repositories of the run that the binding's account clones, for an App installation's tokens. */
+    private static ConversationBindings.GitScope scope(BindingInfo binding,
+            List<ConversationWorkspace.Repository> repositories) {
+        return new ConversationBindings.GitScope(repositories.stream()
+            .filter(repository -> repository.binding() != null && repository.binding().id().equals(binding.id()))
+            .map(repository -> new ConversationBindings.GitRepository(repository.repositoryId(), repository.url(),
+                    repository.readOnly()))
+            .toList());
+    }
+
+    /**
+     * ADR-0116, decision 8: the stable key of the credential an App's token was minted for, which names the runner
+     * host's mirror in place of the token: lowercase hex of SHA-256 over {@code tinfirm-git-mirror:v1:}, the company's
+     * id, {@code :} and the credential's id. The same for every run and token of the credential, never derived from a
+     * token.
+     */
+    static String mirrorKey(UUID companyId, UUID accountId) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(("tinfirm-git-mirror:v1:"
+                    + companyId + ":" + accountId).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest);
+        }
+        catch (java.security.NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("The JDK has no SHA-256", ex);
+        }
     }
 
     private TurnContent notReady(UUID companyId, @Nullable BindingInfo binding,
@@ -500,7 +662,7 @@ class TurnSourceImpl implements TurnSource {
         // The instructions of the version the turn uses: the accepted one's while a change waits for acceptance
         // (ADR-0103).
         PromptRenderer.Context context = new PromptRenderer.Context(agent.name(), settings.agent().instructions(),
-                settings.instructions(), personName, conversation.key(), conversation.title(), about, projects,
+                settings.instructions(), personName, conversation.key(), about, projects,
                 requestMessages, requestText, recentMessages, Math.max(total, 0),
                 answersSection, accounts, "agent/" + conversation.key(), promptRepositories, !requestable.isEmpty(),
                 filesSection,

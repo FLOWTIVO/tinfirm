@@ -30,8 +30,8 @@
 //!   are left out of the JSON);
 //! - the usage of USAGE events and `run.finished` reports cache writes apart from the input
 //!   in v2 (`cacheWriteTokens`); v1 counts them as input ([`UsagePayload::into_v1`]);
-//! - `hello.isolationTiers` has `microvm` in v2 (and, as an additive change, in the v1
-//!   schema: a server from before v2 refuses it, so a v1 host reports `container`).
+//! - `hello.isolationTiers` holds the host's level of isolation in v2 ([`IsolationTier`]),
+//!   with `hello.hardened` and `hello.isolationStated`; a v1 host reports `container`.
 
 use std::fmt;
 
@@ -100,7 +100,7 @@ pub const MESSAGE_TYPES: [&str; 19] = [
 /// Every `type` value defined by the v2 schema, in schema order: v1 without the three
 /// bespoke request pairs, plus `run.request` and `run.request.ack`, and the frames of the
 /// optional features ([`feature`]).
-pub const MESSAGE_TYPES_V2: [&str; 19] = [
+pub const MESSAGE_TYPES_V2: [&str; 23] = [
     "hello",
     "welcome",
     "run.assign",
@@ -110,6 +110,9 @@ pub const MESSAGE_TYPES_V2: [&str; 19] = [
     "run.heartbeat",
     "run.finished",
     "run.cancel",
+    "run.git.revoke",
+    "run.git.revoked",
+    "welcome.done",
     "run.request",
     "run.request.ack",
     "run.steer",
@@ -118,12 +121,13 @@ pub const MESSAGE_TYPES_V2: [&str; 19] = [
     "host.config",
     "host.config.applied",
     "host.pool.status",
+    "host.health",
     "psl.update",
     "error",
 ];
 
 /// Every `type` value of any version: what [`Message::parse`] accepts.
-const KNOWN_MESSAGE_TYPES: [&str; 25] = [
+const KNOWN_MESSAGE_TYPES: [&str; 29] = [
     "hello",
     "welcome",
     "run.assign",
@@ -133,6 +137,9 @@ const KNOWN_MESSAGE_TYPES: [&str; 25] = [
     "run.heartbeat",
     "run.finished",
     "run.cancel",
+    "run.git.revoke",
+    "run.git.revoked",
+    "welcome.done",
     "run.repository_request",
     "run.repository_request.ack",
     "run.task_create",
@@ -147,6 +154,7 @@ const KNOWN_MESSAGE_TYPES: [&str; 25] = [
     "host.config",
     "host.config.applied",
     "host.pool.status",
+    "host.health",
     "psl.update",
     "error",
 ];
@@ -458,15 +466,38 @@ pub enum Executor {
     Docker,
 }
 
-/// `hello.isolationTiers[]` (ADR-0006). `microvm` came with protocol v2: a v1 server from
-/// before it refuses a hello that carries it, so a v1 host reports `container`.
+/// `hello.isolationTiers[]`: in v2 the host's one level of isolation (ADR-0113, decision 1),
+/// named for the strongest wall between an agent's code and the credentials. A v1 host reports
+/// `container`.
+///
+/// `microvm` is no value any more: a server of this release refuses a hello that carries it,
+/// and a server of an earlier release refuses `machine` and `vm-jail`, so hosts with a VM per
+/// run and the server take this release together (ADR-0113, decision 2, which amends ADR-0109
+/// for this one change).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum IsolationTier {
+    /// The credentials are on another machine than the VM (a VM per run at a provider; a
+    /// control host with sandbox nodes).
+    Machine,
+    /// A jail around each VM; the credentials on the same machine, out of a VMM's user's reach.
+    VmJail,
+    /// The container and the kernel; the credentials on the same machine behind the kernel. A
+    /// Docker host reports it whatever its runtime, a Kata host included.
     Container,
+    /// Reserved for a host with a `runsc…` runtime; placed as `container`.
     Gvisor,
-    /// Kata Containers: every sandbox is a microVM with its own kernel (ADR-0025).
-    Microvm,
+}
+
+impl IsolationTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationTier::Machine => "machine",
+            IsolationTier::VmJail => "vm-jail",
+            IsolationTier::Container => "container",
+            IsolationTier::Gvisor => "gvisor",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +529,16 @@ pub enum Message {
     RunFinished(RunFinished),
     #[serde(rename = "run.cancel")]
     RunCancel(RunCancel),
+    /// v2 feature [`feature::RUN_GIT_REVOKE`], server -> host: drop git tokens of a run.
+    #[serde(rename = "run.git.revoke")]
+    RunGitRevoke(RunGitRevoke),
+    /// v2 feature [`feature::RUN_GIT_REVOKE`], host -> server: a `run.git.revoke` is applied.
+    #[serde(rename = "run.git.revoked")]
+    RunGitRevoked(RunGitRevoked),
+    /// v2 feature [`feature::RUN_GIT_REVOKE`], server -> host: the server's answer to the hello
+    /// is complete, every pending revocation of the runs it listed included.
+    #[serde(rename = "welcome.done")]
+    WelcomeDone(WelcomeDone),
     #[serde(rename = "run.repository_request")]
     RunRepositoryRequest(RunRepositoryRequest),
     #[serde(rename = "run.repository_request.ack")]
@@ -531,6 +572,9 @@ pub enum Message {
     /// v2 feature [`feature::SANDBOX_POOL`], host -> server: the host's sandboxes now.
     #[serde(rename = "host.pool.status")]
     HostPoolStatus(HostPoolStatus),
+    /// v2 feature [`feature::HOST_HEALTH`], host -> server: whether the host can take runs.
+    #[serde(rename = "host.health")]
+    HostHealth(HostHealth),
     /// v2 only, server -> host: the Public Suffix List.
     #[serde(rename = "psl.update")]
     PslUpdate(PslUpdate),
@@ -622,6 +666,9 @@ impl Message {
             Message::RunHeartbeat(_) => "run.heartbeat",
             Message::RunFinished(_) => "run.finished",
             Message::RunCancel(_) => "run.cancel",
+            Message::RunGitRevoke(_) => "run.git.revoke",
+            Message::RunGitRevoked(_) => "run.git.revoked",
+            Message::WelcomeDone(_) => "welcome.done",
             Message::RunRepositoryRequest(_) => "run.repository_request",
             Message::RunRepositoryRequestAck(_) => "run.repository_request.ack",
             Message::RunTaskCreate(_) => "run.task_create",
@@ -636,6 +683,7 @@ impl Message {
             Message::HostConfig(_) => "host.config",
             Message::HostConfigApplied(_) => "host.config.applied",
             Message::HostPoolStatus(_) => "host.pool.status",
+            Message::HostHealth(_) => "host.health",
             Message::PslUpdate(_) => "psl.update",
             Message::Error(_) => "error",
         }
@@ -674,6 +722,35 @@ pub struct Hello {
     /// v2, the feature [`feature::SANDBOX_POOL`]: the operator's ceiling of ready sandboxes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<HelloPool>,
+    /// v2, optional (ADR-0113, decision 5): whether the machine that runs the host's VMs is
+    /// hardened beyond the jail. Left out: `no`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardened: Option<Hardened>,
+    /// v2, optional (ADR-0113, decision 3): the level rests on the operator's statement, not on
+    /// what the host can see. Left out when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolation_stated: bool,
+}
+
+/// `hello.hardened`: whether the machine that runs the host's VMs is hardened beyond the jail
+/// (ADR-0113, decision 5). It orders hosts of one level and refuses none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hardened {
+    Yes,
+    No,
+    /// The host runs no machine of its own for its VMs (a VM per run at a provider).
+    None,
+}
+
+impl Hardened {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Hardened::Yes => "yes",
+            Hardened::No => "no",
+            Hardened::None => "none",
+        }
+    }
 }
 
 /// `hello.pool` (ADR-0099).
@@ -701,10 +778,26 @@ pub mod feature {
     /// and [`super::HostPoolStatus`].
     pub const SANDBOX_POOL: &str = "sandbox.pool";
     /// The host runs its agents over the sandbox bridge (ADR-0095): with `run
-    /// --sandbox-bridge`, and always with a VM per run (ADR-0096). It adds no frame: it tells a
-    /// server whose licence does not hold elastic runners (ADR-0100) to refuse the hello with
-    /// `EDITION_REQUIRED` ([`EDITION_REQUIRED`](super::EDITION_REQUIRED)).
+    /// --sandbox-bridge`, and always with a VM per run (ADR-0096). It adds no frame. The
+    /// bridge is in the core (ADR-0114).
     pub const SANDBOX_BRIDGE: &str = "sandbox.bridge";
+    /// The host's VM driver is one of the runner host's paid ones (ADR-0114): a provider's,
+    /// such as `--vm-driver digitalocean`. It adds no frame: it tells a server whose licence
+    /// does not hold elastic runners (ADR-0100) to refuse the hello with `EDITION_REQUIRED`
+    /// ([`EDITION_REQUIRED`](super::EDITION_REQUIRED)). An operator's own driver does not
+    /// list it.
+    pub const SANDBOX_ELASTIC: &str = "sandbox.elastic";
+    /// The host takes [`super::RunGitRevoke`] (ADR-0116): it drops the named repositories' git
+    /// tokens from its git proxy, its own git and its take-back record, and confirms each frame
+    /// it applied with [`super::RunGitRevoked`].
+    pub const RUN_GIT_REVOKE: &str = "run.git.revoke";
+    /// The host reads `workspaces[].git.expiresAt` and `mirrorKey`, and renews a token that
+    /// expires with a [`super::RunRequest`] of kind [`super::RequestKind::GitToken`] (ADR-0116).
+    /// A host that lists it lists [`RUN_GIT_REVOKE`] too.
+    pub const RUN_GIT_REFRESH: &str = "run.git.refresh";
+    /// The host reports with [`super::HostHealth`] that it can take no run, and when it can
+    /// again (ADR-0117); sent only to a server whose `welcome.features` lists it.
+    pub const HOST_HEALTH: &str = "host.health";
 }
 
 /// `error.code` before `welcome`: the server's licence does not hold a feature the hello
@@ -763,6 +856,18 @@ pub struct Welcome {
     pub server_version: Option<String>,
     pub heartbeat_interval_seconds: u64,
     pub lease_ttl_seconds: u64,
+    /// v2, optional (ADR-0116): the optional features this server implements, in the form of
+    /// [`Hello::features`]. Absent (empty): an older server, which implements neither
+    /// [`feature::RUN_GIT_REVOKE`] nor [`feature::RUN_GIT_REFRESH`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
+impl Welcome {
+    /// Whether the server implements the optional feature `name`.
+    pub fn lists(&self, name: &str) -> bool {
+        self.features.iter().any(|f| f == name)
+    }
 }
 
 /// Server -> runner host: start a run. Exactly one of `credential_label` and `model_access` is
@@ -1153,6 +1258,36 @@ pub struct RequestableRepository {
 pub struct GitCredentials {
     pub username: String,
     pub token: Secret,
+    /// v2 feature [`feature::RUN_GIT_REFRESH`] (ADR-0116): when the token stops working, for a
+    /// token minted for this run; the host renews it ([`GitTokenRequest`]). Absent: the token
+    /// lives until the run ends. Comes with [`GitCredentials::mirror_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_instant")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// v2 feature [`feature::RUN_GIT_REFRESH`]: a stable key of the credential the token was
+    /// minted for (64 lowercase hex characters), which names the host's mirror in place of the
+    /// token's `Authorization` header. Comes with [`GitCredentials::expires_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror_key: Option<String>,
+}
+
+impl GitCredentials {
+    /// A token that lives until the run ends (no `expiresAt`, no `mirrorKey`).
+    pub fn new(username: impl Into<String>, token: Secret) -> GitCredentials {
+        GitCredentials {
+            username: username.into(),
+            token,
+            expires_at: None,
+            mirror_key: None,
+        }
+    }
+}
+
+/// True when `key` matches the schema's `mirrorKey`: 64 lowercase hexadecimal characters.
+pub fn is_valid_mirror_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1699,6 +1834,56 @@ pub struct RunCancel {
     pub epoch: i64,
 }
 
+/// Most repositories one [`RunGitRevoke`] names.
+pub const GIT_REVOKE_MAX_COMPONENTS: usize = 20;
+/// Longest `run.git.revoke.message`, in characters.
+pub const GIT_REVOKE_MESSAGE_MAX_CHARS: usize = 1000;
+
+/// Server -> runner host (v2 feature [`feature::RUN_GIT_REVOKE`], ADR-0116): the run may no
+/// longer use the git tokens of the repositories named. Durable on the server, sent again at
+/// every `hello` that lists the run until the run ends; there is no ack. The host applies it
+/// to the run's current epoch only, once per repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunGitRevoke {
+    pub run_id: Uuid,
+    pub epoch: i64,
+    /// `run.assign.workspaces[].componentId` of each repository whose token goes: 1 to
+    /// [`GIT_REVOKE_MAX_COMPONENTS`], never "every repository". An id that is not one of the
+    /// run's is ignored.
+    pub component_ids: Vec<Uuid>,
+    /// Why, as a code (the binding's reason, `SYSTEM_PAUSED`, `CREDENTIAL_REPLACED`,
+    /// `REFRESH_REFUSED`, …). Logged; the host decides nothing from it.
+    pub reason: String,
+    /// The server's text for the run's log and the agent (1 to
+    /// [`GIT_REVOKE_MESSAGE_MAX_CHARS`] characters).
+    pub message: String,
+}
+
+/// Runner host -> server (v2 feature [`feature::RUN_GIT_REVOKE`], ADR-0116): the host has applied
+/// a [`RunGitRevoke`] of the run's current epoch. The tokens of the repositories named are gone
+/// from the run's holder, and its take-back record was written again without them. It names
+/// every repository of that frame that the run has, those revoked already included, so a frame
+/// that comes twice is answered twice with the same ids. The host sends nothing for a frame of
+/// another epoch or of a run it does not hold, nor for a frame that names none of the run's
+/// repositories. It goes in the run's order through the host's outbox, so one written while the
+/// host is disconnected is sent after the next `welcome`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunGitRevoked {
+    pub run_id: Uuid,
+    pub epoch: i64,
+    /// 1 to [`GIT_REVOKE_MAX_COMPONENTS`], each once, in the order of the frame they answer.
+    pub component_ids: Vec<Uuid>,
+}
+
+/// Server -> runner host (v2 feature [`feature::RUN_GIT_REVOKE`], ADR-0116), once per
+/// connection: the last frame of the server's answer to the hello, after every pending
+/// [`RunGitRevoke`] and [`RunCancel`] of the runs the hello listed. A host that took a run back
+/// pushes the run's work only after it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelcomeDone {}
+
 /// Longest `run.steer.text`, in characters.
 pub const STEER_TEXT_MAX_CHARS: usize = 110_000;
 /// Longest `run.steer.ack.message`, in characters.
@@ -1964,6 +2149,13 @@ pub mod request_code {
     /// A tool result above [`super::TOOL_RESULT_MAX_BYTES`]: the agent should narrow the query.
     pub const RESULT_TOO_LARGE: &str = "RESULT_TOO_LARGE";
     pub const TOOL_FAILED: &str = "TOOL_FAILED";
+    /// GIT_TOKEN (ADR-0116): refused for good; the host applies it as a `run.git.revoke`.
+    pub const GIT_REVOKED: &str = "GIT_REVOKED";
+    /// GIT_TOKEN: a kill switch holds the run's systems; the host keeps its token until it
+    /// expires and asks again.
+    pub const GIT_HELD: &str = "GIT_HELD";
+    /// GIT_TOKEN: the code host could not be reached or refused for the moment; as GIT_HELD.
+    pub const GIT_UNAVAILABLE: &str = "GIT_UNAVAILABLE";
 }
 
 /// The kinds of a [`RunRequest`] (`run.request.kind`).
@@ -1981,6 +2173,9 @@ pub enum RequestKind {
     /// A server-executed tool call; answered DONE with a [`ToolResultPayload`], or PENDING with a
     /// decision when the call waits for a member's approval (ADR-0046).
     Tool,
+    /// The host's own (feature [`feature::RUN_GIT_REFRESH`]): new git tokens for repositories
+    /// whose token expires; answered DONE with [`GitTokens`], or REJECTED.
+    GitToken,
 }
 
 impl RequestKind {
@@ -1991,6 +2186,7 @@ impl RequestKind {
             RequestKind::Artifact => "ARTIFACT",
             RequestKind::Network => "NETWORK",
             RequestKind::Tool => "TOOL",
+            RequestKind::GitToken => "GIT_TOKEN",
         }
     }
 }
@@ -2010,6 +2206,7 @@ pub enum RequestPayload {
     Artifact(ArtifactRequest),
     Network(NetworkRequest),
     Tool(ToolRequest),
+    GitToken(GitTokenRequest),
 }
 
 impl RequestPayload {
@@ -2020,6 +2217,7 @@ impl RequestPayload {
             RequestPayload::Artifact(_) => RequestKind::Artifact,
             RequestPayload::Network(_) => RequestKind::Network,
             RequestPayload::Tool(_) => RequestKind::Tool,
+            RequestPayload::GitToken(_) => RequestKind::GitToken,
         }
     }
 }
@@ -2098,6 +2296,47 @@ pub struct ToolRequest {
     pub arguments: serde_json::Value,
 }
 
+/// GIT_TOKEN (feature [`feature::RUN_GIT_REFRESH`], ADR-0116): new git tokens for the
+/// repositories named, each one whose `git` has an `expiresAt`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTokenRequest {
+    /// 1 to [`MAX_WORKSPACES`] `run.assign.workspaces[].componentId`, without duplicates.
+    pub component_ids: Vec<Uuid>,
+}
+
+/// The payload of a DONE answer to a GIT_TOKEN request: each repository named is in exactly one
+/// of `git` and `refused`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTokens {
+    pub git: Vec<GitToken>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<GitTokenRefused>,
+}
+
+/// A renewed git token of one repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitToken {
+    pub component_id: Uuid,
+    pub username: String,
+    pub token: Secret,
+    #[serde(with = "instant")]
+    pub expires_at: DateTime<Utc>,
+}
+
+/// A repository the server did not renew, and why: [`request_code::GIT_REVOKED`],
+/// [`request_code::GIT_HELD`] or [`request_code::GIT_UNAVAILABLE`] (an unknown code reads as
+/// the last).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitTokenRefused {
+    pub component_id: Uuid,
+    pub code: String,
+    pub message: String,
+}
+
 /// `run.request.ack.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -2141,6 +2380,13 @@ pub struct ToolResultPayload {
 }
 
 impl RunRequestAck {
+    /// The payload of a DONE answer to a GIT_TOKEN request, if it reads as one.
+    pub fn git_tokens(&self) -> Option<GitTokens> {
+        self.payload
+            .as_ref()
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
+    }
+
     /// `payload.decisionId` of a PENDING answer.
     pub fn decision_id(&self) -> Option<Uuid> {
         self.payload
@@ -2288,6 +2534,43 @@ pub struct HostPoolStatus {
     pub served_cold: u32,
 }
 
+/// Most problems in one [`HostHealth`].
+pub const HOST_PROBLEMS_MAX: usize = 8;
+/// Longest [`HostProblem::message`], in characters.
+pub const HOST_PROBLEM_MESSAGE_MAX: usize = 1000;
+
+/// Runner host -> server (v2, the feature [`feature::HOST_HEALTH`], ADR-0117): why the host
+/// takes no run now, or, with no problem, that it takes runs again. Sent after the welcome
+/// (and `welcome.done` where the server sends it) of a server that lists the feature: with a
+/// problem, at each change, and once when healthy again. The server answers nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostHealth {
+    /// At most [`HOST_PROBLEMS_MAX`]; empty: the host takes runs.
+    pub problems: Vec<HostProblem>,
+    /// When the current problems began; `None` with none.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_instant")]
+    pub since: Option<DateTime<Utc>>,
+}
+
+/// One reason why the host takes no run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostProblem {
+    pub code: HostProblemCode,
+    /// One line, at most [`HOST_PROBLEM_MESSAGE_MAX`] characters, without control characters.
+    pub message: String,
+}
+
+/// The closed list of [`HostProblem::code`]: only states the host detects. A new code needs a
+/// feature name of its own, since a server refuses a code it does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostProblemCode {
+    /// The VM driver can make no VM: its `verify` reports problems and no room (ADR-0096).
+    VmDriverNoVm,
+}
+
 /// One credential in [`HostConfigApplied`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2338,10 +2621,7 @@ mod tests {
 
     #[test]
     fn secret_is_not_printed() {
-        let creds = GitCredentials {
-            username: "x-access-token".into(),
-            token: Secret::new("ghp_secret_value"),
-        };
+        let creds = GitCredentials::new("x-access-token", Secret::new("ghp_secret_value"));
         let printed = format!("{creds:?}");
         assert!(!printed.contains("ghp_secret_value"));
         assert!(printed.contains("[REDACTED]"));

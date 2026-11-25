@@ -5,6 +5,8 @@ import java.time.Duration;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 
+import org.slf4j.LoggerFactory;
+
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
@@ -17,7 +19,12 @@ import org.springframework.validation.annotation.Validated;
  * @param acceptTimeout   an assigned run without {@code run.accepted} goes back to the queue after this
  * @param prepareTimeout  how long the assignment of a run may take to prepare its {@code run.assign} (the turn's
  *                        content, its git tokens, the relay's token) before the accept timeout may take it back
- * @param rejectBackoff   a rejected run is not dispatched again before this
+ * @param rejectBackoff   a rejected run is not dispatched again before this, after its host's first rejection in a
+ *                        row; each further rejection by the same host doubles it ({@link #rejectBackoff(int)})
+ * @param rejectBackoffMax the doubled back-off stops growing here ({@code TINFIRM_RUN_REJECT_BACKOFF_MAX}), so that a
+ *                        host that rejects every run costs one assignment per run in this time, not one per
+ *                        {@code rejectBackoff}. A configured value shorter than {@code rejectBackoff} is replaced by
+ *                        {@code rejectBackoff}, with a warning: the wait is then fixed and does not double
  * @param maxEventsPerRun event cap per run; LOG events are dropped first
  * @param streamTimeout   lifetime of one SSE stream; the client reconnects with {@code Last-Event-ID}
  * @param streamKeepAlive an idle SSE stream gets a comment after this, so proxies keep it open
@@ -32,6 +39,7 @@ import org.springframework.validation.annotation.Validated;
 record RunProperties(@NotNull @DefaultValue("PT60M") Duration maxWallClock, @Min(1) @DefaultValue("200") int maxTurns,
         @NotNull @DefaultValue("PT10S") Duration acceptTimeout, @NotNull @DefaultValue("PT2M") Duration prepareTimeout,
         @NotNull @DefaultValue("PT10S") Duration rejectBackoff,
+        @NotNull @DefaultValue("PT5M") Duration rejectBackoffMax,
         @Min(100) @DefaultValue("20000") int maxEventsPerRun, @NotNull @DefaultValue("PT30M") Duration streamTimeout,
         @NotNull @DefaultValue("PT15S") Duration streamKeepAlive,
         @NotNull @DefaultValue("PT60S") Duration toolTimeout) {
@@ -43,6 +51,14 @@ record RunProperties(@NotNull @DefaultValue("PT60M") Duration maxWallClock, @Min
         if (streamKeepAlive.toMillis() < 100) {
             throw new IllegalArgumentException("tinfirm.run.stream-keep-alive must be at least 100 milliseconds");
         }
+        if (rejectBackoffMax.compareTo(rejectBackoff) < 0) {
+            // A deployment that set reject-backoff above the new cap's default before the cap existed must still
+            // start: it keeps its fixed wait.
+            LoggerFactory.getLogger(RunProperties.class).warn("tinfirm.run.reject-backoff-max ({}) is shorter than "
+                    + "tinfirm.run.reject-backoff ({}); the cap used is {}, so a rejected run waits {} every time and "
+                    + "the wait does not double", rejectBackoffMax, rejectBackoff, rejectBackoff, rejectBackoff);
+            rejectBackoffMax = rejectBackoff;
+        }
         if (prepareTimeout.toSeconds() < 1) {
             throw new IllegalArgumentException("tinfirm.run.prepare-timeout must be at least 1 second");
         }
@@ -50,5 +66,17 @@ record RunProperties(@NotNull @DefaultValue("PT60M") Duration maxWallClock, @Min
             throw new IllegalArgumentException("tinfirm.run.tool-timeout must be between 100 milliseconds and 60 "
                     + "seconds: the runner host waits 65 seconds for a tool's answer");
         }
+    }
+
+    /**
+     * How long a run waits after the {@code rejections}th rejection in a row by one host: {@code rejectBackoff},
+     * doubled for each rejection after the first, at most {@code rejectBackoffMax}.
+     */
+    Duration rejectBackoff(int rejections) {
+        Duration wait = rejectBackoff;
+        for (int i = 1; i < rejections && wait.compareTo(rejectBackoffMax) < 0; i++) {
+            wait = wait.multipliedBy(2);
+        }
+        return wait.compareTo(rejectBackoffMax) < 0 ? wait : rejectBackoffMax;
     }
 }

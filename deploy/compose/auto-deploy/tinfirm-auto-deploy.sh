@@ -459,6 +459,7 @@ pull() { # ref
 
 COMPOSE=(docker compose -p "$AUTO_DEPLOY_PROJECT" --project-directory "$AUTO_DEPLOY_COMPOSE_DIR"
   -f "$AUTO_DEPLOY_COMPOSE_DIR/compose.yaml" --env-file "$ENV_FILE")
+OVERLAYS_NAMED=0
 
 env_value() { # key -> its value in .env, quotes removed
   local v
@@ -467,6 +468,34 @@ env_value() { # key -> its value in .env, quotes removed
   v="${v#\"}" v="${v%\"}"
   v="${v#\'}" v="${v%\'}"
   printf '%s' "$v"
+}
+
+# The Compose files of this host besides compose.yaml: the .env's TINFIRM_COMPOSE_OVERLAYS,
+# file names of the Compose directory with blanks between them, in the order Compose reads
+# them (compose.tls.yaml for HTTPS with Caddy, compose.entra.yaml). One name a line.
+overlays() {
+  local name
+  for name in $(env_value TINFIRM_COMPOSE_OVERLAYS); do
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$ ]] ||
+      die "TINFIRM_COMPOSE_OVERLAYS in $ENV_FILE names '$name': give file names of the Compose directory, such as compose.tls.yaml"
+    [ "$name" != compose.yaml ] ||
+      die "TINFIRM_COMPOSE_OVERLAYS in $ENV_FILE names compose.yaml, which is always read"
+    printf '%s\n' "$name"
+  done
+}
+
+# Names the host's overlays in COMPOSE, once. Every call that starts or lists the stack needs
+# them: `up --remove-orphans` with compose.yaml alone removes an overlay's services (the TLS
+# overlay's Caddy, and with it ports 80 and 443) and still ends well, since the server
+# answers on loopback.
+name_overlays() {
+  local names name
+  ((OVERLAYS_NAMED)) && return 0
+  names="$(overlays)"
+  for name in $names; do
+    COMPOSE+=(-f "$AUTO_DEPLOY_COMPOSE_DIR/$name")
+  done
+  OVERLAYS_NAMED=1
 }
 
 set_env_value() { # key value: in .env, atomically, mode 600; the other lines stay as they are
@@ -555,9 +584,16 @@ unpack() { # tarball dest
 }
 
 prepare_compose() {
-  local src="$WORK/compose" stray
+  local src="$WORK/compose" stray names name
   unpack "$WORK/assets/$COMPOSE_ASSET" "$src"
   [ -f "$src/compose.yaml" ] || die "$COMPOSE_ASSET has no compose.yaml"
+  # Before anything changes: a revision without an overlay of this host is not deployed, since
+  # its `up` would fail on the missing file or, without the name, remove the overlay's services.
+  names="$(overlays)"
+  for name in $names; do
+    [ -f "$src/$name" ] ||
+      die "$COMPOSE_ASSET has no $name, which TINFIRM_COMPOSE_OVERLAYS in $ENV_FILE names"
+  done
   # Never copy a .env over the host's (CI builds the tarball without one; this is a guard).
   stray="$(find "$src" \( -name .env -o \( -name '.env.*' ! -name .env.example \) \) -print)"
   if [ -n "$stray" ]; then
@@ -885,6 +921,7 @@ deploy_revision() { # rev auto|manual
   company_name
   STEP="compose up"
   STACK_TOUCHED=1
+  name_overlays
   act "${COMPOSE[@]}" up -d --no-build --remove-orphans
   STEP="health check"
   wait_ready "$server_ref"
@@ -1015,6 +1052,9 @@ cmd_status() {
   fi
   if ! runner_mode; then
     echo "compose dir:     $AUTO_DEPLOY_COMPOSE_DIR"
+    if [ -f "$ENV_FILE" ]; then
+      echo "compose files:   compose.yaml $(env_value TINFIRM_COMPOSE_OVERLAYS)"
+    fi
     echo "backups:         $(find "$AUTO_DEPLOY_BACKUP_DIR" -maxdepth 1 -name 'tinfirm-auto-*.dump' 2>/dev/null | wc -l) automatic dumps in $AUTO_DEPLOY_BACKUP_DIR"
   fi
   echo "settings:        $CONFIG_DIR/env$([ -f "$CONFIG_DIR/env" ] || echo ' (none; defaults)')"

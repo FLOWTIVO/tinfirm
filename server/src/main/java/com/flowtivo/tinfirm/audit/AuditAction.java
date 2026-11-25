@@ -130,6 +130,22 @@ public enum AuditAction {
     RUNNER_HOST_REMOVED("runner_host.removed"),
     RUNNER_HOST_UPDATED("runner_host.updated"),
     /**
+     * What a runner host reports about its isolation changed at its {@code hello} (ADR-0113): its level, gVisor, its
+     * hardening or the operator's statement. {@code oldLevel}, {@code newLevel}, {@code oldGvisor}, {@code newGvisor},
+     * {@code oldHardened}, {@code newHardened}, {@code oldStated}, {@code newStated} (a level and a hardening in their
+     * protocol names; the old ones null before the host's first hello to a server of this release). By SYSTEM, in the
+     * chain of each company the host is in.
+     */
+    RUNNER_HOST_ISOLATION_CHANGED("runner_host.isolation_changed"),
+    /**
+     * A runner host reported with {@code host.health} that it takes no run, where it reported no problem before on its
+     * connection (ADR-0117): {@code codes} and the first {@code message}, the host's own words. By SYSTEM, in the
+     * chain of each company the host is in. A change among problems, and a frame sent again, are not audited.
+     */
+    RUNNER_HOST_HEALTH_FAILED("runner_host.health_failed"),
+    /** A runner host that reported a problem on its connection reported none (ADR-0117). By SYSTEM, as above. */
+    RUNNER_HOST_HEALTH_RESTORED("runner_host.health_restored"),
+    /**
      * A turn's run was created QUEUED (the package 3 contract, §8): {@code conversationId}, {@code agentId},
      * {@code turn}, {@code turnReason}, {@code payerPrincipalId}, {@code modelAccess} ({@code BUDGET} or
      * {@code SUBSCRIPTION}).
@@ -153,6 +169,23 @@ public enum AuditAction {
      * {@code runnerHostId}, {@code epoch}, {@code reason} (the frame), {@code lostAt}.
      */
     RUN_RESUMED("run.resumed"),
+    /**
+     * A run's git tokens of some repositories were revoked on its host (ADR-0116, decision 2), one event per run and
+     * cause: {@code conversationId}, {@code bindingId} (a binding that failed its check or followed another
+     * credential) or {@code systemId} (a paused system), {@code componentIds}, {@code reason}, {@code epoch},
+     * {@code sent} (whether {@code run.git.revoke} went to the host at once) and {@code delivery} ({@code SENT},
+     * {@code ON_RECONNECT}, or {@code UNSUPPORTED}: the host does not list {@code run.git.revoke}, and the run keeps
+     * its tokens until it ends). The actor is the change's. Never a token. What was meant at the commit: the host's
+     * confirmation is {@link #RUN_GIT_REVOKE_CONFIRMED}.
+     */
+    RUN_GIT_REVOKED("run.git_revoked"),
+    /**
+     * The run's host confirmed a revocation of its git tokens ({@code run.git.revoked}, ADR-0116): it dropped them and
+     * wrote its take-back record again. Once per revocation, when it is first confirmed: {@code conversationId},
+     * {@code componentIds} (the revocation's), {@code reason}, {@code epoch}, {@code runnerHostId} (the host that
+     * confirmed). The actor is SYSTEM.
+     */
+    RUN_GIT_REVOKE_CONFIRMED("run.git_revoke_confirmed"),
     /**
      * A conversation's tool call ran on its system (the package 3 contract, §8), by the agent: {@code conversationId},
      * {@code runId}, {@code systemId}, {@code tool}, {@code effect}, {@code mode}, {@code accountId},
@@ -416,6 +449,13 @@ public enum AuditAction {
      * ({@code clientSecret}), {@code scopes}, and {@code registered} when Tinfirm registered itself; never the secret.
      */
     SYSTEM_APP_CHANGED("system.app_changed"),
+    /**
+     * A {@code GITHUB} system's GitHub App was set, or its key replaced (ADR-0116): {@code appId}, {@code slug},
+     * {@code keyReplaced}, {@code previousAppId}; never the key.
+     */
+    SYSTEM_GITHUB_APP_SET("system.github_app_set"),
+    /** A {@code GITHUB} system's GitHub App was removed with its key (ADR-0116): {@code appId}. */
+    SYSTEM_GITHUB_APP_REMOVED("system.github_app_removed"),
     /** An MCP server's catalogue was read again: the tools {@code added}, {@code removed} and {@code unconfirmed}. */
     SYSTEM_TOOLS_REFRESHED("system.tools_refreshed"),
     /** An MCP tool's effect was confirmed: {@code tool}, {@code effect}. */

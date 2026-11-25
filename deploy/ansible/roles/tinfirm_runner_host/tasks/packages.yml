@@ -1,0 +1,25 @@
+---
+# What a control host needs (runner/README.md, "A VM per run"): git for the clones and the
+# pushes, openssl for the release's signature, acl for become_user to the runner host's user,
+# tar to unpack the release. No Docker: `run --executor vm` uses none.
+- name: Install the prerequisites (Ubuntu, Debian)
+  ansible.builtin.apt:
+    name:
+      - acl
+      - ca-certificates
+      - git
+      - openssl
+      - tar
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts['os_family'] == 'Debian'
+
+- name: Install the prerequisites (RHEL family)
+  ansible.builtin.dnf:
+    name:
+      - acl
+      - ca-certificates
+      - git
+      - openssl
+      - tar
+  when: ansible_facts['os_family'] == 'RedHat'

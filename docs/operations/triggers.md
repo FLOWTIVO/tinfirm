@@ -150,6 +150,8 @@ A trigger on any source but a schedule whose row acts with a credential lent to 
 
 Model access by subscription follows [ADR-0085](../adr/0085-claude-login-on-the-runner-host.md), automatic retries [ADR-0073](../adr/0073-automatic-retries.md). What each tool mode means is in [agent-permissions.md](agent-permissions.md).
 
+**Isolation.** A trigger on a tracker, a chat channel or a webhook takes input from outside the company. Its agent's page warns when such runs would go to `container` hosts, where an escape reaches the runner host and its credentials; a schedule does not count. A trigger's firings go to the level of isolation chosen for the agent, or to the strongest its company's hosts report, and wait for those hosts rather than go to a weaker one: a level no host reports any more makes them wait `NO_HOST_OF_LEVEL`, and the trigger's editor does not refuse it. The rest is [runner-isolation.md](runner-isolation.md).
+
 **Memory.** The API is `GET /triggers/{id}/memory`, `POST …/memory/{noteNumber}/accept`, `DELETE …/memory/{noteNumber}` and `DELETE …/memory`. The rest is [agent-memory.md](agent-memory.md).
 
 ## 7. Firing

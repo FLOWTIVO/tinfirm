@@ -20,6 +20,7 @@ import com.flowtivo.tinfirm.conversation.ConversationInfo;
 import com.flowtivo.tinfirm.principal.Principals;
 import com.flowtivo.tinfirm.shared.access.CompanyAccess;
 import com.flowtivo.tinfirm.shared.security.Actor;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 
 /**
  * The audit of OWNER's reads of personal conversations (the security review of the redesign, row 18; CONVENTIONS §8,
@@ -34,11 +35,14 @@ import com.flowtivo.tinfirm.shared.security.Actor;
  * recorded when it opens.
  * <p>
  * <b>When.</b> In a transaction of its own ({@code REQUIRES_NEW}), as the break-glass's {@code admin.company.accessed}
- * is, so the read is on record even when the caller's transaction is read-only or what follows fails, and a record
- * that fails fails the read. The records of one request share that transaction. The caller asks at its access check,
- * before its transaction locks a row: the record's own transaction takes the company's chain head when it commits, at
- * once, while the caller's waits on it where PostgreSQL does not see it (the lock order, CONVENTIONS §10). The
- * caller's own audit records take no head before its commit.
+ * is, so the read is on record even when the caller's transaction is read-only or rolls back. It runs once the
+ * caller's transaction has ended and released its connection ({@link AfterTransaction}), before the request is
+ * answered: a request never holds one pooled connection while it waits for a second. A record that fails fails the
+ * request, with nothing returned, whatever became of the caller's transaction: after a rollback, the record's failure is
+ * the answer in place of the request's own error. Its transaction is bookkeeping ({@code AfterTransaction.BOOKKEEPING}),
+ * not the request's change. Each call's records (a page's, one per person or conversation) share one transaction, and a request that
+ * records twice has two; they are appended in the order they were asked for, one after the other on the request's
+ * thread, so in the company's chain they keep that order, with other requests' events possibly between them.
  */
 @Component
 class OwnerReads {
@@ -92,6 +96,8 @@ class OwnerReads {
         this.principals = principals;
         this.ownTransaction = new TransactionTemplate(transactionManager);
         this.ownTransaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        // A record of a read is not the request's change (AfterTransaction.savedInThisWork).
+        this.ownTransaction.setName(AfterTransaction.BOOKKEEPING);
     }
 
     /**
@@ -181,6 +187,10 @@ class OwnerReads {
         if (records.isEmpty()) {
             return;
         }
-        ownTransaction.executeWithoutResult(status -> records.forEach(auditLog::record));
+        // Once the caller's transaction has ended and released its connection (AfterTransaction): a thread that asks
+        // the pool for a second connection while it holds one can wait for the pool's timeout with others like it.
+        // A record that fails fails the request, also after a rollback (runOrFail).
+        AfterTransaction.runOrFail(() -> ownTransaction.executeWithoutResult(status -> records
+            .forEach(auditLog::record)));
     }
 }

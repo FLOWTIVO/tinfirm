@@ -81,12 +81,15 @@ class AgentViews {
 
     private final AgentSkills skills;
 
+    private final AgentIsolations isolations;
+
     /** The deployment's time limit of a turn, in whole minutes, for an agent that sets none. */
     private final int defaultTurnTimeLimitMinutes;
 
     AgentViews(AgentStore store, SettingsStore settings, AgentVersions versions, Systems systems,
-            Principals principals, GroupMembership groups, AgentSkills skills,
+            Principals principals, GroupMembership groups, AgentSkills skills, AgentIsolations isolations,
             @Value("${tinfirm.run.max-wall-clock:PT60M}") Duration deploymentTurnTimeLimit) {
+        this.isolations = isolations;
         this.skills = skills;
         this.store = store;
         this.settings = settings;
@@ -213,6 +216,7 @@ class AgentViews {
             .turnTimeLimitMinutes(row.turnTimeLimitMinutes())
             .defaultTurnTimeLimitMinutes(defaultTurnTimeLimitMinutes)
             .memoryAllowed(row.memoryAllowed())
+            .isolation(isolations.view(row))
             .pausedAt(nullableTs(row.pausedAt()))
             .ownerPrincipalId(row.ownerPrincipalId())
             .ownerName(row.ownerPrincipalId() != null

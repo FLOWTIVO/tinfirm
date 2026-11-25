@@ -19,14 +19,15 @@ import com.flowtivo.tinfirm.run.TurnSource;
 
 /**
  * SQL access to {@code run_repository} (V004): the workspace a run was assigned with, in order, with each
- * repository's git result once the run ended.
+ * repository's git result once the run ended; and to {@code run_assignment_repository} (V087): what each assignment
+ * cloned with a binding's token, by epoch, which a later assignment does not replace (ADR-0116).
  */
 @Repository
 class RunRepositoryStore {
 
     private static final String COLUMNS = """
             run_id, position, repository_id, system_id, binding_id, name, dir, read_only, read_only_cause, pushed,
-            head_sha, commits""";
+            head_sha, commits, component_id, epoch, binding_version""";
 
     private final JdbcClient jdbc;
 
@@ -37,28 +38,135 @@ class RunRepositoryStore {
     /**
      * One repository of a run.
      *
-     * @param pushed whether the run pushed the branch, as its host reported; null until it ended, or without a result
+     * @param pushed      whether the run pushed the branch, as its host reported; null until it ended, or without a
+     *                    result
+     * @param componentId the id {@code run.assign} named it by; null for a row from before V087 whose repository is gone
+     * @param epoch       the assignment that wrote the row; null for a row from before V087
+     * @param bindingVersion the binding's version its git token was revealed at; null without a token, or before V087
      */
     record RepositoryRow(UUID runId, int position, @Nullable UUID repositoryId, @Nullable UUID systemId,
             @Nullable UUID bindingId, String name, String dir, boolean readOnly,
             TurnSource.@Nullable ReadOnlyCause readOnlyCause, @Nullable Boolean pushed, @Nullable String headSha,
-            @Nullable Integer commits) {
+            @Nullable Integer commits, @Nullable UUID componentId, @Nullable Long epoch,
+            @Nullable Long bindingVersion) {
     }
 
-    void insert(UUID companyId, UUID runId, int position, TurnSource.Workspace workspace, String dir) {
+    /**
+     * One repository of the assignment of {@code epoch}; {@code component_id} is the id {@code run.assign} names it by
+     * (ADR-0116), kept after the repository is removed.
+     */
+    void insert(UUID companyId, UUID runId, long epoch, int position, TurnSource.Workspace workspace, String dir) {
         jdbc.sql("""
                 INSERT INTO run_repository (run_id, company_id, position, repository_id, system_id, binding_id, name,
-                                            dir, read_only, read_only_cause)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
+                                            dir, read_only, read_only_cause, component_id, epoch, binding_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""")
             .params(runId, companyId, position, workspace.repositoryId(), workspace.systemId(), workspace.bindingId(),
                     workspace.name(), dir, workspace.readOnly(),
-                    workspace.readOnlyCause() != null ? workspace.readOnlyCause().name() : null)
+                    workspace.readOnlyCause() != null ? workspace.readOnlyCause().name() : null,
+                    workspace.repositoryId(), epoch, workspace.git() != null ? workspace.bindingVersion() : null)
             .update();
+    }
+
+    /**
+     * A repository of a run's current assignment whose git token a revocation may concern (ADR-0116): the run is
+     * assigned (awaiting {@code run.accepted}) or RUNNING, or LOST since {@code lostSince} (it may be resumed).
+     */
+    record RevocationTarget(UUID runId, UUID conversationId, UUID componentId, String name) {
+    }
+
+    private static final String TARGETS = """
+            SELECT rr.run_id, r.conversation_id, rr.component_id, rr.name
+              FROM run_repository rr
+              JOIN run r ON r.id = rr.run_id AND r.company_id = rr.company_id AND rr.epoch = r.epoch
+             WHERE rr.component_id IS NOT NULL
+               AND (r.status = 'RUNNING' OR (r.status = 'QUEUED' AND r.dispatched_at IS NOT NULL)
+                    OR (r.status = 'LOST' AND r.finished_at > :lostSince))
+            """;
+
+    /** The repositories cloned with the binding's account, of the runs a revocation may concern. */
+    List<RevocationTarget> targetsOfBinding(UUID bindingId, java.time.Instant lostSince) {
+        return jdbc.sql(TARGETS + " AND rr.binding_id = :id ORDER BY rr.run_id, rr.position")
+            .param("lostSince", RunStore.ts(lostSince))
+            .param("id", bindingId)
+            .query(RunRepositoryStore::target)
+            .list();
+    }
+
+    /** The repositories of the system, of the runs a revocation may concern. */
+    List<RevocationTarget> targetsOfSystem(UUID systemId, java.time.Instant lostSince) {
+        return jdbc.sql(TARGETS + " AND rr.system_id = :id ORDER BY rr.run_id, rr.position")
+            .param("lostSince", RunStore.ts(lostSince))
+            .param("id", systemId)
+            .query(RunRepositoryStore::target)
+            .list();
+    }
+
+    /** The repositories of the run's current assignment, if a revocation may concern the run. */
+    List<RevocationTarget> targetsOfRun(UUID runId, java.time.Instant lostSince) {
+        return jdbc.sql(TARGETS + " AND rr.run_id = :id ORDER BY rr.position")
+            .param("lostSince", RunStore.ts(lostSince))
+            .param("id", runId)
+            .query(RunRepositoryStore::target)
+            .list();
+    }
+
+    private static RevocationTarget target(ResultSet rs, int row) throws SQLException {
+        return new RevocationTarget(rs.getObject("run_id", UUID.class), rs.getObject("conversation_id", UUID.class),
+                rs.getObject("component_id", UUID.class), rs.getString("name"));
     }
 
     /** The workspace of an earlier assignment of the run goes: each assignment sends its own. */
     void deleteOfRun(UUID runId) {
         jdbc.sql("DELETE FROM run_repository WHERE run_id = ?").param(runId).update();
+    }
+
+    /**
+     * A repository that an assignment cloned with a binding's token ({@code run_assignment_repository}, V087), kept
+     * with the run whatever later assignments do (ADR-0116).
+     *
+     * @param personalHostId the machine the assignment went to, for a member's personal host; null for a company host
+     */
+    record AssignedRepository(UUID runId, long epoch, UUID componentId, int position, String name,
+            @Nullable UUID systemId, UUID bindingId, @Nullable Long bindingVersion, UUID runnerHostId,
+            @Nullable UUID personalHostId) {
+    }
+
+    /**
+     * Records what the assignment of {@code epoch} cloned with a binding's token, and where it went: one row per such
+     * repository, never changed or deleted.
+     */
+    void recordAssignment(UUID companyId, UUID runId, long epoch, int position, TurnSource.Workspace workspace,
+            UUID runnerHostId, @Nullable UUID personalHostId) {
+        if (workspace.bindingId() == null || workspace.git() == null) {
+            return;
+        }
+        jdbc.sql("""
+                INSERT INTO run_assignment_repository (run_id, company_id, epoch, component_id, position, name,
+                                                       system_id, binding_id, binding_version, runner_host_id,
+                                                       personal_host_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (run_id, epoch, component_id) DO NOTHING""")
+            .params(runId, companyId, epoch, workspace.repositoryId(), position, workspace.name(),
+                    workspace.systemId(), workspace.bindingId(), workspace.bindingVersion(), runnerHostId,
+                    personalHostId)
+            .update();
+    }
+
+    /** The repositories the run's assignment of {@code epoch} cloned with a binding's token, in workspace order. */
+    List<AssignedRepository> ofAssignment(UUID runId, long epoch) {
+        return jdbc.sql("""
+                SELECT run_id, epoch, component_id, position, name, system_id, binding_id, binding_version,
+                       runner_host_id, personal_host_id
+                  FROM run_assignment_repository
+                 WHERE run_id = ? AND epoch = ?
+                 ORDER BY position""")
+            .params(runId, epoch)
+            .query((rs, row) -> new AssignedRepository(rs.getObject("run_id", UUID.class), rs.getLong("epoch"),
+                    rs.getObject("component_id", UUID.class), rs.getInt("position"), rs.getString("name"),
+                    rs.getObject("system_id", UUID.class), rs.getObject("binding_id", UUID.class),
+                    rs.getObject("binding_version", Long.class), rs.getObject("runner_host_id", UUID.class),
+                    rs.getObject("personal_host_id", UUID.class)))
+            .list();
     }
 
     List<RepositoryRow> ofRun(UUID runId) {
@@ -117,6 +225,8 @@ class RunRepositoryStore {
                 rs.getObject("repository_id", UUID.class), rs.getObject("system_id", UUID.class),
                 rs.getObject("binding_id", UUID.class), rs.getString("name"), rs.getString("dir"),
                 rs.getBoolean("read_only"), cause != null ? TurnSource.ReadOnlyCause.valueOf(cause) : null,
-                rs.getObject("pushed", Boolean.class), rs.getString("head_sha"), rs.getObject("commits", Integer.class));
+                rs.getObject("pushed", Boolean.class), rs.getString("head_sha"), rs.getObject("commits", Integer.class),
+                rs.getObject("component_id", UUID.class), rs.getObject("epoch", Long.class),
+                rs.getObject("binding_version", Long.class));
     }
 }

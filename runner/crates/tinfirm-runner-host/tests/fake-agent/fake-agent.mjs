@@ -8,6 +8,10 @@
 //   happy              thought, plan, permission-gated edit, git commit, usage + rate
 //                      limit meta, a streamed final message, an uncommitted file (WIP)
 //   slow               writes slow.txt, then streams a chunk every 100 ms until cancelled
+//   end-window         writes done.txt (uncommitted) and, under protocol v2, /output/report.md
+//                      (and /output/appendix.md with `[second-output]`), says "Done: …" and ends
+//                      its turn with its usage; with `[leak]`, first prints the host's credential
+//                      as `leak` does and waits to be stopped
 //   gate               streams a chunk every 100 ms until the file `release` appears in the
 //                      workspace root (the test creates it), then ends the turn; or until
 //                      cancelled
@@ -40,8 +44,14 @@
 //   hang               one message, then silence: never answers, ignores session/cancel
 //   long-tool          one tool call running ~3 s that sends progress updates every 300 ms
 //   refusal            the model refuses (stopReason: refusal)
+//   echo-prompt        reports the content blocks of `session/prompt` exactly as they came, as
+//                      `Prompt blocks: <JSON>` on a line of their own, and ends the turn; it
+//                      applies no marker
 //   fetch              prints `origin`, waits for a new commit on main (git fetch through the
 //                      git proxy), reads its file, tries to push, and leaves an uncommitted file
+//   refetch            fetches `main` (through the git proxy), commits `refetch.txt`, reports and
+//                      waits like `gate` until the file `release` appears, then fetches again
+//                      and reports that fetch and what `release` holds
 //   multi              lists the repositories, prints each `origin` and whether it has
 //                      alternates, then applies the `[commit:<dir>]` and `[wip:<dir>]` markers
 //   forge-remote-ref   commits the credential in the first repository, points the forged
@@ -74,6 +84,9 @@
 //   egress             opens a `CONNECT` to the `[target:<host:port>]` marker through its
 //                      HTTPS_PROXY (with the proxy's credential), sends a line there and reports
 //                      the proxy's status and the line that comes back
+//   proxies            fetches `main` (through the git proxy), then does what `model-proxy` and
+//                      `egress` do and reports it all, and with `[wait]` then waits like `gate`
+//                      until the file `release` appears
 //   skills             lists the skills in `~/.claude/skills` and `~/.agents/skills`, each with
 //                      the `name:` line of its SKILL.md and whether its folder is read-only,
 //                      then writes a file of its own in `~/.claude`, as a runtime saves its
@@ -314,6 +327,83 @@ async function toolCall(sessionId, id, title, kind, rawInput, extra = {}) {
   notify(sessionId, { sessionUpdate: "tool_call", toolCallId: id, title, kind, status: "pending", rawInput, ...extra });
 }
 
+// The model proxy, as the `model-proxy` scenario reports it.
+async function modelProxyReport() {
+  const env = process.env;
+  const base = env.ANTHROPIC_BASE_URL ?? env.TINFIRM_MODEL_BASE_URL ?? env.OPENAI_BASE_URL ?? "";
+  const key = env.ANTHROPIC_AUTH_TOKEN ?? env.OPENAI_API_KEY ?? "";
+  const ask = async (method, endpoint) => {
+    try {
+      const response = await fetch(`${base}${endpoint}`, {
+        method,
+        headers: { authorization: `Bearer ${key}`, "x-api-key": key, "content-type": "application/json" },
+        body: "{}",
+      });
+      await response.text();
+      return String(response.status);
+    } catch {
+      return "unreachable";
+    }
+  };
+  let port = "-";
+  let host = "-";
+  try {
+    port = new URL(base).port || "-";
+    host = new URL(base).hostname || "-";
+  } catch {}
+  const report = [
+    `model-port=${port}`,
+    `model-host=${host}`,
+    `model-key=${key}`,
+    `messages=${await ask("POST", "/v1/messages")}`,
+    `keys=${await ask("POST", "/key/generate")}`,
+  ];
+  return report;
+}
+
+// A connection through the egress proxy, as the `egress` scenario reports it.
+async function egressReport(text) {
+  const report = [];
+  try {
+    const proxy = new URL(process.env.HTTPS_PROXY ?? "");
+    const target = markers(text, "target")[0];
+    const auth = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64");
+    report.push(`proxy: ${proxy.hostname}:${proxy.port}`);
+    report.push(
+      await new Promise((resolve, reject) => {
+        const socket = net.connect(Number(proxy.port), proxy.hostname);
+        let buf = "";
+        let open = false;
+        socket.on("error", reject);
+        socket.on("close", () => resolve(open ? `closed after: ${buf.trim()}` : `closed: ${buf.trim()}`));
+        socket.on("data", (data) => {
+          buf += data.toString();
+          if (!open) {
+            const end = buf.indexOf("\r\n\r\n");
+            if (end < 0) return;
+            const status = buf.slice(0, buf.indexOf("\r\n"));
+            buf = buf.slice(end + 4);
+            if (!status.includes(" 200")) {
+              socket.destroy();
+              return resolve(`status: ${status}`);
+            }
+            open = true;
+            socket.write("hello through the tunnel\n");
+          }
+          if (buf.includes("\n")) {
+            socket.destroy();
+            resolve(`echo: ${buf.trim()}`);
+          }
+        });
+        socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`);
+      }),
+    );
+  } catch (e) {
+    report.push(`egress failed: ${e.message}`);
+  }
+  return report;
+}
+
 async function prompt(msg) {
   const sessionId = msg.params.sessionId;
   const text = msg.params.prompt.map((b) => b.text ?? "").join("");
@@ -459,6 +549,26 @@ async function prompt(msg) {
         usage: { inputTokens: 120, outputTokens: 45, cachedReadTokens: 30, cachedWriteTokens: 15, totalTokens: 210 },
       });
     }
+    case "end-window": {
+      // Ends its turn by itself with work left uncommitted, a file in /output (protocol v2) and
+      // its usage: what a host that dies in the run's end must still save and report.
+      fs.writeFileSync(path.join(cwd, "done.txt"), "the finished work\n");
+      const outputDir = process.env.TINFIRM_OUTPUT_DIR;
+      if (outputDir) {
+        fs.writeFileSync(path.join(outputDir, "report.md"), "The report.\n");
+        if (text.includes("[second-output]")) fs.writeFileSync(path.join(outputDir, "appendix.md"), "The appendix.\n");
+      }
+      if (text.includes("[leak]")) {
+        // As `leak` does: the host stops the agent for it.
+        chunk(sessionId, `The token in base64 is ${Buffer.from(`x-access-token:${hostSecret()}`).toString("base64")}.`);
+        if (await waitCancel(10000)) return done({ stopReason: "cancelled" });
+      }
+      chunk(sessionId, "Done: the work is in done.txt.");
+      return done({
+        stopReason: "end_turn",
+        usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+      });
+    }
     case "slow": {
       fs.writeFileSync(path.join(cwd, "slow.txt"), "work in progress\n");
       for (let i = 0; ; i++) {
@@ -593,36 +703,7 @@ async function prompt(msg) {
       return done({ stopReason: "end_turn" });
     }
     case "model-proxy": {
-      const env = process.env;
-      const base = env.ANTHROPIC_BASE_URL ?? env.TINFIRM_MODEL_BASE_URL ?? env.OPENAI_BASE_URL ?? "";
-      const key = env.ANTHROPIC_AUTH_TOKEN ?? env.OPENAI_API_KEY ?? "";
-      const ask = async (method, endpoint) => {
-        try {
-          const response = await fetch(`${base}${endpoint}`, {
-            method,
-            headers: { authorization: `Bearer ${key}`, "x-api-key": key, "content-type": "application/json" },
-            body: "{}",
-          });
-          await response.text();
-          return String(response.status);
-        } catch {
-          return "unreachable";
-        }
-      };
-      let port = "-";
-      let host = "-";
-      try {
-        port = new URL(base).port || "-";
-        host = new URL(base).hostname || "-";
-      } catch {}
-      const report = [
-        `model-port=${port}`,
-        `model-host=${host}`,
-        `model-key=${key}`,
-        `messages=${await ask("POST", "/v1/messages")}`,
-        `keys=${await ask("POST", "/key/generate")}`,
-      ];
-      chunk(sessionId, report.join(" "));
+      chunk(sessionId, (await modelProxyReport()).join(" "));
       return done({ stopReason: "end_turn" });
     }
     case "leak-commit": {
@@ -732,6 +813,9 @@ async function prompt(msg) {
     case "refusal":
       chunk(sessionId, "I can't help with that.");
       return done({ stopReason: "refusal" });
+    case "echo-prompt":
+      chunk(sessionId, `\nPrompt blocks: ${JSON.stringify(msg.params.prompt)}`);
+      return done({ stopReason: "end_turn" });
     case "fetch": {
       const report = [];
       const failure = (e) => (e.stderr || e.message || "").toString().trim();
@@ -758,6 +842,29 @@ async function prompt(msg) {
       }
       fs.writeFileSync(path.join(cwd, "fetch.txt"), "written after the fetch\n");
       chunk(sessionId, `\n${report.join("\n")}`);
+      return done({ stopReason: "end_turn" });
+    }
+    case "refetch": {
+      const report = [];
+      const fetchOnce = (label) => {
+        try {
+          git(cwd, "fetch", "origin", "main");
+          report.push(`${label}: ok`);
+        } catch (e) {
+          report.push(`${label} failed: ${(e.stderr || e.message || "").toString().trim()}`);
+        }
+      };
+      fetchOnce("first fetch");
+      fs.writeFileSync(path.join(cwd, "refetch.txt"), "work before the revocation\n");
+      git(cwd, "add", "refetch.txt");
+      git(cwd, "commit", "-q", "-m", "Refetch work");
+      chunk(sessionId, `\n${report.join("\n")}\nwaiting for release`);
+      const release = path.join(root, "release");
+      while (!fs.existsSync(release)) {
+        if (await waitCancel(100)) return done({ stopReason: "cancelled" });
+      }
+      fetchOnce("second fetch");
+      chunk(sessionId, `\n${report[1]}\nrelease said: ${fs.readFileSync(release, "utf8").trim()}`);
       return done({ stopReason: "end_turn" });
     }
     case "multi": {
@@ -810,45 +917,26 @@ async function prompt(msg) {
       return done({ stopReason: "end_turn" });
     }
     case "egress": {
+      chunk(sessionId, `\n${(await egressReport(text)).join("\n")}`);
+      return done({ stopReason: "end_turn" });
+    }
+    case "proxies": {
       const report = [];
       try {
-        const proxy = new URL(process.env.HTTPS_PROXY ?? "");
-        const target = markers(text, "target")[0];
-        const auth = Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64");
-        report.push(`proxy: ${proxy.hostname}:${proxy.port}`);
-        report.push(
-          await new Promise((resolve, reject) => {
-            const socket = net.connect(Number(proxy.port), proxy.hostname);
-            let buf = "";
-            let open = false;
-            socket.on("error", reject);
-            socket.on("close", () => resolve(open ? `closed after: ${buf.trim()}` : `closed: ${buf.trim()}`));
-            socket.on("data", (data) => {
-              buf += data.toString();
-              if (!open) {
-                const end = buf.indexOf("\r\n\r\n");
-                if (end < 0) return;
-                const status = buf.slice(0, buf.indexOf("\r\n"));
-                buf = buf.slice(end + 4);
-                if (!status.includes(" 200")) {
-                  socket.destroy();
-                  return resolve(`status: ${status}`);
-                }
-                open = true;
-                socket.write("hello through the tunnel\n");
-              }
-              if (buf.includes("\n")) {
-                socket.destroy();
-                resolve(`echo: ${buf.trim()}`);
-              }
-            });
-            socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\nProxy-Authorization: Basic ${auth}\r\n\r\n`);
-          }),
-        );
+        git(cwd, "fetch", "origin", "main");
+        report.push("fetch: ok");
       } catch (e) {
-        report.push(`egress failed: ${e.message}`);
+        report.push(`fetch failed: ${(e.stderr || e.message || "").toString().trim()}`);
       }
-      chunk(sessionId, `\n${report.join("\n")}`);
+      report.push(...(await modelProxyReport()));
+      report.push(...(await egressReport(text)));
+      chunk(sessionId, `\n${report.join("\n")}\n`);
+      if (text.includes("[wait]")) {
+        chunk(sessionId, "waiting for release");
+        while (!fs.existsSync(path.join(root, "release"))) {
+          if (await waitCancel(100)) return done({ stopReason: "cancelled" });
+        }
+      }
       return done({ stopReason: "end_turn" });
     }
     case "request-repo": {

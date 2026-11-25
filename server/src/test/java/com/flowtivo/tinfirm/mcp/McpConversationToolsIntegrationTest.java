@@ -25,8 +25,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import com.flowtivo.tinfirm.runner.RunnerConnections;
+import com.flowtivo.tinfirm.shared.web.ServerBusy;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.FakeLiteLlm;
 import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.IntegrationTest;
@@ -75,6 +77,10 @@ class McpConversationToolsIntegrationTest extends IntegrationTest {
 
     private static final List<String> WRITE_TOOLS = List.of("cancel_turn", "choose_account", "delete_memory_note",
             "end_conversation", "retry_turn", "send_message", "start_conversation", "test_system");
+
+    /** The frame of a conversation's end, the tool's own transaction. */
+    private static final String END = "com.flowtivo.tinfirm.conversation.internal.ConversationService$$SpringCGLIB$$0"
+            + ".end";
 
     private final FakeLiteLlm litellm = FakeLiteLlm.bundled();
 
@@ -265,7 +271,84 @@ class McpConversationToolsIntegrationTest extends IntegrationTest {
         return "User " + company.email("OWNER");
     }
 
+    // ---- a tool's failure for want of a connection, or after its commit (shared.web.ServerBusy) --------------------
+
+    /** A company with an agent of the MEMBER's and a conversation of theirs, its id. */
+    private UUID conversationOfTheMember(TestCompany company, ApiClient member) {
+        JsonNode agent = member.post(company.path("/agents"), Map.of("name", unique("Helper"), "runtimes",
+                List.of("CLAUDE_CODE"), "instructions", "", "systems", List.of(), "repositories", List.of(),
+                "shareGroupIds", List.of())).json();
+        UUID conversation = UUID.randomUUID();
+        TestConversations.bare(company.id(), conversation, unique("c"), UUID.fromString(agent.get("id").asString()),
+                memberPrincipal(company, company.userId("MEMBER")), "CLAUDE_CODE", "CLIENT");
+        return conversation;
+    }
+
+    /**
+     * A tool runs on its request's thread, inside the request's filters: the end of the request's work
+     * ({@code shared.tx.EndOfWorkConfiguration}) is on the stack of the tool's own transactions.
+     */
+    @Test
+    void aToolRunsOnItsRequestsThreadInsideItsFilters() throws Exception {
+        TestCompany company = companyWithRoles();
+        ApiClient member = loginAs(company.email("MEMBER"));
+        UUID conversation = conversationOfTheMember(company, member);
+        Token token = personalToken(member, "READ");
+        List<StackTraceElement[]> seen = new ArrayList<>();
+        try (McpSyncClient client = connect(company.id(), token.secret())) {
+            ConnectionWatch.plantAt("com.flowtivo.tinfirm.mcp.internal.ToolInvoker",
+                    () -> seen.add(Thread.currentThread().getStackTrace()));
+            ok(call(client, "get_conversation", Map.of("conversation", conversation.toString())), "get_conversation");
+        }
+
+        assertThat(seen).singleElement()
+            .satisfies(stack -> assertThat(stack).anySatisfy(frame -> assertThat(frame.getClassName())
+                .startsWith("com.flowtivo.tinfirm.shared.tx.EndOfWorkConfiguration")));
+    }
+
+    /** A write tool whose own transaction finds no free connection has saved nothing: the client may try again. */
+    @Test
+    void aWriteToolThatFindsNoFreeConnectionBeforeItSavedIsToldToTryAgainLater() throws Exception {
+        TestCompany company = companyWithRoles();
+        ApiClient member = loginAs(company.email("MEMBER"));
+        UUID conversation = conversationOfTheMember(company, member);
+        Token token = personalToken(member, "WRITE");
+
+        CallToolResult ended;
+        try (McpSyncClient client = connect(company.id(), token.secret());
+                AutoCloseable busy = ConnectionWatch.timeOutAt(END)) {
+            ended = call(client, "end_conversation", Map.of("conversation", conversation.toString()));
+        }
+
+        assertThat(error(ended)).isEqualTo("INTERNAL_ERROR: The tool failed on the server. Try again later.");
+        assertThat(member.get(company.path("/conversations/" + conversation)).json().get("state").asString())
+            .isNotEqualTo("ENDED");
+    }
+
+    /**
+     * A write tool whose step after its commit fails: the start committed, and the notice it answers with finds no free
+     * connection. The client is told that its change may already be saved, never to try again.
+     */
+    @Test
+    void aWriteToolWhoseStepAfterItsCommitFailsIsToldItsChangeMayAlreadyBeSaved() throws Exception {
+        Bench bench = bench();
+        JsonNode agent = agent(bench.member(), bench, "Helper");
+        Token token = personalToken(bench.member(), "WRITE");
+
+        CallToolResult started;
+        try (FakeRunner runner = companyHost(bench); McpSyncClient client = connect(bench.id(), token.secret())) {
+            try (AutoCloseable busy = ConnectionWatch.timeOutAt("com.flowtivo.tinfirm.mcp.internal.OwnerNotices")) {
+                started = call(client, "start_conversation", Map.of("agent", agent.get("id").asString(), "message",
+                        "Plan the release"));
+            }
+        }
+
+        assertThat(error(started)).isEqualTo("INTERNAL_ERROR: " + ServerBusy.SAVED_THEN_FAILED);
+        assertThat(ids(bench.member().get(bench.path("/conversations?limit=50")).json())).hasSize(1);
+    }
+
     // ---- the catalogue and the notice ------------------------------------------------------------------------------
+
 
     @Test
     void initializeCarriesTheNoticeAndTheToolsDeclareTheirScopes() {

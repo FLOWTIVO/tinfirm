@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+# The hardening's kernel settings (ADR-0113 decision 5; the role's defaults, "The hardening"):
+# one line for each switch that is on. A value the node had higher already is left out, so that
+# this file never lowers it. The node agent's helper reads these and writes none.
+{% for key, value in _tinfirm_sandbox_node_hardening_sysctls.items() %}
+{{ key }} = {{ value }}
+{% endfor %}

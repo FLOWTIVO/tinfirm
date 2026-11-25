@@ -70,6 +70,11 @@ class RunLocks {
         companies.forEach((conversationId, companyId) -> ports.conversationLock().lock(companyId, conversationId));
     }
 
+    /** Locks these conversations of the company, each once, in the order of their ids. */
+    void lockConversations(UUID companyId, Collection<UUID> conversationIds) {
+        new java.util.TreeSet<>(conversationIds).forEach(id -> ports.conversationLock().lock(companyId, id));
+    }
+
     /** Locks the run's conversation. */
     void lockConversation(RunStore.RunRow run) {
         ports.conversationLock().lock(run.companyId(), run.conversationId());

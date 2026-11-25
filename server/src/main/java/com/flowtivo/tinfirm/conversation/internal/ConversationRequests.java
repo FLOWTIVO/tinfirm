@@ -32,7 +32,11 @@ class ConversationRequests implements RunRequests {
 
     private final SystemNotes notes;
 
-    ConversationRequests(ToolCalls tools, PlatformRequests platform, MemoryTools memory, SystemNotes notes) {
+    private final GitTokenRefresh gitTokens;
+
+    ConversationRequests(ToolCalls tools, PlatformRequests platform, MemoryTools memory, SystemNotes notes,
+            GitTokenRefresh gitTokens) {
+        this.gitTokens = gitTokens;
         this.tools = tools;
         this.platform = platform;
         this.memory = memory;
@@ -60,5 +64,10 @@ class ConversationRequests implements RunRequests {
         }
         RunnerMessages.RunRequestAck answer = tools.call(run, requestId, payload);
         return name != null ? notes.withNotes(run, name, answer) : answer;
+    }
+
+    @Override
+    public GitTokenAnswer gitTokens(ActiveRun run, java.util.List<GitTokenRepository> repositories) {
+        return gitTokens.refresh(run, repositories);
     }
 }

@@ -1,10 +1,12 @@
-//! Ready VMs (ADR-0098) with the VM executor and the fake driver of `tests/fake-vm-driver`: the
-//! pool creates VMs for no run, up to Tinfirm's count and the operator's ceiling; a run takes
-//! a ready one, and its replacement starts at once; a run of another shape starts cold, unless
-//! the VMs run the multi-runtime image (ADR-0101), which every runtime's runs take; VMs
-//! above the target, and old ones, go; a VM that waited is probed again when a run claims it;
-//! and the ready VMs are deleted when the host stops. The VMs here are processes on this
-//! machine (`VmOptions::on_this_machine`).
+//! Ready VMs (ADR-0098, crate::ready_vms) with the VM executor and the fake driver of
+//! `runner/crates/tinfirm-runner-host/tests/fake-vm-driver`: the host creates VMs for no run,
+//! up to Tinfirm's count and the operator's ceiling; a run takes a ready one, and its
+//! replacement starts at once; a run of another shape starts cold, unless the VMs run the
+//! multi-runtime image (ADR-0101), which every runtime's runs take; VMs above the target, and
+//! old ones, go; a VM that waited is probed again when a run claims it; and the ready VMs are
+//! deleted when the host stops. The VMs here are processes on this machine
+//! (`VmOptions::on_this_machine`). Part of elastic runners, under the Tinfirm Enterprise
+//! licence (`ee/LICENSE`); the cold starts are tested with the core, in `vm_runs.rs`.
 
 #[path = "../../../../runner/crates/tinfirm-runner-host/tests/common/mod.rs"]
 mod common;
@@ -15,7 +17,7 @@ use std::time::Duration;
 use common::*;
 use serde_json::Value;
 use tinfirm_bridge::control::ProbeCheck;
-use tinfirm_runner_host::pool::{Pool, PoolOptions};
+use tinfirm_runner_host::ready_vms::{ReadyVmOptions, ReadyVms};
 
 fn calls_of(calls: &[Value], method: &str) -> Vec<Value> {
     calls
@@ -40,23 +42,39 @@ async fn until(what: &str, seconds: u64, mut check: impl FnMut() -> bool) {
     }
 }
 
-/// Pool options for tests: ready VMs above the target go at the next pass.
-fn quick() -> PoolOptions {
-    PoolOptions {
+/// Ready VMs' options for tests: on, up to 4, and those above the target go at the next pass.
+fn quick() -> ReadyVmOptions {
+    ReadyVmOptions {
+        max_ready: 4,
         cool_down: Duration::ZERO,
-        ..PoolOptions::default()
+        ..ReadyVmOptions::default()
     }
 }
 
-fn pool_host(options: tinfirm_runner_host::vm::VmOptions, pool: PoolOptions) -> HostSetup {
+fn pool_host(options: tinfirm_runner_host::vm::VmOptions, pool: ReadyVmOptions) -> HostSetup {
+    pool_host_reprobing(options, pool, tinfirm_runner_host::pool::REPROBE_AFTER)
+}
+
+/// [`pool_host`] whose VMs that came up `reprobe_after` before their claim are probed again.
+fn pool_host_reprobing(
+    options: tinfirm_runner_host::vm::VmOptions,
+    pool: ReadyVmOptions,
+    reprobe_after: Duration,
+) -> HostSetup {
     HostSetup {
-        pool: Some(pool),
+        options: Some(Box::new(move |opts| {
+            opts.ready_vms = pool;
+            opts.vm_reprobe_after = reprobe_after;
+        })),
         ..HostSetup::vm_with(options)
     }
 }
 
-fn pool_of(host: &TestHost) -> Arc<Pool> {
-    host.host.pool().expect("a VM host has a pool").clone()
+fn pool_of(host: &TestHost) -> Arc<ReadyVms> {
+    host.host
+        .ready_vms()
+        .expect("a VM host with --pool-max-ready has ready VMs")
+        .clone()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -116,6 +134,118 @@ async fn a_run_takes_a_ready_vm_and_its_replacement_starts_at_once() {
     .await;
 }
 
+const RESTART_DIR: &str = "TINFIRM_TEST_POOL_RESTART_DIR";
+const RESTART_URL: &str = "TINFIRM_TEST_POOL_RESTART_URL";
+
+/// The hosts of the ready VMs' restart test: the fake driver keeps its VMs in a file, so that
+/// they outlive the host that is killed.
+fn restart_pool_host(dir: &std::path::Path) -> HostSetup {
+    let state = dir.join("vms.json").to_string_lossy().into_owned();
+    pool_host(
+        vm_options(
+            &dir.join("driver.log"),
+            &[("FAKE_VM_STATE", state.as_str())],
+        ),
+        quick(),
+    )
+}
+
+/// Host A of the ready VMs' restart test, in a process of its own that the test kills as a
+/// crash would (SIGKILL), with one ready VM: run only by that test.
+#[test]
+#[ignore = "host A of the ready VMs' restart test, which starts it"]
+fn pool_restart_test_host_a() {
+    let (Ok(dir), Ok(url)) = (std::env::var(RESTART_DIR), std::env::var(RESTART_URL)) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let host = start_host_at(&dir.join("host"), &url, restart_pool_host(&dir)).await;
+            // Tinfirm's count, again and again: the server's welcome, which this test's server
+            // sends with no count, sets it to none.
+            loop {
+                pool_of(&host).set_scheduled(1);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+}
+
+/// The VMs of the fake driver's state file that are running.
+fn running_vms(dir: &std::path::Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(dir.join("vms.json")) else {
+        return Vec::new();
+    };
+    let state: Vec<Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+    state
+        .iter()
+        .filter(|vm| vm["state"] == "running")
+        .filter_map(|vm| vm["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_a_host_restart_its_ready_vms_go_and_a_run_takes_a_new_one_through_its_front() {
+    with_timeout(180, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "pool_restart_test_host_a",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(RESTART_DIR, dir.path())
+            .env(RESTART_URL, &server.url)
+            .stdout(std::process::Stdio::null());
+        let mut host_a = HostProcess::spawn(command);
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        // Host A's ready VM, with its front, which holds its bridge.
+        until("host A's ready VM", 60, || {
+            running_vms(dir.path()).len() == 1 && fronts_of(host_a.id()).len() == 1
+        })
+        .await;
+        let old = running_vms(dir.path()).remove(0);
+        host_a.crash();
+        drop(conn);
+
+        // Host B holds no record of the ready VM, which no run had: it deletes it, and makes a
+        // new one, whose new front takes its bridge; the next run takes that one.
+        let host = start_host_at(
+            &dir.path().join("host"),
+            &server.url,
+            restart_pool_host(dir.path()),
+        )
+        .await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let pool = pool_of(&host);
+        pool.set_scheduled(1);
+        until("host A's ready VM deleted and a new one ready", 60, || {
+            deleted(&vm_driver_calls(&log), &old) && pool.status().ready == 1
+        })
+        .await;
+        let spec = AssignSpec::new("bridge-env", None);
+        conn.send(spec.to_json());
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.text().contains("took a ready sandbox VM"), "{}", t.text());
+        assert!(!t.text().contains(&format!("({old})")), "{}", t.text());
+        assert!(host.host.started_bridge().await.is_none());
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_of_another_runtime_starts_cold_and_the_ready_vm_makes_room() {
     with_timeout(120, async {
@@ -168,6 +298,102 @@ async fn a_run_of_another_runtime_starts_cold_and_the_ready_vm_makes_room() {
     .await;
 }
 
+/// The most VMs the host held at once, from the driver's calls in their order. The fake driver
+/// names its VMs `vm-1`, `vm-2` and so on as it creates them, and the host holds a VM from its
+/// `create` until it asks for its `delete`.
+fn most_vms_held(calls: &[Value]) -> usize {
+    let mut created = 0;
+    let mut held = std::collections::BTreeSet::new();
+    let mut most = 0;
+    for call in calls {
+        match call["method"].as_str() {
+            Some("create") => {
+                created += 1;
+                held.insert(format!("vm-{created}"));
+            }
+            Some("delete") => {
+                if let Some(id) = call["params"]["id"].as_str() {
+                    held.remove(id);
+                }
+            }
+            _ => {}
+        }
+        most = most.max(held.len());
+    }
+    most
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runs_of_another_runtime_never_take_the_host_above_its_pool_size() {
+    with_timeout(240, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let mut server = FakeServer::start().await;
+        // The ready VMs are of Codex's image, so that two runs of Claude Code can go at once
+        // (the tests' Claude Code credential takes two runs, the OpenAI one a single run).
+        let ready = ReadyVmOptions {
+            runtime: tinfirm_protocol::Runtime::Codex,
+            ..quick()
+        };
+        let setup = HostSetup {
+            max_concurrent_runs: 3,
+            ..pool_host(vm_options(&log, &[]), ready)
+        };
+        let host = start_host(&server.url, setup).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let pool = pool_of(&host);
+        // The ready VMs fill the pool: three.
+        pool.set_scheduled(3);
+        until("three VMs ready", 60, || pool.status().ready == 3).await;
+        assert_eq!(most_vms_held(&vm_driver_calls(&log)), 3);
+
+        // Two Claude Code runs at once. Each needs a VM of its own image and starts cold,
+        // while the pool's own passes go on beside them. (The first's transcript takes the
+        // frames of both until it ends, the second's finish too if it came first.)
+        let first = AssignSpec::new("bridge-env", None);
+        let second = AssignSpec::new("bridge-env", None);
+        conn.send(first.to_json());
+        conn.send(second.to_json());
+        let t = conn.until_finished(first.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.text().contains("the run started cold"), "{}", t.text());
+        let second_id = second.run_id.to_string();
+        let finished = match t
+            .frames
+            .iter()
+            .find(|f| f["type"] == "run.finished" && f["runId"] == second_id)
+        {
+            Some(finished) => finished.clone(),
+            None => conn.take_run("run.finished", second.run_id).await,
+        };
+        assert_eq!(finished["outcome"], "SUCCEEDED", "{finished}");
+        // After the runs the pool is back to its count.
+        until("the pool refilled", 60, || pool.status().ready == 3).await;
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+
+        let calls = vm_driver_calls(&log);
+        let images: Vec<String> = calls_of(&calls, "create")
+            .iter()
+            .map(|c| {
+                c["params"]["userData"]["image"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            images.iter().filter(|i| i.contains("claude")).count(),
+            2,
+            "{images:?}"
+        );
+        // Never more than the three VMs of the host's pool size, at any call of the driver.
+        assert_eq!(most_vms_held(&calls), 3, "{calls:#?}");
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn with_the_multi_runtime_image_a_run_of_any_runtime_takes_a_ready_vm() {
     use std::os::unix::fs::PermissionsExt;
@@ -195,7 +421,7 @@ async fn with_the_multi_runtime_image_a_run_of_any_runtime_takes_a_ready_vm() {
             std::env::var("PATH").unwrap_or_default()
         );
         let mut server = FakeServer::start().await;
-        let pool_options = PoolOptions {
+        let pool_options = ReadyVmOptions {
             multi_runtime: true,
             ..quick()
         };
@@ -251,7 +477,7 @@ async fn the_ceiling_bounds_the_count_and_vms_above_the_target_or_too_old_go() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("driver.log");
         let mut server = FakeServer::start().await;
-        let pool_options = PoolOptions {
+        let pool_options = ReadyVmOptions {
             max_ready: 2,
             ..quick()
         };
@@ -292,7 +518,7 @@ async fn a_ready_vm_older_than_its_max_age_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("driver.log");
         let mut server = FakeServer::start().await;
-        let pool_options = PoolOptions {
+        let pool_options = ReadyVmOptions {
             max_age: Duration::from_secs(2),
             ..quick()
         };
@@ -329,12 +555,12 @@ async fn a_vm_that_waited_is_probed_again_when_a_run_claims_it() {
         options.probe = vec![ProbeCheck::Tcp {
             addr: drift.clone(),
         }];
-        let pool_options = PoolOptions {
-            reprobe_after: Duration::from_millis(500),
-            ..quick()
-        };
         let mut server = FakeServer::start().await;
-        let host = start_host(&server.url, pool_host(options, pool_options)).await;
+        let host = start_host(
+            &server.url,
+            pool_host_reprobing(options, quick(), Duration::from_millis(500)),
+        )
+        .await;
         let mut conn = server.accept().await;
         conn.handshake(1).await;
         let pool = pool_of(&host);
@@ -384,38 +610,8 @@ async fn echo() -> u16 {
     port
 }
 
-/// The first line of the egress proxy's answer to a `CONNECT` to `target`, with `proxy_url`'s
-/// credential, at `addr`.
-async fn connect_through(addr: &str, proxy_url: &str, target: &str) -> String {
-    use base64::Engine;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let url = url::Url::parse(proxy_url).unwrap();
-    let auth = base64::engine::general_purpose::STANDARD.encode(format!(
-        "{}:{}",
-        url.username(),
-        url.password().unwrap()
-    ));
-    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
-    socket
-        .write_all(
-            format!(
-                "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut buf = vec![0u8; 512];
-    let n = socket.read(&mut buf).await.unwrap();
-    String::from_utf8_lossy(&buf[..n])
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_ready_vms_egress_listener_refuses_everything_until_its_run_binds_it() {
+async fn a_ready_vms_egress_proxy_is_reached_only_through_the_tunnel_of_the_run_that_claims_it() {
     use tinfirm_runner_host::egress_proxy::{EgressSettings, Rule};
     with_timeout(120, async {
         let port = echo().await;
@@ -437,21 +633,27 @@ async fn a_ready_vms_egress_listener_refuses_everything_until_its_run_binds_it()
         pool.set_scheduled(1);
         until("one VM ready", 30, || pool.status().ready == 1).await;
 
-        // The VM's container starts with its own listener's URL, which no run has bound yet:
-        // even a host-wide destination is refused.
+        // The VM's container starts with its egress proxy's URL: the VM's front serves it,
+        // through a tunnel on the VM's own loopback at the egress proxy's fixed port, which
+        // only the run that claims the VM opens. While the VM waits, nothing listens there,
+        // and this host binds no listener for it (its unbound listener refusing every
+        // destination is the egress proxy's own test).
         let calls = vm_driver_calls(&log);
         let env = &calls_of(&calls, "create")[0]["params"]["userData"]["env"];
         let proxy_url = env["HTTPS_PROXY"]
             .as_str()
             .expect("the proxy in the VM's settings")
             .to_string();
-        let listener_port = url::Url::parse(&proxy_url).unwrap().port().unwrap();
-        // In the test mode the listeners are on 127.0.0.2, the VM's tunnels elsewhere.
+        let url = url::Url::parse(&proxy_url).unwrap();
+        let listener_port = url.port().unwrap();
+        assert_eq!(listener_port, 18_763, "{proxy_url}");
+        let vm_side = format!("{}:{listener_port}", url.host_str().unwrap());
+        assert!(tokio::net::TcpStream::connect(&vm_side).await.is_err());
         let host_side = format!("127.0.0.2:{listener_port}");
-        let refused = connect_through(&host_side, &proxy_url, &format!("localhost:{port}")).await;
-        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert!(tokio::net::TcpStream::connect(&host_side).await.is_err());
 
-        // The run that claims the VM binds its rules to that listener.
+        // The run that claims the VM binds its rules, and reaches the destination through its
+        // tunnel.
         let mut spec = AssignSpec::new("egress", None);
         spec.prompt_extra = format!(" [target:localhost:{port}]");
         conn.send(spec.to_json());
@@ -506,7 +708,7 @@ async fn a_vm_that_cannot_be_created_pauses_the_pools_own_creations_but_not_a_ru
 
 // ----- Tinfirm's count (ADR-0099) ----------------------------------------------------------
 
-fn v2_pool_host(pool: PoolOptions) -> HostSetup {
+fn v2_pool_host(pool: ReadyVmOptions) -> HostSetup {
     HostSetup {
         protocol_version: 2,
         max_concurrent_runs: 3,
@@ -524,7 +726,7 @@ async fn tinfirms_count_comes_in_host_config_and_the_host_reports_its_pool() {
         let mut server = FakeServer::start().await;
         let host = start_host(
             &server.url,
-            v2_pool_host(PoolOptions {
+            v2_pool_host(ReadyVmOptions {
                 max_ready: 2,
                 ..quick()
             }),
@@ -583,7 +785,7 @@ async fn a_window_fills_early_and_its_end_is_followed_without_the_server() {
         let mut server = FakeServer::start().await;
         let host = start_host(
             &server.url,
-            v2_pool_host(PoolOptions {
+            v2_pool_host(ReadyVmOptions {
                 lead_time_max: Duration::from_secs(120),
                 ..quick()
             }),
@@ -611,6 +813,93 @@ async fn a_window_fills_early_and_its_end_is_followed_without_the_server() {
         ))
         .await;
         until("the window ended", 30, || pool.status().ready == 0).await;
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+/// A run's VM whose delete fails while its node does not answer (a node that reboots) is deleted
+/// later by the host on its own, without a restart, once the node answers again: its slot is
+/// free again. Nothing else is deleted meanwhile: neither the VM of a run that still runs nor a
+/// ready VM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vm_whose_delete_failed_while_its_node_was_down_is_deleted_once_it_answers() {
+    with_timeout(180, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("driver.log");
+        let down = dir.path().join("down");
+        let down_env = down.to_string_lossy().into_owned();
+        let mut options = vm_options(&log, &[("FAKE_VM_DOWN", &down_env)]);
+        options.delete_retry = Duration::from_millis(300);
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, pool_host(options, quick())).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let pool = pool_of(&host);
+        pool.set_scheduled(1);
+        until("one VM ready", 30, || pool.status().ready == 1).await;
+
+        // A run that goes on, in vm-1; its replacement, vm-2, is ready.
+        let live = AssignSpec::new("gate", None);
+        conn.send(live.to_json());
+        conn.wait_running(live.run_id).await;
+        until("the replacement ready", 30, || pool.status().ready == 1).await;
+
+        // A run that ends, in vm-2, while the node does not answer: its delete fails.
+        std::fs::write(&down, "").unwrap();
+        let ended = AssignSpec::new("bridge-env", None);
+        conn.send(ended.to_json());
+        let t = conn.until_finished(ended.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(
+            t.text().contains("took a ready sandbox VM (vm-2)"),
+            "{}",
+            t.text()
+        );
+        let calls = vm_driver_calls(&log);
+        let gone = |calls: &[Value], id: &str| {
+            calls_of(calls, "deleted")
+                .iter()
+                .any(|c| c["params"]["id"] == id)
+        };
+        assert!(
+            deleted(&calls, "vm-2") && !gone(&calls, "vm-2"),
+            "{calls:#?}"
+        );
+
+        // The node answers again: the host deletes vm-2 on its own.
+        std::fs::remove_file(&down).unwrap();
+        until("vm-2 deleted after the node is back", 30, || {
+            gone(&vm_driver_calls(&log), "vm-2")
+        })
+        .await;
+        until("vm-3 ready", 30, || pool.status().ready == 1).await;
+        let calls = vm_driver_calls(&log);
+        // Neither the live run's VM nor the ready one was touched.
+        assert!(!deleted(&calls, "vm-1"), "{calls:#?}");
+        assert!(!deleted(&calls, "vm-3"), "{calls:#?}");
+        // And vm-2 is not tried again once it is deleted.
+        let tries = calls_of(&calls, "delete")
+            .iter()
+            .filter(|c| c["params"]["id"] == "vm-2")
+            .count();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let calls = vm_driver_calls(&log);
+        assert_eq!(
+            calls_of(&calls, "delete")
+                .iter()
+                .filter(|c| c["params"]["id"] == "vm-2")
+                .count(),
+            tries,
+            "{calls:#?}"
+        );
+
+        // The live run ends as usual, and its VM goes.
+        release(&host.paths, live.run_id);
+        let t = conn.until_finished(live.run_id).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(gone(&vm_driver_calls(&log), "vm-1"));
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

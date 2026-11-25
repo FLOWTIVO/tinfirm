@@ -57,6 +57,7 @@ import com.flowtivo.tinfirm.shared.security.ActorType;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.sql.Constraints;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 import com.flowtivo.tinfirm.system.CallResult;
@@ -150,6 +151,12 @@ class SystemService {
 
     private final TransactionTemplate transactions;
 
+    /** The authorisation before a call to a system: bookkeeping, not the request's change. */
+    private final TransactionTemplate authorisations;
+
+    /** The system's GitHub App (ADR-0116), looked up when used. */
+    private final ObjectProvider<GitHubAppService> gitHubApps;
+
     private final TimeSource time;
 
     private final ChatSystemsImpl chatSystems;
@@ -172,7 +179,9 @@ class SystemService {
             ApplicationEventPublisher events, SystemMapper mapper, PlatformTransactionManager transactionManager,
             TimeSource time, ChatSystemsImpl chatSystems, ChatEndpoints chatEndpoints, TinfirmProperties tinfirm,
             ObjectProvider<ChatSystemTests> chatTests, WebhookSystemsImpl webhookSystems,
-            ObjectProvider<WebhookLimits> webhookLimits, OutboundProperties outbound) {
+            ObjectProvider<WebhookLimits> webhookLimits, OutboundProperties outbound,
+            ObjectProvider<GitHubAppService> gitHubApps) {
+        this.gitHubApps = gitHubApps;
         this.outbound = outbound;
         this.webhookSystems = webhookSystems;
         this.webhookLimits = webhookLimits;
@@ -187,6 +196,8 @@ class SystemService {
         this.events = events;
         this.mapper = mapper;
         this.transactions = new TransactionTemplate(transactionManager);
+        this.authorisations = new TransactionTemplate(transactionManager);
+        this.authorisations.setName(AfterTransaction.BOOKKEEPING);
         this.time = time;
         this.chatSystems = chatSystems;
         this.chatEndpoints = chatEndpoints;
@@ -200,10 +211,10 @@ class SystemService {
 
     /** Authorises the caller to manage the system, in a transaction of its own before a call to it. */
     Managed managed(UUID companyId, UUID systemId) {
-        return inTransaction(() -> {
+        return Objects.requireNonNull(authorisations.execute(status -> {
             SystemAccess.Caller caller = access.caller(companyId);
             return new Managed(caller, access.managed(caller, systemId));
-        });
+        }));
     }
 
     /** Work in a transaction of its own, in the tenant context the request entered. */
@@ -590,6 +601,7 @@ class SystemService {
         UUID companyId = system.companyId();
         accounts.systemDeleting(companyId, system.id());
         deleteClientSecret(system, system.oauthClientSecretId());
+        gitHubApps.getObject().systemDeleting(companyId, system.id());
         if (system.kind().chat()) {
             chatSystems.deleteSecrets(companyId, system.id());
         }
@@ -949,8 +961,9 @@ class SystemService {
     /**
      * Reaches the system: with an account (the credential named, the caller's own {@code OK} account, the system's
      * only usable credential: {@link #reach}) its "who am I", else a request without a credential; the outcome becomes
-     * the system's status. The calls run outside any transaction, between the one that authorises the caller and the
-     * one that stores the status.
+     * the system's status. A credential that is an installation of the system's GitHub App has no "who am I" at
+     * GitHub: its token is asked what it reaches ({@link SystemClients#installationIdentity}). The calls run outside
+     * any transaction, between the one that authorises the caller and the one that stores the status.
      */
     public SystemTestResult test(UUID companyId, UUID systemId, @Nullable UUID credentialId) {
         Managed managed = managed(companyId, systemId);
@@ -973,8 +986,10 @@ class SystemService {
         SystemTestResult result;
         if (reach.credential() != null) {
             requireStill(system, reach.credential());
-            CallResult<SystemCalls.Identity> identity = clients.whoAmI(system, reach.credential().credential(),
-                    reach.credential().apiBaseUrl());
+            // GitHub answers "who am I" to a user's token only: an installation's is asked what it reaches.
+            CallResult<SystemCalls.Identity> identity = appInstallation(system, reach.credential().accountId())
+                    ? clients.installationIdentity(system, reach.credential().credential())
+                    : clients.whoAmI(system, reach.credential().credential(), reach.credential().apiBaseUrl());
             result = identity.failure() != null
                     ? new SystemTestResult(false, true, identity.failure().kind() == CallResult.Kind.UNAUTHORIZED,
                             (reach.own() ? "Your account" : "The credential") + " was not accepted: "
@@ -1059,6 +1074,16 @@ class SystemService {
             }
         }
         return new Reach(null, false, null, null, false);
+    }
+
+    /**
+     * Whether the account is a credential of the system that is an installation of its GitHub App (kind {@code APP},
+     * ADR-0116), read in a transaction of its own.
+     */
+    private boolean appInstallation(SystemStore.SystemRow system, UUID accountId) {
+        return system.kind() == SystemKind.GITHUB
+                && inTransaction(() -> accounts.appCredentials(system.companyId(), system.id())).stream()
+                    .anyMatch(credential -> credential.id().equals(accountId));
     }
 
     /**
@@ -1459,6 +1484,8 @@ class SystemService {
                 system.accountsRequired(), system.kind().receivesData(),
                 !system.personal() && outbound.internalHost(system.baseUrl())))
             .webhook(webhook)
+            .githubApp(manages && system.kind() == SystemKind.GITHUB && !system.personal()
+                    ? gitHubApps.getObject().has(system.companyId(), system.id()) : null)
             .pollIntervalSeconds(system.kind().tracker()
                     ? (int) SystemPollsImpl.interval(system.settings()).toSeconds() : null)
             .lastTest(lastTest(system, manages, testers));

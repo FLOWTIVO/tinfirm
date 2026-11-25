@@ -16,7 +16,8 @@ Everything is recorded in the audit log in every edition. Proving it to an audit
 | The Outlook add-in and the Gmail add-on | – | :lucide-check: | :lucide-check: |
 | Model access: LiteLLM, per-person budgets, spend views and alerts, the company's key | :lucide-check: | :lucide-check: | :lucide-check: |
 | Safety: sandboxes, the outbound guard, kill switches, suspension | :lucide-check: | :lucide-check: | :lucide-check: |
-| Elastic runners: a fresh VM per run, ready VMs on a schedule, sessions that resume on any company host | – | :lucide-check: | :lucide-check: |
+| The secure sandbox: the sandbox bridge, a VM per run with a VM driver of your own (the driver protocol is open), on as many machines as you run | :lucide-check: | :lucide-check: | :lucide-check: |
+| Elastic runners: a fresh VM per run at a provider (DigitalOcean), ready VMs on a schedule, sessions that resume on any company host | – | :lucide-check: | :lucide-check: |
 | Groups, service accounts, credentials lent to them | :lucide-check: | :lucide-check: | :lucide-check: |
 | Local sign-in, OIDC | :lucide-check: | :lucide-check: | :lucide-check: |
 | [SCIM provisioning](scim.md); [SAML sign-in](saml.md) | – | – | :lucide-check: |

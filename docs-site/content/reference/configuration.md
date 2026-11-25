@@ -20,6 +20,7 @@ Durations are ISO 8601, such as `PT20S` or `P7D`. Sizes take a unit, such as `25
 | `SPRING_FLYWAY_PASSWORD` | none | **Secret.** Its password | `database.existingSecret`, key `database.secretKeys.ownerPassword` |
 | `SPRING_FLYWAY_URL` | the datasource's URL | A URL of its own for the migrations, for example to bypass a transaction pooler | `extraConfig` |
 | `SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE` | `10` | The connection pool of each server pod | `extraConfig` |
+| `SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT` | `30000` | How long a request waits for a free connection of the pool, in milliseconds, each time it asks for one: a request asks several times, so its busy answer can come later than one wait. A read, or a write that cannot have saved anything yet, that finds none in time is answered `503` with `Retry-After` and may be sent again; a write that may already have saved a change is answered `500`, saying so | `extraConfig` |
 
 [Prepare PostgreSQL](../operator-guide/database.md) explains the roles, TLS and pool sizes.
 
@@ -152,7 +153,8 @@ No variable lets the model's provider run a tool itself for a run: the model rel
 | `TINFIRM_RUN_MAX_WALL_CLOCK` | `PT60M` | How long a run may take, for an agent that sets no time limit of its own; at least a minute | `extraConfig` |
 | `TINFIRM_RUN_MAX_TURNS` | `200` | The most tool calls of a run | `extraConfig` |
 | `TINFIRM_RUN_ACCEPT_TIMEOUT` | `PT10S` | A run its host has not accepted this long after it was sent goes back to the queue | `extraConfig` |
-| `TINFIRM_RUN_REJECT_BACKOFF` | `PT10S` | A run its host rejected is not sent again before this | `extraConfig` |
+| `TINFIRM_RUN_REJECT_BACKOFF` | `PT10S` | A run its host rejected is not sent again before this; each further rejection in a row by the same host doubles the wait | `extraConfig` |
+| `TINFIRM_RUN_REJECT_BACKOFF_MAX` | `PT5M` | The longest wait of a run that the same host keeps rejecting. A value shorter than `TINFIRM_RUN_REJECT_BACKOFF` is not used: the server logs a warning at start and the wait stays at `TINFIRM_RUN_REJECT_BACKOFF` without doubling | `extraConfig` |
 | `TINFIRM_RUN_MAX_EVENTS_PER_RUN` | `20000` | The events stored per run, at least 100; log events go first | `extraConfig` |
 | `TINFIRM_RUN_STREAM_TIMEOUT` | `PT30M` | The lifetime of one live stream of a run's or a conversation's events; the page reconnects | `extraConfig` |
 | `TINFIRM_RUNNER_LEASE_TTL` | `PT30S` | The lease of a running run, renewed by its host's heartbeats | `extraConfig` |
@@ -173,6 +175,7 @@ No variable lets the model's provider run a tool itself for a run: the model rel
 |---|---|---|---|
 | `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` | `25MB` | The largest file of a conversation, a person's or the agent's | `extraConfig` |
 | `TINFIRM_ATTACHMENT_MAX_REQUEST_SIZE` | `26MB` | The largest upload request, the file with its other parts | `extraConfig` |
+| `TINFIRM_ATTACHMENT_MAX_DRAIN_SIZE` | `64MB` | The largest upload over the limits that the server still reads to its end, and throws away, for a signed-in person, a token or a runner host, so that the client gets its 413 instead of a closed connection; keep it at the ingress's body size | `extraConfig` |
 | `TINFIRM_ATTACHMENT_MAX_FILES_PER_CONVERSATION` | `50` | The most files one conversation holds | `extraConfig` |
 | `TINFIRM_ATTACHMENT_MAX_CONVERSATION_SIZE` | `250MB` | The most bytes of all files of one conversation | `extraConfig` |
 | `SERVER_TOMCAT_MAXPARTHEADERSIZE` | `16KB` | The largest header of one part of an upload, which carries the file's name | `extraConfig` |

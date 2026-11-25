@@ -11,7 +11,6 @@ import com.flowtivo.tinfirm.account.Accounts;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.trigger.TriggerAccount;
 import com.flowtivo.tinfirm.trigger.TriggerInfo;
-import com.flowtivo.tinfirm.trigger.TriggerSource;
 
 /**
  * The lender is told (the security review of 2026-10-27, D2; the owner's decision Q3). A trigger on a source anyone may
@@ -41,7 +40,7 @@ class TriggerExposures {
     /** Records the credentials the trigger's table exposes to its open source, once each, in the save's transaction. */
     @Transactional(propagation = Propagation.MANDATORY)
     void record(TriggerInfo trigger) {
-        if (trigger.source() == TriggerSource.SCHEDULE || !trigger.live()) {
+        if (!trigger.source().openToWriters() || !trigger.live()) {
             return;
         }
         Instant now = time.now();

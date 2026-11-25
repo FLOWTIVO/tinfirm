@@ -1,0 +1,106 @@
+---
+# The VM image for a local disk, which every VM shares read-only. Tinfirm publishes none
+# (ADR-0112 decision 4): the site builds it with runner/images/vm/local-disk.sh and gives a
+# file or a URL with its SHA-256. The role checks the file as given, unpacks it if it is
+# compressed with zstd, puts it in place, and records the checksum beside it: a second run with
+# the same checksum leaves the image alone. Nothing of the download is kept.
+#
+# Replace the image only on a node without VMs: how a node changes its image under running
+# VMs is not specified yet (ADR-0112, "Upgrades"). The helper is started again afterwards.
+- name: Read the checksum the image was installed from
+  ansible.builtin.slurp:
+    src: "{{ _tinfirm_sandbox_node_image_source }}"
+  register: _tinfirm_sandbox_node_image_recorded
+  failed_when: false
+
+- name: Look for the image
+  ansible.builtin.stat:
+    path: "{{ _tinfirm_sandbox_node_image }}"
+    get_checksum: false
+    follow: false
+  register: _tinfirm_sandbox_node_image_installed
+
+- name: Install the VM image
+  when: >-
+    not _tinfirm_sandbox_node_image_installed.stat.isreg | default(false)
+    or (_tinfirm_sandbox_node_image_recorded.content | default('') | b64decode | trim | lower)
+       != (tinfirm_sandbox_node_image_checksum | lower)
+  vars:
+    _given: "{{ _tinfirm_sandbox_node_cache_dir }}/{{ _tinfirm_sandbox_node_image_given }}"
+    _next: "{{ _tinfirm_sandbox_node_image }}.next"
+  block:
+    - name: Copy the image from the control node
+      ansible.builtin.copy:
+        src: "{{ tinfirm_sandbox_node_image_src }}"
+        dest: "{{ _given }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: tinfirm_sandbox_node_image_src | length > 0
+
+    - name: Download the image
+      ansible.builtin.get_url:
+        url: "{{ tinfirm_sandbox_node_image_url }}"
+        dest: "{{ _given }}"
+        checksum: "{{ tinfirm_sandbox_node_image_checksum }}"
+        headers: "{{ tinfirm_sandbox_node_image_url_headers }}"
+        owner: root
+        group: root
+        mode: "0600"
+        timeout: 600
+      when: tinfirm_sandbox_node_image_url | length > 0
+      no_log: "{{ tinfirm_sandbox_node_image_url_headers | length > 0 }}"
+
+    - name: Read the image's checksum as given
+      ansible.builtin.stat:
+        path: "{{ _given }}"
+        checksum_algorithm: sha256
+      register: _tinfirm_sandbox_node_image_given_stat
+
+    - name: Check the image against its checksum
+      ansible.builtin.assert:
+        that:
+          - _tinfirm_sandbox_node_image_given_stat.stat.checksum == (tinfirm_sandbox_node_image_checksum | regex_replace('^sha256:', '') | lower)
+        fail_msg: >-
+          {{ _tinfirm_sandbox_node_image_given }} is not the file whose SHA-256
+          tinfirm_sandbox_node_image_checksum names: it is not installed.
+        quiet: true
+
+    # zstd writes the image's holes as holes (its default for a file): 32 GiB stay about 3 GiB.
+    - name: Unpack the image
+      ansible.builtin.command:
+        argv: [zstd, -d, -q, -f, --sparse, "{{ _given }}", -o, "{{ _next }}"]
+      changed_when: true
+      when: _tinfirm_sandbox_node_image_zst | bool
+
+    - name: Take the image as it is
+      ansible.builtin.command:
+        argv: [mv, -f, "{{ _given }}", "{{ _next }}"]
+      changed_when: true
+      when: not (_tinfirm_sandbox_node_image_zst | bool)
+
+    - name: Make the image root's and read-only
+      ansible.builtin.file:
+        path: "{{ _next }}"
+        owner: root
+        group: root
+        mode: "0444"
+
+    - name: Put the image in place
+      ansible.builtin.command:
+        argv: [mv, -f, "{{ _next }}", "{{ _tinfirm_sandbox_node_image }}"]
+      changed_when: true
+      notify: Restart the node agent's helper
+
+    - name: Record the checksum the image was installed from
+      ansible.builtin.copy:
+        content: "{{ tinfirm_sandbox_node_image_checksum | lower }}\n"
+        dest: "{{ _tinfirm_sandbox_node_image_source }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Remove the image as given
+      ansible.builtin.file:
+        path: "{{ _given }}"
+        state: absent

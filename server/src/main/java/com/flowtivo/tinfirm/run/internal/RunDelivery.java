@@ -67,10 +67,12 @@ import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
  * from now, {@code run.assigned} audited; then the frame is sent to the host. A frame that cannot be sent waits for
  * the accept timeout, which takes the run back. An assignment that went stale meanwhile (a {@code hello} that did not
  * list it, or the accept timeout, sent the run back to the queue, and it may run under a later epoch already; or it
- * ended) sends nothing, and revokes the token it opened, that epoch's only.</li>
+ * ended) sends nothing, and revokes the token it opened, that epoch's only. Neither does one whose git tokens'
+ * bindings no longer hold, or whose system was paused, since the reveal (ADR-0116): it goes back to the queue.</li>
  * </ol>
  * Taking the assignment back or ending the run writes its conversation too, so it locks the conversation's row before
- * the run's (CONVENTIONS §10); recording the assignment writes the run's rows only, and locks the run alone.
+ * the run's (CONVENTIONS §10); recording the assignment locks the workspace's systems ({@code FOR SHARE}), then the
+ * conversation's row, then the run's.
  */
 @Component
 class RunDelivery {
@@ -207,9 +209,9 @@ class RunDelivery {
             }
             return;
         }
-        TurnSource.TurnContent.Content turn;
+        TurnSource.TurnContent.Content revealed;
         switch (content) {
-            case TurnSource.TurnContent.Content found -> turn = found;
+            case TurnSource.TurnContent.Content found -> revealed = found;
             case TurnSource.TurnContent.NotReady notReady -> {
                 notReady(assignment, notReady.outcome());
                 return;
@@ -235,6 +237,10 @@ class RunDelivery {
                 return;
             }
         }
+        // ADR-0116, decision 8: expiresAt and mirrorKey go only to a host that renews tokens; placement sends a run on
+        // an App's installation to none other.
+        TurnSource.TurnContent.Content turn = connections.supports(assignment.host().id(),
+                RunnerMessages.FEATURE_RUN_GIT_REFRESH) ? revealed : withoutRefresh(revealed);
         List<String> dirs = dirs(turn.workspaces());
         // The conversation's session bundle (ADR-0097), for a company host that takes bundles.
         String resumeSessionId = assignment.previous() != null ? assignment.previous().sessionId() : null;
@@ -246,9 +252,12 @@ class RunDelivery {
                         resumeSessionId));
         RunnerMessages.RunAssign message = build(assignment, turn, dirs, modelAccess, sessionBundle);
         boolean opened = modelAccess != null;
-        if (!Boolean.TRUE.equals(transactions.inCompany(companyId, () -> record(assignment, turn, dirs, opened)))) {
-            log.info("Run {} is no longer assigned with epoch {}; its prepared assignment is not sent", run.id(),
-                    assignment.epoch());
+        Recorded recorded = transactions.inCompany(companyId, () -> record(source, assignment, turn, dirs, opened));
+        if (recorded != Recorded.RECORDED) {
+            if (recorded == Recorded.STALE) {
+                log.info("Run {} is no longer assigned with epoch {}; its prepared assignment is not sent", run.id(),
+                        assignment.epoch());
+            }
             return;
         }
         if (connections.protocolVersion(assignment.host().id()) != assignment.protocolVersion()) {
@@ -260,6 +269,24 @@ class RunDelivery {
             log.info("Run {} could not be sent to runner host {}; the accept timeout will requeue it", run.id(),
                     assignment.host().id());
         }
+    }
+
+    /** The content with each repository's token without its expiry and mirror key. */
+    static TurnSource.TurnContent.Content withoutRefresh(TurnSource.TurnContent.Content turn) {
+        if (turn.workspaces().stream().noneMatch(workspace -> workspace.git() != null
+                && workspace.git().expiresAt() != null)) {
+            return turn;
+        }
+        List<TurnSource.Workspace> workspaces = turn.workspaces().stream()
+            .map(workspace -> workspace.git() == null || workspace.git().expiresAt() == null ? workspace
+                    : new TurnSource.Workspace(workspace.repositoryId(), workspace.systemId(), workspace.bindingId(),
+                            workspace.name(), workspace.url(), workspace.defaultBranch(), workspace.readOnly(),
+                            workspace.readOnlyCause(), workspace.git().withoutRefresh(), workspace.authorName(),
+                            workspace.authorEmail(), workspace.bindingVersion()))
+            .toList();
+        return new TurnSource.TurnContent.Content(turn.title(), turn.prompt(), turn.resumePrompt(), workspaces,
+                turn.requestableRepositories(), turn.tools(), turn.platformTools(), turn.grantedHosts(),
+                turn.attachments());
     }
 
     /** {@code run.assign} of protocol v2, without a session bundle. */
@@ -346,31 +373,65 @@ class RunDelivery {
         return dirs;
     }
 
+    /** What became of an assignment's third phase. */
+    private enum Recorded {
+        /** Recorded: the frame goes. */
+        RECORDED,
+        /** The run is no longer this assignment. */
+        STALE,
+        /** A binding of its git tokens failed its check, or its system was paused, since the reveal (ADR-0116). */
+        REVOKED
+    }
+
     /**
      * Records the assignment when the run is still it: its workspace, the accept timeout from now, the audit. A stale
      * assignment revokes the model token it opened, and only that one: its epoch's. The run may be running under a
      * later assignment with that one's token (the relay's {@code open} of a stale assignment never revokes a later
      * epoch's); a run lost by lease expiry keeps its token, since its host may bring it back; and a run's end revoked
      * the tokens it had.
+     * <p>
+     * Before that, the bindings the git tokens came from are read again ({@link TurnSource#workspaceRevoked}, which
+     * locks the workspace's systems and then the conversation, before the run here): one that no longer holds, or a
+     * paused system, sends nothing, revokes the model token as for a stale assignment, and takes the run back to the
+     * queue, where the next pass says why (ADR-0116, decision 2). Once this transaction has committed, a revocation
+     * finds the run's rows.
      *
      * @param opened whether this delivery opened a token of the model relay
      */
-    private boolean record(RunDispatcher.Assignment assignment, TurnSource.TurnContent.Content turn,
-            List<String> dirs, boolean opened) {
-        RunStore.RunRow run = runs.lock(assignment.run().id()).orElse(null);
+    private Recorded record(TurnSource source, RunDispatcher.Assignment assignment,
+            TurnSource.TurnContent.Content turn, List<String> dirs, boolean opened) {
+        RunStore.RunRow assigned = assignment.run();
+        String revoked = source.workspaceRevoked(assigned.companyId(), assigned.conversationId(), turn.workspaces())
+            .orElse(null);
+        RunStore.RunRow run = locks.lock(assigned.id()).orElse(null);
         if (run == null) {
-            return false;
+            return Recorded.STALE;
         }
         if (!current(run, assignment)) {
             if (opened) {
                 relay.revoke(run.companyId(), run.id(), assignment.epoch());
             }
-            return false;
+            return Recorded.STALE;
+        }
+        if (revoked != null) {
+            if (opened) {
+                relay.revoke(run.companyId(), run.id(), assignment.epoch());
+            }
+            log.info("Run {} is not sent: {}", run.id(), revoked);
+            Instant now = time.now();
+            QueueReason reason = QueueReason.other(revoked);
+            runs.requeue(run.id(), null, reason, now);
+            publisher.publishEvent(TurnStarter.queueReasonChanged(run, reason));
+            hub.changedAfterCommit(run.id());
+            return Recorded.REVOKED;
         }
         repositories.deleteOfRun(run.id());
         for (int position = 0; position < turn.workspaces().size(); position++) {
-            repositories.insert(run.companyId(), run.id(), position, turn.workspaces().get(position),
-                    dirs.get(position));
+            repositories.insert(run.companyId(), run.id(), assignment.epoch(), position,
+                    turn.workspaces().get(position), dirs.get(position));
+            // Kept by epoch, for a later report of this execution (ADR-0116).
+            repositories.recordAssignment(run.companyId(), run.id(), assignment.epoch(), position,
+                    turn.workspaces().get(position), assignment.host().id(), assignment.host().personalHostId());
         }
         // What its host may download: the skills of this assignment (the skills contract, §7.2).
         skills.replace(run.companyId(), run.id(), skills(assignment.settings()));
@@ -386,7 +447,7 @@ class RunDelivery {
             .detail("modelAccess", TurnStarter.modelAccess(assignment.access()))
             .build());
         hub.changedAfterCommit(run.id());
-        return true;
+        return Recorded.RECORDED;
     }
 
     private static boolean current(RunStore.RunRow run, RunDispatcher.Assignment assignment) {
