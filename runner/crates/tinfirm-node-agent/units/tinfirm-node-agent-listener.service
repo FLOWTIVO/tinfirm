@@ -6,12 +6,18 @@ Description=Tinfirm node agent: the listener (unprivileged), which takes the con
 Requires=tinfirm-node-agent-helper.service
 After=tinfirm-node-agent-helper.service network-online.target
 Wants=network-online.target
+# No start limit: under the default one (5 starts in 10 s), starts that fail in a row, or an
+# installation's restarts on top of them, leave the unit failed for good, and the node takes
+# no VM until someone starts its listener by hand.
+StartLimitIntervalSec=0
 
 [Service]
 User=tinfirm-node-listener
 Group=tinfirm-node-listener
 ExecStart=/usr/local/bin/tinfirm-node-agent listener --config /etc/tinfirm/node-agent/listener.json
-# The helper's socket is there a moment after the helper starts: the listener starts again.
+# The helper's socket is there a moment after the helper starts, and the listen address may
+# come late at a boot: the listener waits for each, a minute at most, and then ends with an
+# error. It is started again after that, and after any other failure.
 Restart=on-failure
 RestartSec=1
 UMask=0077

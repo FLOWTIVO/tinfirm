@@ -43,6 +43,13 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// was silent for three times as long has lost its peer; a driver whose connection was closed
 /// all the same makes a new one with its next call.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long the listener waits at its start for each of the two things that may come after
+/// it: the helper's answer, since the helper makes its socket only after the sweep of its own
+/// start, and the address it listens on, which a node's network may bring up late. Then it
+/// ends with the error, and its unit starts it again.
+pub const START_WAIT: Duration = Duration::from_secs(60);
+/// How long it waits between two tries meanwhile.
+const START_RETRY: Duration = Duration::from_millis(500);
 /// At most one summary of refusals in this time.
 pub const REFUSAL_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 /// How many requests one connection may have in flight.
@@ -121,6 +128,10 @@ pub struct ListenerConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub idle: Option<Duration>,
+    /// Test-only: how long the listener waits at its start, in place of [`START_WAIT`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub start_wait: Option<Duration>,
 }
 
 fn default_watch() -> u64 {
@@ -236,7 +247,8 @@ fn parse_template(text: &str) -> Result<TemplateName, RpcError> {
 
 impl Listener {
     /// Checks the listener's directories, reads its records, and makes them agree with the
-    /// helper: a record whose VM is gone goes, and a VM that no record holds is deleted.
+    /// helper: a record whose VM is gone goes, and a VM that no record holds is deleted. A
+    /// helper that does not answer yet is waited for, for [`START_WAIT`] at most.
     pub async fn start(config: ListenerConfig) -> Result<Arc<Listener>> {
         config.validate()?;
         let own = local::own_uid()?;
@@ -277,9 +289,14 @@ impl Listener {
             events,
             refusals: Refusals::default(),
         });
-        let listed = listener
-            .helper
-            .list()
+        // Whatever the helper's first answer fails for, the listener serves nothing without
+        // it: the helper's socket is not there before the end of the helper's own start.
+        let helper = format!(
+            "the helper's answer on {}",
+            listener.config.helper_socket.display()
+        );
+        let wait = listener.config.start_wait.unwrap_or(START_WAIT);
+        let listed = wait_for(&helper, wait, |_| true, || listener.helper.list())
             .await
             .map_err(|e| anyhow::anyhow!("cannot list the helper's VMs: {e}"))?;
         let on_node: BTreeSet<VmId> = listed.vms.iter().map(|vm| vm.id.clone()).collect();
@@ -1058,6 +1075,52 @@ pub fn bind_tcp(listen: SocketAddr) -> std::io::Result<TcpListener> {
     socket.listen(128)
 }
 
+/// Tries `attempt` every [`START_RETRY`] until it succeeds, until it fails with an error that
+/// waiting does not mend (`mends`), or until `within` has passed; then its last error. The
+/// first failure that is waited on says in the log what the listener waits for, and why.
+async fn wait_for<T, E, F>(
+    what: &str,
+    within: Duration,
+    mends: impl Fn(&E) -> bool,
+    mut attempt: impl FnMut() -> F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: Future<Output = Result<T, E>>,
+{
+    let started = Instant::now();
+    let mut said = false;
+    loop {
+        let error = match attempt().await {
+            Ok(done) => return Ok(done),
+            Err(error) => error,
+        };
+        if !mends(&error) || started.elapsed() >= within {
+            return Err(error);
+        }
+        if !said {
+            said = true;
+            tracing::info!(
+                "waiting for {what}, {} s at most: {error}",
+                within.as_secs()
+            );
+        }
+        tokio::time::sleep(START_RETRY).await;
+    }
+}
+
+/// [`bind_tcp`], waiting for `within` at most while the address is not one of the node's: at
+/// a boot the listener may start before the network has put its address on an interface.
+/// Any other failure is no matter of time, and is returned at once.
+pub async fn bind_tcp_within(listen: SocketAddr, within: Duration) -> std::io::Result<TcpListener> {
+    let what = format!("the listen address {listen}");
+    let absent = |e: &std::io::Error| e.kind() == std::io::ErrorKind::AddrNotAvailable;
+    wait_for(&what, within, absent, || {
+        std::future::ready(bind_tcp(listen))
+    })
+    .await
+}
+
 /// `tinfirm-node-agent listener`: starts the listener's transports and its watch.
 pub async fn run(config: ListenerConfig) -> Result<()> {
     let listener = Listener::start(config.clone()).await?;
@@ -1068,8 +1131,9 @@ pub async fn run(config: ListenerConfig) -> Result<()> {
         let (cert, key) = crate::tls::load(&tls.certificate, &tls.key)?;
         let pin = crate::tls::parse_pin(&tls.client_sha256)?;
         let server = crate::tls::server_config(cert, key, pin)?;
-        let tcp =
-            bind_tcp(tls.listen).with_context(|| format!("cannot listen on {}", tls.listen))?;
+        let tcp = bind_tcp_within(tls.listen, config.start_wait.unwrap_or(START_WAIT))
+            .await
+            .with_context(|| format!("cannot listen on {}", tls.listen))?;
         tracing::info!(listen = %tls.listen, "the listener takes TLS");
         tasks.spawn(listener.clone().serve_tls(tcp, server));
     }
@@ -1171,6 +1235,88 @@ mod tests {
             .await
             .unwrap();
         assert!(!keepalive(plain.accept().await.unwrap().0));
+    }
+
+    #[tokio::test]
+    async fn the_start_waits_for_what_time_mends_and_no_longer_than_its_bound() {
+        use std::io::{Error, ErrorKind};
+        let short = Duration::from_millis(100);
+        // What comes after two tries is waited for.
+        let mut tries = 0;
+        let third = wait_for(
+            "a test",
+            Duration::from_secs(30),
+            |_: &Error| true,
+            || {
+                tries += 1;
+                std::future::ready(if tries < 3 {
+                    Err(Error::from(ErrorKind::NotFound))
+                } else {
+                    Ok(tries)
+                })
+            },
+        );
+        let started = Instant::now();
+        assert_eq!(third.await.unwrap(), 3);
+        assert!(
+            started.elapsed() >= 2 * START_RETRY,
+            "{:?}",
+            started.elapsed()
+        );
+        // What never comes ends the wait with its own error, after the bound and not before.
+        let mut tries = 0;
+        let never = wait_for(
+            "a test",
+            short,
+            |_: &Error| true,
+            || {
+                tries += 1;
+                std::future::ready(Err::<(), _>(Error::from(ErrorKind::NotFound)))
+            },
+        );
+        let started = Instant::now();
+        assert_eq!(never.await.unwrap_err().kind(), ErrorKind::NotFound);
+        assert!(started.elapsed() >= short, "{:?}", started.elapsed());
+        assert!(tries >= 2, "{tries}");
+        // What time does not mend is not tried again.
+        let mut tries = 0;
+        let denied = wait_for(
+            "a test",
+            Duration::from_secs(30),
+            |_: &Error| false,
+            || {
+                tries += 1;
+                std::future::ready(Err::<(), _>(Error::from(ErrorKind::PermissionDenied)))
+            },
+        );
+        assert_eq!(
+            denied.await.unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(tries, 1);
+    }
+
+    #[tokio::test]
+    async fn the_tls_socket_waits_only_for_an_address_that_the_node_does_not_have_yet() {
+        let short = Duration::from_millis(100);
+        // An address of the machine: at once.
+        let here = bind_tcp_within("127.0.0.1:0".parse().unwrap(), short).await;
+        let taken = here.unwrap().local_addr().unwrap();
+        // 192.0.2.1 (TEST-NET-1) is on no interface: waited for, for the bound.
+        let started = Instant::now();
+        let absent = bind_tcp_within("192.0.2.1:7700".parse().unwrap(), short).await;
+        assert_eq!(
+            absent.unwrap_err().kind(),
+            std::io::ErrorKind::AddrNotAvailable
+        );
+        assert!(started.elapsed() >= short, "{:?}", started.elapsed());
+        // A port that another socket listens on is no matter of time: at once, in a bound
+        // that the test would not wait for.
+        let _held = bind_tcp(taken).unwrap();
+        let started = Instant::now();
+        let in_use = bind_tcp_within(taken, Duration::from_secs(600)).await;
+        assert_eq!(in_use.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        assert!(started.elapsed() < Duration::from_secs(60));
     }
 
     #[test]

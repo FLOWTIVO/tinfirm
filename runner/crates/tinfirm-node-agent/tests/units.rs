@@ -7,6 +7,7 @@ use tinfirm_node_agent::{harden, hardening, linux};
 
 const HARDENING: &str = include_str!("../units/tinfirm-node-agent-hardening.service");
 const HELPER: &str = include_str!("../units/tinfirm-node-agent-helper.service");
+const LISTENER: &str = include_str!("../units/tinfirm-node-agent-listener.service");
 const PROFILE: &str = include_str!("../units/tinfirm-vmm.apparmor");
 
 /// The words of a unit's directive, all lines of it together, comments left out.
@@ -56,6 +57,15 @@ fn the_helper_wants_the_hardening_and_does_not_require_it() {
     assert!(directive(HELPER, "After").contains(&unit));
     assert!(!directive(HELPER, "Requires").contains(&unit));
     assert!(!directive(HELPER, "BindsTo").contains(&unit));
+}
+
+#[test]
+fn the_listener_is_started_again_after_a_failure_however_often() {
+    assert_eq!(directive(LISTENER, "Restart"), ["on-failure"]);
+    // In [Unit]: the service manager ignores the setting in [Service].
+    let (unit, service) = LISTENER.split_once("[Service]").unwrap();
+    assert_eq!(directive(unit, "StartLimitIntervalSec"), ["0"]);
+    assert!(directive(service, "StartLimitIntervalSec").is_empty());
 }
 
 #[test]

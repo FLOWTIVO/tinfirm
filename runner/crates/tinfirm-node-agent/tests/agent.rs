@@ -1366,6 +1366,59 @@ async fn a_connection_is_not_closed_for_its_silence_while_a_request_is_in_flight
 }
 
 #[tokio::test]
+async fn the_listener_waits_at_its_start_for_a_helper_that_is_not_there_yet() {
+    let own = local::own_uid().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = tmp.path();
+    for name in [
+        "helper-socket",
+        "helper-state",
+        "spool",
+        "listener-state",
+        "listener-socket",
+    ] {
+        dir(&root.join(name), 0o700);
+    }
+    let wanted = helper_config(root, own);
+    let helper_socket = wanted.socket.clone();
+    // No helper at all: the start ends with the helper's error, after its bound.
+    let bound = Duration::from_millis(300);
+    let mut config = listener_config(root, &helper_socket, [0; 32], own);
+    config.start_wait = Some(bound);
+    let started = Instant::now();
+    let error = Listener::start(config).await.err().unwrap();
+    assert!(
+        format!("{error:#}").contains("cannot list the helper's VMs: cannot reach the helper"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() >= bound, "{:?}", started.elapsed());
+    // A helper whose socket comes later, as after the sweep of its own start: the listener
+    // that was started first waits for it, and then starts as if it had been there.
+    let late = Duration::from_millis(700);
+    let helper = Helper::start(wanted, FakeBackend::new()).unwrap();
+    let helper = tokio::spawn(async move {
+        tokio::time::sleep(late).await;
+        helper::run(helper).await.unwrap();
+    });
+    let config = listener_config(root, &helper_socket, [0; 32], own);
+    let socket = config.socket.as_ref().unwrap().path.clone();
+    let started = Instant::now();
+    let listener = Listener::start(config).await.unwrap();
+    assert!(started.elapsed() >= late, "{:?}", started.elapsed());
+    let unix = local::bind(&socket, own).unwrap();
+    let serving = tokio::spawn(listener.serve_unix(unix, own));
+    let mut driver = unix_driver_at(&socket).await;
+    driver.hello().await;
+    assert_eq!(
+        driver.call("list", json!({})).await.unwrap(),
+        json!({"vms": []})
+    );
+    serving.abort();
+    helper.abort();
+}
+
+#[tokio::test]
 async fn the_listener_refuses_to_start_as_root() {
     let own = local::own_uid().unwrap();
     if own != 0 {
