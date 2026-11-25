@@ -38,8 +38,10 @@ COPY protocol/ protocol/
 COPY server/src/main/resources/psl/public_suffix_list.dat server/src/main/resources/psl/
 COPY runner/ runner/
 COPY ee/runner/ ee/runner/
-# The chart's files of the pod driver's objects, which its tests compare (spec.rs).
+# The chart's files of the pod driver's objects, which its tests compare (spec.rs), and the
+# chart's admission policy, whose text a test reads for what a run pod sets (spec.rs).
 COPY deploy/helm/tinfirm/ci/expected/ deploy/helm/tinfirm/ci/expected/
+COPY deploy/helm/tinfirm/templates/run-pod-admission.yaml deploy/helm/tinfirm/templates/
 WORKDIR /src/runner
 
 # ---- 3. The checks ---------------------------------------------------------------------
