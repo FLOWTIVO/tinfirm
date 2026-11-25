@@ -540,6 +540,68 @@ async fn a_host_whose_own_vms_fill_its_nodes_starts_and_one_with_too_few_slots_d
     );
 }
 
+/// A driver that names machines that did not answer its `verify` (`unreachable`) has the room
+/// of the others: too little of it for the ceiling is then no refusal of the start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_starts_with_less_room_than_its_ceiling_only_when_a_node_did_not_answer() {
+    use tinfirm_runner_host::vm::Vms;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("driver.log");
+    let check = |env: Vec<(&'static str, String)>, max: u32| {
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let vms = Vms::new(vm_options(&log, &env));
+        async move { vms.check(max, Some("host-a")).await }
+    };
+    let down = "node node-2: cannot reach the node: connection refused";
+    let unreachable = || ("FAKE_VM_UNREACHABLE", json!([down]).to_string());
+    // Two nodes of 2 slots for a ceiling of 4, and one of them did not answer: the host starts
+    // on the other's 2 slots.
+    let (_, verified, own) = check(vec![("FAKE_VM_SLOTS", "2".into()), unreachable()], 4)
+        .await
+        .unwrap();
+    assert_eq!((verified.max_vms, own), (Some(2), 0));
+    assert_eq!(verified.unreachable, [down]);
+    // And on no free slot at all, with this host's own VM on the node that answers.
+    let (_, verified, own) = check(
+        vec![
+            ("FAKE_VM_SLOTS", "1".into()),
+            ("FAKE_VM_LEFTOVERS", vms_of("host-a", 1)),
+            unreachable(),
+        ],
+        4,
+    )
+    .await
+    .unwrap();
+    assert_eq!((verified.max_vms, own), (Some(0), 1));
+    // Every node answered, with the same room: refused, as the driver's room is all there is.
+    for answered in [
+        vec![("FAKE_VM_SLOTS", "2".to_string())],
+        vec![
+            ("FAKE_VM_SLOTS", "2".to_string()),
+            ("FAKE_VM_UNREACHABLE", "[]".to_string()),
+        ],
+    ] {
+        let error = format!("{:#}", check(answered, 4).await.unwrap_err());
+        assert!(error.contains("--max-concurrent-runs is 4"), "{error}");
+        assert!(error.contains("room for 2 more VM(s)"), "{error}");
+    }
+    // A problem refuses the start whichever node did not answer: no node that answers is one.
+    let problems = json!(["no node of the driver answered"]).to_string();
+    let error = check(
+        vec![
+            ("FAKE_VM_PROBLEMS", problems),
+            ("FAKE_VM_LIMIT", "0".into()),
+            unreachable(),
+        ],
+        4,
+    )
+    .await
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("breaks the contract"), "{error}");
+    assert!(error.contains("no node of the driver answered"), "{error}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_the_node_driver_only_own_vms_on_nodes_of_the_template_count_as_room() {
     use tinfirm_runner_host::vm::{Builtin, Vms};

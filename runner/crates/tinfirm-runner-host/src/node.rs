@@ -47,9 +47,11 @@
 //!   why a node counts as not hardened or not known. The driver reads `hardened` and `holds`,
 //!   never the lines' ids, so a newer agent can add a line ([`hardening_of`]).
 //! - **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer
-//!   with no problem. A node that does not answer is not counted, and `checked` names it: a
-//!   host with one node down still starts. A node that reports a problem, or a template that no
-//!   node offers, is a problem, which refuses the host.
+//!   with no problem. A node that does not answer is not counted, and `checked` and
+//!   `unreachable` name it: by `unreachable` the host knows that the room is that of the other
+//!   nodes alone, and a host with one node down still starts, with a ceiling above that room
+//!   too ([`crate::vm::Vms::check`]). A node that reports a problem, a template that no node
+//!   offers, or no node that answers is a problem, which refuses the host.
 //! - **Ids.** The driver's id of a VM is `<node>:<the agent's id>`: it names the node, so
 //!   `describe` and `delete` reach the right one after the driver was started again.
 //! - **A node down.** `describe` or `delete` of one of its VMs is an error, never `gone`.
@@ -1369,13 +1371,15 @@ impl NodeDriver {
     }
 
     /// The nodes' problems with the template, and the free slots of those that answer with
-    /// none. A node that does not answer is not counted, and `checked` names it. With them, the
-    /// nodes' hardening mark for the template ([`hardening_of`]): `hardened`, left out when it
-    /// is not known, and `notHardened`.
+    /// none. A node that does not answer is not counted, and `checked` names it; `unreachable`
+    /// names it too, with why, for the host, which starts on the other nodes then. With them,
+    /// the nodes' hardening mark for the template ([`hardening_of`]): `hardened`, left out when
+    /// it is not known, and `notHardened`.
     pub async fn verify(&self, template: &str) -> Result<Value> {
         let nodes = self.offering(template);
         let mut problems = Vec::new();
         let mut checked = Vec::new();
+        let mut unreachable = Vec::new();
         let mut max_vms: u64 = 0;
         let mut answered = 0;
         if nodes.is_empty() {
@@ -1407,7 +1411,10 @@ impl NodeDriver {
                         }
                     }
                 }
-                Err(e) => checked.push(format!("{e:#}; not counted")),
+                Err(e) => {
+                    checked.push(format!("{e:#}; not counted"));
+                    unreachable.push(crate::util::one_line(&format!("{e:#}"), CAUSE_MAX));
+                }
             }
         }
         if !nodes.is_empty() && answered == 0 {
@@ -1434,6 +1441,7 @@ impl NodeDriver {
             "maxVms": max_vms.min(u64::from(u32::MAX)),
             "checked": checked,
             "notHardened": not_hardened,
+            "unreachable": unreachable,
         });
         if let Some(hardened) = hardened {
             verified["hardened"] = json!(hardened);
@@ -2299,6 +2307,10 @@ mod tests {
                     format!("node silent: {why}; not counted"),
                     "node healthy: 2 free"
                 ])
+            );
+            assert_eq!(
+                verified["unreachable"],
+                json!([format!("node silent: {why}")])
             );
             // A new VM goes to the healthy node, and `list` shows that node's VMs.
             let created = driver

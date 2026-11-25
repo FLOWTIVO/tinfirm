@@ -176,7 +176,12 @@ fn driver(dir: &Path, nodes: Vec<Value>) -> Driver {
 }
 
 fn driver_at(config: &Path) -> Driver {
-    Driver::new(DriverCommand {
+    Driver::new(command_at(config))
+}
+
+/// The driver's command line with the configuration `config`.
+fn command_at(config: &Path) -> DriverCommand {
+    DriverCommand {
         program: PathBuf::from(env!("CARGO_BIN_EXE_tinfirm-runner-host")),
         args: vec![
             "vm-driver".into(),
@@ -186,7 +191,7 @@ fn driver_at(config: &Path) -> Driver {
         ],
         env: Vec::new(),
         builtin: None,
-    })
+    }
 }
 
 fn rand_suffix() -> String {
@@ -500,6 +505,12 @@ async fn a_node_that_is_down_is_not_counted_listed_or_described_as_gone() {
             .any(|c| c.contains("node down") && c.contains("not counted")),
         "{verified:?}"
     );
+    // The host learns by `unreachable` that the room is that of the other nodes.
+    assert_eq!(verified.unreachable.len(), 1, "{verified:?}");
+    assert!(
+        verified.unreachable[0].starts_with("node down: cannot reach the node: "),
+        "{verified:?}"
+    );
     let id = driver
         .create(TEMPLATE, "n", &user_data(), &labels("v"))
         .await
@@ -526,6 +537,58 @@ async fn a_node_that_is_down_is_not_counted_listed_or_described_as_gone() {
     // A template that no node offers: a problem.
     let verified = driver.verify("other").await.unwrap();
     assert!(!verified.problems.is_empty(), "{verified:?}");
+}
+
+/// The host's check at its start (`Vms::check`), through the driver: a control host whose
+/// ceiling is the sum of its nodes' slots starts while one node does not answer, on the slots
+/// of the other; it does not start when every node answers and has too few, or when none does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_starts_on_the_nodes_that_answer_and_not_when_none_does() {
+    use tinfirm_runner_host::vm::{Builtin, VmOptions, Vms};
+    let tmp = tempfile::tempdir().unwrap();
+    let client = client(tmp.path());
+    let a = agent(2, &client.cert).await;
+    // A node where nothing listens.
+    let closed = {
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        gone.local_addr().unwrap().to_string()
+    };
+    let node_a = tls_node("node-a", &a.tls_addr.to_string(), &a.node_pin, &client);
+    let down = tls_node("down", &closed, &"cd".repeat(32), &client);
+    let vms = |nodes: Vec<Value>| {
+        let config = tmp
+            .path()
+            .join(format!("node-driver-{}.json", rand_suffix()));
+        std::fs::write(&config, json!({ "nodes": nodes }).to_string()).unwrap();
+        let mut command = command_at(&config);
+        command.builtin = Some(Builtin::Node { config });
+        Vms::new(VmOptions::new(command, TEMPLATE.to_string()))
+    };
+
+    // Two nodes of 2 slots, a ceiling of 4, and one node down.
+    let (hello, verified, own) = vms(vec![node_a.clone(), down.clone()])
+        .check(4, Some(HOST))
+        .await
+        .unwrap();
+    assert_eq!(hello.driver, "node");
+    assert_eq!((verified.max_vms, own), (Some(2), 0));
+    assert!(verified.problems.is_empty(), "{verified:?}");
+    assert_eq!(verified.unreachable.len(), 1, "{verified:?}");
+
+    // The same node alone, which answers: its 2 slots are all there is, and 4 is refused.
+    let error = vms(vec![node_a]).check(4, Some(HOST)).await.unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains(
+            "--max-concurrent-runs is 4, but the VM driver `node` has room for 2 more VM(s)"
+        ),
+        "{error}"
+    );
+
+    // No node answers: refused, whatever the ceiling.
+    let error = vms(vec![down]).check(1, Some(HOST)).await.unwrap_err();
+    let error = format!("{error:#}");
+    assert!(error.contains("no node of the driver answered"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

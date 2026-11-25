@@ -443,9 +443,12 @@ The two machines need each other's fingerprint. In this order:
 | A template's `bridgePort` (default 7443) | The node's template | `tinfirm_runner_host_vm_port` |
 | The published ports | `tinfirm_sandbox_node_first_port` and `_max_vms` | The control host's firewall, and the node's `publishedPorts`, which the play lists for it |
 
-`run` refuses to start while the nodes have fewer free VMs than `--max-concurrent-runs`: keep
-`tinfirm_runner_host_max_concurrent_runs` at most the sum of the nodes' `tinfirm_sandbox_node_max_vms`.
-The play warns when it is above what the nodes have free.
+`run` refuses to start while the nodes, every one of them answering, have fewer free VMs than
+`--max-concurrent-runs`: keep `tinfirm_runner_host_max_concurrent_runs` at most the sum of the nodes'
+`tinfirm_sandbox_node_max_vms`. While a node does not answer, `run` starts on the others with a
+warning that names it, and a run beyond their free VMs fails until the node answers again
+([runner/README.md](../../runner/README.md#a-vm-per-run), "Checked at start"). With no node that
+answers it does not start. The play warns when the ceiling is above what the nodes have free.
 
 ### Take a node out
 

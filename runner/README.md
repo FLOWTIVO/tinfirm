@@ -1324,6 +1324,17 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   count is where the room is: only this host's VMs on the nodes that offer `--vm-template` count,
   since only those nodes' free slots are in `maxVms` (a VM's id names its node). A node that does
   not answer is in neither number; a node that reports a problem refuses the start before.
+  Too little room refuses the start only when every node answered. When the driver's `verify` names
+  nodes that did not (`unreachable`, below), the room is that of the others, and whether all the
+  nodes hold the ceiling cannot be told: `run` starts on the nodes that answer, with the warning
+  "the VM driver has less room than the ceiling because part of its machines did not answer",
+  which names each such node and why, as a host that is already running goes on when a node stops
+  answering. The ceiling stays `--max-concurrent-runs`: until the node answers, a run beyond the
+  room of the others fails with `INFRA` when its VM cannot be created ("no node of the driver can
+  take a VM …"), and the node's slots are used from the first create after it answers, with no
+  restart. A node that does not answer is not a problem of `verify`, so this host goes on taking
+  runs ([A driver that can make no VM](#a-vm-per-run)). A start at which no node answers is
+  refused, as a problem.
 - **Leftovers.** After each connection to the server, this host lists its VMs and deletes those it does
   not hold: after a crash of this host, or a delete that failed. Each VM has the labels `tinfirm-host`
   (this host's id) and `tinfirm-vm` (the VM's own id); the run that takes it is in this host's log.
@@ -1459,7 +1470,12 @@ protocol has no notifications and no batches. `verify` answers `problems`, `maxV
 and two optional fields that this host reads only from `vm-driver node`: `hardened` (`yes` or `no`,
 left out when the driver cannot tell; any other value reads as `no`) and `notHardened`, a list of
 why, for the log ([Isolation level](#isolation-level)). A driver of your own may leave both out: its
-hardening is what `--isolation-hardened` states. A method that fails is answered with an error of code
+hardening is what `--isolation-hardened` states. A third optional field, `unreachable`, is a list
+that names the driver's machines that did not answer this `verify`, each with why (`vm-driver
+node`: `node <name>: <why>`); `maxVms` is then the room of the others alone. This host reads it
+from any driver, at its start: with an entry, room below `--max-concurrent-runs` is a warning and
+no refusal ([Checked at start](#a-vm-per-run)). Left out or empty, every machine answered. The
+protocol's version stays 1. A method that fails is answered with an error of code
 -32000 and a message for this host's log, an unknown method too. A line that is not JSON is
 answered with -32700 and `id` `null`, JSON that is no request with -32600 (with its `id` when it has
 one), and an empty line with nothing. This binary's drivers (`vm-driver digitalocean` and `vm-driver
@@ -1565,9 +1581,12 @@ against a node. Here, the driver is tested against node agents with their fake b
   bytes), that it did not answer, or that it has no free slot. Only when every such node is healthy
   and full is it "no node of the driver has a free slot".
 - **Capacity.** `verify`'s `maxVms` is the sum of the free slots of the nodes that answer with no
-  problem. A node that does not answer is not counted and is named in the start's log; a node that
-  reports a problem, or a template that no node offers, refuses the start. The start check adds
-  this host's own VMs on the nodes that answer to that sum ([Checked at start](#a-vm-per-run)).
+  problem. A node that does not answer is not counted and is named in the start's log, and in
+  `verify`'s `unreachable`: this host then starts on the other nodes, with a warning, also when
+  their room is below `--max-concurrent-runs`. A node that reports a problem, a template that no
+  node offers, or no node that answers refuses the start, and so does too little room when every
+  node answered. The start check adds this host's own VMs on the nodes that answer to that sum
+  ([Checked at start](#a-vm-per-run)).
 - **Ids.** A VM's id is `<node>:<the agent's id>`, so the driver, which this host starts again at will,
   finds the node of each.
 - **A node that is down.** `describe` and `delete` of its VMs fail (never `gone`), and the run that

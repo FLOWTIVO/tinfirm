@@ -400,6 +400,12 @@ pub struct Verified {
     /// <what it found>`. The host passes these on and interprets none of them.
     #[serde(default)]
     pub not_hardened: Vec<String>,
+    /// The driver's machines that did not answer this `verify`, each named with why (the node
+    /// driver: `node <name>: <why>`); `max_vms` is then the room of the others alone. Empty or
+    /// left out: every machine answered. With an entry, room below the host's ceiling does
+    /// not refuse its start ([`Vms::check`]); the host interprets no entry.
+    #[serde(default)]
+    pub unreachable: Vec<String>,
 }
 
 /// The hardening mark of the machines that run a host's VMs (ADR-0113, decision 5), as the
@@ -1352,6 +1358,16 @@ impl Vms {
     /// deletes after its hello. They count as this host's own, so a host that restarts with its
     /// VMs still there is not refused for the room they hold. Returns the driver's `hello`,
     /// its `verify`, and the number of such VMs.
+    ///
+    /// Too little room refuses the start only when every machine of the driver answered. When
+    /// the driver names machines that did not ([`Verified::unreachable`]), the room is that of
+    /// the others, and the host starts on them with a warning, as a host that is already
+    /// running goes on when a node stops answering. Its ceiling stays `max_concurrent_runs`:
+    /// until those machines answer, a run beyond the room fails when its VM is created, and
+    /// their slots are used again from the first create after they answer. A machine that does
+    /// not answer is no problem of `verify`, so it does not make the driver one that can make
+    /// no VM ([`no_vms_cause`]). A driver of which no machine answers reports that as a
+    /// problem, which refuses the start as every problem does.
     pub async fn check(
         &self,
         max_concurrent_runs: u32,
@@ -1388,19 +1404,31 @@ impl Vms {
                 }
                 None => "and this host has none of its own yet".to_string(),
             };
-            if max.saturating_add(held) < max_concurrent_runs {
+            if max.saturating_add(held) >= max_concurrent_runs {
+                tracing::info!(
+                    driver = %hello.driver,
+                    room = max,
+                    own = held,
+                    max_concurrent_runs,
+                    "the VM driver has less room than the ceiling, but this host's own VMs hold the rest"
+                );
+            } else if verified.unreachable.is_empty() {
                 bail!(
                     "--max-concurrent-runs is {max_concurrent_runs}, but the VM driver `{}` has room for {max} more VM(s), {why}; lower --max-concurrent-runs, or give the driver more room (more nodes or slots, or a higher limit of the account)",
                     hello.driver
                 );
+            } else {
+                // The room of the machines that answered: whether all of them hold the ceiling
+                // cannot be told now, and a host with a node down runs on the others.
+                tracing::warn!(
+                    driver = %hello.driver,
+                    room = max,
+                    own = held,
+                    max_concurrent_runs,
+                    unreachable = %verified.unreachable.join("; "),
+                    "the VM driver has less room than the ceiling because part of its machines did not answer: this host starts on the others, and until they answer a run beyond that room fails when its VM is created"
+                );
             }
-            tracing::info!(
-                driver = %hello.driver,
-                room = max,
-                own = held,
-                max_concurrent_runs,
-                "the VM driver has less room than the ceiling, but this host's own VMs hold the rest"
-            );
         }
         Ok((hello, verified, held))
     }
