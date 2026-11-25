@@ -8,7 +8,8 @@ Before=tinfirm-node-agent-helper.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# KVM for the processor that is there: one of the two fails, by design.
+# KVM for the processor that is there: one of the two fails, by design. On aarch64 both do:
+# KVM is built into that kernel.
 ExecStart=-/usr/sbin/modprobe kvm_intel
 ExecStart=-/usr/sbin/modprobe kvm_amd
 # The snapshot over the shared image; the veth and the tap device of a VM; the two firewall

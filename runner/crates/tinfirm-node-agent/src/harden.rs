@@ -29,8 +29,16 @@ pub const MODULES_DISABLED: &str = "proc/sys/kernel/modules_disabled";
 /// (`/dev/loop-control`, `/dev/net/tun`), whose nodes are there before the module is loaded and
 /// load it when first opened. Once module loading is off, that load fails.
 pub const DEVICE_MODULES: [&str; 2] = ["loop", "tun"];
-/// KVM for the processor that is there: one of the two.
+/// KVM for the processor that is there, on x86-64: one of the two.
 pub const KVM_VENDOR: [&str; 2] = ["kvm_intel", "kvm_amd"];
+
+/// The modules of which a kernel of the architecture `arch` (as [`std::env::consts::ARCH`]
+/// names it) needs one for its processor's KVM, beside `kvm` of [`MODULES`]: [`KVM_VENDOR`]
+/// on x86-64, and none elsewhere. An aarch64 kernel has no such module: KVM is built into it
+/// whole, and `kvm` is all it shows of it.
+pub fn kvm_vendor(arch: &str) -> &'static [&'static str] {
+    if arch == "x86_64" { &KVM_VENDOR } else { &[] }
+}
 
 /// The lockdown the configuration asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -166,14 +174,14 @@ pub fn read_current(root: &Path) -> Current {
         kexec_load_disabled: number(root, KEXEC),
         lockdown,
         modules_disabled: number(root, MODULES_DISABLED),
-        missing_modules: missing_modules(root),
+        missing_modules: missing_modules(root, std::env::consts::ARCH),
     }
 }
 
-/// The modules the agent needs that are neither loaded nor built into the running kernel, by
-/// the kernel's list of built-in modules in `/lib/modules/<release>` or the copy that the
-/// modules' unit makes.
-fn missing_modules(root: &Path) -> Result<Vec<String>, String> {
+/// The modules the agent needs on a kernel of the architecture `arch` that are neither loaded
+/// nor built into the running kernel, by the kernel's list of built-in modules in
+/// `/lib/modules/<release>` or the copy that the modules' unit makes.
+fn missing_modules(root: &Path, arch: &str) -> Result<Vec<String>, String> {
     let release = read(root, "proc/sys/kernel/osrelease")
         .map(|r| r.trim().to_string())
         .unwrap_or_default();
@@ -197,8 +205,9 @@ fn missing_modules(root: &Path) -> Result<Vec<String>, String> {
         .filter(|name| !there(name))
         .map(|name| name.to_string())
         .collect();
-    if !KVM_VENDOR.iter().any(|name| there(name)) {
-        missing.push(KVM_VENDOR.join(" or "));
+    let vendor = kvm_vendor(arch);
+    if !vendor.is_empty() && !vendor.iter().any(|name| there(name)) {
+        missing.push(vendor.join(" or "));
     }
     Ok(missing)
 }
@@ -569,7 +578,8 @@ mod tests {
         assert!(format!("{e:#}").contains("0666"), "{e:#}");
     }
 
-    /// A machine under a temporary root, with what `harden` reads and writes.
+    /// A machine under a temporary root, with what `harden` reads and writes: an x86-64 one,
+    /// with a vendor's KVM module.
     fn machine(kexec: &str, lockdown: &str, modules: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -596,11 +606,11 @@ mod tests {
     fn the_modules_are_read_from_sys_module_and_the_built_in_list() {
         let dir = machine("0\n", "[none] integrity confidentiality\n", "0\n");
         let root = dir.path();
-        assert_eq!(read_current(root).missing_modules, Ok(vec![]));
+        assert_eq!(missing_modules(root, "x86_64"), Ok(vec![]));
         std::fs::remove_dir(root.join("sys/module/tun")).unwrap();
         std::fs::remove_dir(root.join("sys/module/kvm_amd")).unwrap();
         assert_eq!(
-            read_current(root).missing_modules,
+            missing_modules(root, "x86_64"),
             Ok(vec!["tun".to_string(), "kvm_intel or kvm_amd".to_string()])
         );
         // Built in, by the copy of the modules' unit.
@@ -611,7 +621,49 @@ mod tests {
             "kernel/drivers/net/tun.ko\nkernel/arch/x86/kvm/kvm-amd.ko\n",
         )
         .unwrap();
-        assert_eq!(read_current(root).missing_modules, Ok(vec![]));
+        assert_eq!(missing_modules(root, "x86_64"), Ok(vec![]));
+        // The machine's own architecture is the one that is asked.
+        assert_eq!(
+            read_current(root).missing_modules,
+            missing_modules(root, std::env::consts::ARCH)
+        );
+    }
+
+    #[test]
+    fn a_vendors_kvm_module_is_asked_of_an_x86_64_kernel_alone() {
+        assert_eq!(kvm_vendor("x86_64"), ["kvm_intel", "kvm_amd"]);
+        assert!(kvm_vendor("aarch64").is_empty());
+        // An aarch64 kernel: every module of the list, `kvm` built in among them, and no
+        // vendor's module, which that kernel does not have.
+        let dir = machine("0\n", "[none] integrity confidentiality\n", "0\n");
+        let root = dir.path();
+        std::fs::remove_dir(root.join("sys/module/kvm_amd")).unwrap();
+        assert_eq!(missing_modules(root, "aarch64"), Ok(vec![]));
+        assert_eq!(
+            missing_modules(root, "x86_64"),
+            Ok(vec!["kvm_intel or kvm_amd".to_string()])
+        );
+        // So module loading is turned off there, where an x86-64 kernel without its vendor's
+        // module keeps it.
+        let on = |arch: &str| {
+            let mut current = read_current(root);
+            current.missing_modules = missing_modules(root, arch);
+            steps(&ALL, &current)
+        };
+        assert!(writes(&on("aarch64")).contains(&(MODULES_DISABLED, "1")));
+        assert_eq!(refusals(&on("aarch64")), Vec::<&str>::new());
+        assert!(!writes(&on("x86_64")).contains(&(MODULES_DISABLED, "1")));
+        assert!(refusals(&on("x86_64"))[0].contains("kvm_intel or kvm_amd"));
+        // KVM itself is asked of both: a kernel without it keeps module loading.
+        std::fs::remove_dir(root.join("sys/module/kvm")).unwrap();
+        assert_eq!(
+            missing_modules(root, "aarch64"),
+            Ok(vec!["kvm".to_string()])
+        );
+        assert_eq!(
+            missing_modules(root, "x86_64"),
+            Ok(vec!["kvm".to_string(), "kvm_intel or kvm_amd".to_string()])
+        );
     }
 
     #[test]
