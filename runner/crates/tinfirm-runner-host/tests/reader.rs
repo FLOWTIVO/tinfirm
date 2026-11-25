@@ -1021,6 +1021,218 @@ fn without_landlock_the_seccomp_filter_alone_keeps_a_readers_signals_in_its_grou
     target.wait().unwrap();
 }
 
+// ----- a git outside the system's directories -----------------------------------------------
+
+/// A scratch home of the host's user: the host's config directory with a file that stands for
+/// its token, a file of the user's own, the host's data directory with a run's clone, and a git
+/// of the user's own at `place` beneath the home. That git is a wrapper around the system's git
+/// that has its other programs in `libexec/git-core` of the home, as a git built with the home
+/// as its prefix has them; one of them is `git hello`.
+struct Home {
+    _dir: tempfile::TempDir,
+    home: PathBuf,
+    config: PathBuf,
+    data: PathBuf,
+    token: PathBuf,
+    notes: PathBuf,
+    repo: PathBuf,
+    /// The `PATH` that has the home's git first.
+    path: String,
+}
+
+impl Home {
+    /// `None` where the system's git is not in the system's directories itself: no reader
+    /// could run it for the wrapper.
+    fn new(place: &str) -> Option<Home> {
+        let system = std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join("git"))
+            .find(|candidate| candidate.is_file())
+            .and_then(|git| std::fs::canonicalize(git).ok())
+            .filter(|git| git.starts_with("/usr") || git.starts_with("/bin"))?;
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let config = home.join(".config/tinfirm-runner");
+        let data = home.join(".local/share/tinfirm-runner");
+        let repo = data.join("workspaces/run-1/repo");
+        let programs = home.join("libexec/git-core");
+        for dir in [&config, &repo, &programs] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let token = config.join("config.json");
+        std::fs::write(&token, "tfr_TEST_ONLY_canary_host_token").unwrap();
+        let notes = home.join("notes.txt");
+        std::fs::write(&notes, "the user's own file").unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        let script = |path: &Path, body: String| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        script(
+            &programs.join("git-hello"),
+            "#!/bin/sh\necho 'hello from the programs of the home'\n".to_string(),
+        );
+        let own = home.join(place);
+        script(
+            &own,
+            format!(
+                "#!/bin/sh\nGIT_EXEC_PATH='{}' exec '{}' \"$@\"\n",
+                programs.display(),
+                system.display()
+            ),
+        );
+        let path = format!(
+            "{}:{}",
+            own.parent().unwrap().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Some(Home {
+            _dir: dir,
+            home,
+            config,
+            data,
+            token,
+            notes,
+            repo,
+            path,
+        })
+    }
+
+    /// A reader of the host whose home this is.
+    fn reader(&self) -> Reader {
+        Reader::new(BIN).guarding(&[&self.config, &self.data], Some(&self.home))
+    }
+
+    /// git with `args` in the clone, in `reader` with the home's git first on its `PATH`: its
+    /// stdout, whether it succeeded, and its stderr.
+    fn git(&self, reader: &Reader, args: &[&str]) -> (String, bool, String) {
+        let mut command = reader.git_command(&self.repo, args);
+        command.env("PATH", &self.path);
+        let (out, ok, stderr) = run_pack(command);
+        (String::from_utf8_lossy(&out).into_owned(), ok, stderr)
+    }
+
+    /// The host's probe of a reader, as `run` makes it at its start, with the home's git first
+    /// on the reader's `PATH`: the reader's answer.
+    fn probe(&self) -> serde_json::Value {
+        let job = serde_json::json!({
+            "allow_unconfined": false,
+            "guarded": { "dirs": [&self.config, &self.data], "home": &self.home },
+            "work": {
+                "kind": "probe",
+                "deny_read": [&self.token, &self.notes, &self.config, &self.data],
+                "connect": null
+            }
+        });
+        let out = Command::new(BIN)
+            .arg(tinfirm_runner_host::reader::SUBCOMMAND)
+            .arg(job.to_string())
+            .env_clear()
+            .env("PATH", &self.path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let line = out.stdout.split(|&b| b == b'\n').next().unwrap_or_default();
+        serde_json::from_slice(line)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+const NO_SYSTEM_GIT: &str =
+    "SKIPPED: this kernel cannot confine a reader, or git is not in the system's directories here";
+
+#[test]
+fn a_git_in_the_users_home_gives_a_reader_its_own_directories_and_not_the_home() {
+    let Some(home) = Home::new("bin/git").filter(|_| confinable()) else {
+        eprintln!("{NO_SYSTEM_GIT}");
+        return;
+    };
+    let reader = home.reader();
+    // The reader runs the home's git and, through it, a program of its `libexec/git-core`.
+    let (out, ok, stderr) = home.git(&reader, &["hello"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(out, "hello from the programs of the home\n");
+    let (head, ok, stderr) = home.git(&reader, &["rev-parse", "HEAD"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(head.trim(), git(&home.repo, &["rev-parse", "HEAD"]));
+    // It reads its clone, and nothing else of the home that git stands in: not the host's
+    // token, and not a file beside git's directories.
+    let readme = home.repo.join("README.md");
+    let (hash, ok, stderr) = home.git(&reader, &["hash-object", readme.to_str().unwrap()]);
+    assert!(ok, "{stderr}");
+    assert_eq!(hash.trim().len(), 40, "{hash}");
+    for kept in [&home.token, &home.notes] {
+        let (out, ok, stderr) = home.git(&reader, &["hash-object", kept.to_str().unwrap()]);
+        assert!(!ok, "the reader read {}: {out}", kept.display());
+        assert!(stderr.contains("Permission denied"), "{stderr}");
+    }
+    // As a control, the same git outside a reader reads both.
+    for kept in [&home.token, &home.notes] {
+        let read = Command::new(home.home.join("bin/git"))
+            .args(["hash-object", kept.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(read.status.success(), "{}", kept.display());
+    }
+    // And the probe that `run` and `doctor` judge by is confined the same way.
+    let answer = home.probe();
+    let done = &answer["ok"];
+    assert_eq!(done["status"]["landlock"], true, "{answer}");
+    assert_eq!(done["status"]["problem"], serde_json::Value::Null);
+    assert_eq!(
+        done["read"],
+        serde_json::json!([false, false, false, false]),
+        "{answer}"
+    );
+}
+
+#[test]
+fn a_git_directly_in_the_users_home_is_refused_and_the_probe_says_so() {
+    let Some(home) = Home::new("git").filter(|_| confinable()) else {
+        eprintln!("{NO_SYSTEM_GIT}");
+        return;
+    };
+    // The probe is not confined, and says why: `run` refuses to start on it.
+    let answer = home.probe();
+    let status = &answer["ok"]["status"];
+    assert_eq!(status["landlock"], false, "{answer}");
+    assert_eq!(status["seccomp"], true, "{answer}");
+    let problem = status["problem"].as_str().unwrap_or_default();
+    assert!(
+        problem.contains("is or holds the home of this host's user")
+            && problem.contains(home.home.join("git").to_str().unwrap()),
+        "{answer}"
+    );
+    // A reader that runs git refuses its job, and git never runs.
+    let reader = home.reader();
+    let (out, ok, _) = home.git(&reader, &["rev-parse", "HEAD"]);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("the host takes no unconfined reader")
+            && out.contains("is or holds the home of this host's user"),
+        "{out}"
+    );
+    // A reader that runs no git has no such directory, and stays confined.
+    let scene = Scene::new();
+    let done = reader
+        .unpack(
+            &mut archive(&[file("ok.txt", b"fine")]).as_slice(),
+            &scene.dest,
+            &limits(),
+            false,
+            WAIT,
+        )
+        .unwrap();
+    assert_eq!(done.files, 1);
+    // Only a host that takes an unconfined reader runs such a git, without Landlock.
+    let (head, ok, stderr) = home.git(&reader.allowing_unconfined(true), &["rev-parse", "HEAD"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(head.trim(), git(&home.repo, &["rev-parse", "HEAD"]));
+}
+
 // ----- the push's pack (path C, slice 7) ---------------------------------------------------
 
 /// Runs a pack's reader to its end: its stdout (the pack) and whether it succeeded.

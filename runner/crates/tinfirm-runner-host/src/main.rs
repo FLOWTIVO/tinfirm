@@ -2578,7 +2578,9 @@ fn check_ceiling(max_concurrent_runs: u32, vm: bool) -> Result<()> {
 
 /// The reader of what the sandboxes send back (ADR-0112, open question 1) and the front process
 /// of each sandbox (path C, part 2): this binary, confined. A reader's probe confines itself as
-/// a reader does and tries to open this host's directories, its own memory and a socket; a
+/// a reader that runs git does and tries to open this host's directories, its own memory and a
+/// socket; a git whose place would give a reader the host's files is refused there, and counts
+/// as a reader that cannot be confined ([`host_reader`]). A
 /// front's probe confines itself as a front does and tries those and to reach this process and
 /// to start a program ([`probe_front`]). Where either cannot be confined, every host that uses
 /// the bridge (`--sandbox-bridge`, `--executor vm`) is refused unless `allow`
@@ -2588,7 +2590,7 @@ async fn check_reader_and_front(
     paths: &Paths,
     allow: bool,
 ) -> Result<tinfirm_runner_host::reader::Reader> {
-    let reader = tinfirm_runner_host::reader::Reader::from_current_exe()?;
+    let reader = host_reader(paths)?;
     let reader_probe = probe_reader(paths, &reader).await?;
     let front_probe = probe_front(paths)
         .await
@@ -2643,7 +2645,20 @@ const UNCONFINED_READER_COST: &str = "the reader still runs as a process of its 
 /// nothing outside its own process group.
 const UNCONFINED_FRONT_COST: &str = "each front still runs as a process of its own that holds no credential, but a flaw in its parsing of its sandbox's bridge (the TLS, the frames, the tunnels) or of the HTTP to the sandbox's proxies reaches every file of this host's user, the host's token and stored credentials among them; where seccomp is missing too, it also reaches the network, starts programs and can end `run` and its runs with a signal";
 
-/// A reader's probe, with this host's directories and its memory to be refused.
+/// This host's readers: this binary, told which places of the host's the directories of a git
+/// outside the system's must stay clear of, its config and data directories and its user's home
+/// ([`tinfirm_runner_host::confine::Guarded`]).
+fn host_reader(paths: &Paths) -> Result<tinfirm_runner_host::reader::Reader> {
+    Ok(
+        tinfirm_runner_host::reader::Reader::from_current_exe()?.guarding(
+            &[&paths.config_dir, &paths.data_dir],
+            dirs::home_dir().as_deref(),
+        ),
+    )
+}
+
+/// A reader's probe, with this host's directories and its memory to be refused. It is confined
+/// as the readers that run git are, so what it finds holds for them.
 async fn probe_reader(
     paths: &Paths,
     reader: &tinfirm_runner_host::reader::Reader,
@@ -2755,7 +2770,7 @@ async fn doctor_reader(checks: &mut Checks, paths: &Paths, bridged: bool, allow:
             format!("any process of this host's user can read `run`'s memory: {e}"),
         ),
     }
-    let probe = match tinfirm_runner_host::reader::Reader::from_current_exe() {
+    let probe = match host_reader(paths) {
         Ok(reader) => probe_reader(paths, &reader).await,
         Err(e) => Err(e),
     };

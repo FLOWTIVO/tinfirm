@@ -52,7 +52,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tinfirm_bridge::files::{self, Limits, ReadOne, Unpacked};
 
-use crate::confine::{self, Plan, Status};
+use crate::confine::{self, Guarded, Plan, Status};
 
 /// The hidden subcommand of this binary that is the reader.
 pub const SUBCOMMAND: &str = "reader";
@@ -96,15 +96,20 @@ struct Job {
     /// The host takes an unconfined reader on this system (`--allow-unconfined-reader`, the
     /// tests). Otherwise a reader that cannot confine itself refuses.
     allow_unconfined: bool,
+    /// The host's own places, which a git outside the system's directories must stay clear of
+    /// ([`Guarded`]). They are compared with git's directories and never opened.
+    #[serde(default)]
+    guarded: Guarded,
     work: Work,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Work {
-    /// Confine as a reader does, then try what must be refused: open each of `deny_read`,
-    /// create a socket, connect to `connect`, and, with `signal`, signal and limit that
-    /// process, which is outside the reader's process group ([`Signals`]).
+    /// Confine as a reader that runs git does (the widest plan a reader gets, without a job's
+    /// own directories), then try what must be refused: open each of `deny_read`, create a
+    /// socket, connect to `connect`, and, with `signal`, signal and limit that process, which
+    /// is outside the reader's process group ([`Signals`]).
     Probe {
         deny_read: Vec<PathBuf>,
         connect: Option<SocketAddr>,
@@ -288,6 +293,7 @@ pub enum Input<'a> {
 pub struct Reader {
     binary: PathBuf,
     allow_unconfined: bool,
+    guarded: Guarded,
 }
 
 impl Reader {
@@ -297,6 +303,7 @@ impl Reader {
         Reader {
             binary: binary.into(),
             allow_unconfined: false,
+            guarded: Guarded::default(),
         }
     }
 
@@ -316,6 +323,24 @@ impl Reader {
 
     pub fn allows_unconfined(&self) -> bool {
         self.allow_unconfined
+    }
+
+    /// The host's own places that its readers' git must stay clear of ([`Guarded`]): its
+    /// directories `dirs` (config and data) and its user's `home`. A git installed outside the
+    /// system's directories whose own directories reach one of them is refused, and its reader
+    /// is not confined. They are resolved here, as git's directories are in the reader, so that
+    /// a symbolic link on the way hides neither from the other.
+    pub fn guarding(mut self, dirs: &[&Path], home: Option<&Path>) -> Reader {
+        let resolved = |path: &Path| {
+            std::fs::canonicalize(path)
+                .or_else(|_| std::path::absolute(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        self.guarded = Guarded {
+            dirs: dirs.iter().map(|dir| resolved(dir)).collect(),
+            home: home.map(resolved),
+        };
+        self
     }
 
     pub fn binary(&self) -> &Path {
@@ -571,6 +596,7 @@ impl Reader {
     pub fn git_command(&self, repo: &Path, args: &[&str]) -> tokio::process::Command {
         let job = Job {
             allow_unconfined: self.allow_unconfined,
+            guarded: self.guarded.clone(),
             work: Work::Git {
                 repo: repo.to_path_buf(),
                 args: args.iter().map(|a| a.to_string()).collect(),
@@ -609,6 +635,7 @@ impl Reader {
         check_pack_names(head, exclude).map_err(|e| anyhow!(e))?;
         let job = Job {
             allow_unconfined: self.allow_unconfined,
+            guarded: self.guarded.clone(),
             work: Work::PackObjects {
                 repo: repo.to_path_buf(),
                 head: head.to_string(),
@@ -648,6 +675,7 @@ impl Reader {
     ) -> Result<(Done, Vec<u8>)> {
         let job = serde_json::to_string(&Job {
             allow_unconfined: self.allow_unconfined,
+            guarded: self.guarded.clone(),
             work: work.clone(),
         })?;
         let mut command = std::process::Command::new(&self.binary);
@@ -994,7 +1022,10 @@ pub fn child_main(job: &str) -> ExitCode {
         Ok(job) => job,
         Err(e) => return answer(Answer::Error(e), None),
     };
-    let plan = plan(&job.work);
+    let plan = Plan {
+        guarded: job.guarded.clone(),
+        ..plan(&job.work)
+    };
     #[cfg(target_os = "linux")]
     limit_resources(&job.work);
     let status = confine::confine(&plan);
@@ -1077,7 +1108,13 @@ fn parse_job(text: &str) -> Result<Job, String> {
 
 fn plan(work: &Work) -> Plan {
     match work {
-        Work::Probe { .. } | Work::ReadOne { .. } => Plan::default(),
+        // A probe is judged with what the jobs that run git get: where git is installed decides
+        // what they read, and whether they are confined at all ([`confine::confine`]).
+        Work::Probe { .. } => Plan {
+            git: true,
+            ..Plan::default()
+        },
+        Work::ReadOne { .. } => Plan::default(),
         Work::Unpack { dest, .. } => Plan {
             write: vec![dest.clone()],
             ..Plan::default()
@@ -1508,6 +1545,7 @@ mod tests {
     fn jobs_round_trip_and_refuse_what_is_not_theirs() {
         let job = Job {
             allow_unconfined: false,
+            guarded: Guarded::default(),
             work: Work::Unpack {
                 dest: "/data/homes/a/b".into(),
                 gzip: false,
@@ -1565,6 +1603,7 @@ mod tests {
         );
         let job = serde_json::to_string(&Job {
             allow_unconfined: false,
+            guarded: Guarded::default(),
             work,
         })
         .unwrap();

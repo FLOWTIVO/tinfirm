@@ -912,7 +912,16 @@ The reader:
 - **What it cannot do** (Linux 5.19 or later, with Landlock enabled), applied by itself before it
   reads a byte:
   - Landlock: it reads and writes only its directories (it executes nothing there), and reads and
-    executes the system's directories for git. Anywhere else it opens no file, lists no directory,
+    executes the system's directories for git. Where the first `git` on `run`'s `PATH` is
+    installed outside them, it reads and executes two more: the directory that holds `git` and
+    the one that holds git's other programs (what `git --exec-path` answers), and nothing around
+    them, so `~/bin` and `~/libexec/git-core` for a git built in the home, not the home. A git
+    whose two directories would give more is refused: one that is the root, is or holds the home
+    of `run`'s user, or holds or lies in this host's config or data directory (`/git`, `~/git`,
+    `~/.local/git`). Its reader makes no Landlock rules and counts as not confined (below).
+    Such a git needs a directory of its own, as `/opt/git/bin/git`; one that loads libraries
+    from beside itself (`<prefix>/lib`) does not run in a reader. Anywhere else it opens no
+    file, lists no directory,
     executes nothing, and creates, removes, renames or links nothing: not in this host's config or
     data directory (its token, the take-back records), in another run's directories, or in `/proc`
     (so not `/proc/<pid>/mem` of `run`). Landlock checks no path's metadata, on any kernel: a
@@ -1025,11 +1034,13 @@ Both:
   reaches the host's credentials with no second flaw. By default the push, too, runs in `run`'s
   process tree with the run's token (above); with `--push-client host` it does not, and `run` parses
   the code host's answers to it instead ([The push](#the-push)).
-- **Where they cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS),
-  every host that uses the bridge refuses to start: `--executor vm` and a Docker host with
-  `--sandbox-bridge` alike, before any image is built. At its start `run` runs a reader's probe
-  and a front's, and one refusal names each that is not confined: "this system cannot confine the
-  reader of what sandboxes send back (…) nor the front process of a sandbox (…)". A front whose
+- **Where they cannot be confined** (Linux before 5.19, Landlock not enabled at boot, macOS, or
+  a git whose place is refused, above), every host that uses the bridge refuses to start:
+  `--executor vm` and a Docker host with `--sandbox-bridge` alike, before any image is built. At
+  its start `run` runs a reader's probe and a front's, and one refusal names each that is not
+  confined: "this system cannot confine the reader of what sandboxes send back (…) nor the front
+  process of a sandbox (…)". The reader's probe confines itself as the readers that run git do,
+  with git's own directories where it has them, so it is refused what they are. A front whose
   probe got through anything it must be refused (a host file, a socket, another process, a
   program), or that could not signal its own process group or run its runtime, counts as not
   confined too. `--allow-unconfined-reader` (`TINFIRM_RUNNER_ALLOW_UNCONFINED_READER`), one flag
@@ -1045,8 +1056,9 @@ Both:
     programs and can end `run` and its runs with a signal.
 
   A Docker host without the bridge uses no reader and no front, and checks neither.
-- **`doctor`** runs a reader, which confines itself and tries to open the config and data
-  directories, its parent's memory and a socket, and says `reader: confined: Landlock ABI 7 (files,
+- **`doctor`** runs a reader, which confines itself as one that runs git does and tries to open
+  the config and data directories, its parent's memory and a socket, and says
+  `reader: confined: Landlock ABI 7 (files,
   TCP, signals and abstract sockets), seccomp filter, no_new_privs, not dumpable`, or why not. It
   runs a front's probe, which also tries to reach `doctor`'s process and to start a program, and
   says `front: confined: …`, or why not. Each line has the outcome `run` would give: a failure

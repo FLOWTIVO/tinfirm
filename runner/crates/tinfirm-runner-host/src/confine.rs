@@ -8,7 +8,9 @@
 //!
 //! - makes itself not dumpable (`PR_SET_DUMPABLE` 0): no process of its user traces it or
 //!   reads its memory;
-//! - restricts itself with Landlock: reading and executing the system's directories (for git),
+//! - restricts itself with Landlock: reading and executing the system's directories (for git;
+//!   and, where git is installed outside them, the directory that holds it and the one that
+//!   holds its other programs, with nothing around them: [`Guarded`]),
 //!   reading the directories its job reads, writing only the directories its job writes (and
 //!   never executing there), `/dev/null`, reading `/dev/urandom`. Of every other path, `/proc`
 //!   included, it is refused what Landlock checks: opening a file, listing a directory,
@@ -57,6 +59,8 @@
 //! Elsewhere (macOS, Windows, a Linux kernel without Landlock 2) nothing of this exists, and
 //! [`confine`] says so: the host decides what to do with such a reader ([`crate::reader`]).
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -68,10 +72,26 @@ pub struct Plan {
     pub read: Vec<PathBuf>,
     /// Read and write beneath (never execute).
     pub write: Vec<PathBuf>,
-    /// The job runs git, so the system's directories may be read and executed.
+    /// The job runs git, so the system's directories may be read and executed, and git's own
+    /// two where it is installed outside them.
     pub git: bool,
+    /// What the directories of such a git must stay clear of.
+    pub guarded: Guarded,
     /// Which seccomp filter applies.
     pub profile: Profile,
+}
+
+/// The host's own places. A reader that runs a git from outside the system's directories reads
+/// and executes everything beneath the directory that holds it and the one that holds its other
+/// programs, so neither may reach these: such a git is refused, and its reader is not confined
+/// ([`confine`]). The host gives them resolved (no symbolic link), as git's directories are.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Guarded {
+    /// The host's config and data directories: no directory of git's holds one or lies in one.
+    pub dirs: Vec<PathBuf>,
+    /// The home of the host's user: no directory of git's is it or holds it.
+    pub home: Option<PathBuf>,
 }
 
 /// The kind of process that confines itself, which decides its seccomp filter.
@@ -195,19 +215,107 @@ const SYSTEM_DIRS: &[&str] = &[
 #[cfg(target_os = "linux")]
 const SYSTEM_FILES: &[&str] = &["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"];
 
-/// The directory that holds `git` (and its own `libexec`), when it is outside
-/// [`SYSTEM_DIRS`]: the grandparent of the resolved binary (`/opt/git` for `/opt/git/bin/git`).
+/// Whether `path` is beneath one of [`SYSTEM_DIRS`].
 #[cfg(target_os = "linux")]
-fn git_home() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let git = std::env::split_paths(&path)
+fn in_system_dirs(path: &Path) -> bool {
+    SYSTEM_DIRS.iter().any(|dir| path.starts_with(dir))
+}
+
+/// The directories that a reader's git is read and executed from on top of [`SYSTEM_DIRS`]:
+/// none for the system's git. For a git installed elsewhere, the directory that holds the first
+/// `git` on `PATH` and the one that holds its other programs, which `git --exec-path` names
+/// (`libexec/git-core` beside its directory where git does not answer). Only these two: the
+/// directory above them (`/opt/git` for `/opt/git/bin/git`) is the user's home for a git that
+/// was built there (`~/bin/git`), with the host's token in it. `Err` says why such a git is
+/// refused ([`git_dirs_of`]).
+#[cfg(target_os = "linux")]
+fn git_dirs(guarded: &Guarded) -> Result<Vec<PathBuf>, String> {
+    let Some(path) = std::env::var_os("PATH") else {
+        return Ok(Vec::new());
+    };
+    let Some(git) = std::env::split_paths(&path)
         .map(|dir| dir.join("git"))
-        .find(|candidate| candidate.is_file())?;
-    let git = std::fs::canonicalize(git).ok()?;
-    if SYSTEM_DIRS.iter().any(|dir| git.starts_with(dir)) {
+        .find(|candidate| candidate.is_file())
+        .and_then(|git| std::fs::canonicalize(git).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    if in_system_dirs(&git) {
+        return Ok(Vec::new());
+    }
+    let exec = git_exec_path(&git, &path).or_else(|| {
+        let beside = git.parent()?.parent()?.join("libexec/git-core");
+        std::fs::canonicalize(beside)
+            .ok()
+            .filter(|dir| dir.is_dir())
+    });
+    git_dirs_of(&git, exec.as_deref(), guarded)
+}
+
+/// What `git --exec-path` answers, resolved: the directory of git's other programs. It is asked
+/// before the confinement and before any input is read, in `/` and not in a clone, with no
+/// environment but `PATH`.
+#[cfg(target_os = "linux")]
+fn git_exec_path(git: &Path, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Stdio;
+    let out = std::process::Command::new(git)
+        .arg("--exec-path")
+        .env_clear()
+        .env("PATH", path)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
         return None;
     }
-    git.parent()?.parent().map(PathBuf::from)
+    let line = out.stdout.strip_suffix(b"\n").unwrap_or(&out.stdout);
+    let dir = Path::new(std::ffi::OsStr::from_bytes(line));
+    if !dir.is_absolute() {
+        return None;
+    }
+    std::fs::canonicalize(dir).ok().filter(|dir| dir.is_dir())
+}
+
+/// [`git_dirs`] of the resolved `git` whose other programs are in `exec`: the two directories,
+/// without what the system's directories hold already. `Err` where one of them is the root, is
+/// or holds the home of the host's user, or holds or lies in a directory of the host's
+/// ([`Guarded`]): a reader would read the host's files there, or execute what a reader wrote.
+#[cfg(target_os = "linux")]
+fn git_dirs_of(git: &Path, exec: Option<&Path>, guarded: &Guarded) -> Result<Vec<PathBuf>, String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in [git.parent(), exec].into_iter().flatten() {
+        if !in_system_dirs(dir) && !dirs.iter().any(|have| dir.starts_with(have)) {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    for dir in &dirs {
+        let reaches = if dir.parent().is_none() {
+            Some("is the whole file system".to_string())
+        } else if guarded
+            .home
+            .as_ref()
+            .is_some_and(|home| home.starts_with(dir))
+        {
+            Some("is or holds the home of this host's user".to_string())
+        } else {
+            guarded
+                .dirs
+                .iter()
+                .find(|own| own.starts_with(dir) || dir.starts_with(own))
+                .map(|own| format!("holds or lies in this host's own {}", own.display()))
+        };
+        if let Some(reaches) = reaches {
+            return Err(format!(
+                "git is {}, and a reader that runs it would read and execute all of {}, which {reaches}; install git in a directory of its own (as /opt/git/bin/git) or use the system's",
+                git.display(),
+                dir.display(),
+            ));
+        }
+    }
+    Ok(dirs)
 }
 
 /// Confines this process as `plan` says, as far as this system can ([`Status`]). Called once,
@@ -225,13 +333,19 @@ pub fn confine(plan: &Plan) -> Status {
     let abi = ABI::V7;
     let mut read_exec: Vec<PathBuf> = Vec::new();
     let mut read_files: Vec<PathBuf> = Vec::new();
+    let mut problem = None;
     if plan.git {
         read_exec.extend(SYSTEM_DIRS.iter().map(PathBuf::from));
-        read_exec.extend(git_home());
+        match git_dirs(&plan.guarded) {
+            Ok(dirs) => read_exec.extend(dirs),
+            Err(refusal) => problem = Some(refusal),
+        }
         read_files.extend(SYSTEM_FILES.iter().map(PathBuf::from));
     }
-    let mut problem = None;
-    let landlock = (|| {
+    // A git that is refused its directories leaves the reader without Landlock, as a kernel
+    // without it does: the reader then refuses its job, unless the host takes an unconfined one.
+    let git_refused = problem.is_some();
+    let landlock = (!git_refused).then(|| {
         let created = Ruleset::default()
             // Landlock 2 at least, or no Landlock at all: before it, git cannot store objects.
             .set_compatibility(CompatLevel::HardRequirement)
@@ -255,9 +369,10 @@ pub fn confine(plan: &Plan) -> Status {
             // git's temporary names come from the system's random source.
             .add_rules(path_beneath_rules(["/dev/urandom"], AccessFs::ReadFile))?
             .restrict_self()
-    })();
+    });
     let (landlock_abi, landlock, landlock_net, landlock_scope, no_new_privs) = match landlock {
-        Ok(status) => {
+        None => (0, false, false, false, false),
+        Some(Ok(status)) => {
             let effective = match status.landlock {
                 LandlockStatus::Available { effective_abi, .. } => effective_abi as u32,
                 _ => 0,
@@ -274,7 +389,7 @@ pub fn confine(plan: &Plan) -> Status {
                 status.no_new_privs,
             )
         }
-        Err(e) => {
+        Some(Err(e)) => {
             problem = Some(format!("no Landlock 2 (Linux 5.19) here: {e}"));
             (0, false, false, false, false)
         }
@@ -923,5 +1038,116 @@ mod tests {
         let none = Status::none("macOS");
         assert!(!none.confined());
         assert_eq!(none.describe(), "not confined: macOS");
+    }
+
+    /// A host of the user `u` with its directories where they are by default.
+    #[cfg(target_os = "linux")]
+    fn guarded() -> Guarded {
+        Guarded {
+            dirs: vec![
+                "/home/u/.config/tinfirm-runner".into(),
+                "/home/u/.local/share/tinfirm-runner".into(),
+            ],
+            home: Some("/home/u".into()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dirs_of(git: &str, exec: Option<&str>) -> Result<Vec<PathBuf>, String> {
+        git_dirs_of(Path::new(git), exec.map(Path::new), &guarded())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_git_outside_the_systems_directories_gives_its_two_directories_and_no_more() {
+        let dirs = |list: &[&str]| Ok(list.iter().map(PathBuf::from).collect::<Vec<_>>());
+        // The system's git needs nothing on top of the system's directories.
+        assert_eq!(
+            dirs_of("/usr/bin/git", Some("/usr/lib/git-core")),
+            dirs(&[])
+        );
+        assert_eq!(dirs_of("/usr/local/bin/git", None), dirs(&[]));
+        assert_eq!(
+            dirs_of("/opt/git/bin/git", Some("/opt/git/libexec/git-core")),
+            dirs(&["/opt/git/bin", "/opt/git/libexec/git-core"])
+        );
+        // A git built in the home (the prefix of its own `make install`): its two directories,
+        // and not the home above them, which holds the host's token.
+        assert_eq!(
+            dirs_of("/home/u/bin/git", Some("/home/u/libexec/git-core")),
+            dirs(&["/home/u/bin", "/home/u/libexec/git-core"])
+        );
+        assert_eq!(
+            dirs_of(
+                "/home/u/.local/bin/git",
+                Some("/home/u/.local/libexec/git-core")
+            ),
+            dirs(&["/home/u/.local/bin", "/home/u/.local/libexec/git-core"])
+        );
+        // One directory for both, a wrapper around the system's git, and no answer from git.
+        assert_eq!(
+            dirs_of("/opt/git/git", Some("/opt/git")),
+            dirs(&["/opt/git"])
+        );
+        assert_eq!(
+            dirs_of("/opt/tools/git", Some("/usr/lib/git-core")),
+            dirs(&["/opt/tools"])
+        );
+        assert_eq!(dirs_of("/x/git", None), dirs(&["/x"]));
+        // Nothing of the host's to stay clear of: only the root is refused.
+        assert_eq!(
+            git_dirs_of(Path::new("/home/u/git"), None, &Guarded::default()),
+            dirs(&["/home/u"])
+        );
+        assert!(git_dirs_of(Path::new("/git"), None, &Guarded::default()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_git_whose_directories_reach_the_hosts_own_is_refused() {
+        for (git, exec, reaches) in [
+            // The root, as the directory of git or of its programs.
+            ("/git", None, "is the whole file system"),
+            ("/opt/git/bin/git", Some("/"), "is the whole file system"),
+            // The home itself, and a directory that holds it.
+            ("/home/u/git", None, "is or holds the home"),
+            ("/home/git", None, "is or holds the home"),
+            ("/opt/git/bin/git", Some("/home/u"), "is or holds the home"),
+            // A directory that holds the host's data or config directory.
+            (
+                "/home/u/.local/git",
+                None,
+                "/home/u/.local/share/tinfirm-runner",
+            ),
+            (
+                "/home/u/.config/git",
+                None,
+                "/home/u/.config/tinfirm-runner",
+            ),
+            // The host's directory itself, and one inside it, where readers write.
+            (
+                "/home/u/.local/share/tinfirm-runner/git",
+                None,
+                "holds or lies in",
+            ),
+            (
+                "/home/u/.local/share/tinfirm-runner/workspaces/r/repo/bin/git",
+                None,
+                "holds or lies in",
+            ),
+            (
+                "/opt/git/bin/git",
+                Some("/home/u/.config/tinfirm-runner/credentials"),
+                "holds or lies in",
+            ),
+        ] {
+            let refusal = dirs_of(git, exec).expect_err(git);
+            assert!(refusal.contains(reaches), "{git}: {refusal}");
+            assert!(refusal.contains(git), "{refusal}");
+            // What the host keeps of it for its log and its refusal to start.
+            assert!(refusal.len() < 512, "{refusal}");
+        }
+        // A sibling whose name only begins like the host's directory is none of it.
+        assert!(dirs_of("/home/u/.config/tinfirm-runner-tools/git", None).is_ok());
     }
 }
