@@ -1393,7 +1393,8 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   so a host that is running when a node stops answering has the fewer slots from the next of
   them, and a run may fail at its create before that. While a node does not answer the host asks
   `verify` every 30 s: it has its own slots again within about that time after the node answers,
-  with no restart. Its runs on the node that does not answer count as active until they end. A
+  with no restart. Its runs on the node that does not answer count as active until they end. A node whose address answers nothing costs a call one connection time
+  (10 s): a failed connection is not tried a second time in the same call. A
   node that does not answer is not a problem of `verify`, so this host goes on taking runs
   ([A driver that can make no VM](#a-vm-per-run)). A start at which no node answers is refused,
   as a problem.

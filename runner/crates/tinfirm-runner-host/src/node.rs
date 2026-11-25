@@ -977,8 +977,11 @@ impl Node {
 
     /// One call, for which the node has `within` from now, its connection and `hello`
     /// included. With `again`, a call on a connection that was lost is tried once more on a
-    /// new one, while that time lasts. A call that got no answer in it is not tried again: the
-    /// node used its time up, and the next call makes a new connection ([`Conn::usable`]).
+    /// new one, while that time lasts: a connection that was up may have ended unnoticed. A
+    /// connection that cannot be made is not tried again in the call: the node did not answer
+    /// a new one, and a second dial would cost a node whose address answers nothing a second
+    /// connection time. A call that got no answer in it is not tried again either: the node
+    /// used its time up, and the next call makes a new connection ([`Conn::usable`]).
     async fn call(
         &self,
         method: &str,
@@ -1000,7 +1003,7 @@ impl Node {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
                     last = e.to_string();
-                    continue;
+                    break;
                 }
                 Err(_) => {
                     last = silent();
@@ -2241,9 +2244,9 @@ mod tests {
 
     /// A second for a node where the driver's own times are a minute and more, and 5 s for a
     /// whole create. A connection and its `hello` have a fifth of a second each: as with the
-    /// driver's own times, both tries of a connection end well inside a method's time, so what
-    /// a call reports of a node that answers no `hello` does not hang on which of two times
-    /// that end together is seen first.
+    /// driver's own times, a connection ends well inside a method's time, so what a call
+    /// reports of a node that answers no `hello` does not hang on which of two times that end
+    /// together is seen first.
     fn short() -> Deadlines {
         let second = Duration::from_secs(1);
         Deadlines {
@@ -2292,7 +2295,7 @@ mod tests {
             (
                 false,
                 "cannot reach the node: no answer to hello in time",
-                8,
+                4,
             ),
             (true, "no answer within 1 s", 4),
         ] {
@@ -2337,11 +2340,55 @@ mod tests {
             // Four calls, each with a second for the silent node at most.
             let took = started.elapsed();
             assert!(took < Duration::from_secs(10), "{took:?}");
-            // A connection that gave no answer is not used again. A call whose `hello` got none
-            // tries a second connection in its time, and a call that got no answer after the
-            // `hello` does not: each call made two connections, or one.
+            // A connection that gave no answer is not used again, and a connection that could
+            // not be made (no answer to its `hello`) is not tried a second time in the call:
+            // each call made one connection.
             assert_eq!(connections.load(Ordering::SeqCst), dials);
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_costs_a_call_one_connection_time() {
+        // A node whose address answers nothing: a TCP address that drops the connection's
+        // packets cannot be had here, so a listener that takes the connection and never
+        // answers its TLS stands in. The call ends after one connection time, not two.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = silent.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicU64::new(0));
+        tokio::spawn({
+            let accepted = accepted.clone();
+            async move {
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = silent.accept().await {
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    held.push(stream);
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        write_identity(&cert, &key).unwrap();
+        let node = json!({
+            "name": "far", "address": address, "nodeSha256": "ab".repeat(32),
+            "certificate": cert, "key": key, "templates": ["sandbox"]
+        });
+        let mut deadlines = short();
+        deadlines.connect = Duration::from_secs(1);
+        deadlines.verify = Duration::from_secs(5);
+        let read = |p: &Path| -> Result<Vec<u8>> { Ok(std::fs::read(p)?) };
+        let config = NodeConfig::from_file(file(json!({ "nodes": [node] })), &read, &read).unwrap();
+        let driver = NodeDriver::with(config, deadlines).unwrap();
+        let started = std::time::Instant::now();
+        let verified = driver.verify("sandbox").await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(
+            verified["unreachable"],
+            json!(["node far: cannot reach the node: no connection in time"]),
+            "{verified}"
+        );
+        // One connection time (1 s), where two dials took two.
+        assert!(took < Duration::from_millis(1900), "{took:?}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
