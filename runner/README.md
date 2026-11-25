@@ -1571,6 +1571,15 @@ against a node. Here, the driver is tested against node agents with their fake b
   this host deletes only leftovers it is shown, so a node that does not answer keeps its VMs until it
   answers again. A delete that failed while it was down is tried again on its own
   ([A delete that fails](#a-vm-per-run)), and a run whose VM it took down ends as `INFRA`.
+- **A node that is silent.** A node that keeps its connection and does not answer (it lost power, or
+  its agent hangs) has a time for each method, with its connection and `hello` in it: 70 s for
+  `verify`, 30 s for `describe`, 75 s for `delete` and for `list`, and 150 s for all of a `create`,
+  the choice of its node included. Each is under this host's own time for the driver's method, so the
+  driver still answers for the other nodes: a node that used its time up counts as one that does not
+  answer, and `verify`, a new VM's placement and `list` go on without it. Its connection is not used
+  again, and the next call makes a new one; a call that still waits on it keeps it for its own time.
+  A connection over TLS has TCP keepalive (a probe after 10 s without traffic, lost after 3 probes
+  5 s apart), so a node that is gone is noticed between two calls too.
 - **The port.** Each node publishes each VM's bridge on a port of its own address, which `describe`
   names (above); the VM's bridge listens on `--vm-port` inside it, and its user data comes on a small
   read-only disk that `vm-boot` reads.

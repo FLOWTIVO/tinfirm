@@ -57,7 +57,13 @@
 //!   `describe` of such a VM `failed` at once.
 //! - **Reconnects.** A connection that was lost (an agent that was restarted) is made again at
 //!   the next call; a call that cannot have changed anything (all but `create`) is tried once
-//!   more on a new connection.
+//!   more on a new connection, while the node's time for it lasts.
+//! - **A node that is silent.** A node has a time for each method ([`Deadlines`]), each under
+//!   the host's own time for that method, with its connection and `hello` in it. A node that
+//!   takes longer (it lost power, or its agent hangs, with the connection still up) counts as
+//!   one that does not answer: `verify`, a new VM's placement and `list` go on with the others.
+//!   Its connection is not used again, and the next call makes a new one. A TLS connection has
+//!   TCP keepalive, so a node that is gone is noticed between two calls too.
 //! - **Builds.** The wire's `hello` sends this host's build id ([`crate::images::build_id`])
 //!   and reads the agent's. Builds of another release are a warning by default (`peerBuild`),
 //!   as on the wire; the images' digest after `+` is not compared.
@@ -66,7 +72,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,11 +105,49 @@ pub const WIRE: u32 = 1;
 pub const SERVER_NAME: &str = "tinfirm-node-agent";
 /// The longest line on either side of the wire, and of the driver protocol.
 const MAX_LINE: u64 = 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// A make may take the helper up to its own 60 s, and more for the listener's spool.
-const CALL_TIMEOUT: Duration = Duration::from_secs(150);
+/// TCP keepalive on a node's TLS connection: the first probe after this long without traffic,
+/// then one every [`KEEPALIVE_INTERVAL`], and the connection is lost after
+/// [`KEEPALIVE_PROBES`] of them without an answer (25 s in all).
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const KEEPALIVE_PROBES: u32 = 3;
 /// The most nodes behind one driver.
 pub const MAX_NODES: usize = 64;
+
+/// How long one node has for the driver, by what the driver asks of it. A time runs from the
+/// moment the driver turns to the node, so the node's connection, its `hello` and the second
+/// try are in it. Each is well under the time the host gives the driver for the method
+/// (crate::vm: 120 s for `verify`, 180 s for `create`, 60 s for `describe`, 120 s for `delete`
+/// and for `list`): while a node is silent, the driver still answers the host for the others.
+/// The node agent's listener gives its helper 60 s for one request, so an agent that works
+/// answers `verify`, `delete` and `list` before their time here, with its own error if need
+/// be; `describe` cannot have that, since the host gives it 60 s.
+#[derive(Debug, Clone, Copy)]
+struct Deadlines {
+    /// A connection with its TLS, and then the answer to its `hello`: each.
+    connect: Duration,
+    verify: Duration,
+    /// All of a driver's `create`: the nodes' `verify`, by which it chooses, and the chosen
+    /// node's `create`. A make may take the helper up to its own 60 s, and more for the
+    /// listener's spool: that is left after a round of `verify` that a silent node used up.
+    create: Duration,
+    describe: Duration,
+    delete: Duration,
+    list: Duration,
+}
+
+impl Default for Deadlines {
+    fn default() -> Deadlines {
+        Deadlines {
+            connect: Duration::from_secs(10),
+            verify: Duration::from_secs(70),
+            create: Duration::from_secs(150),
+            describe: Duration::from_secs(30),
+            delete: Duration::from_secs(75),
+            list: Duration::from_secs(75),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -593,6 +637,26 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Option<Vec<u8>
     }
 }
 
+/// Turns TCP keepalive on for a node's connection ([`KEEPALIVE_IDLE`]): a node that lost power
+/// or its network sends no end of the connection, and the kernel alone would notice it only
+/// when it gave up sending, after about 15 minutes, or never on a connection that sends
+/// nothing. On Linux only, as this crate's rustix is: elsewhere a silent node is found by its
+/// time for a call alone.
+#[cfg(target_os = "linux")]
+fn keep_alive(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
+    use rustix::net::sockopt;
+    sockopt::set_socket_keepalive(tcp, true)?;
+    sockopt::set_tcp_keepidle(tcp, KEEPALIVE_IDLE)?;
+    sockopt::set_tcp_keepintvl(tcp, KEEPALIVE_INTERVAL)?;
+    sockopt::set_tcp_keepcnt(tcp, KEEPALIVE_PROBES)?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn keep_alive(_: &tokio::net::TcpStream) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Why a call to a node failed.
 #[derive(Debug)]
 enum CallError {
@@ -600,12 +664,15 @@ enum CallError {
     Lost(String),
     /// The node answered with an error, or out of form.
     Answer(String),
+    /// No answer in the call's time, on a connection that is still up.
+    Silent,
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::Lost(why) | CallError::Answer(why) => f.write_str(why),
+            CallError::Silent => f.write_str("no answer in time"),
         }
     }
 }
@@ -621,6 +688,8 @@ struct Conn {
     lines: mpsc::Sender<Vec<u8>>,
     pending: Pending,
     lost: CancellationToken,
+    /// A call got no answer on it in the call's time ([`Conn::usable`]).
+    silent: AtomicBool,
     next: AtomicU64,
 }
 
@@ -687,11 +756,26 @@ impl Conn {
             lines,
             pending,
             lost,
+            silent: AtomicBool::new(false),
             next: AtomicU64::new(1),
         }
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value, CallError> {
+    /// Whether a new call may use the connection: it was not lost, and no call on it went
+    /// without an answer in its time. Such a node may be gone without a word, or only slow, so
+    /// the calls that still wait on the connection keep it, each for its own time: a create
+    /// among them still gets its answer from a node that is slow.
+    fn usable(&self) -> bool {
+        !self.lost.is_cancelled() && !self.silent.load(Ordering::Relaxed)
+    }
+
+    /// One call, whose request is sent and answered until `deadline`.
+    async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: tokio::time::Instant,
+    ) -> Result<Value, CallError> {
         if self.lost.is_cancelled() {
             return Err(CallError::Lost("the connection was lost".into()));
         }
@@ -703,22 +787,27 @@ impl Conn {
         }))
         .expect("requests serialize");
         line.push(b'\n');
-        if self.lines.send(line).await.is_err() {
-            lock(&self.pending).remove(&id);
-            return Err(CallError::Lost("the connection was lost".into()));
-        }
-        match tokio::time::timeout(CALL_TIMEOUT, rx).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(message))) => Err(CallError::Answer(message)),
-            Ok(Err(_)) => Err(CallError::Lost(
-                "the connection was lost before the answer".into(),
-            )),
+        let answered = async {
+            // The time bounds the sending too: a node that reads nothing fills the queue of
+            // lines in the end.
+            if self.lines.send(line).await.is_err() {
+                lock(&self.pending).remove(&id);
+                return Err(CallError::Lost("the connection was lost".into()));
+            }
+            match rx.await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(message)) => Err(CallError::Answer(message)),
+                Err(_) => Err(CallError::Lost(
+                    "the connection was lost before the answer".into(),
+                )),
+            }
+        };
+        match tokio::time::timeout_at(deadline, answered).await {
+            Ok(answer) => answer,
             Err(_) => {
                 lock(&self.pending).remove(&id);
-                Err(CallError::Lost(format!(
-                    "no answer within {} s",
-                    CALL_TIMEOUT.as_secs()
-                )))
+                self.silent.store(true, Ordering::Relaxed);
+                Err(CallError::Silent)
             }
         }
     }
@@ -734,6 +823,7 @@ pub fn release_of(build: &str) -> &str {
 struct Node {
     spec: NodeSpec,
     policy: BuildPolicy,
+    deadlines: Deadlines,
     tls: Option<Arc<rustls::ClientConfig>>,
     conn: tokio::sync::Mutex<Option<Arc<Conn>>>,
     /// The VMs (the agent's ids) whose VMM the agent reported dead.
@@ -741,7 +831,7 @@ struct Node {
 }
 
 impl Node {
-    fn new(spec: NodeSpec, policy: BuildPolicy) -> Result<Node> {
+    fn new(spec: NodeSpec, policy: BuildPolicy, deadlines: Deadlines) -> Result<Node> {
         let tls = match &spec.target {
             Target::Tls { pin, cert, key, .. } => {
                 Some(tls_config(*pin, cert.clone(), key.clone())?)
@@ -751,6 +841,7 @@ impl Node {
         Ok(Node {
             spec,
             policy,
+            deadlines,
             tls,
             conn: tokio::sync::Mutex::new(None),
             failed: Arc::default(),
@@ -766,11 +857,13 @@ impl Node {
         let (failed, node) = (self.failed.clone(), self.spec.name.clone());
         let conn = match &self.spec.target {
             Target::Socket(path) => {
-                let stream =
-                    tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::UnixStream::connect(path))
-                        .await
-                        .map_err(|_| lost("no connection in time".into()))?
-                        .map_err(|e| lost(e.kind().to_string()))?;
+                let stream = tokio::time::timeout(
+                    self.deadlines.connect,
+                    tokio::net::UnixStream::connect(path),
+                )
+                .await
+                .map_err(|_| lost("no connection in time".into()))?
+                .map_err(|e| lost(e.kind().to_string()))?;
                 Conn::open(stream, failed, node)
             }
             Target::Tls { address, .. } => {
@@ -779,6 +872,14 @@ impl Node {
                     let tcp = tokio::net::TcpStream::connect(address.as_str())
                         .await
                         .map_err(|e| lost(e.kind().to_string()))?;
+                    // Without it the connection works as before, and a silent node is still
+                    // found by its time for a call.
+                    if let Err(e) = keep_alive(&tcp) {
+                        eprintln!(
+                            "node {}: cannot set TCP keepalive on the connection: {e}",
+                            self.name()
+                        );
+                    }
                     let name = rustls::pki_types::ServerName::try_from(SERVER_NAME)
                         .expect("a valid DNS name");
                     tokio_rustls::TlsConnector::from(tls)
@@ -786,7 +887,7 @@ impl Node {
                         .await
                         .map_err(|e| lost(format!("TLS: {e}")))
                 };
-                let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect)
+                let stream = tokio::time::timeout(self.deadlines.connect, connect)
                     .await
                     .map_err(|_| lost("no connection in time".into()))??;
                 Conn::open(stream, failed, node)
@@ -794,10 +895,15 @@ impl Node {
         };
         let own = crate::images::build_id();
         let hello = conn
-            .call("hello", json!({ "wire": WIRE, "build": own }))
+            .call(
+                "hello",
+                json!({ "wire": WIRE, "build": own }),
+                tokio::time::Instant::now() + self.deadlines.connect,
+            )
             .await
             .map_err(|e| match e {
                 CallError::Answer(why) => CallError::Lost(format!("the node refused hello: {why}")),
+                CallError::Silent => lost("no answer to hello in time".into()),
                 lost => lost,
             })?;
         if hello["wire"].as_u64() != Some(u64::from(WIRE)) {
@@ -828,11 +934,11 @@ impl Node {
         Ok(conn)
     }
 
-    /// The connection, made again if it was lost.
+    /// The connection, made again if it was lost or gave a call no answer in its time.
     async fn conn(&self) -> Result<Arc<Conn>, CallError> {
         let mut slot = self.conn.lock().await;
         if let Some(conn) = slot.as_ref()
-            && !conn.lost.is_cancelled()
+            && conn.usable()
         {
             return Ok(conn.clone());
         }
@@ -842,19 +948,46 @@ impl Node {
         Ok(conn)
     }
 
-    /// One call; with `again`, a call on a connection that was lost is tried once more on a
-    /// new one.
-    async fn call(&self, method: &str, params: Value, again: bool) -> Result<Value> {
+    /// One call, for which the node has `within` from now, its connection and `hello`
+    /// included. With `again`, a call on a connection that was lost is tried once more on a
+    /// new one, while that time lasts. A call that got no answer in it is not tried again: the
+    /// node used its time up, and the next call makes a new connection ([`Conn::usable`]).
+    async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        again: bool,
+        within: Duration,
+    ) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + within;
+        let silent = || format!("no answer within {} s", within.as_secs());
         let tries = if again { 2 } else { 1 };
-        let mut last = String::new();
+        let mut last = silent();
         for _ in 0..tries {
-            match self.conn().await {
-                Ok(conn) => match conn.call(method, params.clone()).await {
-                    Ok(value) => return Ok(value),
-                    Err(CallError::Answer(why)) => bail!("node {}: {why}", self.name()),
-                    Err(CallError::Lost(why)) => last = why,
-                },
-                Err(e) => last = e.to_string(),
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            // Another call may hold the node's lock while it makes the connection: that wait
+            // is in the time too.
+            let conn = match tokio::time::timeout_at(deadline, self.conn()).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    last = e.to_string();
+                    continue;
+                }
+                Err(_) => {
+                    last = silent();
+                    break;
+                }
+            };
+            match conn.call(method, params.clone(), deadline).await {
+                Ok(value) => return Ok(value),
+                Err(CallError::Answer(why)) => bail!("node {}: {why}", self.name()),
+                Err(CallError::Lost(why)) => last = why,
+                Err(CallError::Silent) => {
+                    last = silent();
+                    break;
+                }
             }
         }
         bail!("node {}: {last}", self.name())
@@ -866,6 +999,7 @@ impl Node {
 /// The `node` driver: its nodes, in the configuration's order.
 pub struct NodeDriver {
     nodes: Vec<Arc<Node>>,
+    deadlines: Deadlines,
     /// The nodes whose last `verify` answer carried no hardening mark, so that the driver says
     /// so once for each, not at every `verify`.
     unmarked: Mutex<HashSet<String>>,
@@ -1088,14 +1222,20 @@ fn no_place(template: &str, skipped: &[(String, Skipped)]) -> String {
 
 impl NodeDriver {
     pub fn new(config: NodeConfig) -> Result<NodeDriver> {
+        NodeDriver::with(config, Deadlines::default())
+    }
+
+    /// [`NodeDriver::new`], with the nodes' times (the tests wait seconds, not minutes).
+    fn with(config: NodeConfig, deadlines: Deadlines) -> Result<NodeDriver> {
         let policy = config.peer_build;
         let nodes = config
             .nodes
             .into_iter()
-            .map(|spec| Node::new(spec, policy).map(Arc::new))
+            .map(|spec| Node::new(spec, policy, deadlines).map(Arc::new))
             .collect::<Result<_>>()?;
         Ok(NodeDriver {
             nodes,
+            deadlines,
             unmarked: Mutex::new(HashSet::new()),
         })
     }
@@ -1149,13 +1289,17 @@ impl NodeDriver {
         }
     }
 
-    /// Each node's `verify`, in the configuration's order: its answer, or why it gave none.
+    /// Each node's `verify`, in the configuration's order: its answer, or why it gave none,
+    /// which a node that is silent for its time gives as one that cannot be reached does.
     async fn verify_each(&self, nodes: &[&Arc<Node>], template: &str) -> Vec<Result<Value>> {
-        futures::future::join_all(
-            nodes
-                .iter()
-                .map(|node| node.call("verify", json!({ "template": template }), true)),
-        )
+        futures::future::join_all(nodes.iter().map(|node| {
+            node.call(
+                "verify",
+                json!({ "template": template }),
+                true,
+                self.deadlines.verify,
+            )
+        }))
         .await
     }
 
@@ -1261,6 +1405,8 @@ impl NodeDriver {
         if !labels.contains_key(HOST_LABEL) {
             bail!("a sandbox needs the label {HOST_LABEL}");
         }
+        // The choice of the node is in the create's time: the node gets what is left of it.
+        let deadline = tokio::time::Instant::now() + self.deadlines.create;
         let node = self.place(template).await?;
         // Not tried again: a create whose answer was lost may have made a VM, which the
         // host's leftover cleanup then finds.
@@ -1269,6 +1415,7 @@ impl NodeDriver {
                 "create",
                 json!({ "template": template, "name": name, "userData": user_data, "labels": labels }),
                 false,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await?;
         let id = created["id"]
@@ -1293,7 +1440,12 @@ impl NodeDriver {
             return Ok(json!({ "id": id, "state": "failed" }));
         }
         let vm = node
-            .call("describe", json!({ "id": agent_id }), true)
+            .call(
+                "describe",
+                json!({ "id": agent_id }),
+                true,
+                self.deadlines.describe,
+            )
             .await?;
         Ok(Self::view(node, vm))
     }
@@ -1303,8 +1455,13 @@ impl NodeDriver {
             bail!("a delete must name the host's label {HOST_LABEL}: not this host's to delete");
         }
         let (node, agent_id) = self.split(id)?;
-        node.call("delete", json!({ "id": agent_id, "labels": labels }), true)
-            .await?;
+        node.call(
+            "delete",
+            json!({ "id": agent_id, "labels": labels }),
+            true,
+            self.deadlines.delete,
+        )
+        .await?;
         lock(&node.failed).remove(agent_id);
         eprintln!("deleted {id}");
         Ok(json!({}))
@@ -1314,11 +1471,14 @@ impl NodeDriver {
     /// to stderr and left out: the host deletes only VMs it is shown, so none of that node's is
     /// deleted or forgotten.
     pub async fn list(&self, labels: &BTreeMap<String, String>) -> Result<Value> {
-        let answers = futures::future::join_all(
-            self.nodes
-                .iter()
-                .map(|node| node.call("list", json!({ "labels": labels }), true)),
-        )
+        let answers = futures::future::join_all(self.nodes.iter().map(|node| {
+            node.call(
+                "list",
+                json!({ "labels": labels }),
+                true,
+                self.deadlines.list,
+            )
+        }))
         .await;
         let mut vms = Vec::new();
         for (node, answer) in self.nodes.iter().zip(answers) {
@@ -1909,6 +2069,202 @@ mod tests {
             let (served, answers) = serve_lines(input).await;
             assert!(served.is_ok() && answers.is_empty());
         }
+    }
+
+    /// What a stand-in for a node agent does with a request.
+    enum Reply {
+        Answer(Value),
+        /// The answer, after this long.
+        Later(Duration, Value),
+        /// Nothing, ever, with the connection left up.
+        Silence,
+    }
+
+    /// A stand-in for a node agent's listener on the local socket `socket`: `reply` says what a
+    /// request gets, by its method. Returns the count of the connections it took.
+    fn stand_in(
+        socket: &Path,
+        reply: impl Fn(&str) -> Reply + Send + Sync + 'static,
+    ) -> Arc<AtomicU64> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let (connections, reply) = (Arc::new(AtomicU64::new(0)), Arc::new(reply));
+        let taken = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                taken.fetch_add(1, Ordering::SeqCst);
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let (read, write) = stream.into_split();
+                    let write = Arc::new(tokio::sync::Mutex::new(write));
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let (wait, result) = match reply(request["method"].as_str().unwrap()) {
+                            Reply::Answer(result) => (Duration::ZERO, result),
+                            Reply::Later(wait, result) => (wait, result),
+                            Reply::Silence => continue,
+                        };
+                        let write = write.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            let answer =
+                                json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
+                            let mut write = write.lock().await;
+                            let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+                        });
+                    }
+                });
+            }
+        });
+        connections
+    }
+
+    fn node_at(name: &str, socket: &Path) -> Value {
+        json!({ "name": name, "socket": socket, "templates": ["sandbox"] })
+    }
+
+    fn wire_hello() -> Value {
+        json!({ "wire": WIRE, "build": crate::images::build_id() })
+    }
+
+    fn host_label() -> BTreeMap<String, String> {
+        BTreeMap::from([(HOST_LABEL.to_string(), "host".to_string())])
+    }
+
+    /// A second for a node where the driver's own times are a minute and more, and 5 s for a
+    /// whole create.
+    fn short() -> Deadlines {
+        let second = Duration::from_secs(1);
+        Deadlines {
+            connect: second,
+            verify: second,
+            create: 5 * second,
+            describe: second,
+            delete: second,
+            list: second,
+        }
+    }
+
+    #[test]
+    fn a_node_has_less_time_for_a_method_than_the_host_gives_the_driver() {
+        // crate::vm's times for the driver, which are its own: 120 s for `verify`, `delete` and
+        // `list`, 180 s for `create`, 60 s for `describe`. A node's time ends 30 s before.
+        let own = Deadlines::default();
+        let seconds = Duration::from_secs;
+        let under = |node: Duration, host: u64| node + seconds(30) <= seconds(host);
+        assert!(under(own.verify, 120));
+        assert!(under(own.delete, 120));
+        assert!(under(own.list, 120));
+        assert!(under(own.describe, 60));
+        assert!(under(own.create, 180));
+        // A round of `verify` that a silent node used up leaves a make its 60 s.
+        assert!(own.create - own.verify > seconds(60));
+    }
+
+    #[tokio::test]
+    async fn a_silent_node_is_left_out_in_its_time_and_the_others_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy = dir.path().join("healthy.sock");
+        stand_in(&healthy, |method| {
+            Reply::Answer(match method {
+                "hello" => wire_hello(),
+                "verify" => json!({ "problems": [], "maxVms": 2, "checked": [] }),
+                "create" => json!({ "id": "vm-1" }),
+                "list" => json!({ "vms": [{ "id": "vm-1", "state": "running" }] }),
+                _ => json!({}),
+            })
+        });
+        // A node that takes the connection and answers nothing, not its hello either; then one
+        // that is silent after its hello, as a node that lost power with the connection up.
+        for (after_hello, why) in [
+            (false, "cannot reach the node: no answer to hello in time"),
+            (true, "no answer within 1 s"),
+        ] {
+            let silent = dir.path().join(format!("silent-{after_hello}.sock"));
+            let connections = stand_in(&silent, move |method| match method {
+                "hello" if after_hello => Reply::Answer(wire_hello()),
+                _ => Reply::Silence,
+            });
+            let nodes =
+                json!({ "nodes": [node_at("silent", &silent), node_at("healthy", &healthy)] });
+            let driver = NodeDriver::with(config(nodes).unwrap(), short()).unwrap();
+            let started = std::time::Instant::now();
+            // `verify` answers with the healthy node's slots, and names the other.
+            let verified = driver.verify("sandbox").await.unwrap();
+            assert_eq!(verified["problems"], json!([]), "{verified}");
+            assert_eq!(verified["maxVms"], 2, "{verified}");
+            assert_eq!(
+                verified["checked"],
+                json!([
+                    format!("node silent: {why}; not counted"),
+                    "node healthy: 2 free"
+                ])
+            );
+            // A new VM goes to the healthy node, and `list` shows that node's VMs.
+            let created = driver
+                .create("sandbox", "n", "{}", &host_label())
+                .await
+                .unwrap();
+            assert_eq!(created["id"], "healthy:vm-1");
+            let listed = driver.list(&host_label()).await.unwrap();
+            assert_eq!(
+                listed["vms"],
+                json!([{ "id": "healthy:vm-1", "state": "running" }])
+            );
+            // A VM of the silent node: an error in the node's time, never `gone`.
+            let error = format!("{:#}", driver.describe("silent:vm-9").await.unwrap_err());
+            assert_eq!(error, format!("node silent: {why}"));
+            // Four calls, each with a second for the silent node.
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(10), "{took:?}");
+            // A connection that gave a call no answer is not used again: each call made its own.
+            assert_eq!(connections.load(Ordering::SeqCst), 4);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_create_that_waits_keeps_its_answer_when_another_call_gets_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = dir.path().join("slow.sock");
+        // A make that takes 2 s, and a describe that gets no answer in its second.
+        let connections = stand_in(&slow, |method| match method {
+            "hello" => Reply::Answer(wire_hello()),
+            "verify" => Reply::Answer(json!({ "problems": [], "maxVms": 2, "checked": [] })),
+            "create" => Reply::Later(Duration::from_secs(2), json!({ "id": "vm-1" })),
+            _ => Reply::Silence,
+        });
+        let nodes = json!({ "nodes": [node_at("slow", &slow)] });
+        let driver = NodeDriver::with(config(nodes).unwrap(), short()).unwrap();
+        let labels = host_label();
+        let (created, described) =
+            tokio::join!(driver.create("sandbox", "n", "{}", &labels), async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                driver.describe("slow:vm-0").await
+            });
+        let error = format!("{:#}", described.unwrap_err());
+        assert_eq!(error, "node slow: no answer within 1 s");
+        // The create waited on the same connection, and its answer came after that.
+        assert_eq!(created.unwrap()["id"], "slow:vm-1");
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        // The next call makes a new connection.
+        driver.verify("sandbox").await.unwrap();
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_tcp_connection_to_a_node_has_keepalive() {
+        use rustix::net::sockopt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(!sockopt::socket_keepalive(&tcp).unwrap());
+        keep_alive(&tcp).unwrap();
+        assert!(sockopt::socket_keepalive(&tcp).unwrap());
+        assert_eq!(sockopt::tcp_keepidle(&tcp).unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(sockopt::tcp_keepintvl(&tcp).unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(sockopt::tcp_keepcnt(&tcp).unwrap(), KEEPALIVE_PROBES);
     }
 
     #[test]
