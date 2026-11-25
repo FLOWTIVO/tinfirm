@@ -290,10 +290,16 @@ pub fn disk_room_problem(free: u64, others: &[(u64, u64)], wanted: u64) -> Optio
 }
 
 /// What a file system must have free for `check`: a whole snapshot of `snapshot` bytes for
-/// each of the `slots` that holds none yet, and what the snapshots that are there (each
-/// `(size, allocated)`) may still grow by. A snapshot that is there is not asked for a second
+/// each of the `slots` that holds none yet, and what each slot whose snapshot is there (each
+/// `(size, allocated)`) may still take. A snapshot that is there is not asked for a second
 /// time: a file system with room for `slots` snapshots is enough however many VMs run, with
-/// every slot empty and with every slot taken. `None` when there is room; the problem
+/// every slot empty and with every slot taken.
+///
+/// A slot's snapshot may be another template's, of another size. Its slot may hold a snapshot
+/// of this template next, and what the file has allocated is free again when it goes: the slot
+/// counts for a snapshot of this template, or for its own where that is larger, less what is
+/// allocated. A node too small for `slots` snapshots of this template so has the problem with
+/// whatever VMs on it, and not only while it is empty. `None` when there is room; the problem
 /// otherwise.
 pub fn check_room_problem(
     free: u64,
@@ -303,14 +309,14 @@ pub fn check_room_problem(
 ) -> Option<String> {
     let empty = slots.saturating_sub(u64::try_from(others.len()).unwrap_or(u64::MAX));
     let wanted = empty.saturating_mul(snapshot);
-    let promised: u64 = others
+    let promised = others
         .iter()
-        .map(|(size, allocated)| size.saturating_sub(*allocated))
-        .sum();
+        .map(|(size, allocated)| (*size).max(snapshot).saturating_sub(*allocated))
+        .fold(0u64, u64::saturating_add);
     let needed = wanted.saturating_add(promised);
     (free < needed).then(|| {
         format!(
-            "the work directory's file system has {} MiB free, and {} MiB are needed: {} MiB for a snapshot in each of the {empty} slot(s) that hold none and {} MiB that the snapshots of the {} VM(s) there may still grow by",
+            "the work directory's file system has {} MiB free, and {} MiB are needed: {} MiB for a snapshot in each of the {empty} slot(s) that hold none and {} MiB that the {} slot(s) whose snapshot is there may still take (each up to a snapshot of this template, or to its own where that is larger)",
             free >> 20,
             needed >> 20,
             wanted >> 20,
@@ -3081,7 +3087,7 @@ mod tests {
         );
         assert!(
             problem.contains("143360 MiB for a snapshot in each of the 7 slot(s) that hold none")
-                && problem.contains("17408 MiB that the snapshots of the 1 VM(s) there"),
+                && problem.contains("17408 MiB that the 1 slot(s) whose snapshot is there"),
             "{problem}"
         );
         // More snapshots than slots (a leftover's beside the VMs'): no slot is empty.
@@ -3090,23 +3096,72 @@ mod tests {
     }
 
     #[test]
+    fn check_counts_a_slot_with_another_templates_snapshot_for_this_templates() {
+        const GIB: u64 = 1 << 30;
+        // A node of two templates, with snapshots of 1 GiB and of 20 GiB, and 8 slots: the
+        // larger template needs 160 GiB, and the file system has 30 GiB.
+        let (slots, small, large) = (8, GIB, 20 * GIB);
+        let disk = 30 * GIB;
+        // VMs of the small template, each with half its snapshot written.
+        let vms = |count: usize| vec![(small, GIB / 2); count];
+        let written = |there: &[(u64, u64)]| there.iter().map(|(_, a)| *a).sum::<u64>();
+        for count in [0, 1, 7, 8] {
+            let there = vms(count);
+            let free = disk - written(&there);
+            // Too small for the large template with whatever runs, not only while it is empty:
+            // a small snapshot does not stand in for a large one in its slot.
+            let problem = check_room_problem(free, &there, slots, large);
+            assert!(problem.is_some(), "{count} VM(s) of the small template");
+            // And large enough for the small one, as before.
+            assert_eq!(check_room_problem(free, &there, slots, small), None);
+        }
+        // The file system that holds 8 snapshots of the large template has the room for them
+        // with VMs of the small one on it, and one byte less is a problem with each count.
+        for count in [0, 1, 7, 8] {
+            let there = vms(count);
+            let free = slots * large - written(&there);
+            assert_eq!(check_room_problem(free, &there, slots, large), None);
+            assert!(check_room_problem(free - 1, &there, slots, large).is_some());
+        }
+        // A snapshot there that is larger than this template's keeps what it may grow by
+        // itself: 7 GiB for the 7 empty slots of the small template and 17 GiB for it.
+        let one_large = [(large, 3 * GIB)];
+        assert_eq!(check_room_problem(24 * GIB, &one_large, slots, small), None);
+        assert!(check_room_problem(24 * GIB - 1, &one_large, slots, small).is_some());
+    }
+
+    #[test]
     fn check_reads_the_snapshots_that_are_there_into_its_room() {
         let mut config = config();
         let dir = tempfile::tempdir().unwrap();
         config.firecracker.work = dir.path().to_path_buf();
         config.max_vms = 8;
-        // The largest snapshot a template may name, 1 TiB: `check` must not ask this machine
-        // for eight of them while every slot's snapshot is there.
+        // A snapshot that no machine has the room for, so that the problem's text shows what
+        // `check` counted: the slots whose snapshot is in the work directory, and the others.
         let mut template = config.templates.values().next().unwrap().clone();
-        template.snapshot_mib = 1_048_576;
-        for slot in 0..8 {
+        template.snapshot_mib = u32::MAX;
+        let backend = LinuxBackend::new(config);
+        let counted = |empty: u32, there: u32| {
+            let mut answer = Checked::default();
+            backend.check_room_and_memory(&template, &mut answer);
+            let texts = [
+                format!("in each of the {empty} slot(s) that hold none"),
+                format!("that the {there} slot(s) whose snapshot is there may still take"),
+            ];
+            let found = |problem: &String| texts.iter().all(|text| problem.contains(text));
+            assert!(answer.problems.iter().any(found), "{answer:?}");
+        };
+        counted(8, 0);
+        for slot in 0..3 {
             let sparse = std::fs::File::create(dir.path().join(format!("{slot}.snapshot")));
             sparse.unwrap().set_len(4096).unwrap();
         }
-        let mut answer = Checked::default();
-        LinuxBackend::new(config).check_room_and_memory(&template, &mut answer);
-        let room = "room for 8 snapshot(s) of this template".to_string();
-        assert!(answer.checked.contains(&room), "{answer:?}");
+        counted(5, 3);
+        for slot in 3..8 {
+            let sparse = std::fs::File::create(dir.path().join(format!("{slot}.snapshot")));
+            sparse.unwrap().set_len(4096).unwrap();
+        }
+        counted(0, 8);
     }
 
     #[test]
