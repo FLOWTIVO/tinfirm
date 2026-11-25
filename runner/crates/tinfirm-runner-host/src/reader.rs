@@ -986,9 +986,10 @@ fn is_object_name(value: &str) -> bool {
 }
 
 /// The names of a pack's job: `head` and at most [`MAX_PACK_EXCLUDE`] tips to leave out, all full
-/// object names of one format.
+/// object names of one format. `head` is never the zero id, which names no object: no pack is
+/// made for a push that would delete its branch ([`crate::git_push::check_names`]).
 fn check_pack_names(head: &str, exclude: &[String]) -> Result<(), String> {
-    if !is_object_name(head) {
+    if !is_object_name(head) || head.bytes().all(|b| b == b'0') {
         return Err(format!("`{}` is not an object name", clean(head, 80)));
     }
     if exclude.len() > MAX_PACK_EXCLUDE {
@@ -1619,6 +1620,8 @@ mod tests {
         for (head, exclude) in [
             ("HEAD".to_string(), vec![]),
             ("--all".to_string(), vec![]),
+            ("0".repeat(64), vec![]),
+            ("0".repeat(40), vec![]),
             (head.clone(), vec!["b".repeat(40)]),
             (head.clone(), vec!["--not".to_string()]),
             (

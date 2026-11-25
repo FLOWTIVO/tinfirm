@@ -1194,7 +1194,9 @@ over https:
 2. It compares the branch's tip there with the lease (the tip at clone time, or none) before it
    sends anything. A branch that moved, was created or was deleted during the run is refused as
    git refuses it, `[rejected] (stale info)`, and nothing reaches the repository. A branch that is
-   at HEAD already is up to date, and nothing is sent.
+   at HEAD already is up to date, and nothing is sent. A HEAD or a lease that is the zero id is
+   refused before the repository is asked anything: as the new tip it would be the command to
+   delete the branch.
 3. A process without any credential writes the pack. With the bridge (`--sandbox-bridge`,
    `--executor vm`) it is a [reader](#the-reader-and-the-front), confined as for its other git
    commands: it reads the clone, writes nothing, and its stdout is the pack. Without the bridge it is

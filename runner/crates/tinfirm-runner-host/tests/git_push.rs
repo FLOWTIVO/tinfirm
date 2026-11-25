@@ -1068,6 +1068,73 @@ async fn hostile_or_broken_reports_are_failures_and_never_a_push() {
     .await;
 }
 
+/// The zero id names no object. As a push's new tip it is the protocol's command to delete the
+/// branch, and as its old one it says the branch is new. A HEAD or a lease that is the zero id
+/// (a reader that a flaw took over answers `run`'s question for HEAD) pushes nothing: the
+/// repository is not even asked for its refs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_head_or_lease_is_refused_before_the_repository_is_asked_anything() {
+    beside(60, async {
+        let (_dir, host, main) = host_for("http://127.0.0.1:9/origin.git");
+        let ok = format!("ok refs/heads/{BRANCH}");
+        // A code host that would take whatever comes, a delete too.
+        let fake = fake_host(
+            (200, ADVERTISEMENT, vec![], advertisement(&main, CAPS)),
+            (
+                200,
+                RESULT,
+                vec![],
+                sideband_report(&[], &["unpack ok", &ok]),
+            ),
+        )
+        .await;
+        let with_base = |base: Vec<MirrorRef>| {
+            Git::restored(
+                host.dir(),
+                &spec(&fake.url),
+                ("T".into(), "t@tinfirm.invalid".into()),
+                base,
+                None,
+            )
+        };
+        let zero = "0".repeat(40);
+        let outcome = tinfirm_runner_host::git_push::push_outcome(
+            &with_base(host.base_refs().to_vec()),
+            BRANCH,
+            &zero,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed(&outcome).contains("would delete the branch"),
+            "{outcome:?}"
+        );
+        // The branch's tip at clone time, as the zero id.
+        let base = vec![MirrorRef {
+            name: format!("refs/heads/{BRANCH}"),
+            sha: zero,
+        }];
+        let outcome = tinfirm_runner_host::git_push::push_outcome(
+            &with_base(base),
+            BRANCH,
+            &head(host.dir()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            failed(&outcome).contains("the lease is the zero id"),
+            "{outcome:?}"
+        );
+        assert!(
+            fake.seen.lock().unwrap().is_empty(),
+            "the repository was asked"
+        );
+    })
+    .await;
+}
+
 /// What a code host does with its answer to a push once the report is out, as a receive-pack that
 /// runs the repository's post-receive hooks after its report.
 #[derive(Clone)]

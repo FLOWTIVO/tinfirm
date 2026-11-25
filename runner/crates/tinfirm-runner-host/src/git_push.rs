@@ -234,6 +234,36 @@ impl ObjectFormat {
 }
 
 /// A lower-case hexadecimal object name of `len` digits.
+/// The names a push carries: `head`, the branch's new tip, and `lease`, the tip it had at clone
+/// time. Both are full object names of one format, which is given back, and neither is the zero
+/// id. The zero id names no object: in a push's command it stands for "no such branch", so as
+/// the new tip it is the command to delete the branch, and as the old one it says the branch is
+/// new, which a branch with a tip at clone time is not. `run` asks a reader for HEAD
+/// ([`crate::git::Git::read_through`]), and a reader that a flaw took over can answer anything.
+pub fn check_names(head: &str, lease: Option<&str>) -> Result<ObjectFormat, String> {
+    let zero = |name: &str| name.bytes().all(|b| b == b'0');
+    let Some(format) = ObjectFormat::of(head) else {
+        return Err(format!(
+            "`{}` is not an object name",
+            clean(head.as_bytes(), 80)
+        ));
+    };
+    if zero(head) {
+        return Err(
+            "HEAD is the zero id, which names no commit: pushed, it would delete the branch".into(),
+        );
+    }
+    match lease {
+        Some(lease) if ObjectFormat::of(lease) != Some(format) => {
+            Err("the lease is not an object name of HEAD's format".into())
+        }
+        Some(lease) if zero(lease) => Err(
+            "the lease is the zero id, which names no commit: the branch had no such tip".into(),
+        ),
+        _ => Ok(format),
+    }
+}
+
 fn is_hex_name(name: &[u8], len: usize) -> bool {
     name.len() == len && name.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -1507,20 +1537,12 @@ pub async fn push_outcome_within(
         Ok(upstream) => upstream,
         Err(e) => return Ok(Outcome::failed(format!("{e:#}"))),
     };
-    let Some(format) = ObjectFormat::of(head) else {
-        return Ok(Outcome::failed(format!(
-            "`{}` is not an object name",
-            clean(head.as_bytes(), 80)
-        )));
-    };
-    let lease = match crate::git::branch_tip(git.base_refs(), branch) {
-        Some(tip) if ObjectFormat::of(tip) == Some(format) => Some(tip.to_string()),
-        Some(_) => {
-            return Ok(Outcome::failed(
-                "the lease is not an object name of HEAD's format",
-            ));
-        }
-        None => None,
+    // Before anything is asked of the repository: a HEAD or a lease that is no object's name,
+    // the zero id among them, pushes nothing.
+    let lease = crate::git::branch_tip(git.base_refs(), branch).map(str::to_string);
+    let format = match check_names(head, lease.as_deref()) {
+        Ok(format) => format,
+        Err(error) => return Ok(Outcome::failed(error)),
     };
     let known: HashSet<String> = known_tips(git.base_refs(), format);
     // The token, read at this request (ADR-0116): a revoked one pushes nothing.
@@ -2097,6 +2119,37 @@ mod tests {
         out.extend(pkt_line(&band));
         out.extend_from_slice(b"0000");
         out
+    }
+
+    #[test]
+    fn a_push_names_objects_and_never_the_zero_id() {
+        for (len, format) in [(40, ObjectFormat::Sha1), (64, ObjectFormat::Sha256)] {
+            let (head, lease, zero) = ("a".repeat(len), "b".repeat(len), "0".repeat(len));
+            assert_eq!(check_names(&head, None), Ok(format));
+            assert_eq!(check_names(&head, Some(&lease)), Ok(format));
+            // One digit that is not 0 makes it an object's name.
+            let almost = format!("{}1", &zero[1..]);
+            assert_eq!(check_names(&almost, Some(&almost)), Ok(format));
+            // As the new tip, the zero id is the protocol's command to delete the branch.
+            let refused = check_names(&zero, Some(&lease)).unwrap_err();
+            assert!(refused.contains("would delete the branch"), "{refused}");
+            assert!(check_names(&zero, None).is_err());
+            // As the old tip, it says the branch is new: a lease is a tip the branch had.
+            let refused = check_names(&head, Some(&zero)).unwrap_err();
+            assert!(refused.contains("the lease is the zero id"), "{refused}");
+            // What a new branch's command has in the lease's place is this client's own.
+            assert_eq!(format.zero(), zero);
+        }
+        for (head, lease) in [
+            ("HEAD".to_string(), None),
+            ("a".repeat(39), None),
+            ("g".repeat(40), None),
+            ("0".repeat(41), None),
+            ("a".repeat(40), Some("b".repeat(64))),
+            ("a".repeat(64), Some("main".to_string())),
+        ] {
+            assert!(check_names(&head, lease.as_deref()).is_err(), "{head}");
+        }
     }
 
     #[test]
