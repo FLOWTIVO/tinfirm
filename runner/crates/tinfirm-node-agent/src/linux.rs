@@ -299,29 +299,52 @@ pub fn disk_room_problem(free: u64, others: &[(u64, u64)], wanted: u64) -> Optio
 /// of this template next, and what the file has allocated is free again when it goes: the slot
 /// counts for a snapshot of this template, or for its own where that is larger, less what is
 /// allocated. A node too small for `slots` snapshots of this template so has the problem with
-/// whatever VMs on it, and not only while it is empty. `None` when there is room; the problem
-/// otherwise.
+/// whatever VMs on it, and not only while it is empty.
+///
+/// Only `slots` of the snapshots there are in a slot. Where there are more (a leftover's beside
+/// the VMs'), the rest count for what they may still grow by as they are, and the slots are
+/// taken to hold those whose replacement by a snapshot of this template takes most, since the
+/// files do not say which is whose. `None` when there is room; the problem otherwise.
 pub fn check_room_problem(
     free: u64,
     others: &[(u64, u64)],
     slots: u64,
     snapshot: u64,
 ) -> Option<String> {
-    let empty = slots.saturating_sub(u64::try_from(others.len()).unwrap_or(u64::MAX));
+    let there = u64::try_from(others.len()).unwrap_or(u64::MAX);
+    let empty = slots.saturating_sub(there);
     let wanted = empty.saturating_mul(snapshot);
-    let promised = others
+    // What each snapshot there may still grow by as it is ...
+    let own = others
         .iter()
-        .map(|(size, allocated)| (*size).max(snapshot).saturating_sub(*allocated))
+        .map(|(size, allocated)| size.saturating_sub(*allocated))
         .fold(0u64, u64::saturating_add);
+    // ... and what a snapshot of this template in its slot would take on top of that, for as
+    // many of them as there are slots: those for which that is most.
+    let mut more: Vec<u64> = others
+        .iter()
+        .map(|(size, _)| snapshot.saturating_sub(*size))
+        .collect();
+    more.sort_unstable_by(|a, b| b.cmp(a));
+    let more = more
+        .iter()
+        .take(usize::try_from(slots).unwrap_or(usize::MAX))
+        .fold(0u64, |sum, more| sum.saturating_add(*more));
+    let promised = own.saturating_add(more);
     let needed = wanted.saturating_add(promised);
+    let (held, beyond) = (there.min(slots), there.saturating_sub(slots));
+    let surplus = if beyond == 0 {
+        String::new()
+    } else {
+        format!("; the {beyond} snapshot(s) beyond the slots count for what they may still grow by")
+    };
     (free < needed).then(|| {
         format!(
-            "the work directory's file system has {} MiB free, and {} MiB are needed: {} MiB for a snapshot in each of the {empty} slot(s) that hold none and {} MiB that the {} slot(s) whose snapshot is there may still take (each up to a snapshot of this template, or to its own where that is larger)",
+            "the work directory's file system has {} MiB free, and {} MiB are needed: {} MiB for a snapshot in each of the {empty} slot(s) that hold none and {} MiB that the {held} slot(s) whose snapshot is there may still take (each up to a snapshot of this template, or to its own where that is larger{surplus})",
             free >> 20,
             needed >> 20,
             wanted >> 20,
             promised >> 20,
-            others.len()
         )
     })
 }
@@ -3128,6 +3151,23 @@ mod tests {
         let one_large = [(large, 3 * GIB)];
         assert_eq!(check_room_problem(24 * GIB, &one_large, slots, small), None);
         assert!(check_room_problem(24 * GIB - 1, &one_large, slots, small).is_some());
+        // More snapshots than slots (a leftover's beside the VMs'): a snapshot of this template
+        // counts for the 8 slots alone, 19 GiB each beside the small one that is written full,
+        // and the ninth file for what it may grow by itself, which is nothing.
+        let nine = [(small, small); 9];
+        assert_eq!(check_room_problem(152 * GIB, &nine, slots, large), None);
+        let problem = check_room_problem(152 * GIB - 1, &nine, slots, large).unwrap();
+        assert!(
+            problem.contains("that the 8 slot(s) whose snapshot is there")
+                && problem.contains("the 1 snapshot(s) beyond the slots"),
+            "{problem}"
+        );
+        // Which of them are in the slots the files do not say: those whose replacement takes
+        // most. Eight small ones and a large one that may grow by 17 GiB: 152 GiB and 17 GiB.
+        let mut mixed = vec![(small, small); 8];
+        mixed.push((large, 3 * GIB));
+        assert_eq!(check_room_problem(169 * GIB, &mixed, slots, large), None);
+        assert!(check_room_problem(169 * GIB - 1, &mixed, slots, large).is_some());
     }
 
     #[test]
