@@ -362,7 +362,7 @@ Its lines for this driver:
 | `the runner pod's node is unknown (TINFIRM_NODE_NAME)` | The chart sets it from the downward API; a pod without it is not the chart's. The operator |
 | `the pod driver cannot reach the cluster's API: cannot read the token file …` | The pod has no projected token: it is not the chart's runner pod, or the chart's driver is not `pod` |
 
-The admission check is a set of server-side dry runs: the correct pod, which must be admitted, and each pod that must be refused, one deviation each. It needs no right outside the runs' namespace, and works the same with your own engine.
+The admission check is a set of server-side dry runs: the correct pod, which must be admitted, and each pod that must be refused, one deviation each. It needs no right outside the runs' namespace, and works the same with your own engine. A create, with its admission check, its tries for room, the pod and its ticket's Secret, answers within 150 s, under the 180 s the runner host gives it: one that runs out, such as behind an admission webhook that answers slowly, fails as a create with the step that took the time, and the driver deletes the pod it may have made.
 
 **When a run pod stops.** The pod's program checks the pod before it starts the VM, and writes why it stopped to the pod's termination message. The runner host reports it as the VM's failure in its log; while the pod exists, `kubectl -n tinfirm-runs get pod <name> -o jsonpath='{.status.containerStatuses[0].state.terminated.message}'` shows it.
 
