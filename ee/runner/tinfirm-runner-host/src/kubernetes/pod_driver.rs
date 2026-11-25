@@ -8,10 +8,14 @@
 //!   pod, then the ticket's Secret, owned by the pod. The pod's Secret volume holds every
 //!   container back until the Secret exists. When the Secret cannot be made, the pod is deleted;
 //!   so is a pod whose create got no clear answer, since the cluster may hold it all the same.
+//!   A pod that the quota refuses is tried again for up to 10 s while a pod of the host's is
+//!   ending or this driver has just deleted one: that pod's share of the quota comes back.
 //! - `describe` and `list`: read pods. The first time a pod is seen ready, its ticket's Secret
 //!   is deleted: the VM has read it.
 //! - `delete`: reads the pod, refuses it unless it carries every label of the request, then
-//!   deletes the ticket's Secret and the pod.
+//!   deletes the ticket's Secret and the pod, and answers once the pod is gone from the API or
+//!   after 20 s: until it is gone the pod counts against the quota, and the host takes the
+//!   answer for a free slot.
 //! - `verify`: reads the ResourceQuota and the two network policies, lists the run pods, and
 //!   checks the admission policy with dry runs.
 //!
@@ -46,6 +50,13 @@ const UNSCHEDULABLE_AFTER_SECONDS: i64 = 60;
 const GRACE_SECONDS: u32 = 5;
 /// How long the delete of a pod may take whose create got no clear answer.
 const UNSURE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `delete` waits for the pod to be gone from the API: its grace period, and time for
+/// the kubelet to clear it away. Far below the 120 s the host gives a delete.
+const GONE_WAIT: Duration = Duration::from_secs(20);
+/// How long `create` tries again after the quota's refusal, while room is on its way.
+const ROOM_WAIT: Duration = Duration::from_secs(10);
+/// How often `delete` and `create` look again while they wait.
+const POLL: Duration = Duration::from_millis(500);
 /// The longest text of the cluster's that a problem quotes.
 const MAX_QUOTED: usize = 300;
 /// The most unschedulable pods that `verify` names.
@@ -58,8 +69,13 @@ pub struct PodDriver {
     /// The node the runner pod runs on, which no run pod may share (`TINFIRM_NODE_NAME`).
     runner_node: Option<String>,
     admission_ttl: Duration,
+    gone_wait: Duration,
+    room_wait: Duration,
+    poll: Duration,
     /// The templates whose admission check passed, and when.
     admission_checked: Mutex<BTreeMap<String, Instant>>,
+    /// When a delete of this driver's last ended: the quota may count that pod a moment longer.
+    deleted: Mutex<Option<Instant>>,
     /// The pods whose ticket's Secret is deleted.
     tickets_deleted: Mutex<HashSet<String>>,
     /// The pods whose failure is written to the log.
@@ -73,7 +89,11 @@ impl PodDriver {
             api,
             runner_node: runner_node.filter(|n| !n.is_empty()),
             admission_ttl: ADMISSION_CHECK_TTL,
+            gone_wait: GONE_WAIT,
+            room_wait: ROOM_WAIT,
+            poll: POLL,
             admission_checked: Mutex::new(BTreeMap::new()),
+            deleted: Mutex::new(None),
             tickets_deleted: Mutex::new(HashSet::new()),
             failures_logged: Mutex::new(HashSet::new()),
         }
@@ -133,20 +153,25 @@ impl PodDriver {
             );
         }
         let node = self.runner_node()?;
-        self.check_admission(template).await?;
         let id = VmId::random();
         let name = id.pod_name();
         let pod = spec::pod(&self.config, template, &id, labels, node)?;
-        let created = match self
-            .api
-            .create_pod(self.namespace(), &pod, DryRun::No)
-            .await
-        {
-            Ok(created) => created,
-            Err(e) if maybe_stored(&e) => {
-                return Err(self.delete_unsure(&name, create_error("the pod", &e)).await);
+        let started = Instant::now();
+        let mut room_coming = false;
+        let created = loop {
+            let tried = self.try_create(template, &name, &pod).await;
+            // The quota refused the pod. The host asks for a VM as soon as it has a free slot,
+            // and a pod it deleted for that slot holds its share of the quota until it is gone
+            // and the cluster has counted again: that room is tried for again, for a moment.
+            let no_room = tried.as_ref().is_err_and(|e| e.is::<NoRoom>());
+            if !no_room || started.elapsed() >= self.room_wait {
+                break tried?;
             }
-            Err(e) => return Err(create_error("the pod", &e)),
+            room_coming = room_coming || self.room_is_coming(labels).await;
+            if !room_coming {
+                break tried?;
+            }
+            tokio::time::sleep(self.poll).await;
         };
         let uid = created["metadata"]["uid"].as_str().unwrap_or_default();
         let secret = spec::ticket_secret(&self.config, &id, labels, user_data.as_bytes(), uid);
@@ -170,6 +195,42 @@ impl PodDriver {
         }
         eprintln!("created pod {name}");
         Ok(json!({ "id": name }))
+    }
+
+    /// One try of a run pod's create: the admission check, then the pod; the server's pod.
+    async fn try_create(&self, template: &str, name: &str, pod: &Value) -> Result<Value> {
+        self.check_admission(template).await?;
+        match self.api.create_pod(self.namespace(), pod, DryRun::No).await {
+            Ok(created) => Ok(created),
+            Err(e) if maybe_stored(&e) => {
+                Err(self.delete_unsure(name, create_error("the pod", &e)).await)
+            }
+            Err(e) => Err(create_error("the pod", &e)),
+        }
+    }
+
+    /// Whether room that the quota refused is on its way: this driver deleted a pod moments
+    /// ago, or a pod of the host that `labels` name is ending. A read that fails tells of none.
+    async fn room_is_coming(&self, labels: &BTreeMap<String, String>) -> bool {
+        if lock(&self.deleted).is_some_and(|at| at.elapsed() < self.room_wait) {
+            return true;
+        }
+        let host = labels
+            .iter()
+            .filter(|(key, _)| key.as_str() == HOST_LABEL)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let Ok(mut selector) = spec::kubernetes_labels(&host) else {
+            return false;
+        };
+        selector.insert(spec::SANDBOX_LABEL.into(), spec::SANDBOX_VALUE.into());
+        self.api
+            .list_pods(self.namespace(), &selector)
+            .await
+            .is_ok_and(|pods| {
+                pods.iter()
+                    .any(|pod| !pod["metadata"]["deletionTimestamp"].is_null())
+            })
     }
 
     /// Deletes the pod `name` after a create whose answer does not tell whether the server
@@ -326,9 +387,9 @@ impl PodDriver {
             Err(e) if namespace_missing(&e) => {
                 bail!("the runs' namespace {} does not exist", self.namespace())
             }
-            Err(e) if quota_exceeded(&e) => bail!(
-                "no room in the runs' namespace: its ResourceQuota is used up, so the admission policy cannot be checked"
-            ),
+            Err(e) if quota_exceeded(&e) => {
+                Err(NoRoom(", so the admission policy cannot be checked".into()).into())
+            }
             Err(e) if unreachable(&e) => {
                 bail!("cannot reach the API server for the admission check: {e}")
             }
@@ -458,18 +519,40 @@ impl PodDriver {
                 failure_kind(&e.failure)
             );
         }
-        match self
+        // The host frees the VM's slot when this answers, and a pod that is ending still holds
+        // its share of the quota: the answer waits until the pod is gone.
+        let gone = match self
             .api
             .delete_pod(self.namespace(), id, Some(GRACE_SECONDS))
             .await
         {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => {}
+            Ok(()) => self.gone(id).await,
+            Err(e) if e.is_not_found() => true,
             Err(e) => return Err(e.into()),
-        }
+        };
         self.forget(id);
-        eprintln!("deleted pod {id}");
+        *lock(&self.deleted) = Some(Instant::now());
+        if gone {
+            eprintln!("deleted pod {id}");
+        } else {
+            eprintln!(
+                "deleted pod {id}, which is still ending after {} s: it holds its share of the quota until it is gone",
+                self.gone_wait.as_secs()
+            );
+        }
         Ok(json!({}))
+    }
+
+    /// Waits until the pod `id` is gone from the API, for [`GONE_WAIT`] at most; whether it
+    /// is. A read that fails otherwise tells nothing, and the next one may.
+    async fn gone(&self, id: &str) -> bool {
+        let gone = async {
+            while !matches!(self.api.get_pod(self.namespace(), id).await, Err(e) if e.is_not_found())
+            {
+                tokio::time::sleep(self.poll).await;
+            }
+        };
+        tokio::time::timeout(self.gone_wait, gone).await.is_ok()
     }
 
     // ----- verify ---------------------------------------------------------------------
@@ -569,6 +652,12 @@ enum DryRunAnswer {
     Accepted,
     Refused(String),
 }
+
+/// The namespace's ResourceQuota refused a pod, a dry run's too; the text ends the message.
+/// `create` tries again for a moment where a pod that is ending still holds the room.
+#[derive(Debug, thiserror::Error)]
+#[error("no room in the runs' namespace: its ResourceQuota is used up{0}")]
+struct NoRoom(String);
 
 /// Serves the driver protocol on `input` and `output` until `input` ends
 /// ([`crate::vm::serve_driver`]).
@@ -729,10 +818,7 @@ fn api_problem(what: &str, e: &ApiError) -> String {
 /// The error of a create that failed; a full quota says that there is no room.
 fn create_error(what: &str, e: &ApiError) -> anyhow::Error {
     if quota_exceeded(e) {
-        anyhow::anyhow!(
-            "no room in the runs' namespace: its ResourceQuota is used up ({})",
-            one_line(&e.to_string())
-        )
+        NoRoom(format!(" ({})", one_line(&e.to_string()))).into()
     } else {
         anyhow::anyhow!("cannot create {what}: {e}")
     }
@@ -1010,6 +1096,14 @@ mod tests {
         quota: Option<Value>,
         admission: Admission,
         quota_full: bool,
+        /// The most pods the quota admits. A pod that is ending counts until it is gone.
+        pod_limit: Option<usize>,
+        /// How many more creates the quota refuses for a pod that is gone: it counts late.
+        stale_quota: u32,
+        /// How many more requests about pods a deleted pod is there for, ending.
+        ending_for: u32,
+        /// The pods that are ending, each with the requests it is still there for.
+        ending: BTreeMap<String, u32>,
         /// The pod's create stores the pod, and answers with this code and no pod.
         lost_pod_answer: Option<u16>,
         fail_secret_create: bool,
@@ -1050,6 +1144,10 @@ mod tests {
             quota: Some(quota()),
             admission: Admission::Sound,
             quota_full: false,
+            pod_limit: None,
+            stale_quota: 0,
+            ending_for: 0,
+            ending: BTreeMap::new(),
             lost_pod_answer: None,
             fail_secret_create: false,
             fail_secret_deletes: 0,
@@ -1176,10 +1274,41 @@ mod tests {
         }
     }
 
+    /// Takes a pod out of the cluster, and what it owns with it (the garbage collector).
+    fn remove_pod(cluster: &mut Cluster, name: &str) -> Option<Value> {
+        let pod = cluster.pods.remove(name)?;
+        let uid = pod["metadata"]["uid"].clone();
+        cluster
+            .secrets
+            .retain(|_, s| s["metadata"]["ownerReferences"][0]["uid"] != uid);
+        cluster.ending.remove(name);
+        Some(pod)
+    }
+
+    /// One more request about pods: a pod that is ending is there for one request less, and
+    /// gone after its last.
+    fn pods_end(cluster: &mut Cluster) {
+        let gone: Vec<String> = cluster
+            .ending
+            .iter()
+            .filter(|(_, left)| **left == 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in gone {
+            remove_pod(cluster, &name);
+        }
+        for left in cluster.ending.values_mut() {
+            *left -= 1;
+        }
+    }
+
     fn answer(cluster: &mut Cluster, seen: &Seen) -> Reply {
         let (path, query) = seen.target.split_once('?').unwrap_or((&seen.target, ""));
         let dry = query.contains("dryRun=All");
         let pods = format!("/api/v1/namespaces/{NS}/pods");
+        if seen.method != "DELETE" && path.starts_with(&pods) {
+            pods_end(cluster);
+        }
         let secrets = format!("/api/v1/namespaces/{NS}/secrets");
         let policies = format!("/apis/networking.k8s.io/v1/namespaces/{NS}/networkpolicies/");
         let quotas = format!("/api/v1/namespaces/{NS}/resourcequotas/");
@@ -1194,7 +1323,13 @@ mod tests {
                 if !cluster.namespace {
                     return not_found("namespaces", NS);
                 }
-                if cluster.quota_full {
+                if cluster.quota_full
+                    || cluster.stale_quota > 0
+                    || cluster
+                        .pod_limit
+                        .is_some_and(|limit| cluster.pods.len() >= limit)
+                {
+                    cluster.stale_quota = cluster.stale_quota.saturating_sub(1);
                     return Reply::Json(
                         403,
                         status(
@@ -1289,15 +1424,21 @@ mod tests {
                 if cluster.fail_pod_delete {
                     return Reply::Json(403, status(403, "Forbidden", "pods is forbidden"));
                 }
-                match cluster.pods.remove(name) {
-                    Some(pod) => {
-                        // The garbage collector: what the pod owns goes with it.
-                        let uid = pod["metadata"]["uid"].clone();
-                        cluster
-                            .secrets
-                            .retain(|_, s| s["metadata"]["ownerReferences"][0]["uid"] != uid);
-                        Reply::Json(200, pod)
-                    }
+                // With a grace period the pod is there for a while yet, ending.
+                if cluster.ending_for > 0 && !query.contains("gracePeriodSeconds=0") {
+                    let linger = cluster.ending_for;
+                    return match cluster.pods.get_mut(name) {
+                        Some(pod) => {
+                            pod["metadata"]["deletionTimestamp"] = json!("2026-11-20T10:00:00Z");
+                            let pod = pod.clone();
+                            cluster.ending.entry(name.to_string()).or_insert(linger);
+                            Reply::Json(200, pod)
+                        }
+                        None => not_found("pods", name),
+                    };
+                }
+                match remove_pod(cluster, name) {
+                    Some(pod) => Reply::Json(200, pod),
                     None => not_found("pods", name),
                 }
             }
@@ -1391,6 +1532,15 @@ mod tests {
             self.fake.seen.lock().unwrap().clear();
         }
 
+        /// A delete of the pod `name` that is not this driver's: the pod is ending, and there
+        /// for `requests` more requests about pods.
+        fn end(&self, name: &str, requests: u32) {
+            let mut cluster = self.cluster();
+            cluster.pods.get_mut(name).unwrap()["metadata"]["deletionTimestamp"] =
+                json!("2026-11-20T10:00:00Z");
+            cluster.ending.insert(name.to_string(), requests);
+        }
+
         /// One request through the driver protocol, on in-memory pipes; its answer.
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let (mut client, server) = tokio::io::duplex(1024 * 1024);
@@ -1440,13 +1590,11 @@ mod tests {
         let handler: Handler =
             Arc::new(move |seen: &Seen, _: usize| answer(&mut state.lock().unwrap(), seen));
         let setup = setup(handler).await;
-        let driver = Arc::new(PodDriver::new(
-            config(&config_value),
-            setup.api,
-            node.map(str::to_string),
-        ));
+        let mut driver = PodDriver::new(config(&config_value), setup.api, node.map(str::to_string));
+        // The waits as built, and a short look between two tries.
+        driver.poll = Duration::from_millis(5);
         Test {
-            driver,
+            driver: Arc::new(driver),
             cluster,
             fake: setup.fake,
             dir: setup._dir,
@@ -1998,22 +2146,17 @@ mod tests {
             json!({"id": id, "labels": {"tinfirm-host": HOST, "tinfirm-vm": "v1"}}),
         )
         .await;
+        // The last read finds the pod gone.
         assert_eq!(
             t.calls(),
             [
                 format!("GET /api/v1/namespaces/{NS}/pods/{id}"),
                 format!("DELETE /api/v1/namespaces/{NS}/secrets/{ticket}"),
                 format!("DELETE /api/v1/namespaces/{NS}/pods/{id}"),
+                format!("GET /api/v1/namespaces/{NS}/pods/{id}"),
             ]
         );
-        assert!(
-            t.fake
-                .seen()
-                .last()
-                .unwrap()
-                .target
-                .ends_with("?gracePeriodSeconds=5")
-        );
+        assert!(t.fake.seen()[2].target.ends_with("?gracePeriodSeconds=5"));
         assert!(t.cluster().pods.is_empty() && t.cluster().secrets.is_empty());
         // Gone already: success.
         assert_eq!(
@@ -2024,6 +2167,142 @@ mod tests {
             .await,
             json!({})
         );
+    }
+
+    #[tokio::test]
+    async fn delete_answers_once_the_pod_is_gone() {
+        let mut c = cluster();
+        c.ending_for = 2;
+        let mut t = start(c).await;
+        let id = t.create().await;
+        let pod = format!("/api/v1/namespaces/{NS}/pods/{id}");
+        let delete = json!({"id": id, "labels": {"tinfirm-host": HOST}});
+        t.forget_calls();
+        t.ok("delete", delete).await;
+        // After its delete the pod was there for two reads, ending; the third found it gone.
+        assert_eq!(
+            t.calls()[2..],
+            [
+                format!("DELETE {pod}"),
+                format!("GET {pod}"),
+                format!("GET {pod}"),
+                format!("GET {pod}"),
+            ]
+        );
+        assert!(t.cluster().pods.is_empty());
+        assert!(lock(&t.driver.deleted).is_some());
+
+        // A pod that is not gone within the wait: the delete answers all the same, and the pod
+        // reads as gone, as every pod that is being deleted.
+        let id = t.create().await;
+        t.cluster().ending_for = u32::MAX;
+        Arc::get_mut(&mut t.driver).unwrap().gone_wait = Duration::from_millis(100);
+        let started = Instant::now();
+        t.ok(
+            "delete",
+            json!({"id": id, "labels": {"tinfirm-host": HOST}}),
+        )
+        .await;
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(t.cluster().pods.contains_key(&id), "still ending");
+        assert_eq!(t.ok("describe", json!({"id": id})).await["state"], "gone");
+    }
+
+    #[tokio::test]
+    async fn create_waits_for_the_room_of_a_pod_that_is_ending() {
+        let create = json!({"template": "sandbox-4c8g", "userData": USER_DATA,
+                            "labels": {"tinfirm-host": HOST}});
+        let pods = format!("/api/v1/namespaces/{NS}/pods");
+        let full = || {
+            let mut c = cluster();
+            c.pod_limit = Some(1);
+            c
+        };
+        let t = start(full()).await;
+        let a = t.create().await;
+        // Not this driver's delete: the pod is ending, and counts for two creates more.
+        t.end(&a, 3);
+        t.forget_calls();
+        let b = t.ok("create", create.clone()).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Refused; a pod of the host is ending; refused again; then there is room.
+        assert_eq!(
+            t.calls(),
+            [
+                format!("POST {pods}"),
+                format!("GET {pods}"),
+                format!("POST {pods}"),
+                format!("POST {pods}"),
+                format!("POST /api/v1/namespaces/{NS}/secrets"),
+            ]
+        );
+        assert_eq!(
+            t.fake.seen()[1].target,
+            format!(
+                "{pods}?labelSelector=tinfirm.flowtivo.com%2Fhost%3D{HOST}%2Ctinfirm.flowtivo.com%2Fsandbox%3Dvm"
+            )
+        );
+        assert_eq!(
+            t.cluster().pods.keys().collect::<Vec<_>>(),
+            [&b],
+            "the pod that ended is gone"
+        );
+
+        // This driver's own delete: the pod is gone when it answers, and the quota counts it
+        // for two creates more. The admission check is due, and its dry run is refused too.
+        t.ok("delete", json!({"id": b, "labels": {"tinfirm-host": HOST}}))
+            .await;
+        t.cluster().stale_quota = 2;
+        lock(&t.driver.admission_checked).clear();
+        t.forget_calls();
+        t.ok("create", create.clone()).await;
+        let calls = t.calls();
+        let policies = format!("GET /apis/networking.k8s.io/v1/namespaces/{NS}/networkpolicies");
+        let dry_run = format!("POST {pods} (dry run)");
+        assert_eq!(
+            calls[..4],
+            [
+                policies.clone(),
+                dry_run.clone(),
+                policies.clone(),
+                dry_run.clone()
+            ],
+            "{calls:#?}"
+        );
+        // Then the whole check, the pod and its Secret; no pod was listed on the way.
+        assert_eq!(calls.len(), 4 + 1 + battery_calls() + 2, "{calls:#?}");
+        assert!(!calls.contains(&format!("GET {pods}")), "{calls:#?}");
+
+        // A quota full of pods that stay: refused at once, after one look for a pod that ends.
+        let t = start(full()).await;
+        t.create().await;
+        t.forget_calls();
+        let error = t.error("create", create.clone()).await;
+        assert!(
+            error.contains("no room in the runs' namespace: its ResourceQuota is used up"),
+            "{error}"
+        );
+        assert_eq!(t.calls(), [format!("POST {pods}"), format!("GET {pods}")]);
+
+        // A pod that does not end: the create gives up after its wait.
+        let mut t = start(full()).await;
+        let a = t.create().await;
+        t.end(&a, u32::MAX);
+        Arc::get_mut(&mut t.driver).unwrap().room_wait = Duration::from_millis(100);
+        t.forget_calls();
+        let started = Instant::now();
+        let error = t.error("create", create.clone()).await;
+        assert!(error.contains("no room in the runs' namespace"), "{error}");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        let tries = t
+            .calls()
+            .iter()
+            .filter(|c| **c == format!("POST {pods}"))
+            .count();
+        assert!(tries > 1, "{:#?}", t.calls());
+        assert_eq!(t.cluster().pods.len(), 1, "no second pod");
     }
 
     #[tokio::test]
