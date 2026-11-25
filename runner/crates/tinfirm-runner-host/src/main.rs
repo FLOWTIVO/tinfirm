@@ -2475,8 +2475,9 @@ async fn run(
     secure_fs::ensure_private_dir(&paths.config_dir)?;
     // The reader of what the sandboxes send back and a probe of their front, before any image
     // is built: a host that cannot confine either is refused at once.
+    let mut own_files = None;
     let reader_and_front = if sandbox_args.sandbox_bridge || vm_options.is_some() {
-        make_room_to_pass_descriptors();
+        own_files = make_room_to_pass_descriptors();
         Some(check_reader_and_front(paths, sandbox_args.allow_unconfined_reader).await?)
     } else {
         None
@@ -2535,6 +2536,11 @@ async fn run(
             reader_and_front.context("a host with the bridge has a reader")?;
     }
     opts.egress = egress;
+    // A host that passes descriptors to fronts: its sandboxes' containers may hold fewer files
+    // than it does itself, so that they cannot use its room up (confine::sandbox_files).
+    if let Some(own) = own_files {
+        opts.resources.files = tinfirm_runner_host::confine::sandbox_files(own);
+    }
     // The model proxy is always on: a setup where its listeners could never serve a sandbox is
     // refused now, rather than every run with a model gateway later.
     let listeners = tinfirm_runner_host::model_proxy::check_endpoint(endpoint.as_ref()).await?;
@@ -2588,12 +2594,14 @@ fn check_ceiling(max_concurrent_runs: u32, vm: bool) -> Result<()> {
 /// Before a host with fronts starts its first process: `run` raises its own limit of open files
 /// to its hard limit, so that no reader or front that a flaw took over can keep it from passing
 /// descriptors to its fronts ([`tinfirm_runner_host::confine::raise_descriptor_limit`]). Where
-/// the hard limit leaves no room for that, a warning says so and what to set.
-fn make_room_to_pass_descriptors() {
+/// the hard limit leaves no room for that, a warning says so and what to set. Returns the
+/// limit `run` has from now on, where it can be told.
+fn make_room_to_pass_descriptors() -> Option<u64> {
     use tinfirm_runner_host::confine::{
         CONFINED_FILES, FILES_TO_PASS_DESCRIPTORS, MAX_PASSED_AT_ONCE, raise_descriptor_limit,
     };
-    if let Some(files) = raise_descriptor_limit()
+    let files = raise_descriptor_limit();
+    if let Some(files) = files
         && files < FILES_TO_PASS_DESCRIPTORS
     {
         tracing::warn!(
@@ -2602,6 +2610,7 @@ fn make_room_to_pass_descriptors() {
             CONFINED_FILES + MAX_PASSED_AT_ONCE
         );
     }
+    files
 }
 
 /// The reader of what the sandboxes send back (ADR-0112, open question 1) and the front process

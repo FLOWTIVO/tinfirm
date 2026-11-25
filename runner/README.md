@@ -1078,10 +1078,16 @@ Both:
   front holds a limit of 1024, so all of them together bring the count to 1277 at most, and a
   front cannot pass a descriptor at all. Where the hard limit is below 4096, `run` warns at its
   start: set `LimitNOFILE=` in its unit. This does not hold back another program of `run`'s
-  user, which has a limit of its own; on a Docker host, a sandbox whose user (`1000`) is `run`'s
-  own is such a program unless Docker maps its users to a namespace (not tried). Should the
-  kernel refuse `run`, the message does not go and its caller fails with that reason, a warning
-  says so at most once a minute, and no front is ended for it: the kernel names no process.
+  user, which has a limit of its own. On a Docker host without user namespaces, a sandbox whose
+  user (`1000`) is `run`'s own is such a program, so every sandbox's container gets a limit of
+  open files of its own (`nofile`, soft and hard, not the Docker daemon's): 65536, or on a host
+  with the bridge `run`'s own limit less 253 where that is fewer, and never under 1024. With it
+  a sandbox's processes cannot bring the count above `run`'s limit (by the kernel's rule; not
+  tried in a container). A sandbox with a Docker of its own (`--sandbox-docker`) has every
+  capability and can raise its limit: it belongs in a VM runtime, whose descriptors are another
+  kernel's. Should the kernel refuse `run`, the message does not go and its caller fails with
+  that reason, a warning says so at most once a minute, and no front is ended for it: the kernel
+  names no process.
 - **`doctor`** runs a reader, which confines itself as one that runs git does and tries to open
   the config and data directories, its parent's memory and a socket, and says
   `reader: confined: Landlock ABI 7 (files,
@@ -2519,7 +2525,8 @@ new session (`resumeOutcome` `NO_SESSION`).
 4. Starts the container `tinfirm-run-<runId>` under the `--sandbox-runtime`: user 1000:1000,
    all capabilities dropped, `no-new-privileges` (with `--sandbox-docker`, root and the
    settings of [Docker in the sandbox](#kata-containers-and-docker-in-the-sandbox) instead),
-   4 GiB memory, 2 CPUs, 1024 pids, an init process, labels
+   4 GiB memory, 2 CPUs, 1024 pids, 65536 open files (fewer on a host whose own limit is
+   lower, "Descriptors on their way" above), an init process, labels
    `dev.tinfirm.run-id` and `dev.tinfirm.runner-host`. Mounts: the workspace at
    `/workspace` (the agent's working directory, with the repositories in it), the session
    home at `/home/agent`, the attachments read-only at `/attachments` (also in

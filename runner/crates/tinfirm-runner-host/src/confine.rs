@@ -458,6 +458,20 @@ pub const FILES_TO_PASS_DESCRIPTORS: u64 = 4 * CONFINED_FILES;
 
 const _: () = assert!(FILES_TO_PASS_DESCRIPTORS >= 2 * (CONFINED_FILES + MAX_PASSED_AT_ONCE));
 
+/// The limit of open files for the sandboxes' containers of a host that passes descriptors to
+/// fronts and may itself have `own` files open. On a Docker host without user namespaces
+/// whose user is uid 1000, a sandbox's processes are that same user to the kernel, and what
+/// they leave on its way over Unix sockets counts with `run`'s own: with a limit of `n` files
+/// they can leave `n` and one message more there ([`MAX_PASSED_AT_ONCE`]), and `run` passes a
+/// descriptor while the count is not above its own limit ([`raise_descriptor_limit`]). So a
+/// container gets at most `own` less one message, and [`crate::sandbox::SANDBOX_FILES`] where
+/// that is more. Never less than [`CONFINED_FILES`], with which few programs still work: a
+/// host whose own limit leaves no room for that has been warned at its start.
+pub fn sandbox_files(own: u64) -> u64 {
+    own.saturating_sub(MAX_PASSED_AT_ONCE)
+        .clamp(CONFINED_FILES, crate::sandbox::SANDBOX_FILES)
+}
+
 /// Raises this process's soft limit of open files (`RLIMIT_NOFILE`) to its hard limit, and
 /// gives the limit it then has; `None` where no such rule exists (not Linux).
 ///
@@ -1132,6 +1146,24 @@ mod tests {
         let none = Status::none("macOS");
         assert!(!none.confined());
         assert_eq!(none.describe(), "not confined: macOS");
+    }
+
+    #[test]
+    fn a_sandboxes_files_stay_one_message_under_the_hosts_own() {
+        // The limit `run` has under systemd, and one a shell gives: 65536 for the sandbox.
+        assert_eq!(sandbox_files(524_288), 65536);
+        assert_eq!(sandbox_files(1_048_576), 65536);
+        assert_eq!(sandbox_files(65536 + MAX_PASSED_AT_ONCE), 65536);
+        // A host with fewer: what its sandboxes can leave on their way, their files and one
+        // message more, is not above what the host may have itself.
+        for own in [65536, 8192, 4096, CONFINED_FILES + MAX_PASSED_AT_ONCE] {
+            let files = sandbox_files(own);
+            assert_eq!(files, own - MAX_PASSED_AT_ONCE);
+            assert!(files + MAX_PASSED_AT_ONCE <= own);
+        }
+        // Never fewer than a confined process has: that host was warned at its start.
+        assert_eq!(sandbox_files(1024), CONFINED_FILES);
+        assert_eq!(sandbox_files(0), CONFINED_FILES);
     }
 
     #[cfg(target_os = "linux")]

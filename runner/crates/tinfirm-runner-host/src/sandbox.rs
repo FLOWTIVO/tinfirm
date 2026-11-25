@@ -20,7 +20,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bollard::Docker;
 use bollard::container::LogOutput;
-use bollard::models::{ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum};
+use bollard::models::{
+    ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum, ResourcesUlimits,
+};
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, LogsOptionsBuilder,
     StartContainerOptions, StopContainerOptionsBuilder, WaitContainerOptions,
@@ -44,12 +46,19 @@ pub struct Bind {
     pub read_only: bool,
 }
 
+/// A sandbox container's limit of open files (`nofile`, soft and hard), unless the host's own
+/// limit asks for less ([`crate::confine::sandbox_files`]): the container does not take the
+/// Docker daemon's, which is often a million or none.
+pub const SANDBOX_FILES: u64 = 65536;
+
 /// Resource limits of a sandbox (docs/archive/v1/CONVENTIONS.md §15.3 defaults).
 #[derive(Debug, Clone, Copy)]
 pub struct Resources {
     pub memory_bytes: i64,
     pub nano_cpus: i64,
     pub pids_limit: i64,
+    /// The limit of open files of each process in the container (`nofile`, soft and hard).
+    pub files: u64,
 }
 
 impl Default for Resources {
@@ -58,6 +67,7 @@ impl Default for Resources {
             memory_bytes: 4 * 1024 * 1024 * 1024,
             nano_cpus: 2_000_000_000,
             pids_limit: 1024,
+            files: SANDBOX_FILES,
         }
     }
 }
@@ -1298,6 +1308,17 @@ pub fn container_body(spec: &SandboxSpec) -> ContainerCreateBody {
             memory_swap: Some(spec.resources.memory_bytes),
             nano_cpus: Some(spec.resources.nano_cpus),
             pids_limit: Some(spec.resources.pids_limit),
+            // A limit of the container's own, soft and hard. The sandbox's processes are uid
+            // 1000, which on a Docker host without user namespaces may be the user of `run`
+            // itself: the descriptors they leave on their way over Unix sockets then count
+            // against `run`'s passing of connections to its fronts, up to this limit
+            // (crate::confine, `sandbox_files`). A sandbox with a Docker of its own has every
+            // capability and can raise it: that one belongs in a VM runtime.
+            ulimits: Some(vec![ResourcesUlimits {
+                name: Some("nofile".to_string()),
+                soft: Some(i64::try_from(spec.resources.files).unwrap_or(i64::MAX)),
+                hard: Some(i64::try_from(spec.resources.files).unwrap_or(i64::MAX)),
+            }]),
             network_mode: spec.network_mode.clone(),
             extra_hosts: (!spec.extra_hosts.is_empty()).then(|| spec.extra_hosts.clone()),
             dns: (!spec.dns.is_empty()).then(|| spec.dns.clone()),
@@ -2015,6 +2036,11 @@ mod tests {
         assert_eq!(host.init, Some(true));
         assert_eq!(host.memory, Some(4 * 1024 * 1024 * 1024));
         assert_eq!(host.pids_limit, Some(1024));
+        // Its own limit of open files, soft and hard, and not the Docker daemon's.
+        let limits = host.ulimits.unwrap();
+        assert_eq!(limits.len(), 1, "{limits:?}");
+        assert_eq!(limits[0].name.as_deref(), Some("nofile"));
+        assert_eq!((limits[0].soft, limits[0].hard), (Some(65536), Some(65536)));
     }
 
     #[test]
@@ -2062,6 +2088,8 @@ mod tests {
         assert_eq!(host.memory, Some(4 * 1024 * 1024 * 1024));
         assert_eq!(host.nano_cpus, Some(2_000_000_000));
         assert_eq!(host.pids_limit, Some(1024));
+        let limits = host.ulimits.clone().unwrap();
+        assert_eq!((limits[0].soft, limits[0].hard), (Some(65536), Some(65536)));
         assert_eq!(host.init, Some(true));
         assert_eq!(
             host.binds,
