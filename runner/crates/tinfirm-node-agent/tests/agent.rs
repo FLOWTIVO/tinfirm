@@ -1290,6 +1290,82 @@ async fn a_connection_has_at_most_its_requests_in_flight() {
 }
 
 #[tokio::test]
+async fn a_served_connection_that_goes_silent_gives_its_place_back() {
+    let idle = Duration::from_millis(300);
+    let node = node_with(helper_half().await, None, |config| config.idle = Some(idle)).await;
+    // Every served place of each transport, taken by a connection that says hello and then
+    // nothing: what a control host that went without closing its connections leaves behind.
+    let mut over_tls = Vec::new();
+    let mut local = Vec::new();
+    for _ in 0..listener::MAX_CONNECTIONS {
+        let since = Instant::now();
+        let mut driver = tls_driver(&node, Some(node.control_cert.clone()))
+            .await
+            .unwrap();
+        driver.hello().await;
+        over_tls.push((driver, since));
+        let since = Instant::now();
+        let mut driver = unix_driver(&node).await;
+        driver.hello().await;
+        local.push((driver, since));
+    }
+    // The listener closes each of them, and none before its time.
+    for (driver, since) in &mut over_tls {
+        assert!(driver.line().await.is_none());
+        assert!(since.elapsed() >= idle, "{:?}", since.elapsed());
+    }
+    for (driver, since) in &mut local {
+        assert!(driver.line().await.is_none());
+        assert!(since.elapsed() >= idle, "{:?}", since.elapsed());
+    }
+    // Nothing on this side closed them: their places are free because the listener did.
+    assert!(answered(&node, Some(node.control_cert.clone())).await);
+    unix_driver(&node).await.hello().await;
+}
+
+#[tokio::test]
+async fn a_connection_is_not_closed_for_its_silence_while_a_request_is_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = tmp.path();
+    for name in [
+        "helper-socket",
+        "spool",
+        "listener-state",
+        "listener-socket",
+    ] {
+        dir(&root.join(name), 0o700);
+    }
+    let own = local::own_uid().unwrap();
+    let helper_socket = root.join("helper-socket/helper.sock");
+    let helper = hanging_helper(helper_socket.clone()).await;
+    let idle = Duration::from_millis(200);
+    let mut config = listener_config(root, &helper_socket, [0; 32], own);
+    config.idle = Some(idle);
+    let socket = config.socket.as_ref().unwrap().path.clone();
+    let listener = Listener::start(config).await.unwrap();
+    let unix = local::bind(&socket, own).unwrap();
+    let serving = tokio::spawn(listener.serve_unix(unix, own));
+    // A hello and, right behind it, a request that the helper never answers; then nothing for
+    // many times the bound.
+    let mut driver = unix_driver_at(&socket).await;
+    driver.send_raw(hello_line().as_bytes()).await;
+    let request = json!({"jsonrpc": "2.0", "id": 100, "method": "list", "params": {}});
+    driver.send_raw(request.to_string().as_bytes()).await;
+    assert_eq!(driver.line().await.unwrap()["id"], 1);
+    tokio::time::sleep(5 * idle).await;
+    // The connection is still served: its request is still being answered.
+    driver.send_raw(hello_line().as_bytes()).await;
+    assert_eq!(driver.line().await.unwrap()["id"], 1);
+    // One beside it with no request in flight is closed.
+    let mut silent = unix_driver_at(&socket).await;
+    silent.hello().await;
+    assert!(silent.line().await.is_none());
+    serving.abort();
+    helper.abort();
+}
+
+#[tokio::test]
 async fn the_listener_refuses_to_start_as_root() {
     let own = local::own_uid().unwrap();
     if own != 0 {

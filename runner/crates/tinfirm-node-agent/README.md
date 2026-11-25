@@ -202,6 +202,8 @@ Every line of both wires is read as one JSON value in which no object, at any le
 | TLS, after a handshake with the pinned certificate | 16 served connections (`MAX_CONNECTIONS`) | A 17th authenticated connection is closed after its handshake. Nothing displaces a served connection |
 | The local socket | 16 connections of the runner host's uid | A 17th is closed at once; a peer of another uid is closed before it is read |
 
+**A connection that goes silent.** A served connection, on either transport, that sends no request for 15 minutes (`IDLE_TIMEOUT`) while none of its requests is being answered is closed, and its place is free again. A control host that went without closing its connections (a power loss, a firewall between them that forgot the flow) so cannot keep the 16 places until the listener is started again. The runner host's `node` driver asks `verify` on its connection at least every 5 minutes, and makes a new connection with its next call when one was closed all the same. The TLS socket's connections also have TCP keepalive on, with the kernel's times: the first probe after 2 hours, unless the node's `net.ipv4.tcp_keepalive_time` says otherwise.
+
 Refusals (a connection from another address, a failed or late handshake, a dropped pending handshake, a full transport, a local peer of another uid) are counted by kind and logged as one summary at most every 60 s (`REFUSAL_SUMMARY_EVERY`), with kinds and counts only: a peer refused again and again cannot flood the journal.
 
 A request has exactly `jsonrpc` (`"2.0"`), `method`, `params` and `id` (a number, or a string of at most 64 bytes), each once. Any other field is refused. `params` must be a JSON object: absent, an array, a string or `null` is refused with `-32602`. A request without `id` is a notification: the listener takes none and answers none.
@@ -601,6 +603,7 @@ The paths assume the role's defaults (`chrootBase` `/srv/tinfirm-jails`, `work` 
 | A TLS connection from another address than the control host's is closed before its handshake, with the control host's certificate too, and more of them than there are handshake places each end within a second | `tests/agent.rs` (from 127.0.0.2), `listener.rs` |
 | Idle TCP connections, more than the handshake places and the served places together, do not keep the control host out, and do not displace a served connection | `tests/agent.rs`, and the queue's own test in `listener.rs` |
 | At most 16 served connections on each transport, the ones served staying served; at most 64 requests in flight, the next getting `-32007` | `tests/agent.rs` |
+| A served connection that says hello and then nothing is closed after the idle bound, and none before it, on each transport, and its place is free again; one whose request is still being answered is not closed; the TLS socket hands keepalive on to the connections it accepts | `tests/agent.rs`, `listener.rs` |
 | Refusals are logged as one summary at most every 60 s | `listener.rs` |
 | The listener refuses to start as root | `tests/agent.rs` (where the test is root) |
 | At its start the listener empties its spool, drops a stale record and deletes an unrecorded VM; a `list` deletes an unrecorded VM again; a bad record is moved aside and a half-written one removed | `tests/agent.rs`, `listener.rs` |

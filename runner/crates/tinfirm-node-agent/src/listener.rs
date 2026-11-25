@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpListener, TcpSocket, UnixListener};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 
 use crate::egress;
@@ -35,6 +35,14 @@ pub const MAX_CONNECTIONS: usize = 16;
 pub const HANDSHAKE_SLOTS: usize = 8;
 /// How long a TLS client may take to finish its handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a served connection may send no request, while none of its requests is being
+/// answered, before the listener closes it. A control host that went without closing its
+/// connection (a power loss, a firewall between them that forgot the flow) would otherwise
+/// keep one of the [`MAX_CONNECTIONS`] places for as long as the listener runs. The runner
+/// host's `node` driver asks `verify` on its connection at least every 5 minutes, so one that
+/// was silent for three times as long has lost its peer; a driver whose connection was closed
+/// all the same makes a new one with its next call.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 /// At most one summary of refusals in this time.
 pub const REFUSAL_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 /// How many requests one connection may have in flight.
@@ -109,6 +117,10 @@ pub struct ListenerConfig {
     #[serde(skip)]
     #[doc(hidden)]
     pub egress_sender: Option<egress::Sender>,
+    /// Test-only: how long a served connection may be silent, in place of [`IDLE_TIMEOUT`].
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub idle: Option<Duration>,
 }
 
 fn default_watch() -> u64 {
@@ -580,7 +592,8 @@ impl Listener {
 
     // ----- a connection -----------------------------------------------------------------------
 
-    /// Serves one connection of the control host until it closes.
+    /// Serves one connection of the control host until it closes, or until it has sent no
+    /// request for [`IDLE_TIMEOUT`] while none of its requests is being answered.
     pub async fn serve_connection<S>(self: Arc<Self>, stream: S, peer: String)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -603,11 +616,33 @@ impl Listener {
         let mut line = Vec::new();
         let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
         let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
+        let idle = self.config.idle.unwrap_or(IDLE_TIMEOUT);
         loop {
-            match lines.read_line(wire::MAX_LINE, &mut line).await {
-                Ok(true) => {}
-                Ok(false) | Err(LineError::Io(_)) => break,
-                Err(LineError::TooLong) => {
+            // A wait that ends while a request is still being answered goes on with the same
+            // read: a new one would drop the part of a line that this one holds.
+            let got = {
+                let read = lines.read_line(wire::MAX_LINE, &mut line);
+                tokio::pin!(read);
+                loop {
+                    match tokio::time::timeout(idle, &mut read).await {
+                        Ok(got) => break Some(got),
+                        Err(_) if in_flight.available_permits() < MAX_IN_FLIGHT => {}
+                        Err(_) => break None,
+                    }
+                }
+            };
+            match got {
+                Some(Ok(true)) => {}
+                Some(Ok(false) | Err(LineError::Io(_))) => break,
+                None => {
+                    tracing::info!(
+                        peer,
+                        "no request for {} s; the connection is closed",
+                        idle.as_secs()
+                    );
+                    break;
+                }
+                Some(Err(LineError::TooLong)) => {
                     tracing::warn!(
                         peer,
                         "a line over {} bytes; the connection is closed",
@@ -743,7 +778,8 @@ impl Listener {
     /// its handshake, which it must finish within [`HANDSHAKE_TIMEOUT`]; when they are all
     /// taken, the oldest pending handshake is dropped for the new one, so idle connections
     /// cannot keep the control host out. Only a client that presented the pinned certificate
-    /// takes one of the [`MAX_CONNECTIONS`] served places, and nothing ever displaces it.
+    /// takes one of the [`MAX_CONNECTIONS`] served places, and nothing displaces it: it keeps
+    /// its place until it closes or is silent for [`IDLE_TIMEOUT`].
     pub async fn serve_tls(
         self: Arc<Self>,
         listener: TcpListener,
@@ -1006,6 +1042,22 @@ fn load_records(dir: &Path) -> Result<BTreeMap<VmId, Record>> {
     Ok(records)
 }
 
+/// The TLS transport's socket, as `TcpListener::bind` makes it, with keepalive on. Linux hands
+/// the setting on to every connection the socket accepts, so the kernel probes a connection
+/// that is silent for long (after 2 hours, unless the node's `net.ipv4.tcp_keepalive_time`
+/// says otherwise) and ends one whose peer is gone, whatever the listener waits for on it.
+/// [`IDLE_TIMEOUT`] is what gives a place back within minutes.
+pub fn bind_tcp(listen: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = match listen {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    socket.set_keepalive(true)?;
+    socket.bind(listen)?;
+    socket.listen(128)
+}
+
 /// `tinfirm-node-agent listener`: starts the listener's transports and its watch.
 pub async fn run(config: ListenerConfig) -> Result<()> {
     let listener = Listener::start(config.clone()).await?;
@@ -1016,9 +1068,8 @@ pub async fn run(config: ListenerConfig) -> Result<()> {
         let (cert, key) = crate::tls::load(&tls.certificate, &tls.key)?;
         let pin = crate::tls::parse_pin(&tls.client_sha256)?;
         let server = crate::tls::server_config(cert, key, pin)?;
-        let tcp = TcpListener::bind(tls.listen)
-            .await
-            .with_context(|| format!("cannot listen on {}", tls.listen))?;
+        let tcp =
+            bind_tcp(tls.listen).with_context(|| format!("cannot listen on {}", tls.listen))?;
         tracing::info!(listen = %tls.listen, "the listener takes TLS");
         tasks.spawn(listener.clone().serve_tls(tcp, server));
     }
@@ -1094,6 +1145,32 @@ mod tests {
         pending.leave(second);
         pending.leave(newest);
         assert_eq!(pending.queue.len(), HANDSHAKE_SLOTS - 2);
+    }
+
+    #[tokio::test]
+    async fn the_tls_sockets_connections_have_keepalive_on() {
+        // tokio reads the option only through a `TcpSocket`.
+        let keepalive = |stream: tokio::net::TcpStream| {
+            TcpSocket::from_std_stream(stream.into_std().unwrap())
+                .keepalive()
+                .unwrap()
+        };
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(listener) = bind_tcp(address.parse().unwrap()) else {
+                // A machine without IPv6.
+                assert_ne!(address, "127.0.0.1:0");
+                continue;
+            };
+            let to = listener.local_addr().unwrap();
+            let _client = tokio::net::TcpStream::connect(to).await.unwrap();
+            assert!(keepalive(listener.accept().await.unwrap().0), "{address}");
+        }
+        // What a socket without the setting hands on, to show that the read tells them apart.
+        let plain = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = tokio::net::TcpStream::connect(plain.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(!keepalive(plain.accept().await.unwrap().0));
     }
 
     #[test]
