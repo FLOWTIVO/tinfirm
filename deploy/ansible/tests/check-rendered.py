@@ -377,12 +377,20 @@ def confinement(out):
 
 def node_checks(out):
     """What the sandbox node's checks.yml takes of the play's SSH connection, against the one
-    connection its firewall admits."""
+    connection its firewall admits, and which setuid programs hardening.yml strips: every one
+    the scan found but sudo, under its name and under the name of the file it is."""
     judged = json.loads((out / "node-checks.json").read_text())
     for case, admitted in {"admitted": True, "admitted-with-a-newline": True, "another-client": False,
                            "another-address-of-the-node": False, "another-port": False, "malformed": False}.items():
         check(judged.get("ssh " + case) is admitted,
               f"SSH connection {case}: {'admitted' if admitted else 'the play stops before the firewall loads'}")
+    strips = {"a-file": ("/usr/bin/sudo", ["/usr/bin/su", "/usr/bin/passwd"]),
+              "a-link": ("/usr/lib/cargo/bin/sudo", ["/usr/bin/su", "/usr/bin/sudo.ws"]),
+              "absent": ("/usr/bin/sudo", ["/usr/bin/su"])}
+    for case, (sudo, strip) in strips.items():
+        got = judged.get("strip " + case, {})
+        check(got.get("sudo") == sudo and got.get("strip") == strip,
+              f"setuid strip with sudo {case}: sudo is {sudo}, and it keeps its bit")
 
 
 def main():

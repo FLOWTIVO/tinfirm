@@ -346,6 +346,32 @@
         _tinfirm_sandbox_node_ssh:
           stdout: "{{ item.connection }}"
 
+    # What hardening.yml strips of the setuid programs the scan found, by what /usr/bin/sudo is:
+    # a file, a link to the program (update-alternatives), or not there.
+    - name: Judge the setuid programs to strip
+      ansible.builtin.set_fact:
+        _node_checks: >-
+          {{ _node_checks | combine({'strip ' ~ item.case: {
+               'sudo': _tinfirm_sandbox_node_sudo_path,
+               'strip': _tinfirm_sandbox_node_setuid_strip}}) }}
+      loop:
+        - case: a-file
+          link: {exists: true, islnk: false}
+          found: [/usr/bin/su, /usr/bin/sudo, /usr/bin/passwd]
+        - case: a-link
+          link: {exists: true, islnk: true, lnk_source: /usr/lib/cargo/bin/sudo}
+          found: [/usr/bin/su, /usr/lib/cargo/bin/sudo, /usr/bin/sudo.ws]
+        - case: absent
+          link: {exists: false}
+          found: [/usr/bin/su]
+      loop_control:
+        label: "{{ item.case }}"
+      vars:
+        _tinfirm_sandbox_node_sudo_link:
+          stat: "{{ item.link }}"
+        _tinfirm_sandbox_node_setuid_found:
+          stdout_lines: "{{ item.found }}"
+
     - name: Write what the node's checks take
       ansible.builtin.copy:
         content: "{{ _node_checks | to_nice_json }}\n"

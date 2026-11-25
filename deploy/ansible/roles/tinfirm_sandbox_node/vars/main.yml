@@ -90,6 +90,16 @@ _tinfirm_sandbox_node_ssh_admitted: >-
      and _tinfirm_sandbox_node_ssh_fields[0] == tinfirm_sandbox_node_management_address
      and _tinfirm_sandbox_node_ssh_fields[2] == tinfirm_sandbox_node_address
      and _tinfirm_sandbox_node_ssh_fields[3] == (tinfirm_sandbox_node_ssh_port | string) }}
+# The file that is sudo: /usr/bin/sudo, or the file that leads to where it is a link
+# (update-alternatives, as on a release whose sudo is sudo-rs). hardening.yml reads the link.
+_tinfirm_sandbox_node_sudo_path: >-
+  {{ _tinfirm_sandbox_node_sudo_link.stat.lnk_source
+     if (_tinfirm_sandbox_node_sudo_link.stat.islnk | default(false)) else '/usr/bin/sudo' }}
+# The programs whose setuid and setgid bits the role strips: those the scan found, but sudo,
+# under its own name and under the name of the file it is.
+_tinfirm_sandbox_node_setuid_strip: >-
+  {{ _tinfirm_sandbox_node_setuid_found.stdout_lines | default([])
+     | reject('in', ['/usr/bin/sudo', _tinfirm_sandbox_node_sudo_path]) | list }}
 # Where the setuid scan looks, as the helper's line `no-setuid` does.
 _tinfirm_sandbox_node_setuid_dirs: [/usr, /opt, /bin, /sbin]
 

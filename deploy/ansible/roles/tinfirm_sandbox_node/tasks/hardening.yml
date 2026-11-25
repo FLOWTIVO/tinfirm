@@ -138,12 +138,23 @@
   changed_when: false
   when: _tinfirm_sandbox_node_harden_on.setuid | bool
 
+# sudo is spared here and kept for the admin group below. Where /usr/bin/sudo is a link, the
+# program is the file it leads to, and the scan lists that file under its own path: spared by
+# the name /usr/bin/sudo alone, it would lose its bit, and the play its way to root.
+- name: Look at sudo's name
+  ansible.builtin.stat:
+    path: /usr/bin/sudo
+    get_checksum: false
+    follow: false
+  register: _tinfirm_sandbox_node_sudo_link
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
 - name: Read the owner and mode of each
   ansible.builtin.stat:
     path: "{{ item }}"
     get_checksum: false
     follow: false
-  loop: "{{ _tinfirm_sandbox_node_setuid_found.stdout_lines | default([]) | reject('equalto', '/usr/bin/sudo') | list }}"
+  loop: "{{ _tinfirm_sandbox_node_setuid_strip }}"
   register: _tinfirm_sandbox_node_setuid_files
   when: _tinfirm_sandbox_node_harden_on.setuid | bool
 
@@ -179,9 +190,9 @@
     - _tinfirm_sandbox_node_harden_on.setuid | bool
     - ansible_facts['os_family'] == 'RedHat'
 
-- name: Look at sudo
+- name: Look at the file that is sudo
   ansible.builtin.stat:
-    path: /usr/bin/sudo
+    path: "{{ _tinfirm_sandbox_node_sudo_path }}"
     get_checksum: false
     follow: false
   register: _tinfirm_sandbox_node_sudo
@@ -191,7 +202,7 @@
 # (checks.yml refuses a play whose user is not in the group).
 - name: Read sudo's recorded override (Ubuntu, Debian)
   ansible.builtin.command:
-    argv: [dpkg-statoverride, --list, /usr/bin/sudo]
+    argv: [dpkg-statoverride, --list, "{{ _tinfirm_sandbox_node_sudo_path }}"]
   register: _tinfirm_sandbox_node_sudo_override
   changed_when: false
   failed_when: _tinfirm_sandbox_node_sudo_override.rc not in [0, 1]
@@ -203,17 +214,24 @@
 - name: Keep sudo for the admin group (Ubuntu, Debian)
   ansible.builtin.command:
     argv:
-      [dpkg-statoverride, --force-statoverride-add, --update, --add, root, "{{ _tinfirm_sandbox_node_admin_group }}", "4750", /usr/bin/sudo]
+      - dpkg-statoverride
+      - --force-statoverride-add
+      - --update
+      - --add
+      - root
+      - "{{ _tinfirm_sandbox_node_admin_group }}"
+      - "4750"
+      - "{{ _tinfirm_sandbox_node_sudo_path }}"
   changed_when: true
   when:
     - _tinfirm_sandbox_node_harden_on.setuid | bool
     - ansible_facts['os_family'] == 'Debian'
     - _tinfirm_sandbox_node_sudo.stat.isreg | default(false)
-    - _tinfirm_sandbox_node_sudo_override.stdout | trim != ('root ' ~ _tinfirm_sandbox_node_admin_group ~ ' 4750 /usr/bin/sudo')
+    - _tinfirm_sandbox_node_sudo_override.stdout | trim != ('root ' ~ _tinfirm_sandbox_node_admin_group ~ ' 4750 ' ~ _tinfirm_sandbox_node_sudo_path)
 
 - name: Keep sudo for the admin group (RHEL family)
   ansible.builtin.file:
-    path: /usr/bin/sudo
+    path: "{{ _tinfirm_sandbox_node_sudo_path }}"
     owner: root
     group: "{{ _tinfirm_sandbox_node_admin_group }}"
     mode: "4750"
