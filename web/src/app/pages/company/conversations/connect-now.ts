@@ -61,13 +61,10 @@ let nextId = 0;
             (input)="token.set(tokenInput.value)"
           />
           <div class="flex gap-2">
-            <button
-              hlmBtn
-              size="sm"
-              type="submit"
-              class="h-9"
-              [disabled]="busy() || !token().trim()"
-            >
+            <!-- Enabled with the field still empty, as the Connect card's: a [disabled] that
+                 followed the token would lose an Enter pressed just after a paste. An empty token
+                 is ignored on submit. -->
+            <button hlmBtn size="sm" type="submit" class="h-9" [disabled]="busy()">
               @if (busy()) {
                 <hlm-spinner aria-hidden="true" />
               }
@@ -155,7 +152,11 @@ export class ConnectNow {
   protected async connect(event: Event): Promise<void> {
     event.preventDefault();
     const token = this.token().trim();
-    if (!token || this.busy()) return;
+    if (this.busy()) return;
+    if (!token) {
+      this.tokenField()?.nativeElement.focus();
+      return;
+    }
     this.busy.set(true);
     this.error.set(null);
     try {

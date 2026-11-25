@@ -371,6 +371,37 @@ describe('BindingCard', () => {
     expect(changed).toEqual([bound]);
   });
 
+  it('submits a token typed in the same task as the submit, before any change detection', async () => {
+    await render(aWaitingBinding());
+    q('binding-paste-token')!.click();
+    await fixture.whenStable();
+    const submit = el.querySelector<HTMLButtonElement>('form button[type=submit]')!;
+    // Enter in the field submits the form only while its submit button is enabled: it is
+    // enabled before the token, not only once a change detection has seen it.
+    expect(submit.disabled).toBe(false);
+    typeInto(q('binding-token'), 'jira-token');
+    expect(submit.disabled).toBe(false);
+    el.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }));
+    await settle();
+    expect(
+      http.expectOne({ method: 'PUT', url: `/api/companies/c1/me/accounts/${IDS.jira}/token` })
+        .request.body,
+    ).toEqual({ token: 'jira-token' });
+  });
+
+  it('sends nothing for an empty token, and keeps the field focused', async () => {
+    await render(aWaitingBinding());
+    q('binding-paste-token')!.click();
+    await fixture.whenStable();
+    typeInto(q('binding-token'), '   ');
+    await fixture.whenStable();
+    el.querySelector<HTMLButtonElement>('form button[type=submit]')!.click();
+    await settle();
+    http.expectNone(`/api/companies/c1/me/accounts/${IDS.jira}/token`);
+    expect(document.activeElement).toBe(q('binding-token'));
+    expect(changed).toEqual([]);
+  });
+
   it('focuses the token field when it opens, and takes a binding settled meanwhile as settled', async () => {
     await render(aWaitingBinding());
     const outdated: unknown[] = [];
