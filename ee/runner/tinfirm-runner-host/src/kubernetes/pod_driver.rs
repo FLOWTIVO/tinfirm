@@ -22,9 +22,13 @@
 //! It never reads a Secret, and nothing it writes to its log or answers holds a run's user data.
 //!
 //! The protocol has one error code for a method that failed, and the host reads only its
-//! message. What makes the host stop taking runs is `verify`: problems and no room. So a quota
-//! that is used up is a problem of `verify` when it leaves no room for one more pod, and a
-//! create refused for it says so in its message.
+//! message. What makes the host stop taking runs is `verify`: problems and no room. A quota
+//! that run pods have filled is no problem: `verify` answers no room, the host bounds its runs
+//! by its own slots, and at its start it counts its own VMs to that room, so a host that starts
+//! again beside its run pods does start. A quota without room that no run pod holds is a
+//! problem: it is too small, or something else fills it. `verify` is not told which host asks,
+//! so every run pod of the namespace counts as one that may be the host's; the host's own count
+//! at its start tells them apart. A create refused for the quota says so in its message.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -571,6 +575,8 @@ impl PodDriver {
 
         // The quota: the driver's room.
         let mut max_vms = None;
+        // A quota that leaves no room, in its own words.
+        let mut full = None;
         let quota_name = &self.config.resource_quota;
         match self.api.get_resource_quota(&ns, quota_name).await {
             Ok(quota) => {
@@ -579,10 +585,7 @@ impl PodDriver {
                 checked.push(format!("ResourceQuota {quota_name}: {}", room.summary));
                 max_vms = room.max_vms;
                 if room.max_vms == Some(0) {
-                    problems.push(format!(
-                        "no room in the runs' namespace: the ResourceQuota {quota_name} holds no more run pods ({})",
-                        room.summary
-                    ));
+                    full = Some(room.summary);
                 }
             }
             Err(e) if e.is_not_found() => problems.push(format!(
@@ -602,7 +605,8 @@ impl PodDriver {
         problems.extend(found);
         checked.extend(seen);
 
-        // Run pods that no node takes.
+        // Run pods that no node takes, and how many run pods hold room in the quota.
+        let mut holding = None;
         let selector = BTreeMap::from([(
             spec::SANDBOX_LABEL.to_string(),
             spec::SANDBOX_VALUE.to_string(),
@@ -612,8 +616,19 @@ impl PodDriver {
                 let stuck = unschedulable(&pods, chrono::Utc::now());
                 checked.push(format!("{} run pod(s)", pods.len()));
                 problems.extend(stuck.into_iter().take(MAX_UNSCHEDULABLE));
+                holding = Some(pods.iter().filter(|pod| holds_room(pod)).count());
             }
             Err(e) => problems.push(api_problem("the run pods", &e)),
+        }
+
+        // A quota that run pods have filled is full, which is no problem: the answer is no
+        // room. With no run pod to hold the room, no pod can ever be made as things are.
+        if let Some(summary) = &full
+            && holding == Some(0)
+        {
+            problems.push(format!(
+                "no room in the runs' namespace: the ResourceQuota {quota_name} holds no more run pods ({summary}), and no run pod holds its room: the quota is too small for one run pod of this template, or something else in the namespace fills it"
+            ));
         }
 
         // The admission policy.
@@ -629,6 +644,17 @@ impl PodDriver {
                 Ok(found) => {
                     lock(&self.admission_checked).remove(template);
                     problems.extend(found);
+                }
+                // The quota refused the dry run, and run pods hold its room: the namespace is
+                // full, not broken. Nothing is noted as passed, so the create that finds room
+                // makes the check before it makes a pod.
+                Err(e) if e.is::<NoRoom>() && holding.is_some_and(|pods| pods > 0) => {
+                    lock(&self.admission_checked).remove(template);
+                    max_vms = Some(0);
+                    checked.push(
+                        "the admission policy is not checked: the quota has no room for a dry run, and the next create checks it first"
+                            .into(),
+                    );
                 }
                 Err(e) => {
                     lock(&self.admission_checked).remove(template);
@@ -857,6 +883,15 @@ fn failure_kind(failure: &Failure) -> String {
         Failure::Transport(why) => one_line(why),
         Failure::NotSent(why) => format!("not sent: {}", one_line(why)),
     }
+}
+
+/// Whether a pod counts against the namespace's quota: every pod that has not ended, one
+/// that is being deleted too.
+fn holds_room(pod: &Value) -> bool {
+    !matches!(
+        pod["status"]["phase"].as_str(),
+        Some("Failed" | "Succeeded")
+    )
 }
 
 /// The run pods that no node took for longer than [`UNSCHEDULABLE_AFTER_SECONDS`], each
@@ -2379,18 +2414,110 @@ mod tests {
             text.contains("the runs' namespace tinfirm-runs does not exist"),
             "{text}"
         );
+    }
 
-        // A quota with no room left: a problem, and no room.
+    /// A pod of the runs' namespace, as a list of it shows it.
+    fn pod_in(phase: &str, labels: Value, n: u8) -> (String, Value) {
+        let name = format!("tinfirm-vm-{n:032x}");
+        let pod = json!({"metadata": {"name": name, "labels": labels}, "status": {"phase": phase}});
+        (name, pod)
+    }
+
+    /// A cluster whose quota of four pods is used up, with these pods.
+    fn full_cluster(pods: impl IntoIterator<Item = (String, Value)>) -> Cluster {
         let mut c = cluster();
-        c.quota.as_mut().unwrap()["status"]["used"]["pods"] = json!("10");
+        let status = &mut c.quota.as_mut().unwrap()["status"];
+        status["hard"]["pods"] = json!("4");
+        status["used"]["pods"] = json!("4");
+        c.quota_full = true;
+        c.pods.extend(pods);
+        c
+    }
+
+    #[tokio::test]
+    async fn a_quota_that_run_pods_fill_is_full_and_no_problem_of_verify() {
+        let verify = json!({"template": "sandbox-4c8g"});
+        let run_pod =
+            json!({"tinfirm.flowtivo.com/sandbox": "vm", "tinfirm.flowtivo.com/host": HOST});
+        let read =
+            |verified: &Value| serde_json::from_value::<crate::vm::Verified>(verified.clone());
+
+        // The chart's default quota is the host's ceiling in pods. A host that starts again
+        // beside its four run pods: no room, and nothing wrong.
+        let own = (0..4).map(|n| pod_in("Running", run_pod.clone(), n));
+        let t = start(full_cluster(own)).await;
+        let verified = t.ok("verify", verify.clone()).await;
+        assert_eq!(verified["problems"], json!([]), "{verified}");
+        assert_eq!(verified["maxVms"], 0, "{verified}");
+        let checked = verified["checked"].to_string();
+        for expected in [
+            "ResourceQuota tinfirm-runs: room for 0 more run pod(s), bounded by pods",
+            "4 run pod(s)",
+            "the admission policy is not checked: the quota has no room for a dry run",
+        ] {
+            assert!(checked.contains(expected), "{expected}: {checked}");
+        }
+        // For the host that is full, not a driver that can make no VM.
+        assert!(crate::vm::no_vms_cause(&read(&verified).unwrap()).is_none());
+        // One dry run was tried, and nothing counts as passed: when there is room again, the
+        // create makes the admission check before its pod.
+        let dry_runs = |t: &Test| {
+            t.calls()
+                .iter()
+                .filter(|call| call.ends_with("(dry run)"))
+                .count()
+        };
+        assert_eq!(dry_runs(&t), 1);
+        assert!(lock(&t.driver.admission_checked).is_empty());
+        {
+            let mut cluster = t.cluster();
+            cluster.quota_full = false;
+            cluster.admission = Admission::LetsHostPathIn;
+        }
+        let error = t
+            .error(
+                "create",
+                json!({"template": "sandbox-4c8g", "userData": USER_DATA,
+                       "labels": {"tinfirm-host": HOST}}),
+            )
+            .await;
+        assert!(
+            error.contains("accepts a run pod with a hostPath volume"),
+            "{error}"
+        );
+
+        // The same quota filled by what is no run pod, by run pods that have ended and hold
+        // nothing, or by nothing at all: no pod can be made, which is a problem.
+        let foreign = (0..4).map(|n| pod_in("Running", json!({"app": "other"}), n));
+        let ended = (0..4).map(|n| pod_in("Failed", run_pod.clone(), n));
+        for pods in [foreign.collect::<Vec<_>>(), ended.collect(), Vec::new()] {
+            let t = start(full_cluster(pods)).await;
+            let verified = t.ok("verify", verify.clone()).await;
+            assert_eq!(verified["maxVms"], 0, "{verified}");
+            let text = verified["problems"].to_string();
+            for expected in [
+                "no room in the runs' namespace: the ResourceQuota tinfirm-runs holds no more run pods (room for 0 more run pod(s), bounded by pods), and no run pod holds its room",
+                "its ResourceQuota is used up, so the admission policy cannot be checked",
+            ] {
+                assert!(text.contains(expected), "{expected}: {text}");
+            }
+            assert!(!text.contains("admission policy is missing"), "{text}");
+            assert!(crate::vm::no_vms_cause(&read(&verified).unwrap()).is_some());
+        }
+
+        // A quota too small for one pod of the template, in an empty namespace.
+        let mut c = cluster();
+        c.quota = Some(json!({"metadata": {"name": "tinfirm-runs"},
+            "status": {"hard": {"pods": "4", "requests.cpu": "2"}, "used": {}}}));
         c.quota_full = true;
         let t = start(c).await;
-        let verified = t.ok("verify", json!({"template": "sandbox-4c8g"})).await;
-        assert_eq!(verified["maxVms"], 0);
-        let text = problems(&verified);
-        assert!(text.contains("holds no more run pods"), "{text}");
-        assert!(!text.contains("admission policy is missing"), "{text}");
-        assert!(crate::vm::no_vms_cause(&serde_json::from_value(verified).unwrap()).is_some());
+        let verified = t.ok("verify", verify.clone()).await;
+        assert_eq!(verified["maxVms"], 0, "{verified}");
+        let text = verified["problems"].to_string();
+        assert!(
+            text.contains("bounded by requests.cpu), and no run pod holds its room: the quota is too small for one run pod of this template"),
+            "{text}"
+        );
     }
 
     #[tokio::test]
