@@ -289,6 +289,37 @@ pub fn disk_room_problem(free: u64, others: &[(u64, u64)], wanted: u64) -> Optio
     })
 }
 
+/// What a file system must have free for `check`: a whole snapshot of `snapshot` bytes for
+/// each of the `slots` that holds none yet, and what the snapshots that are there (each
+/// `(size, allocated)`) may still grow by. A snapshot that is there is not asked for a second
+/// time: a file system with room for `slots` snapshots is enough however many VMs run, with
+/// every slot empty and with every slot taken. `None` when there is room; the problem
+/// otherwise.
+pub fn check_room_problem(
+    free: u64,
+    others: &[(u64, u64)],
+    slots: u64,
+    snapshot: u64,
+) -> Option<String> {
+    let empty = slots.saturating_sub(u64::try_from(others.len()).unwrap_or(u64::MAX));
+    let wanted = empty.saturating_mul(snapshot);
+    let promised: u64 = others
+        .iter()
+        .map(|(size, allocated)| size.saturating_sub(*allocated))
+        .sum();
+    let needed = wanted.saturating_add(promised);
+    (free < needed).then(|| {
+        format!(
+            "the work directory's file system has {} MiB free, and {} MiB are needed: {} MiB for a snapshot in each of the {empty} slot(s) that hold none and {} MiB that the snapshots of the {} VM(s) there may still grow by",
+            free >> 20,
+            needed >> 20,
+            wanted >> 20,
+            promised >> 20,
+            others.len()
+        )
+    })
+}
+
 /// The tables of `nft list tables`, by family and name (`inet tinfirm_00000000002a`).
 pub fn tables_of(listing: &str) -> std::collections::BTreeSet<String> {
     listing
@@ -1142,11 +1173,20 @@ impl LinuxBackend {
     /// Whether the work directory's file system has room for one more snapshot of `wanted`
     /// bytes beside what the snapshots that are there may still grow by ([`disk_room_problem`]).
     fn room_problem(&self, wanted: u64) -> Option<String> {
+        match self.room() {
+            Ok((free, others)) => disk_room_problem(free, &others, wanted),
+            Err(unknown) => Some(unknown),
+        }
+    }
+
+    /// The work directory's file system: its free bytes, and each snapshot that is there as
+    /// `(size, allocated)`. The problem when either cannot be read.
+    fn room(&self) -> Result<(u64, Vec<(u64, u64)>), String> {
         let work = &self.config.firecracker.work;
         let stat = match rustix::fs::statvfs(work) {
             Ok(stat) => stat,
             Err(e) => {
-                return Some(format!(
+                return Err(format!(
                     "the free space of {} cannot be read: {}",
                     work.display(),
                     std::io::Error::from(e).kind()
@@ -1157,7 +1197,7 @@ impl LinuxBackend {
         // A snapshot that cannot be read is not counted as absent: the answer is then that
         // the room is not known, and no VM is made on a guess.
         let unread = |what: String, e: std::io::Error| {
-            Some(format!(
+            Err(format!(
                 "the snapshots in {} cannot be counted ({what}: {}), so the room for one more is not known",
                 work.display(),
                 e.kind()
@@ -1184,7 +1224,7 @@ impl LinuxBackend {
                 Err(e) => return unread(name, e),
             }
         }
-        disk_room_problem(free, &others, wanted)
+        Ok((free, others))
     }
 
     fn done(&self, step: Step) -> Result<(), BackendError> {
@@ -2068,9 +2108,14 @@ impl LinuxBackend {
     /// `check`: the room for every slot's snapshot, and the memory for every slot's VM.
     fn check_room_and_memory(&self, template: &Template, answer: &mut Checked) {
         let Checked { problems, checked } = answer;
-        // Every slot at once: the snapshots' room, and the VMMs' memory.
+        // Every slot at once: the snapshots' room, and the VMMs' memory. A slot whose snapshot
+        // is there needs only what that snapshot may still grow by, not a second one.
         let all = u64::from(self.config.max_vms);
-        if let Some(problem) = self.room_problem(all.saturating_mul(snapshot_bytes(template))) {
+        let room = match self.room() {
+            Ok((free, others)) => check_room_problem(free, &others, all, snapshot_bytes(template)),
+            Err(unknown) => Some(unknown),
+        };
+        if let Some(problem) = room {
             problems.push(format!(
                 "for {all} VM(s) of this template at once: {problem}"
             ));
@@ -3001,6 +3046,67 @@ mod tests {
                 "0 8 snapshot /dev/loop0 /dev/loop1 N 8"
             ]
         );
+    }
+
+    #[test]
+    fn check_asks_for_no_second_snapshot_of_a_slot_whose_snapshot_is_there() {
+        const GIB: u64 = 1 << 30;
+        // The README's node: 8 slots and snapshots of 20 GiB, so 160 GiB are the documented
+        // need, on a file system of 176 GiB.
+        let (slots, snapshot) = (8, 20 * GIB);
+        // One VM that wrote 3 GiB, and every slot taken, each with another amount written.
+        let one = [(snapshot, 3 * GIB)];
+        let all: Vec<(u64, u64)> = (0..8).map(|vm| (snapshot, vm * GIB)).collect();
+        let written = |there: &[(u64, u64)]| there.iter().map(|(_, a)| *a).sum::<u64>();
+        for disk in [176 * GIB, 160 * GIB] {
+            // No VM: a whole snapshot for every slot.
+            assert_eq!(check_room_problem(disk, &[], slots, snapshot), None);
+            // What is written is no longer free, and no longer asked for either. The rule
+            // before asked for 8 whole snapshots beside the 17 GiB: 177 GiB with one VM.
+            let free = disk - written(&one);
+            assert_eq!(check_room_problem(free, &one, slots, snapshot), None);
+            // A full node needs only what its snapshots may still grow by.
+            let free = disk - written(&all);
+            assert_eq!(check_room_problem(free, &all, slots, snapshot), None);
+        }
+        // One byte less than the documented need is a problem with any number of VMs.
+        assert!(check_room_problem(160 * GIB - 1, &[], slots, snapshot).is_some());
+        let free = 160 * GIB - written(&all) - 1;
+        assert!(check_room_problem(free, &all, slots, snapshot).is_some());
+        let free = 160 * GIB - written(&one) - 1;
+        let problem = check_room_problem(free, &one, slots, snapshot).unwrap();
+        assert!(
+            problem.contains("160767 MiB free") && problem.contains("160768 MiB are needed"),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("143360 MiB for a snapshot in each of the 7 slot(s) that hold none")
+                && problem.contains("17408 MiB that the snapshots of the 1 VM(s) there"),
+            "{problem}"
+        );
+        // More snapshots than slots (a leftover's beside the VMs'): no slot is empty.
+        let nine = [(snapshot, snapshot); 9];
+        assert_eq!(check_room_problem(0, &nine, slots, snapshot), None);
+    }
+
+    #[test]
+    fn check_reads_the_snapshots_that_are_there_into_its_room() {
+        let mut config = config();
+        let dir = tempfile::tempdir().unwrap();
+        config.firecracker.work = dir.path().to_path_buf();
+        config.max_vms = 8;
+        // The largest snapshot a template may name, 1 TiB: `check` must not ask this machine
+        // for eight of them while every slot's snapshot is there.
+        let mut template = config.templates.values().next().unwrap().clone();
+        template.snapshot_mib = 1_048_576;
+        for slot in 0..8 {
+            let sparse = std::fs::File::create(dir.path().join(format!("{slot}.snapshot")));
+            sparse.unwrap().set_len(4096).unwrap();
+        }
+        let mut answer = Checked::default();
+        LinuxBackend::new(config).check_room_and_memory(&template, &mut answer);
+        let room = "room for 8 snapshot(s) of this template".to_string();
+        assert!(answer.checked.contains(&room), "{answer:?}");
     }
 
     #[test]
