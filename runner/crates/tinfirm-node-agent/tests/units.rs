@@ -82,6 +82,8 @@ fn the_listener_is_started_again_after_a_failure_however_often() {
     let (unit, service) = LISTENER.split_once("[Service]").unwrap();
     assert_eq!(directive(unit, "StartLimitIntervalSec"), ["0"]);
     assert!(directive(service, "StartLimitIntervalSec").is_empty());
+    // With no limit to the starts, a fault that lasts is not tried again every second.
+    assert_eq!(directive(service, "RestartSec"), ["5"]);
 }
 
 #[test]
