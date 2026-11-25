@@ -53,7 +53,11 @@ use crate::vm::{DRIVER_PROTOCOL, HOST_LABEL, lock};
 pub const DRIVER: &str = "pod";
 /// How long an admission check that passed is not made again before a create.
 const ADMISSION_CHECK_TTL: Duration = Duration::from_secs(60);
-/// How long a run pod may wait for a node before `verify` reports it.
+/// How long a run pod may wait for a node before `verify` names it, in `checked`: a warning,
+/// no problem. Such a pod holds its room in the quota, which the room already counts, and its
+/// run fails at the host's `--vm-start-timeout`. As a problem it refused the host's start, also
+/// for a leftover pod of the host's own, which the host deletes only once it has started, and
+/// for a pool that an autoscaler is still growing (the owner, 2026-11-25).
 const UNSCHEDULABLE_AFTER_SECONDS: i64 = 60;
 /// The grace period of a deleted pod: Firecracker ends at SIGTERM.
 const GRACE_SECONDS: u32 = 5;
@@ -671,7 +675,12 @@ impl PodDriver {
             Ok(pods) => {
                 let stuck = unschedulable(&pods, chrono::Utc::now());
                 checked.push(format!("{} run pod(s)", pods.len()));
-                problems.extend(stuck.into_iter().take(MAX_UNSCHEDULABLE));
+                checked.extend(
+                    stuck
+                        .into_iter()
+                        .take(MAX_UNSCHEDULABLE)
+                        .map(|why| format!("warning: {why}")),
+                );
                 holding = Some(pods.iter().filter(|pod| holds_room(pod)).count());
             }
             Err(e) => problems.push(api_problem("the run pods", &e)),
@@ -2534,13 +2543,19 @@ mod tests {
             "there is no ResourceQuota tinfirm-runs",
             "there is no NetworkPolicy tinfirm-runs-default-deny",
             "the NetworkPolicy tinfirm-runs-allow-runner is not the one expected: spec.ingress[0].ports[0].port: 22, expected 7443",
-            "has found no node for",
-            "didn't match pod anti-affinity rules",
             "accepts a run pod with a hostPath volume",
             "holds the NetworkPolicy allow-all, which is not the chart's: network policies add up, so it may open the run pods",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
+        // A run pod that waits for a node is a warning, in `checked`, and no problem.
+        assert!(!text.contains("has found no node for"), "{text}");
+        let checked = verified["checked"].to_string();
+        assert!(
+            checked.contains("warning: the run pod tinfirm-vm-00112233445566778899aabbccddeeff has found no node for")
+                && checked.contains("didn't match pod anti-affinity rules"),
+            "{checked}"
+        );
         // No quota to read, and a create would be refused: no room.
         assert_eq!(verified["maxVms"], 0);
 
@@ -2629,8 +2644,8 @@ mod tests {
             assert!(t.cluster().pods.is_empty(), "{problem}");
         }
 
-        // A problem that refuses no create leaves the room as the quota has it: a run pod
-        // that waits for a node.
+        // A run pod that waits for a node is no problem: the room is the quota's, the host's
+        // start is not refused, and a create goes on.
         let mut c = cluster();
         c.pods.insert("tinfirm-vm-00112233445566778899aabbccddeeff".into(), json!({
             "metadata": {"name": "tinfirm-vm-00112233445566778899aabbccddeeff",
@@ -2641,10 +2656,11 @@ mod tests {
         }));
         let t = start(c).await;
         let verified = t.ok("verify", verify.clone()).await;
+        assert_eq!(verified["problems"], json!([]), "{verified}");
         assert!(
-            verified["problems"]
+            verified["checked"]
                 .to_string()
-                .contains("has found no node for"),
+                .contains("warning: the run pod tinfirm-vm-00112233445566778899aabbccddeeff has found no node for"),
             "{verified}"
         );
         assert_eq!(verified["maxVms"], 8, "{verified}");
