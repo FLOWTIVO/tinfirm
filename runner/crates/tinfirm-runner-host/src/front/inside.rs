@@ -189,7 +189,8 @@ fn take_until_ping(
         for message in control.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = message {
                 for fd in fds {
-                    wire::close_on_exec(&fd);
+                    wire::close_on_exec(&fd)
+                        .map_err(|e| format!("cannot keep a descriptor of `run`: {e}"))?;
                     received.push(fd);
                 }
             }

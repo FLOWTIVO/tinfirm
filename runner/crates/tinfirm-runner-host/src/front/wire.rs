@@ -861,12 +861,15 @@ pub const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
 
 /// Close-on-exec on a descriptor that a `recvmsg` with [`RECV_FLAGS`] took: nothing on Linux,
 /// where it is set already. Elsewhere (macOS) it is set after the call, so a program that the
-/// process starts in between could inherit it; the front starts none while it reads.
-pub fn close_on_exec(fd: &std::os::fd::OwnedFd) {
+/// process starts in between could inherit it; the front starts none while it reads. A
+/// descriptor on which it cannot be set is an error: the caller fails its read, and the
+/// descriptors of that message are closed, never kept inheritable.
+pub fn close_on_exec(fd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
     #[cfg(not(target_os = "linux"))]
-    let _ = rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC);
+    rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)?;
     #[cfg(target_os = "linux")]
     let _ = fd;
+    Ok(())
 }
 
 /// One write of `frame`, with `descriptors` attached: how many bytes it took. With descriptors

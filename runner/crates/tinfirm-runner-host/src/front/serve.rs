@@ -80,7 +80,8 @@ impl Channel {
         for message in control.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = message {
                 for fd in fds {
-                    wire::close_on_exec(&fd);
+                    // On an error the rest of `fds` and `fd` are dropped, and so closed.
+                    wire::close_on_exec(&fd)?;
                     self.descriptors.push_back(fd);
                 }
             }
