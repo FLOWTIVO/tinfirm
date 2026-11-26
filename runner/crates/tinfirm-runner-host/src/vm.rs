@@ -1230,10 +1230,14 @@ impl Vms {
     /// answering from the driver's word on, not from its next `verify` of its own (the node
     /// driver's schedule, a failed create). Notices that come together, or while a check is
     /// under way, ask once, and checks for notices are [`NOTICE_GAP`] apart at least. A driver
-    /// that sends none costs nothing here: a healthy host asks its driver no more often.
+    /// that sends none costs nothing here: a healthy host asks its driver no more often. A
+    /// notice that came before this began, such as one between the start's check and now,
+    /// asks once at once: a new receiver would take it as seen.
     pub async fn follow_machines(self: &Arc<Vms>, stop: tokio_util::sync::CancellationToken) {
         let mut notices = self.driver.notices();
-        notices.borrow_and_update();
+        if *notices.borrow_and_update() > 0 {
+            notices.mark_changed();
+        }
         let mut last: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {

@@ -727,6 +727,54 @@ async fn a_running_host_counts_its_room_again_when_the_driver_says_a_machine_sto
     }
 }
 
+/// A notice that comes between the start's check and the host's following of the driver's
+/// notices is not lost: the host asks `verify` once when it begins to follow them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notice_before_the_host_follows_the_driver_still_counts_its_room_again() {
+    use tinfirm_runner_host::vm::Vms;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("driver.log");
+    let down = dir.path().join("nodes-down");
+    let down_path = down.to_string_lossy().into_owned();
+    let env = [
+        ("FAKE_VM_SLOTS", "4"),
+        ("FAKE_VM_NODE_DOWN", down_path.as_str()),
+        ("FAKE_VM_NOTICE", "1"),
+    ];
+    let mut options = vm_options(&log, &env);
+    options.recheck = Duration::from_millis(200);
+    let vms = Vms::new(options);
+    vms.check(4, Some("host-a")).await.unwrap();
+    let mut room = vms.room_watch();
+    assert_eq!(*room.borrow_and_update(), None);
+    // The node goes down, and the driver's notice comes, before the host follows notices.
+    nodes_down(&down, 2);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while calls_of(&vm_driver_calls(&log), "noticed").is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the fake driver sent no notice");
+    // The host's reader of the driver's output counts it a moment after.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(*room.borrow(), None);
+    let stop = tokio_util::sync::CancellationToken::new();
+    let follow = tokio::spawn({
+        let (vms, stop) = (vms.clone(), stop.clone());
+        async move { vms.follow_machines(stop).await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        room.wait_for(|room| *room == Some(2)),
+    )
+    .await
+    .expect("the notice before the host followed them was lost")
+    .unwrap();
+    stop.cancel();
+    follow.await.unwrap();
+}
+
 /// A host that starts while a node does not answer has the slots of the others: it tells the
 /// server so, a run beyond them waits in the server's queue with the cause and no VM is asked
 /// for it, and the host has its ceiling's slots again once the node answers.
