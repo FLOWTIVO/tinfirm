@@ -293,26 +293,39 @@ impl PodDriver {
     }
 
     /// Deletes the pod `name` after a create whose answer does not tell whether the server
-    /// stored it ([`maybe_stored`]), and returns `why` with what became of the pod. Such a pod
-    /// has no ticket, so it never starts, and it would hold its share of the quota until the
-    /// host's cleanup of leftovers, which runs only when the host starts or connects again.
-    /// The delete has [`UNSURE_DELETE_TIMEOUT`]: the host waits for the create's answer.
+    /// stored it ([`maybe_stored`]), or that this driver gave up on, and returns `why` with what
+    /// became of the pod. Such a pod has no ticket, so it never starts, and it would hold its
+    /// share of the quota until the host's cleanup of leftovers, which runs only when the host
+    /// starts or connects again. A create that the driver no longer waits for may still be
+    /// stored after a first delete found nothing (an admission webhook has up to 30 s), so a
+    /// pod that is not found is looked for again until [`UNSURE_DELETE_TIMEOUT`] is over: the
+    /// host waits for the create's answer.
     async fn delete_unsure(&self, name: &str, why: anyhow::Error) -> anyhow::Error {
-        let delete = self.api.delete_pod(self.namespace(), name, Some(0));
-        let failed = match tokio::time::timeout(self.cleanup_time, delete).await {
-            Ok(Ok(())) => {
+        let until = tokio::time::Instant::now() + self.cleanup_time;
+        loop {
+            let delete = self.api.delete_pod(self.namespace(), name, Some(0));
+            let failed = match tokio::time::timeout_at(until, delete).await {
+                Ok(Ok(())) => {
+                    return why.context(format!(
+                        "the server had stored the pod {name}, which is deleted again"
+                    ));
+                }
+                // Not stored, or not yet: looked for again while the time lasts.
+                Ok(Err(e)) if e.is_not_found() => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some(format!("no answer within {:?}", self.cleanup_time)),
+            };
+            if let Some(failed) = failed {
                 return why.context(format!(
-                    "the server had stored the pod {name}, which is deleted again"
+                    "and the pod {name}, if the server stored it, could not be deleted ({failed}): the host's cleanup of leftovers deletes it, since it carries the host's label"
                 ));
             }
-            // The server did not store it.
-            Ok(Err(e)) if e.is_not_found() => return why,
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => format!("no answer within {:?}", self.cleanup_time),
-        };
-        why.context(format!(
-            "and the pod {name}, if the server stored it, could not be deleted ({failed}): the host's cleanup of leftovers deletes it, since it carries the host's label"
-        ))
+            if tokio::time::Instant::now() + self.poll >= until {
+                // The server did not store it in the time a create can take.
+                return why;
+            }
+            tokio::time::sleep(self.poll).await;
+        }
     }
 
     /// Checks the network policies and the admission policy for `template`, unless they passed
@@ -1213,6 +1226,11 @@ mod tests {
         ending: BTreeMap<String, u32>,
         /// The pod's create stores the pod, and answers with this code and no pod.
         lost_pod_answer: Option<u16>,
+        /// With `lost_pod_answer`: the pod is stored only after this many deletes of pods, as
+        /// a create that an admission webhook still holds when the driver gives up on it.
+        stored_after_deletes: u32,
+        /// Such a pod, not stored yet.
+        unstored: Option<(String, Value)>,
         fail_secret_create: bool,
         /// How many more of the Secrets' deletes fail.
         fail_secret_deletes: u32,
@@ -1260,6 +1278,8 @@ mod tests {
             ending_for: 0,
             ending: BTreeMap::new(),
             lost_pod_answer: None,
+            stored_after_deletes: 0,
+            unstored: None,
             fail_secret_create: false,
             fail_secret_deletes: 0,
             fail_pod_delete: false,
@@ -1497,7 +1517,11 @@ mod tests {
                 pod["metadata"]["uid"] = json!(format!("0000-{:04}", cluster.next_uid));
                 cluster.next_uid += 1;
                 pod["status"] = json!({"phase": "Pending"});
-                cluster.pods.insert(name, pod.clone());
+                if cluster.lost_pod_answer.is_some() && cluster.stored_after_deletes > 0 {
+                    cluster.unstored = Some((name, pod.clone()));
+                } else {
+                    cluster.pods.insert(name, pod.clone());
+                }
                 match cluster.lost_pod_answer {
                     Some(500) => Reply::Json(
                         500,
@@ -1550,6 +1574,14 @@ mod tests {
             }
             ("DELETE", p) if p.starts_with(&format!("{pods}/")) => {
                 let name = &p[pods.len() + 1..];
+                if cluster.unstored.is_some() {
+                    if cluster.stored_after_deletes == 0 {
+                        let (stored, pod) = cluster.unstored.take().unwrap();
+                        cluster.pods.insert(stored, pod);
+                    } else {
+                        cluster.stored_after_deletes -= 1;
+                    }
+                }
                 if cluster.fail_pod_delete {
                     return Reply::Json(403, status(403, "Forbidden", "pods is forbidden"));
                 }
@@ -2024,6 +2056,27 @@ mod tests {
             );
             assert_eq!(calls.last().unwrap().split(' ').next(), Some("DELETE"));
         }
+
+        // A pod that the server stores only after the first deletes found nothing, as a create
+        // that an admission webhook still held: looked for again, and deleted.
+        let mut c = cluster();
+        c.lost_pod_answer = Some(500);
+        c.stored_after_deletes = 2;
+        let t = start(c).await;
+        let error = t.error("create", create.clone()).await;
+        assert!(
+            error.contains("the server had stored the pod tinfirm-vm-")
+                && error.contains("which is deleted again"),
+            "{error}"
+        );
+        assert!(t.cluster().pods.is_empty(), "the late pod is gone");
+        assert!(t.cluster().unstored.is_none());
+        let deletes = t
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with(&format!("DELETE /api/v1/namespaces/{NS}/pods/")))
+            .count();
+        assert_eq!(deletes, 3);
 
         // When the delete fails too, the answer says that the cleanup takes the pod.
         let mut c = cluster();
