@@ -711,11 +711,17 @@ struct Conn {
     /// A call got no answer on it in the call's time ([`Conn::usable`]).
     silent: AtomicBool,
     next: AtomicU64,
+    /// Set once the node answered `hello` and the driver took the connection: only then does
+    /// its loss go to `gone`.
+    established: Arc<AtomicBool>,
 }
 
 impl Conn {
     /// `gone` hears of a connection that ends by itself (the node closed it, or TCP keepalive
-    /// gave up on it), with why, and not of one that the driver dropped.
+    /// gave up on it), with why, and not of one that the driver dropped, nor of one that ended
+    /// before it was established ([`Conn::established`]): a node that takes connections and
+    /// closes them before its `hello` would otherwise send the host a notice at every `verify`
+    /// that its notice asked for.
     fn open<S>(stream: S, failed: Arc<Mutex<HashSet<String>>>, node: String, gone: Gone) -> Conn
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
@@ -724,6 +730,7 @@ impl Conn {
         let pending: Pending = Arc::default();
         let lost = CancellationToken::new();
         let (lines, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let established = Arc::new(AtomicBool::new(false));
         {
             let lost = lost.clone();
             tokio::spawn(async move {
@@ -736,7 +743,7 @@ impl Conn {
             });
         }
         {
-            let (pending, lost) = (pending.clone(), lost.clone());
+            let (pending, lost, established) = (pending.clone(), lost.clone(), established.clone());
             tokio::spawn(async move {
                 let mut reader = BufReader::new(read);
                 loop {
@@ -747,8 +754,10 @@ impl Conn {
                         _ = lost.cancelled() => break,
                     };
                     let Some(line) = line else {
-                        let _ =
-                            gone.send(format!("node {node}: the connection to the node was lost"));
+                        if established.load(Ordering::SeqCst) {
+                            let _ = gone
+                                .send(format!("node {node}: the connection to the node was lost"));
+                        }
                         break;
                     };
                     let Ok(message) = serde_json::from_slice::<Value>(&line) else {
@@ -796,6 +805,7 @@ impl Conn {
             lost,
             silent: AtomicBool::new(false),
             next: AtomicU64::new(1),
+            established,
         }
     }
 
@@ -976,6 +986,7 @@ impl Node {
                 ),
             }
         }
+        conn.established.store(true, Ordering::SeqCst);
         Ok(conn)
     }
 
@@ -2483,7 +2494,23 @@ mod tests {
             "hello" => Reply::Answer(wire_hello()),
             _ => Reply::Silence,
         });
-        let nodes = json!({ "nodes": [node_at("closing", &closing), node_at("silent", &silent)] });
+        // A node that takes each connection and closes it before its hello: its connections
+        // were never established, and their end is no news either, else each verify that a
+        // notice asks for would bring the next notice.
+        let slamming = dir.path().join("slamming.sock");
+        let slam = tokio::net::UnixListener::bind(&slamming).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = slam.accept().await {
+                // It reads the hello, then closes: the driver's reading sees the end.
+                let mut lines = BufReader::new(stream).lines();
+                let _ = lines.next_line().await;
+            }
+        });
+        let nodes = json!({ "nodes": [
+            node_at("closing", &closing),
+            node_at("silent", &silent),
+            node_at("slamming", &slamming),
+        ] });
         let driver = Arc::new(NodeDriver::with(config(nodes).unwrap(), short()).unwrap());
         let (mut host, input) = tokio::io::duplex(64 * 1024);
         let (output, from_driver) = tokio::io::duplex(64 * 1024);
