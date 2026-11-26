@@ -164,18 +164,8 @@ cmd_package() {
   rm -rf "$stage"
 }
 
-# The node agent's build id (TINFIRM_BUILD_ID at compile time, ADR-0112): the workspace's
-# version in runner/Cargo.toml, which in a release is the release's version (set-version.sh,
-# cargo:runner), then `+` and the asset's version as build metadata when that is not the
-# same: 1.0.0 for v1.0.0, 1.0.1-SNAPSHOT+rolling-abc1234 for rolling. The runner host's build
-# id is the workspace's version, `+images.` and a digest. Both sides of the node wire compare
-# what comes before the first `+` (release_of), so a node agent and a runner host of one
-# release see one release, and of two releases two.
 # The first `version = "..."` of [workspace.package] in runner/Cargo.toml, as set-version.sh
-# reads it. A function of its own, not inline in "$(...)": the bash of macOS (3.2, which the
-# runner host's aarch64-apple-darwin asset is built with) reads double quotes inside a
-# single-quoted program in a double-quoted command substitution as quotes, and then fails the
-# whole script to parse ("unexpected EOF while looking for matching `''").
+# reads it.
 workspace_version() {
   awk '
     /^\[/ { in_pkg = ($0 ~ /^\[workspace\.package\][[:space:]]*$/); next }
@@ -184,6 +174,13 @@ workspace_version() {
     }' "$ROOT/runner/Cargo.toml"
 }
 
+# The node agent's build id (TINFIRM_BUILD_ID at compile time, ADR-0112): the workspace's
+# version in runner/Cargo.toml, which in a release is the release's version (set-version.sh,
+# cargo:runner), then `+` and the asset's version as build metadata when that is not the
+# same: 1.0.0 for v1.0.0, 1.0.1-SNAPSHOT+rolling-abc1234 for rolling. The runner host's build
+# id is the workspace's version, `+images.` and a digest. Both sides of the node wire compare
+# what comes before the first `+` (release_of), so a node agent and a runner host of one
+# release see one release, and of two releases two.
 cmd_build_id() {
   local version="${1:?usage: assets.sh build-id <version>}" workspace
   workspace="$(workspace_version)"
@@ -417,7 +414,11 @@ cmd_publish() {
   subject="$(cmd_subject "$rev")"
   run_url=""
   if [ -n "${GITHUB_RUN_ID:-}" ]; then run_url="$server/$GH_REPO/actions/runs/$GITHUB_RUN_ID"; fi
-  notes="$(cat <<NOTES
+  # Read from the heredoc, not "$(cat <<NOTES ...)": the bash of macOS (3.2, which runs this
+  # script for the aarch64-apple-darwin asset) scans a command substitution's text without
+  # knowing heredocs, so an apostrophe in the notes opened a quote there and the whole script
+  # failed to parse ("unexpected EOF while looking for matching `''").
+  IFS= read -r -d '' notes <<NOTES || true
 Rolling prerelease of \`main\`: every push to main that passes CI replaces it. It is not a
 release, has no version and no support; use a versioned release for anything you rely on.
 
@@ -433,7 +434,7 @@ ${run_url:+- Build: $run_url
 Hosts that follow this prerelease: [auto-deploy]($server/$GH_REPO/blob/main/docs/operations/auto-deploy.md).
 A runner host from a release: [runner/README.md]($server/$GH_REPO/blob/main/runner/README.md#install-from-a-release).
 NOTES
-)"
+  notes="${notes%$'\n'}"
 
   if ! gh release view rolling >/dev/null 2>&1; then
     gh release create rolling --target "$rev" --prerelease --latest=false --title "$title" --notes "$notes"
