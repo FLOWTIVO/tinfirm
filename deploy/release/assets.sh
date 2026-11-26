@@ -171,14 +171,22 @@ cmd_package() {
 # id is the workspace's version, `+images.` and a digest. Both sides of the node wire compare
 # what comes before the first `+` (release_of), so a node agent and a runner host of one
 # release see one release, and of two releases two.
-cmd_build_id() {
-  local version="${1:?usage: assets.sh build-id <version>}" workspace
-  # The first `version = "..."` of [workspace.package], as set-version.sh reads it.
-  workspace="$(awk '
+# The first `version = "..."` of [workspace.package] in runner/Cargo.toml, as set-version.sh
+# reads it. A function of its own, not inline in "$(...)": the bash of macOS (3.2, which the
+# runner host's aarch64-apple-darwin asset is built with) reads double quotes inside a
+# single-quoted program in a double-quoted command substitution as quotes, and then fails the
+# whole script to parse ("unexpected EOF while looking for matching `''").
+workspace_version() {
+  awk '
     /^\[/ { in_pkg = ($0 ~ /^\[workspace\.package\][[:space:]]*$/); next }
     in_pkg && /^version[[:space:]]*=[[:space:]]*"[^"]*"/ {
       sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
-    }' "$ROOT/runner/Cargo.toml")"
+    }' "$ROOT/runner/Cargo.toml"
+}
+
+cmd_build_id() {
+  local version="${1:?usage: assets.sh build-id <version>}" workspace
+  workspace="$(workspace_version)"
   [ -n "$workspace" ] || die "no version in [workspace.package] of runner/Cargo.toml"
   if [ "$version" = "$workspace" ]; then
     echo "$workspace"
