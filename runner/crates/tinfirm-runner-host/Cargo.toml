@@ -57,6 +57,11 @@ libc.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
 seccompiler.workspace = true
+
+# A sandbox's front (crate::front) passes descriptors over its control channel, on every Unix:
+# the front runs unconfined where it cannot be confined, as on macOS with
+# --allow-unconfined-reader. The calls of Linux alone are behind cfg(target_os = "linux").
+[target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
 [dev-dependencies]

@@ -851,6 +851,24 @@ pub fn send_frame(
 /// The most descriptors one message carries.
 pub const MAX_DESCRIPTORS: usize = 3;
 
+/// The flags of a `recvmsg` that takes descriptors: close-on-exec at once where the kernel
+/// can (Linux, `MSG_CMSG_CLOEXEC`); elsewhere the receiver sets it on each one it got
+/// ([`close_on_exec`]).
+#[cfg(target_os = "linux")]
+pub const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::CMSG_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+pub const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
+
+/// Close-on-exec on a descriptor that a `recvmsg` with [`RECV_FLAGS`] took: nothing on Linux,
+/// where it is set already. Elsewhere (macOS) it is set after the call, so a program that the
+/// process starts in between could inherit it; the front starts none while it reads.
+pub fn close_on_exec(fd: &std::os::fd::OwnedFd) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC);
+    #[cfg(target_os = "linux")]
+    let _ = fd;
+}
+
 /// One write of `frame`, with `descriptors` attached: how many bytes it took. With descriptors
 /// it is a `sendmsg`; without, a plain `write`, which is all a front has: its seccomp filter
 /// refuses it `sendmsg`, the call that could pass a descriptor ([`crate::confine::Profile`]).

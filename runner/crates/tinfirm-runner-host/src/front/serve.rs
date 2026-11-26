@@ -60,7 +60,7 @@ struct Channel {
 impl Channel {
     /// Reads once more: `false` at the end of the channel.
     fn read(&mut self) -> std::io::Result<bool> {
-        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, recvmsg};
         let mut buffer = vec![0u8; READ];
         let mut space =
             [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(DESCRIPTORS_PER_READ))];
@@ -70,7 +70,7 @@ impl Channel {
                 &self.socket,
                 &mut [IoSliceMut::new(&mut buffer)],
                 &mut control,
-                RecvFlags::CMSG_CLOEXEC,
+                wire::RECV_FLAGS,
             ) {
                 Ok(received) => break received,
                 Err(rustix::io::Errno::INTR) => continue,
@@ -79,7 +79,10 @@ impl Channel {
         };
         for message in control.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = message {
-                self.descriptors.extend(fds);
+                for fd in fds {
+                    wire::close_on_exec(&fd);
+                    self.descriptors.push_back(fd);
+                }
             }
         }
         if received.bytes == 0 {

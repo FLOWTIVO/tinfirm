@@ -147,7 +147,7 @@ fn take_until_ping(
     received: &mut Vec<OwnedFd>,
     taken: &mut Vec<String>,
 ) -> Result<(), String> {
-    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, recvmsg};
     let mut bytes = Vec::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -179,7 +179,7 @@ fn take_until_ping(
                 channel,
                 &mut [IoSliceMut::new(&mut buffer)],
                 &mut control,
-                RecvFlags::CMSG_CLOEXEC,
+                wire::RECV_FLAGS,
             ) {
                 Ok(got) => break got,
                 Err(rustix::io::Errno::INTR) => continue,
@@ -188,7 +188,10 @@ fn take_until_ping(
         };
         for message in control.drain() {
             if let RecvAncillaryMessage::ScmRights(fds) = message {
-                received.extend(fds);
+                for fd in fds {
+                    wire::close_on_exec(&fd);
+                    received.push(fd);
+                }
             }
         }
         if got.bytes == 0 {
@@ -239,11 +242,7 @@ impl Tally {
 
     /// A process outside the front's group: signals, its group, its limits, a pidfd.
     fn process(&mut self, pid: u32) {
-        use rustix::process::{
-            Pid, PidfdFlags, PidfdGetfdFlags, Resource, Signal, getrlimit, kill_process,
-            kill_process_group, pidfd_getfd, pidfd_open, pidfd_send_signal, prlimit,
-            test_kill_process,
-        };
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process};
         let Some(target) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
             return;
         };
@@ -258,6 +257,17 @@ impl Tally {
             format!("group {pid}"),
             kill_process_group(target, Signal::CONT).map_err(Into::into),
         );
+        self.limits_and_pidfd(pid, target);
+    }
+
+    /// The calls on another process that Linux alone has: its limits (`prlimit64`) and a
+    /// pidfd, with the descriptors and the signal it gives.
+    #[cfg(target_os = "linux")]
+    fn limits_and_pidfd(&mut self, pid: u32, target: rustix::process::Pid) {
+        use rustix::process::{
+            PidfdFlags, PidfdGetfdFlags, Resource, Signal, getrlimit, pidfd_getfd, pidfd_open,
+            pidfd_send_signal, prlimit,
+        };
         // Its core size set to the front's own (0): harmless where it gets through.
         self.note(
             "prlimit64",
@@ -284,18 +294,28 @@ impl Tally {
         }
     }
 
+    /// Neither exists off Linux: nothing to try.
+    #[cfg(not(target_os = "linux"))]
+    fn limits_and_pidfd(&mut self, _pid: u32, _target: rustix::process::Pid) {}
+
     /// Sockets of its own: every family, and the connections and names of `attempts`.
     fn sockets(&mut self, attempts: &Attempts) {
         use rustix::net::{AddressFamily, SocketType, socket};
-        for (family, kind, name) in [
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut families = vec![
             (AddressFamily::INET, SocketType::STREAM, "inet stream"),
             (AddressFamily::INET, SocketType::DGRAM, "inet dgram"),
             (AddressFamily::INET6, SocketType::STREAM, "inet6 stream"),
             (AddressFamily::UNIX, SocketType::STREAM, "unix stream"),
             (AddressFamily::UNIX, SocketType::DGRAM, "unix dgram"),
+        ];
+        // Families of Linux alone.
+        #[cfg(target_os = "linux")]
+        families.extend([
             (AddressFamily::NETLINK, SocketType::RAW, "netlink"),
             (AddressFamily::PACKET, SocketType::RAW, "packet"),
-        ] {
+        ]);
+        for (family, kind, name) in families {
             self.note(
                 "socket",
                 name,
@@ -309,6 +329,8 @@ impl Tally {
                 std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)),
             );
         }
+        // Abstract socket names: Linux alone has them.
+        #[cfg(target_os = "linux")]
         for name in &attempts.abstract_names {
             use std::os::linux::net::SocketAddrExt;
             let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
@@ -330,7 +352,9 @@ impl Tally {
 
     /// A descriptor that `run` sent: where it is a socket, it must connect or bind nowhere.
     fn held_socket(&mut self, fd: &OwnedFd, attempts: &Attempts) {
-        use rustix::net::{SocketAddrUnix, bind, connect};
+        use rustix::net::connect;
+        #[cfg(target_os = "linux")]
+        use rustix::net::{SocketAddrUnix, bind};
         if rustix::net::sockopt::socket_type(fd).is_err() {
             return;
         }
@@ -342,6 +366,7 @@ impl Tally {
                 connect(fd, addr).map_err(Into::into),
             );
         }
+        #[cfg(target_os = "linux")]
         for name in &attempts.abstract_names {
             let Ok(addr) = SocketAddrUnix::new_abstract_name(name.as_bytes()) else {
                 continue;
@@ -424,7 +449,7 @@ fn describe(fd: &OwnedFd, number: i32) -> Held {
         return held;
     }
     use rustix::net::{AddressFamily, SocketType, sockopt};
-    let family = match sockopt::socket_domain(fd) {
+    let family = match socket_family(fd) {
         Ok(AddressFamily::UNIX) => "unix",
         Ok(AddressFamily::INET) => "inet",
         Ok(AddressFamily::INET6) => "inet6",
@@ -439,15 +464,48 @@ fn describe(fd: &OwnedFd, number: i32) -> Held {
         Err(_) => "unknown",
     };
     held.kind = format!("{family} {socket_type}");
-    held.listening = sockopt::socket_acceptconn(fd).unwrap_or(false);
+    held.listening = listening(fd);
     if family == "unix" {
-        held.peer = sockopt::socket_peercred(fd)
-            .ok()
-            .map(|cred| cred.pid.as_raw_nonzero().get().unsigned_abs());
+        held.peer = peer_pid(fd);
     } else if let Ok(copy) = fd.try_clone() {
         let socket = std::net::TcpStream::from(copy);
         held.addr = socket.local_addr().ok().map(|a| a.to_string());
         held.peer_addr = socket.peer_addr().ok().map(|a| a.to_string());
     }
     held
+}
+
+/// A socket's family: `SO_DOMAIN` on Linux; elsewhere its own address's (`getsockname`).
+#[cfg(target_os = "linux")]
+fn socket_family(fd: &OwnedFd) -> rustix::io::Result<rustix::net::AddressFamily> {
+    rustix::net::sockopt::socket_domain(fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_family(fd: &OwnedFd) -> rustix::io::Result<rustix::net::AddressFamily> {
+    rustix::net::getsockname(fd).map(|addr| addr.address_family())
+}
+
+/// Whether a socket listens (`SO_ACCEPTCONN`, which Linux alone reads here).
+#[cfg(target_os = "linux")]
+fn listening(fd: &OwnedFd) -> bool {
+    rustix::net::sockopt::socket_acceptconn(fd).unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listening(_fd: &OwnedFd) -> bool {
+    false
+}
+
+/// The pid of a Unix socket's peer (`SO_PEERCRED`, Linux alone).
+#[cfg(target_os = "linux")]
+fn peer_pid(fd: &OwnedFd) -> Option<u32> {
+    rustix::net::sockopt::socket_peercred(fd)
+        .ok()
+        .map(|cred| cred.pid.as_raw_nonzero().get().unsigned_abs())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_pid(_fd: &OwnedFd) -> Option<u32> {
+    None
 }

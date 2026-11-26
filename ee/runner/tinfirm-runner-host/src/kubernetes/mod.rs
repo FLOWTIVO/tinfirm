@@ -22,7 +22,19 @@ pub mod api;
 pub mod config;
 pub mod pod_driver;
 pub mod spec;
+// The TAP device of a run's pod, by netlink and the TUN ioctls of Linux: a run's pod runs on a
+// Linux worker. Elsewhere (the runner host built for macOS) `vm-pod tap-setup` refuses.
+#[cfg(target_os = "linux")]
 pub mod tap;
+#[cfg(not(target_os = "linux"))]
+pub mod tap {
+    use std::net::Ipv4Addr;
+
+    /// `vm-pod tap-setup` off Linux: a run's pod runs on a Linux worker alone.
+    pub fn set_up(_name: &str, _uid: u32, _gid: u32, _address: Ipv4Addr) -> anyhow::Result<()> {
+        anyhow::bail!("a run pod's TAP device is set up on Linux alone")
+    }
+}
 pub mod vm_pod;
 
 /// `--vm-driver pod`: this binary's driver of a pod per run (`vm-driver pod`).
