@@ -15,6 +15,11 @@ Description=Tinfirm node agent: the hardening that lasts until a reboot
 # wanted, not required: one that does not come up delays this unit for as long as the
 # network's own service waits for it (two minutes with systemd-networkd), and stops nothing.
 # The listener waits for the same target, so the node serves no later for it.
+#
+# After the devices the boot has found so far: ExecStartPre= below waits until udev has
+# handled their events, with the modules its rules load for them, for 60 s at most. Only this
+# unit, and the helper after it, wait: not the whole boot, as systemd-udev-settle.service
+# would (deprecated).
 Wants=tinfirm-node-agent-modules.service network-online.target
 After=tinfirm-node-agent-modules.service tinfirm-node-agent-firewall.service kdump-tools.service kdump.service systemd-sysctl.service network-online.target
 # The helper asks for this unit with Wants=, not Requires=: a node whose hardening fails runs
@@ -24,6 +29,13 @@ Before=tinfirm-node-agent-helper.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# The events of the devices found at boot (systemd-udev-trigger.service, before
+# sysinit.target) and the modules their rules load. `-`: a wait that runs out, or a udev that
+# does not answer, is noted in the journal and `harden` runs anyway; a module still missing for
+# the agent then keeps module loading on, as `harden` says. Over the unit's own sandbox below:
+# udevadm reaches udev's control socket and reads its queue under /run/udev, AF_UNIX and
+# read-only.
+ExecStartPre=-/usr/bin/udevadm settle --timeout=60
 ExecStart=/usr/local/bin/tinfirm-node-agent harden --config /etc/tinfirm/node-agent/hardening.json
 UMask=0077
 

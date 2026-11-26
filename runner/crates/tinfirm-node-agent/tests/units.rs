@@ -67,6 +67,27 @@ fn the_hardening_waits_for_the_network_and_does_not_require_it() {
 }
 
 #[test]
+fn the_hardening_waits_a_bounded_time_for_the_devices_and_runs_anyway() {
+    // udev's events of the devices found at boot, with the modules their rules load, before
+    // module loading goes off; for 60 s at most, and a wait that fails stops nothing (`-`).
+    assert_eq!(
+        directive(HARDENING, "ExecStartPre"),
+        ["-/usr/bin/udevadm", "settle", "--timeout=60"]
+    );
+    // This unit alone waits: not the whole boot, as the deprecated settle service would.
+    for name in ["Wants", "Requires", "After"] {
+        assert!(
+            !directive(HARDENING, name).contains(&"systemd-udev-settle.service".to_string()),
+            "{name}"
+        );
+    }
+    // A oneshot has no start timeout by default; the bound is the settle's own.
+    assert!(directive(HARDENING, "TimeoutStartSec").is_empty());
+    // udevadm talks to udev over its control socket under /run/udev: AF_UNIX stays allowed.
+    assert_eq!(directive(HARDENING, "RestrictAddressFamilies"), ["AF_UNIX"]);
+}
+
+#[test]
 fn the_helper_wants_the_hardening_and_does_not_require_it() {
     let unit = "tinfirm-node-agent-hardening.service".to_string();
     assert!(directive(HELPER, "Wants").contains(&unit));

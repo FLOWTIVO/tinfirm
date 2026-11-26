@@ -53,6 +53,12 @@ pub const RUN_LABEL: &str = "tinfirm-run";
 /// `--vm-driver digitalocean`: this binary's own driver for DigitalOcean (`vm-driver
 /// digitalocean`, crate::digitalocean), which is paid (ADR-0114).
 pub const BUILTIN_DIGITALOCEAN: &str = "digitalocean";
+/// The one notification of the driver protocol: a driver that learns between the host's calls
+/// that one of its machines stopped answering (a node's connection was lost) says so, and the
+/// host asks its `verify` at once instead of at its next one ([`Vms::follow_machines`]). It
+/// carries no `id` and gets no answer; `params.why` is for the log. Optional for a driver, and
+/// a host that does not know it ignores it, so the protocol stays version 1.
+pub const MACHINES_CHANGED: &str = "machinesChanged";
 
 /// How long one call of the driver may take, by method.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,6 +85,9 @@ const MAX_LINE: u64 = 4 * 1024 * 1024;
 /// While the driver can make no VM, how often the host asks its `verify` again on its own
 /// ([`VmOptions::recheck`]).
 const RECHECK: Duration = Duration::from_secs(30);
+/// The least time between two health checks that the driver's [`MACHINES_CHANGED`] asks for:
+/// a machine whose connection flaps costs the driver one `verify` per this time at most.
+const NOTICE_GAP: Duration = Duration::from_secs(5);
 /// A run that comes while the driver can make no VM asks `verify` again first, unless the last
 /// answer is this recent: the server dispatches a rejected run again after 10 s, and several
 /// runs at once ask once.
@@ -547,6 +556,8 @@ pub struct Driver {
     command: DriverCommand,
     process: tokio::sync::Mutex<Option<Arc<Process>>>,
     next_id: AtomicU64,
+    /// Counts the driver's [`MACHINES_CHANGED`] notifications, over its restarts.
+    notices: tokio::sync::watch::Sender<u64>,
 }
 
 impl Driver {
@@ -555,7 +566,13 @@ impl Driver {
             command,
             process: tokio::sync::Mutex::new(None),
             next_id: AtomicU64::new(1),
+            notices: tokio::sync::watch::Sender::new(0),
         }
+    }
+
+    /// The count of the driver's [`MACHINES_CHANGED`] notifications, as it grows.
+    pub fn notices(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.notices.subscribe()
     }
 
     async fn process(&self) -> Result<Arc<Process>> {
@@ -583,7 +600,7 @@ impl Driver {
         let stdout = child.stdout.take().context("the driver has no stdout")?;
         let stderr = child.stderr.take().context("the driver has no stderr")?;
         let calls = Arc::new(Calls::default());
-        tokio::spawn(read_answers(stdout, calls.clone()));
+        tokio::spawn(read_answers(stdout, calls.clone(), self.notices.clone()));
         let process = Arc::new(Process {
             stdin: tokio::sync::Mutex::new(stdin),
             calls,
@@ -734,7 +751,11 @@ impl Driver {
     }
 }
 
-async fn read_answers(stdout: tokio::process::ChildStdout, calls: Arc<Calls>) {
+async fn read_answers(
+    stdout: tokio::process::ChildStdout,
+    calls: Arc<Calls>,
+    notices: tokio::sync::watch::Sender<u64>,
+) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut line = Vec::new();
@@ -755,6 +776,17 @@ async fn read_answers(stdout: tokio::process::ChildStdout, calls: Arc<Calls>) {
             continue;
         };
         let Some(id) = message.get("id").and_then(Value::as_u64) else {
+            // A notification: the one the host knows counts, any other is ignored.
+            if message.get("id").is_none()
+                && message.get("method").and_then(Value::as_str) == Some(MACHINES_CHANGED)
+            {
+                let why = message["params"]["why"].as_str().unwrap_or("");
+                tracing::info!(
+                    why = %crate::util::one_line(why, CAUSE_MAX),
+                    "the VM driver says that a machine of its own stopped answering: the host asks its verify now"
+                );
+                notices.send_modify(|n| *n += 1);
+            }
             continue;
         };
         let Some(tx) = lock(&calls.pending).remove(&id) else {
@@ -859,7 +891,25 @@ pub fn read_request(line: &[u8]) -> RequestLine {
 /// answer on a line of its own, in any order. A line that is not a request gets an error
 /// answer ([`PARSE_ERROR`], [`INVALID_REQUEST`]); an empty line none. Fails when the input
 /// held such lines and no request, so that a caller that sent only bad lines sees a failure.
-pub async fn serve_driver<R, W, F, Fut>(input: R, mut output: W, handle: F) -> Result<()>
+pub async fn serve_driver<R, W, F, Fut>(input: R, output: W, handle: F) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Fn(String, Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
+{
+    let (_none, notices) = tokio::sync::mpsc::unbounded_channel();
+    serve_driver_with_notices(input, output, notices, handle).await
+}
+
+/// [`serve_driver`], which also writes each of `notices`, the driver's notifications
+/// ([`MACHINES_CHANGED`]), between its answers, until `input` ends.
+pub async fn serve_driver_with_notices<R, W, F, Fut>(
+    input: R,
+    mut output: W,
+    mut notices: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    handle: F,
+) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -868,7 +918,23 @@ where
 {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
-        while let Some(answer) = rx.recv().await {
+        let mut noticing = true;
+        loop {
+            let answer = tokio::select! {
+                // The answers first: the writer ends when they do, not with the notices.
+                biased;
+                answer = rx.recv() => match answer {
+                    Some(answer) => answer,
+                    None => break,
+                },
+                notice = notices.recv(), if noticing => match notice {
+                    Some(notice) => notice,
+                    None => {
+                        noticing = false;
+                        continue;
+                    }
+                },
+            };
             let mut line = serde_json::to_vec(&answer).expect("answers serialize");
             line.push(b'\n');
             if output.write_all(&line).await.is_err() || output.flush().await.is_err() {
@@ -1153,6 +1219,44 @@ impl Vms {
                 () = stop.cancelled() => return,
                 _ = tick.tick() => {}
             }
+            // Bounded by the driver's own time for `verify`.
+            self.check_within(VERIFY_TIMEOUT + Duration::from_secs(5))
+                .await;
+        }
+    }
+
+    /// Until `stop`: a health check ([`Vms::check_within`]) for each [`MACHINES_CHANGED`] of
+    /// the driver, so that a host that is running has the fewer slots of a machine that stopped
+    /// answering from the driver's word on, not from its next `verify` of its own (the node
+    /// driver's schedule, a failed create). Notices that come together, or while a check is
+    /// under way, ask once, and checks for notices are [`NOTICE_GAP`] apart at least. A driver
+    /// that sends none costs nothing here: a healthy host asks its driver no more often. A
+    /// notice that came before this began, such as one between the start's check and now,
+    /// asks once at once: a new receiver would take it as seen.
+    pub async fn follow_machines(self: &Arc<Vms>, stop: tokio_util::sync::CancellationToken) {
+        let mut notices = self.driver.notices();
+        if *notices.borrow_and_update() > 0 {
+            notices.mark_changed();
+        }
+        let mut last: Option<tokio::time::Instant> = None;
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                changed = notices.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+            if let Some(last) = last {
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    () = tokio::time::sleep_until(last + NOTICE_GAP) => {}
+                }
+            }
+            // The notices up to now are this check's.
+            notices.borrow_and_update();
+            last = Some(tokio::time::Instant::now());
             // Bounded by the driver's own time for `verify`.
             self.check_within(VERIFY_TIMEOUT + Duration::from_secs(5))
                 .await;

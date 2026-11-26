@@ -53,12 +53,23 @@ use crate::vm::{DRIVER_PROTOCOL, HOST_LABEL, lock};
 pub const DRIVER: &str = "pod";
 /// How long an admission check that passed is not made again before a create.
 const ADMISSION_CHECK_TTL: Duration = Duration::from_secs(60);
-/// How long a run pod may wait for a node before `verify` reports it.
+/// How long a run pod may wait for a node before `verify` names it, in `checked`: a warning,
+/// no problem. Such a pod holds its room in the quota, which the room already counts, and its
+/// run fails at the host's `--vm-start-timeout`. As a problem it refused the host's start, also
+/// for a leftover pod of the host's own, which the host deletes only once it has started, and
+/// for a pool that an autoscaler is still growing (the owner, 2026-11-25).
 const UNSCHEDULABLE_AFTER_SECONDS: i64 = 60;
 /// The grace period of a deleted pod: Firecracker ends at SIGTERM.
 const GRACE_SECONDS: u32 = 5;
-/// How long the delete of a pod may take whose create got no clear answer.
+/// How long the delete of a pod may take whose create got no clear answer, or that a create
+/// that failed after it leaves; and how long the ticket's Secret may take.
 const UNSURE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+/// All of a `create`, from the request to the answer: its admission check, its tries for room,
+/// the pod, the Secret and a delete of the pod when a later step fails. Each step has its own
+/// timeout, and a read is tried again after a 429 or a 5xx, so without this the steps could
+/// add up past the host's 180 s for a driver's create (crate::vm), and the host would give up
+/// without the driver's reason. 30 s under the host's, as the node driver's create is.
+const CREATE_TIME: Duration = Duration::from_secs(150);
 /// How long `delete` waits for the pod to be gone from the API: its grace period, and time for
 /// the kubelet to clear it away. Far below the 120 s the host gives a delete.
 const GONE_WAIT: Duration = Duration::from_secs(20);
@@ -81,6 +92,10 @@ pub struct PodDriver {
     gone_wait: Duration,
     room_wait: Duration,
     poll: Duration,
+    /// [`CREATE_TIME`].
+    create_time: Duration,
+    /// [`UNSURE_DELETE_TIMEOUT`]: kept at the end of a create for each step after the pod.
+    cleanup_time: Duration,
     /// The templates whose admission check passed, and when.
     admission_checked: Mutex<BTreeMap<String, Instant>>,
     /// When a delete of this driver's last ended: the quota may count that pod a moment longer.
@@ -101,6 +116,8 @@ impl PodDriver {
             gone_wait: GONE_WAIT,
             room_wait: ROOM_WAIT,
             poll: POLL,
+            create_time: CREATE_TIME,
+            cleanup_time: UNSURE_DELETE_TIMEOUT,
             admission_checked: Mutex::new(BTreeMap::new()),
             deleted: Mutex::new(None),
             tickets_deleted: Mutex::new(HashSet::new()),
@@ -144,7 +161,10 @@ impl PodDriver {
     // ----- create --------------------------------------------------------------------
 
     /// Creates a run's pod and its ticket's Secret; the VM's id is the pod's name. The
-    /// protocol's `name` is not used: the driver names its pods.
+    /// protocol's `name` is not used: the driver names its pods. All of it within
+    /// [`CREATE_TIME`]: the pod by that time less two [`UNSURE_DELETE_TIMEOUT`]s, the Secret by
+    /// it less one, so that the delete of a pod that a later step leaves still fits. A step
+    /// that runs out is a failed create, and leaves no pod that this driver could delete.
     pub async fn create(
         &self,
         template: &str,
@@ -166,39 +186,69 @@ impl PodDriver {
         let name = id.pod_name();
         let pod = spec::pod(&self.config, template, &id, labels, node)?;
         let started = Instant::now();
-        let mut room_coming = false;
-        let created = loop {
-            let tried = self.try_create(template, &name, &pod).await;
-            // The quota refused the pod. The host asks for a VM as soon as it has a free slot,
-            // and a pod it deleted for that slot holds its share of the quota until it is gone
-            // and the cluster has counted again: that room is tried for again, for a moment.
-            let no_room = tried.as_ref().is_err_and(|e| e.is::<NoRoom>());
-            if !no_room || started.elapsed() >= self.room_wait {
-                break tried?;
+        let deadline = tokio::time::Instant::now() + self.create_time;
+        let pod_by = deadline - 2 * self.cleanup_time;
+        let made_pod = async {
+            let mut room_coming = false;
+            loop {
+                let tried = self.try_create(template, &name, &pod).await;
+                // The quota refused the pod. The host asks for a VM as soon as it has a free
+                // slot, and a pod it deleted for that slot holds its share of the quota until
+                // it is gone and the cluster has counted again: that room is tried for again,
+                // for a moment.
+                let no_room = tried.as_ref().is_err_and(|e| e.is::<NoRoom>());
+                if !no_room || started.elapsed() >= self.room_wait {
+                    break tried;
+                }
+                room_coming = room_coming || self.room_is_coming(labels).await;
+                if !room_coming {
+                    break tried;
+                }
+                tokio::time::sleep(self.poll).await;
             }
-            room_coming = room_coming || self.room_is_coming(labels).await;
-            if !room_coming {
-                break tried?;
+        };
+        let created = match tokio::time::timeout_at(pod_by, made_pod).await {
+            Ok(created) => created?,
+            // The pod's own create may have been under way, and stored it.
+            Err(_) => {
+                let why = anyhow::anyhow!(
+                    "no run pod within {} s: the admission check, the room or the pod's create took the time",
+                    self.create_time
+                        .saturating_sub(2 * self.cleanup_time)
+                        .as_secs()
+                );
+                return Err(self.delete_unsure(&name, why).await);
             }
-            tokio::time::sleep(self.poll).await;
         };
         let uid = created["metadata"]["uid"].as_str().unwrap_or_default();
         let secret = spec::ticket_secret(&self.config, &id, labels, user_data.as_bytes(), uid);
         let made = match secret {
-            Ok(secret) => self
-                .api
-                .create_secret(self.namespace(), &secret, DryRun::No)
-                .await
-                .map_err(|e| secret_error(&e)),
+            Ok(secret) => {
+                let create = self
+                    .api
+                    .create_secret(self.namespace(), &secret, DryRun::No);
+                match tokio::time::timeout_at(deadline - self.cleanup_time, create).await {
+                    Ok(made) => made.map_err(|e| secret_error(&e)),
+                    // The pod owns its Secret (spec::ticket_secret): the pod's delete below
+                    // takes a Secret that was stored all the same.
+                    Err(_) => Err(anyhow::anyhow!(
+                        "cannot create the ticket's Secret: no answer in time"
+                    )),
+                }
+            }
             Err(e) => Err(e),
         };
         if let Err(why) = made {
             // The pod never started: its Secret volume waits for the Secret.
-            return Err(match self.api.delete_pod(self.namespace(), &name, Some(0)).await {
-                Ok(()) => why.context(format!("the pod {name} is deleted again")),
-                Err(e) if e.is_not_found() => why,
-                Err(e) => why.context(format!(
+            let delete = self.api.delete_pod(self.namespace(), &name, Some(0));
+            return Err(match tokio::time::timeout(self.cleanup_time, delete).await {
+                Ok(Ok(())) => why.context(format!("the pod {name} is deleted again")),
+                Ok(Err(e)) if e.is_not_found() => why,
+                Ok(Err(e)) => why.context(format!(
                     "and the pod {name} could not be deleted ({e}): the host's cleanup of leftovers deletes it, since it carries the host's label"
+                )),
+                Err(_) => why.context(format!(
+                    "and the pod {name} could not be deleted (no answer in time): the host's cleanup of leftovers deletes it, since it carries the host's label"
                 )),
             });
         }
@@ -243,26 +293,43 @@ impl PodDriver {
     }
 
     /// Deletes the pod `name` after a create whose answer does not tell whether the server
-    /// stored it ([`maybe_stored`]), and returns `why` with what became of the pod. Such a pod
-    /// has no ticket, so it never starts, and it would hold its share of the quota until the
-    /// host's cleanup of leftovers, which runs only when the host starts or connects again.
-    /// The delete has [`UNSURE_DELETE_TIMEOUT`]: the host waits for the create's answer.
+    /// stored it ([`maybe_stored`]), or that this driver gave up on, and returns `why` with what
+    /// became of the pod. Such a pod has no ticket, so it never starts, and it would hold its
+    /// share of the quota until the host's cleanup of leftovers, which runs only when the host
+    /// starts or connects again. A create that the driver no longer waits for may still be
+    /// stored after a first delete found nothing (an admission webhook has up to 30 s), so a
+    /// pod that is not found is looked for again until [`UNSURE_DELETE_TIMEOUT`] is over: the
+    /// host waits for the create's answer.
     async fn delete_unsure(&self, name: &str, why: anyhow::Error) -> anyhow::Error {
-        let delete = self.api.delete_pod(self.namespace(), name, Some(0));
-        let failed = match tokio::time::timeout(UNSURE_DELETE_TIMEOUT, delete).await {
-            Ok(Ok(())) => {
+        let until = tokio::time::Instant::now() + self.cleanup_time;
+        loop {
+            // A last delete at the window's end has a poll's time of its own.
+            let answer_by = until.max(tokio::time::Instant::now() + self.poll);
+            let delete = self.api.delete_pod(self.namespace(), name, Some(0));
+            let failed = match tokio::time::timeout_at(answer_by, delete).await {
+                Ok(Ok(())) => {
+                    return why.context(format!(
+                        "the server had stored the pod {name}, which is deleted again"
+                    ));
+                }
+                // Not stored, or not yet: looked for again while the time lasts.
+                Ok(Err(e)) if e.is_not_found() => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(_) => Some(format!("no answer within {:?}", self.cleanup_time)),
+            };
+            if let Some(failed) = failed {
                 return why.context(format!(
-                    "the server had stored the pod {name}, which is deleted again"
+                    "and the pod {name}, if the server stored it, could not be deleted ({failed}): the host's cleanup of leftovers deletes it, since it carries the host's label"
                 ));
             }
-            // The server did not store it.
-            Ok(Err(e)) if e.is_not_found() => return why,
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => format!("no answer within {UNSURE_DELETE_TIMEOUT:?}"),
-        };
-        why.context(format!(
-            "and the pod {name}, if the server stored it, could not be deleted ({failed}): the host's cleanup of leftovers deletes it, since it carries the host's label"
-        ))
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                // The server did not store it in the time a create can take.
+                return why;
+            }
+            // The last look is at the window's end itself.
+            tokio::time::sleep_until((now + self.poll).min(until)).await;
+        }
     }
 
     /// Checks the network policies and the admission policy for `template`, unless they passed
@@ -625,7 +692,12 @@ impl PodDriver {
             Ok(pods) => {
                 let stuck = unschedulable(&pods, chrono::Utc::now());
                 checked.push(format!("{} run pod(s)", pods.len()));
-                problems.extend(stuck.into_iter().take(MAX_UNSCHEDULABLE));
+                checked.extend(
+                    stuck
+                        .into_iter()
+                        .take(MAX_UNSCHEDULABLE)
+                        .map(|why| format!("warning: {why}")),
+                );
                 holding = Some(pods.iter().filter(|pod| holds_room(pod)).count());
             }
             Err(e) => problems.push(api_problem("the run pods", &e)),
@@ -1158,12 +1230,21 @@ mod tests {
         ending: BTreeMap<String, u32>,
         /// The pod's create stores the pod, and answers with this code and no pod.
         lost_pod_answer: Option<u16>,
+        /// With `lost_pod_answer`: the pod is stored only after this many deletes of pods, as
+        /// a create that an admission webhook still holds when the driver gives up on it.
+        stored_after_deletes: u32,
+        /// Such a pod, not stored yet.
+        unstored: Option<(String, Value)>,
         fail_secret_create: bool,
         /// How many more of the Secrets' deletes fail.
         fail_secret_deletes: u32,
         fail_pod_delete: bool,
         /// Reads of the network policies are forbidden.
         fail_policy_reads: bool,
+        /// Dry runs answer after this long, as a slow admission webhook would.
+        late_dry_runs: Option<Duration>,
+        /// The Secret's create answers after this long, and stores nothing.
+        late_secret_create: Option<Duration>,
         next_uid: u64,
         /// The driver's configuration, which the fake admission policy follows.
         config: PodConfig,
@@ -1201,10 +1282,14 @@ mod tests {
             ending_for: 0,
             ending: BTreeMap::new(),
             lost_pod_answer: None,
+            stored_after_deletes: 0,
+            unstored: None,
             fail_secret_create: false,
             fail_secret_deletes: 0,
             fail_pod_delete: false,
             fail_policy_reads: false,
+            late_dry_runs: None,
+            late_secret_create: None,
             next_uid: 1,
             config,
         }
@@ -1388,6 +1473,9 @@ mod tests {
                 if !cluster.namespace {
                     return not_found("namespaces", NS);
                 }
+                if let Some(late) = cluster.late_dry_runs.filter(|_| dry) {
+                    return Reply::Late(late);
+                }
                 if cluster.quota_full
                     || cluster.stale_quota > 0
                     || cluster
@@ -1433,7 +1521,11 @@ mod tests {
                 pod["metadata"]["uid"] = json!(format!("0000-{:04}", cluster.next_uid));
                 cluster.next_uid += 1;
                 pod["status"] = json!({"phase": "Pending"});
-                cluster.pods.insert(name, pod.clone());
+                if cluster.lost_pod_answer.is_some() && cluster.stored_after_deletes > 0 {
+                    cluster.unstored = Some((name, pod.clone()));
+                } else {
+                    cluster.pods.insert(name, pod.clone());
+                }
                 match cluster.lost_pod_answer {
                     Some(500) => Reply::Json(
                         500,
@@ -1486,6 +1578,14 @@ mod tests {
             }
             ("DELETE", p) if p.starts_with(&format!("{pods}/")) => {
                 let name = &p[pods.len() + 1..];
+                if cluster.unstored.is_some() {
+                    if cluster.stored_after_deletes == 0 {
+                        let (stored, pod) = cluster.unstored.take().unwrap();
+                        cluster.pods.insert(stored, pod);
+                    } else {
+                        cluster.stored_after_deletes -= 1;
+                    }
+                }
                 if cluster.fail_pod_delete {
                     return Reply::Json(403, status(403, "Forbidden", "pods is forbidden"));
                 }
@@ -1508,6 +1608,9 @@ mod tests {
                 }
             }
             ("POST", p) if p == secrets => {
+                if let Some(late) = cluster.late_secret_create {
+                    return Reply::Late(late);
+                }
                 if cluster.fail_secret_create {
                     // A server that quotes what it got, the worst case.
                     let quoted = seen.body.to_string();
@@ -1958,6 +2061,45 @@ mod tests {
             assert_eq!(calls.last().unwrap().split(' ').next(), Some("DELETE"));
         }
 
+        // A pod that the server stores only after the first deletes found nothing, as a create
+        // that an admission webhook still held: looked for again, and deleted.
+        let mut c = cluster();
+        c.lost_pod_answer = Some(500);
+        c.stored_after_deletes = 2;
+        let t = start(c).await;
+        let error = t.error("create", create.clone()).await;
+        assert!(
+            error.contains("the server had stored the pod tinfirm-vm-")
+                && error.contains("which is deleted again"),
+            "{error}"
+        );
+        assert!(t.cluster().pods.is_empty(), "the late pod is gone");
+        assert!(t.cluster().unstored.is_none());
+        let deletes = t
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with(&format!("DELETE /api/v1/namespaces/{NS}/pods/")))
+            .count();
+        assert_eq!(deletes, 3);
+
+        // A pod stored in the last moment of the window: the last look is at its end, not a
+        // poll before it. A window of 1 s and looks 0.6 s apart: at 0, 0.6 and 1 s.
+        let mut c = cluster();
+        c.lost_pod_answer = Some(500);
+        c.stored_after_deletes = 2;
+        let mut t = start(c).await;
+        {
+            let driver = Arc::get_mut(&mut t.driver).unwrap();
+            driver.cleanup_time = Duration::from_secs(1);
+            driver.poll = Duration::from_millis(600);
+        }
+        let error = t.error("create", create.clone()).await;
+        assert!(
+            error.contains("the server had stored the pod tinfirm-vm-"),
+            "{error}"
+        );
+        assert!(t.cluster().pods.is_empty(), "the late pod is gone");
+
         // When the delete fails too, the answer says that the cleanup takes the pod.
         let mut c = cluster();
         c.lost_pod_answer = Some(500);
@@ -1985,6 +2127,61 @@ mod tests {
             t.calls()
         );
         assert_eq!(t.cluster().pods.len(), 1, "the first create's pod");
+    }
+
+    #[tokio::test]
+    async fn a_create_answers_within_its_own_time_and_leaves_no_pod() {
+        let create = json!({"template": "sandbox-4c8g", "userData": USER_DATA,
+                            "labels": {"tinfirm-host": HOST}});
+        // Times as built, scaled down: `all` in all, `cleanup` kept for each step after the pod.
+        let scaled = |t: &mut Test, all: u64, cleanup: u64| {
+            let driver = Arc::get_mut(&mut t.driver).unwrap();
+            driver.create_time = Duration::from_millis(all);
+            driver.cleanup_time = Duration::from_millis(cleanup);
+        };
+        // An admission webhook that answers each dry run after 2 s: no pod by its time.
+        let mut c = cluster();
+        c.late_dry_runs = Some(Duration::from_secs(2));
+        let mut t = start(c).await;
+        scaled(&mut t, 1500, 300);
+        let started = std::time::Instant::now();
+        let error = t.error("create", create.clone()).await;
+        let took = started.elapsed();
+        assert!(error.contains("no run pod within 0 s"), "{error}");
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert!(t.cluster().pods.is_empty());
+        assert!(
+            !t.calls()
+                .contains(&format!("POST /api/v1/namespaces/{NS}/pods")),
+            "{:#?}",
+            t.calls()
+        );
+
+        // A Secret whose create does not answer: the pod is deleted again within the time. The
+        // admission check's dozen calls to the fake API come first: more time for this one.
+        let mut c = cluster();
+        c.late_secret_create = Some(Duration::from_secs(20));
+        let mut t = start(c).await;
+        scaled(&mut t, 6000, 1500);
+        let started = std::time::Instant::now();
+        let error = t.error("create", create.clone()).await;
+        let took = started.elapsed();
+        assert!(
+            error.contains("cannot create the ticket's Secret: no answer in time"),
+            "{error}"
+        );
+        assert!(error.contains("is deleted again"), "{error}");
+        assert!(took < Duration::from_millis(6000), "{took:?}");
+        assert!(t.cluster().pods.is_empty());
+    }
+
+    #[test]
+    fn a_create_has_less_time_than_the_host_gives_it_with_room_for_its_cleanup() {
+        // crate::vm gives a driver's create 180 s.
+        assert!(CREATE_TIME + Duration::from_secs(30) <= Duration::from_secs(180));
+        // The pod's stage keeps time for the Secret and for one delete, and for its own tries.
+        let pod_stage = CREATE_TIME - 2 * UNSURE_DELETE_TIMEOUT;
+        assert!(pod_stage > ROOM_WAIT + super::super::api::DEFAULT_TIMEOUT);
     }
 
     #[test]
@@ -2421,13 +2618,19 @@ mod tests {
             "there is no ResourceQuota tinfirm-runs",
             "there is no NetworkPolicy tinfirm-runs-default-deny",
             "the NetworkPolicy tinfirm-runs-allow-runner is not the one expected: spec.ingress[0].ports[0].port: 22, expected 7443",
-            "has found no node for",
-            "didn't match pod anti-affinity rules",
             "accepts a run pod with a hostPath volume",
             "holds the NetworkPolicy allow-all, which is not the chart's: network policies add up, so it may open the run pods",
         ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
+        // A run pod that waits for a node is a warning, in `checked`, and no problem.
+        assert!(!text.contains("has found no node for"), "{text}");
+        let checked = verified["checked"].to_string();
+        assert!(
+            checked.contains("warning: the run pod tinfirm-vm-00112233445566778899aabbccddeeff has found no node for")
+                && checked.contains("didn't match pod anti-affinity rules"),
+            "{checked}"
+        );
         // No quota to read, and a create would be refused: no room.
         assert_eq!(verified["maxVms"], 0);
 
@@ -2516,8 +2719,8 @@ mod tests {
             assert!(t.cluster().pods.is_empty(), "{problem}");
         }
 
-        // A problem that refuses no create leaves the room as the quota has it: a run pod
-        // that waits for a node.
+        // A run pod that waits for a node is no problem: the room is the quota's, the host's
+        // start is not refused, and a create goes on.
         let mut c = cluster();
         c.pods.insert("tinfirm-vm-00112233445566778899aabbccddeeff".into(), json!({
             "metadata": {"name": "tinfirm-vm-00112233445566778899aabbccddeeff",
@@ -2528,10 +2731,11 @@ mod tests {
         }));
         let t = start(c).await;
         let verified = t.ok("verify", verify.clone()).await;
+        assert_eq!(verified["problems"], json!([]), "{verified}");
         assert!(
-            verified["problems"]
+            verified["checked"]
                 .to_string()
-                .contains("has found no node for"),
+                .contains("warning: the run pod tinfirm-vm-00112233445566778899aabbccddeeff has found no node for"),
             "{verified}"
         );
         assert_eq!(verified["maxVms"], 8, "{verified}");

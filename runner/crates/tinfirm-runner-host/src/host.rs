@@ -2975,6 +2975,16 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
         }
         _ => None,
     };
+    // With a VM per run: a health check when the driver says that a machine stopped answering
+    // (`machinesChanged`), so that the room below follows it at once.
+    let machines = match &host.opts.executor {
+        Executor::Vm(vms) => {
+            let vms = vms.clone();
+            let stop = finish.clone();
+            Some(tokio::spawn(async move { vms.follow_machines(stop).await }))
+        }
+        _ => None,
+    };
     let tell = tokio::spawn(tell_hardening(host.clone(), finish.clone()));
     // With a VM per run: the slots this host has while part of its driver's machines do not
     // answer ([`Host::set_vm_room`]).
@@ -3023,6 +3033,9 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
     health.abort();
     tell.abort();
     vm_room.abort();
+    if let Some(machines) = machines {
+        machines.abort();
+    }
     if let Some(hardening) = hardening {
         hardening.abort();
     }

@@ -320,13 +320,11 @@ let nextId = 0;
                     (input)="token.set(tokenInput.value)"
                   />
                   <div class="flex gap-2">
-                    <button
-                      hlmBtn
-                      size="sm"
-                      type="submit"
-                      class="h-9"
-                      [disabled]="busy() || !token().trim()"
-                    >
+                    <!-- Enabled with the field still empty: Enter in the field submits the form only
+                         while this button is enabled, and a [disabled] that followed the token
+                         would lag behind a token pasted just before Enter by one change detection:
+                         the Enter would be lost. An empty token is ignored on submit. -->
+                    <button hlmBtn size="sm" type="submit" class="h-9" [disabled]="busy()">
                       @if (busy()) {
                         <hlm-spinner aria-hidden="true" />
                       }
@@ -512,7 +510,11 @@ export class BindingCard {
   protected connectWithToken(event: Event): Promise<void> {
     event.preventDefault();
     const token = this.token().trim();
-    if (!token) return Promise.resolve();
+    if (this.busy()) return Promise.resolve();
+    if (!token) {
+      this.tokenField()?.nativeElement.focus();
+      return Promise.resolve();
+    }
     return this.run(async () => {
       try {
         await this.api.invoke(storeMyAccountToken, {
