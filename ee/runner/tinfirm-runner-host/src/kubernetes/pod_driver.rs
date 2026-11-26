@@ -303,8 +303,10 @@ impl PodDriver {
     async fn delete_unsure(&self, name: &str, why: anyhow::Error) -> anyhow::Error {
         let until = tokio::time::Instant::now() + self.cleanup_time;
         loop {
+            // A last delete at the window's end has a poll's time of its own.
+            let answer_by = until.max(tokio::time::Instant::now() + self.poll);
             let delete = self.api.delete_pod(self.namespace(), name, Some(0));
-            let failed = match tokio::time::timeout_at(until, delete).await {
+            let failed = match tokio::time::timeout_at(answer_by, delete).await {
                 Ok(Ok(())) => {
                     return why.context(format!(
                         "the server had stored the pod {name}, which is deleted again"
@@ -320,11 +322,13 @@ impl PodDriver {
                     "and the pod {name}, if the server stored it, could not be deleted ({failed}): the host's cleanup of leftovers deletes it, since it carries the host's label"
                 ));
             }
-            if tokio::time::Instant::now() + self.poll >= until {
+            let now = tokio::time::Instant::now();
+            if now >= until {
                 // The server did not store it in the time a create can take.
                 return why;
             }
-            tokio::time::sleep(self.poll).await;
+            // The last look is at the window's end itself.
+            tokio::time::sleep_until((now + self.poll).min(until)).await;
         }
     }
 
@@ -2077,6 +2081,24 @@ mod tests {
             .filter(|call| call.starts_with(&format!("DELETE /api/v1/namespaces/{NS}/pods/")))
             .count();
         assert_eq!(deletes, 3);
+
+        // A pod stored in the last moment of the window: the last look is at its end, not a
+        // poll before it. A window of 1 s and looks 0.6 s apart: at 0, 0.6 and 1 s.
+        let mut c = cluster();
+        c.lost_pod_answer = Some(500);
+        c.stored_after_deletes = 2;
+        let mut t = start(c).await;
+        {
+            let driver = Arc::get_mut(&mut t.driver).unwrap();
+            driver.cleanup_time = Duration::from_secs(1);
+            driver.poll = Duration::from_millis(600);
+        }
+        let error = t.error("create", create.clone()).await;
+        assert!(
+            error.contains("the server had stored the pod tinfirm-vm-"),
+            "{error}"
+        );
+        assert!(t.cluster().pods.is_empty(), "the late pod is gone");
 
         // When the delete fails too, the answer says that the cleanup takes the pod.
         let mut c = cluster();
