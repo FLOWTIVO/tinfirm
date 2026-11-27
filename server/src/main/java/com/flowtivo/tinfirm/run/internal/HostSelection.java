@@ -16,7 +16,8 @@ import com.flowtivo.tinfirm.runner.RunnerMessages;
  * own choice (the package 3 contract, §5.7 step 4 and 5; open point 13). A host takes the run when it is connected and
  * has confirmed its capacity on that connection, speaks runner protocol v2, does not drain, reports no problem with
  * {@code host.health} (ADR-0117) and has a free slot under
- * its dispatch limit. Of those, for a session that moves with its bundle, a host of its level that restores it wins;
+ * its dispatch limit. Of those, any host before the one that rejected the run last; then, for a session that moves
+ * with its bundle, a host of its level that restores it;
  * then the conversation's previous host, so that the turn resumes its session there; then the stronger host by its
  * level and hardening ({@link Isolation#rank}, ADR-0113: the dispatcher hands it the hosts that take one level, the
  * payer's stronger personal hosts among them, and the session's host); else the one with the most free slots, then the first by name, so that runs spread over the hosts.
@@ -128,6 +129,17 @@ final class HostSelection {
      */
     static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills,
             @Nullable IsolationLevel restorersOf, boolean needsAppTokens) {
+        return select(eligible, previousHost, needsSkills, restorersOf, needsAppTokens, null);
+    }
+
+    /**
+     * As {@link #select(List, UUID, boolean, IsolationLevel, boolean)}, for a run that {@code rejectedBy} rejected
+     * last ({@link QueueReason#rejections}): another free host takes it before that one, even before the session's
+     * host, so that a host that cannot run it does not get it again while another stands idle. With no other free
+     * host it goes to that one again, after its back-off.
+     */
+    static Outcome select(List<Host> eligible, @Nullable UUID previousHost, boolean needsSkills,
+            @Nullable IsolationLevel restorersOf, boolean needsAppTokens, @Nullable UUID rejectedBy) {
         if (eligible.isEmpty()) {
             throw new IllegalArgumentException("No eligible host to select from");
         }
@@ -189,13 +201,16 @@ final class HostSelection {
             return new Waits(QueueReason.hostsFull(healthy.size() == 1 ? healthy.getFirst().info() : null, used,
                     limit));
         }
-        // A free host of the level that restores a moving session first; then the session's (or previous) host; then
-        // the stronger by level and hardening, the one with more room, the name.
+        // A free host that did not reject the run last first; then one of the level that restores a moving session;
+        // then the session's (or previous) host; then the stronger by level and hardening, the one with more room, the
+        // name.
+        Comparator<Host> notRejecting = Comparator.comparing(host -> host.info().id().equals(rejectedBy));
         Comparator<Host> restoring = Comparator.comparing(host -> !(restorersOf != null && host.restores()
                 && Isolation.takes(host.info(), restorersOf)));
         Comparator<Host> previous = Comparator.comparing(host -> !host.info().id().equals(previousHost));
         return new Chosen(free.stream()
-            .min(restoring.thenComparing(previous)
+            .min(notRejecting.thenComparing(restoring)
+                .thenComparing(previous)
                 .thenComparingInt(host -> Isolation.rank(host.info()))
                 .thenComparing(Comparator.comparingInt(Host::free).reversed())
                 .thenComparing(host -> host.info().name())

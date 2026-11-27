@@ -499,9 +499,11 @@ class RunDispatcher {
             .toList();
         UUID previousHost = placement.preferred() != null ? placement.preferred()
                 : runs.previousHost(run.conversationId(), run.id()).orElse(null);
+        UUID rejectedBy = run.queueReason() != null && run.queueReason().rejections() != null
+                ? run.queueReason().rejections().runnerHostId() : null;
         HostSelection.Host chosen;
         switch (HostSelection.select(candidates, previousHost, !effective.skills().isEmpty(),
-                placement.preferRestorers() ? placement.level() : null, ready.appTokens())) {
+                placement.preferRestorers() ? placement.level() : null, ready.appTokens(), rejectedBy)) {
             case HostSelection.Waits waits -> {
                 return waiting(run, placement.weakerLeftOut() || placement.chosen()
                         ? waits.reason().withIsolationLevel(placement.level(), placement.chosen()) : waits.reason(),

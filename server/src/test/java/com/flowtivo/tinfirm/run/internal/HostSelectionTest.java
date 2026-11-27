@@ -194,6 +194,26 @@ class HostSelectionTest {
     }
 
     /**
+     * A run that a host rejected goes to another free host, even when the one that rejected it is the session's host
+     * and has more room; with no other free host it goes to that one again.
+     */
+    @org.junit.jupiter.api.Test
+    void aHostThatRejectedTheRunGetsItAgainOnlyWhenNoOtherIsFree() {
+        HostSelection.Host alpha = host(A, "alpha", true, 2, false, 4, 0);
+        HostSelection.Host beta = host(B, "beta", true, 2, false, 4, 3);
+        assertThat(HostSelection.select(List.of(alpha, beta), A, false, null, false, A))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("beta"));
+        assertThat(HostSelection.select(List.of(alpha, beta), A, false, null, false, B))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("alpha"));
+        HostSelection.Host betaFull = host(B, "beta", true, 2, false, 4, 4);
+        assertThat(HostSelection.select(List.of(alpha, betaFull), null, false, null, false, A))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("alpha"));
+    }
+
+    /**
      * ADR-0117: a host that reports a problem with {@code host.health} gets no run. A run goes to a healthy host; when
      * only the one host may take it, it waits with that host's name and first problem; of several, with none.
      */
