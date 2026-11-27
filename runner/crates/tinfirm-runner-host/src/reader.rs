@@ -79,6 +79,18 @@ const MAX_READ_ONE: u64 = crate::mcp::MAX_UPLOAD_BYTES;
 /// What the reader may hold in memory (`RLIMIT_DATA`) while it unpacks or reads one file.
 #[cfg(target_os = "linux")]
 const READER_MEMORY: u64 = 1 << 30;
+/// What each git of a reader may hold in memory (`RLIMIT_DATA`): a bundle's fetch and checkout,
+/// the git jobs and the pack's. git inflates an object of up to 512 MiB
+/// (`core.bigFileThreshold`) in memory, and larger ones it streams; `index-pack` resolves deltas
+/// in at most 3 threads, and the pack's job bounds its delta window ([`PACK_WINDOW_MEMORY`]).
+/// The packs it maps are read only, which the limit does not count.
+const GIT_MEMORY: u64 = 4 << 30;
+/// The delta window of each of `pack-objects`' threads, so that a clone of large objects stays
+/// within [`GIT_MEMORY`].
+const PACK_WINDOW_MEMORY: &str = "--window-memory=256m";
+/// The longest record of `git ls-tree -r -l -z`: a path of [`MAX_NAME`] bytes after its mode,
+/// type, object name and size.
+const MAX_TREE_RECORD: u64 = MAX_NAME as u64 + 256;
 /// Where git's reflog says the host's own steps come from.
 const READER_IDENTITY: (&str, &str) = ("Tinfirm runner host", "runner@tinfirm.invalid");
 /// The longest bundle header ([`check_bundle_header`]), and its most lines.
@@ -88,6 +100,23 @@ const MAX_BUNDLE_LINES: usize = 10_000;
 const MAX_PACK_EXCLUDE: usize = crate::git_push::MAX_PACK_TIPS;
 /// Where the reader fetches the sandbox's HEAD to, for a moment.
 const IMPORTED_REF: &str = "refs/tinfirm/sandbox";
+
+/// What a bundle's HEAD may check out in the host's clone: its tree's entries, and the bytes of
+/// their blobs together. The reader totals them with `git ls-tree` before the checkout, so that
+/// a small bundle of one large blob under many paths cannot fill the host's disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkTreeLimits {
+    pub max_entries: usize,
+    pub max_bytes: u64,
+}
+
+/// A work tree of 1,000,000 files and 16 GiB at most: twice the bytes of a bundle
+/// ([`crate::sandbox_files::BUNDLE_LIMITS`], 8 GiB), since a tree's files compress.
+pub const WORK_TREE_LIMITS: WorkTreeLimits = WorkTreeLimits {
+    max_entries: 1_000_000,
+    max_bytes: 16 << 30,
+};
 
 /// What a reader is asked to do: the job of one process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,13 +156,14 @@ enum Work {
     ReadOne { max: u64 },
     /// The archive on stdin holds the sandbox's bundle `name`: unpack it into `scratch`, check
     /// its header, fetch its HEAD into `repo` with every object checked, and move `repo`'s HEAD
-    /// and work tree there, if it is `head`.
+    /// and work tree there, if it is `head` and its tree is within `tree`.
     Bundle {
         repo: PathBuf,
         scratch: PathBuf,
         name: String,
         head: String,
         limits: JobLimits,
+        tree: WorkTreeLimits,
     },
     /// Run git in `repo` (read only) with `args`, after the host's safe settings.
     Git { repo: PathBuf, args: Vec<String> },
@@ -294,6 +324,7 @@ pub struct Reader {
     binary: PathBuf,
     allow_unconfined: bool,
     guarded: Guarded,
+    work_tree: WorkTreeLimits,
 }
 
 impl Reader {
@@ -304,7 +335,15 @@ impl Reader {
             binary: binary.into(),
             allow_unconfined: false,
             guarded: Guarded::default(),
+            work_tree: WORK_TREE_LIMITS,
         }
+    }
+
+    /// What a bundle's HEAD may check out ([`WORK_TREE_LIMITS`] unless this says otherwise:
+    /// the tests).
+    pub fn bounding_work_trees(mut self, tree: WorkTreeLimits) -> Reader {
+        self.work_tree = tree;
+        self
     }
 
     /// Readers of this process's own executable.
@@ -528,7 +567,8 @@ impl Reader {
     /// The archive `input` holds the sandbox's bundle `name`: a reader unpacks it into
     /// `scratch` (which exists and is empty), checks its header (one ref, `HEAD`, which must be
     /// `head`), fetches it into the clone `repo` with every object checked, and moves `repo`'s
-    /// HEAD and work tree to `head`. Blocking.
+    /// HEAD and work tree to `head`, if `head`'s tree is within the reader's
+    /// [`WorkTreeLimits`]. Blocking.
     ///
     /// The reader writes into `repo`: the caller sanitizes its `.git` afterwards and reads it
     /// only through readers ([`crate::git::Git::read_through`]).
@@ -578,6 +618,7 @@ impl Reader {
             name: name.to_string(),
             head: head.to_string(),
             limits: limits.into(),
+            tree: self.work_tree,
         };
         let (done, rest) = self.exchange(&work, Some(input), 0, timeout)?;
         let Done::Bundle { head: imported } = done else {
@@ -1074,8 +1115,9 @@ pub fn child_main(job: &str) -> ExitCode {
             name,
             head,
             limits,
+            tree,
         } => answer(
-            match bundle(&repo, &scratch, &name, &head, limits.into()) {
+            match bundle(&repo, &scratch, &name, &head, limits.into(), &tree) {
                 Ok(done) => Answer::Ok(done),
                 Err(e) => Answer::Error(e),
             },
@@ -1136,7 +1178,9 @@ fn plan(work: &Work) -> Plan {
 }
 
 /// The kernel's own bounds for an unpacking: no file larger than its limit, and a bounded heap,
-/// whatever the code in the reader then does. And for every reader, git's too, a bound of the
+/// whatever the code in the reader then does. For a job that runs git, a bounded heap for each
+/// git it starts ([`GIT_MEMORY`]), and for a bundle's, no file larger than its work tree or its
+/// bundle may be. And for every reader, git's too, a bound of the
 /// descriptors it may hold, which is also the bound of what it can leave on its way over a pair
 /// of Unix sockets: `run` has raised its own limit, and a reader that kept it could keep `run`
 /// from passing descriptors to its fronts ([`confine::raise_descriptor_limit`]).
@@ -1162,7 +1206,15 @@ fn limit_resources(work: &Work) {
             limit(Resource::Fsize, 0);
             limit(Resource::Data, READER_MEMORY);
         }
-        Work::Probe { .. } | Work::Bundle { .. } | Work::Git { .. } | Work::PackObjects { .. } => {}
+        Work::Bundle { limits, tree, .. } => {
+            limit(
+                Resource::Fsize,
+                tree.max_bytes.max(limits.max_file_bytes).max(1),
+            );
+            limit(Resource::Data, GIT_MEMORY);
+        }
+        Work::Git { .. } | Work::PackObjects { .. } => limit(Resource::Data, GIT_MEMORY),
+        Work::Probe { .. } => {}
     }
 }
 
@@ -1366,7 +1418,13 @@ fn pack_objects(repo: &Path, head: &str, exclude: &[String], delta_base_offset: 
         eprintln!("tinfirm reader: {e}");
         return ExitCode::from(2);
     }
-    let mut args = vec!["pack-objects", "--revs", "--stdout", "-q"];
+    let mut args = vec![
+        "pack-objects",
+        "--revs",
+        "--stdout",
+        "-q",
+        PACK_WINDOW_MEMORY,
+    ];
     if delta_base_offset {
         args.push("--delta-base-offset");
     }
@@ -1412,6 +1470,7 @@ fn bundle(
     name: &str,
     head: &str,
     limits: Limits,
+    tree: &WorkTreeLimits,
 ) -> Result<Done, String> {
     if !is_object_name(head) || !is_bundle_name(name) {
         return Err("the job names no object or no bundle".into());
@@ -1454,11 +1513,95 @@ fn bundle(
     let commit = format!("{head}^{{commit}}");
     git_ok(repo, scratch, &["cat-file", "-e", &commit])
         .map_err(|_| format!("the sandbox's HEAD {head} is not a commit"))?;
+    check_work_tree(repo, scratch, head, tree)?;
     git_ok(repo, scratch, &["reset", "--hard", "--quiet", head])?;
     let _ = std::fs::remove_file(&path);
     Ok(Done::Bundle {
         head: head.to_string(),
     })
+}
+
+/// `head`'s tree within `tree`, before it is checked out: its entries counted, and the sizes of
+/// their blobs added up, as `git ls-tree -r -l` lists them without reading a blob.
+fn check_work_tree(
+    repo: &Path,
+    home: &Path,
+    head: &str,
+    tree: &WorkTreeLimits,
+) -> Result<(), String> {
+    let mut child = git(repo, home)
+        .args(["ls-tree", "-r", "-l", "-z", "--full-tree", head])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    let stdout = child.stdout.take().expect("piped");
+    let checked = total_work_tree(io::BufReader::new(stdout), tree);
+    if checked.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    checked?;
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        _ => Err("git ls-tree failed on the sandbox's HEAD".into()),
+    }
+}
+
+/// Totals the records of `git ls-tree -r -l -z`: `<mode> <type> <object> <size>\t<path>\0`,
+/// with the size `-` for a submodule's commit.
+fn total_work_tree(mut listing: impl BufRead, tree: &WorkTreeLimits) -> Result<(), String> {
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        let n = (&mut listing)
+            .take(MAX_TREE_RECORD)
+            .read_until(0, &mut record)
+            .map_err(|e| format!("cannot read git ls-tree: {e}"))?;
+        if n == 0 {
+            return Ok(());
+        }
+        if record.last() != Some(&0) {
+            return Err(format!(
+                "the sandbox's HEAD holds a path longer than {MAX_NAME} bytes"
+            ));
+        }
+        let meta = record.split(|b| *b == b'\t').next().unwrap_or_default();
+        let size = match meta.rsplit(|b| *b == b' ').next() {
+            Some(b"-") => 0,
+            Some(size) => std::str::from_utf8(size)
+                .ok()
+                .and_then(|size| size.parse::<u64>().ok())
+                .ok_or("git ls-tree listed an entry without a size")?,
+            None => return Err("git ls-tree listed an entry without a size".into()),
+        };
+        entries += 1;
+        bytes = bytes.saturating_add(size);
+        if entries > tree.max_entries {
+            return Err(format!(
+                "the sandbox's HEAD holds more than {} files",
+                tree.max_entries
+            ));
+        }
+        if bytes > tree.max_bytes {
+            return Err(format!(
+                "the sandbox's HEAD's files are larger than {} together",
+                size_text(tree.max_bytes)
+            ));
+        }
+    }
+}
+
+fn size_text(bytes: u64) -> String {
+    if bytes >= 1 << 30 && bytes.is_multiple_of(1 << 30) {
+        format!("{} GiB", bytes >> 30)
+    } else if bytes >= 1 << 20 && bytes.is_multiple_of(1 << 20) {
+        format!("{} MiB", bytes >> 20)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 /// A bundle's header, before git reads the bundle: version 2 or 3, no capability but the object
@@ -1641,6 +1784,32 @@ mod tests {
                 .pack_objects_command(Path::new("/r"), "HEAD", &[], false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_work_tree_is_totalled_from_its_listing() {
+        let tree = WorkTreeLimits {
+            max_entries: 3,
+            max_bytes: 100,
+        };
+        let oid = "a".repeat(40);
+        let blob = |size: &str, path: &str| format!("100644 blob {oid} {size:>7}\t{path}\0");
+        // A submodule's commit has no size.
+        let submodule = format!("160000 commit {oid}       -\tvendor/lib\0");
+        let total = |listing: String| total_work_tree(listing.as_bytes(), &tree);
+        assert_eq!(total(String::new()), Ok(()));
+        assert_eq!(
+            total(blob("60", "a") + &submodule + &blob("40", "b c\td")),
+            Ok(())
+        );
+        let error = total(blob("60", "a") + &blob("41", "b")).unwrap_err();
+        assert!(error.contains("larger than 100 bytes"), "{error}");
+        let error = total(blob("1", "a").repeat(4)).unwrap_err();
+        assert!(error.contains("more than 3 files"), "{error}");
+        let error = total(blob("1", &"p/".repeat(MAX_NAME))).unwrap_err();
+        assert!(error.contains("longer than"), "{error}");
+        assert!(total(blob("x", "a")).is_err());
+        assert!(total(format!("100644 blob {oid} 1\tunended")).is_err());
     }
 
     #[test]

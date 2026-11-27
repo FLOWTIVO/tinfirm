@@ -676,7 +676,9 @@ holds its bridge.
   - After the agent, the host runs its git steps in the sandbox: the WIP commit, then a bundle of
     `HEAD`. A [reader](#the-reader-and-the-front) fetches the bundle into the host's own clone, which the agent
     never reached, with every object checked, and the host pushes from there with the usual checks.
-    The host never runs git in a `.git` that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
+    The host never runs git in a `.git` that the agent wrote. A bundle has 8 GiB at most, and the
+    tree of its `HEAD` 1,000,000 files and 16 GiB together, which the reader totals with
+    `git ls-tree` before it checks the tree out. Every host-side git command runs with
     `core.packedGitWindowSize` set to 1 TiB, so git maps a whole pack at once: the fetch from a
     bundle of git 2.43 to 2.48 closes a file descriptor twice, and with git's default window of
     1 GiB the fetch of a bundle over 1 GiB could fail with `packfile … cannot be mapped: Bad file
@@ -953,8 +955,10 @@ The reader:
     user reads its memory;
   - it runs in a process group of its own, which `run` kills when the reading is over or its time
     is up, with everything the reader started. An unpacking may write no file larger than its
-    limit and use at most 1 GiB of memory. Every reader, with the git it runs, may hold at most
-    1024 descriptors.
+    limit and use at most 1 GiB of memory. Each git that a reader runs may use at most 4 GiB of
+    memory (`RLIMIT_DATA`; the packs git maps read only do not count, and the pack for a push
+    bounds its delta window to 256 MiB a thread), and a bundle's import writes no file over
+    16 GiB. Every reader, with the git it runs, may hold at most 1024 descriptors.
 - **What `run` takes back from it.** One line of JSON of a fixed form, at most 1 MiB (and, for the
   platform tools' file, that file's bytes). `run` treats the answer as hostile too: every field is
   bounded and checked, and once the reader is gone, `run` walks what it wrote, without following

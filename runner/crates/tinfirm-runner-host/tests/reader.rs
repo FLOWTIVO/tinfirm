@@ -17,7 +17,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tinfirm_bridge::files::{Limits, MAX_LEFT_OUT, ReadOne};
-use tinfirm_runner_host::reader::{Reader, verify_tree};
+use tinfirm_runner_host::reader::{Reader, WorkTreeLimits, verify_tree};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tinfirm-runner-host");
 const WAIT: Duration = Duration::from_secs(60);
@@ -505,10 +505,14 @@ impl Repos {
     }
 
     fn import(&self, input: Vec<u8>, head: &str) -> anyhow::Result<()> {
+        self.import_by(reader(), input, head)
+    }
+
+    fn import_by(&self, reader: Reader, input: Vec<u8>, head: &str) -> anyhow::Result<()> {
         let scratch = self.root.join("runs/run-1/bundle-0");
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
-        reader().import_bundle(
+        reader.import_bundle(
             &mut input.as_slice(),
             &self.host,
             &scratch,
@@ -615,6 +619,52 @@ fn hostile_bundles_are_refused_and_the_clone_keeps_its_head() {
     // Then a good one still goes in.
     repos.import(repos.bundle(&["HEAD"]), &repos.head).unwrap();
     assert_eq!(repos.host_head(), repos.head);
+}
+
+#[test]
+fn a_head_whose_work_tree_is_too_large_is_refused_before_its_checkout() {
+    let repos = Repos::new();
+    // One blob of 64 KiB under 64 paths: a bundle of 64 KiB, a work tree of 4 MiB.
+    let blob: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 7 % 251) as u8).collect();
+    std::fs::create_dir_all(repos.sandbox.join("copies")).unwrap();
+    for i in 0..64 {
+        std::fs::write(repos.sandbox.join(format!("copies/{i}.bin")), &blob).unwrap();
+    }
+    git(&repos.sandbox, &["add", "-A"]);
+    git(&repos.sandbox, &["commit", "-q", "-m", "copies"]);
+    let head = git(&repos.sandbox, &["rev-parse", "HEAD"]);
+    let bounded = |max_entries, max_bytes| {
+        reader().bounding_work_trees(WorkTreeLimits {
+            max_entries,
+            max_bytes,
+        })
+    };
+    for (reader, expected) in [
+        (bounded(1000, 4 << 20), "larger than 4 MiB"),
+        (bounded(65, 1 << 30), "more than 65 files"),
+    ] {
+        let error = repos
+            .import_by(reader, repos.bundle(&["HEAD"]), &head)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{expected}: {error:#}"
+        );
+        assert_eq!(repos.host_head(), repos.base);
+        assert!(
+            !repos.host.join("copies").exists(),
+            "the work tree was checked out"
+        );
+    }
+    // Within both bounds it goes in.
+    repos
+        .import_by(bounded(66, 5 << 20), repos.bundle(&["HEAD"]), &head)
+        .unwrap();
+    assert_eq!(repos.host_head(), head);
+    assert_eq!(
+        std::fs::read(repos.host.join("copies/63.bin")).unwrap(),
+        blob
+    );
 }
 
 // ----- readers that lie or die ---------------------------------------------------------------
@@ -871,6 +921,44 @@ fn a_reader_and_its_git_may_hold_no_more_descriptors_than_a_confined_process() {
         format!("{limit} {limit}\n"),
         "this process may hold {own}"
     );
+}
+
+#[test]
+fn a_readers_git_and_its_pack_have_a_bounded_heap() {
+    // In git's place, a script that says its limits of data, soft and hard, in KiB, and the
+    // arguments of a pack.
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    let script = fake.join("git");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ncat >/dev/null\necho \"$(ulimit -Sd) $(ulimit -Hd)\"\nfor a; do case $a in --window-memory=*) echo \"$a\";; esac; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let repo = tempfile::tempdir().unwrap();
+    let mut git = reader().git_command(repo.path(), &["rev-parse", "HEAD"]);
+    git.env("PATH", &path);
+    let head = "a".repeat(40);
+    let mut pack = reader()
+        .pack_objects_command(repo.path(), &head, &[], true)
+        .unwrap();
+    pack.env("PATH", &path);
+    // 4 GiB.
+    for (command, expected) in [
+        (git, "4194304 4194304\n"),
+        (pack, "4194304 4194304\n--window-memory=256m\n"),
+    ] {
+        let (out, ok, stderr) = run_pack(command);
+        assert!(ok, "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&out), expected);
+    }
 }
 
 // ----- the confinement ------------------------------------------------------------------------
