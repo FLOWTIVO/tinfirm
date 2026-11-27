@@ -3723,10 +3723,7 @@ async fn collect_from_sandbox(
     let mut collection = Collection::default();
     let tag = format!("{}.{}", assign.run_id, assign.epoch);
     if !repos.is_empty() {
-        let temp = home_dir
-            .parent()
-            .map(|p| p.join(format!("{}bundles-{tag}", crate::homes::DELETE_PREFIX)))
-            .unwrap_or_else(|| PathBuf::from(format!("{}.bundles", assign.run_id)));
+        let temp = crate::homes::scratch_dir(home_dir, "bundles", &tag);
         let message = format!("WIP: uncommitted changes from run {}", assign.run_id);
         for (index, repo) in repos.iter_mut().enumerate() {
             // Commits this clone has, which the bundle leaves out.

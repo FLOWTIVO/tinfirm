@@ -2178,7 +2178,10 @@ deletion and gc (mirror key, repository URL without credentials, freed bytes).
 - **Session homes** that no run used for longer than `TINFIRM_RUNNER_HOME_MAX_IDLE_DAYS`
   (default 30) are deleted the same way, never the home of an active run. A later
   follow-up run of that conversation gets a new, empty home: `session/load` fails there, so the
-  host starts a new session with the full prompt.
+  host starts a new session with the full prompt. What a run works on beside its home
+  (`homes/<agentId>/.tmp-scratch-<workItemId>-…`: the work a collection brings back from the
+  sandbox, a session bundle it restores) is removed by the pass only once no run holds that
+  home, as what a crash left.
 - **Skills** in the cache (`skills/<sha256>/<name>`) that no run used for longer than
   `TINFIRM_RUNNER_SKILL_CACHE_MAX_IDLE_DAYS` (default 14) are deleted the same way, never one
   that an active run mounts. A later run with that skill downloads it again.

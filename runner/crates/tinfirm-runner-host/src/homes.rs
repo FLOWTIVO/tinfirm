@@ -11,6 +11,9 @@
 //!   a new session with the full prompt (§15.4 step 4).
 //! - A home is renamed to `.tmp-delete-…` in its agent's directory first and removed
 //!   afterwards; the startup cleanup removes what a crash left behind.
+//! - A run that holds its home works beside it in `.tmp-scratch-<workItemId>-…` directories
+//!   ([`scratch_dir`]): what a collection from its sandbox brings back, a session bundle it
+//!   restores. The same cleanup removes one only once no run holds its home.
 //! - `homes/<agentId>/<workItemId>.skills`, also outside the mount, lists the mount points of
 //!   skills that the host created in the home for its last run ([`crate::skills`]); it goes
 //!   with the home.
@@ -35,6 +38,8 @@ const SKILLS_SUFFIX: &str = ".skills";
 const BUNDLE_SUFFIX: &str = ".bundle";
 /// Prefix of a home that is being deleted.
 pub(crate) const DELETE_PREFIX: &str = ".tmp-delete-";
+/// Prefix of a directory that a run which holds a home works in beside it ([`scratch_dir`]).
+const SCRATCH_PREFIX: &str = ".tmp-scratch-";
 
 type Active = Arc<Mutex<HashMap<PathBuf, usize>>>;
 
@@ -118,6 +123,15 @@ pub fn skills_record_path(home: &Path) -> PathBuf {
 /// session folders last were (ADR-0097, [`crate::session_bundles`]), outside the mount.
 pub fn bundle_record_path(home: &Path) -> PathBuf {
     beside(home, BUNDLE_SUFFIX)
+}
+
+/// `homes/<agentId>/.tmp-scratch-<workItemId>-<what>-<tag>`: a directory that a run which holds
+/// `home` works in beside it, such as what a collection from its sandbox brings back
+/// ([`crate::sandbox_files`]) or a session bundle it restores. The sweep removes it only once
+/// no run holds `home` ([`SessionHomes::remove_stale_temp_dirs`]).
+pub fn scratch_dir(home: &Path, what: &str, tag: &str) -> PathBuf {
+    let name = home.file_name().unwrap_or_default().to_string_lossy();
+    home.with_file_name(format!("{SCRATCH_PREFIX}{name}-{what}-{tag}"))
 }
 
 fn beside(home: &Path, suffix: &str) -> PathBuf {
@@ -213,25 +227,48 @@ impl SessionHomes {
         homes
     }
 
-    /// Startup and every pass: removes homes whose deletion did not finish.
+    /// Startup and every pass: removes homes whose deletion did not finish, and the directories
+    /// that a run worked in beside its home ([`scratch_dir`]) once no run holds that home: one
+    /// whose run is under way, a collection's, stays.
     pub fn remove_stale_temp_dirs(&self) {
         let Ok(agents) = std::fs::read_dir(&self.dir) else {
             return;
         };
         for agent in agents.filter_map(|e| e.ok()) {
-            let Ok(entries) = std::fs::read_dir(agent.path()) else {
+            let agent_dir = agent.path();
+            let Ok(entries) = std::fs::read_dir(&agent_dir) else {
                 continue;
             };
             for entry in entries.filter_map(|e| e.ok()) {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(DELETE_PREFIX)
-                {
-                    let path = entry.path();
-                    if let Err(e) = std::fs::remove_dir_all(&path) {
-                        tracing::warn!(path = %path.display(), error = %e, "cannot remove a deleted session home");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let path = entry.path();
+                let deleted = if name.starts_with(DELETE_PREFIX) {
+                    path
+                } else if let Some(rest) = name.strip_prefix(SCRATCH_PREFIX) {
+                    // Checked and renamed under the lease registry's lock: a run that leases
+                    // the home after this collects into a directory of its own.
+                    let active = lock(&self.active);
+                    let in_use = active.keys().any(|home| {
+                        home.parent() == Some(agent_dir.as_path())
+                            && home.file_name().is_some_and(|home| {
+                                rest.starts_with(&format!("{}-", home.to_string_lossy()))
+                            })
+                    });
+                    if in_use {
+                        continue;
                     }
+                    let target =
+                        path.with_file_name(format!("{DELETE_PREFIX}{}", Uuid::new_v4().simple()));
+                    if let Err(e) = std::fs::rename(&path, &target) {
+                        tracing::warn!(path = %path.display(), error = %e, "cannot remove what a run left beside its session home");
+                        continue;
+                    }
+                    target
+                } else {
+                    continue;
+                };
+                if let Err(e) = std::fs::remove_dir_all(&deleted) {
+                    tracing::warn!(path = %deleted.display(), error = %e, "cannot remove a deleted session home");
                 }
             }
         }
@@ -374,6 +411,51 @@ mod tests {
             skills_record_path(&homes.path(agent, task)),
             PathBuf::from(format!("/d/homes/{agent}/{task}.skills"))
         );
+    }
+
+    /// What a collection unpacks into, next to the home it collects, stays while a run holds
+    /// that home: a sweep at startup or in a pass removes only what a crash left of one.
+    #[test]
+    fn a_sweep_leaves_the_directories_of_a_collection_under_way() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes = SessionHomes::new(tmp.path());
+        let (agent, task, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let lease = homes.lease(agent, task);
+        let tag = format!("{}.1", Uuid::new_v4());
+        let under_way: Vec<PathBuf> = ["in", "out", "bundles"]
+            .iter()
+            .map(|what| scratch_dir(lease.path(), what, &tag))
+            .collect();
+        // A crash's: of a home that no run holds, and a deleted home's.
+        let left = [
+            scratch_dir(&homes.path(agent, other), "in", &tag),
+            homes
+                .path(agent, other)
+                .with_file_name(format!("{DELETE_PREFIX}{other}-0123")),
+        ];
+        for dir in under_way.iter().chain(&left) {
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+        }
+        homes.remove_stale_temp_dirs();
+        homes.prune(TimeDelta::days(30), Utc::now(), false);
+        for dir in &under_way {
+            assert!(dir.join("sub").exists(), "{} is gone", dir.display());
+        }
+        for dir in &left {
+            assert!(!dir.exists(), "{} is still there", dir.display());
+        }
+        // Once the run lets the home go, what is left of its collection is a leftover too.
+        drop(lease);
+        homes.remove_stale_temp_dirs();
+        for dir in &under_way {
+            assert!(!dir.exists(), "{} is still there", dir.display());
+        }
+        // Nothing else is in the agent's directory but the home's stamp.
+        let names: Vec<String> = std::fs::read_dir(tmp.path().join(agent.to_string()))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![format!("{task}.last-used")]);
     }
 
     #[test]
