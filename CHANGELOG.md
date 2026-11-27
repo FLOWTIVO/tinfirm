@@ -6,7 +6,7 @@ Releases are cut by hand with `.github/workflows/release.yml`, which dates a ver
 
 Between releases, `main` is a development channel: images tagged `sha-<commit>` and `main`, charts `0.0.0-sha-<commit>` and the `rolling` prerelease ([README](README.md#status)).
 
-## [1.0.0-rc.2] - unreleased
+## [1.0.0-rc.2] - 2026-11-27
 
 The second release candidate of 1.0.0. It contains everything listed under 1.0.0 below, plus the fixes since 1.0.0-rc.1. Install 1.0.0, not this candidate.
 
