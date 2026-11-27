@@ -28,6 +28,8 @@
 //                      the problems and maxVms 0, and a create fails
 //   FAKE_VM_CREATE_FAILS  when set, every create fails with this message, and verify stays
 //                      clean: a failure of the VM alone, such as its user data
+//   FAKE_VM_CREATE_LATE  when set, every create makes its "VM" and then fails with this
+//                      message, as a create that the host gave up on while the driver went on
 //   FAKE_VM_HARDENED   a file: while it is there, `verify` adds its content, a JSON object such
 //                      as {"hardened": "no", "notHardened": ["node n1: io-uring: ..."]}, to
 //                      its answer, as the node driver reports its nodes' hardening; without
@@ -196,6 +198,14 @@ const methods = {
     const published = env.FAKE_VM_PUBLISH ? 20000 + random(40000) : null;
     const port = published && String(published) !== listen ? published : published && published + 1;
     const vm = { id, name, labels: { ...labels, "tinfirm-sandbox": "1" }, state: "starting", address, child: null };
+    if (env.FAKE_VM_CREATE_LATE) {
+      // The "VM" is there, with its labels, and the create still fails: no bridge runs in it.
+      vm.state = "running";
+      vms.set(id, vm);
+      save();
+      log("made", { id });
+      throw new Error(env.FAKE_VM_CREATE_LATE);
+    }
     if (port) {
       vm.port = port;
       log("published", { id, port });

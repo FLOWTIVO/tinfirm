@@ -78,6 +78,16 @@ const DELETE_RETRY_MAX: Duration = Duration::from_secs(300);
 /// waits). It goes on trying after them, once per [`DELETE_RETRY_MAX`], and says so once: a
 /// node that comes back after hours gets its slot back without a restart of this host.
 const DELETE_RETRIES: u32 = 12;
+/// After a create that failed or timed out on this host's side, when the host looks for the VM
+/// that the driver may have made all the same ([`VmOptions::failed_create_looks`]): each time
+/// from the failure. Past the driver's own time for a create (the node and pod drivers answer
+/// within 150 s), and before the next connection's cleanup of leftovers, which may be hours
+/// away.
+const FAILED_CREATE_LOOKS: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
 /// How long a run whose VM's bridge was lost waits for the driver's `describe` of the VM.
 const LOST_WAIT: Duration = Duration::from_secs(25);
 /// The longest line the driver may answer with.
@@ -238,6 +248,9 @@ pub struct VmOptions {
     /// After a delete that failed: the first wait before the host tries it again on its own
     /// ([`DELETE_RETRY`]). No flag sets it.
     pub delete_retry: Duration,
+    /// After a create that failed: when the host looks for the VM it may have made all the
+    /// same, and deletes it ([`FAILED_CREATE_LOOKS`]). No flag sets it.
+    pub failed_create_looks: Vec<Duration>,
     /// Test-only: the driver's "VMs" are processes on this machine, so the sandbox shares this
     /// machine's network and file system as the local test executor's does.
     #[doc(hidden)]
@@ -258,6 +271,7 @@ impl VmOptions {
             check_wait: CHECK_WAIT,
             hardening_every: HARDENING_EVERY,
             delete_retry: DELETE_RETRY,
+            failed_create_looks: FAILED_CREATE_LOOKS.to_vec(),
             on_this_machine: false,
         }
     }
@@ -1798,9 +1812,14 @@ impl Vms {
         {
             Ok(id) => id,
             Err(e) => {
-                // A create that failed may still have left a VM: the cleanup takes it.
+                // A create that failed may still have left a VM, more so one that timed out
+                // here while the driver went on: the host looks for it by its label and
+                // deletes it, and the cleanup at the next connection takes what is left.
                 if let Some(label) = &label {
                     lock(&self.live).remove(label);
+                    if let Some(host) = labels.get(HOST_LABEL) {
+                        self.look_for_failed_create(host, label);
+                    }
                 }
                 // Before the run fails, for at most `check_wait`: the next run then finds the
                 // host's state. A slower check records its answer when it comes.
@@ -1823,6 +1842,53 @@ impl Vms {
             reach: None,
             deleted: false,
         })
+    }
+
+    /// After a create of the VM labelled `label` failed: looks for that VM at each of
+    /// `failed_create_looks` from now, and deletes it once found ([`Vms::delete_labelled`],
+    /// which tries a failed delete again later). Stops at the first look that finds it, at the
+    /// last look, and when this host holds the label again (it never does: each create has a
+    /// label of its own). A look whose list fails waits for the next.
+    fn look_for_failed_create(self: &Arc<Vms>, host: &str, label: &str) {
+        let (vms, host, label) = (Arc::downgrade(self), host.to_string(), label.to_string());
+        let looks = self.options.failed_create_looks.clone();
+        let started = tokio::time::Instant::now();
+        tokio::spawn(async move {
+            let labels = BTreeMap::from([
+                (HOST_LABEL.to_string(), host.clone()),
+                (VM_LABEL.to_string(), label.clone()),
+            ]);
+            for after in looks {
+                tokio::time::sleep_until(started + after).await;
+                let Some(vms) = vms.upgrade() else { return };
+                if lock(&vms.live).contains(&label) {
+                    return;
+                }
+                let found = match vms.driver.list(&labels).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        tracing::debug!(label = %label, error = %format!("{e:#}"), "cannot look for the VM of a create that failed");
+                        continue;
+                    }
+                };
+                let found: Vec<Vm> = found
+                    .into_iter()
+                    .filter(|vm| {
+                        vm.state != VmState::Gone
+                            && vm.labels.get(VM_LABEL) == Some(&label)
+                            && vm.labels.get(HOST_LABEL) == Some(&host)
+                    })
+                    .collect();
+                if found.is_empty() {
+                    continue;
+                }
+                for vm in found {
+                    tracing::warn!(vm = %vm.id, label = %label, "the driver made a sandbox VM for a create that failed here: deleting it");
+                    vms.delete_labelled(&vm.id, &host, None).await;
+                }
+                return;
+            }
+        });
     }
 
     /// A VM of the process this host restarted from, whose run it takes back (ADR-0101): held
