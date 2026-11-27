@@ -1059,6 +1059,10 @@ Both:
     credentials among them; where seccomp is missing too, it also reaches the network, starts
     programs and can end `run` and its runs with a signal.
 
+  On macOS the front, unconfined, passes the sandbox's descriptors as on Linux, and its probe
+  tries only what macOS has: no pidfd, `prlimit`, netlink or packet socket, and no abstract
+  socket name.
+
   On a host whose probes were confined, a reader or a front that cannot confine itself later
   (the kernel refuses it Landlock or the filter then) does not work unconfined: the reader
   refuses its job, and the front serves nothing and ends with the reason, which fails its

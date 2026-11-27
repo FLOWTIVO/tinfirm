@@ -114,8 +114,11 @@ const MAX_LINE: u64 = 1024 * 1024;
 /// TCP keepalive on a node's TLS connection: the first probe after this long without traffic,
 /// then one every [`KEEPALIVE_INTERVAL`], and the connection is lost after
 /// [`KEEPALIVE_PROBES`] of them without an answer (25 s in all).
+#[cfg(target_os = "linux")]
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 const KEEPALIVE_PROBES: u32 = 3;
 /// The node agent's error code of a node that runs as many VMs as it may (`code::FULL` of the
 /// agent's wire).
