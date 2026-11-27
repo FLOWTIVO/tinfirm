@@ -720,7 +720,9 @@ holds its bridge.
   directory (`runs/<run id>.json`, 0600): the assignment, the sandbox, the bridge's session key, the
   repositories as cloned and the agent's session, and the sandbox's bridge (`bridge`: its TLS
   identity, and on Docker its port and its peer's address; a VM's dial target is the record's
-  sandbox). A `run` that starts after a crash, a `kill -9` or an upgrade finds the records and
+  sandbox). Each is written whole, through a temporary copy that is renamed into place; a host
+  killed in that write leaves the copy, and the next `run` removes it at its start. A `run` that
+  starts after a crash, a `kill -9` or an upgrade finds the records and
   takes each run back before it connects: the run is in its `hello`, so Tinfirm keeps it; a new
   front starts for each sandbox with the same identity, listening on the same port (a VM's dials
   it), and the sandbox's bridge comes back to it with the session's key. A record without `bridge`
