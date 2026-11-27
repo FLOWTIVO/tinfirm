@@ -961,12 +961,14 @@ impl Shared {
         }
     }
 
-    /// On an orderly end of the process, once its connection has ended: a run's end that was
-    /// written on a connection counts as delivered, as the outbox counts it, so its kept report
-    /// goes. A report never written to a connection stays for the next start.
-    pub fn forget_written_reports(&self) {
+    /// On an orderly end of the process, once its connection has ended: a run's end that the
+    /// outbox forgot, or that was written on a connection the server then closed in order
+    /// ([`crate::outbox::Outbox::closed_in_order`]), is delivered, so its kept report goes. Any
+    /// other stays for the next start, a report written on a connection that broke included:
+    /// the server, or a proxy before it, may have gone down with it unread.
+    pub fn forget_delivered_reports_at_the_end(&self) {
         self.forget_delivered_reports();
-        for (run_id, epoch) in self.outbox.finished_written() {
+        for (run_id, epoch) in self.outbox.take_delivered_at_the_close() {
             self.records.remove_report(run_id, epoch);
         }
     }
@@ -3073,11 +3075,11 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
             }
         },
     };
-    // An orderly end: the ends written on the connection count as delivered, as the outbox
-    // counts them, and their kept reports go; one never written stays for the next start. The
-    // ticker that forgets delivered reports has stopped already.
+    // An orderly end: the ends that the server is known to have read, by the outbox's retention
+    // or by its answer to the last connection's close, have their kept reports go; any other
+    // stays for the next start. The ticker that forgets delivered reports has stopped already.
     if ended.is_ok() {
-        host.forget_written_reports();
+        host.forget_delivered_reports_at_the_end();
     }
     ended
 }

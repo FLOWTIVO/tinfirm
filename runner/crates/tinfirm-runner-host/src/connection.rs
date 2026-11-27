@@ -83,6 +83,9 @@ const SEND_BUFFER_BYTES: u32 = 256 * 1024;
 /// A frame, flush or close that takes longer than this ends the connection: the link is
 /// dead or too slow to keep the leases (the host reconnects).
 const WRITE_TIMEOUT: Duration = SILENCE_LIMIT;
+/// How long the host waits for the server's answer to its close at the end of a drain or a
+/// shutdown.
+const CLOSE_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest wait between two connection attempts while the host holds runs. The server
 /// keeps a host's runs for a grace period after a disconnect (2 minutes by default,
 /// docs/archive/v1/CONVENTIONS.md §15.1); they should be back well within it.
@@ -114,10 +117,11 @@ pub async fn run(host: Host, drain: CancellationToken) -> Result<()> {
     let url = host.config.websocket_url()?;
     let mut backoff = host.opts.reconnect_min_backoff;
     loop {
-        // After a shutdown, what was written before the connection broke counts as sent.
-        // A draining host connects once more while it holds recent runs: their last frames
-        // may have been lost with the connection, and the next one sends them again before
-        // it closes with 1000.
+        // After a shutdown, what was written before the connection broke counts as sent: it is
+        // not written again, and the kept report of a run's end stays for the next start
+        // (crate::host::Shared::forget_delivered_reports_at_the_end). A draining host connects
+        // once more while it holds recent runs: their last frames may have been lost with the
+        // connection, and the next one sends them again before it closes with 1000.
         if drain.is_cancelled()
             && host.outbox.all_finished_sent()
             && host.outbox.is_drained()
@@ -423,6 +427,27 @@ where
     Ok(!host.outbox.is_drained())
 }
 
+/// Whether the server answers the host's close with its own within [`CLOSE_ANSWER_TIMEOUT`].
+/// What it sends before the answer is not looked at: the host is going.
+async fn closed_by_the_server<S>(socket: &mut WebSocketStream<S>) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let answer = async {
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(WsMessage::Close(_)) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    };
+    tokio::time::timeout(CLOSE_ANSWER_TIMEOUT, answer)
+        .await
+        .unwrap_or(false)
+}
+
 async fn session(host: &Host, url: &str, drain: &CancellationToken) -> Result<Ended> {
     let socket = connect(host, url).await?;
     converse(host, socket, drain).await
@@ -559,6 +584,11 @@ where
                 reason: reason.into(),
             }));
             let _ = tokio::time::timeout(WRITE_TIMEOUT, close).await;
+            // The server answers the close only once it has read every frame before it: then,
+            // and only then, the ends written on this connection are known to be delivered.
+            if closed_by_the_server(&mut socket).await {
+                host.outbox.closed_in_order();
+            }
             return Ok(Ended::Drained);
         }
         tokio::select! {

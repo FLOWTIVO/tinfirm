@@ -3152,6 +3152,34 @@ async fn a_host_stopped_while_cut_off_keeps_its_report_and_its_next_start_sends_
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_stopped_as_the_server_goes_down_after_the_end_keeps_its_report() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        run_to_its_end(&mut conn, &spec, frame).await;
+        // The end was written, and the server goes down with the connection, as in a restart
+        // of the server or of a proxy: what it had not handled is lost with it. SIGTERM comes
+        // before a welcome could follow.
+        server.set_refusing(true);
+        conn.kill();
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+        let report = kept_report(dir.path(), spec.run_id, 1);
+        assert!(report.exists(), "{:?}", kept_reports(dir.path()));
+        server.set_refusing(false);
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+        assert!(t.events().is_empty(), "{}", t.text());
+    })
+    .await;
+}
+
 /// A host in this process whose runs' ends wait at `step` until the test removes
 /// `<dir>/halted`.
 async fn host_pausing_at(

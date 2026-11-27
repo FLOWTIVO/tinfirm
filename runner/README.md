@@ -773,9 +773,12 @@ holds its bridge.
     keeps it (`runs/<run id>.<epoch>.finished.json`, 0600: the frame as sent, no credential) in the
     record's place, and removes it once it was written on a connection that then stayed up for
     `TINFIRM_RUNNER_FINISHED_RETENTION` (3 minutes), or, on an orderly stop (SIGTERM, a drain),
-    once it was written at all; Tinfirm assigning the run again removes it too. A `run` that
-    starts after a crash, or after a stop while it was cut off from Tinfirm, finds the reports it
-    never wrote or wrote shortly before and sends them again; Tinfirm ignores a report of a run it
+    once it was written on the last connection and Tinfirm answered that connection's close
+    (which it does only once it has read every frame before it); Tinfirm assigning the run
+    again removes it too. A report written on a connection that broke before that, as when a
+    stop races a restart of Tinfirm or of a proxy before it, stays. A `run` that starts after a
+    crash, or after a stop while it was cut off from Tinfirm, finds the reports it never wrote
+    or wrote shortly before and sends them again; Tinfirm ignores a report of a run it
     ended already. A record of a newer execution of the same run is taken back, and the older
     report goes unsent. The protocol has no acknowledgement of the report, so one that Tinfirm
     drops after it was written is still lost.
