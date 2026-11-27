@@ -189,7 +189,8 @@ The main ones:
   or, without it, the system's local port range (`net.ipv4.ip_local_port_range`). During the
   first start after an upgrade from a version with one shared bridge port, that port (kept in
   `runs/bridge.json` under the data directory) is opened once more, only while the runs of the
-  version before are taken back: keep it admitted until then. Without the bridge
+  version before are taken back, and closes when the last of them has ended: keep it admitted
+  until then. Without the bridge
   (`tinfirm_runner_host_sandbox_bridge: false`) the sandboxes reach the git proxy and the model
   proxies on the gateway of Docker's bridge, on ports the system picks: allow traffic from
   `docker0` to that address on every port (runner/README.md, "Git in the sandbox", "Model

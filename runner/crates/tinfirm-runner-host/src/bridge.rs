@@ -121,7 +121,8 @@ fn rand_below(n: u32) -> u32 {
 
 /// The host's shared bridge listener, which serves only the runs taken back from records of the
 /// version before each sandbox's bridge was its front's (`runs/bridge.json`): their bridges pin
-/// its identity and dial its port, or, a VM's, are dialed by it.
+/// its identity and dial its port, or, a VM's, are dialed by it. It closes once the last of
+/// those runs has ended ([`crate::host::Shared::take_back_runs`]).
 #[derive(Clone)]
 pub struct BridgeListener {
     pub server: BridgeServer,

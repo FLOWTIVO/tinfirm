@@ -1985,6 +1985,7 @@ async fn a_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener
 
         // Host B, of this version, takes the run back through its shared listener.
         let host = start_host_at(dir.path(), &server.url, HostSetup::bridged()).await;
+        let shared = shared_listener_addr(&host.host).await;
         let mut conn = server.accept().await;
         conn.handshake(1).await;
         let t = conn.until_finished(spec.run_id).await;
@@ -2004,12 +2005,8 @@ async fn a_run_of_a_host_before_fronts_is_taken_back_through_the_shared_listener
             Some("work in progress\n")
         );
         assert!(!record.exists());
-        let listener = host
-            .host
-            .started_bridge()
-            .await
-            .expect("the shared listener");
-        assert_eq!(listener.server.run_count(), 0);
+        // Its last run has ended: the shared listener closes.
+        until_the_shared_listener_closes(&host.host, shared).await;
         host.shutdown.cancel();
         host.handle.await.unwrap().unwrap();
     })

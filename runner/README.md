@@ -716,7 +716,8 @@ holds its bridge.
     a port per sandbox, from `--sandbox-bridge-ports`, or without it from the system's range for
     local ports (`net.ipv4.ip_local_port_range`). It admits no port of a proxy: the host binds
     none. The first start after an upgrade from a version before the fronts also opens the shared
-    port that `runs/bridge.json` keeps, only while that version's runs are taken back (below). With
+    port that `runs/bridge.json` keeps, only while that version's runs are taken back (below): it
+    closes when the last of them has ended. With
     a [VM per run](#a-vm-per-run) the control host dials each VM and listens on nothing for it.
 - **A restart of this host loses no work** ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
   threat model R36). From the start of a run's sandbox until the run's report is made, this host
@@ -730,7 +731,8 @@ holds its bridge.
   it), and the sandbox's bridge comes back to it with the session's key. A record without `bridge`
   (one of the version before the fronts) is taken back through one shared listener in `run`,
   whose identity and port `runs/bridge.json` keeps; that is the only use of the shared listener and
-  of that file. The agent that the earlier process started stops, its work comes back and is pushed, its
+  of that file. The listener stops accepting once the last of those runs has ended (or at once,
+  when none of them can be taken back), and a bridge that dials it later is refused. The agent that the earlier process started stops, its work comes back and is pushed, its
   session is saved, and the run ends failed with `INFRA`, saying what was saved; the next message
   goes on from there. A sandbox that does not come back within 2 minutes is removed, and its work
   is lost. Shown on a control host with a VM per run (2026-11-22; the outputs are not in this
