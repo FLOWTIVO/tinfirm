@@ -661,7 +661,9 @@ holds its bridge.
   service and the port. `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` set where the bridge listeners
   go.
   - Each connection has a window of 128 KiB per direction, so one that stalls holds back no other;
-    at most 128 are open per run.
+    at most 128 are open per run. What waits for a connection is its window's bytes, never a cost per
+    frame: an empty frame adds nothing, a second end of stream is ignored, and bytes after it reset the
+    connection.
   - A container of the agent's own Docker reaches the tunnels only on Docker's `host` network,
     because they listen on the sandbox's loopback.
 - **No mounts: the files travel over the bridge.** The container gets none of this host's

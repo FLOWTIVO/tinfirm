@@ -9,7 +9,11 @@
 //!   receiver's `CREDIT`, which the receiver sends as it writes the bytes on, so one slow
 //!   reader holds back its own stream, never the link. A receiver resets a stream whose peer
 //!   sends past the window.
-//! - `EOF` ends one direction (a half close); `reset` ends both at once.
+//! - What a receiver holds for a stream is the bytes in its window, and nothing per frame:
+//!   the bytes of the frames that wait for its writer are joined into one buffer, an empty
+//!   `DATA` frame adds nothing, and the stream's `EOF` waits once.
+//! - `EOF` ends one direction (a half close); `reset` ends both at once. A second `EOF` is
+//!   ignored, and a receiver resets a stream whose peer sends bytes after its `EOF`.
 //! - At most [`MAX_STREAMS`] streams are open at once, and a run has at most [`MAX_TUNNELS`]
 //!   tunnels.
 //! - The same streams carry the host's files ([`crate::files`]): those the host numbers, from
@@ -23,7 +27,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{Control, Tunnel};
@@ -43,13 +47,81 @@ pub const HOST_STREAMS: u32 = 0x8000_0000;
 /// The most bytes read from a connection into one frame.
 const CHUNK: usize = 32 * 1024;
 
+/// What waits for a stream's writer. It never holds more than the stream's window: the
+/// frames' bytes are joined, so a peer's many small frames cost no more than one.
+#[derive(Default)]
+struct Inbox {
+    state: Mutex<InboxState>,
+    /// One writer waits on it: a notification given while it writes is kept for it.
+    ready: Notify,
+}
+
+#[derive(Default)]
+struct InboxState {
+    bytes: Vec<u8>,
+    /// The peer's `EOF`, written on after `bytes`.
+    eof: bool,
+    /// The stream is gone from the table: reset, or closed.
+    gone: bool,
+}
+
 enum Incoming {
     Data(Vec<u8>),
     Eof,
+    Gone,
+}
+
+impl Inbox {
+    fn push(&self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut state = lock(&self.state);
+        if state.bytes.is_empty() {
+            state.bytes = bytes;
+        } else {
+            state.bytes.extend_from_slice(&bytes);
+        }
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    fn end(&self) {
+        lock(&self.state).eof = true;
+        self.ready.notify_one();
+    }
+
+    /// The bytes that wait, all at once, then the `EOF`.
+    async fn next(&self) -> Incoming {
+        loop {
+            {
+                let mut state = lock(&self.state);
+                if !state.bytes.is_empty() {
+                    return Incoming::Data(std::mem::take(&mut state.bytes));
+                }
+                if state.eof {
+                    return Incoming::Eof;
+                }
+                if state.gone {
+                    return Incoming::Gone;
+                }
+            }
+            self.ready.notified().await;
+        }
+    }
+
+    /// The items that wait for the writer.
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        let state = lock(&self.state);
+        usize::from(!state.bytes.is_empty()) + usize::from(state.eof)
+    }
 }
 
 struct Entry {
-    incoming: mpsc::UnboundedSender<Incoming>,
+    incoming: Arc<Inbox>,
+    /// The peer's `EOF` came: no bytes may follow it.
+    ended: bool,
     /// What the peer may still send before our next credit.
     budget: u32,
     /// Bytes written on since our last credit.
@@ -57,6 +129,13 @@ struct Entry {
     /// What we may still send before the peer's next credit.
     window: Arc<Semaphore>,
     cancel: CancellationToken,
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        lock(&self.incoming.state).gone = true;
+        self.incoming.ready.notify_one();
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -73,7 +152,7 @@ pub struct Streams {
 /// A registered stream whose connection does not run yet: its bytes wait.
 pub struct Opened {
     id: u32,
-    incoming: mpsc::UnboundedReceiver<Incoming>,
+    incoming: Arc<Inbox>,
     window: Arc<Semaphore>,
     cancel: CancellationToken,
 }
@@ -81,6 +160,12 @@ pub struct Opened {
 impl Opened {
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// The items queued for the stream's writer.
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.incoming.queued()
     }
 }
 
@@ -112,13 +197,14 @@ impl Streams {
         if table.len() >= MAX_STREAMS || table.contains_key(&id) {
             return None;
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let inbox = Arc::new(Inbox::default());
         let window = Arc::new(Semaphore::new(WINDOW as usize));
         let cancel = self.closed.child_token();
         table.insert(
             id,
             Entry {
-                incoming: tx,
+                incoming: inbox.clone(),
+                ended: false,
                 budget: WINDOW,
                 consumed: 0,
                 window: window.clone(),
@@ -127,7 +213,7 @@ impl Streams {
         );
         Some(Opened {
             id,
-            incoming: rx,
+            incoming: inbox,
             window,
             cancel,
         })
@@ -156,8 +242,12 @@ impl Streams {
         match event {
             Inbound::Data { stream, bytes } if stream >= STREAM_DYNAMIC => self.data(stream, bytes),
             Inbound::Eof { stream } if stream >= STREAM_DYNAMIC => {
-                if let Some(entry) = lock(&self.table).get(&stream) {
-                    let _ = entry.incoming.send(Incoming::Eof);
+                // A second one is ignored: it waits once.
+                if let Some(entry) = lock(&self.table).get_mut(&stream)
+                    && !entry.ended
+                {
+                    entry.ended = true;
+                    entry.incoming.end();
                 }
             }
             Inbound::Credit { stream, bytes } => self.credit(stream, bytes),
@@ -177,11 +267,15 @@ impl Streams {
             return;
         };
         let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        if len > entry.budget {
-            tracing::warn!(
-                stream = id,
-                "a tunnel's peer sent more than its window; resetting the stream"
-            );
+        let refused = if entry.ended {
+            Some("a tunnel's peer sent bytes after its end of stream; resetting the stream")
+        } else if len > entry.budget {
+            Some("a tunnel's peer sent more than its window; resetting the stream")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            tracing::warn!(stream = id, "{why}");
             if let Some(entry) = table.remove(&id) {
                 entry.cancel.cancel();
             }
@@ -190,7 +284,7 @@ impl Streams {
             return;
         }
         entry.budget -= len;
-        let _ = entry.incoming.send(Incoming::Data(bytes));
+        entry.incoming.push(bytes);
     }
 
     fn credit(&self, id: u32, bytes: u32) {
@@ -257,7 +351,7 @@ impl Streams {
     {
         let Opened {
             id,
-            mut incoming,
+            incoming,
             window,
             cancel,
         } = opened;
@@ -279,21 +373,22 @@ impl Streams {
         };
         let streams = &self;
         let inbound = async {
-            while let Some(item) = incoming.recv().await {
-                match item {
+            loop {
+                match incoming.next().await {
                     Incoming::Data(bytes) => {
                         writer.write_all(&bytes).await.map_err(|_| ())?;
-                        let n = u32::try_from(bytes.len()).expect("a frame fits");
+                        // At most the window.
+                        let n = u32::try_from(bytes.len()).expect("the window fits");
                         streams.consumed(id, n).await;
                     }
                     Incoming::Eof => {
                         let _ = writer.shutdown().await;
                         return Ok(());
                     }
+                    // Reset, or closed.
+                    Incoming::Gone => return Err(()),
                 }
             }
-            // Reset, or closed.
-            Err(())
         };
         tokio::select! {
             _ = cancel.cancelled() => {}
@@ -622,6 +717,32 @@ mod tests {
             stream: 16,
             bytes: vec![1],
         });
+        assert_eq!(control(&mut peer_in).await, Control::Reset { stream: 16 });
+        assert!(streams.is_empty());
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn what_a_stream_holds_is_bounded_by_its_window_not_by_its_frames() {
+        let ((ours, _ours_in), (peer, mut peer_in)) = pair();
+        let streams = Streams::new(ours);
+        // Registered, but its connection never runs: nothing is taken from the queue.
+        let opened = streams.open(16).unwrap();
+        let data = |bytes: Vec<u8>| Inbound::Data { stream: 16, bytes };
+        // Bytes one at a time, up to the window, and empty frames, which carry nothing.
+        for _ in 0..WINDOW / 2 {
+            streams.route(data(vec![1]));
+            streams.route(data(Vec::new()));
+        }
+        assert_eq!(opened.queued(), 1, "the bytes wait as one");
+        // One end of stream, sent again and again.
+        for _ in 0..100_000 {
+            streams.route(Inbound::Eof { stream: 16 });
+        }
+        assert_eq!(opened.queued(), 2, "the end of stream waits once");
+        assert_eq!(streams.len(), 1, "an end of stream sent again is ignored");
+        // Bytes after the end of stream: no honest peer sends them.
+        streams.route(data(vec![1]));
         assert_eq!(control(&mut peer_in).await, Control::Reset { stream: 16 });
         assert!(streams.is_empty());
         drop(peer);
