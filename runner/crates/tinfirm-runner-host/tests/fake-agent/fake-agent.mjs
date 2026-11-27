@@ -629,6 +629,20 @@ async function prompt(msg) {
       if (await waitCancel(10000)) return done({ stopReason: "cancelled" });
       return done({ stopReason: "end_turn" });
     }
+    case "leak-on-cancel": {
+      // Works as `slow` does, with a file in /output (protocol v2), and leaks the credential
+      // only once the host asked it to end its turn: a leak that is not the run's first stop.
+      fs.writeFileSync(path.join(cwd, "slow.txt"), "work in progress\n");
+      const outputDir = process.env.TINFIRM_OUTPUT_DIR;
+      if (outputDir) fs.writeFileSync(path.join(outputDir, "report.md"), "The report.\n");
+      for (let i = 0; ; i++) {
+        chunk(sessionId, `tick ${i} `);
+        if (await waitCancel(100)) {
+          chunk(sessionId, `The token in base64 is ${Buffer.from(`x-access-token:${hostSecret()}`).toString("base64")}.`);
+          return done({ stopReason: "cancelled" });
+        }
+      }
+    }
     case "bridge-env": {
       // What the agent sees over the sandbox bridge (ADR-0095): the run's credential and
       // settings, none of the bridge's own, and a parent (the bridge) that holds no credential.

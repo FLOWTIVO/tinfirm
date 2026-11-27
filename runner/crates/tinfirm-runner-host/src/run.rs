@@ -394,6 +394,8 @@ struct AgentPhase {
     /// Set once the session is open: `None` inside when `session/load` succeeded.
     not_resumed: Option<Option<NotResumed>>,
     stop: Option<StopCause>,
+    /// The agent's output contained a credential value, whatever stopped the run first.
+    leaked: bool,
     result: Option<AcpResult>,
     summary: Option<String>,
     usage: Option<tinfirm_protocol::UsagePayload>,
@@ -1489,7 +1491,7 @@ fn keep_the_record_for_the_end(run: &mut Run<'_>, repos: &[Repo<'_>], agent: &Ag
     let Some(record) = run.sink.record() else {
         return false;
     };
-    let leak = matches!(agent.stop, Some(StopCause::Leak));
+    let leak = agent.leaked;
     let cancelled = matches!(agent.stop, Some(StopCause::Cancel))
         || *run.stop_rx.borrow() == Some(StopRequest::Cancel);
     if record.collected_at_the_end(&collected_repos(repos), leak, cancelled) {
@@ -1668,6 +1670,16 @@ async fn agent_outcome(
                 )
                 .await
             }
+        }
+        // A leak after the first stop cause: that cause stays the run's failure, if it set one,
+        // and the leak fails a cancelled run, as a leak in a commit does. Either way nothing of
+        // the run leaves the host.
+        if agent.leaked && !outcome.leak {
+            outcome.leak = true;
+            run.failure.set(
+                FailureClass::CredentialLeak,
+                "the agent's output contained a credential value once the run had begun to stop; nothing was pushed",
+            );
         }
     }
     ControlFlow::Continue(outcome)
@@ -4035,6 +4047,8 @@ struct AgentTurn {
     not_resumed: Option<Option<NotResumed>>,
     /// Why the run stopped the agent: the first cause, or an abort, which overrides it.
     stop: Option<StopCause>,
+    /// The agent's output contained a credential value: as the first stop cause, or after it.
+    leaked: bool,
     /// When the agent has to have ended its turn after `session/cancel`.
     cancel_deadline: Option<tokio::time::Instant>,
     stderr_events: usize,
@@ -4065,6 +4079,7 @@ impl AgentTurn {
             session_id: None,
             not_resumed: None,
             stop: None,
+            leaked: false,
             cancel_deadline: None,
             stderr_events: 0,
             stderr_tail: Vec::new(),
@@ -4096,12 +4111,15 @@ impl AgentTurn {
     }
 
     /// Emits mapped events; a redaction hit in agent output is a credential leak, whether the
-    /// mapper (which redacts before it truncates) or the sink found it.
+    /// mapper (which redacts before it truncates) or the sink found it. The turn keeps it even
+    /// when the run stopped already for another cause: a leak keeps the run's work on the host
+    /// whatever stopped it first.
     fn emit_all(&mut self, sink: &mut EventSink) -> bool {
         let mut leak = self.mapper.take_leak();
         for event in self.out.drain(..) {
             leak |= sink.emit(event);
         }
+        self.leaked |= leak;
         leak
     }
 
@@ -4251,6 +4269,7 @@ impl AgentTurn {
                 .or_else(|| result.as_ref().and_then(|r| r.session_id.clone())),
             not_resumed: self.not_resumed,
             stop: self.stop,
+            leaked: self.leaked,
             result,
             summary,
             usage: self.mapper.usage(),

@@ -2647,7 +2647,10 @@ with `modelAccess` the host keeps no cooldown, and the server holds the payer's 
 budget resets ([Model access](#model-access)). Every credential value on the host (raw,
 base64 at any alignment, URL-encoded) is replaced with `[REDACTED]` before anything leaves
 the host; if the agent's own output contains one, or a commit to be pushed in any
-repository does, the run stops with `CREDENTIAL_LEAK` and no repository is pushed.
+repository does, the run stops with `CREDENTIAL_LEAK` and no repository is pushed. A leak in
+the agent's output after the run was stopped for another cause (a cancel, a guard, a time or
+usage limit) keeps the run on the host just the same: nothing is pushed or saved, and the run
+fails with the earlier cause's failure, or with `CREDENTIAL_LEAK` when it was cancelled.
 
 If the connection drops, runs keep going; events are buffered (up to 10 000 per run) and
 flushed after the reconnect, with the last 500 frames of each run written again. The backoff
