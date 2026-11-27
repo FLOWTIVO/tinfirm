@@ -2521,7 +2521,9 @@ new session (`resumeOutcome` `NO_SESSION`).
    are checked while the run takes its slot, so two assignments cannot both take the last
    one. The image check comes after that, in the run's own task, and so does the wait for
    the stale copy of a run assigned again with a newer epoch (the new execution starts once
-   the old one has stopped): the connection never waits for Docker or for another run.
+   the old one has stopped, or after 20 s): the connection never waits for Docker or for
+   another run. The workspace and the attachments are the run's, whatever its epoch: a stale
+   copy that ends later removes neither while the newer execution has the run on this host.
 2. For each repository, in order (a run can have none):
    - fetches the host's mirror of the repository URL for that repository's credentials
      (creating it on first use; a token minted for the run names its credential's mirror,
