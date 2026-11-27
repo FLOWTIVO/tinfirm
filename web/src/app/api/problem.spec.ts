@@ -8,6 +8,7 @@ import {
   problemMessage,
   problemDetails,
   problemReason,
+  SAVED_THEN_FAILED,
   toProblem,
 } from './problem';
 
@@ -40,6 +41,19 @@ describe('problem details', () => {
     );
     expect(problemMessage(httpError(403, {}), { 'status:403': 'Owners only.' })).toBe(
       'Owners only.',
+    );
+  });
+
+  it('tells a write that may already be saved so, never to try again', () => {
+    const saved = httpError(500, { status: 500, detail: SAVED_THEN_FAILED });
+    expect(problemMessage(saved)).toBe(SAVED_THEN_FAILED);
+    expect(problemMessage(saved, { 'status:500': "Couldn't save." })).toBe(SAVED_THEN_FAILED);
+    expect(problemMessage(httpError(500, { detail: 'Internal server error' }))).toBe(
+      'Something went wrong on the server. Try again in a moment.',
+    );
+    // Only the server's own 500 says so: a proxy's 502 with the same text does not.
+    expect(problemMessage(httpError(502, { detail: SAVED_THEN_FAILED }))).toContain(
+      'Something went wrong on the server',
     );
   });
 

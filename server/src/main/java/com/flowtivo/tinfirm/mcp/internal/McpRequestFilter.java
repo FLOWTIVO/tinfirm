@@ -8,6 +8,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
@@ -194,6 +195,13 @@ final class McpRequestFilter extends OncePerRequestFilter {
                     ProblemCode.VALIDATION_FAILED, null);
             return;
         }
+        if (holdsNul(message)) {
+            // The parser's U+0000, whatever the Content-Type, the charset or the bytes that gave it: the scan of a
+            // JSON body (shared.web.RequestInputFilter) sees only a body of a JSON media type.
+            error(response, HttpStatus.BAD_REQUEST, null, -32600, NulCharacterException.DETAIL,
+                    ProblemCode.VALIDATION_FAILED, null);
+            return;
+        }
         if (message.isArray()) {
             error(response, HttpStatus.BAD_REQUEST, null, -32600,
                     "Batched requests are not supported: send one JSON-RPC message per request",
@@ -276,6 +284,32 @@ final class McpRequestFilter extends OncePerRequestFilter {
         catch (JacksonException ex) {
             return null;
         }
+    }
+
+    /** Whether a string of the message, or a property's name, holds U+0000. */
+    static boolean holdsNul(JsonNode message) {
+        ArrayDeque<JsonNode> next = new ArrayDeque<>();
+        next.add(message);
+        while (!next.isEmpty()) {
+            JsonNode node = next.poll();
+            if (node.isString()) {
+                if (node.stringValue().indexOf('\0') >= 0) {
+                    return true;
+                }
+            }
+            else if (node.isObject()) {
+                for (Map.Entry<String, JsonNode> property : node.properties()) {
+                    if (property.getKey().indexOf('\0') >= 0) {
+                        return true;
+                    }
+                    next.add(property.getValue());
+                }
+            }
+            else if (node.isArray()) {
+                node.values().forEach(next::add);
+            }
+        }
+        return false;
     }
 
     private static @Nullable String text(@Nullable JsonNode node) {

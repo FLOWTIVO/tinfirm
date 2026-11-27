@@ -595,6 +595,14 @@ export function isStatus(error: unknown, status: number): boolean {
   return error instanceof HttpErrorResponse && error.status === status;
 }
 
+/**
+ * The detail of a 500 for a write that failed once a change of it was saved (CONVENTIONS §6,
+ * `shared.web.ServerBusy.SAVED_THEN_FAILED`): shown as it is, since sending the write again may
+ * make the change twice.
+ */
+export const SAVED_THEN_FAILED =
+  'The request did not finish, but a change of it may already be saved. Look at the result before you send it again.';
+
 function statusMessage(status: number): string | undefined {
   if (status === 0) return "Can't reach the server. Check your connection and try again.";
   if (status === 401) return 'Your session has ended. Sign in again.';
@@ -629,6 +637,8 @@ export function problemMessage(error: unknown, overrides: Record<string, string>
       ? `${message} ${withPeriod(problem.detail)}`
       : message;
   }
+  // Before a screen's own message for the status: whatever it says, the change may be saved.
+  if (problem.status === 500 && problem.detail === SAVED_THEN_FAILED) return SAVED_THEN_FAILED;
   if (overrides[`status:${problem.status}`]) return overrides[`status:${problem.status}`];
   if (problem.code?.startsWith('DUPLICATE_')) {
     return problem.detail ?? 'Something with this name already exists.';

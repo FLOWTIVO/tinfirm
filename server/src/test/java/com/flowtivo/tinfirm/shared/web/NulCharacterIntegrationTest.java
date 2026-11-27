@@ -2,6 +2,7 @@ package com.flowtivo.tinfirm.shared.web;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -79,7 +80,32 @@ class NulCharacterIntegrationTest extends IntegrationTest {
                 + "; XSRF-TOKEN=" + xsrf, "X-XSRF-TOKEN", xsrf, "Content-Type", "application/json",
                 "Accept", "application/json"), "{\"name\":\"utf16\",\"memberIds\":[]}".getBytes(StandardCharsets.UTF_16BE));
         assertRefused(utf16.status(), utf16.header("Content-Type"), utf16.body(), "UTF-16");
+        // The overlong forms of U+0000 are no UTF-8, and the parser decodes them to U+0000 all the same.
+        for (byte[] overlong : List.of(new byte[] {(byte) 0xC0, (byte) 0x80},
+                new byte[] {(byte) 0xE0, (byte) 0x80, (byte) 0x80},
+                new byte[] {(byte) 0xF0, (byte) 0x80, (byte) 0x80, (byte) 0x80})) {
+            RawHttp.Answer answer = RawHttp.send(port, "POST", company.path("/groups"), Map.of("Cookie",
+                    session(owner) + "; XSRF-TOKEN=" + xsrf, "X-XSRF-TOKEN", xsrf, "Content-Type", "application/json",
+                    "Accept", "application/json"), concat("{\"name\":\"a".getBytes(StandardCharsets.US_ASCII), overlong,
+                            "b\",\"memberIds\":[]}".getBytes(StandardCharsets.US_ASCII)));
+            assertRefused(answer.status(), answer.header("Content-Type"), answer.body(),
+                    "overlong UTF-8 of " + overlong.length + " bytes");
+        }
+        // A charset whose bytes of the escape are not ASCII's: the converter reads the body as its text.
+        Charset ebcdic = Charset.forName("IBM037");
+        RawHttp.Answer ibm037 = RawHttp.send(port, "POST", company.path("/groups"), Map.of("Cookie", session(owner)
+                + "; XSRF-TOKEN=" + xsrf, "X-XSRF-TOKEN", xsrf, "Content-Type", "application/json; charset=IBM037",
+                "Accept", "application/json"), "{\"name\":\"a\\u0000b\",\"memberIds\":[]}".getBytes(ebcdic));
+        assertRefused(ibm037.status(), ibm037.header("Content-Type"), ibm037.body(), "IBM037");
         assertThat(output.getOut().substring(before)).doesNotContain("Unhandled exception");
+        // Without U+0000, a body in that charset is read as before.
+        String ebcdicName = unique("ebcdic");
+        RawHttp.Answer ibm037Plain = RawHttp.send(port, "POST", company.path("/groups"), Map.of("Cookie",
+                session(owner) + "; XSRF-TOKEN=" + xsrf, "X-XSRF-TOKEN", xsrf, "Content-Type",
+                "application/json; charset=IBM037", "Accept", "application/json"),
+                ("{\"name\":\"" + ebcdicName + "\",\"memberIds\":[]}").getBytes(ebcdic));
+        assertThat(ibm037Plain.status()).as("%s", ibm037Plain.body()).isEqualTo(201);
+        assertThat(JSON.readTree(ibm037Plain.body()).get("name").asString()).isEqualTo(ebcdicName);
 
         // A backslash before u0000 is text, not U+0000: the group is created.
         String name = unique("g") + "\\\\u0000";
@@ -175,6 +201,38 @@ class NulCharacterIntegrationTest extends IntegrationTest {
         JsonNode error = answer.json().get("error");
         assertThat(error.get("data").get("code").asString()).isEqualTo("VALIDATION_FAILED");
         assertThat(error.get("message").asString()).isEqualTo(NulCharacterException.DETAIL);
+
+        // The endpoint parses its body as JSON whatever the Content-Type says, also an overlong U+0000.
+        String bearer = "Bearer " + token.json().get("token").asString();
+        byte[] escaped = ("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":"
+                + "\"list_agents\",\"arguments\":{\"cursor\":\"a\\u0000b\"}}}").getBytes(StandardCharsets.UTF_8);
+        byte[] overlong = concat(("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":"
+                + "\"list_agents\",\"arguments\":{\"cursor\":\"a").getBytes(StandardCharsets.UTF_8),
+                new byte[] {(byte) 0xC0, (byte) 0x80}, "b\"}}}".getBytes(StandardCharsets.UTF_8));
+        Map<String, byte[]> bodies = new java.util.LinkedHashMap<>();
+        bodies.put("text/plain", escaped);
+        bodies.put("", escaped);
+        bodies.put("application/json", overlong);
+        bodies.forEach((type, body) -> {
+            Map<String, String> headers = new java.util.HashMap<>(Map.of("Authorization", bearer, "Accept",
+                    "application/json, text/event-stream"));
+            if (!type.isEmpty()) {
+                headers.put("Content-Type", type);
+            }
+            RawHttp.Answer raw = RawHttp.send(port, "POST", company.path("/mcp"), headers, body);
+            assertThat(raw.status()).as("%s: %s", type, raw.body()).isEqualTo(400);
+            JsonNode refused = JSON.readTree(raw.body()).get("error");
+            assertThat(refused.get("data").get("code").asString()).as(type).isEqualTo("VALIDATION_FAILED");
+            assertThat(refused.get("message").asString()).as(type).isEqualTo(NulCharacterException.DETAIL);
+        });
+    }
+
+    private static byte[] concat(byte[]... parts) {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (byte[] part : parts) {
+            out.writeBytes(part);
+        }
+        return out.toByteArray();
     }
 
     @Test

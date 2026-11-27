@@ -4,6 +4,12 @@ import java.io.BufferedReader;
 import java.io.FilterReader;
 import java.io.IOException;
 import java.io.Reader;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CoderResult;
+import java.nio.charset.CodingErrorAction;
 import java.util.Collection;
 import java.util.Enumeration;
 import java.util.Map;
@@ -20,6 +26,7 @@ import org.apache.tomcat.util.http.fileupload.InvalidFileNameException;
 import org.jspecify.annotations.Nullable;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 
 /**
  * The request as every filter and handler reads it, refusing U+0000 (NUL) in what may reach a SQL parameter as text
@@ -31,7 +38,10 @@ import org.springframework.http.HttpHeaders;
  * when its name is a plain one. A JSON body's {@code read} throws {@link NulCharacterException}, so that its reader
  * fails as for a body it cannot read. Only the escape {@code \u0000} gives a JSON string a NUL; a raw NUL byte is no
  * valid UTF-8 JSON (RFC 8259 asks for UTF-8 between systems; UTF-16 and UTF-32 bodies hold NUL bytes and are refused
- * with it). A path cannot hold NUL: Tomcat refuses {@code %00} in a path with 400 before any filter.
+ * with it). The body is scanned as its parser decodes it: as UTF-8 bytes, the overlong forms of U+0000 included
+ * ({@code C0 80}, {@code E0 80 80}, {@code F0 80 80 80}, which the parser decodes to it), or, when its Content-Type
+ * names another charset than UTF-8, UTF-16 or UTF-32, as the text of that charset, which Spring MVC's converter reads
+ * it as. A path cannot hold NUL: Tomcat refuses {@code %00} in a path with 400 before any filter.
  */
 final class NulRefusingRequest extends HttpServletRequestWrapper {
 
@@ -125,9 +135,30 @@ final class NulRefusingRequest extends HttpServletRequestWrapper {
             return super.getInputStream();
         }
         if (body == null) {
-            body = new ScannedInputStream(super.getInputStream());
+            body = new ScannedInputStream(super.getInputStream(), textCharset());
         }
         return body;
+    }
+
+    /**
+     * The charset that Spring MVC's JSON converter decodes the body with as text: the one the Content-Type names
+     * unless it is UTF-8, UTF-16 or UTF-32, which the parser reads as bytes itself. Null for those, for none, and for
+     * a Content-Type or charset that cannot be read, which the converter refuses.
+     */
+    private @Nullable Charset textCharset() {
+        Charset charset;
+        try {
+            charset = MediaType.parseMediaType(getContentType()).getCharset();
+        }
+        catch (IllegalArgumentException ex) {
+            // InvalidMediaTypeException among them, an unsupported charset included.
+            return null;
+        }
+        if (charset == null) {
+            return null;
+        }
+        String name = charset.name();
+        return name.startsWith("UTF-8") || name.startsWith("UTF-16") || name.startsWith("UTF-32") ? null : charset;
     }
 
     @Override
@@ -216,21 +247,38 @@ final class NulRefusingRequest extends HttpServletRequestWrapper {
         }
     }
 
+    /**
+     * The body's bytes, scanned as they pass: as UTF-8 when {@code charset} is null, else as the text of that charset,
+     * decoded as Spring MVC's converter decodes it (a malformed or unmappable byte as U+FFFD).
+     */
     private static final class ScannedInputStream extends ServletInputStream {
 
         private final ServletInputStream in;
 
         private final Scanner scanner = new Scanner();
 
-        ScannedInputStream(ServletInputStream in) {
+        private final @Nullable CharsetDecoder decoder;
+
+        private final CharBuffer chars = CharBuffer.allocate(1024);
+
+        /** Bytes of a character that the next read completes, for {@link #decoder}. */
+        private ByteBuffer pending = ByteBuffer.allocate(0);
+
+        /** In UTF-8: how many bytes {@code 80} still end an overlong U+0000 ({@code C0}, {@code E0}, {@code F0}). */
+        private int overlong;
+
+        ScannedInputStream(ServletInputStream in, @Nullable Charset charset) {
             this.in = in;
+            this.decoder = charset == null ? null : charset.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPLACE)
+                .onUnmappableCharacter(CodingErrorAction.REPLACE);
         }
 
         @Override
         public int read() throws IOException {
             int b = in.read();
             if (b >= 0) {
-                scanner.accept(b);
+                scan(new byte[] {(byte) b}, 0, 1);
             }
             return b;
         }
@@ -238,10 +286,48 @@ final class NulRefusingRequest extends HttpServletRequestWrapper {
         @Override
         public int read(byte[] buffer, int offset, int length) throws IOException {
             int n = in.read(buffer, offset, length);
-            for (int i = 0; i < n; i++) {
-                scanner.accept(buffer[offset + i] & 0xff);
+            if (n > 0) {
+                scan(buffer, offset, n);
             }
             return n;
+        }
+
+        private void scan(byte[] bytes, int offset, int length) throws NulCharacterException {
+            if (decoder == null) {
+                for (int i = offset; i < offset + length; i++) {
+                    int b = bytes[i] & 0xff;
+                    utf8(b);
+                    scanner.accept(b);
+                }
+                return;
+            }
+            ByteBuffer input = ByteBuffer.allocate(pending.remaining() + length);
+            input.put(pending).put(bytes, offset, length).flip();
+            CoderResult result;
+            do {
+                result = decoder.decode(input, chars, false);
+                chars.flip();
+                while (chars.hasRemaining()) {
+                    scanner.accept(chars.get());
+                }
+                chars.clear();
+            }
+            while (result.isOverflow());
+            pending = input.slice();
+        }
+
+        /** The overlong forms of U+0000, which UTF-8 does not allow and the JSON parser decodes all the same. */
+        private void utf8(int b) throws NulCharacterException {
+            if (overlong > 0) {
+                if (b == 0x80) {
+                    if (--overlong == 0) {
+                        throw new NulCharacterException();
+                    }
+                    return;
+                }
+                overlong = 0;
+            }
+            overlong = b == 0xC0 ? 1 : b == 0xE0 ? 2 : b == 0xF0 ? 3 : 0;
         }
 
         @Override
