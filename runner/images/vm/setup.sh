@@ -22,9 +22,12 @@ apt-get install -y --no-install-recommends ca-certificates curl gnupg
 DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/debian/gpg -o /tmp/docker.asc
-fingerprint="$(gpg --show-keys --with-colons /tmp/docker.asc | awk -F: '$1 == "fpr" { print $10; exit }')"
-if [ "$fingerprint" != "$DOCKER_KEY_FINGERPRINT" ]; then
-    echo "setup.sh: the key at download.docker.com/linux/debian/gpg is ${fingerprint:-no key}, not Docker's $DOCKER_KEY_FINGERPRINT" >&2
+# One key, Docker's: APT would trust every key of the file, so another one beside it is refused.
+keys="$(gpg --show-keys --with-colons /tmp/docker.asc)"
+primaries="$(printf '%s\n' "$keys" | awk -F: '$1 == "pub"' | wc -l)"
+fingerprint="$(printf '%s\n' "$keys" | awk -F: '$1 == "fpr" { print $10; exit }')"
+if [ "$primaries" -ne 1 ] || [ "$fingerprint" != "$DOCKER_KEY_FINGERPRINT" ]; then
+    echo "setup.sh: the file at download.docker.com/linux/debian/gpg is not Docker's $DOCKER_KEY_FINGERPRINT alone: $primaries key(s), the first ${fingerprint:-none}" >&2
     exit 1
 fi
 install -m 0644 /tmp/docker.asc /etc/apt/keyrings/docker.asc

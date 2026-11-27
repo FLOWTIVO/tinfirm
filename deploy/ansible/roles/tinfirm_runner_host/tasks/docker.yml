@@ -51,11 +51,13 @@
     - name: Check the fingerprint of Docker's key
       ansible.builtin.assert:
         that:
+          # One key, Docker's: APT would trust every key of the file.
+          - _tinfirm_runner_host_docker_key.stdout_lines | select('match', '^pub:') | list | length == 1
           - >-
             (_tinfirm_runner_host_docker_key.stdout_lines | select('match', '^fpr:') | first
              | default('') | split(':'))[9] | default('') == tinfirm_runner_host_docker_key_fingerprint
         fail_msg: >-
-          The key at {{ _tinfirm_runner_host_docker_repo }}/gpg is not the one whose fingerprint is
+          The file at {{ _tinfirm_runner_host_docker_repo }}/gpg is not the one key whose fingerprint is
           {{ tinfirm_runner_host_docker_key_fingerprint }} (tinfirm_runner_host_docker_key_fingerprint).
         quiet: true
 
