@@ -236,9 +236,11 @@ async fn scan_output(
         let mut fresh = false;
         let mut found = false;
         loop {
+            // A failed read fails the scan: what git wrote after it was not scanned.
             let n = match stdout.read(&mut buf[filled..]).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => n,
+                Err(_) => return None,
             };
             if found {
                 continue;
