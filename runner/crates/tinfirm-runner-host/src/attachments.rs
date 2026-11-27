@@ -153,9 +153,12 @@ pub fn is_format_char(c: char) -> bool {
     )
 }
 
-/// The per-run directory; deleted when dropped, so every way out of a run cleans it up.
+/// The per-run directory; deleted when dropped, so every way out of a run cleans it up, unless
+/// another execution of the run took it over by then ([`AttachmentsDir::left_when`]).
 pub struct AttachmentsDir {
     path: PathBuf,
+    /// Whether the directory is another's when this one is dropped: it stays then.
+    taken_over: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl AttachmentsDir {
@@ -169,7 +172,17 @@ impl AttachmentsDir {
         }
         std::fs::create_dir(&path)?;
         set_mode(&path, 0o755)?;
-        Ok(AttachmentsDir { path })
+        Ok(AttachmentsDir {
+            path,
+            taken_over: None,
+        })
+    }
+
+    /// The directory stays when it is dropped while `taken_over` says so: its path is the
+    /// run's, whatever the epoch, and a newer execution of the run may use it by then.
+    pub fn left_when(mut self, taken_over: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.taken_over = Some(Box::new(taken_over));
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -179,6 +192,13 @@ impl AttachmentsDir {
 
 impl Drop for AttachmentsDir {
     fn drop(&mut self) {
+        if self
+            .taken_over
+            .as_ref()
+            .is_some_and(|taken_over| taken_over())
+        {
+            return;
+        }
         if let Err(e) = std::fs::remove_dir_all(&self.path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -709,5 +729,24 @@ mod tests {
         assert!(path.exists());
         drop(dir);
         assert!(!path.exists());
+    }
+
+    /// The directory's path is the run's: one that another execution of the run took over by
+    /// the drop stays for it.
+    #[test]
+    fn a_directory_taken_over_stays_when_dropped() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("attachments").join("run");
+        let taken_over = Arc::new(AtomicBool::new(false));
+        let dir = AttachmentsDir::create(path.clone()).unwrap().left_when({
+            let taken_over = taken_over.clone();
+            move || taken_over.load(Ordering::SeqCst)
+        });
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        taken_over.store(true, Ordering::SeqCst);
+        drop(dir);
+        assert!(path.join("f.txt").exists());
     }
 }

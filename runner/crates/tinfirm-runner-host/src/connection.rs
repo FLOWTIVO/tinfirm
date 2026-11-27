@@ -83,6 +83,9 @@ const SEND_BUFFER_BYTES: u32 = 256 * 1024;
 /// A frame, flush or close that takes longer than this ends the connection: the link is
 /// dead or too slow to keep the leases (the host reconnects).
 const WRITE_TIMEOUT: Duration = SILENCE_LIMIT;
+/// How long the host waits for the server's answer to its close at the end of a drain or a
+/// shutdown.
+const CLOSE_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest wait between two connection attempts while the host holds runs. The server
 /// keeps a host's runs for a grace period after a disconnect (2 minutes by default,
 /// docs/archive/v1/CONVENTIONS.md §15.1); they should be back well within it.
@@ -114,10 +117,11 @@ pub async fn run(host: Host, drain: CancellationToken) -> Result<()> {
     let url = host.config.websocket_url()?;
     let mut backoff = host.opts.reconnect_min_backoff;
     loop {
-        // After a shutdown, what was written before the connection broke counts as sent.
-        // A draining host connects once more while it holds recent runs: their last frames
-        // may have been lost with the connection, and the next one sends them again before
-        // it closes with 1000.
+        // After a shutdown, what was written before the connection broke counts as sent: it is
+        // not written again, and the kept report of a run's end stays for the next start
+        // (crate::host::Shared::forget_delivered_reports_at_the_end). A draining host connects
+        // once more while it holds recent runs: their last frames may have been lost with the
+        // connection, and the next one sends them again before it closes with 1000.
         if drain.is_cancelled()
             && host.outbox.all_finished_sent()
             && host.outbox.is_drained()
@@ -423,6 +427,37 @@ where
     Ok(!host.outbox.is_drained())
 }
 
+/// Whether the server answers the host's close with its own within [`CLOSE_ANSWER_TIMEOUT`],
+/// with no `error` before it. The server answers a frame it could not process with `error`
+/// ("it was ignored") and then still answers the close, so after an `error` nothing written on
+/// this connection counts as delivered. Its other frames are not looked at: the host is going.
+async fn closed_by_the_server<S>(socket: &mut WebSocketStream<S>) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let answer = async {
+        let mut refused = false;
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(WsMessage::Close(_)) => return !refused,
+                Ok(WsMessage::Text(text)) => refused |= is_error_frame(&text),
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    };
+    tokio::time::timeout(CLOSE_ANSWER_TIMEOUT, answer)
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether a frame of the server is an `error`.
+fn is_error_frame(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .is_ok_and(|frame| frame.get("type").and_then(|t| t.as_str()) == Some("error"))
+}
+
 async fn session(host: &Host, url: &str, drain: &CancellationToken) -> Result<Ended> {
     let socket = connect(host, url).await?;
     converse(host, socket, drain).await
@@ -541,6 +576,9 @@ where
     ping.tick().await;
     let mut last_received = Instant::now();
     let mut draining = drain.is_cancelled();
+    // The server answered a frame of this connection with `error`: it may have ignored an end,
+    // so the close's answer shows nothing delivered ([`closed_by_the_server`]).
+    let mut refused = false;
 
     loop {
         // Write what is pending, in order, a batch at a time.
@@ -559,6 +597,12 @@ where
                 reason: reason.into(),
             }));
             let _ = tokio::time::timeout(WRITE_TIMEOUT, close).await;
+            // The server answers the close only once it has read every frame before it: then,
+            // and only then, the ends written on this connection are known to be delivered,
+            // unless it answered one of them with `error`.
+            if closed_by_the_server(&mut socket).await && !refused {
+                host.outbox.closed_in_order();
+            }
             return Ok(Ended::Drained);
         }
         tokio::select! {
@@ -566,21 +610,24 @@ where
             frame = socket.next() => {
                 last_received = Instant::now();
                 match frame {
-                    Some(Ok(WsMessage::Text(text))) => match Message::parse_version(&text, version) {
-                        Ok(message) => host.handle_message(message),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "cannot process a frame from the server");
-                            let is_error = text.contains("\"type\":\"error\"");
-                            if !is_error {
-                                host.outbox.push_control(Message::Error(ErrorMessage {
-                                    code: e.code().to_string(),
-                                    message: e.to_string(),
-                                    run_id: None,
-                                    epoch: None,
-                                }));
+                    Some(Ok(WsMessage::Text(text))) => {
+                        refused |= is_error_frame(&text);
+                        match Message::parse_version(&text, version) {
+                            Ok(message) => host.handle_message(message),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "cannot process a frame from the server");
+                                let is_error = text.contains("\"type\":\"error\"");
+                                if !is_error {
+                                    host.outbox.push_control(Message::Error(ErrorMessage {
+                                        code: e.code().to_string(),
+                                        message: e.to_string(),
+                                        run_id: None,
+                                        epoch: None,
+                                    }));
+                                }
                             }
                         }
-                    },
+                    }
                     Some(Ok(WsMessage::Close(frame))) => {
                         if let Some(fatal) = close_error(frame.as_ref()) {
                             return Err(fatal.into());

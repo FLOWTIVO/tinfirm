@@ -596,6 +596,39 @@ impl Records {
         records
     }
 
+    /// Removes the temporary copies that a write of a record, a kept report or the bridge's
+    /// identity leaves when its process is killed in it ([`write_replacing`]): each holds the
+    /// whole file, credentials and all, and nothing else reads or removes it. Only for the start
+    /// of `run`, which holds `run.lock`, before this process writes any of them: a copy that is
+    /// there then is a dead process's, never a write in progress.
+    pub fn remove_leftovers(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // `<name>.json.tmp`, and `.<name>.json.tmp.tmp-<hex>` of its own write
+            // (`secure_fs::write_private_file`).
+            let leftover = name.ends_with(".json.tmp")
+                || (name.starts_with('.') && name.contains(".json.tmp.tmp-"));
+            if !leftover || !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "removed what a killed process left of a write of a run's record")
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot remove what a killed process left of a write of a run's record")
+                }
+            }
+        }
+    }
+
     /// What `doctor` says of the records, without changing any: how many runs a start of
     /// `run` takes back, and how many of those have their work on this host already and wait
     /// for the server before they push it ([`RunRecord::collected`]). A record that cannot be

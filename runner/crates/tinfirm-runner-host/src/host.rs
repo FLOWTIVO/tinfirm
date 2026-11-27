@@ -793,8 +793,9 @@ impl Shared {
     /// before this one left (ADR-0101). Each is a run of this host's from now on, listed in
     /// `hello.activeRuns`, and its task waits for the sandbox's bridge to come back, then ends
     /// the run ([`run::take_back`]). A record that this host cannot take back is logged and
-    /// removed.
+    /// removed, and so is what a killed process left of a record's write.
     pub async fn take_back_runs(self: &Arc<Self>) {
+        self.records.remove_leftovers();
         self.send_kept_reports();
         let mut records = self.records.load_all();
         if records.is_empty() {
@@ -960,12 +961,14 @@ impl Shared {
         }
     }
 
-    /// On an orderly end of the process, once its connection has ended: a run's end that was
-    /// written on a connection counts as delivered, as the outbox counts it, so its kept report
-    /// goes. A report never written to a connection stays for the next start.
-    pub fn forget_written_reports(&self) {
+    /// On an orderly end of the process, once its connection has ended: a run's end that the
+    /// outbox forgot, or that was written on a connection the server then closed in order
+    /// ([`crate::outbox::Outbox::closed_in_order`]), is delivered, so its kept report goes. Any
+    /// other stays for the next start, a report written on a connection that broke included:
+    /// the server, or a proxy before it, may have gone down with it unread.
+    pub fn forget_delivered_reports_at_the_end(&self) {
         self.forget_delivered_reports();
-        for (run_id, epoch) in self.outbox.finished_written() {
+        for (run_id, epoch) in self.outbox.take_delivered_at_the_close() {
             self.records.remove_report(run_id, epoch);
         }
     }
@@ -3072,11 +3075,11 @@ pub async fn serve(host: Host, shutdown: CancellationToken) -> Result<()> {
             }
         },
     };
-    // An orderly end: the ends written on the connection count as delivered, as the outbox
-    // counts them, and their kept reports go; one never written stays for the next start. The
-    // ticker that forgets delivered reports has stopped already.
+    // An orderly end: the ends that the server is known to have read, by the outbox's retention
+    // or by its answer to the last connection's close, have their kept reports go; any other
+    // stays for the next start. The ticker that forgets delivered reports has stopped already.
     if ended.is_ok() {
-        host.forget_written_reports();
+        host.forget_delivered_reports_at_the_end();
     }
     ended
 }
@@ -3545,6 +3548,49 @@ mod tests {
         assert!(tool_took >= Duration::from_millis(2800), "{tool_took:?}");
         assert!(tool_took < Duration::from_millis(4300), "{tool_took:?}");
         assert_eq!(host.waiting_platform_requests(), 0);
+    }
+
+    /// A process killed while it wrote a record, a kept report or the bridge's identity leaves
+    /// the temporary copy of that file, credentials and all: the next start removes it, and
+    /// keeps what is no such copy.
+    #[tokio::test]
+    async fn the_start_removes_what_a_killed_write_of_a_record_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(dir.path().join("config"), dir.path().join("data"));
+        let runs = paths.data_dir.join("runs");
+        crate::secure_fs::ensure_private_dir(&runs).unwrap();
+        let (run, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let leftovers = [
+            format!("{run}.json.tmp"),
+            format!(".{run}.json.tmp.tmp-{}", Uuid::new_v4().simple()),
+            format!("{other}.3.finished.json.tmp"),
+            format!(
+                ".{other}.3.finished.json.tmp.tmp-{}",
+                Uuid::new_v4().simple()
+            ),
+            "bridge.json.tmp".to_string(),
+            format!(".bridge.json.tmp.tmp-{}", Uuid::new_v4().simple()),
+        ];
+        for name in &leftovers {
+            // TEST-ONLY value, no real credential.
+            std::fs::write(runs.join(name), r#"{"token":"ghs_TEST_ONLY_leftover"}"#).unwrap();
+        }
+        // No copy of a write: it stays.
+        std::fs::write(runs.join("notes.txt"), "kept").unwrap();
+        let local = Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        let config = crate::config::HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TEST_ONLY_host_token_of_the_leftover_test"),
+        );
+        let host = Shared::new(HostOptions::new(paths, local), config);
+        host.take_back_runs().await;
+        for name in &leftovers {
+            assert!(!runs.join(name).exists(), "{name} is still there");
+        }
+        assert!(runs.join("notes.txt").exists());
     }
 
     #[tokio::test]

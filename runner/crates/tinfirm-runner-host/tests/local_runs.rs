@@ -335,6 +335,60 @@ async fn credential_in_a_commit_blocks_the_push() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leak_after_a_cancel_still_keeps_the_run_on_the_host() {
+    if !logins_reach_the_sandbox() {
+        // The agent leaks the run's login, which a VM per run never gets.
+        return;
+    }
+    with_timeout(120, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let host = start_host(&server.url, HostSetup::v2()).await;
+        let mut conn = server.accept().await;
+        conn.handshake(5).await;
+        let spec = AssignSpec::v2("leak-on-cancel", Some(&repo.url));
+        conn.send(spec.to_json());
+        conn.wait_running(spec.run_id).await;
+        conn.send(json!({"type": "run.cancel", "runId": spec.run_id, "epoch": 1}));
+        let t = conn.until_finished(spec.run_id).await;
+        t.assert_no_secrets();
+        assert!(t.text().contains("[REDACTED]"));
+        let finished = t.finished();
+        // A leak fails the run, cancelled or not, as a leak in a commit does.
+        assert_eq!(finished["outcome"], "FAILED", "{finished:#}");
+        assert_eq!(finished["failureClass"], "CREDENTIAL_LEAK");
+        assert_eq!(finished["git"][0]["pushed"], false);
+        assert!(
+            repo.branch_head("agent/TEST-1").is_none(),
+            "nothing may be pushed after a leak"
+        );
+        assert!(server.uploads.lock().unwrap().is_empty());
+        assert!(finished["artifacts"].as_array().is_none_or(Vec::is_empty));
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leak_after_the_time_limit_keeps_the_limit_as_the_cause_and_pushes_nothing() {
+    if !logins_reach_the_sandbox() {
+        // The agent leaks the run's login, which a VM per run never gets.
+        return;
+    }
+    with_timeout(120, async {
+        let t = guard_run_as(2, "leak-on-cancel", 200, Some(Duration::from_secs(2))).await;
+        t.assert_no_secrets();
+        let finished = t.finished();
+        // The first stop stays the run's failure; the leak still keeps its work on the host.
+        assert_eq!(finished["failureClass"], "TIME_LIMIT", "{finished:#}");
+        assert_eq!(finished["git"][0]["pushed"], false);
+        assert!(finished["artifacts"].as_array().is_none_or(Vec::is_empty));
+    })
+    .await;
+}
+
 async fn guard_run(scenario: &str, max_turns: u32, wall_clock: Option<Duration>) -> Transcript {
     guard_run_as(1, scenario, max_turns, wall_clock).await
 }

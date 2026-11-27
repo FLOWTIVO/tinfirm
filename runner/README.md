@@ -720,7 +720,9 @@ holds its bridge.
   directory (`runs/<run id>.json`, 0600): the assignment, the sandbox, the bridge's session key, the
   repositories as cloned and the agent's session, and the sandbox's bridge (`bridge`: its TLS
   identity, and on Docker its port and its peer's address; a VM's dial target is the record's
-  sandbox). A `run` that starts after a crash, a `kill -9` or an upgrade finds the records and
+  sandbox). Each is written whole, through a temporary copy that is renamed into place; a host
+  killed in that write leaves the copy, and the next `run` removes it at its start. A `run` that
+  starts after a crash, a `kill -9` or an upgrade finds the records and
   takes each run back before it connects: the run is in its `hello`, so Tinfirm keeps it; a new
   front starts for each sandbox with the same identity, listening on the same port (a VM's dials
   it), and the sandbox's bridge comes back to it with the session's key. A record without `bridge`
@@ -771,9 +773,12 @@ holds its bridge.
     keeps it (`runs/<run id>.<epoch>.finished.json`, 0600: the frame as sent, no credential) in the
     record's place, and removes it once it was written on a connection that then stayed up for
     `TINFIRM_RUNNER_FINISHED_RETENTION` (3 minutes), or, on an orderly stop (SIGTERM, a drain),
-    once it was written at all; Tinfirm assigning the run again removes it too. A `run` that
-    starts after a crash, or after a stop while it was cut off from Tinfirm, finds the reports it
-    never wrote or wrote shortly before and sends them again; Tinfirm ignores a report of a run it
+    once it was written on the last connection and Tinfirm answered that connection's close
+    (which it does only once it has read every frame before it); Tinfirm assigning the run
+    again removes it too. A report written on a connection that broke before that, as when a
+    stop races a restart of Tinfirm or of a proxy before it, stays. A `run` that starts after a
+    crash, or after a stop while it was cut off from Tinfirm, finds the reports it never wrote
+    or wrote shortly before and sends them again; Tinfirm ignores a report of a run it
     ended already. A record of a newer execution of the same run is taken back, and the older
     report goes unsent. The protocol has no acknowledgement of the report, so one that Tinfirm
     drops after it was written is still lost.
@@ -2176,7 +2181,10 @@ deletion and gc (mirror key, repository URL without credentials, freed bytes).
 - **Session homes** that no run used for longer than `TINFIRM_RUNNER_HOME_MAX_IDLE_DAYS`
   (default 30) are deleted the same way, never the home of an active run. A later
   follow-up run of that conversation gets a new, empty home: `session/load` fails there, so the
-  host starts a new session with the full prompt.
+  host starts a new session with the full prompt. What a run works on beside its home
+  (`homes/<agentId>/.tmp-scratch-<workItemId>-…`: the work a collection brings back from the
+  sandbox, a session bundle it restores) is removed by the pass only once no run holds that
+  home, as what a crash left.
 - **Skills** in the cache (`skills/<sha256>/<name>`) that no run used for longer than
   `TINFIRM_RUNNER_SKILL_CACHE_MAX_IDLE_DAYS` (default 14) are deleted the same way, never one
   that an active run mounts. A later run with that skill downloads it again.
@@ -2519,7 +2527,9 @@ new session (`resumeOutcome` `NO_SESSION`).
    are checked while the run takes its slot, so two assignments cannot both take the last
    one. The image check comes after that, in the run's own task, and so does the wait for
    the stale copy of a run assigned again with a newer epoch (the new execution starts once
-   the old one has stopped): the connection never waits for Docker or for another run.
+   the old one has stopped, or after 20 s): the connection never waits for Docker or for
+   another run. The workspace and the attachments are the run's, whatever its epoch: a stale
+   copy that ends later removes neither while the newer execution has the run on this host.
 2. For each repository, in order (a run can have none):
    - fetches the host's mirror of the repository URL for that repository's credentials
      (creating it on first use; a token minted for the run names its credential's mirror,
@@ -2647,7 +2657,10 @@ with `modelAccess` the host keeps no cooldown, and the server holds the payer's 
 budget resets ([Model access](#model-access)). Every credential value on the host (raw,
 base64 at any alignment, URL-encoded) is replaced with `[REDACTED]` before anything leaves
 the host; if the agent's own output contains one, or a commit to be pushed in any
-repository does, the run stops with `CREDENTIAL_LEAK` and no repository is pushed.
+repository does, the run stops with `CREDENTIAL_LEAK` and no repository is pushed. A leak in
+the agent's output after the run was stopped for another cause (a cancel, a guard, a time or
+usage limit) keeps the run on the host just the same: nothing is pushed or saved, and the run
+fails with the earlier cause's failure, or with `CREDENTIAL_LEAK` when it was cancelled.
 
 If the connection drops, runs keep going; events are buffered (up to 10 000 per run) and
 flushed after the reconnect, with the last 500 frames of each run written again. The backoff

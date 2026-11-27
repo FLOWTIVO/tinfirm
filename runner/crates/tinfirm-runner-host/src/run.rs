@@ -394,6 +394,8 @@ struct AgentPhase {
     /// Set once the session is open: `None` inside when `session/load` succeeded.
     not_resumed: Option<Option<NotResumed>>,
     stop: Option<StopCause>,
+    /// The agent's output contained a credential value, whatever stopped the run first.
+    leaked: bool,
     result: Option<AcpResult>,
     summary: Option<String>,
     usage: Option<tinfirm_protocol::UsagePayload>,
@@ -878,8 +880,13 @@ async fn clone_repositories<'a>(
             run.failure.set(FailureClass::GitError, message.clone());
         }
         if !matches!(cloned, Some(Ok(()))) {
+            // The workspace's path is the run's, whatever its epoch: one that a newer execution
+            // of the run on this host uses already is left to it.
+            let ours = shared.no_newer_execution(assign.run_id, assign.epoch);
             if *run.stop_rx.borrow() == Some(StopRequest::Abort) {
-                cleanup_workspace(shared, &dirs.workspace, false);
+                if ours {
+                    cleanup_workspace(shared, &dirs.workspace, false);
+                }
                 return ControlFlow::Break(None);
             }
             let was_cancelled = run.failure.0.is_none();
@@ -890,7 +897,9 @@ async fn clone_repositories<'a>(
                 ..Report::default()
             };
             let finished = run.finish(was_cancelled, report);
-            cleanup_workspace(shared, &dirs.workspace, finished.outcome == Outcome::Failed);
+            if ours {
+                cleanup_workspace(shared, &dirs.workspace, finished.outcome == Outcome::Failed);
+            }
             return ControlFlow::Break(Some(finished));
         }
     }
@@ -905,6 +914,10 @@ async fn download_attachments(run: &mut Run<'_>) -> Option<AttachmentsDir> {
     if !assign.attachments.is_empty() && run.stop_rx.borrow().is_none() && run.failure.0.is_none() {
         match AttachmentsDir::create(shared.opts.paths.attachments(assign.run_id)) {
             Ok(dir) => {
+                // The directory's path is the run's, whatever its epoch: it stays when a newer
+                // execution of the run on this host uses it by the time this one ends.
+                let (run_id, epoch, host) = (assign.run_id, assign.epoch, shared.clone());
+                let dir = dir.left_when(move || !host.no_newer_execution(run_id, epoch));
                 let downloaded = tokio::select! {
                     result = attachments::download_all(
                         &shared.config.server_url,
@@ -1489,7 +1502,7 @@ fn keep_the_record_for_the_end(run: &mut Run<'_>, repos: &[Repo<'_>], agent: &Ag
     let Some(record) = run.sink.record() else {
         return false;
     };
-    let leak = matches!(agent.stop, Some(StopCause::Leak));
+    let leak = agent.leaked;
     let cancelled = matches!(agent.stop, Some(StopCause::Cancel))
         || *run.stop_rx.borrow() == Some(StopRequest::Cancel);
     if record.collected_at_the_end(&collected_repos(repos), leak, cancelled) {
@@ -1607,15 +1620,21 @@ async fn agent_outcome(
 ) -> ControlFlow<Option<RunFinished>, AgentOutcome> {
     let shared = run.shared;
     let mut outcome = AgentOutcome::default();
+    // The workspace's path is the run's, whatever its epoch: an aborted execution leaves one
+    // that a newer execution of the run on this host uses already to it.
+    let (run_id, epoch) = (run.assign.run_id, run.assign.epoch);
+    let aborted = || {
+        if shared.no_newer_execution(run_id, epoch) {
+            cleanup_workspace(shared, workspace_dir, false);
+        }
+        ControlFlow::Break(None)
+    };
     // Copied out of the channel first. A `match` on the borrow itself keeps the channel's lock
     // until the match ends, so through the removal of the workspace: a second stop that the
     // server sends meanwhile would block the thread that passes it on.
     let stop = *run.stop_rx.borrow();
     match stop {
-        Some(StopRequest::Abort) => {
-            cleanup_workspace(shared, workspace_dir, false);
-            return ControlFlow::Break(None);
-        }
+        Some(StopRequest::Abort) => return aborted(),
         Some(StopRequest::Cancel) => outcome.cancelled = true,
         None => {}
     }
@@ -1625,10 +1644,7 @@ async fn agent_outcome(
         outcome.summary = agent.summary.clone();
         outcome.usage = agent.usage.clone();
         match agent.stop.clone() {
-            Some(StopCause::Abort) => {
-                cleanup_workspace(shared, workspace_dir, false);
-                return ControlFlow::Break(None);
-            }
+            Some(StopCause::Abort) => return aborted(),
             Some(StopCause::Cancel) => outcome.cancelled = true,
             Some(StopCause::Leak) => {
                 outcome.leak = true;
@@ -1668,6 +1684,16 @@ async fn agent_outcome(
                 )
                 .await
             }
+        }
+        // A leak after the first stop cause: that cause stays the run's failure, if it set one,
+        // and the leak fails a cancelled run, as a leak in a commit does. Either way nothing of
+        // the run leaves the host.
+        if agent.leaked && !outcome.leak {
+            outcome.leak = true;
+            run.failure.set(
+                FailureClass::CredentialLeak,
+                "the agent's output contained a credential value once the run had begun to stop; nothing was pushed",
+            );
         }
     }
     ControlFlow::Continue(outcome)
@@ -1889,8 +1915,12 @@ pub async fn take_back(
             }
             tokens.drop_record();
             run.sink.drop_record();
-            let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
-            cleanup_workspace(shared, &dirs.workspace, false);
+            // The run's paths, whatever its epoch: a newer execution on this host that uses
+            // them already keeps them.
+            if shared.no_newer_execution(assign.run_id, assign.epoch) {
+                let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
+                cleanup_workspace(shared, &dirs.workspace, false);
+            }
             return TakenBackEnd::Aborted;
         }
         // The outcome that the run's own end decided stands: a cancel that comes after it
@@ -1920,8 +1950,8 @@ pub async fn take_back(
             sandbox.stop(Duration::from_secs(5)).await;
         }
         forget_the_record(&mut run);
-        let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
         if shared.no_newer_execution(assign.run_id, assign.epoch) {
+            let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
             cleanup_workspace(shared, &dirs.workspace, false);
         }
         return TakenBackEnd::Aborted;
@@ -1973,8 +2003,8 @@ pub async fn take_back(
     }
     keep_the_report(&mut run, &finished);
     halt_at(shared, EndStep::ReportKept).await;
-    let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
     if shared.no_newer_execution(assign.run_id, assign.epoch) {
+        let _ = std::fs::remove_dir_all(paths.attachments(assign.run_id));
         cleanup_workspace(
             shared,
             &dirs.workspace,
@@ -3693,10 +3723,7 @@ async fn collect_from_sandbox(
     let mut collection = Collection::default();
     let tag = format!("{}.{}", assign.run_id, assign.epoch);
     if !repos.is_empty() {
-        let temp = home_dir
-            .parent()
-            .map(|p| p.join(format!("{}bundles-{tag}", crate::homes::DELETE_PREFIX)))
-            .unwrap_or_else(|| PathBuf::from(format!("{}.bundles", assign.run_id)));
+        let temp = crate::homes::scratch_dir(home_dir, "bundles", &tag);
         let message = format!("WIP: uncommitted changes from run {}", assign.run_id);
         for (index, repo) in repos.iter_mut().enumerate() {
             // Commits this clone has, which the bundle leaves out.
@@ -4035,6 +4062,8 @@ struct AgentTurn {
     not_resumed: Option<Option<NotResumed>>,
     /// Why the run stopped the agent: the first cause, or an abort, which overrides it.
     stop: Option<StopCause>,
+    /// The agent's output contained a credential value: as the first stop cause, or after it.
+    leaked: bool,
     /// When the agent has to have ended its turn after `session/cancel`.
     cancel_deadline: Option<tokio::time::Instant>,
     stderr_events: usize,
@@ -4065,6 +4094,7 @@ impl AgentTurn {
             session_id: None,
             not_resumed: None,
             stop: None,
+            leaked: false,
             cancel_deadline: None,
             stderr_events: 0,
             stderr_tail: Vec::new(),
@@ -4096,12 +4126,15 @@ impl AgentTurn {
     }
 
     /// Emits mapped events; a redaction hit in agent output is a credential leak, whether the
-    /// mapper (which redacts before it truncates) or the sink found it.
+    /// mapper (which redacts before it truncates) or the sink found it. The turn keeps it even
+    /// when the run stopped already for another cause: a leak keeps the run's work on the host
+    /// whatever stopped it first.
     fn emit_all(&mut self, sink: &mut EventSink) -> bool {
         let mut leak = self.mapper.take_leak();
         for event in self.out.drain(..) {
             leak |= sink.emit(event);
         }
+        self.leaked |= leak;
         leak
     }
 
@@ -4251,6 +4284,7 @@ impl AgentTurn {
                 .or_else(|| result.as_ref().and_then(|r| r.session_id.clone())),
             not_resumed: self.not_resumed,
             stop: self.stop,
+            leaked: self.leaked,
             result,
             summary,
             usage: self.mapper.usage(),
@@ -5965,5 +5999,132 @@ mod tests {
         let kept = records.load_all();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].session_id.as_deref(), Some("session-1"));
+    }
+
+    /// A host with a newer execution (epoch 3) of a run on it, which uses the run's workspace
+    /// and attachments already, each with a file in it.
+    fn a_newer_execution_on_the_host(dir: &Path, run_id: Uuid) -> (Arc<Shared>, PathBuf, PathBuf) {
+        let paths = crate::paths::Paths::new(dir.join("config"), dir.join("data"));
+        let local = crate::sandbox::Executor::Local {
+            program: "false".into(),
+            args: Vec::new(),
+        };
+        // TEST-ONLY token, no real credential.
+        let config = crate::config::HostConfig::new(
+            "http://127.0.0.1:9",
+            tinfirm_protocol::Secret::new("tfr_TESTONLYnewerexecutiontesthosttoken0123456"),
+        );
+        let shared = Shared::new(crate::host::HostOptions::new(paths.clone(), local), config);
+        shared.register_test_run(run_id, 3, "claude");
+        let (workspace, attachments) = (paths.workspace(run_id), paths.attachments(run_id));
+        for dir in [&workspace, &attachments] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("newer.txt"), "the newer execution's").unwrap();
+        }
+        (shared, workspace, attachments)
+    }
+
+    /// An older execution of the run (`assign`) that is aborted, as [`execute`] holds it.
+    fn an_aborted_run<'a>(
+        shared: &'a Arc<Shared>,
+        assign: &'a RunAssign,
+        tokens: &'a Arc<RunGitTokens>,
+    ) -> Run<'a> {
+        let (_, stop_rx) = watch::channel(Some(StopRequest::Abort));
+        Run {
+            shared,
+            assign,
+            tokens,
+            sink: EventSink::new(shared.clone(), assign.run_id, assign.epoch),
+            failure: Failure::default(),
+            stop_rx,
+        }
+    }
+
+    /// An older execution that is aborted in its agent's phase leaves the run's workspace to
+    /// the newer execution that uses it already, whether the stop or the agent's turn says so.
+    #[tokio::test]
+    async fn an_abort_in_the_agents_phase_leaves_a_newer_executions_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let assign = test_assign();
+        let (shared, workspace, _) = a_newer_execution_on_the_host(dir.path(), assign.run_id);
+        let tokens = RunGitTokens::new_empty(assign.run_id, assign.epoch);
+        let Some(tinfirm_protocol::AssignedCredential::Model(access)) = assign.credential() else {
+            unreachable!("the test's assignment has model access");
+        };
+        let credential = RunCredential::Model(access.clone());
+        let mut run = an_aborted_run(&shared, &assign, &tokens);
+        let outcome = agent_outcome(&mut run, &credential, None, None, &workspace).await;
+        assert!(matches!(outcome, ControlFlow::Break(None)));
+        assert!(workspace.join("newer.txt").exists());
+
+        let (_stop_tx, stop_rx) = watch::channel(None);
+        run.stop_rx = stop_rx;
+        let phase = AgentPhase {
+            session_id: None,
+            not_resumed: None,
+            stop: Some(StopCause::Abort),
+            leaked: false,
+            result: None,
+            summary: None,
+            usage: None,
+            stderr_tail: Vec::new(),
+        };
+        let outcome = agent_outcome(&mut run, &credential, Some(phase), None, &workspace).await;
+        assert!(matches!(outcome, ControlFlow::Break(None)));
+        assert!(workspace.join("newer.txt").exists());
+    }
+
+    /// An older execution that is aborted while it clones leaves the run's workspace to the
+    /// newer execution that uses it already.
+    #[tokio::test]
+    async fn an_abort_in_the_clone_leaves_a_newer_executions_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut assign = test_assign();
+        assign.workspaces = vec![
+            serde_json::from_value(serde_json::json!({
+                "componentId": Uuid::new_v4(),
+                "dir": "repo",
+                "name": "Repo",
+                "repoUrl": format!("file://{}/missing.git", dir.path().display()),
+                "defaultBranch": "main",
+                "branch": "agent/TEST-1",
+            }))
+            .unwrap(),
+        ];
+        let (shared, workspace, _) = a_newer_execution_on_the_host(dir.path(), assign.run_id);
+        let tokens = RunGitTokens::new(&assign);
+        let mut run = an_aborted_run(&shared, &assign, &tokens);
+        let home_lease = shared.homes.lease(assign.agent.id, assign.work_item().id);
+        let dirs = RunDirs {
+            workspace: workspace.clone(),
+            output_root: None,
+            output: None,
+            home: home_lease.path().to_path_buf(),
+            _home_lease: home_lease,
+            new_home: true,
+        };
+        let cloned = clone_repositories(&mut run, &dirs).await;
+        assert!(matches!(cloned, ControlFlow::Break(None)));
+        assert!(workspace.join("newer.txt").exists());
+    }
+
+    /// A run taken back that is aborted at once, for a newer execution of the run on this
+    /// host, leaves that execution's workspace and attachments to it.
+    #[tokio::test]
+    async fn an_abort_of_a_run_taken_back_leaves_a_newer_executions_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = crate::takeback::tests::record();
+        let run_id = record.run_id();
+        let (shared, workspace, attachments) = a_newer_execution_on_the_host(dir.path(), run_id);
+        let records = crate::takeback::Records::new(&shared.opts.paths);
+        records.save(&record).unwrap();
+        let kept = Arc::new(RecordHandle::kept(&records, record.clone()));
+        let tokens = RunGitTokens::new(&record.assign);
+        let (_stop_tx, stop_rx) = watch::channel(Some(StopRequest::Abort));
+        let end = take_back(&shared, record, kept, &tokens, None, stop_rx).await;
+        assert!(matches!(end, TakenBackEnd::Aborted));
+        assert!(workspace.join("newer.txt").exists());
+        assert!(attachments.join("newer.txt").exists());
     }
 }

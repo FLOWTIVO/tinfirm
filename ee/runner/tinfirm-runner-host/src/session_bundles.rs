@@ -145,9 +145,10 @@ pub fn restore(
     bundle: &[u8],
     reader: Option<&crate::reader::Reader>,
 ) -> Result<Restored> {
-    let parent = home.parent().context("a session home has a parent")?;
+    home.parent().context("a session home has a parent")?;
     std::fs::create_dir_all(home).with_context(|| format!("cannot create {}", home.display()))?;
-    let scratch = parent.join(format!("{DELETE_PREFIX}bundle-{}", Uuid::new_v4().simple()));
+    // Beside the home, where the homes' sweep leaves it while the run holds the home.
+    let scratch = crate::homes::scratch_dir(home, "bundle", &Uuid::new_v4().simple().to_string());
     let result = restore_via(home, runtime, bundle, &scratch, reader);
     let _ = std::fs::remove_dir_all(&scratch);
     result

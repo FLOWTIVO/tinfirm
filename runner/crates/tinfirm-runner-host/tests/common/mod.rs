@@ -362,6 +362,12 @@ impl FakeServer {
                                     if let Some(f) = frame {
                                         *close_frame_task.lock().unwrap() = Some((u16::from(f.code), f.reason.to_string()));
                                     }
+                                    // Answered as a server answers it, once every frame before
+                                    // it was read: the next read sends the answer.
+                                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                                        while ws.next().await.is_some() {}
+                                    })
+                                    .await;
                                     let _ = frame_tx.send(None);
                                     break;
                                 }

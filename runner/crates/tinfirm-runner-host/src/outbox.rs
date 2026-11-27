@@ -74,6 +74,9 @@ struct Inner {
     /// epoch: a finished one whose end can no longer be lost, or one that another execution of
     /// its run replaced or that was dropped (its end no longer matters).
     forgotten: Vec<(Uuid, i64)>,
+    /// The finished executions whose end was written on a connection that the server closed
+    /// in order after it ([`Outbox::closed_in_order`]), by run and epoch.
+    delivered_at_the_close: Vec<(Uuid, i64)>,
 }
 
 #[derive(Debug)]
@@ -347,8 +350,7 @@ impl Outbox {
     }
 
     /// The finished executions whose `run.finished` has been written (on this connection or on
-    /// one that broke after it: what was written counts as sent), by run and epoch. On an
-    /// orderly end of the process their end counts as delivered.
+    /// one that broke after it: what was written counts as sent), by run and epoch.
     pub fn finished_written(&self) -> Vec<(Uuid, i64)> {
         self.lock()
             .runs
@@ -356,6 +358,21 @@ impl Outbox {
             .filter(|q| q.finished_pushed && q.next_unsent >= q.items.len())
             .map(|q| (q.run_id, q.epoch))
             .collect()
+    }
+
+    /// The connection ended with the server's answer to the host's close, which the server
+    /// sends only once it has read every frame before it: the end of each finished execution
+    /// written by then is delivered. A connection that broke, or a close that the server did
+    /// not answer, proves nothing: the server may have lost what it had not handled.
+    pub fn closed_in_order(&self) {
+        let written = self.finished_written();
+        self.lock().delivered_at_the_close.extend(written);
+    }
+
+    /// The finished executions whose end an orderly close delivered ([`Outbox::closed_in_order`])
+    /// since the last call, by run and epoch.
+    pub fn take_delivered_at_the_close(&self) -> Vec<(Uuid, i64)> {
+        std::mem::take(&mut self.lock().delivered_at_the_close)
     }
 
     /// `true` when nothing is waiting to be written.
@@ -594,6 +611,29 @@ mod tests {
         outbox.drop_run(running, 2);
         outbox.drop_run(running, 2);
         assert_eq!(outbox.take_forgotten(), vec![(running, 2)]);
+    }
+
+    /// Only an orderly close names the ends written by then as delivered, and once.
+    #[test]
+    fn an_orderly_close_delivers_the_ends_written_before_it() {
+        let outbox = Outbox::new();
+        let (written, unwritten) = (Uuid::new_v4(), Uuid::new_v4());
+        outbox.open_run(RunAccepted {
+            run_id: written,
+            epoch: 1,
+        });
+        outbox.push_finished(finished(written, 0));
+        take_all(&outbox);
+        outbox.open_run(RunAccepted {
+            run_id: unwritten,
+            epoch: 1,
+        });
+        outbox.push_finished(finished(unwritten, 0));
+        // Written, on a connection that then broke: not known to be delivered.
+        assert!(outbox.take_delivered_at_the_close().is_empty());
+        outbox.closed_in_order();
+        assert_eq!(outbox.take_delivered_at_the_close(), vec![(written, 1)]);
+        assert!(outbox.take_delivered_at_the_close().is_empty());
     }
 
     #[test]

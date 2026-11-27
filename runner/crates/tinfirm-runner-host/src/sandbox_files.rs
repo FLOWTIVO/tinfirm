@@ -403,17 +403,16 @@ pub async fn collect_home(
     home_dir: &Path,
     tag: &str,
 ) -> Result<Unpacked> {
-    let parent = home_dir
+    home_dir
         .parent()
         .context("the session home has no parent directory")?;
-    let name = home_dir
+    home_dir
         .file_name()
-        .context("the session home has no name")?
-        .to_string_lossy()
-        .into_owned();
-    // Named so that the startup cleanup removes them after a crash (crate::homes).
-    let incoming = parent.join(format!("{}{name}-in-{tag}", crate::homes::DELETE_PREFIX));
-    let outgoing = parent.join(format!("{}{name}-out-{tag}", crate::homes::DELETE_PREFIX));
+        .context("the session home has no name")?;
+    // Named so that the homes' sweep removes them after a crash, and leaves them while the run
+    // holds the home (crate::homes).
+    let incoming = crate::homes::scratch_dir(home_dir, "in", tag);
+    let outgoing = crate::homes::scratch_dir(home_dir, "out", tag);
     let _ = std::fs::remove_dir_all(&incoming);
     crate::secure_fs::ensure_private_dir(&incoming)?;
     let (reader, dest) = (reader.clone(), incoming.clone());
