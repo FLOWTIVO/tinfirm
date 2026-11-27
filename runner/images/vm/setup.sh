@@ -16,10 +16,22 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl gnupg
 
-# Docker Engine from Docker's own repository.
+# Docker Engine from Docker's own repository, whose key is trusted by its fingerprint, not by
+# where it came from: the one that the runner base image's copy (runner/images/base/docker.asc)
+# and the runner host role (tinfirm_runner_host_docker_key_fingerprint) check.
+DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
-chmod a+r /etc/apt/keyrings/docker.asc
+curl -fsSL https://download.docker.com/linux/debian/gpg -o /tmp/docker.asc
+# One key, Docker's: APT would trust every key of the file, so another one beside it is refused.
+keys="$(gpg --show-keys --with-colons /tmp/docker.asc)"
+primaries="$(printf '%s\n' "$keys" | awk -F: '$1 == "pub"' | wc -l)"
+fingerprint="$(printf '%s\n' "$keys" | awk -F: '$1 == "fpr" { print $10; exit }')"
+if [ "$primaries" -ne 1 ] || [ "$fingerprint" != "$DOCKER_KEY_FINGERPRINT" ]; then
+    echo "setup.sh: the file at download.docker.com/linux/debian/gpg is not Docker's $DOCKER_KEY_FINGERPRINT alone: $primaries key(s), the first ${fingerprint:-none}" >&2
+    exit 1
+fi
+install -m 0644 /tmp/docker.asc /etc/apt/keyrings/docker.asc
+rm -f /tmp/docker.asc
 # shellcheck source=/dev/null
 . /etc/os-release
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" \

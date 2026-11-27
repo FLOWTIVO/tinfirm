@@ -727,6 +727,58 @@ async fn a_running_host_counts_its_room_again_when_the_driver_says_a_machine_sto
     }
 }
 
+/// A create that failed on this host's side while the driver still made the VM: the host looks
+/// for that VM by its label after the failure and deletes it, without waiting for the next
+/// connection's cleanup of leftovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_vm_of_a_create_that_failed_here_is_found_and_deleted() {
+    use tinfirm_runner_host::vm::Vms;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("driver.log");
+    let env = [("FAKE_VM_CREATE_LATE", "the create timed out")];
+    let mut options = vm_options(&log, &env);
+    options.failed_create_looks = vec![Duration::from_millis(200), Duration::from_millis(600)];
+    let vms = Vms::new(options);
+    let labels = Vms::labels("host-a", "vm-label-1");
+    let user_data = tinfirm_runner_host::vm::UserData {
+        tinfirm: tinfirm_runner_host::vm::USER_DATA_VERSION,
+        image: "runner".into(),
+        env: Default::default(),
+    };
+    let Err(error) = vms.create("run-1", &user_data, &labels).await else {
+        panic!("a create that times out should fail");
+    };
+    assert!(
+        format!("{error:#}").contains("the create timed out"),
+        "{error:#}"
+    );
+    let made = calls_of(&vm_driver_calls(&log), "made")
+        .first()
+        .map(|call| call["params"]["id"].as_str().unwrap().to_string())
+        .expect("the fake driver made the VM");
+    // The host looks for it, and deletes it, on its own.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !calls_of(&vm_driver_calls(&log), "deleted")
+            .iter()
+            .any(|call| call["params"]["id"] == made.as_str())
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the VM of the failed create was not deleted");
+    // It looked by the VM's own label, among this host's.
+    let calls = vm_driver_calls(&log);
+    let looked = calls_of(&calls, "list");
+    assert!(
+        looked.iter().any(
+            |call| call["params"]["labels"]["tinfirm-vm"] == "vm-label-1"
+                && call["params"]["labels"]["tinfirm-host"] == "host-a"
+        ),
+        "{calls:#?}"
+    );
+}
+
 /// A notice that comes between the start's check and the host's following of the driver's
 /// notices is not lost: the host asks `verify` once when it begins to follow them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

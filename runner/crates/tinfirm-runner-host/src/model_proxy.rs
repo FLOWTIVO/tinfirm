@@ -586,6 +586,7 @@ impl ModelProxy {
             addresses: self.settings.addresses(),
             local_gateway,
             bind_ip: self.bind_ip,
+            port,
             tls,
             forwarded: AtomicU64::new(0),
             refused: AtomicU64::new(0),
@@ -712,8 +713,11 @@ struct RunState {
     /// The gateway's origin is the one of `--model-proxy-local-gateway`: it may be on loopback
     /// and this machine's own addresses.
     local_gateway: bool,
-    /// The listener's own address: never a destination.
+    /// The listener's own address with [`RunState::port`]: never a destination.
     bind_ip: IpAddr,
+    /// The port of the run's listener at `bind_ip` (or of its front's, which a sandbox's tunnel
+    /// reaches): `bind_ip` with another port is another service of this machine.
+    port: u16,
     /// `None` for a plain-http gateway (tests).
     tls: Option<Arc<rustls::ClientConfig>>,
     forwarded: AtomicU64,
@@ -1171,7 +1175,7 @@ async fn connect(state: &RunState) -> std::result::Result<TcpStream, String> {
     let mut refused = None;
     let mut last_error = None;
     for addr in addrs {
-        if let Some(why) = refusal(state, addr.ip()) {
+        if let Some(why) = refusal(state, addr) {
             refused = Some(why);
             continue;
         }
@@ -1209,17 +1213,19 @@ const LOOPBACK: &str = "loopback";
 /// One of this machine's own addresses that is not loopback.
 const THIS_HOST: &str = "this host's own";
 
-/// Why the proxy does not connect to `ip` for the run's gateway, or `None`.
+/// Why the proxy does not connect to `addr` for the run's gateway, or `None`.
 ///
-/// The listener's own address never: whatever listens there is this host's, never the gateway.
-/// The gateway of `--model-proxy-local-gateway` may be on loopback and this machine's other
-/// addresses, private ones too, but not on the addresses that no gateway has (cloud metadata,
-/// link-local, reserved, unspecified); on any other address it has the rules of every gateway.
-fn refusal(state: &RunState, ip: IpAddr) -> Option<&'static str> {
-    let ip = ip.to_canonical();
-    if ip == state.bind_ip.to_canonical() {
+/// The run's own listener never ([`is_own`]): it is this proxy, never the gateway. The gateway of
+/// `--model-proxy-local-gateway` may be on loopback and this machine's other addresses, private
+/// ones too, the listener's own address with another port included (on a host with
+/// `--sandbox-bridge` that is 127.0.0.1), but not on the addresses that no gateway has (cloud
+/// metadata, link-local, reserved, unspecified); on any other address it has the rules of every
+/// gateway.
+fn refusal(state: &RunState, addr: SocketAddr) -> Option<&'static str> {
+    if is_own(state.bind_ip, state.port, addr) {
         return Some("the model proxy's own");
     }
+    let ip = addr.ip().to_canonical();
     if state.local_gateway && (ip.is_loopback() || is_local_address(ip)) {
         let on_this_machine = EgressSettings {
             allow: Vec::new(),
@@ -1232,6 +1238,11 @@ fn refusal(state: &RunState, ip: IpAddr) -> Option<&'static str> {
         return Some(why);
     }
     (!state.addresses.allow_loopback && is_local_address(ip)).then_some(THIS_HOST)
+}
+
+/// Whether `addr` is the run's own listener: its address and its port.
+fn is_own(bind_ip: IpAddr, port: u16, addr: SocketAddr) -> bool {
+    addr.ip().to_canonical() == bind_ip.to_canonical() && addr.port() == port
 }
 
 /// One request on its own connection to the gateway (TLS unless a test allowed plain http).
@@ -1477,7 +1488,12 @@ mod tests {
 
     impl FakeGateway {
         async fn start(replier: Replier) -> FakeGateway {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            FakeGateway::start_on("127.0.0.1", replier).await
+        }
+
+        /// A gateway on `ip`, as one on the proxy's own address with another port.
+        async fn start_on(ip: &str, replier: Replier) -> FakeGateway {
+            let listener = TcpListener::bind((ip, 0)).await.unwrap();
             let addr = listener.local_addr().unwrap();
             let seen = Arc::new(Mutex::new(Vec::new()));
             let (go, go_rx) = mpsc::unbounded_channel::<()>();
@@ -1690,6 +1706,17 @@ mod tests {
         assert!(settings.local_gateway.is_none());
         let settings = ModelProxySettings::from_options(false, None).unwrap();
         assert!(!settings.allow_private && !settings.allow_loopback && !settings.allow_http);
+    }
+
+    #[test]
+    fn the_proxy_refuses_its_own_listener_and_not_its_address_with_another_port() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(is_own(ip, 4100, "127.0.0.1:4100".parse().unwrap()));
+        // The same as an IPv4-mapped IPv6 address.
+        assert!(is_own(ip, 4100, "[::ffff:127.0.0.1]:4100".parse().unwrap()));
+        // A local gateway beside it on the same address.
+        assert!(!is_own(ip, 4100, "127.0.0.1:4000".parse().unwrap()));
+        assert!(!is_own(ip, 4100, "127.0.0.2:4100".parse().unwrap()));
     }
 
     #[test]
@@ -2500,12 +2527,25 @@ mod tests {
         assert!(other.seen().is_empty());
         assert_eq!(named.seen().len(), 1);
 
-        // Named or not: never the listener's own address, cloud metadata, or a private address
-        // of another machine without --egress-allow-private.
-        let own_listener = TcpListener::bind("127.0.0.2:0").await.unwrap();
-        let own = format!("http://{}", own_listener.local_addr().unwrap());
+        // The named gateway on the proxy's own address with another port (on a host with
+        // --sandbox-bridge, 127.0.0.1): another service of this machine, which it reaches.
+        let beside = FakeGateway::start_on("127.0.0.2", Arc::new(|_: &Seen| Reply::ok("{}"))).await;
+        let beside_url = beside.url("");
+        let guard = ModelProxy::new(settings(&beside_url), &endpoint())
+            .start_run_at(
+                Uuid::new_v4(),
+                &access(ModelFormat::Anthropic, &beside_url),
+                &front(mode).await,
+            )
+            .await
+            .unwrap();
+        let (status, body) = post(&guard).await;
+        assert_eq!(status, StatusCode::OK, "{beside_url}: {body}");
+        assert_eq!(beside.seen().len(), 1);
+
+        // Named or not: never cloud metadata, or a private address of another machine without
+        // --egress-allow-private.
         for (url, why) in [
-            (own.as_str(), "(the model proxy's own)"),
             ("http://169.254.169.254", "cloud metadata"),
             ("http://100.100.100.200", "(cloud metadata)"),
             ("http://10.1.2.3:4000", "(private)"),

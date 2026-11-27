@@ -3263,20 +3263,59 @@ async fn drain(paths: &Paths, no_wait: bool) -> Result<()> {
     Ok(())
 }
 
-/// The PID in `run.lock`, if one is there.
+/// The PID in `run.lock`, if one is there. Only `run` writes one, and whoever takes the lock
+/// empties it ([`run_lock`]), so a PID there while the lock is held is `run`'s.
 fn read_pid(path: &std::path::Path) -> Option<u32> {
-    std::fs::read_to_string(path)
+    let pid = std::fs::read_to_string(path)
         .ok()?
         .trim()
         .parse::<u32>()
-        .ok()
-        .filter(|pid| *pid > 1)
+        .ok()?;
+    pid_to_signal(pid, pid_1_is_this_program())
+}
+
+/// Whether `drain` may signal `pid`. Never 0. PID 1 only where PID 1 is this program
+/// (`one_is_us`): in the Helm chart's runner pod `run` is the image's entrypoint, so PID 1,
+/// and the pod's preStop `drain` must reach it. Elsewhere PID 1 is the system's init, which a
+/// `drain` that does not share `run`'s PID namespace (on the host, for a `run` in a container)
+/// must not signal.
+fn pid_to_signal(pid: u32, one_is_us: bool) -> Option<u32> {
+    match pid {
+        0 => None,
+        1 if !one_is_us => None,
+        pid => Some(pid),
+    }
+}
+
+/// Whether PID 1 runs this binary, as in a container whose entrypoint it is: the two
+/// executables are one file. Linux only (`/proc/1/exe`); elsewhere PID 1 is never this program.
+fn pid_1_is_this_program() -> bool {
+    let (Ok(one), Ok(own)) = (
+        std::fs::canonicalize("/proc/1/exe"),
+        std::env::current_exe().and_then(std::fs::canonicalize),
+    ) else {
+        return false;
+    };
+    one == own
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tinfirm_runner_host::kubernetes::{config, spec};
+
+    #[test]
+    fn drain_signals_pid_1_only_where_pid_1_is_this_program() {
+        // The runner pod: `run` is the entrypoint, PID 1, and `drain` runs in the same pod.
+        assert_eq!(pid_to_signal(1, true), Some(1));
+        // A host, or a `drain` outside the container of a `run`: PID 1 is init.
+        assert_eq!(pid_to_signal(1, false), None);
+        assert_eq!(pid_to_signal(0, true), None);
+        assert_eq!(pid_to_signal(4242, false), Some(4242));
+        // Here PID 1 is this program only where the test itself runs as PID 1, as `run` does
+        // in the runner pod (`unshare --pid --fork --mount-proc <this test binary>`).
+        assert_eq!(pid_1_is_this_program(), std::process::id() == 1);
+    }
 
     /// The pod driver's configuration that the chart renders for its CI values.
     const POD_CONFIG: &str =
