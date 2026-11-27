@@ -3180,6 +3180,33 @@ async fn a_host_stopped_as_the_server_goes_down_after_the_end_keeps_its_report()
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_stopped_after_the_server_refused_a_frame_keeps_its_report() {
+    with_timeout(180, async {
+        let repo = TestRepo::new();
+        let mut server = FakeServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let host = start_host_at(dir.path(), &server.url, restart_setup(true)).await;
+        let mut conn = server.accept().await;
+        conn.handshake(1).await;
+        let (spec, frame) = end_run("end-window", &repo.url, "");
+        run_to_its_end(&mut conn, &spec, frame).await;
+        // The server could not store the end, says so, and still answers the close in order.
+        conn.send(json!({
+            "type": "error",
+            "code": "INTERNAL_ERROR",
+            "message": "The server could not process the frame; it was ignored",
+        }));
+        host.shutdown.cancel();
+        host.handle.await.unwrap().unwrap();
+        let report = kept_report(dir.path(), spec.run_id, 1);
+        assert!(report.exists(), "{:?}", kept_reports(dir.path()));
+        let t = finished_by_the_next_host(&mut server, dir.path(), &spec).await;
+        assert_eq!(t.finished()["outcome"], "SUCCEEDED", "{}", t.text());
+    })
+    .await;
+}
+
 /// A host in this process whose runs' ends wait at `step` until the test removes
 /// `<dir>/halted`.
 async fn host_pausing_at(
