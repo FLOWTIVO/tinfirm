@@ -137,6 +137,4 @@ An installation that followed the development channel (images `sha-<commit>`, a 
 13. **Tell people that personal access tokens now expire** after 90 days, existing tokens included. A password change revokes them.
 14. **On instances with several companies,** review SCIM-provisioned users who never signed in and belong to more than one company.
 
-[1.0.0-rc.2]: https://github.com/FLOWTIVO/tinfirm/releases/tag/v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/FLOWTIVO/tinfirm/releases/tag/v1.0.0-rc.1
-[1.0.0]: https://github.com/FLOWTIVO/tinfirm/releases/tag/v1.0.0
