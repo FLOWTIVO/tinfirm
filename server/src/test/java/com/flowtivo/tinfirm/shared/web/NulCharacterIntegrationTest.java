@@ -201,6 +201,30 @@ class NulCharacterIntegrationTest extends IntegrationTest {
         JsonNode error = answer.json().get("error");
         assertThat(error.get("data").get("code").asString()).isEqualTo("VALIDATION_FAILED");
         assertThat(error.get("message").asString()).isEqualTo(NulCharacterException.DETAIL);
+
+        // The endpoint parses its body as JSON whatever the Content-Type says, also an overlong U+0000.
+        String bearer = "Bearer " + token.json().get("token").asString();
+        byte[] escaped = ("{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":"
+                + "\"list_agents\",\"arguments\":{\"cursor\":\"a\\u0000b\"}}}").getBytes(StandardCharsets.UTF_8);
+        byte[] overlong = concat(("{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":"
+                + "\"list_agents\",\"arguments\":{\"cursor\":\"a").getBytes(StandardCharsets.UTF_8),
+                new byte[] {(byte) 0xC0, (byte) 0x80}, "b\"}}}".getBytes(StandardCharsets.UTF_8));
+        Map<String, byte[]> bodies = new java.util.LinkedHashMap<>();
+        bodies.put("text/plain", escaped);
+        bodies.put("", escaped);
+        bodies.put("application/json", overlong);
+        bodies.forEach((type, body) -> {
+            Map<String, String> headers = new java.util.HashMap<>(Map.of("Authorization", bearer, "Accept",
+                    "application/json, text/event-stream"));
+            if (!type.isEmpty()) {
+                headers.put("Content-Type", type);
+            }
+            RawHttp.Answer raw = RawHttp.send(port, "POST", company.path("/mcp"), headers, body);
+            assertThat(raw.status()).as("%s: %s", type, raw.body()).isEqualTo(400);
+            JsonNode refused = JSON.readTree(raw.body()).get("error");
+            assertThat(refused.get("data").get("code").asString()).as(type).isEqualTo("VALIDATION_FAILED");
+            assertThat(refused.get("message").asString()).as(type).isEqualTo(NulCharacterException.DETAIL);
+        });
     }
 
     private static byte[] concat(byte[]... parts) {
