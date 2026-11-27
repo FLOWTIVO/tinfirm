@@ -1,0 +1,15 @@
+== R1 before the fix (the agent as of bb0cb70, under its units): the VM's user sets the sticky bit on its chroot, with its files in it
+made: node-1:vm-2db89f94bb42078352d8d07ca2263806
+as uid 1100000: chmod 1700 on the chroot of tfvm-00000000006d-0000: drwx-----T UNKNOWN
+delete, try 1: delete failed: node node-1: of the VM tfvm-00000000006d-0000 this is left: the jail /srv/tinfirm-jails/firecracker/tfvm-00000000006d-0000 (permission denied)
+delete: ERROR after 54 ms: {'code': -32000, 'message': 'node node-1: of the VM tfvm-00000000006d-0000 this is left: the jail /srv/tinfirm-jails/firecracker/tfvm-00000000006d-0000 (permission denied)'}
+delete: (None, 54)
+delete, try 2: delete failed: node node-1: of the VM tfvm-00000000006d-0000 this is left: the jail /srv/tinfirm-jails/firecracker/tfvm-00000000006d-0000 (permission denied)
+delete: ERROR after 5 ms: {'code': -32000, 'message': 'node node-1: of the VM tfvm-00000000006d-0000 this is left: the jail /srv/tinfirm-jails/firecracker/tfvm-00000000006d-0000 (permission denied)'}
+delete: (None, 5)
+list: {"vms": [{"id": "node-1:vm-2db89f94bb42078352d8d07ca2263806", "name": "sticky", "state": "failed", "address": "10.0.0.6", "port": 20000, "labels": {"tinfirm-host": "two-machine-run"}}]}
+on the node: jail tfvm-00000000006d-0000 still there with: dev firecracker firecracker.pid root.disk run userdata.disk vm.json vmlinux
+by hand, as root with every capability: chmod 0700, then the delete goes through
+delete, try 3: deleted node-1:vm-2db89f94bb42078352d8d07ca2263806
+delete: ({}, 19)
+left: jails 0, device-mapper 0, VM tables 0

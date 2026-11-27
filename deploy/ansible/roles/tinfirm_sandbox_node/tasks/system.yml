@@ -1,0 +1,97 @@
+---
+# The node agent's units, as they ran on a node (runner/crates/tinfirm-node-agent/units/; the
+# copies in files/ are checked against them in CI), and the node's own settings.
+- name: Install the node agent's units
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ _tinfirm_sandbox_node_units }}"
+  register: _tinfirm_sandbox_node_unit_files
+  notify:
+    - Restart the node's kernel modules
+    - Reload the node's firewall
+    - Run the node's hardening again
+    - Restart the node agent's helper
+    - Restart the node agent's listener
+
+- name: Create the listener's drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/tinfirm-node-agent-listener.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# The listener's unit denies every IP address; this admits the control host's alone.
+- name: Admit the control host to the listener
+  ansible.builtin.template:
+    src: listener-control-host.conf.j2
+    dest: /etc/systemd/system/tinfirm-node-agent-listener.service.d/control-host.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: _tinfirm_sandbox_node_dropin
+  notify: Restart the node agent's listener
+
+# net.ipv4.ip_forward = 1, which the helper reads and never writes, and
+# user.max_user_namespaces = 0 for every process of the node.
+# Before the firewall is enabled: a cloud-init that asked the metadata service at the next
+# start would never get an answer through it.
+- name: Switch cloud-init off for good
+  ansible.builtin.copy:
+    content: "Written by the role tinfirm_sandbox_node: the node's firewall drops the metadata service.\n"
+    dest: /etc/cloud/cloud-init.disabled
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - tinfirm_sandbox_node_cloud_init == 'disable'
+    - _tinfirm_sandbox_node_cloud_init.results[0].stat.exists
+
+# Before the firewall is enabled: it drops the node's DNS queries too. On a machine whose own
+# name is in no file (a cloud image whose name the platform's DNS answers), sudo then waits
+# 10 seconds for that name at every call, which is longer than Ansible waits for sudo: the
+# play's next task would fail (seen on a cloud image of Ubuntu 24.04, 2026-11-20). The name is
+# the one the kernel gives (`uname -n`), which sudo looks up; where it is a full name, the short
+# one goes on the same line.
+- name: Look for the node's own name in /etc/hosts
+  ansible.builtin.command:
+    argv: [getent, -s, files, hosts, "{{ ansible_facts['nodename'] }}"]
+  register: _tinfirm_sandbox_node_own_name
+  changed_when: false
+  failed_when: _tinfirm_sandbox_node_own_name.rc not in [0, 2]
+
+- name: Make the node's own name resolve without DNS
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: >-
+      127.0.1.1 {{ ansible_facts['nodename'] }}{{
+        '' if ansible_facts['nodename'] == ansible_facts['hostname'] else ' ' ~ ansible_facts['hostname'] }}
+    owner: root
+    group: root
+    mode: "0644"
+  when: _tinfirm_sandbox_node_own_name.rc == 2
+
+- name: Install the node's sysctl settings
+  ansible.builtin.copy:
+    src: tinfirm-node-agent.sysctl.conf
+    dest: /etc/sysctl.d/60-tinfirm-node-agent.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply the node's sysctl settings
+
+# The node's own firewall: one table, with this node's values in its `define` lines. nft
+# checks the file before it is written; loading it again replaces that table alone.
+- name: Write the node's firewall
+  ansible.builtin.template:
+    src: firewall.nft.j2
+    dest: "{{ _tinfirm_sandbox_node_firewall }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: nft -c -f %s
+  notify: Reload the node's firewall

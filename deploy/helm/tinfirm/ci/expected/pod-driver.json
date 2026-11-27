@@ -1,0 +1,55 @@
+{
+  "bridgePort": 7443,
+  "devices": {
+    "kvm": "devices.example.com/kvm",
+    "tun": "devices.example.com/tun"
+  },
+  "disk": {
+    "variant": "copy",
+    "volume": "emptyDir"
+  },
+  "image": "registry.example.com:5000/tinfirm/vm-pod@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "isolationStatement": "the workers for runs hold nothing else",
+  "namespace": "tinfirm-runs",
+  "nodeSelector": {
+    "tinfirm.flowtivo.com/kvm": "true"
+  },
+  "policies": {
+    "allowRunner": "tinfirm-runs-allow-runner",
+    "defaultDeny": "tinfirm-runs-default-deny"
+  },
+  "resourceQuota": "tinfirm-runs",
+  "runServiceAccount": "tinfirm-run",
+  "runner": {
+    "labels": {
+      "app.kubernetes.io/component": "runner",
+      "app.kubernetes.io/instance": "tinfirm",
+      "app.kubernetes.io/name": "tinfirm"
+    },
+    "namespace": "tinfirm"
+  },
+  "tap": {
+    "cidr": "172.30.0.0/30",
+    "mode": "multus",
+    "networkAttachment": "kube-system/tinfirm-tap"
+  },
+  "templates": {
+    "sandbox-4c8g": {
+      "diskMib": 32768,
+      "memoryMib": 8192,
+      "vcpus": 4
+    },
+    "sandbox-8c16g": {
+      "diskMib": 65536,
+      "memoryMib": 16384,
+      "vcpus": 8
+    }
+  },
+  "tolerations": [
+    {
+      "effect": "NoSchedule",
+      "key": "tinfirm.flowtivo.com/kvm",
+      "operator": "Exists"
+    }
+  ]
+}

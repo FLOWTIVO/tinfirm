@@ -295,7 +295,7 @@ final class ToolRules {
             case RECONNECT_COMPANY -> "an admin signs the granted account in again";
             case CHOOSE -> names.person() + " reconnects their own account or uses a grant";
             case PICK_GRANT -> names.person() + " picks a grant";
-            case SUSPENDED -> "an admin resumes the account's holder";
+            case SUSPENDED -> "the suspension of the account's holder is lifted";
             case SYSTEM_OFF -> "an admin switches personal MCP servers on";
             default -> names.person() + " connects it";
         };

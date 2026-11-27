@@ -1,0 +1,65 @@
+# The AppArmor profile of every VM's VMM (ADR-0113, decision 5): one profile for all of them,
+# since every VM's files have the same names in its own jail and the users keep the VMs
+# apart. CI parses it. On 2026-11-22 it ran on one node (an Ubuntu 24.04 cloud image): in complain
+# mode with no apparmor="ALLOWED" line, and in enforce mode, through a real conversation and a
+# make that failed after its VMM started, with no apparmor="DENIED" line. The role loads it in
+# enforce mode by default. On a distribution or kernel it has not run on, load it first in
+# complain mode, run VMs with and without guestConsole and a make that fails, and read the
+# apparmor="ALLOWED" lines before it is enforced (the crate's README, "The VMM's profile").
+#
+# How it attaches: the helper, `start-jailer` and the jailer are unconfined, and the jailer
+# execs Firecracker after its pivot_root into the jail, so the exec's path is /firecracker.
+# The longer form is the same file seen from the node, under the default chroot base.
+#
+# Each rule names what in src/linux.rs makes the VMM open it. Firecracker is a static binary
+# (musl): it loads no library. It holds no capability (the helper checks its status at each
+# make), so the profile grants none; nothing mounts /proc or /sys in a jail, so it has no rule
+# for them.
+
+abi <abi/3.0>,
+
+profile tinfirm-vmm /{,srv/tinfirm-jails/firecracker/tfvm-*/root/}firecracker flags=(attach_disconnected) {
+  # Its own binary, which the jailer copies into the jail (`--exec-file`).
+  /firecracker mr,
+
+  # firecracker_config: `boot-source.kernel_image_path` (KERNEL).
+  /vmlinux r,
+  # firecracker_config: the drive `root`, `is_read_only: false` (ROOT_DISK, the block node of
+  # the VM's snapshot that the helper makes with mknod).
+  /root.disk rw,
+  # firecracker_config: the drive `userdata`, `is_read_only: true` (USER_DATA_DISK).
+  /userdata.disk r,
+  # jailer_argv: `--config-file` (VM_CONFIG).
+  /vm.json r,
+  # jailer_argv: `--log-path` (VMM_LOG). Firecracker opens its log to read and write.
+  /firecracker.log rw,
+
+  # jailer_argv: `--api-sock` (API_SOCKET). It makes the socket, removes an old one, and the
+  # helper (unconfined) connects to it to ask whether the guest runs (vmm_runs).
+  /run/firecracker.socket rw,
+  network unix stream,
+  unix (create, bind, listen, accept, send, receive, getattr, getopt, setopt, shutdown) type=stream,
+
+  # The devices the jailer makes in the jail: KVM, and the tap device that
+  # firecracker_config's network interface (`host_dev_name`) opens. /dev/urandom is kept:
+  # whether Firecracker opens it is not known, and no run can show it while this rule allows
+  # the open, in either mode. /dev/userfaultfd, which the jailer also makes, is left out: it
+  # serves a snapshot's restore, which the helper never asks for.
+  /dev/kvm rw,
+  /dev/net/tun rw,
+  /dev/urandom r,
+
+  # What it inherits from the helper (build, "The VMM"): standard input /dev/null; standard
+  # output /dev/null, or <work>/<jail>.console with guestConsole; standard error
+  # <work>/<jail>.errors. They are opened outside the jail, so their paths are disconnected
+  # from it (attach_disconnected); the rules give their paths as the node sees them, under
+  # the default work directory.
+  /dev/null rw,
+  /var/lib/tinfirm-node-agent/work/tfvm-*.console w,
+  /var/lib/tinfirm-node-agent/work/tfvm-*.errors w,
+
+  # Its own threads signal each other (a vCPU's kick); the helper, the jailer and the kernel's
+  # cgroup.kill end it.
+  signal (send, receive) peer=tinfirm-vmm,
+  signal (receive) peer=unconfined,
+}

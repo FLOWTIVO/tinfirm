@@ -1,6 +1,9 @@
 package com.flowtivo.tinfirm.runner;
 
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 
@@ -36,10 +39,55 @@ public interface RunnerSessionListener {
     List<RunnerMessages.Outbound> runMessage(ConnectedHost host, RunnerMessages.RunMessage message);
 
     /**
+     * The {@code run.git.revoke} frames of an answer ({@link #hostConnected}, {@link #runMessage},
+     * {@link #beforeCancelOfForeignRun}) that were written to the host's connection, after the write (ADR-0116): their
+     * revocations count as sent from now. A frame whose write failed is not among them. Called in the tenant context of
+     * the company whose runs they are, outside any transaction.
+     */
+    default void revocationsWritten(UUID companyId, List<RunnerMessages.RunGitRevoke> written) {
+    }
+
+    /**
+     * ADR-0116: a run that the host reports in {@code hello} and that is of a company the host is not in (a machine
+     * whose owner left it): the {@code run.git.revoke} frames that go before its {@code run.cancel}, for the epoch the
+     * host reports, and only when that assignment went to this machine, so that a host learns nothing of a run it does
+     * not hold. Called in the tenant context of the run's company, outside any transaction.
+     *
+     * @param personalHostId   the machine that reports the run
+     * @param takesRevocations whether the connection takes {@code run.git.revoke} (protocol 2 and the feature)
+     */
+    default List<RunnerMessages.Outbound> beforeCancelOfForeignRun(UUID companyId, UUID personalHostId,
+            RunnerMessages.ActiveRun run, boolean takesRevocations) {
+        return List.of();
+    }
+
+    /**
+     * ADR-0116: ends the answer to a {@code hello} that lists {@code run.git.revoke}, after its other frames were
+     * written. Writes with {@code write}, in this order, the revocations of the runs the hello listed (in each company,
+     * for the epoch it listed, of an assignment that went to that presence) that were not written to a connection yet,
+     * and then {@code welcome.done}, while no revocation of a run on these hosts can commit; then counts the
+     * revocations written as sent. Called outside any transaction and any tenant context.
+     *
+     * @param listed the host's presences, each with the runs the hello listed in its company
+     * @param write  writes a frame to the connection; false when the write failed
+     */
+    default void endHelloAnswer(Map<ConnectedHost, List<RunnerMessages.ActiveRun>> listed,
+            Predicate<RunnerMessages.Outbound> write) {
+        write.test(new RunnerMessages.WelcomeDone());
+    }
+
+    /**
      * After {@code host.config.applied} was stored: the host's confirmed capacity or draining state changed, and on
      * the first one of a connection the host starts taking runs. Dispatches without waiting for the next tick.
      */
     void hostConfigured(ConnectedHost host);
+
+    /**
+     * ADR-0117: the host's problems changed from none to some ({@code healthy} false), or from some to none
+     * ({@code healthy} true), in this company's context. The runs that wait in a back-off after this host's
+     * rejections are placed again now, and the dispatcher runs without waiting for its next tick.
+     */
+    void hostHealthChanged(ConnectedHost host, boolean healthy);
 
     /**
      * The connected host sent a frame, and its runs' leases were last renewed this way at least

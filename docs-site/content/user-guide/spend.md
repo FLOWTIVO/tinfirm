@@ -29,7 +29,7 @@ Tinfirm keeps a key at the gateway for you, with your budget on it. You never se
 | **Model access is not set up yet** | An Admin has not set up the company's model gateway. Until then nothing is paid by a budget, and new conversations are refused unless a subscription of yours pays |
 | **Your budget is being set up** | Tinfirm is creating your key at the gateway; it is ready in a moment |
 | **Your budget is spent until {day}** | Turns it pays wait until it resets |
-| **Your budget is blocked** | Your access to the company is suspended; nothing is paid by your budget until an Admin resumes it |
+| **Your budget is blocked** | Your access to the company is suspended; nothing is paid by your budget until the suspension is lifted |
 | **Your budget cannot be used right now** | The gateway refused your key or cannot be reached. Turns it pays wait, and Tinfirm tries again by itself |
 
 Your budget can pay only for a model the gateway serves and your budget allows. Choose the model in your **My settings** for the agent: a budget needs one.

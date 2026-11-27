@@ -1,0 +1,27 @@
+# Grows the VM's root file system to the size of its disk, once at boot, before Docker starts
+# (local-disk.sh installs it). A run pod's image holds the VM image shrunk to what it uses
+# (ee/runner/images/vm/pod-image.sh), and the pod grows its copy to the template's disk size
+# (ADR-0115, decision 2): without this unit the guest would see only the shrunk file system.
+#
+# It runs only where the kernel's command line carries `tinfirm.grow-root`, which a run pod's
+# program sets (vm_pod.rs, GROW_ROOT_CMDLINE). A sandbox node's VM does not carry the word: its
+# file system fills its disk already, and the unit is skipped there. The root disk is the VM's
+# first drive, /dev/vda. A resize that does not end within two minutes is given up, and the
+# boot goes on with the file system as it is.
+[Unit]
+Description=Tinfirm sandbox: grow the root file system to its disk
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=local-fs.target containerd.service docker.service tinfirm-vm-boot.service shutdown.target
+Conflicts=shutdown.target
+ConditionKernelCommandLine=tinfirm.grow-root
+ConditionPathExists=/dev/vda
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=120
+ExecStart=/usr/sbin/resize2fs /dev/vda
+
+[Install]
+WantedBy=local-fs.target

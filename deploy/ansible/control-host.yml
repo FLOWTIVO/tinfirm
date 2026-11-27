@@ -1,0 +1,18 @@
+---
+# Tinfirm control hosts: runner hosts with `run --executor vm --vm-driver node`, which hold the
+# credentials and run no agent code; the VMs run on sandbox nodes (ADR-0112;
+# deploy/ansible/README.md, "Sandbox nodes"). No Docker, no Kata, no runner images. Not ready
+# for production.
+#
+#   ansible-playbook -i inventory.yml deploy/ansible/control-host.yml --ask-vault-pass
+#
+# A first set-up runs it twice: once to make the client certificate whose fingerprint the nodes
+# pin, then, after sandbox-node.yml, with each node's fingerprint.
+
+- name: Tinfirm control hosts with sandbox nodes
+  hosts: tinfirm_control_hosts
+  become: true
+  vars:
+    tinfirm_runner_host_executor: vm
+  roles:
+    - role: tinfirm_runner_host

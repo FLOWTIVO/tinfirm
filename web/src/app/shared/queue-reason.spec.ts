@@ -49,6 +49,8 @@ describe('queueReasonView (the package 3 contract, §5.7)', () => {
     ${'NO_HOST_FOR_SKILLS'}      | ${MEMBER} | ${'Your runner hosts'}   | ${['accounts']}                        | ${{ tab: 'hosts' }}  | ${undefined}
     ${'NO_HOST_FOR_SKILLS'}      | ${ADMIN}  | ${'Runner hosts'}        | ${['runner-hosts']}                    | ${undefined}         | ${'host-h-office'}
     ${'NO_HOST_FOR_CREDENTIALS'} | ${ADMIN}  | ${'Runner hosts'}        | ${['runner-hosts']}                    | ${undefined}         | ${'host-h-office'}
+    ${'NO_HOST_OF_LEVEL'}        | ${MEMBER} | ${'Open the agent'}      | ${['agents', IDS.agent]}               | ${undefined}         | ${undefined}
+    ${'NO_HOST_OF_LEVEL'}        | ${ADMIN}  | ${'Runner hosts'}        | ${['runner-hosts']}                    | ${undefined}         | ${'host-h-office'}
     ${'RUNNER_HOST_OFFLINE'}     | ${ADMIN}  | ${'Runner hosts'}        | ${['runner-hosts']}                    | ${undefined}         | ${'host-h-office'}
   `(
     'links $code to its fix for the reader',

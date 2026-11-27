@@ -43,7 +43,8 @@ spring:
     multipart:
       # A conversation's files and a runner host's uploads of /output (ADR-0014): one file per request, buffered on
       # disk. The same variable as tinfirm.attachment.max-file-size, so an oversized upload is refused before it is
-      # read completely (413 ATTACHMENT_TOO_LARGE).
+      # parsed or stored (413 ATTACHMENT_TOO_LARGE; tinfirm.attachment.max-drain-size says how much of it is still
+      # read and thrown away so that the client gets the answer).
       max-file-size: ${TINFIRM_ATTACHMENT_MAX_FILE_SIZE:25MB}
       max-request-size: ${TINFIRM_ATTACHMENT_MAX_REQUEST_SIZE:26MB}
       # The body is parsed, and its parts written to disk, only when a handler first reads a parameter or a part, after
@@ -159,9 +160,11 @@ tinfirm:
     # Limits handed to the runner host with every assignment.
     max-wall-clock: ${TINFIRM_RUN_MAX_WALL_CLOCK:PT60M}
     max-turns: ${TINFIRM_RUN_MAX_TURNS:200}
-    # An assigned run without run.accepted goes back to the queue after this; a rejected run waits this long.
+    # An assigned run without run.accepted goes back to the queue after this; a rejected run waits reject-backoff,
+    # twice as long after each further rejection in a row by the same host, at most reject-backoff-max.
     accept-timeout: ${TINFIRM_RUN_ACCEPT_TIMEOUT:PT10S}
     reject-backoff: ${TINFIRM_RUN_REJECT_BACKOFF:PT10S}
+    reject-backoff-max: ${TINFIRM_RUN_REJECT_BACKOFF_MAX:PT5M}
     # Stored events per run; LOG events are dropped first.
     max-events-per-run: ${TINFIRM_RUN_MAX_EVENTS_PER_RUN:20000}
     # Lifetime of one SSE stream of run events; the client reconnects with Last-Event-ID.
@@ -217,6 +220,11 @@ tinfirm:
     max-file-size: ${TINFIRM_ATTACHMENT_MAX_FILE_SIZE:25MB}
     max-files-per-conversation: ${TINFIRM_ATTACHMENT_MAX_FILES_PER_CONVERSATION:50}
     max-conversation-size: ${TINFIRM_ATTACHMENT_MAX_CONVERSATION_SIZE:250MB}
+    # An upload over the multipart limit (above) that declares at most this many bytes, from an authenticated caller,
+    # is read to its end and thrown away before its 413 is answered, so that a client still sending gets the answer
+    # instead of a reset connection (shared.web.ApiExceptionHandler). Neither memory nor disk holds it. A larger one,
+    # and any anonymous one, is closed after the answer. The bundled reverse proxies let 64 MiB through.
+    max-drain-size: ${TINFIRM_ATTACHMENT_MAX_DRAIN_SIZE:64MB}
   conversation:
     change-requests:
       # The state of a watched change request (not MERGED) is read again this long after the last read; at least

@@ -17,6 +17,7 @@ import com.flowtivo.tinfirm.shared.api.model.CredentialLendRequest;
 import com.flowtivo.tinfirm.shared.api.model.SignInRequest;
 import com.flowtivo.tinfirm.shared.api.model.SignInStart;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredential;
+import com.flowtivo.tinfirm.shared.api.model.SystemCredentialAppCreateRequest;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredentialClientCreateRequest;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredentialCreateRequest;
 import com.flowtivo.tinfirm.shared.api.model.SystemCredentialList;
@@ -58,6 +59,18 @@ class CredentialsController implements CredentialsApi {
     public ResponseEntity<SystemCredential> addSystemCredentialClient(UUID companyId, UUID systemId,
             SystemCredentialClientCreateRequest body) {
         return ResponseEntity.status(HttpStatus.CREATED).body(credentials.addClient(companyId, systemId, body));
+    }
+
+    @Override
+    public ResponseEntity<SystemCredential> addSystemCredentialApp(UUID companyId, UUID systemId,
+            SystemCredentialAppCreateRequest body) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(credentials.addApp(companyId, systemId, body));
+    }
+
+    @Override
+    public ResponseEntity<SystemCredential> checkSystemCredentialApp(UUID companyId, UUID systemId,
+            UUID credentialId) {
+        return ResponseEntity.ok(credentials.checkApp(companyId, systemId, credentialId));
     }
 
     @Override

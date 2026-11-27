@@ -17,6 +17,7 @@ import com.flowtivo.tinfirm.shared.security.ActorAuthentication;
 import com.flowtivo.tinfirm.shared.security.AuthenticatedUser;
 import com.flowtivo.tinfirm.shared.tenant.TenantContext;
 import com.flowtivo.tinfirm.shared.tenant.TenantContextHolder;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 
 /**
@@ -45,6 +46,8 @@ class OAuthCompanyAccess {
         this.guard = guard;
         this.memberships = memberships;
         this.transactions = new TransactionTemplate(transactionManager);
+        // A guard's check on the authorization server's chain, not a request's change.
+        this.transactions.setName(AfterTransaction.BOOKKEEPING);
     }
 
     /** The active user of a principal name (a user id), loaded fresh. */

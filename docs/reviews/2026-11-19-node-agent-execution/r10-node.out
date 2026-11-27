@@ -1,0 +1,54 @@
+== the node: tinfirm-node-agent 1.0.0-rc.2-SNAPSHOT
+active active active
+== verify, as the control host's driver gets it (the lines about the firewall, the room and the memory)
+verify: 9 ms, problems [], maxVms 2
+problems: []
+checked: node node-1: 2 free
+checked: node node-1: room for 2 snapshot(s) of this template
+checked: node node-1: memory for 2 VM(s) of this template
+checked: node node-1: the cgroup controller memory
+checked: node node-1: the node's own firewall table (inet tinfirm_node)
+
+== 1. a jail is a file system of its own
+in the helper's mount namespace: /srv/tinfirm-jails/firecracker/tfvm-000000000075-0000/root rw,nosuid,relatime shared:372 - tmpfs tinfirm-jail rw,size=65536k,nr_inodes=1024,mode=700,inode64
+in the node's own namespace the chroot is an empty directory: 0 entries; the user data and the VMM's files are in memory only
+the VMM's root: dev firecracker firecracker.log firecracker.pid root.disk run userdata.disk vm.json vmlinux ; 16384 blocks of 4096 bytes, 5562 free; 1024 inodes, 1008 free
+the VMM's standard output and error: /var/lib/tinfirm-node-agent/work/tfvm-000000000075-0000.console, /var/lib/tinfirm-node-agent/work/tfvm-000000000075-0000.errors
+Firecracker's log: 34 lines, the last: 2026-11-20T06:29:00.487545677 [tfvm-000000000075-0000:fc_vcpu 0:WARN] vcpu: IO write @ 0x2e9:0x1 failed: bus_error: MissingAddressRange
+-- the VM's user fills it: bytes, then names, then a sticky directory and the sticky bit on the chroot itself (R1)
+22781952 bytes (23 MB, 22 MiB) copied, 0.00684432 s, 3.3 GB/s
+names until none is left: 1007
+chmod 1700 on a directory with a file, and on the chroot: done
+the jail now: 0 blocks free, 1 inodes free; the node's work file system changed by 12 KiB; the VMM still runs: 1
+-- the next VM beside it
+created node-1:vm-16704dc362e2d420773f1daca652d5bb (jail-b) from the template sandbox-2c2g
+create: 154 ms, id node-1:vm-16704dc362e2d420773f1daca652d5bb; describe: 8 ms, running at 10.0.0.6:20001
+list: {"vms": [{"address": "10.0.0.6", "id": "node-1:vm-a114d9ecb75185acf3478eee77c61220", "labels": {"tinfirm-host": "two-machine-run"}, "name": "jail-a", "port": 20000, "state": "running"}, {"address": "10.0.0.6", "id": "node-1:vm-16704dc362e2d420773f1daca652d5bb", "labels": {"tinfirm-host": "two-machine-run"}, "name": "jail-b
+delete of the filled, sticky one: delete: ({}, 86)
+delete of the other: delete: ({}, 88)
+left: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, work files 0, jail mounts in the helper's namespace 0, in the node's 0
+
+== 2. the helper is started again while a VM runs (its new mount namespace does not hold the jail's file system)
+after the restart: VMMs 1; jail mounts in the new helper's namespace: 0
+list: {"vms": [{"address": "10.0.0.6", "id": "node-1:vm-e7e02c717f76bf4ab26ef7f58b1cee4a", "labels": {"tinfirm-host": "two-machine-run"}, "name": "restart", "port": 20000, "state": "running"}]}
+delete: delete: ({}, 62)
+left: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, work files 0, jail mounts in the helper's namespace 0, in the node's 0
+
+== 3. R5: the node's firewall table and the agent
+with the table deleted by hand, verify: problems []
+checked: node node-1: NOT THERE: the node's own firewall table (inet tinfirm_node); the node lets out and in whatever its network allows
+a typing mistake in the firewall file (control_host = 10.0.0.555), then a restart of the firewall and of the agent:
+A dependency job for tinfirm-node-agent-listener.service failed. See 'journalctl -xe' for details.
+  firewall failed, helper inactive, listener inactive
+  /etc/tinfirm/node-agent/firewall.nft:21:23-32: Error: Could not resolve hostname: Name or service not known
+  /etc/tinfirm/node-agent/firewall.nft:21:23-32: Error: Could not resolve hostname: Name or service not known
+corrected and started: firewall active, helper active, listener active
+a restart of the firewall unit: the table before 1, after 1; a stop leaves it: 1 (the helper, which requires the unit, stops with it: inactive)
+created node-1:vm-6e5415aa40d48b51d05075711c419287 (two-machine-run-0) from the template sandbox-2c2g
+deleted node-1:vm-6e5415aa40d48b51d05075711c419287
+create: 153 ms, id node-1:vm-6e5415aa40d48b51d05075711c419287; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2643 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 5 ms, 1 VM
+delete: 66 ms; then describe says gone; the port answers `nothing`
+
+== 4. R6: a jailer of another name in the configuration
+Error: firecracker.jailer must be a file named `jailer`

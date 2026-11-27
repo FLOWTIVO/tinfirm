@@ -4,9 +4,12 @@ import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -47,9 +50,9 @@ import tools.jackson.databind.json.JsonMapper;
  * still runs it: it lists the run in {@code hello}, or sends a heartbeat or {@code run.finished} for it.
  * <p>
  * Locks (CONVENTIONS §10): a frame that may write the run's conversation ({@code run.accepted}, {@code run.rejected},
- * {@code run.finished}, a heartbeat that resumes a run, {@code hello}, a platform request, {@code run.steer.ack}) locks
- * the conversation's row before the run's, and {@code hello} the conversations of all the runs it handles, in the
- * order of their ids, before any run; an event frame and a lease's renewal lock runs only.
+ * {@code run.finished}, a heartbeat that resumes a run or reports an earlier epoch, {@code hello}, a platform request,
+ * {@code run.steer.ack}) locks the conversation's row before the run's, and {@code hello} the conversations of all
+ * the runs it handles, in the order of their ids, before any run; an event frame and a lease's renewal lock runs only.
  * <p>
  * Flood controls (the security review of 2026-10-27, M4), before any transaction ({@link RunnerFloodControl}): a
  * {@code run.request} over its host's or its company's rate is answered {@code REJECTED TOO_MANY_REQUESTS}; a
@@ -117,11 +120,15 @@ class RunnerSessionHandler implements RunnerSessionListener {
 
     private final RunnerFloodControl flood;
 
+    private final GitRevocationService revocations;
+
     RunnerSessionHandler(RunStore runs, RunLocks locks, RunEventStore events, RunCommandStore commands,
             RunCompletion completion, RunResumption resumption, RunRequestRouter requests, RunDispatcher dispatcher,
             RunEventHub hub, RunMetrics metrics, ApplicationEventPublisher publisher, SystemTransactions transactions,
             RunnerProperties runnerProperties, RunProperties properties, TimeSource time,
-            PublicSuffixPush publicSuffixes, RunPorts ports, SessionBundleCleanup bundles, RunnerFloodControl flood) {
+            PublicSuffixPush publicSuffixes, RunPorts ports, SessionBundleCleanup bundles, RunnerFloodControl flood,
+            GitRevocationService revocations) {
+        this.revocations = revocations;
         this.flood = flood;
         this.ports = ports;
         this.bundles = bundles;
@@ -146,6 +153,22 @@ class RunnerSessionHandler implements RunnerSessionListener {
     /** The host confirmed its capacity: it may take runs now (the first time on a connection) or fewer or more. */
     @Override
     public void hostConfigured(ConnectedHost host) {
+        dispatcher.nudge();
+    }
+
+    /**
+     * ADR-0117, decision 6: the host's problems came or went. The runs that wait in a back-off after its rejections are
+     * placed again at once, with their count of rejections: once it is healthy they go to it, while it has a problem
+     * they go to another host or wait with its problem as their reason. Then the dispatcher runs.
+     */
+    @Override
+    public void hostHealthChanged(ConnectedHost host, boolean healthy) {
+        int released = transactions.inCompany(host.companyId(),
+                () -> runs.releaseRejectedBy(host.runnerHostId(), time.now()));
+        if (released > 0) {
+            log.info("Runner host {} reports that it takes {}: {} runs it rejected are placed again now",
+                    host.runnerHostId(), healthy ? "runs again" : "no run", released);
+        }
         dispatcher.nudge();
     }
 
@@ -185,6 +208,10 @@ class RunnerSessionHandler implements RunnerSessionListener {
                 // A call on a system may take a minute: never in a transaction, never holding up the frames.
                 return requests.call(host, request);
             }
+            if (RunnerMessages.RequestKind.GIT_TOKEN.name().equals(request.kind())) {
+                // A mint at GitHub (ADR-0116): never in a transaction, never holding up the frames.
+                return requests.gitToken(host, request);
+            }
         }
         if (message instanceof RunnerMessages.RunEvent event) {
             return event(host, event);
@@ -197,6 +224,7 @@ class RunnerSessionHandler implements RunnerSessionListener {
             case RunnerMessages.RunFinished finished -> finished(host, finished);
             case RunnerMessages.RunRequest request -> requests.request(host, request);
             case RunnerMessages.RunSteerAck ack -> steered(host, ack);
+            case RunnerMessages.RunGitRevoked revoked -> revocations.confirmed(host, revoked);
             case RunnerMessages.RunRepositoryRequest request -> List.of(RunnerMessages.RunRepositoryRequestAck
                 .rejected(request.runId(), request.requestId(), RunRequestRouter.RUN_NOT_ACTIVE, NOT_V2));
             case RunnerMessages.RunTaskCreate create -> List.of(RunnerMessages.RunTaskCreateAck
@@ -204,6 +232,30 @@ class RunnerSessionHandler implements RunnerSessionListener {
             case RunnerMessages.RunAsk ask -> List.of(RunnerMessages.RunAskAck
                 .rejected(ask.runId(), ask.requestId(), RunRequestRouter.RUN_NOT_ACTIVE, NOT_V2));
         });
+    }
+
+    /** ADR-0116: the revocations of an answer that were written to the host's connection count as sent. */
+    @Override
+    public void revocationsWritten(UUID companyId, List<RunnerMessages.RunGitRevoke> written) {
+        revocations.written(written);
+    }
+
+    /**
+     * ADR-0116: before the cancel of a run of a company a machine is no longer in, its revocations, in one
+     * transaction of the run's company ({@link GitRevocationService#beforeForeignCancel}).
+     */
+    @Override
+    public List<RunnerMessages.Outbound> beforeCancelOfForeignRun(UUID companyId, UUID personalHostId,
+            RunnerMessages.ActiveRun run, boolean takesRevocations) {
+        return transactions.inCompany(companyId, () -> revocations.beforeForeignCancel(personalHostId, run.runId(),
+                run.epoch(), takesRevocations));
+    }
+
+    /** ADR-0116: the end of a hello's answer ({@link GitRevocationService#endHelloAnswer}). */
+    @Override
+    public void endHelloAnswer(Map<ConnectedHost, List<RunnerMessages.ActiveRun>> listed,
+            Predicate<RunnerMessages.Outbound> write) {
+        revocations.endHelloAnswer(listed, write);
     }
 
     private static final String NOT_V2 = "The run is not active: this server runs conversations on hosts of runner "
@@ -220,8 +272,11 @@ class RunnerSessionHandler implements RunnerSessionListener {
      * <li>any other run the host reports is resumed when it was lost by lease expiry and the rule of
      * {@link RunResumption} allows it, and cancelled otherwise.</li>
      * </ul>
-     * Pending cancel commands of the kept and resumed runs are sent again. A v2 host that holds no Public Suffix List,
-     * or another version than the server's, gets the server's first ({@code psl.update}, {@link PublicSuffixPush}).
+     * Pending revocations of git tokens (ADR-0116) and cancel commands of the kept and resumed runs are sent again, the
+     * revocations first; and every {@code run.cancel} of the answer follows the revocations its host must hear first
+     * ({@link GitRevocationService#beforeCancels}), since a cancelled run pushes its work. A v2 host that holds no
+     * Public Suffix List, or another version than the server's, gets the server's first ({@code psl.update},
+     * {@link PublicSuffixPush}).
      */
     @Override
     public List<RunnerMessages.Outbound> hostConnected(ConnectedHost host, List<RunnerMessages.ActiveRun> activeRuns,
@@ -239,6 +294,8 @@ class RunnerSessionHandler implements RunnerSessionListener {
             List<RunStore.RunRow> handled = new ArrayList<>(occupying);
             reported.keySet().forEach(runId -> runs.find(runId).ifPresent(handled::add));
             locks.lockConversations(handled);
+            Set<UUID> locked = new HashSet<>();
+            handled.forEach(run -> locked.add(run.id()));
             for (RunStore.RunRow listed : occupying) {
                 RunStore.RunRow run = runs.lock(listed.id()).orElse(null);
                 if (run == null || !run.status().active()) {
@@ -287,8 +344,10 @@ class RunnerSessionHandler implements RunnerSessionListener {
                     replies.add(new RunnerMessages.RunCancel(other.runId(), other.epoch()));
                 }
             }
+            // A revocation goes before a cancel: a cancelled run pushes its work (ADR-0116).
+            replies.addAll(revocations.pending(host, kept, now));
             replies.addAll(pendingCancels(kept, now));
-            return replies;
+            return revocations.beforeCancels(host, replies, locked);
         });
     }
 
@@ -312,6 +371,11 @@ class RunnerSessionHandler implements RunnerSessionListener {
     // ---- run.accepted / run.rejected ------------------------------------------------------------------------------
 
     private List<RunnerMessages.Outbound> accepted(ConnectedHost host, RunnerMessages.RunAccepted accepted) {
+        // The run is locked, its conversation first: a cancel's revocations may be recorded (ADR-0116).
+        return revocations.beforeCancels(host, accept(host, accepted), Set.of(accepted.runId()));
+    }
+
+    private List<RunnerMessages.Outbound> accept(ConnectedHost host, RunnerMessages.RunAccepted accepted) {
         RunStore.RunRow run = locks.lock(accepted.runId()).orElse(null);
         List<RunnerMessages.Outbound> problem = check(host, run, accepted.runId(), accepted.epoch(), true);
         if (problem != null) {
@@ -325,7 +389,9 @@ class RunnerSessionHandler implements RunnerSessionListener {
                 markRunning(run, time.now());
                 log.info("Run {} of conversation {} accepted by runner host {}", run.id(), run.conversationKey(),
                         host.runnerHostId());
-                return List.of();
+                // A revocation sent while the assignment was on its way may have reached the host before it, which
+                // dropped it (ADR-0116): it goes again now that the host runs the run.
+                return revocations.pending(host, List.of(run.id()), time.now());
             }
             case RUNNING -> {
                 runs.renewLease(run.id(), run.epoch(), host.runnerHostId(), lease(time.now()));
@@ -347,11 +413,26 @@ class RunnerSessionHandler implements RunnerSessionListener {
         if (run.status() == RunStatus.QUEUED && run.dispatchedAt() != null) {
             log.info("Runner host {} rejected run {} ({}): {}", host.runnerHostId(), run.id(),
                     abbreviate(rejected.code(), 300), abbreviate(rejected.reason(), 300));
-            // The run waits until retryAt: the dispatcher does not look at it before, so the reason stays.
+            // The run waits until retryAt: the dispatcher does not look at it before, so the reason stays. A host that
+            // rejects the same run again makes it wait twice as long each time, up to rejectBackoffMax: each attempt
+            // assigns the run anew, with its audit events, its credentials and a new epoch, which a host that cannot
+            // run anything for hours would otherwise cost every rejectBackoff. TASK_RUN_ACTIVE passes by itself
+            // once the previous turn ends there: it keeps the short wait and leaves the count as it was.
             Instant now = time.now();
-            Instant retryAt = now.plus(properties.rejectBackoff());
+            QueueReason.Rejections before = run.queueReason() != null
+                    ? run.queueReason().rejectionsBy(host.runnerHostId()) : null;
+            QueueReason.Rejections counted;
+            Instant retryAt;
+            if (RunnerMessages.TASK_RUN_ACTIVE.equals(rejected.code())) {
+                counted = before;
+                retryAt = now.plus(properties.rejectBackoff());
+            }
+            else {
+                counted = new QueueReason.Rejections(host.runnerHostId(), before != null ? before.count() + 1 : 1);
+                retryAt = now.plus(properties.rejectBackoff(counted.count()));
+            }
             QueueReason reason = QueueReason.rejected(run.runnerHostId(), run.runnerHostName(), rejected.code(),
-                    rejected.reason(), retryAt);
+                    rejected.reason(), retryAt).withRejections(counted);
             runs.requeue(run.id(), retryAt, reason, now);
             publisher.publishEvent(TurnStarter.queueReasonChanged(run, reason));
             hub.changedAfterCommit(run.id());
@@ -527,15 +608,24 @@ class RunnerSessionHandler implements RunnerSessionListener {
         List<RunnerMessages.Outbound> replies = new ArrayList<>();
         Instant now = time.now();
         Instant lease = lease(now);
-        // A run that ended on the server may be resumed below, which its conversation hears of: the conversations of
-        // those runs first, in the order of their ids (CONVENTIONS §10).
+        // A run that ended on the server may be resumed below, which its conversation hears of; an execution of an
+        // earlier epoch is cancelled after the revocations its host must hear (ADR-0116), which may be recorded: the
+        // conversations of those runs first, in the order of their ids (CONVENTIONS §10).
         locks.lockConversations(heartbeat.runs()
             .stream()
-            .map(entry -> runs.find(entry.runId()).orElse(null))
-            .filter(found -> found != null && !found.status().active())
+            .filter(entry -> runs.find(entry.runId())
+                .map(found -> !found.status().active() || earlierExecution(host, found, entry.epoch()))
+                .orElse(false))
+            .map(entry -> runs.find(entry.runId()).orElseThrow())
             .toList());
+        Set<UUID> locked = new HashSet<>();
         for (RunnerMessages.HeartbeatRun entry : heartbeat.runs()) {
             RunStore.RunRow run = runs.find(entry.runId()).orElse(null);
+            if (run != null && earlierExecution(host, run, entry.epoch())) {
+                // Locked, its conversation first: the check of its repositories before the cancel may record one.
+                run = runs.lock(run.id()).orElse(run);
+                locked.add(run.id());
+            }
             List<RunnerMessages.Outbound> problem = check(host, run, entry.runId(), entry.epoch(), true);
             if (problem != null) {
                 replies.addAll(problem);
@@ -547,19 +637,31 @@ class RunnerSessionHandler implements RunnerSessionListener {
             else if (!run.status().active()) {
                 // Ended on the server. A run lost by lease expiry that the host still runs is resumed; the host must
                 // stop any other.
-                RunStore.RunRow locked = locks.lock(run.id()).orElse(run);
-                if (locked.status() == RunStatus.RUNNING) {
-                    runs.renewLease(locked.id(), locked.epoch(), host.runnerHostId(), lease);
+                RunStore.RunRow held = locks.lock(run.id()).orElse(run);
+                locked.add(held.id());
+                if (held.status() == RunStatus.RUNNING) {
+                    runs.renewLease(held.id(), held.epoch(), host.runnerHostId(), lease);
                 }
-                else if (resumption.resume(host, locked, entry.epoch(), now, "run.heartbeat")) {
-                    replies.addAll(pendingCancels(List.of(locked.id()), now));
+                else if (resumption.resume(host, held, entry.epoch(), now, "run.heartbeat")) {
+                    // Its revocations, which its resumption opened again, before its cancel (ADR-0116).
+                    replies.addAll(revocations.pending(host, List.of(held.id()), now));
+                    replies.addAll(pendingCancels(List.of(held.id()), now));
                 }
                 else {
                     replies.add(new RunnerMessages.RunCancel(run.id(), run.epoch()));
                 }
             }
         }
-        return replies;
+        // A cancel follows the revocations of the run's assignment that its host must hear first (ADR-0116).
+        return revocations.beforeCancels(host, replies, locked);
+    }
+
+    /**
+     * Whether a heartbeat reports an execution of another epoch than the run's current one, of a run that is not
+     * assigned to another host: it is cancelled, and its revocations go first (ADR-0116).
+     */
+    private static boolean earlierExecution(ConnectedHost host, RunStore.RunRow run, long epoch) {
+        return run.epoch() != epoch && (run.runnerHostId() == null || run.runnerHostId().equals(host.runnerHostId()));
     }
 
     // ---- run.steer.ack --------------------------------------------------------------------------------------------

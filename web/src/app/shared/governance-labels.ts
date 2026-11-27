@@ -56,12 +56,34 @@ export function pulledBy(kill: Pick<KillSwitch, 'byName'>): string {
   return kill.byName ? `by ${kill.byName}` : '';
 }
 
-/** A suspension's cause: an admin's, or the instance admin's deactivation of the user. */
-export function suspensionCause(cause: string | null | undefined): string | null {
-  if (cause === 'USER_DEACTIVATED') {
-    return 'Their Tinfirm account was deactivated; reactivating the user resumes them.';
+/** Whom a suspension's words are about: a member (them), the reader (you), a service account (it). */
+export type SuspendedWho = 'them' | 'you' | 'it';
+
+/**
+ * A suspension's cause and what lifts it, in the binding card's words: an admin's suspension, which
+ * an admin resumes; the user's deactivation, which an instance admin lifts by reactivating the user;
+ * the company's identity provider's (SCIM), which only it lifts. Null when the cause is not known.
+ */
+export function suspensionCause(
+  cause: string | null | undefined,
+  who: SuspendedWho = 'them',
+): string | null {
+  switch (cause) {
+    case 'ADMIN':
+      return who === 'you'
+        ? 'An admin suspended you; an admin resumes you.'
+        : `An admin suspended ${who}; an admin resumes ${who}.`;
+    case 'USER_DEACTIVATED':
+      return who === 'you'
+        ? 'Your Tinfirm account was deactivated; an instance admin reactivates it, which resumes you.'
+        : 'Their Tinfirm account was deactivated; an instance admin reactivates the user, which resumes them.';
+    case 'SCIM':
+      return who === 'you'
+        ? 'The company’s identity provider deactivated you; it reactivates you, which resumes you.'
+        : 'The company’s identity provider deactivated them; the identity provider reactivates them, which resumes them.';
+    default:
+      return null;
   }
-  return null;
 }
 
 /** Where a switch's page is, under the company: the system, the member, the agent, the trigger. */
@@ -231,6 +253,7 @@ export const DEPARTURE_CREDENTIAL_FIXES: Record<DepartureCredential['kind'], str
   TOKEN: 'store a new token',
   OAUTH: 'sign it in again',
   CLIENT: 'store new client credentials',
+  APP: 'add the GitHub App’s installation again',
 };
 
 // --- Retention, holds and erasure ----------------------------------------------------------------

@@ -36,6 +36,7 @@ Any member can make an agent, and owns the agents they make.
 | **Runtimes** | The runtimes its instructions work on: **Claude Code**, **Codex**, **pi** and **OpenCode**. One is the **Default** (**Make default** changes it); each person may pick another of them in their settings. A new agent starts on the runtime that suits how your company pays for models, and says why: **Claude Code** when the company's gateway serves a Claude model, **Codex** when it serves OpenAI's models only, **pi** when it serves other providers' models; without a gateway, the runtime of your own subscription, else **Claude Code**. |
 | **Time limit of a turn** | Minutes one turn may run before the runner host stops it, from 5 to 1440. Empty: the installation's default, which the field shows (usually 60). A stopped turn keeps its work: retry it and the agent goes on from where it stopped. |
 | **Memory** | **People and triggers may turn its memory on**, on by default. Each person who turns memory on gets notes of their own; a trigger's notes wait for its team's review. Turning it off keeps the notes, unread and unwritten. See [Agent memory](memory.md). |
+| **Isolation** | Where its turns run. **Automatic**, the default, sends them to the strongest level of isolation your company's runner hosts report, and names that level. Your own runner host takes your turns too when it reports that level or a stronger one; a turn never waits for it. **Only hosts that report** a level keeps them on the company's hosts of that level, and on your own host when it reports it or a stronger one. The choice appears only where the company's hosts report more than one level, or one is chosen. A turn never moves to a weaker host by itself: it waits for a host of its level. Choosing a level warns first: open conversations whose session is on a host of another level start a new session of the runtime on their next turn, keeping the conversation and its workspace. |
 
 ### Instructions
 
@@ -121,6 +122,8 @@ Open an agent from **Agents**. The page shows:
 
 If it is not shared with you, **You cannot use this agent** says whom to ask.
 
+Two notices concern where its turns run. **Outside input runs in a container** appears when it has a trigger on a tracker, a chat channel or a webhook, so that people outside the company can start its runs, and those runs go to container hosts: an escape from a container reaches the runner host and its credentials. Choose a stronger level for it, or ask an admin for a runner host that reports vm-jail or machine. **No runner host of its level** appears when the level chosen for it is reported by no runner host any more: new conversations with it are refused until one does, or its editor chooses another level.
+
 ## Change an agent: versions, widening and narrowing
 
 **Edit** on the agent's page opens the editor. **Save** sends only the sections you changed. Every change of what the agent is makes a new version.
@@ -133,7 +136,7 @@ A version **widens** the one before when it:
 - adds a network host that no host before covers;
 - changes the instructions, adds a skill or moves a skill's pin, when the agent **can act** after the change: it has a tool **Allowed** for writes, a repository with read and write access, or a network host.
 
-Removing or lowering anything widens nothing, a removed skill included, and nor do changes to the name, handle, description, runtimes, time limit or memory switch. A change of the instructions or skills of an agent that cannot act reaches everyone at their next turn: each conversation then says *The agent's instructions changed on 2026-10-27 by Jane Doe.* (or its skills), and the change is in the audit log.
+Removing or lowering anything widens nothing, a removed skill included, and nor do changes to the name, handle, description, runtimes, time limit, memory switch or isolation. A change of the instructions or skills of an agent that cannot act reaches everyone at their next turn: each conversation then says *The agent's instructions changed on 2026-10-27 by Jane Doe.* (or its skills), and the change is in the audit log.
 
 - **Narrowing reaches everyone at once**, from each conversation's next turn.
 - **A widening reaches each person only once they accept it.** Until then, their turns use the current version without what it adds. Before you save, the editor names what widens: **This change widens {agent}**, and people who use it keep their version until they accept the change.

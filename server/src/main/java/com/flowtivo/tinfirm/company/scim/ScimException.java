@@ -63,6 +63,11 @@ public class ScimException extends RuntimeException {
         return new ScimException(403, null, "EDITION_REQUIRED");
     }
 
+    /** 503: no database connection was free in time ({@code shared.web.ServerBusy}), with {@code Retry-After}. */
+    public static ScimException busy(long retryAfterSeconds) {
+        return new ScimException(503, null, "SERVER_BUSY", Math.max(1, retryAfterSeconds));
+    }
+
     public static ScimException tooManyRequests(long retryAfterSeconds) {
         return new ScimException(429, null, "Too many requests", Math.max(1, retryAfterSeconds));
     }

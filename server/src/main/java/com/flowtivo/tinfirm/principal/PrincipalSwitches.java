@@ -49,6 +49,9 @@ public interface PrincipalSwitches {
     /** The member's principal that has not left, with its suspension if any; empty for a user who is not a member. */
     Optional<Suspension> ofMember(UUID companyId, UUID userId);
 
+    /** Why the principal is suspended now; empty for an active principal, one that left, or none. */
+    Optional<Cause> suspendedFor(UUID companyId, UUID principalId);
+
     /** A member who left: who, since when, the groups they were in then, and whether the admins closed the checklist. */
     Optional<Departure> departure(UUID companyId, UUID principalId);
 
@@ -67,7 +70,22 @@ public interface PrincipalSwitches {
      * client (ADR-0087), which lifts only its own.
      */
     enum Cause {
-        ADMIN, USER_DEACTIVATED, SCIM
+        ADMIN(""), USER_DEACTIVATED(" because their Tinfirm account was deactivated"),
+        SCIM(" because the company's identity provider deactivated them");
+
+        private final String because;
+
+        Cause(String because) {
+            this.because = because;
+        }
+
+        /**
+         * What follows "suspended" where a revocation of a run's git access says why (ADR-0116): nothing for an
+         * admin's switch, the deactivation for the other two, in the words the kill switches' page uses.
+         */
+        public String because() {
+            return because;
+        }
     }
 
     /**

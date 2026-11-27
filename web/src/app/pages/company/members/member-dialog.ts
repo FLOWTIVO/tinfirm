@@ -801,7 +801,7 @@ export class MemberDialog {
     return {
       CANNOT_SUSPEND_SELF: 'You cannot suspend yourself. Another admin can.',
       LAST_OWNER: `${member.displayName} is the last active owner. Make someone else an owner first.`,
-      PRINCIPAL_SUSPENDED: `${member.displayName}'s Tinfirm account was deactivated: reactivating the user resumes them.`,
+      PRINCIPAL_SUSPENDED: `${member.displayName}’s suspension is not an admin’s: an instance admin deactivated their Tinfirm account, or the company’s identity provider deactivated them, and only reactivating them resumes them.`,
       'status:403': 'Your role cannot suspend this member.',
     };
   }

@@ -80,17 +80,24 @@ public record NewTurn(UUID companyId, UUID conversationId, String conversationKe
     /**
      * When an automatic retry may run, and which of how many in a row it is (ADR-0073).
      *
-     * @param at       the earliest time it is dispatched
-     * @param attempt  its number in the row, from 1
-     * @param attempts how many there are at most
+     * @param at           the earliest time it is dispatched
+     * @param attempt      its number in the row, from 1
+     * @param attempts     how many there are at most
+     * @param beforePrompt the failed run was lost because its host restarted before its agent got a prompt, and
+     *                     the turn is started again without its owner's choice (ADR-0073, amended 2026-11-23)
      */
-    public record Scheduled(Instant at, int attempt, int attempts) {
+    public record Scheduled(Instant at, int attempt, int attempts, boolean beforePrompt) {
 
         public Scheduled {
             Objects.requireNonNull(at, "at");
             if (attempt < 1 || attempt > attempts) {
                 throw new IllegalArgumentException("An automatic retry is one of 1 to " + attempts);
             }
+        }
+
+        /** An automatic retry its owner chose. */
+        public Scheduled(Instant at, int attempt, int attempts) {
+            this(at, attempt, attempts, false);
         }
     }
 }

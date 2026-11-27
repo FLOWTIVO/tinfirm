@@ -52,8 +52,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use http_body_util::{BodyExt, Full, Limited};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
@@ -70,8 +70,8 @@ use tinfirm_protocol::{
 };
 use uuid::Uuid;
 
+use crate::sandbox::Files;
 use tinfirm_bridge::files::ReadOne;
-use tinfirm_bridge::host::SandboxFiles;
 
 use crate::attachments::{Upload, UploadResponse, UploadSource};
 
@@ -216,11 +216,12 @@ pub struct FileRoot {
 /// The sandbox's files once its bridge has connected (`run --sandbox-bridge`), for the tools
 /// that read them; until then, and once the sandbox is gone, they cannot be read.
 #[derive(Clone, Default)]
-pub struct SandboxReader(Arc<std::sync::OnceLock<SandboxFiles>>);
+pub struct SandboxReader(Arc<std::sync::OnceLock<(Files, crate::reader::Reader)>>);
 
 impl SandboxReader {
-    pub fn set(&self, files: SandboxFiles) {
-        let _ = self.0.set(files);
+    /// The sandbox's files, and the readers that parse what comes of them (crate::reader).
+    pub fn set(&self, files: Files, reader: crate::reader::Reader) {
+        let _ = self.0.set((files, reader));
     }
 }
 
@@ -245,12 +246,20 @@ async fn read_from_sandbox(
     relative: &Path,
     max: u64,
 ) -> Result<Vec<u8>, ReadError> {
-    let Some(files) = reader.0.get() else {
+    let Some((files, parser)) = reader.0.get() else {
         return Err(ReadError::Refused("the sandbox's files cannot be reached"));
     };
-    let path = relative.to_string_lossy();
+    let path = relative.to_string_lossy().into_owned();
+    let parser = parser.clone();
+    // The archive is parsed by a reader that holds no credential (crate::reader).
     match files
-        .read_file(root, &path, max, SANDBOX_READ_TIMEOUT)
+        .receive(
+            root,
+            vec![path],
+            Vec::new(),
+            SANDBOX_READ_TIMEOUT,
+            move |input| parser.read_one_from(input, max, SANDBOX_READ_TIMEOUT),
+        )
         .await
     {
         Ok(ReadOne::File(content)) => Ok(content),
@@ -2087,13 +2096,44 @@ fn plain(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     response
 }
 
+/// Why a request body could not be read whole ([`read_bounded`]).
+enum BodyRefused {
+    /// It is longer than [`MAX_BODY`].
+    TooLarge,
+    /// It does not have the length its head declared.
+    LengthMismatch,
+    /// Its stream broke: the client left, or the front said that it did not end.
+    Broken,
+}
+
+/// A request body of at most [`MAX_BODY`] bytes, or why it is refused.
+async fn read_bounded(mut body: crate::front::head::ProxyBody) -> Result<Bytes, BodyRefused> {
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) if crate::front::head::length_mismatch(e.as_ref()) => {
+                return Err(BodyRefused::LengthMismatch);
+            }
+            Err(_) => return Err(BodyRefused::Broken),
+        };
+        if let Ok(data) = frame.into_data() {
+            if out.len() + data.len() > MAX_BODY {
+                return Err(BodyRefused::TooLarge);
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(out))
+}
+
 /// Serves one HTTP request to a run's MCP endpoint.
 /// `body_timeout` bounds the read of the request body from the end of its headers (M5 of
 /// the security review of 2026-10-27: a sandbox that sends a body slowly holds no request
 /// slot of its run for long).
 pub async fn handle_http(
     tools: Arc<RunTools>,
-    req: Request<Incoming>,
+    req: Request<crate::front::head::ProxyBody>,
     body_timeout: std::time::Duration,
 ) -> Response<Full<Bytes>> {
     // Agents do not send Origin; browsers always do. No page may talk to this endpoint.
@@ -2110,14 +2150,23 @@ pub async fn handle_http(
             .insert(header::ALLOW, HeaderValue::from_static("POST"));
         return response;
     }
-    let body = match tokio::time::timeout(
-        body_timeout,
-        Limited::new(req.into_body(), MAX_BODY).collect(),
-    )
-    .await
-    {
-        Ok(Ok(body)) => body.to_bytes(),
-        Ok(Err(_)) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large"),
+    let body = match tokio::time::timeout(body_timeout, read_bounded(req.into_body())).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(BodyRefused::TooLarge)) => {
+            return plain(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large");
+        }
+        // The git proxy's and the model proxy's rule: a body that does not have its declared
+        // length is a bad request, not a size problem.
+        Ok(Err(BodyRefused::LengthMismatch)) => {
+            tracing::warn!(
+                "platform MCP endpoint: a request body did not have the length its head declared"
+            );
+            return plain(
+                StatusCode::BAD_REQUEST,
+                "the request body does not have the length its head declared",
+            );
+        }
+        Ok(Err(BodyRefused::Broken)) => return plain(StatusCode::BAD_REQUEST, "bad request body"),
         Err(_) => {
             return plain(
                 StatusCode::REQUEST_TIMEOUT,
@@ -2360,10 +2409,10 @@ mod tests {
             repo_url: format!("https://github.com/acme/{dir}.git"),
             default_branch: "main".into(),
             branch: "agent/ACME-7".into(),
-            git: Some(GitCredentials {
-                username: "x-access-token".into(),
-                token: tinfirm_protocol::Secret::new("ghp_TEST_ONLY"),
-            }),
+            git: Some(GitCredentials::new(
+                "x-access-token",
+                tinfirm_protocol::Secret::new("ghp_TEST_ONLY"),
+            )),
             author_name: None,
             author_email: None,
             read_only: false,

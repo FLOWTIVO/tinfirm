@@ -34,6 +34,7 @@ import com.flowtivo.tinfirm.runner.ConnectedHost;
 import com.flowtivo.tinfirm.runner.RunnerAuthentication;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 import com.flowtivo.tinfirm.shared.web.ApiException;
+import com.flowtivo.tinfirm.shared.web.ApiExceptionHandler;
 
 /**
  * The files of a run's conversation for its runner host (ADR-0014, ADR-0021; the runner protocol v2:
@@ -124,7 +125,9 @@ class RunnerFilesController {
             @RequestHeader(name = HttpHeaders.AUTHORIZATION, required = false) @Nullable String authorization)
             throws IOException, ServletException {
         ConnectedHost host = host(authorization, runId);
-        // Authenticated: from here on the body may be read.
+        // Authenticated: from here on the body may be read, and an upload over the limit is read to its end so that
+        // the host gets its 413 (the runner chain sets no principal).
+        request.setAttribute(ApiExceptionHandler.AUTHENTICATED_CALLER, Boolean.TRUE);
         long epoch = ServletRequestUtils.getRequiredLongParameter(request, "epoch");
         MultipartFile file = request.getFile("file");
         if (file == null) {

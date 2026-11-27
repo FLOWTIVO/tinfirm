@@ -2,7 +2,7 @@
 
 This page installs Tinfirm on Kubernetes with the Helm chart `tinfirm`: the Secrets to create first, the values that matter, the install itself, how to check it, and the network policy the chart puts around the server. It is for operators who know Kubernetes, Helm and PostgreSQL.
 
-The chart deploys the server and, unless you turn it off, the bundled LiteLLM, and, if you turn it on, a runner host whose sandboxes are VMs ([The runner pod](#the-runner-pod)). It deploys no database and creates no Secret: you prepare PostgreSQL ([Prepare PostgreSQL](database.md)) and create the Secrets yourself.
+The chart deploys the server and, unless you turn it off, the bundled LiteLLM, and, if you turn it on, a runner host whose sandboxes are VMs, on sandbox nodes outside the cluster, at DigitalOcean, or in a pod per run in the cluster itself ([The runner pod](#the-runner-pod)). It deploys no database and creates no Secret: you prepare PostgreSQL ([Prepare PostgreSQL](database.md)) and create the Secrets yourself.
 
 !!! info "Releases and development builds"
 
@@ -35,7 +35,8 @@ The chart names Secrets and never holds a secret value. The pods do not start un
 | `auditAnchor.existingSecret` | `<kid>.key` for each key of `auditAnchor.keys`, `<kid>.pub` for a retired one | The Ed25519 keys that sign the audit's checkpoints: [Anchor the audit](audit-anchor.md) | With `auditAnchor.sink` |
 | `auditAnchor.s3.existingSecret` | `access-key-id`, `secret-access-key` | The key of the checkpoints' bucket, which may not delete | With the `s3` sink |
 | `runner.existingSecret` (`tinfirm-runner`) | `runner.secretKeys.token` (`token`) | The runner pod's token, `tfr_` and 43 base64url characters | With the runner pod |
-| `runner.vm.digitalocean.existingSecret` (`tinfirm-digitalocean`) | `runner.vm.digitalocean.secretKeys.token` (`token`) | The DigitalOcean API token that creates the runner pod's VMs | With the runner pod |
+| `runner.vm.digitalocean.existingSecret` (`tinfirm-digitalocean`) | `runner.vm.digitalocean.secretKeys.token` (`token`) | The DigitalOcean API token that creates the runner pod's VMs | With the runner pod and `runner.vm.driver: digitalocean` |
+| `runner.vm.node.existingSecret` (`tinfirm-node-driver`) | `runner.vm.node.secretKeys.certificate` (`client.crt`), `runner.vm.node.secretKeys.key` (`client.key`) | The runner pod's client certificate and its key, DER, which the sandbox nodes pin | With the runner pod and `runner.vm.driver: node` |
 
 LiteLLM's database credentials can also come from a Secret of their own, for example one that a database operator writes: [Connect LiteLLM to its database](database.md#connect-litellm-to-its-database).
 
@@ -334,22 +335,89 @@ LiteLLM runs from its non-root image as user 65534, with a read-only root filesy
 
 ## The runner pod
 
-With `runner.enabled: true` the chart also runs a runner host, as a pod: the company runner host of one company in `companies`, whose sandboxes are VMs that it creates and deletes, on DigitalOcean a Droplet per run. You need no machine for it, and nobody registers it in the app: the server registers it at its start, with the token you put in a Secret, and replaces the token when you change it. One pod serves many runs at once, each in a VM of its own; it needs no Docker and no privilege.
+With `runner.enabled: true` the chart also runs a runner host, as a pod: the company runner host of one company in `companies`, whose sandboxes are VMs, one per run, deleted when the run ends. You need no machine for it, and nobody registers it in the app: the server registers it at its start, with the token you put in a Secret, and replaces the token when you change it. One pod serves many runs at once; it needs no Docker and no privilege. With the drivers `node` and `digitalocean` the cluster runs no VM; with `pod` it runs each VM in a pod of its own.
 
-Sandboxes as VMs are part of Pro and Enterprise ([Licence](licence.md)). Without such a key the server refuses the host, and the pod stops.
+`runner.vm.driver` chooses where the VMs run:
 
-Before you turn it on, prepare on DigitalOcean:
+| `runner.vm.driver` | Where the VMs run | Edition | State |
+|---|---|---|---|
+| `node` | On sandbox nodes outside the cluster: your machines with KVM, each running the node agent, which hold no credential | Every edition, Community included | Not ready for production: the role that sets up a node ran on a machine once, with ten conversations through that node; the chart's pod has not run against a node, and a node's hardening has run on one node, a real conversation through it included (below) |
+| `digitalocean` (the default) | A DigitalOcean Droplet per run | Pro and Enterprise ([Licence](licence.md)). Without such a key the server refuses the host, and the pod stops. | Available |
+| `pod` | In this cluster: a pod per run in a namespace of the runs' own, with Firecracker in it as an unprivileged user, on workers with KVM that run nothing else | Pro and Enterprise | Not ready for production: it has run in no cluster yet ([Sandbox VMs in your Kubernetes cluster](kubernetes-pod-per-run.md)) |
 
-- the VM image: a private snapshot that holds the runner images and the runner host of the same release (the repository's `ee/runner/images/vm`), rebuilt after every upgrade;
-- a VPC of the sandboxes' own, peered with the cluster's when the pod reaches the VMs on their private addresses (`connect: private`);
-- a Cloud Firewall on the tag `tinfirm-sandbox` that lets in only the cluster's addresses, to the bridge's port 7443, and lets nothing out;
-- an API token that may create, read and delete Droplets and read the firewall and the VPC.
+Ready VMs, which wait for runs so that a run starts in seconds, are Pro's and Enterprise's with either driver: `runner.pool.maxReady` stays `0`, its default, in Community.
 
-Then create the two Secrets, in the release's namespace:
+Either way, create the host's token in the release's namespace first:
 
 ```sh
 printf 'tfr_%s' "$(openssl rand 32 | basenc --base64url | tr -d '=')" > runner-token
 kubectl -n tinfirm create secret generic tinfirm-runner --from-file=token=./runner-token
+```
+
+### With sandbox nodes
+
+!!! warning "Not ready for production"
+
+    The node agent makes and deletes VMs: that ran on one node with KVM, driven by the runner host's `node` driver. The Ansible role that installs a node, with the agent's service units and the node's own firewall, ran on a machine once, on 2026-11-20 ([Sandbox nodes on your own machines](sandbox-nodes.md)). The role hardens a node by default, and that hardening ran on one node on 2026-11-22, with a real conversation through it ([The node's hardening](sandbox-nodes.md#the-nodes-hardening)). Tinfirm publishes no VM image: you build it ([Sandbox nodes on your own machines](sandbox-nodes.md#what-you-need)). The chart's pod has not run against a node: the conversations that ran through a node came from a runner host on a machine of its own. The runner host refuses to start with the `node` driver while a node's check reports a problem. Use this form to prepare and to test, and DigitalOcean's driver for production until then.
+
+The pod is then a control host: it holds the credentials and runs no agent code. The VMs run on sandbox nodes, machines outside the cluster that hold nothing, each with the node agent. The pod reaches each node's agent over TLS, with the node's certificate pinned by its SHA-256 and the pod's own client certificate, which each node pins in turn. A node's local socket, for a runner host on the node's own machine, is not for a pod. Such a host would report the isolation level `machine`.
+
+Prepare:
+
+- the sandbox nodes, each with the node agent, its templates and the VM image of the same release as the chart. The node agent is the archive `tinfirm-node-agent-<version>-<target>.tar.gz` of that release, checked against its signed `SHA256SUMS` as the runner host's ([Install and run runner hosts](runner-hosts.md#install)). The play `sandbox-node.yml` installs a node ([Sandbox nodes on your own machines](sandbox-nodes.md)): give it the pod's client fingerprint as `tinfirm_sandbox_node_client_sha256` and the address the pod's connections come from as `tinfirm_sandbox_node_control_host`;
+- the pod's client certificate and key: `tinfirm-runner-host node identity --cert client.crt --key client.key` writes them (DER, the key with mode 0600; it refuses files that exist) and prints the certificate's SHA-256, which each node's listener names as `tls.clientSha256`. `tinfirm-node-agent identity` makes the same files, so either binary will do;
+- each node's certificate's SHA-256: `tinfirm-runner-host node fingerprint --cert node.crt`, or `tinfirm-node-agent fingerprint --cert node.crt` on the node;
+- the network: the pod reaches each node at its agent's TLS port (`tls.listen`) and at the ports where the node publishes the VMs' bridges (its `network.firstPort` to `firstPort + maxVms - 1`), and each node's `network.controlHost` is the address it sees the pod's connections come from. A node lets in the published ports from that one address alone, so the cluster's pods must leave through one address, such as a NAT gateway or an egress IP.
+
+Create the Secret with the certificate and the key:
+
+```sh
+kubectl -n tinfirm create secret generic tinfirm-node-driver \
+  --from-file=client.crt=./client.crt --from-file=client.key=./client.key
+```
+
+The driver reads the key only from a file of the pod's user that no other user may read. A Secret's files belong to root, so an init container copies the key, as the pod's user and with mode 0600, into a volume in memory; the certificate is read from the Secret's volume.
+
+And add the values:
+
+```yaml
+runner:
+  enabled: true
+  company: main            # the key of a company in `companies`
+  name: kubernetes         # the host's name on that company's Runner hosts page
+  maxConcurrentRuns: 8     # at most the nodes' free slots
+  vm:
+    driver: node
+    template: sandbox-4c8g # a template that one of the nodes offers
+    node:
+      publishedPorts:      # the nodes' firstPort to firstPort + maxVms - 1
+        first: 20000
+        last: 20007
+      nodes:
+        - name: node-1
+          address: 10.0.0.20:7700   # the node agent's TLS listener
+          nodeSha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          templates: [sandbox-4c8g]
+```
+
+`helm lint` refuses `driver: node` without a node, a node without its `address` or `nodeSha256`, and nodes together with `runner.vm.digitalocean.templates`. The install refuses a `template` that no node offers.
+
+### In this cluster, a pod per run
+
+The pod creates a pod for each run in a namespace of the runs' own, which runs the run's VM with Firecracker as an unprivileged user in a user namespace of its own. It needs workers with KVM, a device plugin for `/dev/kvm` and `/dev/net/tun`, user namespaces for pods, and a run pod's image that you build. The cluster's admin prepares the workers and the device plugin; the chart installs the runs' namespace, its two network policies, its quota, the driver's rights and the admission policy. [Sandbox VMs in your Kubernetes cluster](kubernetes-pod-per-run.md) has what the cluster needs, what its admin applies, the image's recipe, the values and the checks. This form has run in no cluster yet.
+
+### With DigitalOcean
+
+The pod makes a Droplet per run with DigitalOcean's driver, which is part of Pro and Enterprise. Before you turn it on, prepare on DigitalOcean:
+
+- the VM image: a private snapshot that holds the runner images and the runner host of the same release (the recipe is the repository's `runner/images/vm`, and DigitalOcean's Packer template `ee/runner/images/vm/digitalocean.pkr.hcl` runs it), rebuilt after every upgrade;
+- a VPC of the sandboxes' own, peered with the cluster's when the pod reaches the VMs on their private addresses (`connect: private`);
+- a Cloud Firewall on the tag `tinfirm-sandbox` that lets in only the cluster's addresses, to the bridge's port 7443, and lets nothing out;
+- an API token that may create, read and delete Droplets and read the firewall and the VPC.
+
+Then create its Secret, in the release's namespace:
+
+```sh
 kubectl -n tinfirm create secret generic tinfirm-digitalocean --from-file=token=./digitalocean-token
 ```
 
@@ -374,6 +442,8 @@ runner:
           firewall: FIREWALL_ID
 ```
 
+### The runner pod's values
+
 | Value | Default | Meaning |
 |---|---|---|
 | `runner.enabled` | `false` | Runs the runner pod |
@@ -382,20 +452,25 @@ runner:
 | `runner.existingSecret`, `runner.secretKeys.token` | `tinfirm-runner`, `token` | The host's token, `tfr_` and 43 base64url characters. The server gets it at its start and keeps only its hash; the pod reads it from a file. |
 | `runner.serverUrl` | the public URL | The server's URL that the pod connects to, https only, as any runner host's |
 | `runner.maxConcurrentRuns` | `4` | The most runs at once, up to 1000; admins can lower it on **Runner hosts**, never raise it |
-| `runner.vm.template` | `sandbox` | The template, a key of `runner.vm.digitalocean.templates`, that every VM is created from |
-| `runner.vm.digitalocean.existingSecret`, `.secretKeys.token` | `tinfirm-digitalocean`, `token` | The DigitalOcean API token. The driver holds it; the runner host never reads it. |
-| `runner.vm.digitalocean.connect` | `private` | `private`: the pod reaches the VMs on their VPC addresses; `public`: on their public addresses, which the firewall opens to the cluster's egress addresses alone |
-| `runner.vm.digitalocean.templates` | none | Each template's `region`, `size`, `image` (the snapshot id), `vpc`, `firewall` and optional `bridgePort` |
-| `runner.vm.port`, `.startTimeout`, `.imageVersion`, `.probes` | `7443`, `900`, `warn`, none | The bridge's port in the VM; how long a VM may take to come up, in seconds; what to do with a VM image of another release (`warn` or `refuse`); more addresses a VM must not reach |
-| `runner.pool.*` | at most 4 ready VMs, of Claude Code's image | The ready VMs that admins may ask for on **Runner hosts**; `pool.runtime: any` lets them serve every runtime |
+| `runner.vm.driver` | `digitalocean` | `node` (sandbox nodes, every edition; not ready for production, above), `digitalocean` (Pro and Enterprise) or `pod` (a pod per run in this cluster, Pro and Enterprise; not ready for production, its values on [its own page](kubernetes-pod-per-run.md#the-charts-values)) |
+| `runner.vm.template` | `sandbox` | The template that every VM is created from: one that a node offers, or a key of `runner.vm.digitalocean.templates` or `runner.vm.pod.templates` |
+| `runner.vm.node.existingSecret`, `.secretKeys.certificate`, `.secretKeys.key` | `tinfirm-node-driver`, `client.crt`, `client.key` | With `node`: the pod's client certificate and key, DER |
+| `runner.vm.node.nodes` | none | With `node`, 1 to 64: each node's `name` (1 to 32 of `a-z`, `0-9` and `-`), `address` (`HOST:PORT` of its agent's TLS listener; an IPv6 address in brackets), `nodeSha256` (its certificate's SHA-256) and `templates` |
+| `runner.vm.node.publishedPorts.first`, `.last` | `20000`, `21023` | With `node`: the ports where the nodes publish the VMs' bridges, for the pod's policy. The default is the node agent's documented `firstPort` with its most slots, 1024; narrow it to your nodes' `firstPort` and `maxVms`. |
+| `runner.vm.node.peerBuild` | `warn` | With `node`: a node agent of another release is logged (`warn`) or refused (`refuse`) |
+| `runner.vm.digitalocean.existingSecret`, `.secretKeys.token` | `tinfirm-digitalocean`, `token` | With `digitalocean`: the API token. The driver holds it; the runner host never reads it. |
+| `runner.vm.digitalocean.connect` | `private` | With `digitalocean`. `private`: the pod reaches the VMs on their VPC addresses; `public`: on their public addresses, which the firewall opens to the cluster's egress addresses alone |
+| `runner.vm.digitalocean.templates` | none | With `digitalocean`: each template's `region`, `size`, `image` (the snapshot id), `vpc`, `firewall` and optional `bridgePort` |
+| `runner.vm.port`, `.startTimeout`, `.imageVersion`, `.probes` | `7443`, `900`, `warn`, none | The bridge's port in the VM (with `node`, the templates' `bridgePort`); how long a VM may take to come up, in seconds; what to do with a VM image of another release (`warn` or `refuse`); more addresses a VM must not reach |
+| `runner.pool.*` | no ready VMs (`maxReady: 0`); Claude Code's image | The most ready VMs that admins may ask for on **Runner hosts** (`pool.maxReady`; above 0 the server needs a key with elastic runners, with either driver); `pool.runtime: any` lets them serve every runtime |
 | `runner.persistence.*` | a 20Gi claim | The pod's data: the records that let a restarted pod take its runs back, its repository mirrors and the runs' outputs. Disabled, a restart loses the runs in progress. |
 | `runner.terminationGracePeriodSeconds` | `3600` | How long an upgrade waits for the active runs to finish |
 | `runner.extraConfig` | `{}` | More settings of the runner host as its variables, such as `TINFIRM_RUNNER_EGRESS_ALLOW` (one host per line) for package registries the sandboxes may reach. Never credentials. |
 | `runner.resources` | request 250m CPU and 512Mi, limit 2Gi | |
 
-The pod runs as user 10001 with a read-only root filesystem, no capabilities and no privilege escalation, and never calls the Kubernetes API. On an upgrade it drains first: it takes no new runs and lets the active ones finish. When `terminationGracePeriodSeconds` ends first, it stops, and the next pod takes its runs back: their work is pushed and their sessions saved, and they end as failed, so the next message of each conversation goes on from there.
+The pod runs as user 10001 with a read-only root filesystem, no capabilities and no privilege escalation. It calls the Kubernetes API only with the `pod` driver, with a ServiceAccount token whose rights are in the runs' namespace alone. On an upgrade it drains first: it takes no new runs and lets the active ones finish. When `terminationGracePeriodSeconds` ends first, it stops, and the next pod takes its runs back: their work is pushed and their sessions saved, and they end as failed, so the next message of each conversation goes on from there.
 
-To rotate the token, put a new one in the Secret, then restart the server, which replaces the old token at its start and closes its connection, and then the pod.
+To rotate the token, put a new one in the Secret, then restart the server, which replaces the old token at its start and closes its connection, and then the pod. To rotate the client certificate of the `node` driver, update the Secret, set the new certificate's SHA-256 as `tls.clientSha256` on each node's listener, which accepts one certificate, restart that listener, which reads its configuration at its start, and restart the pod; runs cannot start in between.
 
 ## Install the chart
 
@@ -586,10 +661,11 @@ The runner pod (`runner.enabled`) has a policy of its own:
 
 | Direction | Peers | Ports |
 |---|---|---|
-| Ingress | None, and no value adds one: the pod dials the server and the VMs, and the sandboxes' traffic comes back over those connections | |
+| Ingress | None, and no value adds one: the pod dials the server, the VMs and the nodes, and the sandboxes' traffic comes back over those connections | |
 | Egress | DNS | 53 |
-| Egress | `networkPolicy.runner.egress.https.to`, `.ports` | Any address on 443 by default: the server's public URL (which may resolve to the cluster's own load balancer), DigitalOcean's API, the git hosts, the model gateways, and what the sandboxes may reach |
-| Egress | The VMs: `networkPolicy.runner.egress.vms.to` | `runner.vm.port`, any address by default; narrow it to the sandboxes' VPC |
+| Egress | `networkPolicy.runner.egress.https.to`, `.ports` | Any address on 443 by default: the server's public URL (which may resolve to the cluster's own load balancer), DigitalOcean's API (with `digitalocean`), the git hosts, the model gateways, and what the sandboxes may reach |
+| Egress | With `digitalocean`, the VMs: `networkPolicy.runner.egress.vms.to` | `runner.vm.port`, any address by default; narrow it to the sandboxes' VPC |
+| Egress | With `node`, the nodes: each node's own address by default, or the peers of `networkPolicy.runner.egress.nodes.to` | Each node's agent port (from its `address`) and `runner.vm.node.publishedPorts` (a port range: Kubernetes 1.25 and later). By default one rule per node, to its address alone, which must then be an IP address; with host names, name the nodes' peers in `nodes.to`, such as an `ipBlock` of their network. |
 | Egress | `networkPolicy.runner.egress.extra` | Nothing. An ingress controller in the cluster whose pods listen on another port, such as 8443, needs a rule for them here. |
 
 ## Next steps

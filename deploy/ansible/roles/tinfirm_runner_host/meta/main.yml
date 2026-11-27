@@ -5,7 +5,8 @@ galaxy_info:
   description: >-
     Tinfirm runner host on a Linux VM with nested virtualisation: Docker Engine, Kata
     Containers with Cloud Hypervisor, the runner host as a systemd service, and the runner
-    images.
+    images; or a control host whose VMs run on sandbox nodes (ADR-0112), with none of those
+    but the service.
   license: MIT
   min_ansible_version: "2.15"
   platforms:

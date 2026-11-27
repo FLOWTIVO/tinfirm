@@ -26,6 +26,7 @@ import com.flowtivo.tinfirm.audit.AuditAction;
 import com.flowtivo.tinfirm.audit.AuditLog;
 import com.flowtivo.tinfirm.audit.AuditRecord;
 import com.flowtivo.tinfirm.shared.security.Actor;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 
 /**
  * The clients known by their Client ID Metadata Document (ADR-0045): MCP Security's
@@ -67,7 +68,9 @@ final class CimdClients implements RegisteredClientRepository {
         this.fetcher = fetcher;
         this.stored = stored;
         this.auditLog = auditLog;
-        this.transactions = transactions;
+        // A client's document kept as it was resolved: the server's registry, not a request's change.
+        this.transactions = new TransactionTemplate(java.util.Objects.requireNonNull(transactions.getTransactionManager()));
+        this.transactions.setName(AfterTransaction.BOOKKEEPING);
         this.allowHttp = allowHttp;
         this.documents = new ClientIdMetadataDocumentRegisteredClientRepository();
         this.documents.setMetadataDocumentResolver(fetcher);

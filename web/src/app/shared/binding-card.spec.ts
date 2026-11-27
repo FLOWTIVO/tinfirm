@@ -197,7 +197,7 @@ describe('bindingCardText (plan §4.1)', () => {
     ${'PICK_GRANT'}        | ${'Act on Jira through:'}                     | ${true}
     ${'CHOOSE'}            | ${'Your Jira account needs signing in again'} | ${true}
     ${'RECONNECT_COMPANY'} | ${'Jira waits for an admin'}                  | ${false}
-    ${'SUSPENDED'}         | ${'Jira waits for an admin'}                  | ${false}
+    ${'SUSPENDED'}         | ${'Jira waits until a suspension is lifted'}  | ${false}
     ${'SYSTEM_OFF'}        | ${'Jira is switched off'}                     | ${false}
     ${'NOT_ENTITLED'}      | ${'Jira waits for the trigger’s author'}      | ${false}
   `('a waiting binding of reason $reason', ({ reason, title, actionable }) => {
@@ -246,6 +246,23 @@ describe('bindingCardText (plan §4.1)', () => {
     expect(
       bindingCardText(waiting({ reason: 'NONE' }), { ...ctx, mine: false, personName: 'Alice' }),
     ).toMatchObject({ title: 'Waiting for Alice', actionable: false });
+  });
+
+  it('says a suspension in the server’s words, which know the holder and the cause', () => {
+    for (const text of [
+      'Jira: the service account svc-reader it acts through is suspended; an admin resumes it.',
+      'Jira: Ana, whose account it acts through, is suspended in this company; an admin resumes them.',
+      'Jira: Ana, whose account it acts through, is suspended because their Tinfirm account was deactivated; an instance admin reactivates the user, which resumes them.',
+      'Jira: Ana, whose account it acts through, is suspended because the company’s identity provider deactivated them; the identity provider reactivates them, which resumes them.',
+    ]) {
+      expect(
+        bindingCardText(waiting({ reason: 'SUSPENDED', holderName: 'Ana', text }), ctx),
+      ).toEqual({
+        title: 'Jira waits until a suspension is lifted',
+        body: text,
+        actionable: false,
+      });
+    }
   });
 
   it('offers the grant in the CHOOSE sentence', () => {
@@ -352,6 +369,37 @@ describe('BindingCard', () => {
     await settle();
 
     expect(changed).toEqual([bound]);
+  });
+
+  it('submits a token typed in the same task as the submit, before any change detection', async () => {
+    await render(aWaitingBinding());
+    q('binding-paste-token')!.click();
+    await fixture.whenStable();
+    const submit = el.querySelector<HTMLButtonElement>('form button[type=submit]')!;
+    // Enter in the field submits the form only while its submit button is enabled: it is
+    // enabled before the token, not only once a change detection has seen it.
+    expect(submit.disabled).toBe(false);
+    typeInto(q('binding-token'), 'jira-token');
+    expect(submit.disabled).toBe(false);
+    el.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }));
+    await settle();
+    expect(
+      http.expectOne({ method: 'PUT', url: `/api/companies/c1/me/accounts/${IDS.jira}/token` })
+        .request.body,
+    ).toEqual({ token: 'jira-token' });
+  });
+
+  it('sends nothing for an empty token, and keeps the field focused', async () => {
+    await render(aWaitingBinding());
+    q('binding-paste-token')!.click();
+    await fixture.whenStable();
+    typeInto(q('binding-token'), '   ');
+    await fixture.whenStable();
+    el.querySelector<HTMLButtonElement>('form button[type=submit]')!.click();
+    await settle();
+    http.expectNone(`/api/companies/c1/me/accounts/${IDS.jira}/token`);
+    expect(document.activeElement).toBe(q('binding-token'));
+    expect(changed).toEqual([]);
   });
 
   it('focuses the token field when it opens, and takes a binding settled meanwhile as settled', async () => {

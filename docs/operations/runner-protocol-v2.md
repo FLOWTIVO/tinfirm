@@ -14,8 +14,8 @@ and [`protocol/runner-v2.schema.json`](../../protocol/runner-v2.schema.json), an
 | Tools the agent sees | `ask_human`, `finish_run`, `request_repository`, `create_task`, `upload_attachment`, `list_repositories` | The platform tools `ask`, `finish`, `request_access`, `request_network_access` (only on a host with the egress proxy), `save_artifact` and `list_repositories`, as far as `run.assign.platformTools` names them; plus the server-executed tools of `run.assign.tools`: the systems' tools (`jira_get`, `jira_search`, …) and, while the agent's memory is on, `remember`, `forget` and `recall` |
 | Documents | `upload_attachment` only | `/output` in the sandbox, saved as outputs of the conversation when the run ends (`run.finished.artifacts`), and `save_artifact` for files elsewhere and for links. The host refuses a file above `run --upload-max-bytes` (default 25 MiB, the server's default `TINFIRM_ATTACHMENT_MAX_FILE_SIZE`) before it reads it; set the two alike |
 | `run.assign` | `task {id, key, title}` | `workItem {id, key, title}` and `job {id}`, which carry the conversation (PLATFORM.md §11.1); `tools[]`; `platformTools[]`, the platform tools the agent may use (`finish` and `list_repositories` always); `allowedHosts[]`, the network hosts approved for the conversation or the agent; `skills[]` (feature `run.skills`, below); and `agent.effort` unless it is the runtime's default |
-| `hello.features` | none | The optional features the host implements: `run.steer` and `run.skills` (below) |
-| `hello.isolationTiers` | `container`, `gvisor` | also `microvm` (a Kata runtime) |
+| `hello.features` | none | The optional features the host implements: `run.steer`, `run.skills`, `run.git.revoke`, `host.health` and others (below) |
+| `hello.isolationTiers` | `container`, `gvisor` (and `microvm`, which no v1 host sends); all placed as `container` | The host's level of isolation: `machine`, `vm-jail`, `container`, or `gvisor` (placed as `container`); `microvm` is refused. Beside it `hardened` and `isolationStated` (below) |
 | `welcome` | no version | `protocolVersion`: the version the server speaks |
 | Usage (USAGE events, `run.finished.usage`) | cache writes counted in `inputTokens` | `cacheWriteTokens` apart from `inputTokens` |
 | A run stopped at `limits.maxWallClockSeconds` | `GUARD_STOPPED`, as the other guards | `TIME_LIMIT`, which the server shows as a stop that a retry goes on from |
@@ -158,6 +158,134 @@ ships it.
   upgrade the hosts, and rebuild the pi image for pi's steering
   (`tinfirm-runner-host images build --runtime pi`). OpenCode has no steering; its messages wait
   for the next turn.
+- **Revoking a run's git token** ([ADR-0116](../adr/0116-short-lived-and-revocable-git-tokens.md)).
+  A host that lists the feature `run.git.revoke` gets `run.git.revoke {runId, epoch,
+  componentIds, reason, message}` when the account that cloned one of its run's repositories can
+  no longer be used: the conversation's binding there waits or is gone (an account disconnected
+  or to sign in again, a credential disabled, a grant or a lending withdrawn, a person who left
+  the grant's group, a holder suspended or gone, a system removed), the system is paused (with
+  or without "stop running turns"), or a trigger's binding follows its service account to
+  another credential. The host drops those repositories' tokens: its git proxy answers the
+  agent's next fetch with 403 and the message, and it does not push them at the run's end, so a
+  repository with commits ahead fails the run `GIT_ERROR`. The other repositories go on.
+  - The server keeps the revocation as a durable command (`run_command` of type `REVOKE_GIT`),
+    sends the frame right after the change's commit (also to the connected host of a run lost
+    within the resume window, which may still run it), and again at every `hello` that lists the
+    run until the run ends, when the host accepts the run (a frame sent while `run.assign` was on
+    its way may have come first), and when a heartbeat resumes a lost run.
+  - **The host confirms it.** Once it has dropped the tokens and written its take-back record
+    again, the host answers `run.git.revoked {runId, epoch, componentIds}`, naming the
+    repositories of that frame that its run has, also when the frame comes twice. The server
+    takes it only from the run's host for the run's epoch, ignores any other without an `error`,
+    and marks the revocation confirmed. A host sends nothing back for a `run.git.revoke` of an
+    unknown run or another epoch, no `error` frame: it ignores it. A host of protocol 1 never gets one, and would answer it `error`
+    `UNKNOWN_TYPE`.
+  - **Before every `run.cancel`** of a run that a host reports (in its `hello`, a heartbeat or a
+    `run.accepted`), the host first gets `run.git.revoke` for that assignment: every revocation
+    recorded for it, pending or done, and every repository whose binding no longer holds, whose
+    system is paused or removed, or whose binding changed since the run cloned it (reason
+    `BINDING_CHANGED`). The second part covers a run the server stopped tracking (it ended, or was
+    lost longer ago than the resume window, `TINFIRM_RUNNER_LOST_RESUME_WINDOW`), whose cause came
+    later, and an earlier execution of a run that was assigned again: the server keeps what each
+    assignment cloned, by epoch, for as long as it keeps the run. It is recorded and audited then.
+    A heartbeat of an earlier epoch gets the same. So does a member's machine that reports a run
+    of a company its owner left, when that run's assignment went to this machine; a machine that
+    did not hold it gets the cancel alone. A cancelled run pushes its work, so it never pushes with
+    a token the server would refuse it now.
+  - `welcome.done` (no other field) ends the server's answer to a `hello` that lists
+    `run.git.revoke`: once per connection, after every frame it sends again for the runs the
+    `hello` listed (the revocations, then the cancels), also when there is nothing to send again.
+    Every revocation of those runs that committed before `welcome.done` was written went before
+    it: while the answer ends, the server holds back the commit of any revocation of the host's
+    runs, and sends those that committed meanwhile first. One that commits later goes right after
+    its commit; the host applies it when it arrives, and a push it already started finishes. A
+    frame may come twice; the host applies it once.
+  - A host that took a run back after a restart pushes it, and uses its git tokens, only once
+    the current process has had the server's `welcome` and, from a server that lists
+    `run.git.revoke` in `welcome.features`, `welcome.done`: there is no time limit, so it never
+    pushes with a token the server revoked while it was away. The take-back record stays, marked
+    collected, until the run ends. An older server sends no `welcome.done`, and the host goes on
+    at `welcome`. When the server cannot complete its answer after `welcome` (a database error,
+    for example), it sends `error` `INTERNAL_ERROR` and closes the connection with 1011; the host
+    reconnects, and its next `hello` is answered whole.
+  - Each revocation is audited `run.git_revoked` (the run, the binding or the paused system,
+    the repositories, the reason, and how the host was to be told), and its first confirmation
+    `run.git_revoke_confirmed` (the run, the repositories, the host). The run's page shows it on
+    the repository: confirmed (`CONFIRMED`, "The runner host dropped the token."), sent and not
+    confirmed yet (`SENT`, the frame was written to the host's connection; it goes again when the
+    host reconnects), pending (`PENDING`, the host was not connected: it is told when it
+    reconnects, before it can push), or the host cannot drop a token (`UNSUPPORTED`).
+  - A host that does not list the feature gets nothing: its run keeps its tokens until it ends,
+    as before, the audit says `sent: false`, and the conversation says so. Upgrade the hosts to
+    revoke at once; nothing needs configuring.
+  - A paused agent or trigger, and the company's stop, revoke nothing: those runs finish, or are
+    cancelled, by their own rules, and a cancelled run pushes its work (the owner's decision of
+    2026-11-20 for the company's stop).
+  - A revocation stops only what has not started: a fetch or a push already under way finishes,
+    what the sandbox holds stays there, and the token itself stays valid at the code host. Rotate
+    a member's personal access token at the code host when it may have been copied. A GitHub
+    App's token stays valid at GitHub until its hour ends: the server keeps no run's token, and
+    does not ask GitHub to revoke it.
+- **Renewing a GitHub App's tokens** ([ADR-0116](../adr/0116-short-lived-and-revocable-git-tokens.md)).
+  A host that lists the feature `run.git.refresh` (and `run.git.revoke` with it) gets, for a
+  repository whose credential is an installation of a GitHub system's App, `workspaces[].git`
+  with `expiresAt` (an hour from the mint) and `mirrorKey` (the key it names the repository's
+  mirror by, in place of the token). It renews with `run.request` kind `GIT_TOKEN`,
+  `payload {componentIds}`: when ten minutes or less are left, before the push at the run's end
+  when twenty or less are left, and after it took a run back, once connected. The server checks
+  the conversation's binding again for each, and answers `DONE` with `{git: [{componentId,
+  username, token, expiresAt}], refused?: [{componentId, code, message}]}`, or `REJECTED` with
+  `GIT_REVOKED` (refused for good: applied as a `run.git.revoke`, and recorded as one),
+  `GIT_HELD` (a kill switch holds; ask again later) or `GIT_UNAVAILABLE` (GitHub not answering)
+  when no repository got a token and all share the code. At most one `GIT_TOKEN` request of a run
+  waits for its answer; the host waits 30 seconds. A run on such a credential goes only to a host
+  that lists both features; until one is connected it waits with `NO_HOST_FOR_APP_TOKENS`. A host
+  without the feature never gets `expiresAt` or `mirrorKey`.
+- **`welcome.features`.** From this release the server's `welcome` names every optional feature
+  it implements. A host that took a run back after a restart waits for `welcome.done` before it
+  pushes the run's work only when `welcome.features` lists `run.git.revoke`; with an older server
+  it pushes as before, without waiting.
+- **A host that can take no run** ([ADR-0117](../adr/0117-a-host-reports-that-it-can-take-no-run.md)).
+  A host that lists the feature `host.health`, today a host with a VM per run, tells the server
+  when it can take no run, and when it can again:
+
+  | Field | Meaning |
+  |---|---|
+  | `type` | `host.health` |
+  | `problems` | At most 8 `{code, message}`; empty: the host takes runs |
+  | `problems[].code` | A closed list, today `VM_DRIVER_NO_VM`: the VM driver's `verify` reports problems and no room |
+  | `problems[].message` | The host's own words, one line of at most 1000 characters |
+  | `since` | When the current problems began, by the host's clock; absent without problems |
+
+  - **The host** sends the frame only on a connection whose `welcome.features` lists
+    `host.health`, after `welcome` and, from a server that lists `run.git.revoke`, after
+    `welcome.done`: when it has a problem, at each change of its problems, and once with an empty
+    list when it is healthy again. It sends nothing while it is healthy and was healthy on that
+    connection. A connection starts healthy on both sides, so after a reconnect a host that still
+    has a problem says it again. It sends at most one frame every 5 seconds, the latest state, and
+    keeps rejecting a run that arrives while it has a problem (a frame on its way, or an older
+    server).
+  - **The server** keeps the problems with the host's connection, in memory: a disconnect, a new
+    connection and a restart of the server forget them. It assigns no run to such a host. A run that
+    only such hosts may take waits with `RUNNER_HOST_UNHEALTHY`, which names the host and its first
+    problem ("Runner host … can take no run: …."); no `run.assign`, no audit of an assignment, no
+    token and no new epoch happen while it waits. When the host's problems go or come, the runs
+    that wait in a back-off after its rejections are placed again at once, and the dispatcher runs:
+    once the host takes runs again, they start within seconds. The host's card shows the problems,
+    the host's text as text, while it is connected. The audit has `runner_host.health_failed` when
+    the host's connection goes from no problem to a problem and `runner_host.health_restored` when
+    it goes back; a change among problems is not audited.
+  - **Its limits.** A frame from a host that did not list the feature, or outside the schema (an
+    unknown code, more than 8 problems, a message of several lines or too long), is answered
+    `error BAD_MESSAGE` and not applied. More than 12 frames a minute from one connection (12 at
+    once, one more every 5 seconds) are answered `error TOO_MANY_REQUESTS` and not applied: the
+    server keeps the state it took last.
+  - **Compatibility.** A host of an older release does not list the feature and rejects each run as
+    before; the server waits longer after each further rejection of a run by the same host
+    (`TINFIRM_RUN_REJECT_BACKOFF`, doubled each time up to `TINFIRM_RUN_REJECT_BACKOFF_MAX`, 5
+    minutes by default). A server of an older release does not list the feature in
+    `welcome.features`, and the host sends nothing. Nothing needs configuring, and the server and
+    the hosts can be upgraded in either order.
 - **Skills** ([ADR-0064](../adr/0064-skills-library.md)). A v2 host that lists `run.skills` gets
   the agent's skills in `run.assign.skills` and downloads each from the server before the
   sandbox starts ([runner/README.md](../../runner/README.md#skills-protocol-v2)). A run whose
@@ -171,16 +299,59 @@ ships it.
   Enterprise licence ([ADR-0100](../adr/0100-elastic-runners-in-pro.md)). Without both, nothing
   changes.
 - **The sandbox bridge** ([ADR-0095](../adr/0095-sandbox-bridge.md),
-  [ADR-0100](../adr/0100-elastic-runners-in-pro.md)). A host with `run --sandbox-bridge` or a VM
-  per run lists `sandbox.bridge`, which adds no frame; both need protocol 2. Elastic runners are
-  Pro's and Enterprise's: a server whose licence does not hold them answers the `hello` with
-  `error` `EDITION_REQUIRED` and close code 1008, and the host stops with that message, without
-  reconnecting. Run the host with Docker and without `--sandbox-bridge`, or apply a Pro or
-  Enterprise key and start the host again.
+  [ADR-0114](../adr/0114-the-secure-sandbox-is-in-the-core.md)). A host with
+  `run --sandbox-bridge` or a VM per run lists `sandbox.bridge`, which adds no frame; both need
+  protocol 2. The bridge is in the core: every edition accepts it.
+- **Elastic runners** ([ADR-0100](../adr/0100-elastic-runners-in-pro.md),
+  [ADR-0114](../adr/0114-the-secure-sandbox-is-in-the-core.md)). Two features of the `hello`
+  are Pro's and Enterprise's:
+
+  | Feature | The host lists it when | Without a Pro or Enterprise licence, run instead |
+  |---|---|---|
+  | `sandbox.pool` | it keeps ready VMs | `run --pool-max-ready 0`: every run starts cold |
+  | `sandbox.elastic` | its VM driver is one of the binary's paid ones, a provider's (DigitalOcean's) | Docker, or a VM driver of your own: the driver protocol is open |
+
+  A server whose licence does not hold elastic runners answers such a `hello` with `error`
+  `EDITION_REQUIRED` and close code 1008, and the host stops with that message, without
+  reconnecting. Change the host as the table says, or apply a Pro or Enterprise key, and start
+  the host again.
+- **Isolation level** ([ADR-0113](../adr/0113-levels-of-isolation-and-placement.md)). A v2
+  host sends its level in `hello.isolationTiers`, one value: `machine`, `vm-jail`, `container`,
+  or `gvisor` for a host with a `runsc` runtime, which is placed as `container`. A host that
+  sends several values is placed by the weakest. Beside it, optional: `hardened` (`yes`, `no`, or
+  `none` for a VM per run at a provider; absent is `no`) and `isolationStated` (true when the
+  level rests on the operator's statement; absent is false). They add no frame. The server
+  stores the report at every `hello` and shows it on the host's card as reported; it checks none
+  of it. A host of this release derives its level from what it can see: a host with Docker
+  reports `container`, Kata Containers included, and one with `--vm-driver digitalocean` reports
+  `machine` with `hardened` `none`. With a VM driver of the operator's own it reports
+  `container` unless the operator states a level (`run --isolation-level machine|vm-jail`,
+  `--isolation-hardened yes|no|none`), marked `isolationStated`; a statement where the host
+  derives its own level stops `run`. Its startup log and `doctor` say the level and what an
+  escape from a sandbox reaches ([runner/README.md](../../runner/README.md#isolation-level)).
+
+  `microvm` is no value of v2 any more. A host of an older release sends it for Kata Containers
+  and for a VM per run, two different levels, so the server refuses its `hello` with `error`
+  `UPGRADE_REQUIRED` and close code 1008. The message names the server's version and says to
+  upgrade `tinfirm-runner-host` to it. The host logs the message and stops, without
+  reconnecting. Upgrade the server first, then at once every host with a VM per run or Kata;
+  Docker hosts keep working and can follow at any time
+  ([runner-isolation.md](runner-isolation.md#5-upgrading-the-server-then-the-vm-hosts-at-once)).
+  This is the one exception to "compatibility is the protocol and its features" (ADR-0113,
+  decision 2, which amends ADR-0109 for this change).
+
+  The server places runs by level (ADR-0113, decision 4;
+  [CONVENTIONS §15.6](../CONVENTIONS.md#156-runs-and-turns)): an agent's runs go to the
+  strongest level among the company's hosts that may run them, and a member's own host takes
+  their runs too when it reports that level or a stronger one. They wait for those hosts rather
+  than go to a weaker one. A host that has not connected to a server of this release yet is
+  placed as `container`. An agent's editor can choose a level for it
+  ([runner-isolation.md](runner-isolation.md)).
 - **Ready sandboxes** ([ADR-0098](../adr/0098-ready-vms.md),
   [ADR-0099](../adr/0099-pool-settings.md)). A host with a VM per run (`run --executor vm`)
-  lists `sandbox.pool` and reports its operator's `--pool-max-ready` in `hello.pool`. An owner
-  or admin sets the schedule on the host's card (Runner hosts › Ready sandboxes); the server
+  and ready VMs lists `sandbox.pool` and reports its operator's `--pool-max-ready` in
+  `hello.pool`. An owner or admin sets the schedule on the host's card (Runner hosts › Ready
+  sandboxes); the server
   evaluates it every minute (`TINFIRM_RUNNER_POOL_TICK`) and sends the count now and its next
   change in `host.config.pool`. Until a schedule is set, none waits ready. The host reports its
   sandboxes in `host.pool.status`, which the card shows. Such a host may have up to 1000 slots
@@ -189,8 +360,10 @@ ships it.
 ## Checks
 
 - `run`'s log line `runner host starting` shows `protocol_version`.
-- A v2 host's `hello` lists `isolationTiers: ["microvm"]` on a Kata host, which the server
-  accepts (it does not store the tier yet).
+- A v2 host's `hello` lists its level in `isolationTiers`, `["container"]` on a Kata host, and
+  the host's card says "Reports container". A host of an older release with Kata or a VM per
+  run sends `["microvm"]`; its log ends with the server's `UPGRADE_REQUIRED` message and close
+  1008.
 - The company's audit log has a `tool.called` event per server-executed tool call, and a
   `secret.accessed` event with purpose `run-tool:{runId}` for each.
 - After a run, the conversation's outputs hold the files the agent left in `/output`; the run's
@@ -200,11 +373,14 @@ ships it.
   earlier session", or "Started a new session: …" with the reason), and
   `tinfirm_runs_finished_total{resumed, resume_outcome, runtime}` counts it. Many
   `NO_SESSION` runs mean that turns of a conversation land on another host than the turn before.
-- A host with a VM per run shows "Ready sandboxes" on its card once it connected; after a
+- A host that lists `sandbox.pool` shows "Ready sandboxes" on its card once it connected; after a
   schedule is saved, its `host.config.applied` carries `pool.readyTarget`, at most its
   `maxReadyCeiling`, and its card shows the ready, starting and busy sandboxes it reported.
 - `tinfirm_runner_refused_frames_total{frame, reason}` counts the requests and events the
   limits refused (`rate`, `size`, `budget`, `in_flight`). A steady count of `rate` for one
   company's hosts, or any `size`, points to a host that floods or does not cut its events.
+- A host with a VM per run lists `host.health` in its `hello`. While its driver can make no VM,
+  its card says **Takes no runs** and why, and its waiting turns show `RUNNER_HOST_UNHEALTHY`;
+  the company's audit has one `runner_host.health_failed` per episode and connection.
 - A run's page shows its tokens as `in · cache read · cache write · out`
   ([prompt-cache.md](prompt-cache.md)).

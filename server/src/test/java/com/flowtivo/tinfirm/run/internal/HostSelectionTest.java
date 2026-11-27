@@ -13,6 +13,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import com.flowtivo.tinfirm.run.QueueReasonCode;
 import com.flowtivo.tinfirm.runner.HostScope;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
+import com.flowtivo.tinfirm.runner.RunnerMessages;
 
 /**
  * The host of a run among the eligible ones (the package 3 contract, §5.7 steps 4 and 5; open point 13), as a table:
@@ -105,5 +106,137 @@ class HostSelectionTest {
         assertThat(HostSelection.select(List.of(plain), A, true))
             .isInstanceOfSatisfying(HostSelection.Waits.class,
                     waits -> assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.NO_HOST_FOR_SKILLS));
+    }
+
+    /** A run on a GitHub App's installation goes only to a host that renews its tokens (ADR-0116, decision 8). */
+    @org.junit.jupiter.api.Test
+    void aRunOnAnAppInstallationGoesOnlyToAHostThatRenewsTokens() {
+        RunnerHostInfo alpha = host(A, "alpha", true, 2, false, 4, 0).info();
+        RunnerHostInfo beta = host(B, "beta", true, 2, false, 4, 3).info();
+        HostSelection.Host plain = new HostSelection.Host(alpha, true, 2, 0, false, false, false);
+        HostSelection.Host renewing = new HostSelection.Host(beta, true, 2, 3, false, false, true);
+
+        assertThat(HostSelection.select(List.of(plain, renewing), null, false, null, true))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("beta"));
+        assertThat(HostSelection.select(List.of(plain, renewing), null, false, null, false))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("alpha"));
+        assertThat(HostSelection.select(List.of(plain), A, false, null, true))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.NO_HOST_FOR_APP_TOKENS);
+                assertThat(waits.reason().text()).contains("alpha", "run.git.refresh");
+            });
+    }
+
+    private static HostSelection.Host leveled(String name, com.flowtivo.tinfirm.runner.@Nullable IsolationLevel level,
+            com.flowtivo.tinfirm.runner.@Nullable Hardening hardened, int used, boolean restores) {
+        RunnerHostInfo info = new RunnerHostInfo(UUID.randomUUID(), UUID.randomUUID(), name, HostScope.COMPANY, null,
+                null, 4, 4, null, false, null, "1.0.0", Instant.now(), level, hardened, false);
+        return new HostSelection.Host(info, true, 2, used, false, restores);
+    }
+
+    /**
+     * ADR-0113, decision 4: among the free hosts the dispatcher hands it, the stronger by level and hardening comes
+     * before the one with more room; the session's host comes before both; a host that restores a moving session's
+     * bundle before all others.
+     */
+    @org.junit.jupiter.api.Test
+    void theStrongerHostByLevelAndHardeningComesBeforeTheFreerOne() {
+        HostSelection.Host hardened = leveled("hardened", com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE,
+                com.flowtivo.tinfirm.runner.Hardening.YES, 3, false);
+        HostSelection.Host plain = leveled("plain", com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE,
+                com.flowtivo.tinfirm.runner.Hardening.NO, 0, false);
+        HostSelection.Host restoring = leveled("restoring", com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE,
+                com.flowtivo.tinfirm.runner.Hardening.NO, 2, true);
+        assertThat(HostSelection.select(List.of(plain, hardened), null, false))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("hardened"));
+        assertThat(HostSelection.select(List.of(plain, hardened), plain.info().id(), false))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("plain"));
+        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false,
+                com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("restoring"));
+        assertThat(HostSelection.select(List.of(plain, hardened, restoring), null, false, null))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("hardened"));
+    }
+
+    /**
+     * ADR-0113, decision 4 (the review of 2026-11-18, finding 1): a moving session goes first to a free host of the
+     * level that restores it, before the session's or the previous run's host; a restorer of another level (the
+     * weaker session host itself) is not one; the session's host then comes before the level's other hosts.
+     */
+    @org.junit.jupiter.api.Test
+    void aFreeRestorerOfTheLevelComesFirstThenTheSessionsHostThenTheRest() {
+        com.flowtivo.tinfirm.runner.IsolationLevel machine = com.flowtivo.tinfirm.runner.IsolationLevel.MACHINE;
+        HostSelection.Host session = leveled("session", null, null, 0, true);
+        HostSelection.Host other = leveled("other", machine, com.flowtivo.tinfirm.runner.Hardening.NONE, 0, false);
+        HostSelection.Host restorer = leveled("restorer", machine, com.flowtivo.tinfirm.runner.Hardening.NO, 3,
+                true);
+        assertThat(HostSelection.select(List.of(session, other, restorer), session.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("restorer"));
+        // No free restorer of the level: the session's host, though another host of the level is free.
+        HostSelection.Host busy = leveled("restorer", machine, com.flowtivo.tinfirm.runner.Hardening.NO, 4, true);
+        assertThat(HostSelection.select(List.of(session, other, busy), session.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("session"));
+        // A chosen level: no session host among the candidates, and the restorer before the previous run's host.
+        assertThat(HostSelection.select(List.of(other, restorer), other.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("restorer"));
+        assertThat(HostSelection.select(List.of(other, busy), other.info().id(), false, machine))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("other"));
+    }
+
+    /**
+     * ADR-0117: a host that reports a problem with {@code host.health} gets no run. A run goes to a healthy host; when
+     * only the one host may take it, it waits with that host's name and first problem; of several, with none.
+     */
+    @org.junit.jupiter.api.Test
+    void aHostThatReportsAProblemTakesNoRun() {
+        RunnerHostInfo alpha = host(A, "alpha", true, 2, false, 4, 0).info();
+        RunnerHostInfo beta = host(B, "beta", true, 2, false, 4, 3).info();
+        List<RunnerMessages.HostProblem> problems = List.of(
+                new RunnerMessages.HostProblem("VM_DRIVER_NO_VM", "node node-1: the firewall table is missing"));
+        HostSelection.Host broken = new HostSelection.Host(alpha, true, 2, 0, false, false, false, problems);
+        HostSelection.Host working = new HostSelection.Host(beta, true, 2, 3, false, false, false, List.of());
+
+        // The broken host has more room and is the previous host: the healthy one takes the run all the same.
+        assertThat(HostSelection.select(List.of(broken, working), A))
+            .isInstanceOfSatisfying(HostSelection.Chosen.class,
+                    chosen -> assertThat(chosen.host().info().name()).isEqualTo("beta"));
+        assertThat(HostSelection.select(List.of(broken), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_UNHEALTHY);
+                assertThat(waits.reason().runnerHostId()).isEqualTo(A);
+                assertThat(waits.reason().reason()).isEqualTo("VM_DRIVER_NO_VM");
+                assertThat(waits.reason().text())
+                    .isEqualTo("Runner host alpha can take no run: node node-1: the firewall table is missing.");
+            });
+        HostSelection.Host brokenToo = new HostSelection.Host(beta, true, 2, 3, false, false, false, problems);
+        assertThat(HostSelection.select(List.of(broken, brokenToo), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_UNHEALTHY);
+                assertThat(waits.reason().runnerHostId()).isNull();
+                assertThat(waits.reason().text()).isEqualTo("None of the 2 runner hosts that may run this "
+                        + "conversation can take a run now: each reports a problem.");
+            });
+        // A draining host says so first; a full healthy host beside a broken one is full.
+        RunnerHostInfo draining = host(A, "alpha", true, 2, true, 4, 0).info();
+        assertThat(HostSelection.select(List.of(new HostSelection.Host(draining, true, 2, 0, false, false, false,
+                problems)), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class,
+                    waits -> assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_DRAINING));
+        HostSelection.Host full = new HostSelection.Host(beta, true, 2, 4, false, false, false, List.of());
+        assertThat(HostSelection.select(List.of(broken, full), null))
+            .isInstanceOfSatisfying(HostSelection.Waits.class, waits -> {
+                assertThat(waits.reason().code()).isEqualTo(QueueReasonCode.RUNNER_HOST_FULL);
+                assertThat(waits.reason().runnerHostName()).isEqualTo("beta");
+            });
     }
 }

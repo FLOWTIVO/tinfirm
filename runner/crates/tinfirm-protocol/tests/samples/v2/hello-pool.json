@@ -6,7 +6,7 @@
   "os": "linux",
   "arch": "x86_64",
   "executors": ["docker"],
-  "isolationTiers": ["microvm"],
+  "isolationTiers": ["machine"],
   "maxConcurrentRuns": 32,
   "credentials": [],
   "runtimes": [

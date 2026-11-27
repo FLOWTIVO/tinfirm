@@ -1,0 +1,241 @@
+---
+# The hardening of ADR-0113 decision 5, each line by its switch (defaults/main.yml, "The
+# hardening"). The node agent's helper checks every line in its `check` and writes none; the
+# proof (proof.yml) fails when a line whose switch is on does not hold.
+
+# --- The kernel's settings ------------------------------------------------------------------------
+
+# Read first: a value the node has stricter already is left out of the file (vars/main.yml,
+# _tinfirm_sandbox_node_hardening_sysctls). A setting this kernel does not have is left out of
+# what was read; checks.yml refuses a switch whose setting is missing.
+- name: Read the kernel's settings that the hardening sets
+  ansible.builtin.slurp:
+    src: "/proc/sys/{{ item | replace('.', '/') }}"
+  loop: "{{ _tinfirm_sandbox_node_hardening_keys }}"
+  register: _tinfirm_sandbox_node_sysctl_read
+  failed_when: false
+
+- name: Keep what was read
+  ansible.builtin.set_fact:
+    _tinfirm_sandbox_node_sysctl_current: >-
+      {{ dict(_tinfirm_sandbox_node_sysctl_read.results
+              | selectattr('content', 'defined')
+              | map(attribute='item')
+              | zip(_tinfirm_sandbox_node_sysctl_read.results
+                    | selectattr('content', 'defined')
+                    | map(attribute='content') | map('b64decode') | map('trim') | map('int'))) }}
+
+- name: Write the hardening's sysctl settings
+  ansible.builtin.template:
+    src: hardening.sysctl.conf.j2
+    dest: "{{ _tinfirm_sandbox_node_hardening_sysctl }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: _tinfirm_sandbox_node_hardening_file
+
+# Whenever the node does not have them, not only when the file changed: a run that failed
+# between the file and its application would otherwise never apply them (as service.yml does
+# for the agent's own two settings).
+- name: Apply the hardening's sysctl settings that are not in force
+  ansible.builtin.command:
+    argv: [sysctl, -p, "{{ _tinfirm_sandbox_node_hardening_sysctl }}"]
+  changed_when: true
+  when: _tinfirm_sandbox_node_hardening_pending | length > 0
+
+# --- AppArmor and the VMMs' profile ---------------------------------------------------------------
+
+# AppArmor's package is one of the node's packages (packages.yml, vars/main.yml): installed
+# before the node's firewall is loaded, after which the node reaches no mirror.
+# The parser checks the file before it is written, and apparmor.service loads it at each boot,
+# in the mode its flags give (_tinfirm_sandbox_node_profile_text).
+- name: Install the VMMs' AppArmor profile
+  ansible.builtin.copy:
+    content: "{{ _tinfirm_sandbox_node_profile_text }}"
+    dest: "{{ _tinfirm_sandbox_node_profile }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: apparmor_parser -Q -K %s
+  register: _tinfirm_sandbox_node_profile_file
+  when: _tinfirm_sandbox_node_harden_on.mac | bool
+
+- name: Read the loaded AppArmor profiles
+  ansible.builtin.slurp:
+    src: /sys/kernel/security/apparmor/profiles
+  register: _tinfirm_sandbox_node_profiles
+  failed_when: false
+
+# Loaded again when its file changed, or when it is not loaded in its mode: from complain to
+# enforce and back, the file's flags change, and the load replaces the profile in the new mode.
+# A second run finds it loaded as it should be and loads nothing.
+- name: Load the VMMs' AppArmor profile in its mode
+  ansible.builtin.command:
+    argv: [apparmor_parser, -r, "{{ _tinfirm_sandbox_node_profile }}"]
+  changed_when: true
+  when:
+    - _tinfirm_sandbox_node_harden_on.mac | bool
+    - >-
+      _tinfirm_sandbox_node_profile_file is changed
+      or _tinfirm_sandbox_node_profile_loaded not in
+         ((_tinfirm_sandbox_node_profiles.content | default('') | b64decode).splitlines() | map('trim') | list)
+
+# Off: a profile that an earlier run loaded is unloaded, by its name, and its file removed, so that
+# AppArmor no longer attaches it to the VMMs that start (it attaches by the program's path, whatever
+# helper.json says). A VMM that runs keeps its confinement until it ends.
+- name: Unload the VMMs' AppArmor profile
+  ansible.builtin.command:
+    argv: [apparmor_parser, -R, -K]
+    stdin: "profile tinfirm-vmm {}"
+  changed_when: true
+  when:
+    - not _tinfirm_sandbox_node_harden_on.mac | bool
+    - >-
+      (_tinfirm_sandbox_node_profiles.content | default('') | b64decode).splitlines() | map('trim')
+      | select('match', 'tinfirm-vmm [(]') | list | length > 0
+
+- name: Remove the VMMs' AppArmor profile's file
+  ansible.builtin.file:
+    path: "{{ _tinfirm_sandbox_node_profile }}"
+    state: absent
+  when: not _tinfirm_sandbox_node_harden_on.mac | bool
+
+# --- What lasts until a reboot: kexec, lockdown, module loading -------------------------------
+
+# `tinfirm-node-agent harden` reads it at each boot, from its own unit (installed with the
+# others, system.yml), after the modules' and the firewall's units and before the helper.
+- name: Write what the hardening's unit sets at each boot
+  ansible.builtin.template:
+    src: hardening.json.j2
+    dest: "{{ _tinfirm_sandbox_node_hardening_config }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Run the node's hardening again
+
+# --- Setuid and setgid programs ---------------------------------------------------------------
+
+# As the helper's scan: /usr and /opt, and /bin and /sbin where they are directories of their
+# own; one file system each, no link followed.
+- name: Look at the directories the setuid scan walks
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+    follow: false
+  loop: "{{ _tinfirm_sandbox_node_setuid_dirs }}"
+  register: _tinfirm_sandbox_node_setuid_roots
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+- name: Find the setuid and setgid programs that others may run
+  ansible.builtin.command:
+    argv: >-
+      {{ ['find']
+         + (_tinfirm_sandbox_node_setuid_roots.results | selectattr('stat', 'defined')
+            | selectattr('stat.isdir', 'defined') | selectattr('stat.isdir')
+            | rejectattr('stat.islnk') | map(attribute='item') | list)
+         + ['-xdev', '-type', 'f', '-perm', '/6000', '-perm', '-o+x', '-print'] }}
+  register: _tinfirm_sandbox_node_setuid_found
+  changed_when: false
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+# sudo is spared here and kept for the admin group below. Where /usr/bin/sudo is a link, the
+# program is the file it leads to, and the scan lists that file under its own path: spared by
+# the name /usr/bin/sudo alone, it would lose its bit, and the play its way to root.
+- name: Look at sudo's name
+  ansible.builtin.stat:
+    path: /usr/bin/sudo
+    get_checksum: false
+    follow: false
+  register: _tinfirm_sandbox_node_sudo_link
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+- name: Read the owner and mode of each
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+    follow: false
+  loop: "{{ _tinfirm_sandbox_node_setuid_strip }}"
+  register: _tinfirm_sandbox_node_setuid_files
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+# On Debian and Ubuntu the change is recorded, so that an upgrade of the package keeps it;
+# --update makes it at once. An override the operator had for the file is replaced.
+- name: Strip the setuid and setgid bits (Ubuntu, Debian)
+  ansible.builtin.command:
+    argv:
+      - dpkg-statoverride
+      - --force-statoverride-add
+      - --update
+      - --add
+      - "{{ item.stat.pw_name }}"
+      - "{{ item.stat.gr_name }}"
+      - "{{ '%04o' % ((item.stat.mode | int(base=8)) - ((item.stat.mode | int(base=8)) // 1024 % 4) * 1024) }}"
+      - "{{ item.item }}"
+  loop: "{{ _tinfirm_sandbox_node_setuid_files.results | default([]) | selectattr('stat', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  changed_when: true
+  when:
+    - _tinfirm_sandbox_node_harden_on.setuid | bool
+    - ansible_facts['os_family'] == 'Debian'
+
+- name: Strip the setuid and setgid bits (RHEL family)
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    mode: u-s,g-s
+  loop: "{{ _tinfirm_sandbox_node_setuid_files.results | default([]) | selectattr('stat', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - _tinfirm_sandbox_node_harden_on.setuid | bool
+    - ansible_facts['os_family'] == 'RedHat'
+
+- name: Look at the file that is sudo
+  ansible.builtin.stat:
+    path: "{{ _tinfirm_sandbox_node_sudo_path }}"
+    get_checksum: false
+    follow: false
+  register: _tinfirm_sandbox_node_sudo
+  when: _tinfirm_sandbox_node_harden_on.setuid | bool
+
+# sudo stays, for the admin group alone: the operator's way to root, and this play's
+# (checks.yml refuses a play whose user is not in the group).
+- name: Read sudo's recorded override (Ubuntu, Debian)
+  ansible.builtin.command:
+    argv: [dpkg-statoverride, --list, "{{ _tinfirm_sandbox_node_sudo_path }}"]
+  register: _tinfirm_sandbox_node_sudo_override
+  changed_when: false
+  failed_when: _tinfirm_sandbox_node_sudo_override.rc not in [0, 1]
+  when:
+    - _tinfirm_sandbox_node_harden_on.setuid | bool
+    - ansible_facts['os_family'] == 'Debian'
+    - _tinfirm_sandbox_node_sudo.stat.isreg | default(false)
+
+- name: Keep sudo for the admin group (Ubuntu, Debian)
+  ansible.builtin.command:
+    argv:
+      - dpkg-statoverride
+      - --force-statoverride-add
+      - --update
+      - --add
+      - root
+      - "{{ _tinfirm_sandbox_node_admin_group }}"
+      - "4750"
+      - "{{ _tinfirm_sandbox_node_sudo_path }}"
+  changed_when: true
+  when:
+    - _tinfirm_sandbox_node_harden_on.setuid | bool
+    - ansible_facts['os_family'] == 'Debian'
+    - _tinfirm_sandbox_node_sudo.stat.isreg | default(false)
+    - _tinfirm_sandbox_node_sudo_override.stdout | trim != ('root ' ~ _tinfirm_sandbox_node_admin_group ~ ' 4750 ' ~ _tinfirm_sandbox_node_sudo_path)
+
+- name: Keep sudo for the admin group (RHEL family)
+  ansible.builtin.file:
+    path: "{{ _tinfirm_sandbox_node_sudo_path }}"
+    owner: root
+    group: "{{ _tinfirm_sandbox_node_admin_group }}"
+    mode: "4750"
+  when:
+    - _tinfirm_sandbox_node_harden_on.setuid | bool
+    - ansible_facts['os_family'] == 'RedHat'
+    - _tinfirm_sandbox_node_sudo.stat.isreg | default(false)

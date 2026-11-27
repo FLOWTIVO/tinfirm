@@ -24,6 +24,7 @@ import org.springframework.web.socket.WebSocketSession;
 
 import com.flowtivo.tinfirm.runner.ConnectedHost;
 import com.flowtivo.tinfirm.runner.RunnerConnections;
+import com.flowtivo.tinfirm.runner.RunnerConnections.Health;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RunnerProperties;
 
@@ -56,6 +57,14 @@ class RunnerConnectionRegistry implements RunnerConnections {
     private static final Logger log = LoggerFactory.getLogger(RunnerConnectionRegistry.class);
 
     private static final int SILENCE_LIMIT_INTERVALS = 3;
+
+    /**
+     * ADR-0117, decision 7: a connection sends at most 12 {@code host.health} frames a minute, 12 at once and one more
+     * every 5 seconds. A host sends at most one every 5 seconds, so a host that follows the protocol never meets it.
+     */
+    static final int HEALTH_BURST = 12;
+
+    static final Duration HEALTH_REFILL = Duration.ofSeconds(5);
 
     private final Map<UUID, Connection> byHost = new ConcurrentHashMap<>();
 
@@ -95,12 +104,33 @@ class RunnerConnectionRegistry implements RunnerConnections {
         /** The host has sent {@code host.config.applied} on this connection. */
         private volatile boolean configured;
 
+        /** What the host reported last with {@code host.health} on this connection (ADR-0117); none at first. */
+        private volatile Health health = Health.NONE;
+
+        /** The {@code host.health} frames the connection may still send now: a bucket of {@link #HEALTH_BURST}. */
+        private double healthTokens = HEALTH_BURST;
+
+        private Instant healthRefilled;
+
         Connection(ConnectedHost host, WebSocketSession session, Set<String> features, Instant now) {
             this.host = host;
             this.session = session;
             this.features = Set.copyOf(features);
             this.lastInbound = now;
             this.lastRenewal = now;
+            this.healthRefilled = now;
+        }
+
+        /** Whether one more {@code host.health} is within the bound; if so, it is counted. */
+        synchronized boolean admitHealth(Instant now) {
+            double seconds = Math.max(0, Duration.between(healthRefilled, now).toMillis() / 1000.0);
+            healthTokens = Math.min(HEALTH_BURST, healthTokens + seconds / HEALTH_REFILL.toSeconds());
+            healthRefilled = now;
+            if (healthTokens < 1) {
+                return false;
+            }
+            healthTokens -= 1;
+            return true;
         }
 
         /** Whether the leases are due for renewal; if so, they count as renewed now. */
@@ -262,6 +292,53 @@ class RunnerConnectionRegistry implements RunnerConnections {
     public boolean supports(UUID runnerHostId, String feature) {
         Connection connection = connection(runnerHostId);
         return connection != null && connection.session.isOpen() && connection.features.contains(feature);
+    }
+
+    @Override
+    public Health health(UUID runnerHostId) {
+        Connection connection = connection(runnerHostId);
+        return connection != null && connection.session.isOpen() ? connection.health : Health.NONE;
+    }
+
+    /** What a {@code host.health} did to the connection's state. */
+    enum HealthOutcome {
+        /** Over the bound: not applied, the last state stays. */
+        TOO_MANY,
+        /** The same problems as before, or a connection that is no longer the current one. */
+        SAME,
+        /** Other problems than before. */
+        CHANGED
+    }
+
+    record HealthReport(HealthOutcome outcome, Health before, Health after) {
+    }
+
+    /**
+     * Applies a {@code host.health} of the host's current connection (ADR-0117): its problems replace the last ones, and
+     * {@code since} is kept from the first frame of a run of problems, at most now.
+     */
+    HealthReport reportHealth(UUID hostId, String sessionId, RunnerMessages.HostHealth reported) {
+        Connection connection = connection(hostId);
+        if (connection == null || !connection.session.getId().equals(sessionId)) {
+            return new HealthReport(HealthOutcome.SAME, Health.NONE, Health.NONE);
+        }
+        Instant now = clock.instant();
+        synchronized (connection) {
+            Health before = connection.health;
+            if (!connection.admitHealth(now)) {
+                return new HealthReport(HealthOutcome.TOO_MANY, before, before);
+            }
+            if (before.problems().equals(reported.problems())) {
+                return new HealthReport(HealthOutcome.SAME, before, before);
+            }
+            Instant since = reported.sinceInstant();
+            if (since == null || since.isAfter(now)) {
+                since = before.unhealthy() && before.since() != null ? before.since() : now;
+            }
+            Health after = new Health(reported.problems(), since);
+            connection.health = after;
+            return new HealthReport(HealthOutcome.CHANGED, before, after);
+        }
     }
 
     @Override

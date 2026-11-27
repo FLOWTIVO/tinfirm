@@ -459,6 +459,12 @@ class AccountsImpl implements Accounts {
     }
 
     @Override
+    public RunGitToken mintForRun(UUID companyId, UUID accountId, @Nullable UUID actingPrincipalId, String purpose,
+            java.util.List<String> repositoryUrls, GrantInfo.Access access) {
+        return credentials.mintForRun(companyId, accountId, actingPrincipalId, purpose, repositoryUrls, access);
+    }
+
+    @Override
     @Transactional
     public boolean refused(UUID companyId, UUID accountId, String reason) {
         return credentials.refused(companyId, accountId, reason);

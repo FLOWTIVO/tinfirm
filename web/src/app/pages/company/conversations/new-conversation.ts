@@ -100,6 +100,8 @@ const START_REASONS: Record<string, string> = {
   NO_RUNNER_HOST: 'No runner host of the company runs this agent’s runtime.',
   NO_HOST_FOR_CREDENTIALS: 'No runner host may carry this conversation’s credentials.',
   CANNOT_RUN_ANYWHERE: 'No runner host may run this conversation as it is set up.',
+  NO_HOST_OF_LEVEL:
+    'This agent’s runs go only to runner hosts of the level of isolation chosen for it, and no runner host that may run this conversation reports that level. Its editor can choose another level, or an admin can add a host that reports it.',
 };
 
 /** A refused start in words: the reason of `MODEL_ACCESS_UNAVAILABLE` or `NO_HOST_FOR_CONVERSATION`. */

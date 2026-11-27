@@ -76,6 +76,20 @@ class TurnFailureMessageTest {
     }
 
     @Test
+    void aRunLostBeforeItsAgentGotAPromptIsSaidInPlainWords() {
+        assertThat(TurnService.failureMessage(lost("HOST_RESTARTED"), "LOST", new NewTurn.Scheduled(Instant.now(), 1,
+                3, true), false)).isEqualTo("The runner host restarted before the agent started on this turn, so "
+                        + "nothing was lost. Tinfirm starts the turn again by itself in 1 minute (automatic retry 1 "
+                        + "of 3); cancel the turn to stop it.");
+        assertThat(TurnService.failureMessage(lost("HOST_RESTARTED"), "LOST", new NewTurn.Scheduled(Instant.now(), 3,
+                3, true), false)).endsWith(" in 4 minutes (automatic retry 3 of 3); cancel the turn to stop it.");
+        // The retries in a row spent: the note any spent row has.
+        assertThat(TurnService.failureMessage(lost("HOST_RESTARTED"), "LOST", null, true)).isEqualTo("The turn was "
+                + "lost: its runner host stopped reporting it. The runner host restarted. Tinfirm retried it by "
+                + "itself 3 times in a row; retry the turn, or say what to do next.");
+    }
+
+    @Test
     void onlyAProviderOrGatewayThatMayPassOrARunLostForGoodIsRetriedByItself() {
         assertThat(TurnService.mayPass(failed("SERVER_LIMITED", null), "SERVER_LIMITED")).isTrue();
         assertThat(TurnService.mayPass(lost("HOST_RESTARTED"), "LOST")).isTrue();

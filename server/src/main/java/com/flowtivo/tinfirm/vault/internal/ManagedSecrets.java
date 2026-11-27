@@ -25,6 +25,8 @@ final class ManagedSecrets {
             new Kind("SYSTEM_CREDENTIAL", "a system's credential"),
             new Kind("SERVICE_ACCOUNT", "a system's credential"),
             new Kind("SYSTEM_OAUTH_CLIENT_SECRET", "a system's OAuth client"),
+            // A GITHUB system's GitHub App's private key (ADR-0116): set and removed on the system's page.
+            new Kind("SYSTEM_GITHUB_APP_KEY", "a system's GitHub App"),
             // A Slack system's own secrets (the package 5 contract, §3.1): written on the system's page, never here.
             new Kind("SLACK_SIGNING_SECRET", "a chat system's"),
             new Kind("SLACK_APP_TOKEN", "a chat system's"),

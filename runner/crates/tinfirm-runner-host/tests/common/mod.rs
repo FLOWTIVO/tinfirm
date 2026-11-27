@@ -37,6 +37,12 @@ pub const TEST_CLAUDE_TOKEN: &str = "sk-ant-oat01-TEST-ONLY-fake-claude-token-01
 pub const TEST_OPENAI_KEY: &str = "sk-TEST-ONLY-fake-openai-key-0123456789abcdef";
 pub const TEST_HOST_TOKEN: &str = "tfr_TESTONLYfakehosttoken0123456789abcdefghijk";
 pub const TEST_GIT_TOKEN: &str = "github_pat_TEST_ONLY_fake_git_token_0123456789";
+/// A GitHub App's installation token minted for a run (ADR-0116), and the one it is renewed with.
+pub const TEST_APP_TOKEN: &str = "ghs_TEST_ONLY_fake_installation_token_0123";
+pub const TEST_RENEWED_TOKEN: &str = "ghs_TEST_ONLY_fake_renewed_token_456789";
+/// A credential's `git.mirrorKey`.
+pub const TEST_MIRROR_KEY: &str =
+    "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f";
 /// The key of a company model credential in `run.assign.modelAccess` (ADR-0027).
 pub const TEST_MODEL_KEY: &str = "sk-litellm-TEST-ONLY-fake-model-key-0123456789abcdef";
 /// Its gateway (never contacted: the fake agent only reports what it was given).
@@ -55,10 +61,9 @@ pub fn local_executor() -> Executor {
     }
 }
 
-/// The fake VM driver (`ee/runner/tinfirm-runner-host/tests/fake-vm-driver`, the driver protocol of ADR-0096).
+/// The fake VM driver (`tests/fake-vm-driver`, the driver protocol of ADR-0096).
 pub fn fake_vm_driver_script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../ee/runner/tinfirm-runner-host/tests/fake-vm-driver/fake-driver.mjs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fake-vm-driver/fake-driver.mjs")
 }
 
 /// The VM executor with the fake driver, whose "VMs" are this crate's binary as `bridge` on a
@@ -94,6 +99,7 @@ pub fn vm_options(log: &Path, env: &[(&str, &str)]) -> tinfirm_runner_host::vm::
             program: PathBuf::from("node"),
             args: vec![fake_vm_driver_script().to_string_lossy().into_owned()],
             env: driver_env,
+            builtin: None,
         },
         template.to_string(),
     );
@@ -268,6 +274,8 @@ pub struct Conn {
     pub max_frame: usize,
     /// Every text frame received on this connection, in order.
     pub frames: Vec<Value>,
+    /// `welcome.features` of the next handshake ([`Conn::handshake_listing`]).
+    pub welcome_features: Option<Value>,
     /// Frames received but passed over by [`Conn::take`]; [`Conn::next`] returns them first.
     backlog: VecDeque<Value>,
     pub closed: bool,
@@ -376,6 +384,7 @@ impl FakeServer {
                     pongs,
                     max_frame: 0,
                     frames: Vec::new(),
+                    welcome_features: None,
                     backlog: VecDeque::new(),
                     closed: false,
                     close_frame,
@@ -634,6 +643,27 @@ impl Conn {
         .await;
     }
 
+    /// Waits until a run's agent has said `needle` (its AGENT_MESSAGE events, joined).
+    pub async fn until_agent_says(&mut self, run_id: Uuid, needle: &str) {
+        let id = run_id.to_string();
+        let mut said = String::new();
+        loop {
+            let frame = self
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("connection closed before the agent said {needle:?}"));
+            if frame["type"] == "run.finished" && frame["runId"] == id {
+                panic!("the run finished before the agent said {needle:?}: {said}\n{frame:#}");
+            }
+            if frame["runId"] == id && frame["eventType"] == "AGENT_MESSAGE" {
+                said.push_str(frame["payload"]["text"].as_str().unwrap_or_default());
+                if said.contains(needle) {
+                    return;
+                }
+            }
+        }
+    }
+
     async fn receive(&mut self) -> Option<Value> {
         if self.closed {
             return None;
@@ -725,6 +755,15 @@ impl Conn {
         hello
     }
 
+    /// [`Conn::handshake`] of a server that lists `features` in `welcome.features` (a server
+    /// of ADR-0116 and later lists `run.git.revoke` and `run.git.refresh`).
+    pub async fn handshake_listing(&mut self, heartbeat_seconds: u64, features: &[&str]) -> Value {
+        self.welcome_features = Some(json!(features));
+        let hello = self.handshake(heartbeat_seconds).await;
+        self.welcome_features = None;
+        hello
+    }
+
     /// Answers `hello` with `welcome`, then sends `config` (if any) and waits for its
     /// `host.config.applied`. Returns the hello and the applied frame.
     pub async fn handshake_with(
@@ -733,7 +772,7 @@ impl Conn {
         config: Option<Value>,
     ) -> (Value, Option<Value>) {
         let hello = self.expect("hello").await;
-        self.send(json!({
+        let mut welcome = json!({
             "type": "welcome",
             "protocolVersion": hello["protocolVersion"],
             "runnerHostId": self.runner_host_id,
@@ -742,7 +781,11 @@ impl Conn {
             "heartbeatIntervalSeconds": heartbeat_seconds,
             "leaseTtlSeconds": 30,
             "someFutureField": {"ignored": true}
-        }));
+        });
+        if let Some(features) = &self.welcome_features {
+            welcome["features"] = features.clone();
+        }
+        self.send(welcome);
         let applied = match config {
             Some(config) => {
                 self.send(config);
@@ -942,6 +985,8 @@ impl Transcript {
             TEST_OPENAI_KEY,
             TEST_HOST_TOKEN,
             TEST_GIT_TOKEN,
+            TEST_APP_TOKEN,
+            TEST_RENEWED_TOKEN,
             TEST_MODEL_KEY,
         ] {
             assert!(
@@ -1143,14 +1188,21 @@ pub struct HostSetup {
     pub egress: Option<EgressSettings>,
     /// The sandboxes' settings (`run --sandbox-*`); `None`: the defaults.
     pub sandbox: Option<SandboxSettings>,
-    /// The VM pool's ceilings and tuning (`run --pool-*`, ADR-0098); `None`: the defaults.
-    pub pool: Option<tinfirm_runner_host::pool::PoolOptions>,
+    /// Sets more of the host's options, after all of the above: the paid features' tests
+    /// (`ee/runner/tinfirm-runner-host/tests`) set theirs here.
+    pub options: Option<SetOptions>,
 }
+
+/// More of a test host's options ([`HostSetup::options`]).
+pub type SetOptions = Box<dyn FnOnce(&mut HostOptions) + Send>;
 
 /// With this variable set, every test host runs its agents over the sandbox bridge
 /// (`run --sandbox-bridge`, ADR-0095): the local tests then run with the files and the
 /// listeners over the bridge, as `make runner-test` and CI run them a second time.
 pub const BRIDGE_ENV: &str = "TINFIRM_TEST_SANDBOX_BRIDGE";
+/// With `host`, the test hosts push with the runner host's own client (`run --push-client
+/// host`); a test can also set it in [`HostSetup::options`].
+pub const PUSH_CLIENT_ENV: &str = "TINFIRM_TEST_PUSH_CLIENT";
 
 /// Whether [`BRIDGE_ENV`] is set, or [`VM_ENV`], whose runs go over the bridge too.
 pub fn bridged_tests() -> bool {
@@ -1210,7 +1262,7 @@ impl HostSetup {
             bridge,
             egress: None,
             sandbox: None,
-            pool: None,
+            options: None,
         }
     }
 
@@ -1331,12 +1383,22 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
     if let Some(sandbox) = setup.sandbox {
         opts.sandbox = sandbox;
     }
-    if let Some(pool) = setup.pool {
-        opts.pool = pool;
-    }
     if let Some(binary) = setup.bridge {
         let mut bridge = BridgeOptions::new(binary);
         bridge.connect_timeout = Duration::from_secs(30);
+        // The tests are about the runs: a kernel without Landlock reads unconfined, as a host
+        // with --allow-unconfined-reader does. The reader's own tests (reader.rs) take no
+        // unconfined reader.
+        bridge.reader = bridge.reader.clone().allowing_unconfined(true);
+        // The fronts are this host's own binary, as `run` sets them, whatever runs as the
+        // sandbox's bridge; and as the readers, they serve on a kernel that confines none.
+        bridge.front = tinfirm_runner_host::front::handle::FrontCommand {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_tinfirm-runner-host")),
+            args: vec![tinfirm_runner_host::front::SUBCOMMAND.to_string()],
+            env: Vec::new(),
+            tap: None,
+        }
+        .allowing_unconfined(true);
         opts.bridge = Some(bridge);
     }
     if let Some(timeout) = setup.inactivity_timeout {
@@ -1354,9 +1416,17 @@ async fn start_host_in(dir: TempDir, root: &Path, server_url: &str, setup: HostS
     }
     // The tests use file:// bare repositories.
     opts.allow_insecure_repo_urls = true;
+    // `TINFIRM_TEST_PUSH_CLIENT=host`: every run pushes with the runner host's own client
+    // (crate::git_push) where its repository is served over HTTP.
+    if std::env::var(PUSH_CLIENT_ENV).is_ok_and(|v| v == "host") {
+        opts.push_client = tinfirm_runner_host::git_push::PushClient::Host;
+    }
     opts.reconnect_min_backoff = Duration::from_millis(100);
     opts.reconnect_max_backoff = Duration::from_millis(500);
     opts.cancel_grace = Duration::from_secs(5);
+    if let Some(options) = setup.options {
+        options(&mut opts);
+    }
     let mut config = HostConfig::load(&paths).unwrap();
     // As `run --protocol-version` would.
     config.protocol_version = setup.protocol_version;
@@ -1383,6 +1453,8 @@ pub struct WorkspaceEntry {
     pub token: Option<String>,
     /// `readOnly`: the host must never push it.
     pub read_only: bool,
+    /// `git.expiresAt` and `git.mirrorKey` (ADR-0116): a token minted for the run.
+    pub expiring: Option<(chrono::DateTime<chrono::Utc>, String)>,
 }
 
 impl WorkspaceEntry {
@@ -1394,7 +1466,20 @@ impl WorkspaceEntry {
             repo_url: repo_url.into(),
             token: Some(TEST_GIT_TOKEN.into()),
             read_only: false,
+            expiring: None,
         }
+    }
+
+    /// With `token`, which expires at `expires_at`, minted for the credential `mirror_key`.
+    pub fn expiring(
+        mut self,
+        token: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        mirror_key: &str,
+    ) -> WorkspaceEntry {
+        self.token = Some(token.into());
+        self.expiring = Some((expires_at, mirror_key.into()));
+        self
     }
 }
 
@@ -1503,7 +1588,14 @@ impl<'a> AssignSpec<'a> {
                     "repoUrl": w.repo_url,
                     "defaultBranch": "main",
                     "branch": format!("agent/{}", self.task_key),
-                    "git": w.token.as_ref().map(|t| json!({"username": "x-access-token", "token": t})),
+                    "git": w.token.as_ref().map(|t| {
+                        let mut git = json!({"username": "x-access-token", "token": t});
+                        if let Some((expires_at, mirror_key)) = &w.expiring {
+                            git["expiresAt"] = json!(expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                            git["mirrorKey"] = json!(mirror_key);
+                        }
+                        git
+                    }),
                     "authorName": "Tinfirm agent Tester",
                     "authorEmail": format!("agent+{}@tinfirm.invalid", self.agent_id),
                     "readOnly": w.read_only
@@ -1639,6 +1731,58 @@ pub fn request_ack(
     ack
 }
 
+/// A `run.git.revoke` frame (ADR-0116).
+pub fn git_revoke(run_id: Uuid, epoch: i64, component_ids: &[Uuid], message: &str) -> Value {
+    json!({
+        "type": "run.git.revoke",
+        "runId": run_id,
+        "epoch": epoch,
+        "componentIds": component_ids,
+        "reason": "GRANT_REMOVED",
+        "message": message
+    })
+}
+
+/// A DONE answer to a `run.request` of kind GIT_TOKEN: `renewed` as (componentId, token,
+/// expiresAt), `refused` as (componentId, code, message).
+pub fn git_tokens_ack(
+    request: &Value,
+    renewed: &[(Uuid, &str, chrono::DateTime<chrono::Utc>)],
+    refused: &[(Uuid, &str, &str)],
+) -> Value {
+    let git: Vec<Value> = renewed
+        .iter()
+        .map(|(id, token, at)| {
+            json!({
+                "componentId": id,
+                "username": "x-access-token",
+                "token": token,
+                "expiresAt": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            })
+        })
+        .collect();
+    let refused: Vec<Value> = refused
+        .iter()
+        .map(|(id, code, message)| json!({"componentId": id, "code": code, "message": message}))
+        .collect();
+    request_ack(
+        request,
+        "DONE",
+        Some(json!({"git": git, "refused": refused})),
+        None,
+        None,
+    )
+}
+
+/// `Authorization` of `token` as the runner host sends it.
+pub fn basic_of(token: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+    )
+}
+
 /// The server's answer to a `run.repository_request` frame.
 pub fn repository_ack(request: &Value, status: &str, code: Option<&str>, message: &str) -> Value {
     let mut ack = json!({
@@ -1760,4 +1904,134 @@ pub async fn run_fetch_scenario(setup: HostSetup) -> Transcript {
     host.shutdown.cancel();
     host.handle.await.unwrap().unwrap();
     t
+}
+
+/// The fronts of a host that runs as a process of the test's own: its children that run as
+/// `front`.
+pub fn fronts_of(host: u32) -> Vec<u32> {
+    let mut fronts = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().filter_map(|e| e.ok()) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let ppid = stat
+            .rfind(')')
+            .and_then(|at| stat[at + 1..].split_whitespace().nth(1))
+            .and_then(|ppid| ppid.parse::<u32>().ok());
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let front = cmdline
+            .split(|b| *b == 0)
+            .nth(1)
+            .is_some_and(|arg| arg == tinfirm_runner_host::front::SUBCOMMAND.as_bytes());
+        if ppid == Some(host) && front {
+            fronts.push(pid);
+        }
+    }
+    fronts
+}
+
+/// Ends a front as a crash would (SIGKILL).
+pub fn kill_front(pid: u32) {
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "cannot kill the front {pid}");
+}
+
+/// Makes the record of `run_id` that a crashed host left under `data_dir` one that a host of
+/// the version before each sandbox's bridge was its front's would have left (ADR-0112, path C,
+/// part 2): the record keeps no `bridge`, and the bridge's identity, which the sandbox's bridge
+/// pins, is the shared listener's (`runs/bridge.json`), on the port the bridge dials (none for
+/// a VM's bridge, which the host dials). A host that starts then takes the run back through its
+/// shared listener. Returns once the bridge's port is free, as the shared listener of a host
+/// that died left it.
+pub fn make_record_of_the_version_before(data_dir: &Path, run_id: Uuid) {
+    let records = tinfirm_runner_host::takeback::Records::new(&Paths::new(
+        data_dir.with_file_name("config"),
+        data_dir,
+    ));
+    let mut record = records
+        .load_all()
+        .into_iter()
+        .find(|record| record.run_id() == run_id)
+        .expect("the run's record");
+    let bridge = record
+        .bridge
+        .take()
+        .expect("the record keeps its front's bridge");
+    let identity = bridge
+        .keep(Some(String::new()))
+        .and_then(|keep| keep.identity())
+        .expect("the record's bridge identity");
+    records.save(&record).unwrap();
+    records
+        .save_listener(&identity, bridge.port.unwrap_or(0))
+        .unwrap();
+    if let (Some(ip), Some(port)) = (bridge.ip, bridge.port) {
+        // The front that held the port ends with its host a moment after.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::net::TcpListener::bind((ip, port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the port {port} stays taken"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// A runner host in a process of its own, as the restart tests start one (host A, which the
+/// test kills as a crash would). It runs in a process group of its own. A test that ends
+/// without [`HostProcess::crash`], a failed one among them, kills that group when this is
+/// dropped, also while it unwinds from a panic: the host and what it started there (a local
+/// sandbox's bridge, a fake driver's VMs) do not outlive the test and keep its output open.
+/// After a crash, what the host started lives on, as after a real one, for the next host.
+pub struct HostProcess {
+    child: std::process::Child,
+    crashed: bool,
+}
+
+impl HostProcess {
+    /// Starts `command` in a process group of its own.
+    pub fn spawn(mut command: Command) -> HostProcess {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        HostProcess {
+            child: command.spawn().unwrap(),
+            crashed: false,
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Kills the host alone as a crash would (SIGKILL) and waits until it has ended.
+    pub fn crash(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+        self.crashed = true;
+    }
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        if self.crashed {
+            return;
+        }
+        // Its group's id is the host's pid, which is not reaped yet: it names no other group.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.child.id())])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

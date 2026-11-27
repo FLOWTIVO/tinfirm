@@ -1,6 +1,6 @@
 # Build context of runner-musl.Dockerfile (the repository root): the Rust workspace, its paid
-# code under ee/runner (ADR-0100) and the protocol schema it includes, and the licences the
-# image carries, nothing else.
+# code under ee/runner (ADR-0100, ADR-0114) and the protocol schema it includes, and the
+# licences the image carries, nothing else.
 *
 !runner
 !ee/runner

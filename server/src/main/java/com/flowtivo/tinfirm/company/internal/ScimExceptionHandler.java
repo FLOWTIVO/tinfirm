@@ -2,6 +2,9 @@ package com.flowtivo.tinfirm.company.internal;
 
 import java.util.Map;
 
+import jakarta.servlet.http.HttpServletRequest;
+
+import org.apache.tomcat.util.http.InvalidParameterException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.Ordered;
@@ -17,6 +20,7 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 
 import com.flowtivo.tinfirm.company.scim.ScimException;
 import com.flowtivo.tinfirm.shared.web.ApiException;
+import com.flowtivo.tinfirm.shared.web.ServerBusy;
 
 /**
  * The SCIM endpoint's refusals in SCIM's own form (RFC 7644 §3.12), never {@code problem+json} (ADR-0087, decision
@@ -49,6 +53,15 @@ class ScimExceptionHandler {
         return scim(ScimException.invalidSyntax("The request is not SCIM's JSON"));
     }
 
+    /** A query string Tomcat cannot parse ({@code ApiExceptionHandler.handleInvalidParameter}), never echoed. */
+    @ExceptionHandler(InvalidParameterException.class)
+    ResponseEntity<Map<String, Object>> parameters(InvalidParameterException ex) {
+        if (ex.getErrorCode() == 413) {
+            return scim(new ScimException(413, null, "The request's parameters are larger than Tinfirm allows"));
+        }
+        return scim(ScimException.invalidSyntax("The request's parameters cannot be read"));
+    }
+
     @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
     ResponseEntity<Map<String, Object>> mediaType(HttpMediaTypeNotSupportedException ex) {
         return scim(new ScimException(415, null, "Send application/scim+json or application/json"));
@@ -61,8 +74,16 @@ class ScimExceptionHandler {
         return scim(new ScimException(ex.status().value(), null, code));
     }
 
+    /**
+     * The same answers as outside SCIM ({@code ServerBusy}'s rule), in SCIM's form: a 503 with {@code Retry-After}, or
+     * a 500 that says a change of it may already be saved.
+     */
     @ExceptionHandler(RuntimeException.class)
-    ResponseEntity<Map<String, Object>> unexpected(RuntimeException ex) {
+    ResponseEntity<Map<String, Object>> unexpected(RuntimeException ex, HttpServletRequest request) {
+        ServerBusy.Answer answer = ServerBusy.decide(ex, request.getMethod());
+        if (answer != ServerBusy.Answer.NONE) {
+            return scim(ScimErrors.of(ServerBusy.exception(answer, ex)));
+        }
         log.error("A SCIM request failed", ex);
         return scim(new ScimException(500, null, "The request failed in Tinfirm"));
     }

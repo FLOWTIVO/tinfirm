@@ -566,3 +566,33 @@ describe('network hosts', () => {
     expect(hostCovers('example.com', 'a.example.com')).toBe(false);
   });
 });
+
+describe('isolation (ADR-0113)', () => {
+  it('is automatic by default, sent with a new agent only when chosen, and changed as a change', () => {
+    expect(EMPTY_DRAFT.isolation).toBe('AUTOMATIC');
+    expect(draftOf(agent).isolation).toBe('AUTOMATIC');
+    expect(createRequest(saved).isolation).toBeUndefined();
+    expect(createRequest({ ...saved, isolation: 'VM_JAIL' }).isolation).toBe('VM_JAIL');
+
+    expect(changeOf(agent, { ...saved, isolation: 'MACHINE' }).about).toEqual({
+      isolation: 'MACHINE',
+    });
+    const chosen: Agent = {
+      ...agent,
+      isolation: {
+        setting: 'MACHINE',
+        offered: ['MACHINE', 'CONTAINER'],
+        chosenUnavailable: false,
+        outsideStarts: false,
+        containerWarning: false,
+      },
+    };
+    expect(draftOf(chosen).isolation).toBe('MACHINE');
+    expect(changeOf(chosen, { ...draftOf(chosen), isolation: 'AUTOMATIC' }).about).toEqual({
+      isolation: 'AUTOMATIC',
+    });
+    expect(changedSections(changeOf(chosen, draftOf(chosen)))).toEqual([]);
+    // It never widens: people need not accept it.
+    expect(wideningOf(chosen, { ...draftOf(chosen), isolation: 'CONTAINER' })).toEqual([]);
+  });
+});

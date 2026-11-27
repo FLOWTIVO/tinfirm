@@ -40,6 +40,8 @@ import com.flowtivo.tinfirm.shared.security.ScimAuthentication;
 import com.flowtivo.tinfirm.shared.tenant.TenantContext;
 import com.flowtivo.tinfirm.shared.tenant.TenantContextHolder;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
+import com.flowtivo.tinfirm.shared.web.ServerBusy;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 
@@ -85,6 +87,8 @@ final class ScimRequestFilter extends OncePerRequestFilter {
 
     private final TransactionTemplate transactions;
 
+    private final TransactionTemplate touches;
+
     private final TimeSource time;
 
     private final ScimProperties limits;
@@ -102,6 +106,10 @@ final class ScimRequestFilter extends OncePerRequestFilter {
         this.settings = settings;
         this.auditLog = auditLog;
         this.transactions = transactions;
+        // The token's last use and the check that SCIM is still allowed are the request's bookkeeping, not its change
+        // (AfterTransaction.BOOKKEEPING).
+        this.touches = new TransactionTemplate(java.util.Objects.requireNonNull(transactions.getTransactionManager()));
+        this.touches.setName(AfterTransaction.BOOKKEEPING);
         this.time = time;
         this.limits = limits;
         this.refusalsByAddress = Caffeine.newBuilder()
@@ -120,6 +128,24 @@ final class ScimRequestFilter extends OncePerRequestFilter {
 
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        try {
+            serve(request, response, chain);
+        }
+        catch (RuntimeException ex) {
+            // What fails, in the token's lookup or in SCIM's chain, for want of a database connection, or after a saved
+            // change, is answered by the API's rule (ServerBusy) in SCIM's form; anything else goes on to the outer
+            // filters.
+            ServerBusy.Answer answer = ServerBusy.decide(ex, request.getMethod());
+            if (answer == ServerBusy.Answer.NONE || response.isCommitted()) {
+                throw ex;
+            }
+            response.resetBuffer();
+            ScimErrors.write(response, ScimErrors.of(ServerBusy.exception(answer, ex)));
+        }
+    }
+
+    private void serve(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
         if (request.getHeader(HttpHeaders.ORIGIN) != null) {
             ScimErrors.write(response, new ScimException(403, null, "Browser requests are refused on this endpoint"));
@@ -186,7 +212,7 @@ final class ScimRequestFilter extends OncePerRequestFilter {
         SecurityContext previous = SecurityContextHolder.getContext();
         SecurityContextHolder.setContext(context);
         try (TenantContextHolder.Scope ignored = TenantContextHolder.open(TenantContext.forCompany(companyId))) {
-            transactions.executeWithoutResult(status -> tokens.touch(companyId, tokenId, now));
+            touches.executeWithoutResult(status -> tokens.touch(companyId, tokenId, now));
             chain.doFilter(new Bounded(request), response);
         }
         finally {
@@ -197,7 +223,7 @@ final class ScimRequestFilter extends OncePerRequestFilter {
     /** Whether the deployment still allows the company's SCIM, read in its own tenant context. */
     private boolean enabled(UUID companyId) {
         try (TenantContextHolder.Scope ignored = TenantContextHolder.open(TenantContext.forCompany(companyId))) {
-            return Boolean.TRUE.equals(transactions.execute(status -> settings.of(companyId).enabled()));
+            return Boolean.TRUE.equals(touches.execute(status -> settings.of(companyId).enabled()));
         }
     }
 

@@ -32,6 +32,7 @@ import com.flowtivo.tinfirm.shared.security.SystemContext;
 import com.flowtivo.tinfirm.shared.tenant.TenantScope;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.support.ApiClient;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.FakeRunner;
 import com.flowtivo.tinfirm.support.IntegrationTest;
 import com.flowtivo.tinfirm.support.TenantSql;
@@ -132,8 +133,8 @@ class DeclaredCompaniesIntegrationTest extends IntegrationTest {
     }
 
     /**
-     * A key applied in a transaction applies the waiting declarations after its commit, while the finished transaction
-     * is still bound to the thread (LicenceChanged).
+     * A key applied in a transaction applies the waiting declarations after its commit (LicenceChanged), once the
+     * transaction has released its connection, before the call that applied the key returns.
      */
     @Test
     void aKeyAppliedLaterAppliesTheDeclarationsThatWaitedAfterItsCommit() {
@@ -146,6 +147,7 @@ class DeclaredCompaniesIntegrationTest extends IntegrationTest {
         assertThat(companiesWith(second)).isZero();
 
         DeclaredCompaniesService enterprise = declaring(declarations, null);
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         new TransactionTemplate(transactionManager).executeWithoutResult(status -> org.springframework.transaction
             .support.TransactionSynchronizationManager.registerSynchronization(
                     new org.springframework.transaction.support.TransactionSynchronization() {
@@ -156,6 +158,19 @@ class DeclaredCompaniesIntegrationTest extends IntegrationTest {
                     }));
 
         assertThat(companiesWith(second)).isOne();
+        assertThat(mark.at(DeclaredCompaniesService.class.getName())).as("second connections asked for").isZero();
+    }
+
+    /** A sign-in's declared owners are applied once its transaction has released its connection. */
+    @Test
+    void aSignInAppliesTheDeclaredOwnersWithOneConnectionAtATime() {
+        String email = uniqueEmail("signs-in");
+        createUser(admin(), email, false);
+
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
+        loginAs(email);
+
+        assertThat(mark.at(DeclaredCompaniesService.class.getName())).as("second connections asked for").isZero();
     }
 
     /** The declared companies that exist count first: a new key that sorts before them waits under Community. */

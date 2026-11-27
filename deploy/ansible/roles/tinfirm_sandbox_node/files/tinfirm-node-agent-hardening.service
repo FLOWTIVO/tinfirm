@@ -1,0 +1,82 @@
+# The hardening's settings that last until a reboot (ADR-0113, decision 5): kexec off,
+# lockdown at integrity, module loading off, as /etc/tinfirm/node-agent/hardening.json asks.
+# The kernel keeps them until the next boot, so this unit sets them again at each boot. A
+# second run finds them set and writes nothing. The helper reads them for the hardening mark
+# and writes none.
+[Unit]
+Description=Tinfirm node agent: the hardening that lasts until a reboot
+# After the modules: once module loading is off, nothing loads one, and `harden` leaves it on
+# while a module the agent needs is missing. After the firewall: its rules need their modules
+# too. After kdump: a crash kernel loaded at boot stays loaded once kexec is off.
+#
+# After the network is up: bringing it up loads modules of its own (a NIC's driver that the
+# initramfs does not hold, a bond or a VLAN, a protocol), and one that is asked for once
+# module loading is off is refused, at this boot and at each one after it. The network is
+# wanted, not required: one that does not come up delays this unit for as long as the
+# network's own service waits for it (two minutes with systemd-networkd), and stops nothing.
+# The listener waits for the same target, so the node serves no later for it.
+#
+# After the devices the boot has found so far: ExecStartPre= below waits until udev has
+# handled their events, with the modules its rules load for them, for 60 s at most. Only this
+# unit, and the helper after it, wait: not the whole boot, as systemd-udev-settle.service
+# would (deprecated).
+Wants=tinfirm-node-agent-modules.service network-online.target
+After=tinfirm-node-agent-modules.service tinfirm-node-agent-firewall.service kdump-tools.service kdump.service systemd-sysctl.service network-online.target
+# The helper asks for this unit with Wants=, not Requires=: a node whose hardening fails runs
+# on, and its mark says `no`.
+Before=tinfirm-node-agent-helper.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The events of the devices found at boot (systemd-udev-trigger.service, before
+# sysinit.target) and the modules their rules load. `-`: a wait that runs out, or a udev that
+# does not answer, is noted in the journal and `harden` runs anyway; a module still missing for
+# the agent then keeps module loading on, as `harden` says. Over the unit's own sandbox below:
+# udevadm reaches udev's control socket and reads its queue under /run/udev, AF_UNIX and
+# read-only.
+ExecStartPre=-/usr/bin/udevadm settle --timeout=60
+ExecStart=/usr/local/bin/tinfirm-node-agent harden --config /etc/tinfirm/node-agent/hardening.json
+UMask=0077
+
+# Writing the lockdown level needs CAP_SYS_ADMIN (the kernel's lockdown_write). The two
+# sysctls ask only that the writer may open their files (root, mode 0644).
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=yes
+
+# No network at all.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# The file system: read-only. /proc/sys and /sys/kernel/security stay writable: neither
+# ProtectKernelTunables nor ProtectKernelModules is set (below).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap @cpu-emulation @keyring @memlock @pkey @aio @resources @privileged
+SystemCallErrorNumber=EPERM
+
+# Not set, each for a reason:
+# - ProtectKernelTunables: makes /proc/sys and /sys read-only, and `harden` writes
+#   kernel.kexec_load_disabled, kernel.modules_disabled and /sys/kernel/security/lockdown.
+# - ProtectKernelModules: it is meant to stop module loading by this unit's processes, which
+#   `harden` never does (@module is filtered above), and whether it leaves
+#   kernel.modules_disabled writable is not shown. It also hides /lib/modules, where `harden`
+#   reads the kernel's list of built-in modules when the modules' unit made no copy.
+
+[Install]
+WantedBy=multi-user.target

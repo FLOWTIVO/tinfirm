@@ -41,6 +41,7 @@ import com.flowtivo.tinfirm.shared.security.ActorType;
 import com.flowtivo.tinfirm.shared.security.CurrentActor;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
 import com.flowtivo.tinfirm.shared.tx.AfterCommit;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.web.ApiException;
 import com.flowtivo.tinfirm.shared.web.ProblemCode;
 import com.flowtivo.tinfirm.vault.SecretWriter;
@@ -78,6 +79,9 @@ class ModelSettingsService {
     private static final Duration MODELS_CACHE = Duration.ofMinutes(1);
 
     private final TransactionTemplate transactions;
+
+    /** The reads before a call to the gateway: bookkeeping, not the request's change. */
+    private final TransactionTemplate lookups;
 
     private final CompanyAccessGuard companyAccess;
 
@@ -119,6 +123,8 @@ class ModelSettingsService {
             SecretWriter secrets, AuditLog auditLog, ApplicationEventPublisher events, ModelProperties properties,
             TinfirmProperties tinfirm, TimeSource time, BudgetAlertStore alerts) {
         this.transactions = new TransactionTemplate(transactionManager);
+        this.lookups = new TransactionTemplate(transactionManager);
+        this.lookups.setName(AfterTransaction.BOOKKEEPING);
         this.alerts = alerts;
         this.companyAccess = companyAccess;
         this.companies = companies;
@@ -322,7 +328,7 @@ class ModelSettingsService {
     ModelSettingsTestResult test(UUID companyId) {
         record Target(ModelSettingsStore.SettingsRow settings, Optional<Gateway> gateway, String companyName) {
         }
-        Target target = Objects.requireNonNull(transactions.execute(status -> {
+        Target target = Objects.requireNonNull(lookups.execute(status -> {
             companyAccess.require(companyId, CompanyPermission.MANAGE_MODEL_ACCESS);
             ModelSettingsStore.SettingsRow settings = store.find(companyId).orElseThrow(ModelSettingsService::missing);
             String companyName = companies.find(companyId)

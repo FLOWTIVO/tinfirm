@@ -1,0 +1,235 @@
+---
+# Defaults of the role tinfirm_sandbox_node (deploy/ansible/README.md, ADR-0112 decision 4,
+# runner/crates/tinfirm-node-agent/README.md). Every variable that a site may set is here.
+#
+# A sandbox node holds no credential, and nothing here is a secret: the node's TLS key is made
+# on the node and never leaves it. Headers for a mirror that needs authentication belong in
+# Ansible Vault.
+#
+# Not done by this role: the single machine (ADR-0112 decision 5), which the node agent refuses
+# today, and the node's egress to anything but the control host, which the agent's `verify`
+# does not try. Sandbox nodes are not ready for production: the hardening below has run on one
+# node only (2026-11-22, Ubuntu 24.04), a real conversation through it included. Tinfirm
+# publishes no VM image: the site builds it.
+
+# --- The node agent's binary -----------------------------------------------------------------
+
+# Exactly one of the two:
+# - a `tinfirm-node-agent` binary on the control node (built, or taken out of a release);
+tinfirm_sandbox_node_binary_src: ""
+# - a release archive tinfirm-node-agent-<version>-<target>.tar.gz to download, from the same
+#   release as the control host's runner host (the two check each other's release).
+tinfirm_sandbox_node_binary_url: ""
+# Where the release's SHA256SUMS and SHA256SUMS.sig are, a URL of their directory. Empty: the
+# directory of tinfirm_sandbox_node_binary_url.
+tinfirm_sandbox_node_release_url: ""
+# The public key SHA256SUMS.sig must verify against before any checksum in SHA256SUMS is
+# trusted: a file on the control node. The default is FLOWTIVO's release key, shipped with the
+# role (files/cosign.pub). For `rolling`: deploy/compose/auto-deploy/cosign-rolling.pub.
+tinfirm_sandbox_node_public_key: cosign.pub
+# Checksum of the archive, "sha256:<hex>". Empty: the archive's line of the release's signed
+# SHA256SUMS. Set: it must be that line too. Required only for a release without
+# SHA256SUMS.sig, which tinfirm_sandbox_node_allow_unsigned admits.
+tinfirm_sandbox_node_binary_checksum: ""
+# true: install a release whose SHA256SUMS has no signature (404) against
+# tinfirm_sandbox_node_binary_checksum, with a warning. A signature that does not verify is
+# refused even then.
+tinfirm_sandbox_node_allow_unsigned: false
+# HTTP headers for the downloads from the release, e.g. {Authorization: "Bearer …"}; Vault.
+tinfirm_sandbox_node_binary_url_headers: {}
+
+# --- Firecracker and its jailer ----------------------------------------------------------------
+
+# The release that ran on a node (the agent's README, "What a node needs").
+tinfirm_sandbox_node_firecracker_version: "1.14.2"
+# GitHub, or a mirror with the same layout (<url>/v<version>/firecracker-v<version>-<arch>.tgz).
+tinfirm_sandbox_node_firecracker_download_url: https://github.com/firecracker-microvm/firecracker/releases/download
+# The SHA-256 of the archive and of its two binaries, each "sha256:<hex>":
+#   {archive: …, firecracker: …, jailer: …}
+# Empty: the known ones of the pinned version and this node's architecture (vars/main.yml).
+# A version the role does not know needs all three here, or the role stops.
+tinfirm_sandbox_node_firecracker_checksums: {}
+
+# --- The guest kernel ----------------------------------------------------------------------------
+
+# Kata Containers publishes the guest kernel; Tinfirm builds none (ADR-0112 decision 4). The
+# role downloads Kata's static release, takes the kernel out of it, checks it, and removes
+# the archive (about 1 GB).
+tinfirm_sandbox_node_kernel_kata_version: "4.3.1"
+# GitHub, or a mirror with the same layout (<url>/<version>/<archive>).
+tinfirm_sandbox_node_kernel_download_url: https://github.com/kata-containers/kata-containers/releases/download
+tinfirm_sandbox_node_kernel_archive: "kata-static-{{ tinfirm_sandbox_node_kernel_kata_version }}-{{ _tinfirm_sandbox_node_kata_arch }}.tar.zst"
+# The SHA-256 of the archive and of the kernel in it, and the kernel's path in the archive:
+#   {archive: "sha256:…", member: opt/kata/share/kata-containers/vmlinux-…, kernel: "sha256:…"}
+# Empty: the known ones (vars/main.yml): Kata 4.3.1 on x86_64, which every run so far used.
+# No other version or architecture is known.
+tinfirm_sandbox_node_kernel_checksums: {}
+
+# --- The VM image for a local disk -------------------------------------------------------------
+
+# Tinfirm publishes no such image (ADR-0112 decision 4): it holds Claude Code when built with
+# every runtime, and Tinfirm does not redistribute Claude Code. Build it with
+# runner/images/vm/local-disk.sh and the control host's own runner host binary, then give it
+# here, compressed with zstd (`zstd tinfirm-vm.img`, a name ending in .zst) or as it is. A file
+# that is not compressed is copied or downloaded whole: 32 GiB by default, holes included.
+# Exactly one of the two:
+# - a file on the control node;
+tinfirm_sandbox_node_image_src: ""
+# - a URL to download.
+tinfirm_sandbox_node_image_url: ""
+tinfirm_sandbox_node_image_url_headers: {}
+# Its SHA-256, "sha256:<hex>", of the file as given (compressed or not). Required: the role
+# checks the file against it before anything uses it.
+tinfirm_sandbox_node_image_checksum: ""
+
+# --- The node's network ---------------------------------------------------------------------------
+
+# The node's IPv4 address as the control host dials it: the listener's address and TLS port,
+# and the address on which each VM's bridge is published. Default: the address of the default
+# route.
+tinfirm_sandbox_node_address: "{{ ansible_facts['default_ipv4']['address'] | default('') }}"
+# The control host's IPv4 address, as the node sees its connections: the one source of
+# connections to the agent and to the published ports. Required. It must not be the node's own
+# address: the single machine is set aside (ADR-0112 decision 5), and the helper refuses it.
+tinfirm_sandbox_node_control_host: ""
+# The one IPv4 address the node admits to SSH: the operator's way in, and this play's. Required.
+# It may be the control host's; then a control host that is taken over reaches the node's SSH
+# port, though still not without a key.
+tinfirm_sandbox_node_management_address: ""
+# The port of the node's SSH server, which the node's firewall admits from the management
+# address alone (the firewall's `ssh_port`). The role does not change sshd's port.
+tinfirm_sandbox_node_ssh_port: 22
+# true: the role stops when this play's SSH connection comes from another address than
+# tinfirm_sandbox_node_management_address, since the node's firewall would then lock it out.
+tinfirm_sandbox_node_check_ssh_source: true
+# A cloud image's cloud-init asks its platform's metadata service at every start. The node's
+# firewall, which is loaded before the network, drops that, and the node then does not finish
+# its start: on the machine where this was found it took no SSH for 21 minutes
+# (docs/reviews/2026-11-19-node-agent-execution/README.md, "The node's firewall at boot").
+# `refuse` stops the play on a node whose cloud-init would run at the next start. `disable`
+# writes /etc/cloud/cloud-init.disabled, so that cloud-init never runs again on this node:
+# what it set up at the first start (the user, the keys, the network's files) stays.
+tinfirm_sandbox_node_cloud_init: refuse
+# The listener's TLS port (`tls.listen`), which the control host's driver dials.
+tinfirm_sandbox_node_agent_port: 7700
+# The published port of the first VM; VM slot N's is first_port + N (`network.firstPort`). The
+# range must not hold the agent's port.
+tinfirm_sandbox_node_first_port: 20000
+# The VMs' own addresses, a /29 per VM, that never leave the node (`network.vmRange`). It must
+# hold neither the node's nor the control host's address.
+tinfirm_sandbox_node_vm_range: 10.231.0.0/16
+# true: the node's firewall admits the renewal of a DHCP lease. false on a node with a static
+# address.
+tinfirm_sandbox_node_dhcp: true
+
+# --- The control host -----------------------------------------------------------------------------
+
+# The SHA-256 of the control host's client certificate (`tls.clientSha256`), 64 hex digits: the
+# fingerprint that the control host's play shows. Required.
+tinfirm_sandbox_node_client_sha256: ""
+# What the listener does with a driver of another release: warn or refuse (`peerBuild`).
+tinfirm_sandbox_node_peer_build: warn
+
+# --- The VMs ----------------------------------------------------------------------------------------
+
+# The most VMs the node runs at once (`maxVms`, 1 to 1024). `check` refuses a node without the
+# memory for this many VMs of each template (memoryMib + 128 MiB each), or without the disk
+# room for this many snapshots.
+tinfirm_sandbox_node_max_vms: 2
+# The templates the control host may create VMs from (`templates`), each a name of a-z, 0-9
+# and - with: vcpus (1 to 32), memoryMib (128 to 262144), snapshotMib (64 to 1048576), and
+# optionally bridgePort (default 7443: the control host's --vm-port) and pidsMax (default 64).
+# The role adds the image and the kernel it installs.
+tinfirm_sandbox_node_templates:
+  sandbox-2c4g:
+    vcpus: 2
+    memoryMib: 4096
+    snapshotMib: 8192
+# The first uid of the VMs' users (`vmUidBase`); slot N's VMM runs as vmUidBase + N. No
+# account is created for them. At least 100000, and outside every range in /etc/subuid.
+tinfirm_sandbox_node_vm_uid_base: 1100000
+# The listener's user's uid. Empty: the system picks one when the user is created.
+tinfirm_sandbox_node_listener_uid: ""
+# The guest's serial console in a file on the node (`firecracker.guestConsole`), for finding
+# out why a guest does not come up. A guest's log may hold what a run printed: leave it off
+# where runs are real.
+tinfirm_sandbox_node_guest_console: false
+# The cgroup under which each VMM gets its own (`firecracker.cgroupParent`).
+tinfirm_sandbox_node_cgroup_parent: tinfirm-vms
+# How often the listener asks the helper for VMMs that died, in milliseconds (`watchMs`).
+tinfirm_sandbox_node_watch_ms: 1000
+
+# The node's name in the control host's configuration, which the role prints with the
+# fingerprint: 1 to 32 bytes of a-z, 0-9 and -.
+tinfirm_sandbox_node_name: "{{ inventory_hostname_short | lower | regex_replace('[^a-z0-9-]', '-') | truncate(32, true, '') }}"
+
+# --- The hardening (ADR-0113 decision 5) ----------------------------------------------------------
+
+# The hardening mark: each line below that holds on the node, and every one must for the helper
+# to report `yes` (runner/crates/tinfirm-node-agent/README.md, "The hardening mark"). A switch
+# that is off leaves its setting as the machine has it: its line of the mark may then fail, the
+# mark is `no`, and nothing else stops. user.max_user_namespaces = 0 has no switch: the jail
+# relies on it (ADR-0112), and the role always sets it.
+#
+# The master switch: false leaves every line below off, whatever its own switch says.
+tinfirm_sandbox_node_harden: true
+# kernel.unprivileged_bpf_disabled = 1: no eBPF for users. One-way: switching it off again
+# takes a reboot. Off: the line `unprivileged-bpf` holds only where the machine has 1 or 2.
+tinfirm_sandbox_node_harden_bpf: true
+# kernel.io_uring_disabled = 2: no io_uring for anyone. It needs Linux 6.6 or later (Debian 12's
+# 6.1 has no such setting: the role refuses the switch there). Off: `io-uring` fails.
+tinfirm_sandbox_node_harden_io_uring: true
+# AppArmor and the VMMs' profile tinfirm-vmm, in one of three modes (not true or false):
+# - `enforce`: the package, the profile loaded in enforce mode, and `"vmmProfile": "required"` in
+#   helper.json, so that a make fails for a VMM that the profile does not confine. VMMs that ran
+#   before it was loaded stay unconfined until they are deleted, and `vmm-mac` fails until then.
+# - `complain`: the profile loaded in complain mode. It refuses nothing, and the kernel logs what
+#   it would have refused (`journalctl -k`, lines with apparmor="ALLOWED"); makes do not ask, and
+#   `vmm-mac` does not hold, so the node's mark is `no`.
+# - `off` (or false): no profile. One that an earlier run loaded is unloaded and its file removed;
+#   a VMM that runs keeps its confinement until it ends. `vmm-mac` fails, and makes do not ask.
+# A Red Hat family node has SELinux and no AppArmor: the role refuses complain and enforce there,
+# so set `off` on such a node.
+# The default is `enforce`, since 2026-11-22 (the owner). On one node (an Ubuntu 24.04 cloud
+# image) the profile logged nothing in complain mode over the VMs' whole life, and no
+# apparmor="DENIED" line in enforce mode over a real conversation, a run of the tests' stand-in
+# agent and a make that failed after its VMM started. That is one distribution and kernel: a rule
+# the profile lacks elsewhere stops every VM from starting. If VMs stop starting, look for
+# apparmor="DENIED" lines of tinfirm-vmm in the kernel's log (`journalctl -k`), set `complain`
+# (the node's mark is then `no` for `vmm-mac`), and report the lines. `complain` is for a first
+# run on a distribution or kernel the profile has not run on.
+tinfirm_sandbox_node_harden_mac: enforce
+# kernel.panic_on_oops = 1, and kernel.panic = tinfirm_sandbox_node_kernel_panic: an exploit that
+# fails takes the node down instead of trying again, and ends every run on it. Off:
+# `panic-on-oops` fails.
+tinfirm_sandbox_node_harden_panic_on_oops: true
+# Seconds after a panic before the node reboots; 0: it stays down until an operator looks, also
+# on a cloud's image that rebooted by itself after a panic before the role ran (`kernel.panic`
+# was -1 on the image of 2026-11-22).
+tinfirm_sandbox_node_kernel_panic: 0
+# kernel.modules_disabled = 1, set at each boot by tinfirm-node-agent-hardening.service once the
+# modules the agent needs are loaded. Until the next reboot no module loads: a firewall rule or a
+# tool that needs a new one fails. Off: `modules-disabled` fails.
+tinfirm_sandbox_node_harden_modules: true
+# kernel.kexec_load_disabled = 1, set at each boot after kdump's unit: a crash kernel loaded at
+# boot stays, no other kernel can be loaded. Off: `kexec-disabled` fails.
+tinfirm_sandbox_node_harden_kexec: true
+# Lockdown at integrity, set at each boot unless the kernel is there already: unsigned modules
+# and writes to kernel memory are refused. It needs the lockdown LSM: the role refuses the
+# switch on a kernel without it. Off: `lockdown` fails.
+tinfirm_sandbox_node_harden_lockdown: true
+# Strips the setuid and setgid bits from every program under /usr, /opt, /bin and /sbin that
+# others may run, and keeps sudo as 4750 root and the distribution's admin group (sudo on Debian
+# and Ubuntu, wheel on the Red Hat family): su, passwd, chsh, mount and the like no longer work
+# for users, snaps no longer start (snap-confine), and only the admin group can use sudo. On
+# Debian and Ubuntu each change is recorded with dpkg-statoverride, so that upgrades keep it.
+# Off: `no-setuid` fails while such a program is there.
+tinfirm_sandbox_node_harden_setuid: true
+# The distribution's hardening, as the narrower facts of the mark: kernel.kptr_restrict >= 1,
+# kernel.dmesg_restrict = 1, kernel.perf_event_paranoid >= 2, kernel.randomize_va_space = 2,
+# fs.protected_symlinks = 1, fs.protected_hardlinks = 1. A value the machine has stricter
+# already is left as it is. Off: `distribution-hardening` fails where the machine has less.
+tinfirm_sandbox_node_harden_distribution: true
+# The most days the node may run since its boot before its mark is `no` (the line `max-uptime`,
+# which stands for a patched kernel: re-image or reboot the node before then). 1 to 3650.
+tinfirm_sandbox_node_max_uptime_days: 30

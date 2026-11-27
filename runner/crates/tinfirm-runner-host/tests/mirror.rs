@@ -30,10 +30,10 @@ fn spec(repo_url: &str) -> WorkspaceSpec {
         repo_url: repo_url.into(),
         default_branch: "main".into(),
         branch: "agent/TEST-1".into(),
-        git: Some(GitCredentials {
-            username: "x-access-token".into(),
-            token: Secret::new(TEST_GIT_TOKEN),
-        }),
+        git: Some(GitCredentials::new(
+            "x-access-token",
+            Secret::new(TEST_GIT_TOKEN),
+        )),
         author_name: None,
         author_email: None,
         read_only: false,
@@ -315,7 +315,7 @@ async fn a_workspace_is_a_copy_with_no_link_to_the_mirror() {
             ("Host".into(), "host@tinfirm.invalid".into()),
         );
         let lease = mirrors
-            .update(&url, host_git.authorization())
+            .update(&url, host_git.authorization().unwrap().as_ref())
             .await
             .unwrap();
         let requests = server.seen().len();
@@ -535,7 +535,36 @@ async fn a_bundle_larger_than_the_pack_window_imports() {
         // refs are updated, when the new pack has that number. The on-demand submodule check
         // then reads HEAD's root tree, which git finds in the new pack before the loose copy,
         // and mapping its window fails: "cannot be mapped: Bad file descriptor".
-        host_git.import_bundle(&bundle, &head).await.unwrap();
+        // The import runs in a reader (ADR-0112, open question 1), with the host's settings.
+        let mut archive = tar::Builder::new(Vec::new());
+        archive
+            .append_path_with_name(&bundle, "repository-0.bundle")
+            .unwrap();
+        let archive = archive.into_inner().unwrap();
+        let import = scratch.path().join("import");
+        std::fs::create_dir(&import).unwrap();
+        let reader =
+            tinfirm_runner_host::reader::Reader::new(env!("CARGO_BIN_EXE_tinfirm-runner-host"))
+                .allowing_unconfined(true);
+        let (clone, expected) = (workspace.clone(), head.clone());
+        tokio::task::spawn_blocking(move || {
+            reader.import_bundle(
+                &mut archive.as_slice(),
+                &clone,
+                &import,
+                "repository-0.bundle",
+                &expected,
+                &tinfirm_bridge::files::Limits {
+                    max_files: 1,
+                    max_bytes: 1 << 30,
+                    max_file_bytes: 1 << 30,
+                },
+                Duration::from_secs(300),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(git(&workspace, &["rev-parse", "HEAD"]).trim(), head);
         git(&workspace, &["fsck", "--strict", "--no-dangling"]);
     })

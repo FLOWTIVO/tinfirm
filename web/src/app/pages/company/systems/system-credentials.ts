@@ -24,6 +24,7 @@ import {
   lucideLogIn,
   lucidePencil,
   lucidePlus,
+  lucideRefreshCw,
   lucideTrash2,
   lucideUsers,
   lucideX,
@@ -38,6 +39,7 @@ import { HlmInput } from '@spartan-ng/helm/input';
 import { HlmSpinner } from '@spartan-ng/helm/spinner';
 import { Api } from '../../../api/generated/api';
 import {
+  checkSystemCredentialApp,
   deleteGrant,
   lendSystemCredential,
   listSystemCredentials,
@@ -69,6 +71,7 @@ import {
   CREDENTIAL_KIND_LABELS,
   CREDENTIAL_MESSAGES,
   type CredentialTone,
+  checkMessages,
   credentialProblem,
   credentialState,
   memberAccountsLine,
@@ -165,9 +168,11 @@ export function withdrawalText(
  * triggers open to anyone that act with it through them (`openTriggers`, D2).
  * OWNER and ADMIN add one (a token, or a sign-in with the system's app that comes back here), store
  * a new token or sign it in again, rename, disable, enable and remove it, and lend it to a group or
- * a service account, all here. A chat system's bot is among them, marked, and managed under Bot
- * only. It tells the page the credentials each time they are read (`credentials`), for the tools'
- * and the test's choice of credential and for what a removal of the system says.
+ * a service account, all here; for an installation of the system's GitHub App that GitHub refused,
+ * which takes neither, they have GitHub asked again (ADR-0116). A chat system's bot is among them,
+ * marked, and managed under Bot only. It tells the page the credentials each time they are read
+ * (`credentials`), for the tools' and the test's choice of credential and for what a removal of the
+ * system says.
  */
 @Component({
   selector: 'app-system-credentials',
@@ -202,6 +207,7 @@ export function withdrawalText(
       lucideLogIn,
       lucidePencil,
       lucidePlus,
+      lucideRefreshCw,
       lucideTrash2,
       lucideUsers,
       lucideX,
@@ -379,7 +385,7 @@ export function withdrawalText(
                 </div>
                 @if (!c.bot) {
                   <div class="flex shrink-0 items-center gap-1">
-                    @if (c.enabled && c.status !== 'OK' && canReconnect()) {
+                    @if (c.enabled && c.status !== 'OK' && canReconnect() && c.kind !== 'APP') {
                       <button
                         hlmBtn
                         variant="outline"
@@ -395,6 +401,25 @@ export function withdrawalText(
                           aria-hidden="true"
                         />
                         {{ reconnectLabel(c) }}
+                      </button>
+                    }
+                    @if (c.enabled && c.status !== 'OK' && c.kind === 'APP') {
+                      <button
+                        hlmBtn
+                        variant="outline"
+                        size="sm"
+                        type="button"
+                        class="border-human/40 text-human hover:text-human max-sm:h-11"
+                        data-testid="credential-check"
+                        [disabled]="!!s.paused || busy() === c.id"
+                        (click)="checkAgain(c)"
+                      >
+                        @if (busy() === c.id) {
+                          <hlm-spinner aria-hidden="true" />
+                        } @else {
+                          <ng-icon name="lucideRefreshCw" aria-hidden="true" />
+                        }
+                        Check again
                       </button>
                     }
                     <button
@@ -634,7 +659,7 @@ export function withdrawalText(
 
     <ng-template #menu let-c>
       <hlm-dropdown-menu class="w-72">
-        @if (canReconnect()) {
+        @if (canReconnect() && c.kind !== 'APP') {
           <button
             hlmDropdownMenuItem
             type="button"
@@ -976,6 +1001,33 @@ export class SystemCredentials {
         `${saved.name} is added to ${this.system().name}`,
         `${login ? `${login} ` : ''}Lend it to a group or a service account next.`,
       );
+    }
+  }
+
+  // --- Check an installation of the GitHub App again ------------------------------------------
+
+  /**
+   * Has GitHub asked again for an installation it refused (`checkSystemCredentialApp`): once GitHub
+   * mints a token for it, it works again as it is, with its grants and lendings; while GitHub
+   * refuses, its reason is shown and nothing changes.
+   */
+  protected async checkAgain(credential: SystemCredential): Promise<void> {
+    if (this.busy()) return;
+    this.busy.set(credential.id);
+    try {
+      const checked = await this.api.invoke(checkSystemCredentialApp, {
+        ...this.key(),
+        credentialId: credential.id,
+      });
+      this.credentialsRes.reload();
+      this.notify.success(
+        `${checked.name} works again`,
+        checked.login ? `As ${checked.login}.` : undefined,
+      );
+    } catch (error) {
+      this.notify.error(`${credential.name} does not work yet`, error, checkMessages(error));
+    } finally {
+      this.busy.set(null);
     }
   }
 

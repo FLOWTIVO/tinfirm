@@ -53,6 +53,7 @@ import com.flowtivo.tinfirm.model.RunModelContext;
 import com.flowtivo.tinfirm.principal.PrincipalEvents;
 import com.flowtivo.tinfirm.run.TurnReason;
 import com.flowtivo.tinfirm.run.Turns;
+import com.flowtivo.tinfirm.runner.Isolation;
 import com.flowtivo.tinfirm.runner.RunnerDirectory;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 import com.flowtivo.tinfirm.shared.access.CompanyAccess;
@@ -159,6 +160,8 @@ class ConversationService {
 
     private final ConversationHolds holds;
 
+    private final GitRevocations gitRevocations;
+
     ConversationService(ConversationStore store, BindingStore bindingStore, ConversationsImpl conversations,
             BindingService bindings, TurnService turnService, ConversationViews views,
             ConversationMessagesImpl messages, DecisionReads decisions, CompanyAccessGuard companyAccess,
@@ -166,7 +169,9 @@ class ConversationService {
             RunnerDirectory runners, Turns turns, ObjectProvider<OpenDecisions> openDecisions,
             ObjectProvider<QuestionAnswers> questionAnswers, AuditLog auditLog, ApplicationEventPublisher events,
             TimeSource time, AttachmentService attachments, OwnerReads ownerReads, PlaceStore places,
-            CompanySwitches companySwitches, SubmissionKeys keys, ConversationHolds holds) {
+            CompanySwitches companySwitches, SubmissionKeys keys, ConversationHolds holds,
+            GitRevocations gitRevocations) {
+        this.gitRevocations = gitRevocations;
         this.holds = holds;
         this.companySwitches = companySwitches;
         this.store = store;
@@ -457,8 +462,9 @@ class ConversationService {
      * {@code POST /conversations} refuses what can never run (§5.7): no gateway, an inactive payer, a subscription
      * gone, or a budget's settings that name no model or one its key does not allow ({@code MODEL_ACCESS_UNAVAILABLE});
      * no registered host, connected or not, that may run its credentials by package 2's rule
-     * ({@code NO_HOST_FOR_CONVERSATION}). The workspace's accounts are those its code hosts would bind now. A spent
-     * budget or an offline host does not refuse: the first turn waits.
+     * ({@code NO_HOST_FOR_CONVERSATION}), or none of them that reports the level of isolation chosen for the agent
+     * ({@code NO_HOST_OF_LEVEL}, ADR-0113 decision 4). The workspace's accounts are those its code hosts would bind
+     * now. A spent budget or an offline host does not refuse: the first turn waits.
      */
     private void refuseWhatCannotRun(UUID companyId, UUID person, ModelAccessChoice choice,
             EffectiveSettings effective, List<ConversationInfo.WorkspaceEntry> workspace) {
@@ -492,6 +498,7 @@ class ConversationService {
             }
             throw unavailable(refuse.reason().name(), refuse.detail());
         }
+        List<RunnerHostInfo> counting;
         switch (choice) {
             case ModelAccessChoice.Subscription subscription -> {
                 switch (hosts.eligible(context)) {
@@ -502,6 +509,7 @@ class ConversationService {
                             throw noHost("NO_RUNNER_HOST", eligible.whyNone() != null ? eligible.whyNone()
                                     : "No runner host can run this conversation");
                         }
+                        counting = eligible.hosts();
                     }
                 }
             }
@@ -510,9 +518,10 @@ class ConversationService {
                     .filter(host -> host.serves(effective.runtime()))
                     .toList();
                 boolean ownWorkspace = context.workspaceAllOf(person);
-                boolean may = serving.stream()
-                    .anyMatch(host -> host.company() || ownWorkspace && host.personalOf(person));
-                if (!may) {
+                counting = serving.stream()
+                    .filter(host -> host.company() || ownWorkspace && host.personalOf(person))
+                    .toList();
+                if (counting.isEmpty()) {
                     throw serving.isEmpty()
                             ? noHost("NO_RUNNER_HOST", "No runner host of the company, and none of yours, can run "
                                     + effective.runtime())
@@ -521,6 +530,14 @@ class ConversationService {
                                     + "company host for " + effective.runtime());
                 }
             }
+        }
+        // ADR-0113, decision 4: a level chosen for the agent that none of these hosts takes (a company host of it, or
+        // the person's own host of it or a stronger one) never runs until one does; an automatic agent goes to the
+        // strongest the company's hosts among them report, and never waits for a personal host.
+        if (Isolation.target(counting, effective.agent().agent().isolationLevel())
+                instanceof Isolation.NoHostOfLevel none) {
+            throw noHost("NO_HOST_OF_LEVEL", "This agent's runs go to runner hosts that report "
+                    + none.chosen().wire() + ", and no runner host that may run this conversation reports it");
         }
     }
 
@@ -853,6 +870,8 @@ class ConversationService {
         for (ConversationStore.ConversationRow row : inLockOrder(store.openOfPerson(event.companyId(),
                 event.principalId()))) {
             store.lock(event.companyId(), row.id());
+            // ADR-0116: a cancelled run pushes its work; the git tokens of the person's accounts and grants go first.
+            gitRevocations.personLeaving(event.companyId(), event.principalId(), row.id());
             turns.cancelActive(event.companyId(), row.id());
             end(store.lock(event.companyId(), row.id()).orElseThrow().info(), ConversationInfo.EndedReason.PERSON_LEFT,
                     null);

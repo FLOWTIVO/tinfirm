@@ -1,0 +1,43 @@
+[package]
+name = "tinfirm-node-agent"
+description = "Tinfirm node agent: makes and deletes jailed Firecracker VMs for a control host (ADR-0112)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A binary of its own, which links no other crate of the workspace (ADR-0112 decision 4).
+[[bin]]
+name = "tinfirm-node-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+ring.workspace = true
+rcgen.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Constants only (O_NOFOLLOW, O_NONBLOCK, O_NOCTTY), whose values differ by architecture; no
+# call into libc, so no unsafe code.
+libc.workspace = true
+# What `std` has no safe call for, and the workspace's `unsafe_code` rule keeps out of our own
+# code: prctl(PR_CAPBSET_DROP) for the VMM's bounding set (`src/bounding.rs`), the calls
+# relative to an open directory that remove a jail's tree (`src/tree.rs`), a file system's
+# free space, and a signal to a tool's process group (`src/linux.rs`). Already in the
+# workspace, for the runner host.
+rustix = { workspace = true, features = ["thread", "fs", "process", "mount"] }
+# The binary's allocator, which overwrites what is freed (`src/main.rs`).
+zeroizing-alloc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

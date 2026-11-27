@@ -47,13 +47,18 @@ export const CREDENTIAL_KIND_LABELS: Record<SystemCredential['kind'], string> = 
   TOKEN: 'Token',
   OAUTH: 'Sign-in',
   CLIENT: 'Client credentials',
+  APP: 'GitHub App installation',
 };
 
-/** What an admin does to a credential the system refused, by how it was connected. */
+/**
+ * What an admin does to a credential the system refused, by how it was connected. An installation
+ * of the GitHub App takes no token or sign-in: GitHub is asked for it again (ADR-0116).
+ */
 export const CREDENTIAL_RECONNECT_LABELS: Record<SystemCredential['kind'], string> = {
   TOKEN: 'Store a new token',
   OAUTH: 'Sign in again',
   CLIENT: 'Store new client credentials',
+  APP: 'Check again',
 };
 
 export type CredentialTone = 'neutral' | 'success' | 'human' | 'destructive';
@@ -176,6 +181,20 @@ export const CREDENTIAL_MESSAGES: Record<string, string> = {
   'status:403': 'Only owners and admins can manage the company’s credentials.',
   'status:404': 'This credential, group or service account is gone. Reload the page.',
 };
+
+/**
+ * The words of a failed check of an installation of the GitHub App (`checkSystemCredentialApp`):
+ * while GitHub refuses it, GitHub's own answer, which is the problem's detail ("GitHub answered
+ * 401: Bad credentials"), in place of the code's general words; the other codes their message.
+ */
+export function checkMessages(error: unknown): Record<string, string> {
+  const { code, detail } = toProblem(error);
+  if (code !== 'GITHUB_APP_REFUSED' || !detail) return CREDENTIAL_MESSAGES;
+  return {
+    ...CREDENTIAL_MESSAGES,
+    GITHUB_APP_REFUSED: /[.!?]$/.test(detail) ? detail : `${detail}.`,
+  };
+}
 
 /**
  * Why a credential's token or sign-in was not taken: the system's own reason for a refused token;

@@ -133,6 +133,47 @@ public interface Accounts {
     boolean refused(UUID companyId, UUID accountId, String reason);
 
     /**
+     * A run's own git token of an {@code APP} credential (ADR-0116, decision 8): minted at GitHub for the
+     * repositories named, all on the installation's account, with {@code contents} and {@code pull_requests} at
+     * {@code access} ({@code read} or {@code write}), never {@code workflows}, valid GitHub's hour. Neither the vault nor
+     * the database keeps it. The credential's secret and the App's key are revealed for it, each audited as
+     * {@code secret.accessed} with {@code purpose} ({@code run:{runId}}). Outside any transaction; the caller checked
+     * the binding through the gate (ADR-0105) just before.
+     *
+     * @param repositoryUrls the repositories' clone URLs, {@code https://{host}/{owner}/{repo}(.git)}
+     */
+    RunGitToken mintForRun(UUID companyId, UUID accountId, @Nullable UUID actingPrincipalId, String purpose,
+            List<String> repositoryUrls, GrantInfo.Access access);
+
+    /** What {@link #mintForRun} answers. */
+    sealed interface RunGitToken {
+
+        /** The token, valid until {@code expiresAt}. Never log it. */
+        record Minted(String token, java.time.Instant expiresAt) implements RunGitToken {
+
+            @Override
+            public String toString() {
+                return "Minted[token=***, expiresAt=" + expiresAt + "]";
+            }
+        }
+
+        /**
+         * GitHub does not mint for these repositories: one is not on the installation's account, or the installation
+         * does not cover it. An admin installs the App there; the message names the repository and the installation.
+         */
+        record NotCovered(String message) implements RunGitToken {
+        }
+
+        /** GitHub could not be reached, or answered 5xx or 429: trying again later may work. */
+        record Unavailable(String message) implements RunGitToken {
+        }
+
+        /** The credential cannot mint: gone, disabled, not {@code APP}, or refused by GitHub (turned RECONNECT). */
+        record Refused(String message) implements RunGitToken {
+        }
+    }
+
+    /**
      * A credential for one call. Never log it.
      *
      * @param apiBaseUrl where to call the system with it when that is not its base URL (Jira Cloud's gateway); null

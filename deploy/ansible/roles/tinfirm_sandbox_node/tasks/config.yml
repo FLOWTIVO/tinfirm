@@ -1,0 +1,72 @@
+---
+# The node's TLS identity is made here, by the agent itself, and never leaves the node: a
+# node replaced by a new image gets a new one, whose fingerprint the control host then pins.
+- name: Look for the node's certificate and key
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+    follow: false
+  loop:
+    - "{{ _tinfirm_sandbox_node_cert }}"
+    - "{{ _tinfirm_sandbox_node_key }}"
+  register: _tinfirm_sandbox_node_identity
+
+- name: Refuse half an identity
+  ansible.builtin.assert:
+    that:
+      - _tinfirm_sandbox_node_identity.results[0].stat.exists == _tinfirm_sandbox_node_identity.results[1].stat.exists
+    fail_msg: >-
+      Of {{ _tinfirm_sandbox_node_cert }} and {{ _tinfirm_sandbox_node_key }} only one exists. The
+      role never overwrites an identity: remove the one that is left, run the role again, and
+      give the control host the new fingerprint it shows.
+    quiet: true
+
+- name: Make the node's identity
+  ansible.builtin.command:
+    argv:
+      - "{{ _tinfirm_sandbox_node_binary_path }}"
+      - identity
+      - --cert
+      - "{{ _tinfirm_sandbox_node_cert }}"
+      - --key
+      - "{{ _tinfirm_sandbox_node_key }}"
+  changed_when: true
+  when: not _tinfirm_sandbox_node_identity.results[1].stat.exists
+  notify: Restart the node agent's listener
+
+# The listener refuses a key that another user owns or that group or others can read; the
+# driver pins the certificate, which anyone may read.
+- name: Give the key to the listener's user
+  ansible.builtin.file:
+    path: "{{ _tinfirm_sandbox_node_key }}"
+    owner: "{{ _tinfirm_sandbox_node_listener_user }}"
+    group: "{{ _tinfirm_sandbox_node_listener_user }}"
+    mode: "0600"
+  notify: Restart the node agent's listener
+
+- name: Make the certificate root's
+  ansible.builtin.file:
+    path: "{{ _tinfirm_sandbox_node_cert }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# The helper refuses, at its start, a configuration that is not root's or that its group or
+# others can write: it names the programs the helper runs as root.
+- name: Write the helper's configuration
+  ansible.builtin.template:
+    src: helper.json.j2
+    dest: "{{ _tinfirm_sandbox_node_helper_config }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart the node agent's helper
+
+- name: Write the listener's configuration
+  ansible.builtin.template:
+    src: listener.json.j2
+    dest: "{{ _tinfirm_sandbox_node_listener_config }}"
+    owner: root
+    group: "{{ _tinfirm_sandbox_node_listener_user }}"
+    mode: "0640"
+  notify: Restart the node agent's listener

@@ -1,0 +1,5 @@
+# {{ ansible_managed }}
+# The one address that may connect to the listener (its unit has IPAddressDeny=any): the
+# control host's, as the listener's own tls.controlHost and the node's firewall name it.
+[Service]
+IPAddressAllow={{ tinfirm_sandbox_node_control_host }}

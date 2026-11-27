@@ -1,0 +1,34 @@
+== 1. the node's own journal of a boot with the four units enabled and cloud-init as the image has it (read from its disk afterwards: the node took no SSH for 21 minutes and was then deleted and made again)
+[    3.145789] node systemd[1]: Starting tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall...
+[    3.295953] node systemd[1]: Finished tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall.
+[    3.783379] node cloud-init[534]: Cloud-init v. 26.2-0ubuntu1~24.04.2 running 'init-local' at Fri, 20 Nov 2026 07:02:43 +0000. Up 3.76 seconds.
+[    4.012947] node dhcpcd[554]: eth0: offered 10.0.0.6 from <the platform address>
+[   34.056064] node cloud-init[534]: 2026-11-20 07:03:13,899 - azure.py[WARNING]: Polling IMDS failed attempt 1 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Max
+[   65.087776] node cloud-init[534]: 2026-11-20 07:03:44,930 - azure.py[WARNING]: Polling IMDS failed attempt 2 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Max
+[  313.274693] node cloud-init[534]: 2026-11-20 07:07:53,117 - azure.py[WARNING]: Polling IMDS failed attempt 10 with exception: UrlError("HTTPConnectionPool(host='<the metadata service>', port=80): Ma
+[  313.283326] node cloud-init[534]: 2026-11-20 07:07:53,118 - azure.py[WARNING]: Failed to fetch metadata from IMDS: HTTPConnectionPool(host='<the metadata service>', port=80): Max retries exceeded wi
+[  313.283326] node cloud-init[534]: 2026-11-20 07:07:53,118 - azure.py[ERROR]: Azure datasource failure occurred: result=error|reason=connection timeout querying IMDS|agent=Cloud-Init/26.2-0ubu
+[ 1206.704456] node systemd[1]: tinfirm-node-agent-firewall.service: Deactivated successfully.
+[ 1206.704573] node systemd[1]: Stopped tinfirm-node-agent-firewall.service - Tinfirm node agent: the node's own firewall.
+(nothing more is logged between 313 s and the shutdown at 1206 s; port 22 refused connections all that time, so the boot had not reached its sockets)
+
+== a reboot with the four units enabled and cloud-init switched off (/etc/cloud/cloud-init.disabled); up 21.57 s
+units: firewall active, modules active, helper active, listener active; the table loaded: 1; way-back timer fired: inactive
+ordering cycles or deleted jobs in this boot: 0
+  3571 ms: tinfirm-node-agent-firewall.service
+  3684 ms: sysinit.target
+  3712 ms: ssh.socket
+  4437 ms: tinfirm-node-agent-modules.service
+  4449 ms: tinfirm-node-agent-helper.service
+  4606 ms: network-pre.target
+  4737 ms: systemd-networkd.service
+  4740 ms: network.target
+  5973 ms: network-online.target
+  6009 ms: tinfirm-node-agent-listener.service
+afterwards: units disabled disabled , cloud-init on again
+created node-1:vm-f23929f6bf257dc8cd3acf17222217fb (two-machine-run-0) from the template sandbox-2c2g
+deleted node-1:vm-f23929f6bf257dc8cd3acf17222217fb
+verify: 67 ms, problems [], maxVms 2
+create: 701 ms, id node-1:vm-f23929f6bf257dc8cd3acf17222217fb; describe: 7 ms, running at 10.0.0.6:20000
+guest ready: 14196 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 5 ms, 1 VM
+delete: 94 ms; then describe says gone; the port answers `nothing`

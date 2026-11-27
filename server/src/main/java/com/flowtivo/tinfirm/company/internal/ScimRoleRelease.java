@@ -21,6 +21,7 @@ import com.flowtivo.tinfirm.company.scim.ScimRoleSource;
 import com.flowtivo.tinfirm.company.scim.ScimSettings;
 import com.flowtivo.tinfirm.shared.licence.LicenceChanged;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 
 /**
  * Releases the roles SCIM decides when SCIM no longer decides them (ADR-0088, decision 7; ADR-0087, decision 10):
@@ -59,9 +60,14 @@ class ScimRoleRelease {
         releaseWhereScimNoLongerDecides();
     }
 
+    /**
+     * After the key's commit, once its transaction has released its connection ({@link AfterTransaction}): in an
+     * after-commit listener the finished transaction is still bound to the thread, and a transaction asked for there
+     * would join it.
+     */
     @TransactionalEventListener(fallbackExecution = true)
     void licenceChanged(LicenceChanged event) {
-        releaseWhereScimNoLongerDecides();
+        AfterTransaction.run(this::releaseWhereScimNoLongerDecides);
     }
 
     /** One pass over the companies that hold memberships whose role SCIM decides; how many were released. */

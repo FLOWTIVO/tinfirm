@@ -157,12 +157,12 @@ public final class FakeRunner implements AutoCloseable {
         return hello;
     }
 
-    /** A valid {@code hello} of protocol v2 from a Kata host ({@code microvm}). */
+    /** A valid {@code hello} of protocol v2 from a host with Docker ({@code container}, a Kata host's level too). */
     public static Map<String, Object> helloV2(List<Map<String, Object>> credentials,
             List<Map<String, Object>> activeRuns) {
         Map<String, Object> hello = hello(credentials, activeRuns);
         hello.put("protocolVersion", 2);
-        hello.put("isolationTiers", List.of("microvm"));
+        hello.put("isolationTiers", List.of("container"));
         return hello;
     }
 
@@ -186,10 +186,34 @@ public final class FakeRunner implements AutoCloseable {
      */
     public static Map<String, Object> helloWithPool(int maxConcurrentRuns, int maxReady) {
         Map<String, Object> hello = helloV2(List.of(), List.of(), "0.3.0", maxConcurrentRuns);
-        hello.put("isolationTiers", List.of("microvm"));
+        hello.put("isolationTiers", List.of("machine"));
+        hello.put("hardened", "none");
         hello.put("features", List.of("sandbox.pool", "sandbox.bridge"));
         hello.put("pool", Map.of("maxReady", maxReady));
         return hello;
+    }
+
+    /**
+     * A {@code hello} of protocol v2 from a host that reports its isolation (ADR-0113): {@code level} in
+     * {@code isolationTiers} ({@code machine}, {@code vm-jail}, {@code container} or {@code gvisor}), {@code hardened}
+     * ({@code yes}, {@code no} or {@code none}; left out when null) and {@code isolationStated} when not null.
+     */
+    public static Map<String, Object> helloWithIsolation(String level, String hardened, Boolean stated) {
+        Map<String, Object> hello = helloV2(List.of(), List.of());
+        hello.put("isolationTiers", List.of(level));
+        hello.put("features", List.of("run.steer"));
+        if (hardened != null) {
+            hello.put("hardened", hardened);
+        }
+        if (stated != null) {
+            hello.put("isolationStated", stated);
+        }
+        return hello;
+    }
+
+    /** {@link #helloWithIsolation(String, String, Boolean)} without {@code isolationStated}. */
+    public static Map<String, Object> helloWithIsolation(String level, String hardened) {
+        return helloWithIsolation(level, hardened, null);
     }
 
     /** Sends a {@code hello} of protocol v2 of this runner version and slots, and waits for welcome. */

@@ -116,4 +116,16 @@ public interface SystemAccounts {
      * account that is gone or a credential nobody borrows.
      */
     Optional<UUID> holderOf(UUID companyId, UUID accountId);
+
+    /**
+     * The credentials of kind {@code APP} on the system, each one installation of its GitHub App (ADR-0116), by name;
+     * none without the account module.
+     */
+    default List<AppCredential> appCredentials(UUID companyId, UUID systemId) {
+        return List.of();
+    }
+
+    /** A credential that is an installation of the system's GitHub App. */
+    record AppCredential(UUID id, String name, long installationId) {
+    }
 }

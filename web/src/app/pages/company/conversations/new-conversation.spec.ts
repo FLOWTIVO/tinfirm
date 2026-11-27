@@ -442,6 +442,7 @@ describe('startProblem', () => {
     ],
     ['MODEL_ACCESS_UNAVAILABLE', 'MODEL_REQUIRED', 'Choose a model in your settings of the agent'],
     ['NO_HOST_FOR_CONVERSATION', 'NO_HOST_FOR_CREDENTIALS', 'No runner host may carry'],
+    ['NO_HOST_FOR_CONVERSATION', 'NO_HOST_OF_LEVEL', 'the level of isolation chosen for it'],
   ])('explains %s with its reason', (code, reason, words) => {
     const error = new HttpErrorResponse({
       status: 409,

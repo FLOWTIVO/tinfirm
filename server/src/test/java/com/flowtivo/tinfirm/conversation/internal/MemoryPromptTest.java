@@ -83,8 +83,8 @@ class MemoryPromptTest {
     @Test
     void onlyTheFullPromptHasTheSection() {
         PromptRenderer.Context context = new PromptRenderer.Context("Analyst", "Be precise.", null, "Alice", "a-1",
-                "Title", null, List.of(), List.of(), "Do it.", List.of(), 0, null, List.of(), "agent/a-1", List.of(),
-                false, null, List.of(), null, null, null, "You keep notes across your conversations with Alice.");
+                null, List.of(), List.of(), "Do it.", List.of(), 0, null, List.of(), "agent/a-1", List.of(), false,
+                null, List.of(), null, null, null, "You keep notes across your conversations with Alice.");
         String prompt = PromptRenderer.prompt(context);
         assertThat(prompt).contains("# Memory\nYou keep notes across your conversations with Alice.");
         assertThat(prompt.indexOf("# Memory")).isLessThan(prompt.indexOf("# Request"));

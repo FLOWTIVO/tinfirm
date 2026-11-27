@@ -32,6 +32,12 @@ public record AccountInfo(UUID id, UUID companyId, UUID systemId, @Nullable UUID
          * service account's on Jira Cloud. A credential of the system only, never a member's own account.
          */
         CLIENT,
+        /**
+         * An installation of the system's GitHub App (ADR-0116): a credential of a {@code GITHUB} system only, never a
+         * member's own account. Tinfirm mints its tokens itself with the App's key, for its own calls with the
+         * installation's permissions less {@code workflows}, and for each run one limited to the run's repositories.
+         */
+        APP,
         /** An identity without a credential: a chat user linked through the identity provider (package 5). */
         LINK
     }

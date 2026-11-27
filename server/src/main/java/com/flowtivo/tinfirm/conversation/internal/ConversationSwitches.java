@@ -12,12 +12,14 @@ import org.springframework.transaction.annotation.Transactional;
 import com.flowtivo.tinfirm.company.CompanyRunsDependents;
 import com.flowtivo.tinfirm.conversation.PersonConversations;
 import com.flowtivo.tinfirm.run.RunCancellations;
+import com.flowtivo.tinfirm.run.RunGitRevocations;
 import com.flowtivo.tinfirm.system.SystemSwitchDependents;
 
 /**
  * The conversation module's part of the kill switches and of a member's departure (the package 6 contract, §5.4,
- * §5.5): a system paused with {@code stopRunning} cancels the running turns of the open conversations bound to it
- * (its bindings keep their state: for the conversations the system is one without an account); the company's stop
+ * §5.5): a system paused revokes the git tokens of its repositories from the runs under way (ADR-0116), and with
+ * {@code stopRunning} then cancels the running turns of the open conversations bound to it (its bindings keep their
+ * state: for the conversations the system is one without an account); the company's stop
  * refuses every parked call that has not started (the security review of 2026-10-27, M6: {@link ParkedCalls#stopped});
  * and a person's conversations by counts.
  */
@@ -30,7 +32,17 @@ class ConversationSwitches implements SystemSwitchDependents, CompanyRunsDepende
 
     private final ObjectProvider<ParkedCalls> parked;
 
-    ConversationSwitches(JdbcClient jdbc, RunCancellations cancellations, ObjectProvider<ParkedCalls> parked) {
+    private final RunGitRevocations revocations;
+
+    private final GitRevocations gitRevocations;
+
+    private final ConversationStore conversationStore;
+
+    ConversationSwitches(JdbcClient jdbc, RunCancellations cancellations, ObjectProvider<ParkedCalls> parked,
+            RunGitRevocations revocations, GitRevocations gitRevocations, ConversationStore conversationStore) {
+        this.revocations = revocations;
+        this.gitRevocations = gitRevocations;
+        this.conversationStore = conversationStore;
         this.jdbc = jdbc;
         this.cancellations = cancellations;
         this.parked = parked;
@@ -51,17 +63,23 @@ class ConversationSwitches implements SystemSwitchDependents, CompanyRunsDepende
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
     public Pausing systemPausing(UUID companyId, UUID systemId, boolean stopRunning) {
-        if (!stopRunning) {
-            return Pausing.NONE;
-        }
-        List<UUID> conversations = jdbc.sql("""
+        List<UUID> conversations = stopRunning ? jdbc.sql("""
                 SELECT DISTINCT b.conversation_id
                   FROM conversation_binding b
                   JOIN conversation c ON c.id = b.conversation_id AND c.company_id = b.company_id
                  WHERE b.company_id = ? AND b.system_id = ? AND b.state <> 'GONE' AND c.state = 'OPEN'""")
             .params(companyId, systemId)
             .query(UUID.class)
-            .list();
+            .list() : List.of();
+        // Every conversation this pause writes, in the order of their ids, before any run (CONVENTIONS §10).
+        java.util.SortedSet<UUID> locked = new java.util.TreeSet<>(conversations);
+        locked.addAll(revocations.conversationsOfSystem(companyId, systemId));
+        locked.forEach(conversationId -> conversationStore.lock(companyId, conversationId));
+        // ADR-0116: the git tokens go first, with or without stopRunning, since a cancelled run pushes its work.
+        gitRevocations.systemPaused(companyId, systemId);
+        if (!stopRunning) {
+            return Pausing.NONE;
+        }
         return new Pausing(cancellations.cancelRunningOfConversations(companyId, conversations), 0);
     }
 

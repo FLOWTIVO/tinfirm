@@ -29,6 +29,7 @@ import com.flowtivo.tinfirm.run.TurnEnded;
 import com.flowtivo.tinfirm.run.TurnReason;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
 import com.flowtivo.tinfirm.support.RunnerFileRequests;
 import com.flowtivo.tinfirm.support.TestRuns;
 
@@ -119,6 +120,30 @@ class RunnerFilesIntegrationTest extends OutputTestBench {
     private static Set<String> uploads(File directory) {
         File[] files = directory.listFiles((dir, name) -> name.startsWith("upload_"));
         return files == null ? Set.of() : Arrays.stream(files).map(File::getName).collect(Collectors.toSet());
+    }
+
+    /**
+     * An upload whose own transaction finds no free connection: the host's lookups before it are no change of the
+     * request, so the host is told the server is busy, and no file is stored.
+     */
+    @Test
+    void anUploadThatFindsNoFreeConnectionForItsOwnTransactionIsToldTheServerIsBusy() throws Exception {
+        Bench bench = bench();
+        Conversation conversation = conversation(bench);
+        RunnerHostRef host = host(bench);
+        UUID runId = running(bench, conversation, host, 1, 1);
+
+        HttpResponse<String> upload;
+        try (AutoCloseable busy = ConnectionWatch.timeOutAt(RunnerFilesController.class.getName() + ".upload",
+                "com.flowtivo.tinfirm.runner.internal.RunnerHostSessions")) {
+            upload = hostUpload(host.token(), runId, 1, "&artifact=true&source=save_artifact", "report.md",
+                    "text/markdown", REPORT);
+        }
+
+        assertThat(upload.statusCode()).as(upload.body()).isEqualTo(503);
+        assertThat(json(upload).get("code").asString()).isEqualTo("SERVER_BUSY");
+        assertThat(upload.headers().firstValue("Retry-After")).hasValue("2");
+        assertThat(list(bench.person().get(files(bench, conversation)).json())).isEmpty();
     }
 
     @Test

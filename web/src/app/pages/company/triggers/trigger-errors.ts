@@ -68,6 +68,7 @@ const REASONS: Record<string, string> = {
   NO_HOST_FOR_CREDENTIALS:
     'A subscription runs only on its own host, which may not hold the credentials a service account borrows.',
   CANNOT_RUN_ANYWHERE: 'No runner host may run it as it is set up.',
+  NO_HOST_OF_LEVEL: 'No runner host reports the level of isolation chosen for its agent.',
 };
 
 export function triggerFailure(error: unknown): TriggerFailure {

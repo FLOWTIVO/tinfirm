@@ -2,6 +2,7 @@ package com.flowtivo.tinfirm.runner.internal;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -29,6 +30,7 @@ import com.flowtivo.tinfirm.runner.RunnerSessionListener;
 import com.flowtivo.tinfirm.shared.licence.Feature;
 import com.flowtivo.tinfirm.shared.licence.Licensing;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 
 /**
  * The runner endpoint {@code /api/runner/v1/connect} (docs/archive/v1/CONVENTIONS.md §15.1).
@@ -36,17 +38,22 @@ import com.flowtivo.tinfirm.shared.security.SystemContext;
  * <li>Authentication: {@code Authorization: Bearer tfr_...}, outside the browser session. A missing, malformed,
  * unknown or revoked token closes the connection with 4401.</li>
  * <li>The first frame must be a valid {@code hello}, else the connection is closed with 1008; so is a hello that
- * lists {@code sandbox.bridge} or {@code sandbox.pool} while the licence in force does not hold
- * {@code ELASTIC_RUNNERS}, after an
- * {@code error} {@code EDITION_REQUIRED} (ADR-0100). Its
- * {@code protocolVersion} must be 1 or 2, else the connection is closed with 1002 after an {@code error}
- * {@code UNSUPPORTED_PROTOCOL}; the connection speaks that version from then on (CONVENTIONS §14.10). The hello
+ * lists {@code sandbox.pool} or {@code sandbox.elastic} while the licence in force does not hold
+ * {@code ELASTIC_RUNNERS}, after an {@code error} {@code EDITION_REQUIRED} (ADR-0100, ADR-0114).
+ * {@code sandbox.bridge} is accepted in every edition. So is a hello of protocol 2 whose {@code isolationTiers}
+ * carry {@code microvm}, after an {@code error} {@code UPGRADE_REQUIRED} that names the server's version (ADR-0113,
+ * decision 2). Its {@code protocolVersion} must be 1 or 2, else the
+ * connection is closed with 1002 after an {@code error} {@code UNSUPPORTED_PROTOCOL}; the connection speaks that
+ * version from then on (CONVENTIONS §14.10). The hello
  * records the host, its ceiling and version, and a personal host's credentials ({@link RunnerHostSessions}; a company
  * host's are refused with an {@code error} {@code PERSONAL_HOST_CREDENTIAL_ONLY} after {@code host.config}), and is
  * answered with {@code welcome} (which names the version) and then {@code host.config}, before any other frame. Only
  * then does the host become connected (a second connection of the same host replaces the first with 4409); the
  * dispatcher assigns runs to it once it has answered with {@code host.config.applied}
- * (docs/archive/v1/CONVENTIONS.md §15.1, §15.7).</li>
+ * (docs/archive/v1/CONVENTIONS.md §15.1, §15.7). An answer that cannot be completed once {@code welcome} was sent
+ * (the reconciliation or the end of the answer fails) closes the connection with 1011 after an {@code error}
+ * {@code INTERNAL_ERROR}: the host reconnects and says hello again, since one that took runs back waits for
+ * {@code welcome.done} without a limit (ADR-0116). A failure before {@code welcome} is answered as any frame's.</li>
  * <li>Every frame is validated against the connection's version; a bad or unknown frame, and a frame of the other
  * version, is answered with {@code error} and otherwise ignored.</li>
  * <li>Frames are processed one at a time per connection, as actor SYSTEM in the tenant context of the host's
@@ -112,6 +119,10 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
+        ended("a runner host's connection", () -> established(session));
+    }
+
+    private void established(WebSocketSession session) {
         WebSocketSession out = new ConcurrentWebSocketSessionDecorator(session, SEND_TIME_LIMIT_MS,
                 SEND_BUFFER_LIMIT_BYTES);
         session.getAttributes().put(OUT, out);
@@ -128,15 +139,30 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage frame) {
-        ConnectedHost host = current(session);
-        WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
-        if (host == null || out == null) {
-            return;
+        ended("a runner host's frame", () -> {
+            ConnectedHost host = current(session);
+            WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
+            if (host == null || out == null) {
+                return;
+            }
+            boolean renew = registry.markInbound(host.machineId(), out.getId());
+            process(session, out, host, frame);
+            if (renew) {
+                hostActive(host);
+            }
+        });
+    }
+
+    /**
+     * The safety net of work kept for after a transaction (CONVENTIONS §10) after each callback: the container may
+     * run the connection's next callback on this thread.
+     */
+    private static void ended(String where, Runnable callback) {
+        try {
+            callback.run();
         }
-        boolean renew = registry.markInbound(host.machineId(), out.getId());
-        process(session, out, host, frame);
-        if (renew) {
-            hostActive(host);
+        finally {
+            AfterTransaction.endOfWork(where);
         }
     }
 
@@ -179,6 +205,54 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
         }
     }
 
+    /**
+     * The hello's gate of elastic runners (ADR-0100, as ADR-0114 decision 3 amends it): the {@code error} message for
+     * a hello that lists a paid feature of the runner host while the licence in force does not hold
+     * {@code ELASTIC_RUNNERS}, or null when it may connect. Paid are ready sandboxes ({@code sandbox.pool}) and a VM
+     * driver of the binary's paid ones ({@code sandbox.elastic}: a provider's, DigitalOcean's today). The sandbox bridge
+     * ({@code sandbox.bridge}), the VM executor and the driver protocol are the core's, so every edition accepts them.
+     * <p>
+     * What this gate is, and is not: it holds for Tinfirm's own paid drivers in Tinfirm's own runner binary, which
+     * list {@code sandbox.elastic}. It does not stop a driver an operator wrote for the open driver protocol (ADR-0096):
+     * such a host lists no paid feature, and the server cannot tell it from a host without a paid driver. What is paid
+     * is Tinfirm's drivers, their guards and their support, not the right to make VMs elsewhere (ADR-0114).
+     */
+    private @Nullable String unlicensedFeatures(Set<String> features) {
+        boolean pool = features.contains(RunnerMessages.FEATURE_SANDBOX_POOL);
+        boolean elastic = features.contains(RunnerMessages.FEATURE_SANDBOX_ELASTIC);
+        if ((!pool && !elastic) || licensing.has(Feature.ELASTIC_RUNNERS)) {
+            return null;
+        }
+        List<String> needs = new ArrayList<>();
+        List<String> instead = new ArrayList<>();
+        if (pool) {
+            needs.add("ready VMs (" + RunnerMessages.FEATURE_SANDBOX_POOL + ")");
+            instead.add("start the host with --pool-max-ready 0, and every run starts cold");
+        }
+        if (elastic) {
+            needs.add("a provider's VM driver (" + RunnerMessages.FEATURE_SANDBOX_ELASTIC + ")");
+            instead.add("run sandboxes with Docker, or with a VM driver of your own, since the driver protocol is "
+                    + "open");
+        }
+        return "This server's licence does not hold elastic runners (" + Feature.ELASTIC_RUNNERS.name() + ", the "
+                + Feature.ELASTIC_RUNNERS.edition().name() + " edition), which this runner host needs for "
+                + String.join(" and ", needs) + ". Instead, " + String.join("; ", instead)
+                + ". Or apply a Pro or Enterprise licence key";
+    }
+
+    /**
+     * The {@code error} message for a hello of protocol 2 that carries {@code microvm} (ADR-0113, decision 2): a Kata
+     * host or a host with a VM per run of an older release, which must take the server's release. It names the
+     * version to install, or says "this server's version" where the build does not name one.
+     */
+    static String microvmRefusal(@Nullable String serverVersion) {
+        String version = serverVersion != null ? "version " + serverVersion : "this server's version";
+        return "This runner host reports the isolation tier microvm, which this Tinfirm server (" + version
+                + ") no longer takes: a host now reports its level of isolation, container for Kata Containers and "
+                + "machine or vm-jail for a VM per run. Upgrade tinfirm-runner-host on this host to " + version
+                + ", the server's, and start it again. Hosts with Docker keep working until they are upgraded.";
+    }
+
     private void hello(WebSocketSession session, WebSocketSession out, ConnectedHost authenticated,
             RunnerMessages.Hello hello, List<String> unknownCredentialKinds) {
         if (!RunnerMessages.supported(hello.protocolVersion())) {
@@ -191,23 +265,24 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
         // From here on the connection speaks the host's version: its frames decode, and run.assign is built, for it.
         ConnectedHost host = authenticated.speaking(hello.protocolVersion());
         session.getAttributes().put(HOST, host);
+        if (hello.carriesMicrovm()) {
+            // A host to upgrade with the server (ADR-0113, decision 2): it stops, and does not reconnect, at 1008.
+            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.UPGRADE_REQUIRED,
+                    microvmRefusal(serverVersion)));
+            RunnerConnectionRegistry.close(out, CloseStatus.POLICY_VIOLATION.withReason(
+                    "Upgrade tinfirm-runner-host to " + (serverVersion != null ? serverVersion : "the server's version")));
+            return;
+        }
         String problem = RunnerHostSessions.helloProblem(hello);
         if (problem != null) {
             registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.BAD_MESSAGE, problem));
             RunnerConnectionRegistry.close(out, CloseStatus.POLICY_VIOLATION.withReason("Invalid hello"));
             return;
         }
-        if ((hello.featureSet().contains(RunnerMessages.FEATURE_SANDBOX_BRIDGE)
-                || hello.featureSet().contains(RunnerMessages.FEATURE_SANDBOX_POOL))
-                && !licensing.has(Feature.ELASTIC_RUNNERS)) {
-            // Elastic runners are Pro's and Enterprise's (ADR-0100): the host stops rather than reconnects. Ready
-            // sandboxes are a VM per run's, which always lists the bridge: a pool without it is refused the same way,
-            // so that no hello re-evaluates Tinfirm's schedule for a host the licence does not cover.
-            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.EDITION_REQUIRED,
-                    "This server's licence does not hold elastic runners (" + Feature.ELASTIC_RUNNERS.name() + ", "
-                            + "the " + Feature.ELASTIC_RUNNERS.edition().name() + " edition), which a runner host "
-                            + "with the sandbox bridge or a VM per run needs. Run it with Docker and without "
-                            + "--sandbox-bridge, or apply a Pro or Enterprise licence key"));
+        String unlicensed = unlicensedFeatures(hello.featureSet());
+        if (unlicensed != null) {
+            // The host stops rather than reconnects. No hello of a refused pool re-evaluates Tinfirm's schedule.
+            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.EDITION_REQUIRED, unlicensed));
             RunnerConnectionRegistry.close(out, CloseStatus.POLICY_VIOLATION.withReason("Edition required"));
             return;
         }
@@ -217,16 +292,39 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
             return;
         }
         session.getAttributes().put(LABELS, RunnerHostSessions.acceptedLabels(hello, outcome.get()));
-        RunnerMessages.HostConfig config = outcome.get().config();
         // A machine's welcome names the machine and the first of its companies (none: the nil UUID): the runner host
         // keeps them in its state file and uses neither (ADR-0092).
         List<ConnectedHost> placements = host.placements();
         registry.sendTo(out, new RunnerMessages.Welcome(host.protocolVersion(), host.machineId(),
                 placements.isEmpty() ? NO_COMPANY : placements.getFirst().company(), serverVersion,
                 Math.max(1, properties.heartbeatInterval().toSeconds()),
-                Math.max(1, properties.leaseTtl().toSeconds())));
+                Math.max(1, properties.leaseTtl().toSeconds()),
+                host.protocolVersion() == RunnerMessages.PROTOCOL_V2 ? RunnerMessages.SERVER_FEATURES : null));
+        try {
+            answer(session, out, host, hello, unknownCredentialKinds, outcome.get(), placements);
+        }
+        catch (RuntimeException ex) {
+            // ADR-0116: the host has its welcome, and one that took runs back waits for welcome.done without a limit.
+            // An answer that cannot be completed closes the connection with a status the host is not stopped by
+            // (1011): it reconnects, and its next hello is answered whole. The registration goes as for any close.
+            log.error("Answering the hello of runner host {} failed; closing its connection", host.machineId(), ex);
+            registry.sendTo(out, RunnerMessages.ProtocolError.of("INTERNAL_ERROR",
+                    "The server could not complete its answer to hello; reconnect"));
+            RunnerConnectionRegistry.close(out, CloseStatus.SERVER_ERROR.withReason("Hello not answered"));
+        }
+    }
+
+    /**
+     * The answer to a hello after {@code welcome}: {@code host.config} and its problems, the registration, the
+     * reconciliation of the runs the host reports, and for a host that lists {@code run.git.revoke} the end of the
+     * answer with {@code welcome.done} (ADR-0116).
+     */
+    private void answer(WebSocketSession session, WebSocketSession out, ConnectedHost host,
+            RunnerMessages.Hello hello, List<String> unknownCredentialKinds, RunnerHostSessions.HelloOutcome outcome,
+            List<ConnectedHost> placements) {
+        RunnerMessages.HostConfig config = outcome.config();
         registry.sendTo(out, config);
-        if (outcome.get().credentialsRefused()) {
+        if (outcome.credentialsRefused()) {
             // M5: only a personal host holds credentials; a company host runs budget-paid runs only.
             registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.PERSONAL_HOST_CREDENTIAL_ONLY,
                     "This is a company runner host: the credentials it reports are ignored, since only a member's "
@@ -248,29 +346,50 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
             .ifPresent(latest -> registry.sendTo(out, latest));
         List<RunnerMessages.ActiveRun> activeRuns = hello.activeRuns() != null ? hello.activeRuns() : List.of();
         String publicSuffixSha256 = hello.publicSuffixList() != null ? hello.publicSuffixList().sha256() : null;
-        send(out, connected(host, placements, activeRuns, publicSuffixSha256));
+        boolean takesRevocations = hello.protocolVersion() == RunnerMessages.PROTOCOL_V2
+                && hello.featureSet().contains(RunnerMessages.FEATURE_RUN_GIT_REVOKE);
+        Reconciled answer = connected(host, placements, activeRuns, publicSuffixSha256, takesRevocations);
+        Map<UUID, List<RunnerMessages.RunGitRevoke>> written = new HashMap<>();
+        for (Answered frame : answer.frames()) {
+            if (registry.sendTo(out, frame.frame()) && frame.company() != null
+                    && frame.frame() instanceof RunnerMessages.RunGitRevoke revoke) {
+                written.computeIfAbsent(frame.company(), id -> new ArrayList<>()).add(revoke);
+            }
+        }
+        written.forEach(this::revocationsWritten);
+        if (takesRevocations) {
+            // ADR-0116: the end of what the hello's answer sends, the revocations that committed meanwhile included,
+            // written while none of the host's runs can commit another. A host that took a run back pushes its work
+            // only after it.
+            listener().endHelloAnswer(answer.listed(), frame -> registry.sendTo(out, frame));
+        }
     }
 
     /**
      * Reconciles the host in each of its companies, with the active runs it reports that belong to that company. A
-     * reported run of no company of the host's (one it left, or a run the server does not know) is cancelled.
+     * reported run of no company of the host's (one it left, or a run the server does not know) is cancelled; one of
+     * a company a machine is no longer in gets the revocations of its assignment first, when that assignment went to
+     * this machine (ADR-0116).
      */
-    private List<RunnerMessages.Outbound> connected(ConnectedHost host, List<ConnectedHost> placements,
-            List<RunnerMessages.ActiveRun> activeRuns, @Nullable String publicSuffixSha256) {
+    private Reconciled connected(ConnectedHost host, List<ConnectedHost> placements,
+            List<RunnerMessages.ActiveRun> activeRuns, @Nullable String publicSuffixSha256, boolean takesRevocations) {
         Map<UUID, List<RunnerMessages.ActiveRun>> byCompany = new HashMap<>();
-        List<RunnerMessages.Outbound> frames = new ArrayList<>();
+        List<Answered> frames = new ArrayList<>();
         for (RunnerMessages.ActiveRun active : activeRuns) {
             UUID company = sessions.placeForRun(host, active.runId()).map(ConnectedHost::company).orElse(null);
             if (company == null) {
-                frames.add(new RunnerMessages.RunCancel(active.runId(), active.epoch()));
+                frames.addAll(foreign(host, active, takesRevocations));
+                frames.add(new Answered(null, new RunnerMessages.RunCancel(active.runId(), active.epoch())));
             }
             else {
                 byCompany.computeIfAbsent(company, id -> new ArrayList<>()).add(active);
             }
         }
         boolean pslSent = false;
+        Map<ConnectedHost, List<RunnerMessages.ActiveRun>> listed = new LinkedHashMap<>();
         for (ConnectedHost placed : placements) {
             List<RunnerMessages.ActiveRun> theirs = byCompany.getOrDefault(placed.company(), List.of());
+            listed.put(placed, theirs);
             for (RunnerMessages.Outbound frame : SystemContext.callInCompany(placed.company(),
                     () -> listener().hostConnected(placed, theirs, publicSuffixSha256))) {
                 // The Public Suffix List is the server's, not a company's: sent once.
@@ -280,10 +399,58 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                     }
                     pslSent = true;
                 }
-                frames.add(frame);
+                frames.add(new Answered(placed.company(), frame));
             }
         }
-        return frames;
+        return new Reconciled(frames, listed);
+    }
+
+    /**
+     * ADR-0116: the revocations that go before the cancel of a run of a company a machine is no longer in, in that
+     * company's context: none for a company host, an unknown run, or an assignment that did not go to this machine.
+     */
+    private List<Answered> foreign(ConnectedHost host, RunnerMessages.ActiveRun active, boolean takesRevocations) {
+        UUID machine = host.personalHostId();
+        UUID company = machine != null ? sessions.runCompany(active.runId()).orElse(null) : null;
+        if (machine == null || company == null) {
+            return List.of();
+        }
+        return SystemContext.callInCompany(company,
+                () -> listener().beforeCancelOfForeignRun(company, machine, active, takesRevocations))
+            .stream()
+            .map(frame -> new Answered(company, frame))
+            .toList();
+    }
+
+    /** What the reconciliation of a hello answered, and the runs it listed in each company the host is in. */
+    private record Reconciled(List<Answered> frames, Map<ConnectedHost, List<RunnerMessages.ActiveRun>> listed) {
+    }
+
+    /** A frame of the hello's answer, with the company whose runs it concerns; null for a bare cancel. */
+    private record Answered(@Nullable UUID company, RunnerMessages.Outbound frame) {
+    }
+
+    /** The frames of a run message's answer, written; then the company hears which revocations were written. */
+    private void send(WebSocketSession out, ConnectedHost placed, List<RunnerMessages.Outbound> frames) {
+        List<RunnerMessages.RunGitRevoke> written = new ArrayList<>();
+        for (RunnerMessages.Outbound frame : frames) {
+            if (registry.sendTo(out, frame) && frame instanceof RunnerMessages.RunGitRevoke revoke) {
+                written.add(revoke);
+            }
+        }
+        if (!written.isEmpty()) {
+            revocationsWritten(placed.company(), written);
+        }
+    }
+
+    /** ADR-0116: the revocations written count as sent; a failure to record it leaves them pending, never lost. */
+    private void revocationsWritten(UUID company, List<RunnerMessages.RunGitRevoke> written) {
+        try {
+            SystemContext.runInCompany(company, () -> listener().revocationsWritten(company, written));
+        }
+        catch (RuntimeException ex) {
+            log.warn("Recording the revocations written to a runner host in company {} failed", company, ex);
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -296,6 +463,7 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                 .credentialStatus(host, (Set<String>) session.getAttributes().getOrDefault(LABELS, Set.of()), status)
                 .ifPresent(error -> registry.sendTo(out, error));
             case RunnerMessages.HostConfigApplied applied -> applied(out, host, applied);
+            case RunnerMessages.HostHealth health -> health(session, out, host, health);
             case RunnerMessages.HostPoolStatus status -> {
                 // Only a company host keeps ready sandboxes (ADR-0099), and only one whose hello listed the feature.
                 if (!host.personal() && registry.supports(host.runnerHostId(), RunnerMessages.FEATURE_SANDBOX_POOL)) {
@@ -323,9 +491,19 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                 byCompany.forEach((company, entries) -> {
                     ConnectedHost placed = known.in(company).orElseThrow();
                     RunnerMessages.RunHeartbeat theirs = new RunnerMessages.RunHeartbeat(entries);
-                    send(out, SystemContext.callInCompany(company, () -> listener().runMessage(placed, theirs)));
+                    send(out, placed, SystemContext.callInCompany(company,
+                            () -> listener().runMessage(placed, theirs)));
                 });
                 sessions.touch(host);
+            }
+            case RunnerMessages.RunGitRevoked revoked -> {
+                // ADR-0116: a confirmation of a run of no company of the host's is ignored, without an error.
+                ConnectedHost placed = sessions.placeForRun(host, revoked.runId()).orElse(null);
+                if (placed != null) {
+                    adopt(session, host, placed);
+                    send(out, placed, SystemContext.callInCompany(placed.company(),
+                            () -> listener().runMessage(placed, revoked)));
+                }
             }
             case RunnerMessages.OneRunMessage runMessage -> {
                 ConnectedHost placed = sessions.placeForRun(host, runMessage.runId()).orElse(null);
@@ -334,10 +512,60 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
                     return;
                 }
                 adopt(session, host, placed);
-                send(out, SystemContext.callInCompany(placed.company(), () -> listener().runMessage(placed, runMessage)));
+                send(out, placed, SystemContext.callInCompany(placed.company(),
+                        () -> listener().runMessage(placed, runMessage)));
             }
             case RunnerMessages.ProtocolError error -> log.warn("Runner host {} reported error {}: {}",
                     host.machineId(), abbreviate(error.code()), abbreviate(error.message()));
+        }
+    }
+
+    /**
+     * ADR-0117: a host's report of its health, kept with its connection. A host whose hello did not list the feature is
+     * answered {@code BAD_MESSAGE}, one over the flood bound {@code TOO_MANY_REQUESTS}; neither is applied. A change
+     * from no problem to a problem, and back, is audited and tells each company the host is in, whose runs that waited
+     * for it are placed again.
+     */
+    private void health(WebSocketSession session, WebSocketSession out, ConnectedHost host,
+            RunnerMessages.HostHealth health) {
+        if (!registry.supports(host.runnerHostId(), RunnerMessages.FEATURE_HOST_HEALTH)) {
+            registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.BAD_MESSAGE,
+                    "host.health needs a host that lists the feature host.health in hello"));
+            return;
+        }
+        RunnerConnectionRegistry.HealthReport report = registry.reportHealth(host.machineId(), session.getId(),
+                health);
+        switch (report.outcome()) {
+            case TOO_MANY -> registry.sendTo(out, RunnerMessages.ProtocolError.of(RunnerMessages.TOO_MANY_REQUESTS,
+                    "This runner host sends host.health more often than the server takes (12 a minute); the server "
+                            + "keeps the state it took last."));
+            case SAME -> {
+            }
+            case CHANGED -> {
+                boolean wasUnhealthy = report.before().unhealthy();
+                boolean unhealthy = report.after().unhealthy();
+                log.info("Runner host {} reports {}", host.machineId(), unhealthy
+                        ? "that it takes no run: " + report.after().problems().stream()
+                            .map(problem -> problem.code() + " " + abbreviate(problem.message()))
+                            .toList()
+                        : "that it takes runs again");
+                if (wasUnhealthy == unhealthy) {
+                    // Other problems than before: the page shows them; nothing else changes.
+                    return;
+                }
+                sessions.auditHealth(host, report.after());
+                for (ConnectedHost placed : host.placements()) {
+                    try {
+                        SystemContext.runInCompany(placed.company(),
+                                () -> listener().hostHealthChanged(placed, !unhealthy));
+                    }
+                    catch (RuntimeException ex) {
+                        // The dispatcher's next pass places the runs anyway; the health is kept.
+                        log.warn("Placing the runs of runner host {} again in company {} failed", host.machineId(),
+                                placed.company(), ex);
+                    }
+                }
+            }
         }
     }
 
@@ -408,19 +636,15 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
         return listeners.getObject();
     }
 
-    private void send(WebSocketSession out, List<RunnerMessages.Outbound> frames) {
-        for (RunnerMessages.Outbound frame : frames) {
-            registry.sendTo(out, frame);
-        }
-    }
-
     @Override
     protected void handlePongMessage(WebSocketSession session, PongMessage message) {
-        ConnectedHost host = current(session);
-        WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
-        if (host != null && out != null && registry.markInbound(host.machineId(), out.getId())) {
-            hostActive(host);
-        }
+        ended("a runner host's pong", () -> {
+            ConnectedHost host = current(session);
+            WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
+            if (host != null && out != null && registry.markInbound(host.machineId(), out.getId())) {
+                hostActive(host);
+            }
+        });
     }
 
     /** The host talks, so it is alive: its running runs get a fresh lease. */
@@ -442,6 +666,13 @@ class RunnerWebSocketHandler extends TextWebSocketHandler {
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
+        // A connection the server closes in a transaction's afterCommit (a host revoked or deleted) is closed on that
+        // thread: what the disconnect writes waits for the transaction's end (AfterTransaction), never joining it. Not
+        // the end of a piece of work then, so no safety net here.
+        AfterTransaction.run(() -> closed(session));
+    }
+
+    private void closed(WebSocketSession session) {
         ConnectedHost host = current(session);
         WebSocketSession out = (WebSocketSession) session.getAttributes().get(OUT);
         if (host == null || out == null) {

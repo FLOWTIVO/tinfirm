@@ -21,13 +21,26 @@ import org.jspecify.annotations.Nullable;
  * @param reason            why it waits or why it is gone; null while {@link State#BOUND}
  * @param choices           the grants offered for {@link Reason#PICK_GRANT} and {@link Reason#CHOOSE}
  * @param waitingSince      since when it waits; null unless {@link State#WAITING}
+ * @param version           counts the changes of its state, kind, account, holder and grant
+ *                          ({@code conversation_binding.version}, V087): a git token revealed at one version is the
+ *                          binding's own only while the version stays (ADR-0116)
  */
 public record BindingInfo(UUID id, UUID companyId, UUID conversationId, UUID systemId, State state, @Nullable How how,
         @Nullable UUID accountId, @Nullable UUID holderPrincipalId, @Nullable String externalId, @Nullable UUID grantId,
-        @Nullable Reason reason, List<UUID> choices, @Nullable Instant waitingSince, @Nullable Instant boundAt) {
+        @Nullable Reason reason, List<UUID> choices, @Nullable Instant waitingSince, @Nullable Instant boundAt,
+        long version) {
 
     public BindingInfo {
         choices = List.copyOf(choices);
+    }
+
+    /** A binding not stored yet, or one whose version does not matter: version 0. */
+    public BindingInfo(UUID id, UUID companyId, UUID conversationId, UUID systemId, State state, @Nullable How how,
+            @Nullable UUID accountId, @Nullable UUID holderPrincipalId, @Nullable String externalId,
+            @Nullable UUID grantId, @Nullable Reason reason, List<UUID> choices, @Nullable Instant waitingSince,
+            @Nullable Instant boundAt) {
+        this(id, companyId, conversationId, systemId, state, how, accountId, holderPrincipalId, externalId, grantId,
+                reason, choices, waitingSince, boundAt, 0);
     }
 
     public boolean bound() {

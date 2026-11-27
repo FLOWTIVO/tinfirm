@@ -21,6 +21,7 @@ import org.springframework.transaction.event.TransactionalEventListener;
 import com.flowtivo.tinfirm.shared.config.TinfirmProperties;
 import com.flowtivo.tinfirm.shared.security.SystemContext;
 import com.flowtivo.tinfirm.shared.time.TimeSource;
+import com.flowtivo.tinfirm.shared.tx.AfterTransaction;
 import com.flowtivo.tinfirm.shared.tx.SystemTransactions;
 import com.flowtivo.tinfirm.system.CallResult;
 import com.flowtivo.tinfirm.system.ChatCalls;
@@ -348,14 +349,20 @@ class SlackSockets {
         }
     }
 
-    /** A system's transport changed: its connections follow at once (opened or closed by the next pass). */
+    /**
+     * A system's transport changed: its connections follow at once (opened or closed by the next pass). Closed once the
+     * change's transaction has released its connection ({@link AfterTransaction}): a slot's release asked for in this
+     * after-commit listener would join the finished transaction.
+     */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     void transportChanged(SystemEvents.ChatTransportChanged event) {
-        for (Slot key : Set.copyOf(connections.keySet())) {
-            if (key.systemId().equals(event.systemId())) {
-                close(key);
+        AfterTransaction.run(() -> {
+            for (Slot key : Set.copyOf(connections.keySet())) {
+                if (key.systemId().equals(event.systemId())) {
+                    close(key);
+                }
             }
-        }
+        });
     }
 
     /** Whether this replica holds an open connection of the system, for the tests. */

@@ -44,7 +44,8 @@ class RunAssignmentTest {
     private static final JsonMapper JSON = JsonMapper.builder().build();
 
     private static final RunProperties PROPERTIES = new RunProperties(Duration.ofMinutes(60), 200,
-            Duration.ofSeconds(10), Duration.ofMinutes(2), Duration.ofSeconds(10), 20000, Duration.ofMinutes(30),
+            Duration.ofSeconds(10), Duration.ofMinutes(2), Duration.ofSeconds(10), Duration.ofMinutes(5), 20000,
+            Duration.ofMinutes(30),
             Duration.ofSeconds(15), Duration.ofSeconds(60));
 
     private final RunDelivery delivery = new RunDelivery(null, null, null, null, null, null, null, null, null, null,
@@ -59,7 +60,7 @@ class RunAssignmentTest {
                 RuntimeKind.CODEX, TurnReason.MESSAGE, 3, UUID.randomUUID(), UUID.randomUUID(), modelAccess, null,
                 null, null, null, null, RunStatus.QUEUED, 0, null, null, null, null, Instant.now(), null, null, null,
                 null, null, null, "agent/shop-123-dev-2", null, null, null, null, null, 0, 0, null, null, null, null,
-                null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null);
     }
 
     /** The person's settings: the agent Builder with its hosts, a model and an effort. */

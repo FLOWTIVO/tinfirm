@@ -10,7 +10,7 @@ You verify offline, with FLOWTIVO's public key alone. Nothing calls out to FLOWT
 | `ghcr.io/flowtivo/tinfirm-runner-host` | The runner host, for the Helm chart's runner pod; it holds no agent runtime |
 | `oci://ghcr.io/flowtivo/charts/tinfirm` | The Helm chart, an OCI artifact; signed, without an SBOM |
 
-A release names all three with its version: for v1.0.0, the images `ghcr.io/flowtivo/tinfirm-server:v1.0.0` and `ghcr.io/flowtivo/tinfirm-runner-host:v1.0.0`, and the chart `1.0.0`. Its GitHub Release carries the runner host archives and the Compose files, under a signed `SHA256SUMS` ([What is not signed](#what-is-not-signed)).
+A release names all three with its version: for v1.0.0, the images `ghcr.io/flowtivo/tinfirm-server:v1.0.0` and `ghcr.io/flowtivo/tinfirm-runner-host:v1.0.0`, and the chart `1.0.0`. Its GitHub Release carries the runner host archives, the node agent archives and the Compose files, under a signed `SHA256SUMS` ([What is not signed](#what-is-not-signed)).
 
 ## What you need
 
@@ -112,12 +112,12 @@ An admission controller that verifies cosign signatures, such as Sigstore's poli
 ## What is not signed
 
 - **The runner images.** A runner host builds them itself, from the Dockerfiles in its own binary; FLOWTIVO publishes no runner image.
-- **The release's files** are not signed one by one: the runner host binaries and the Compose files are listed in the release's `SHA256SUMS`, and `SHA256SUMS` is signed with the same key, as `SHA256SUMS.sig` (and the cosign bundle `SHA256SUMS.sigstore.json`). Download them from the release's page on [GitHub](https://github.com/FLOWTIVO/tinfirm/releases), or for v1.0.0:
+- **The release's files** are not signed one by one: the runner host binaries, the node agent binaries and the Compose files are listed in the release's `SHA256SUMS`, and `SHA256SUMS` is signed with the same key, as `SHA256SUMS.sig` (and the cosign bundle `SHA256SUMS.sigstore.json`). Download them from the release's page on [GitHub](https://github.com/FLOWTIVO/tinfirm/releases), or for v1.0.0:
 
     ```sh
     base=https://github.com/FLOWTIVO/tinfirm/releases/download/v1.0.0
     curl -fsSL -O "$base/SHA256SUMS" -O "$base/SHA256SUMS.sig" -O "$base/SHA256SUMS.sigstore.json"
-    curl -fsSL -O "$base/tinfirm-compose-1.0.0.tar.gz"     # or a runner host archive
+    curl -fsSL -O "$base/tinfirm-compose-1.0.0.tar.gz"     # or a runner host or node agent archive
     ```
 
     Check the signature first, then the files against it:

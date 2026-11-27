@@ -111,11 +111,52 @@ describe('RunnerHosts', () => {
   it.each<[string, Partial<RunnerHost>]>([
     ['offline', { online: false, lastSeenAt: AT.earlier }],
     ['draining', { draining: true }],
+    [
+      'reporting a problem',
+      {
+        problems: [{ code: 'VM_DRIVER_NO_VM', message: 'node node-1: the table is missing' }],
+        problemsSince: AT.earlier,
+      },
+    ],
   ])('warns when no host takes turns: the only one is %s', async (_, overrides) => {
     await open([aRunnerHost(overrides)]);
     expect(words(q('none-takes-turns'))).toBe(
-      'No company host takes turns now Turns paid by a budget wait until a company host is online and not draining.',
+      'No company host takes turns now Turns paid by a budget wait until a company host is online, not draining and reports no problem.',
     );
+  });
+
+  it('says why a host that reports a problem takes no runs, in its own words as text (ADR-0117)', async () => {
+    await open([
+      aRunnerHost({
+        problems: [
+          {
+            code: 'VM_DRIVER_NO_VM',
+            message: 'node node-1: the firewall table <b>inet tinfirm_node</b> is not loaded',
+          },
+        ],
+        problemsSince: AT.earlier,
+      }),
+    ]);
+    const card = host('office');
+    expect(words(q('host-state', card))).toBe('Online');
+    expect(words(q('host-unhealthy', card))).toBe('Takes no runs');
+    const problems = q('host-problems', card)!;
+    expect(words(problems)).toContain('Why it takes no runs');
+    const item = q('host-problem', problems)!;
+    expect(words(item)).toContain('Its VM driver can make no VM');
+    // The host's text is shown as text, never as markup.
+    expect(item.textContent).toContain('<b>inet tinfirm_node</b>');
+    expect(item.querySelector('b')).toBeNull();
+    expect(words(q('host-problems-since', problems))).toContain('as the host reports');
+    expect(words(q('host-problems-since', problems))).toContain(
+      'Turns that only this host may run wait until it reports that it takes runs again.',
+    );
+  });
+
+  it('shows no problem for a host that takes runs', async () => {
+    await open([aRunnerHost()]);
+    expect(q('host-unhealthy', host('office'))).toBeNull();
+    expect(q('host-problems', host('office'))).toBeNull();
   });
 
   it('says what a company host is for when there is none', async () => {
@@ -228,6 +269,53 @@ describe('RunnerHosts', () => {
     await fixture.whenStable();
     expect(hosts()).toHaveLength(0);
     expect(notify.success).toHaveBeenCalledWith('office removed', 'Its token no longer works.');
+  });
+
+  it('shows what each host reports about its isolation, as reported (ADR-0113)', async () => {
+    await open([
+      aPoolRunnerHost({
+        isolation: { level: 'MACHINE', gvisor: false, hardened: 'NONE', stated: false },
+      }),
+      aRunnerHost({
+        id: 'h-jail',
+        name: 'single',
+        isolation: { level: 'VM_JAIL', gvisor: false, hardened: 'YES', stated: true },
+      }),
+      aRunnerHost({
+        id: 'h-kata',
+        name: 'kata-01',
+        isolation: { level: 'CONTAINER', gvisor: false, hardened: 'NO', stated: false },
+      }),
+      aRunnerHost({
+        id: 'h-gvisor',
+        name: 'sandboxed',
+        isolation: { level: 'CONTAINER', gvisor: true, hardened: 'NO', stated: false },
+      }),
+      aRunnerHost({ id: 'h-new', name: 'never-seen', isolation: null }),
+    ]);
+    const machine = q('host-isolation', host('droplets'))!;
+    expect(words(q('isolation-reports', machine))).toBe('Reports machine');
+    expect(words(q('isolation-hardening', machine))).toContain(
+      'provider’s hypervisor is the boundary',
+    );
+    expect(words(q('isolation-reaches', machine))).toContain('credentials are on another machine');
+
+    const jail = q('host-isolation', host('single'))!;
+    expect(words(q('isolation-reports', jail))).toBe('Reports vm-jail, stated by the operator');
+    expect(words(q('isolation-hardening', jail))).toMatch(/^Hardened/);
+
+    // A Kata host reports container, as a host with Docker does.
+    const kata = q('host-isolation', host('kata-01'))!;
+    expect(words(q('isolation-reports', kata))).toBe('Reports container');
+    expect(words(q('isolation-hardening', kata))).toMatch(/^Not hardened/);
+    expect(words(q('isolation-reaches', kata))).toContain('behind the kernel alone');
+
+    const gvisor = q('host-isolation', host('sandboxed'))!;
+    expect(words(q('isolation-reports', gvisor))).toBe('Reports container with gVisor');
+    expect(words(q('isolation-reaches', gvisor))).toContain('behind gVisor and the kernel');
+
+    // Before its first hello to a server of this release, nothing.
+    expect(q('host-isolation', host('never-seen'))).toBeNull();
   });
 
   describe('ready sandboxes (ADR-0099)', () => {

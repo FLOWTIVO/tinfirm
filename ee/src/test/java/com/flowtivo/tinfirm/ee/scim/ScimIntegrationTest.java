@@ -16,6 +16,8 @@ import org.junit.jupiter.api.Test;
 import com.flowtivo.tinfirm.ee.licence.TestLicences;
 import com.flowtivo.tinfirm.support.ApiClient;
 import com.flowtivo.tinfirm.support.ApiResponse;
+import com.flowtivo.tinfirm.support.ConnectionWatch;
+import com.flowtivo.tinfirm.support.RawHttp;
 import com.flowtivo.tinfirm.support.TenantSql;
 import com.flowtivo.tinfirm.support.TestDatabase;
 
@@ -224,6 +226,19 @@ class ScimIntegrationTest extends ScimTest {
         }
         assertThat(last.status()).isEqualTo(429);
         assertThat(last.header("Retry-After")).isNotNull();
+    }
+
+    @Test
+    void aQueryTomcatCannotParseIsScimsInvalidSyntax() {
+        // Not valid UTF-8 (Tomcat's InvalidParameterException): SCIM's own 400, never echoing the value.
+        String token = issueToken(scimCompany());
+        for (String query : List.of("filter=%00%ff%27", "filter=%zz")) {
+            RawHttp.Answer answer = RawHttp.send(port, "GET", "/scim/v2/Users?" + query,
+                    Map.of("Authorization", "Bearer " + token, "Accept", SCIM_JSON), null);
+            assertThat(answer.status()).as("%s", answer).isEqualTo(400);
+            assertThat(answer.header("Content-Type")).startsWith(SCIM_JSON);
+            assertThat(answer.body()).contains("\"scimType\":\"invalidSyntax\"").doesNotContain("filter");
+        }
     }
 
     // ---- create, read, list ---------------------------------------------------------------------------------------
@@ -575,10 +590,14 @@ class ScimIntegrationTest extends ScimTest {
         Scim scim = scim(company);
         UUID owner = company.userId("OWNER");
 
+        ConnectionWatch.Mark mark = ConnectionWatch.mark();
         ApiResponse last = scim.patch("/Users/" + owner, patch(op("replace", "active", false)));
         scimError(last, 400, "mutability");
         assertThat(last.json().get("detail").asString()).isEqualTo("LAST_OWNER");
         scimError(scim.delete("/Users/" + owner), 400, "mutability");
+        // The refusal is kept once the request's transaction, which rolled back, has released its connection.
+        assertThat(mark.at("com.flowtivo.tinfirm.ee.scim.ScimDirectoryImpl")).as("second connections asked for")
+            .isZero();
         ApiClient ownerSession = loginAs(company.email("OWNER"));
         assertThat(ownerSession.get(company.path("/inbox")).json().get("items")).anySatisfy(
                 item -> assertThat(item.get("kind").asString()).isEqualTo("SCIM_LAST_OWNER"));

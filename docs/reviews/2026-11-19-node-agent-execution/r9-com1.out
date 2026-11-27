@@ -1,0 +1,14 @@
+== control, with console=ttyS0
+the jailer's first process ended with status 0
+the VMM's standard output: 4954 bytes; the guest's marker in it: 0 times
+its first bytes: 2026-11-19T23:28:30.490495689 [tfvm-00000000eeee-0007:main] Running Firecracker v1.14.2 2026-11-19T23:28:30.490591069 [t
+the VMM's standard error: 0 bytes: 
+the VMM: runs as pid 31830
+its last bytes: cpu 1] vcpu: IO read @ 0x2e9:0x1 failed: bus_error: MissingAddressRange 2026-11-19T23:28:30.632043312 [tfvm-00000000eeee-0007:fc_vcpu 1] vcpu: IO write @ 0x2e9:0x1 failed: bus_error: MissingAddressRange ioperm: Function not implemented  SCRIPT-ENDED status 1  
+== the agent's arguments for guestConsole off
+the jailer's first process ended with status 0
+the VMM's standard output: 1763 bytes; the guest's marker in it: 0 times
+its first bytes: 2026-11-19T23:28:53.269476474 [tfvm-00000000eeee-0007:main] Running Firecracker v1.14.2 2026-11-19T23:28:53.269570643 [t
+the VMM's standard error: 0 bytes: 
+the VMM: runs as pid 31926
+its last bytes:  2026-11-19T23:28:53.362215173 [tfvm-00000000eeee-0007:fc_vcpu 0] vcpu: IO write @ 0x71:0x1 failed: bus_error: MissingAddressRange 2026-11-19T23:28:53.376257615 [tfvm-00000000eeee-0007:fc_vcpu 0] vcpu: IO read @ 0x87:0x1 failed: bus_error: MissingAddressRange 

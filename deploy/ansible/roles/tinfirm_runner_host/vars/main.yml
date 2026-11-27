@@ -1,6 +1,20 @@
 ---
 # Values the role derives from defaults/main.yml and the facts. Sites set defaults/main.yml.
 
+# A control host (ADR-0112): `run --executor vm --vm-driver node`.
+_tinfirm_runner_host_vm: "{{ tinfirm_runner_host_executor == 'vm' }}"
+# The node driver's files, at the paths runner/README.md names ("Sandbox nodes"). `run` reads
+# the configuration at its start, and names it to the driver it starts.
+_tinfirm_runner_host_node_config: /etc/tinfirm/node-driver.json
+_tinfirm_runner_host_node_dir: /etc/tinfirm/node-driver
+_tinfirm_runner_host_node_cert: /etc/tinfirm/node-driver/client.crt
+_tinfirm_runner_host_node_key: /etc/tinfirm/node-driver/client.key
+# The nodes with a pin, which the driver's configuration names, and the names of those without
+# one, which it leaves out: emptying a node's nodeSha256 takes the node out at the next run.
+_tinfirm_runner_host_nodes_pinned: "{{ tinfirm_runner_host_nodes | selectattr('nodeSha256', 'defined') | selectattr('nodeSha256', 'truthy') | list }}"
+_tinfirm_runner_host_nodes_unpinned: >-
+  {{ tinfirm_runner_host_nodes | map(attribute='name') | difference(_tinfirm_runner_host_nodes_pinned | map(attribute='name')) }}
+
 _tinfirm_runner_host_kata_arch: "{{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] }}"
 # The Go runtime's shim from the static release, and the configuration the role writes.
 _tinfirm_runner_host_kata_shim: /opt/kata/bin/containerd-shim-kata-v2
@@ -92,3 +106,38 @@ _tinfirm_runner_host_images_build_argv: >-
   {{ [tinfirm_runner_host_binary_path, 'images', 'build', '--runtime', tinfirm_runner_host_images_runtime]
      + (tinfirm_runner_host_images_build_args.items() | map('join', '=')
         | map('regex_replace', '^', '--build-arg=') | list) }}
+
+# The lines of the installed binary's `doctor` that say this machine cannot confine the reader of
+# what sandboxes send back, or the front process of a sandbox, as confinement.yml takes them
+# (main.rs, `doctor_reader` and `doctor_front`): the lines `doctor` marks as failed and that
+# are about the reader or a front. `run` refuses to start for each of them. `doctor`'s other
+# failures (Docker, the images, the login) are not among them, nor is a line it only warns of,
+# as with `--allow-unconfined-reader`.
+_tinfirm_runner_host_unconfined: >-
+  {{ _tinfirm_runner_host_doctor.stdout_lines | default([])
+     | select('match', '^[[]FAIL[]] (reader|front)') | list }}
+# Whether that `doctor` answered the question at all: it says one line about the reader and one
+# about the fronts, whatever it finds. A binary that could not be run, ended early or printed
+# something else has answered nothing, and the play must not take that for a yes.
+_tinfirm_runner_host_confinement_answered: >-
+  {{ (_tinfirm_runner_host_doctor.stdout_lines | default([]) | select('match', '^[[].{4}[]] reader: ') | list | length > 0)
+     and (_tinfirm_runner_host_doctor.stdout_lines | default([]) | select('match', '^[[].{4}[]] front: ') | list | length > 0) }}
+# A runner host from before the reader and the fronts: its `doctor` takes no option, so it ends
+# with clap's status 2 and "unexpected argument". It has nothing to confine and `run` does not
+# refuse to start, so there is nothing to ask it.
+_tinfirm_runner_host_confinement_older: >-
+  {{ (_tinfirm_runner_host_doctor.rc | default(-1) | int) == 2
+     and 'unexpected argument' in (_tinfirm_runner_host_doctor.stderr | default('')) }}
+
+# tinfirm_runner_host_sandbox_bridge_ports as checks.yml takes it: empty, or FROM-TO (or one
+# port) from 1 to 65535 with a port for every run at once, on a Docker host with the sandbox
+# bridge (`run --sandbox-bridge-ports`, as bridge.rs `parse_port_range` reads it).
+_tinfirm_runner_host_bridge_ports_ok: >-
+  {%- set r = tinfirm_runner_host_sandbox_bridge_ports | string | trim -%}
+  {%- if r | length == 0 -%}{{ true }}
+  {%- elif not (r is match('^[0-9]{1,5}(-[0-9]{1,5})?$')) -%}{{ false }}
+  {%- else -%}
+  {%-   set from = r.split('-') | first | int -%}{%- set to = r.split('-') | last | int -%}
+  {{ (tinfirm_runner_host_sandbox_bridge | bool) and not (_tinfirm_runner_host_vm | bool)
+     and 1 <= from <= to <= 65535 and (to - from + 1) >= (tinfirm_runner_host_max_concurrent_runs | int) }}
+  {%- endif -%}

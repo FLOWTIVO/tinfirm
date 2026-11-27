@@ -1,0 +1,9 @@
+== the canary ticket in the listener's memory, by tests/attack/node-root.sh, each time on a new VM
+-- the listener parsing a request's parameters by reference (tried for R7, then dropped):
+  the helper's memory: not found;  the listener's memory: FOUND (1 places); (after 1 list call(s))
+  the helper's memory: not found;  the listener's memory: FOUND (1 places); (after 1 list call(s))
+  the helper's memory: not found;  the listener's memory: not found; (after 3 list call(s))
+-- the listener as it is (parameters parsed from a copy whose strings move):
+  the listener's memory: not found; (after 1 list call(s))
+  the listener's memory: FOUND (1 places); (after 1 list call(s))
+  the listener's memory: not found; (after 1 list call(s), r10-attack-node-root.out)

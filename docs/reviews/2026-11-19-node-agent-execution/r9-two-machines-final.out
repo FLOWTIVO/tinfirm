@@ -1,0 +1,23 @@
+hello: 2 ms, {'protocol': 1, 'driver': 'node', 'version': '1.0.0-rc.2-SNAPSHOT+images.0872e5e5c5b0'}
+verify: 22 ms, problems [], maxVms 2
+  checked: node node-1: cgroup.kill
+  checked: node node-1: room for 2 snapshot(s) of this template
+  checked: node node-1: memory for 2 VM(s) of this template
+create: 610 ms, id node-1:vm-5857228113550f273d6727c1bd6a929b; describe: 11 ms, running at 10.0.0.6:20000
+guest ready: 3015 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 5 ms, 1 VM
+delete: 90 ms; then describe says gone; the port answers `nothing`
+create: 144 ms, id node-1:vm-403603877a55bb21158ca3fe37009c34; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2838 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 88 ms; then describe says gone; the port answers `nothing`
+create: 149 ms, id node-1:vm-1e030f2c5f30f09d0e3c20d715b108a9; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2959 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 88 ms; then describe says gone; the port answers `nothing`
+create: 144 ms, id node-1:vm-9964bfa3d3b14b701679c7bfa3190742; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2720 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 110 ms; then describe says gone; the port answers `nothing`
+create: 141 ms, id node-1:vm-5d6b45992ea55079fe2cff7a8cbf2dc5; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2731 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 5 ms, 1 VM
+delete: 70 ms; then describe says gone; the port answers `nothing`
+create: 143 ms, id node-1:vm-c2d11739e5cd4256152289542223ad52; describe: 5 ms, running at 10.0.0.6:20000
+guest ready: 2915 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `nothing`; list: 6 ms, 1 VM
+delete: 71 ms; then describe says gone; the port answers `nothing`

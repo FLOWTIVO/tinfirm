@@ -4,13 +4,13 @@ Every command and option of `tinfirm-runner-host`, every `TINFIRM_RUNNER_*` envi
 
 ## Compatibility
 
-A runner host and the server agree on the **runner protocol**, never on a version number. Any runner host release that speaks a protocol the server supports works with it, so hosts and server can be upgraded in either order.
+A runner host and the server agree on the **runner protocol**, never on a version number. Any runner host release that speaks a protocol the server supports works with it, so hosts and server can be upgraded in either order. One release is the exception: from the release that reports levels of isolation, the server refuses a host of an older release with a VM per run or Kata Containers, which reports the tier `microvm`. Such a host stops with the error `UPGRADE_REQUIRED`, which names the server's version: upgrade it to that version right after the server ([Upgrade runner hosts](../operator-guide/maintenance.md#upgrade-runner-hosts)).
 
 | Number | Where you see it | What it means |
 |---|---|---|
 | The release version | `tinfirm-runner-host --version`, the host's card (such as `v1.0.0`), the release's file names and the image tag `v1.0.0` | Which release the host runs, for support. Tinfirm decides nothing from it |
 | The protocol version | The `protocol_version` of the host's `runner host starting` log line | Version 2 takes turns. A host on version 1 connects but takes none |
-| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), and with elastic runners ready sandboxes (`sandbox.pool`) and the sandbox bridge (`sandbox.bridge`). A host without one still takes turns |
+| The features | Not shown | Optional capabilities within protocol 2: steering (`run.steer`), skills (`run.skills`), session bundles (`session.bundle`), the sandbox bridge (`sandbox.bridge`), and with elastic runners (Pro and Enterprise) ready sandboxes (`sandbox.pool`) and a provider's VM driver (`sandbox.elastic`). A host without one still takes turns. Not a feature: the host's level of isolation, which it sends in every hello, derived from its executor and its VM driver, or from `run --isolation-level` with a VM driver of your own; the server stores and shows it |
 
 The server accepts protocol versions 1 and 2. Every host of protocol 2 keeps a run's model token out of the sandbox (its model proxy is always on) and sends its own token with the run's model requests, so turns paid by a budget go to any host of protocol 2. A build from the `rolling` prerelease shows what it was built from after its version, such as `0.1.0-SNAPSHOT (rolling-abc1234)`.
 
@@ -96,6 +96,7 @@ Connects to the server and runs agents. Before it connects, it rebuilds the imag
 | `--server <url>` | `TINFIRM_RUNNER_SERVER` | `config.json` | With `--token-file`, in place of `login`: the server's URL, https only, for a host whose settings come from its environment, such as the Helm chart's runner pod |
 | `--token-file <file>` | `TINFIRM_RUNNER_TOKEN_FILE` | `config.json` | With `--server`: the file that holds the host's token, such as a mounted Secret. Read once, at the start. |
 | `--no-image-rebuild` | `TINFIRM_RUNNER_NO_IMAGE_REBUILD` | off | Keep the images as they are, for hosts whose images are built otherwise |
+| `--push-client <git\|host>` | `TINFIRM_RUNNER_PUSH_CLIENT` | `git` | Which client pushes a run's work. `git` is `git push`, with the run's git token in its environment. `host` is the runner host's own receive-pack client: a process without the token packs the objects, and the host sends them, with the same lease. `host` has been checked against a git server run for the test and, for a new branch, GitHub, and not against GitLab, Gitea or Azure DevOps; use it only to test it. |
 | `--upload-max-bytes <n>` | `TINFIRM_RUNNER_UPLOAD_MAX_BYTES` | `26214400` (25 MiB) | The largest file an agent's upload may have (`save_artifact`, a file of `/output`), at most 100 MiB. A larger file is refused on its size before it is read, and the host reads, scans and sends at most 3 files at once. Set it to the server's `TINFIRM_ATTACHMENT_MAX_FILE_SIZE` when that differs from its default. |
 | `--sandbox-runtime <name>` | `TINFIRM_RUNNER_SANDBOX_RUNTIME` | Docker's default (runc) | The Docker runtime of every sandbox, such as `kata`. Refused when Docker does not know it. |
 | `--sandbox-docker` | `TINFIRM_RUNNER_SANDBOX_DOCKER` | off | The agent's own Docker daemon in the sandbox. Needs a runtime whose name starts with `kata`. |
@@ -122,7 +123,7 @@ Asks the `run` of this config directory to drain: it sends SIGHUP to the process
 |---|---|
 | SIGTERM, SIGINT (`Ctrl-C`) | Cancels the active runs, pushes their work in progress, reports them cancelled, and exits. A second one exits at once. |
 | SIGHUP, `drain`, `systemctl reload` | Drains: takes no new run, lets the active ones finish, then exits with status 0. A second SIGHUP changes nothing. |
-| SIGKILL, a crash, an upgrade that kills `run` | With elastic runners (Pro and Enterprise): the next `run` on the same data directory takes back the runs whose sandboxes still live. It stops their agents, pushes their work, saves their sessions and reports them failed (`INFRA`), so the next message goes on from there. Without them, the runs are lost. |
+| SIGKILL, a crash, an upgrade that kills `run` | With the sandbox bridge: the next `run` on the same data directory takes back the runs whose sandboxes still live. It stops their agents, pushes their work, saves their sessions and reports them failed (`INFRA`), so the next message goes on from there. Without it, the runs are lost. |
 | The server closes with 4401 (bad or revoked token), 4409 (another connection of this host replaced this one), 1002 (unsupported protocol version) or 1008 (the server refused the host) | Stops its runs without pushing, does not reconnect, and exits non-zero |
 | Any other lost connection | Keeps its runs going and reconnects, after 1 second growing to 30, at most 5 while it holds runs |
 
@@ -169,7 +170,7 @@ The **data directory** (mode 0700):
 | `claude-logins/<label>` | A Claude login's own Claude Code configuration |
 | `codex-homes/<label>` | A Codex login's own `CODEX_HOME` |
 | `public_suffix_list.dat` | The Public Suffix List the server sent, which the egress proxy uses |
-| `runs/` | With elastic runners: a record of each run whose sandbox lives, with its credentials, and the sandbox bridge's identity (mode 0600), so that a restarted `run` takes the runs back. A record goes with its sandbox. |
+| `runs/` | With the sandbox bridge: a record of each run whose sandbox lives, with its credentials, and the sandbox bridge's identity (mode 0600), so that a restarted `run` takes the runs back. A record goes with its sandbox. |
 
 ## The sandbox
 
@@ -182,7 +183,7 @@ Each run is a container `tinfirm-run-<run id>`:
 | Processes | 1,024 |
 | User | 1000:1000, every capability dropped, `no-new-privileges`; with `--sandbox-docker`, root with the settings Docker in a microVM needs |
 | Mounts | `/workspace`, `/home/agent`, `/attachments` (read-only), `/output`, the agent's skills (read-only) |
-| Isolation tier | `microvm` for a runtime named `kata…`, `gvisor` for `runsc…`, else `container` |
+| Isolation level reported | `gvisor` for a runtime named `runsc…`, placed as `container`; else `container`, a runtime named `kata…` included |
 
 ### Sandbox settings
 

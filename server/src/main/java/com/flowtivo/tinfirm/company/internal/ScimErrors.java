@@ -8,10 +8,12 @@ import java.util.Map;
 import jakarta.servlet.http.HttpServletResponse;
 
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 
 import tools.jackson.databind.json.JsonMapper;
 
 import com.flowtivo.tinfirm.company.scim.ScimException;
+import com.flowtivo.tinfirm.shared.web.ApiException;
 
 /** SCIM's error form (RFC 7644 §3.12), written by the endpoint's chain and its controller alike. */
 final class ScimErrors {
@@ -34,6 +36,17 @@ final class ScimErrors {
         }
         body.put("detail", ex.getMessage());
         return body;
+    }
+
+    /**
+     * An answer of the API's rule after a commit or for want of a database connection ({@code ServerBusy}) in SCIM's
+     * form: a 503 with its {@code Retry-After}, or a 500 with its detail.
+     */
+    static ScimException of(ApiException answer) {
+        if (answer.status() == HttpStatus.SERVICE_UNAVAILABLE && answer.retryAfter() != null) {
+            return ScimException.busy(answer.retryAfter().toSeconds());
+        }
+        return new ScimException(answer.status().value(), null, answer.getMessage());
     }
 
     /** Writes the error itself, from a filter, before any handler. */

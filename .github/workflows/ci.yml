@@ -6,8 +6,8 @@ name: CI
 # Under `workflow_call` the event name is the CALLER's (`workflow_dispatch`), so no gate
 # job may branch on it. The two that do, `publish` and `rolling`, must NOT run under the
 # release gate: after a push to main they publish that commit, the server image
-# (sha-<sha> and `main`) and the rolling prerelease with the runner host binaries and the
-# Compose files, which hosts that follow rolling deploy from
+# (sha-<sha> and `main`) and the rolling prerelease with the runner host binaries, the node
+# agent's and the Compose files, which hosts that follow rolling deploy from
 # (docs/operations/auto-deploy.md).
 #
 # Runners: every job runs on the runner label in the repository variable CI_RUNNER
@@ -364,14 +364,42 @@ jobs:
         with:
           version: v4.3.0
       # The release key's public half ships with the Compose files, where install.sh gives it
-      # to the auto-deploy hosts, and with the runner host's Ansible role (M13): copies of the
-      # one customers verify against.
+      # to the auto-deploy hosts, and with the runner host's and the sandbox node's Ansible
+      # roles (M13): copies of the one customers verify against.
       - name: The shipped cosign.pub
         run: |
-          for copy in deploy/compose/auto-deploy/cosign.pub deploy/ansible/roles/tinfirm_runner_host/files/cosign.pub; do
+          for copy in deploy/compose/auto-deploy/cosign.pub deploy/ansible/roles/tinfirm_runner_host/files/cosign.pub \
+            deploy/ansible/roles/tinfirm_sandbox_node/files/cosign.pub; do
             cmp docs-site/content/cosign.pub "$copy" \
               || { echo "::error::$copy must be a copy of docs-site/content/cosign.pub"; exit 1; }
           done
+      # The sandbox node's role installs the node agent's units as they ran on a node: copies,
+      # and the firewall's template is the units' file with the node's values in its defines.
+      - name: The sandbox node role's units
+        run: |
+          set -euo pipefail
+          units=runner/crates/tinfirm-node-agent/units
+          role=deploy/ansible/roles/tinfirm_sandbox_node
+          for unit in tinfirm-node-agent-firewall.service tinfirm-node-agent-hardening.service \
+            tinfirm-node-agent-helper.service tinfirm-node-agent-listener.service \
+            tinfirm-node-agent-modules.service tinfirm-node-agent.sysctl.conf \
+            tinfirm-node-agent.tmpfiles.conf tinfirm-vmm.apparmor; do
+            cmp "$units/$unit" "$role/files/$unit" \
+              || { echo "::error::$role/files/$unit must be a copy of $units/$unit"; exit 1; }
+          done
+          diff <(grep -v '^define ' "$units/tinfirm-node-agent.nft") \
+            <(grep -v -e '^define ' -e '^{%' -e '^# {{ ansible_managed }}$' "$role/templates/firewall.nft.j2") \
+            || { echo "::error::$role/templates/firewall.nft.j2 must be $units/tinfirm-node-agent.nft with the node's values in its define lines"; exit 1; }
+      # The VMMs' AppArmor profile, parsed and compiled as the role's `validate` does on a node,
+      # without loading it (-Q) or touching a cache (-K): its syntax and its rules, not what it
+      # allows, which only a node shows.
+      - name: The VMMs' AppArmor profile parses
+        run: |
+          set -euo pipefail
+          command -v apparmor_parser >/dev/null \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends apparmor; }
+          apparmor_parser --version | head -n 1
+          apparmor_parser -Q -K runner/crates/tinfirm-node-agent/units/tinfirm-vmm.apparmor
       # The check the auto-deploy hosts run on SHA256SUMS.sig (openssl, no cosign), against
       # a throwaway P-256 key and a signature in cosign's format (base64 DER).
       - name: The signature check of SHA256SUMS
@@ -408,7 +436,12 @@ jobs:
             helm template tinfirm "$chart" -f "$values" > /dev/null
             echo "::endgroup::"
           done
-      - name: Compose config (with and without the oidc profile, SAML, and the Entra ID and second-company examples)
+      # The pod driver's objects (ADR-0115, decision 2): the runs' network policies and the
+      # driver's configuration are the files of ci/expected/, which the driver's tests read
+      # too; the admission policies by capability; the renders that must fail.
+      - name: Helm, the pod driver's objects
+        run: deploy/helm/check-runner-pod.sh
+      - name: Compose config (with and without the oidc profile, SAML, the Entra ID and second-company examples, and the HTTPS overlay)
         run: |
           set -euo pipefail
           compose=(docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/.env.example)
@@ -421,6 +454,8 @@ jobs:
             "${compose[@]}" -f deploy/compose/compose.entra.yaml config --quiet
           TINFIRM_ACME_ISSUER_URI=https://sso.example.com TINFIRM_ACME_CLIENT_ID=lint TINFIRM_ACME_CLIENT_SECRET=lint \
             "${compose[@]}" -f deploy/compose/compose.companies.example.yaml config --quiet
+          TINFIRM_TLS_HOST=lint.example.com \
+            "${compose[@]}" -f deploy/compose/compose.tls.yaml config --quiet
       # Dependabot bumps the Compose file's LiteLLM alone. The chart's goes with it, and the
       # filter of LiteLLM's fields with both (LiteLlmRequests, which the server's relay
       # applies): it removes the new version's all_litellm_params, which
@@ -470,12 +505,12 @@ jobs:
           "$dir/bin/actionlint" -version | head -n 1
       - name: Dockerfile lint (hadolint)
         timeout-minutes: 2
-        run: hadolint Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile
+        run: hadolint Dockerfile deploy/release/runner-musl.Dockerfile runner/ci.Dockerfile docs-site/Dockerfile ee/runner/images/vm/pod.Dockerfile
       - name: Shell script lint (shellcheck)
         timeout-minutes: 2
         run: |
-          shellcheck deploy/compose/deploy-host.sh deploy/compose/smoke.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh ee/runner/images/vm/setup.sh \
-            .github/check-pins.sh .github/actions/set-version/*.sh
+          shellcheck deploy/compose/deploy-host.sh deploy/compose/smoke.sh deploy/compose/auto-deploy/*.sh deploy/release/assets.sh deploy/release/sign-images.sh runner/images/vm/setup.sh runner/images/vm/local-disk.sh \
+            ee/runner/images/vm/pod-image.sh .github/check-pins.sh .github/actions/set-version/*.sh deploy/helm/check-runner-pod.sh
       - name: Workflow lint (actionlint)
         timeout-minutes: 2
         run: actionlint -color
@@ -566,10 +601,14 @@ jobs:
   # commit for hosts that deploy main (docs/operations/auto-deploy.md):
   #   publish  the server image ghcr.io/flowtivo/tinfirm-server:sha-<sha>, and `main`, and
   #            the chart oci://ghcr.io/flowtivo/charts/tinfirm:0.0.0-sha-<sha> (ADR-0080);
-  #   rolling  the rolling prerelease with the runner host binaries and the Compose files
-  #            (runner-artifacts.yml), after the image: hosts that see the new prerelease
-  #            pull sha-<sha> right away.
-  # Releases keep their own images and assets (release.yml).
+  #   rolling  the rolling prerelease with the runner host binaries, the node agent's and
+  #            the Compose files (runner-artifacts.yml), after the image: hosts that see the
+  #            new prerelease pull sha-<sha> right away.
+  # Releases keep their own images and assets (release.yml). No pull-request job builds the
+  # release's static binaries (runner-musl.Dockerfile, `binary`): `runner` checks and tests
+  # the whole workspace, the node agent included, on glibc, and hadolint lints the
+  # Dockerfile. `rolling` is the first build the release's way, at every push to main, so a
+  # release is never the first; a failed `rolling` shows it on main before any release.
   #
   # Both are skipped under the release gate (workflow_call), where the event is the caller's
   # `workflow_dispatch`. release.yml still grants their permissions, because GitHub

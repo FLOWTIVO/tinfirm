@@ -1,0 +1,56 @@
+---
+# Example values for render.yml: those of runner/crates/tinfirm-node-agent/README.md and
+# runner/README.md, so that the rendered firewall can be compared with the units' own file.
+tinfirm_sandbox_node_address: 10.0.0.20
+tinfirm_sandbox_node_control_host: 10.0.0.5
+tinfirm_sandbox_node_management_address: 10.0.0.9
+tinfirm_sandbox_node_agent_port: 7700
+tinfirm_sandbox_node_first_port: 20000
+tinfirm_sandbox_node_max_vms: 8
+tinfirm_sandbox_node_vm_range: 10.231.0.0/16
+tinfirm_sandbox_node_client_sha256: 0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef
+tinfirm_sandbox_node_templates:
+  sandbox-4c8g:
+    vcpus: 4
+    memoryMib: "8192"
+    snapshotMib: 20480
+    pidsMax: 64
+_tinfirm_sandbox_node_listener_uid: "991"
+# The role finds its files/ by itself; render.yml is not the role.
+_tinfirm_sandbox_node_profile_src: "{{ playbook_dir }}/../roles/tinfirm_sandbox_node/files/tinfirm-vmm.apparmor"
+# The node's kernel settings as tasks/hardening.yml reads them: Ubuntu 24.04's, where
+# kernel.perf_event_paranoid is 4 and kernel.unprivileged_bpf_disabled 2, after a first run of
+# the role for the rest. A second run must write the same file and apply nothing.
+_tinfirm_sandbox_node_sysctl_current:
+  kernel.unprivileged_bpf_disabled: 1
+  kernel.io_uring_disabled: 2
+  kernel.panic_on_oops: 1
+  kernel.panic: 0
+  kernel.kptr_restrict: 1
+  kernel.dmesg_restrict: 1
+  kernel.perf_event_paranoid: 4
+  kernel.randomize_va_space: 2
+  fs.protected_symlinks: 1
+  fs.protected_hardlinks: 1
+
+tinfirm_runner_host_binary_url: https://example.invalid/tinfirm-runner-host-1.0.0-x86_64-unknown-linux-musl.tar.gz
+tinfirm_runner_host_vm_template: sandbox-4c8g
+tinfirm_runner_host_max_concurrent_runs: 8
+tinfirm_runner_host_vm_probe: ["tcp:db.internal:5432"]
+tinfirm_runner_host_egress_allow: [registry.npmjs.org]
+tinfirm_runner_host_sandbox_npm_registry: https://nexus.internal/repository/npm/
+tinfirm_runner_host_nodes:
+  - name: node-1
+    address: 10.0.0.20:7700
+    nodeSha256: FEDCBA9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+    templates: [sandbox-4c8g]
+    publishedPorts: {first: 20000, last: 20007}
+  - name: node-2
+    address: 10.0.0.21:7700
+    nodeSha256: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+    templates: [sandbox-4c8g]
+  # Not pinned yet, or its pin emptied: the driver's configuration leaves it out.
+  - name: node-3
+    address: 10.0.0.22:7700
+    nodeSha256: ""
+    templates: [sandbox-4c8g]

@@ -8,6 +8,7 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 
 import com.flowtivo.tinfirm.run.QueueReasonCode;
+import com.flowtivo.tinfirm.runner.IsolationLevel;
 import com.flowtivo.tinfirm.runner.RunnerHostInfo;
 import com.flowtivo.tinfirm.runner.RunnerMessages;
 import com.flowtivo.tinfirm.runner.RuntimeKind;
@@ -24,11 +25,36 @@ import tools.jackson.databind.json.JsonMapper;
  *                        ({@code PRINCIPAL_INACTIVE}, {@code SUBSCRIPTION_GONE}, …) for {@code MODEL_ACCESS_UNAVAILABLE}
  * @param credentialLabel a subscription's label ({@code CREDENTIAL_POOL_FULL}, and a subscription's run waiting for
  *                        its host)
+ * @param isolationLevel  the level of isolation the run goes to (ADR-0113, decision 4), set where the level held it
+ *                        back: always for {@code NO_HOST_OF_LEVEL}, and for a reason about the hosts of its level
+ *                        when the level was chosen for the agent, or a weaker host that could run the conversation was
+ *                        left out
+ * @param levelChosen     with {@code isolationLevel}: whether the level was chosen for the agent (true) or is the
+ *                        strongest the hosts report (false); the text says "only" for the one, "not weaker" for the
+ *                        other
+ * @param rejections      how often in a row one host rejected the run, which sets the next back-off
+ *                        ({@link RunProperties#rejectBackoff(int)}). Not in the API. It stays with the run's later
+ *                        reasons while the run waits, and with its assignment to the same host; an assignment to
+ *                        another host, and the run's start, drop it.
  */
 record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable String runnerHostName,
         @Nullable String credentialLabel, @Nullable Integer used, @Nullable Integer limit,
         @Nullable Instant lastSeenAt, @Nullable Instant retryAt, @Nullable String reason,
-        @Nullable String rejectCode, @Nullable String message, @Nullable RuntimeKind runtime) {
+        @Nullable String rejectCode, @Nullable String message, @Nullable RuntimeKind runtime,
+        @Nullable IsolationLevel isolationLevel, @Nullable Boolean levelChosen, @Nullable Rejections rejections) {
+
+    /** {@code count} rejections in a row of the run by the host {@code runnerHostId}, the latest included. */
+    record Rejections(UUID runnerHostId, int count) {
+    }
+
+    /** A reason without a level. */
+    QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable String runnerHostName,
+            @Nullable String credentialLabel, @Nullable Integer used, @Nullable Integer limit,
+            @Nullable Instant lastSeenAt, @Nullable Instant retryAt, @Nullable String reason,
+            @Nullable String rejectCode, @Nullable String message, @Nullable RuntimeKind runtime) {
+        this(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt, reason, rejectCode,
+                message, runtime, null, null, null);
+    }
 
     /** Texts from hosts and other modules are cut to this length. */
     static final int MAX_MESSAGE_LENGTH = 500;
@@ -110,6 +136,21 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
         return of(QueueReasonCode.RUNNER_HOST_DRAINING).withHost(host.id(), host.name());
     }
 
+    /**
+     * ADR-0117: the one host that may take the run reports that it takes no run: its first problem's code in
+     * {@code reason}, the host's words in {@code message}.
+     */
+    static QueueReason hostUnhealthy(RunnerHostInfo host, RunnerMessages.HostProblem problem) {
+        return of(QueueReasonCode.RUNNER_HOST_UNHEALTHY).withHost(host.id(), host.name()).withReason(problem.code())
+            .withMessage(problem.message());
+    }
+
+    /** ADR-0117: each of the {@code hosts} hosts that may take the run reports that it takes no run. */
+    static QueueReason hostsUnhealthy(int hosts) {
+        return of(QueueReasonCode.RUNNER_HOST_UNHEALTHY).withMessage("None of the " + hosts + " runner hosts that "
+                + "may run this conversation can take a run now: each reports a problem.");
+    }
+
     static QueueReason poolFull(RunnerHostInfo host, String label, int used, int limit) {
         return of(QueueReasonCode.CREDENTIAL_POOL_FULL).withHost(host.id(), host.name()).withLabel(label)
             .withUsage(used, limit);
@@ -122,6 +163,34 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
     static QueueReason hostsFull(@Nullable RunnerHostInfo host, int used, int limit) {
         QueueReason full = of(QueueReasonCode.RUNNER_HOST_FULL).withUsage(used, limit);
         return host != null ? full.withHost(host.id(), host.name()) : full;
+    }
+
+    /**
+     * The level chosen for the agent is not reported by any host that may run the conversation (ADR-0113, decision
+     * 4): the run waits for one, and never goes to a host of another level.
+     */
+    static QueueReason noHostOfLevel(IsolationLevel chosen) {
+        return of(QueueReasonCode.NO_HOST_OF_LEVEL).withIsolationLevel(chosen, true);
+    }
+
+    /**
+     * This reason about the hosts of the run's level, with the level: the run waits for them, the hosts of a level
+     * chosen for its agent only, or of the strongest level, not a weaker one (ADR-0113, decision 4).
+     */
+    QueueReason withIsolationLevel(IsolationLevel level, boolean chosen) {
+        return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
+                reason, rejectCode, message, runtime, level, chosen, rejections);
+    }
+
+    /** This reason with the run's count of rejections in a row; null drops it. */
+    QueueReason withRejections(@Nullable Rejections counted) {
+        return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
+                reason, rejectCode, message, runtime, isolationLevel, levelChosen, counted);
+    }
+
+    /** The count of rejections in a row when the host made them, else null: another host starts again from none. */
+    @Nullable Rejections rejectionsBy(@Nullable UUID hostId) {
+        return rejections != null && rejections.runnerHostId().equals(hostId) ? rejections : null;
     }
 
     /** Sent to the chosen host; waiting for {@code run.accepted}. */
@@ -160,6 +229,15 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
     }
 
     /**
+     * A repository's binding is on a GitHub App's installation, and none of the connected hosts that could take the
+     * run lists {@code run.git.refresh} and {@code run.git.revoke} (ADR-0116): the run waits for a host that renews its
+     * tokens.
+     */
+    static QueueReason noHostForAppTokens(String message) {
+        return of(QueueReasonCode.NO_HOST_FOR_APP_TOKENS).withMessage(message);
+    }
+
+    /**
      * An automatic retry of a failed turn (ADR-0073) waits until {@code at}: the {@code attempt}th of at most
      * {@code attempts} in a row, in {@code used} and {@code limit}.
      */
@@ -179,6 +257,17 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
      * rather than printing {@code null}.
      */
     String text() {
+        String text = baseText();
+        if (isolationLevel == null || code == QueueReasonCode.NO_HOST_OF_LEVEL) {
+            return text;
+        }
+        return Boolean.TRUE.equals(levelChosen)
+                ? text + " This agent's runs go only to hosts that report " + isolationLevel.wire() + "."
+                : text + " This agent's runs go to hosts that report " + isolationLevel.wire()
+                        + " and do not move to a weaker one.";
+    }
+
+    private String baseText() {
         return switch (code) {
             case COMPANY_STOPPED -> message != null ? message : "The company's runs are stopped.";
             case SYSTEM_PAUSED -> message != null ? message : "A system of the workspace is paused.";
@@ -198,10 +287,19 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
                     + "available.";
             case NO_HOST_FOR_CREDENTIALS -> message != null ? message : "No runner host may run this conversation's "
                     + "credentials.";
+            case NO_HOST_OF_LEVEL -> "This agent's runs go to hosts that report "
+                    + (isolationLevel != null ? isolationLevel.wire() : "the level chosen for it")
+                    + ", and no runner host that may run this conversation reports it.";
             case NO_RUNNER_HOST -> message != null ? message : "No connected runner host can run the runtime "
                     + (runtime != null ? runtime.name() : "of the agent") + ".";
             case RUNNER_HOST_OFFLINE -> "Runner host " + runnerHostName + " is offline.";
             case RUNNER_HOST_DRAINING -> "Runner host " + runnerHostName + " is finishing its runs before it restarts.";
+            // The host's own words, cut and on one line: shown as text, never interpreted.
+            case RUNNER_HOST_UNHEALTHY -> runnerHostName == null
+                    ? message != null ? message : "No runner host that may run this conversation can take a run now."
+                    : message == null ? "Runner host " + runnerHostName + " can take no run."
+                    : "Runner host " + runnerHostName + " can take no run: " + message
+                            + (message.endsWith(".") ? "" : ".");
             case CREDENTIAL_POOL_FULL -> "Waiting for a free slot of the subscription " + credentialLabel + " (" + used
                     + " of " + limit + " in use).";
             case RUNNER_HOST_FULL -> "Waiting for a free slot on "
@@ -216,6 +314,9 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
                     + "until it is resumed.";
             case NO_HOST_FOR_SKILLS -> message != null ? message : "The agent has skills, and no connected runner "
                     + "host that may run this conversation delivers skills yet.";
+            case NO_HOST_FOR_APP_TOKENS -> message != null ? message : "A repository of this conversation acts "
+                    + "through a GitHub App's installation, and no connected runner host that may run it renews its "
+                    + "tokens yet.";
             // The time is retryAt, for the reader's own clock and locale, as BUDGET_SPENT's.
             case RETRY_SCHEDULED -> "The previous turn failed for a reason that may pass; Tinfirm retries it by itself"
                     + (used != null && limit != null ? " (automatic retry " + used + " of " + limit + ")" : "") + ".";
@@ -239,6 +340,14 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
         put(details, "rejectCode", rejectCode);
         put(details, "message", message);
         put(details, "runtime", runtime != null ? runtime.name() : null);
+        put(details, "isolationLevel", isolationLevel != null ? isolationLevel.name() : null);
+        put(details, "levelChosen", levelChosen);
+        if (rejections != null) {
+            Map<String, Object> counted = new LinkedHashMap<>();
+            counted.put("runnerHostId", rejections.runnerHostId().toString());
+            counted.put("count", rejections.count());
+            details.put("rejections", counted);
+        }
         return JSON.writeValueAsString(details);
     }
 
@@ -253,49 +362,60 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
                 text(details, "runnerHostName"), text(details, "credentialLabel"), integer(details, "used"),
                 integer(details, "limit"), instantOf(details, "lastSeenAt"), instantOf(details, "retryAt"),
                 text(details, "reason"), text(details, "rejectCode"), text(details, "message"),
-                runtime != null ? RuntimeKind.valueOf(runtime) : null);
+                runtime != null ? RuntimeKind.valueOf(runtime) : null,
+                IsolationLevel.ofName(text(details, "isolationLevel")), bool(details, "levelChosen"),
+                rejections(details.get("rejections")));
+    }
+
+    private static @Nullable Rejections rejections(@Nullable JsonNode counted) {
+        if (counted == null || !counted.isObject()) {
+            return null;
+        }
+        UUID hostId = uuid(counted, "runnerHostId");
+        Integer count = integer(counted, "count");
+        return hostId != null && count != null && count > 0 ? new Rejections(hostId, count) : null;
     }
 
     // ---- helpers -------------------------------------------------------------------------------------------------
 
     private QueueReason withHost(@Nullable UUID hostId, @Nullable String hostName) {
         return new QueueReason(code, hostId, hostName, credentialLabel, used, limit, lastSeenAt, retryAt, reason,
-                rejectCode, message, runtime);
+                rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withLabel(@Nullable String label) {
         return new QueueReason(code, runnerHostId, runnerHostName, label, used, limit, lastSeenAt, retryAt, reason,
-                rejectCode, message, runtime);
+                rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withLastSeenAt(@Nullable Instant at) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, at, retryAt, reason,
-                rejectCode, message, runtime);
+                rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withRetryAt(@Nullable Instant at) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, at,
-                reason, rejectCode, message, runtime);
+                reason, rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withReason(@Nullable String cause) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
-                cut(cause, MAX_CODE_LENGTH), rejectCode, message, runtime);
+                cut(cause, MAX_CODE_LENGTH), rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withMessage(@Nullable String text) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
-                reason, rejectCode, cut(text, MAX_MESSAGE_LENGTH), runtime);
+                reason, rejectCode, cut(text, MAX_MESSAGE_LENGTH), runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withUsage(int usedSlots, int slotLimit) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, usedSlots, slotLimit, lastSeenAt,
-                retryAt, reason, rejectCode, message, runtime);
+                retryAt, reason, rejectCode, message, runtime, isolationLevel, levelChosen, rejections);
     }
 
     private QueueReason withRuntime(RuntimeKind kind) {
         return new QueueReason(code, runnerHostId, runnerHostName, credentialLabel, used, limit, lastSeenAt, retryAt,
-                reason, rejectCode, message, kind);
+                reason, rejectCode, message, kind, isolationLevel, levelChosen, rejections);
     }
 
     private static @Nullable String cut(@Nullable String text, int max) {
@@ -316,6 +436,11 @@ record QueueReason(QueueReasonCode code, @Nullable UUID runnerHostId, @Nullable 
     private static @Nullable UUID uuid(JsonNode details, String name) {
         String value = text(details, name);
         return value != null ? UUID.fromString(value) : null;
+    }
+
+    private static @Nullable Boolean bool(JsonNode details, String name) {
+        JsonNode value = details.get(name);
+        return value != null && value.isBoolean() ? value.booleanValue() : null;
     }
 
     private static @Nullable Integer integer(JsonNode details, String name) {

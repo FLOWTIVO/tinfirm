@@ -21,8 +21,9 @@ public enum Feature {
     /** The OWNER's retention periods; without them retention keeps everything (decision 8). */
     RETENTION_SETTINGS(Edition.PRO),
     /**
-     * Elastic runners (ADR-0100): runner hosts with the sandbox bridge or a VM per run, their ready sandboxes on
-     * Tinfirm's schedule, and session bundles (ADR-0095 to ADR-0099).
+     * Elastic runners (ADR-0100, as ADR-0114 amends it): a provider's VMs per run (the runner binary's paid VM
+     * drivers, DigitalOcean's today), ready VMs and their schedules, and session bundles (ADR-0096 to ADR-0099). The
+     * sandbox bridge, the VM executor and the driver protocol are in the core, in every edition.
      */
     ELASTIC_RUNNERS(Edition.PRO),
     LEGAL_HOLDS(Edition.ENTERPRISE),

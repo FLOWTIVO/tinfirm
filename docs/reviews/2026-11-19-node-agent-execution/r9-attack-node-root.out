@@ -1,0 +1,29 @@
+the VM tfvm-000000000053-0000 (VMM pid 24937); helper pid 20868; listener pid 22493
+== 1. the canary ticket on the node
+where it must be (ADR-0112, Consequences: root on a node reads its runs' tickets):
+  the VM's user-data disk (/srv/tinfirm-jails/firecracker/tfvm-000000000053-0000/root/userdata.disk): FOUND
+  the guest's memory (the VMM's process): FOUND (70 places)
+  the guest's own disk, through its snapshot device (the guest's Docker keeps the container's environment): FOUND
+where it must not be:
+  the listener's spool: not found (0 files)
+  the listener's records: not found
+  the helper's record: not found
+  the VM's console file: not found
+  the jail but for the user-data disk: not found
+  the agent's configuration: not found
+  the journal of the whole machine: not found
+  the helper's memory: not found
+  the listener's memory: not found
+  /run, /tmp, /var/tmp, /dev/shm: not found
+  the swap: the node has no swap
+== 2. the agent's port, from the node itself, as root, without the control host's key
+  nothing (TimeoutError)
+== 3. connections the node itself can open, as root (the node's firewall table: loaded)
+  the-control-host's-SSH (10.0.0.4:22): nothing (TimeoutError)
+  the-control-host,-port-443 (10.0.0.4:443): nothing (TimeoutError)
+  the-control-host,-the-agent's-own-port-number (10.0.0.4:7700): nothing (TimeoutError)
+  the-metadata-service (169.254.169.254:80): nothing (TimeoutError)
+  Azure's-host-agent (168.63.129.16:80): nothing (TimeoutError)
+  the-internet-by-address (1.1.1.1:443): nothing (TimeoutError)
+  a-resolver (8.8.8.8:53): nothing (TimeoutError)
+left after all of it: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, VM tables 0, cgroups 0, work files 0, spool files 0

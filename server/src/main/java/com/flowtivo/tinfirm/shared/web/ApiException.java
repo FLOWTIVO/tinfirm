@@ -135,6 +135,12 @@ public class ApiException extends RuntimeException {
         return new ApiException(HttpStatus.TOO_MANY_REQUESTS, ProblemCode.RATE_LIMITED, detail, retryAfter, Map.of());
     }
 
+    /** 503 {@code SERVER_BUSY} with {@code Retry-After} ({@link ServerBusy}). */
+    public static ApiException serverBusy(Duration retryAfter) {
+        return new ApiException(HttpStatus.SERVICE_UNAVAILABLE, ProblemCode.SERVER_BUSY,
+                "The server is busy. Try again shortly.", retryAfter, Map.of());
+    }
+
     public HttpStatus status() {
         return status;
     }

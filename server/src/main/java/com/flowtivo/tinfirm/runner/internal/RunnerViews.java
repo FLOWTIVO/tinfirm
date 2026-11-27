@@ -15,14 +15,28 @@ final class RunnerViews {
     /**
      * {@code maxConcurrentRuns} is the effective value as last confirmed (0 while draining); {@code draining} is
      * true only while the host is connected. A company host has no owner; a personal host lists the credentials it
-     * reported (a company host holds none).
+     * reported (a company host holds none). {@code isolation} is null before the host's first {@code hello} to a
+     * server of this release. {@code problems} and {@code problemsSince} are what the connected host reports with
+     * {@code host.health} (ADR-0117), null while it takes runs or is offline.
      */
     record HostDetails(UUID id, String name, String scope, @Nullable UUID ownerPrincipalId,
             @Nullable String ownerDisplay, boolean online, boolean draining, @Nullable Instant lastSeenAt,
             @Nullable String version, @Nullable String hostname, @Nullable String os,
             @Nullable String arch, int maxConcurrentRuns, int maxConcurrentRunsCeiling,
             @Nullable Integer desiredMaxConcurrentRuns, boolean configPending, int activeRuns,
-            List<CredentialDetails> credentials, Instant createdAt, @Nullable PoolDetails pool) {
+            List<CredentialDetails> credentials, Instant createdAt, @Nullable PoolDetails pool,
+            @Nullable IsolationView isolation, @Nullable List<ProblemView> problems, @Nullable Instant problemsSince) {
+    }
+
+    /** ADR-0117: one problem the connected host reports. */
+    record ProblemView(String code, String message) {
+    }
+
+    /**
+     * What the host reported about its isolation at its latest {@code hello} (ADR-0113), shown as reported: its level
+     * by name, whether its tier was {@code gvisor}, its hardening by name, and whether the operator stated the level.
+     */
+    record IsolationView(String level, boolean gvisor, String hardened, boolean stated) {
     }
 
     /**

@@ -86,6 +86,8 @@ function sentence(text: string): string {
 const RUNNER_HOST_CODES: ReadonlySet<QueueReasonCode> = new Set<QueueReasonCode>([
   'RUNNER_HOST_OFFLINE',
   'RUNNER_HOST_DRAINING',
+  // ADR-0117: the host says it takes no run; its card says why.
+  'RUNNER_HOST_UNHEALTHY',
   'RUNNER_HOST_FULL',
   'RUNNER_HOST_REJECTED',
   'PREVIOUS_RUN_ACTIVE',
@@ -133,11 +135,16 @@ function fixFor(
     case 'HOST_OFFLINE':
     case 'CREDENTIAL_POOL_FULL':
       return ownHosts;
-    // NO_HOST_FOR_SKILLS waits for a host whose runner delivers skills (ADR-0064).
+    // NO_HOST_FOR_SKILLS waits for a host whose runner delivers skills (ADR-0064), and
+    // NO_HOST_FOR_APP_TOKENS for one that renews a GitHub App's tokens (ADR-0116).
     case 'NO_HOST_FOR_CREDENTIALS':
     case 'NO_RUNNER_HOST':
     case 'NO_HOST_FOR_SKILLS':
+    case 'NO_HOST_FOR_APP_TOKENS':
       return companyHosts ?? ownHosts;
+    // ADR-0113: a host that reports the level chosen for the agent, or another level for the agent.
+    case 'NO_HOST_OF_LEVEL':
+      return companyHosts ?? { label: 'Open the agent', commands: ['agents', run.agentId] };
     default:
       return RUNNER_HOST_CODES.has(reason.code) ? companyHosts : null;
   }

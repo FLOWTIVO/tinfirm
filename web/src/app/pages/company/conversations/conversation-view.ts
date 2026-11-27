@@ -253,7 +253,10 @@ export interface TurnLine {
   readonly icon: string | null;
   readonly failureClass: string | null;
   readonly duration: string | null;
-  /** "Pushed 2 commits to" `agent/SHOP-241-1`, or "No changes". */
+  /**
+   * "Pushed 2 commits to" `agent/SHOP-241-1`, "No changes", or "1 commit not pushed: git access
+   * revoked" where Tinfirm revoked the run's git access to a repository with commits left.
+   */
   readonly push: { readonly text: string; readonly branch: string | null } | null;
   readonly changeRequests: readonly { readonly url: string; readonly label: string }[];
   /**
@@ -323,15 +326,23 @@ export function turnLine(
 ): TurnLine {
   const pushed = run.repositories.filter((r) => r.pushed);
   const commits = pushed.reduce((n, r) => n + (r.commits ?? 0), 0);
+  // Commits left on the runner host because Tinfirm revoked the run's git access there (ADR-0116):
+  // a cancelled turn says so too; the run's page says why, under "Git access revoked".
+  const revoked = run.repositories
+    .filter((r) => r.gitRevoked && r.pushed === false)
+    .reduce((n, r) => n + (r.commits ?? 0), 0);
+  const notPushed = revoked > 0 ? `${commitCount(revoked)} not pushed: git access revoked` : null;
   const push =
     run.repositories.length === 0
       ? null
       : pushed.length === 0
-        ? run.status === 'SUCCEEDED'
-          ? { text: 'No changes', branch: null }
-          : null
+        ? notPushed
+          ? { text: notPushed, branch: null }
+          : run.status === 'SUCCEEDED'
+            ? { text: 'No changes', branch: null }
+            : null
         : {
-            text: commits > 0 ? `Pushed ${commitCount(commits)} to` : 'Pushed',
+            text: `${notPushed ? `${notPushed} · ` : ''}${commits > 0 ? `Pushed ${commitCount(commits)} to` : 'Pushed'}`,
             branch: run.branch ?? null,
           };
   const spent = turnCost(run, cost);

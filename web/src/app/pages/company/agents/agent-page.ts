@@ -49,6 +49,10 @@ import { Time } from '../../../shared/time';
 import { ViewerNotice } from '../../../shared/viewer-notice';
 import { WhoActsWhoPays } from '../../../shared/who-acts-who-pays';
 import { NotFound } from '../../not-found';
+import {
+  chosenUnavailableText,
+  containerWarningText,
+} from '../../../shared/runner-hosts/isolation-view';
 import { AgentDefinition } from './agent-definition';
 import { AgentSkills } from './agent-skills';
 import { notUsableText, runtimesText, sharingText } from './agent-labels';
@@ -293,6 +297,22 @@ const NOT_EDITABLE = {
               [widening]="a.widening"
               (accepted)="onAccepted()"
             />
+          }
+
+          @if (containerWarning(); as warning) {
+            <div hlmAlert data-testid="container-warning">
+              <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+              <h2 hlmAlertTitle>Outside input runs in a container</h2>
+              <p hlmAlertDescription>{{ warning }}</p>
+            </div>
+          }
+
+          @if (isolationUnavailable(); as notice) {
+            <div hlmAlert variant="destructive" data-testid="isolation-unavailable">
+              <ng-icon name="lucideCircleAlert" aria-hidden="true" />
+              <h2 hlmAlertTitle>No runner host of its level</h2>
+              <p hlmAlertDescription>{{ notice }}</p>
+            </div>
           }
 
           @if (!usable()) {
@@ -546,6 +566,14 @@ export class AgentPage {
     const a = this.agent();
     return a ? sharingText(a) : '';
   });
+  /** ADR-0113: hostile input that would run in a container, and a chosen level no host reports. */
+  protected readonly containerWarning = computed(() =>
+    containerWarningText(this.agent()?.isolation),
+  );
+  protected readonly isolationUnavailable = computed(() =>
+    chosenUnavailableText(this.agent()?.isolation),
+  );
+
   protected readonly notUsable = computed(() => {
     const a = this.agent();
     return a ? notUsableText(a) : '';

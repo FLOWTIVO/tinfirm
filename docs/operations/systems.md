@@ -56,13 +56,103 @@ Setting it up, the callback URL, the default scopes and the app to register at e
 - **An MCP server's** sign-in is found by discovery: [mcp-servers.md, section 3.1](mcp-servers.md#31-sign-in-with-oauth). **Slack's** Sign-in app is for the `history` tool only, with the fixed scopes `channels:history groups:history` ([chats.md](chats.md)).
 - The server calls the authorization server itself, so with the Helm chart's NetworkPolicy it needs an egress rule ([helm.md, section 4](helm.md#4-networkpolicy)); every such call passes the outbound guard (section 9).
 
+## 3.1 The GitHub App
+
+A `GITHUB` system can hold one GitHub App ([ADR-0116](../adr/0116-short-lived-and-revocable-git-tokens.md)).
+It is the company's own App, registered by an admin at GitHub, not a vendor's App, and it is a
+different thing from the Sign-in app of section 3, which stays as it is. Its installations become
+credentials of kind `APP`, and every run on such a credential gets a token of its own: limited to
+the run's repositories, with `contents` and `pull_requests` only, valid GitHub's hour, and renewed
+by the runner host through the server. Setting it up, step by step, is in the admin guide's
+[Set up the GitHub App](../../docs-site/content/admin-guide/systems.md#set-up-the-github-app).
+
+1. **Upgrade the runner hosts first.** A run on an App credential goes only to a host that lists the
+   features `run.git.refresh` and `run.git.revoke`; until one is connected it waits with the queue
+   reason `NO_HOST_FOR_APP_TOKENS`. The App's section on the system's page counts the connected
+   hosts that lack them.
+2. **Register the App at GitHub** under the organisation (Settings, Developer settings, GitHub
+   Apps): no webhook, no callback URL. Repository permissions: Contents read and write, Pull
+   requests read and write, Metadata read, Issues read and write when agents use the system's issue
+   tools. Never Workflows: no token Tinfirm mints asks for it, so an agent's push never changes
+   `.github/workflows/`. Generate a private key and note the App's id.
+3. **Install the App** on the organisation or the account, with all repositories or the ones
+   agents work in.
+4. **On the system's page**, under **GitHub App**, enter the App's id and paste the private key.
+5. **Add credential › GitHub App installation**, pick the installation, and lend the credential to
+   groups or service accounts as any other.
+
+Inside:
+
+- The key is PEM, PKCS#1 (`BEGIN RSA PRIVATE KEY`, as GitHub downloads it) or PKCS#8, RSA of at
+  least 2048 bits. It is a managed company secret (`SYSTEM_GITHUB_APP_KEY`), never shown again; to
+  rotate it, generate a new key at GitHub, set it here, then delete the old one at GitHub. Each use
+  is `secret.accessed` with its purpose (`run:{runId}`, `github-app:installations`,
+  `github-app:installation`, or the purpose of the server's own call).
+- Tinfirm signs the App's JSON Web Token itself (RS256, issued a minute ago, valid nine minutes,
+  `iss` the App's id) and calls `{baseUrl}/app`, `{baseUrl}/app/installations`,
+  `{baseUrl}/app/installations/{id}` and `{baseUrl}/app/installations/{id}/access_tokens`.
+  `{baseUrl}` is the system's base URL: `https://api.github.com`, or a GitHub Enterprise Server's
+  `https://<host>/api/v3`. **The GitHub Enterprise Server half is built from GitHub's documentation
+  and untested against a real server.**
+- A run's token is minted at the assignment, with `repositories` (the names on the installation's
+  account) and `permissions` `{contents, pull_requests}` at `write` for the run's writable
+  repositories and at `read` for its read-only ones: at most two tokens per credential and run.
+  Neither the vault nor the database keeps it. A repository on another account, or one the
+  installation does not cover, ends the turn with a message that names it: install the App there.
+- Tinfirm's own calls with the credential (tools, change requests, polls, write-back) use a token
+  minted with the installation's permissions less `workflows`, kept in the credential's secret
+  until five minutes before it expires. GitHub refusing the App, or not knowing the installation
+  any more, turns the credential **Check again** (`RECONNECT`): check the App and its installation
+  at GitHub, then press **Check again** on the credential (`POST …/credentials/{credentialId}/app`).
+  Tinfirm asks GitHub for the installation again, and once GitHub mints a token the credential is
+  **Working** again in place, with its grants and lendings; while GitHub refuses, it shows GitHub's
+  reason and nothing changes.
+- `run.assign` carries the token with its `expiresAt` and `mirrorKey`, the key the host names the
+  repository's mirror by in place of the token, the same for every run of the credential. The host
+  renews a token with `run.request` `GIT_TOKEN` when ten minutes or less are left, and before the
+  push at the run's end when twenty or less are left; the server checks the conversation's binding
+  again each time ([runner-protocol-v2.md](runner-protocol-v2.md)).
+- **What is unverified about GitHub's API** (ADR-0116, "To specify and verify during the build"):
+  whether `metadata: read` comes with every token; whether a token can be asked for a shorter
+  life than the hour; whether a push that changes `.github/workflows/` is refused without
+  `workflows`; whether a token can be revoked at GitHub before it expires (Tinfirm does not
+  revoke one: a revoked run's token stops working at the code host only when its hour ends);
+  the bot user an installation's token acts as; and GitHub's limits on minting. The endpoints,
+  their bodies, the JWT's claims and its ten-minute limit, the 422 for a repository the
+  installation does not cover, and the user name `x-access-token` follow GitHub's REST
+  documentation as of this release, and are exercised here against a fake GitHub only.
+
+| Operation | API, under `/api/companies/{companyId}` | Audited as |
+|---|---|---|
+| Read the App | `GET /systems/{systemId}/github-app` | |
+| Set it, or replace its key | `PUT /systems/{systemId}/github-app` with `appId` and `privateKey` | `system.github_app_set` |
+| Remove it (no `APP` credential left) | `DELETE /systems/{systemId}/github-app` | `system.github_app_removed` |
+| List its installations | `GET /systems/{systemId}/github-app/installations` | |
+| Add an installation as a credential | `POST /systems/{systemId}/credentials/app` with `name` and `installationId` | `account.connected` |
+
+Problems: `400 GITHUB_APP_REFUSED` (GitHub refused the id and key, or does not know the
+installation), `400 SYSTEM_KIND_INVALID` (not a company GitHub system; a token or sign-in on an
+installation's credential), `409 GITHUB_APP_REQUIRED`, `409 DUPLICATE_INSTALLATION`,
+`409 GITHUB_APP_IN_USE` (remove the installations' credentials first), `409 GITHUB_APP_CHANGED`,
+`409 SYSTEM_PAUSED`, `502 GITHUB_UNREACHABLE`.
+
+- **Another App on the system.** A `PUT` with another `appId` than the system's App is
+  `409 GITHUB_APP_IN_USE` while a credential of kind `APP` remains: each is an installation of the
+  App it was added for, and another App's key would mint for it, or fail. The same `appId` with a
+  new key is the key's rotation, always allowed. Remove the installations' credentials, then set
+  the other App, then add its installations.
+- **Adding an installation while the App changes.** Tinfirm asks GitHub for the installation with
+  the key of the App it read first, and stores the credential only while the system's App is still
+  that one (the same id, and the same key secret: not removed and set again). Otherwise it answers
+  `409 GITHUB_APP_CHANGED` and stores nothing; choose the installation again.
+
 ## 4. Credentials
 
 Adding a credential, its states and its menu, and lending it to groups and service accounts are in [Add a credential](../../docs-site/content/admin-guide/systems.md#add-a-credential), [Keep a credential working](../../docs-site/content/admin-guide/systems.md#keep-a-credential-working) and [Lend a credential](../../docs-site/content/admin-guide/systems.md#lend-a-credential). The account model and how a conversation picks an account are in [accounts.md](accounts.md). Inside:
 
 - **Who holds them**: a company Jira, GitHub, GitLab, Git or MCP server. A personal MCP server holds none (`400 PERSONAL_SYSTEM`: only its owner's own account acts there), nor does a webhook. A chat system's bot is a credential, marked **Chat bot** and managed only under **Bot** ([chats.md](chats.md)).
 - **Problems**: `409 DUPLICATE_CREDENTIAL_NAME` (a name the system has, ignoring case), `400 ACCOUNT_REFUSED` with the system's reason (a token the "who am I" of section 2 refuses), `409 IDENTITY_IN_USE` (the user is a member's own account: [accounts.md, section 7](accounts.md#7-one-identity-per-system)), `409 SYSTEM_PAUSED`, `409 DUPLICATE_GRANT` (a credential lent to a group twice).
-- **States**: **Working** is `OK`; **Sign in again** and **Store a new token** are `RECONNECT` (refused, or a sign-in that could not be refreshed); **Not working** is `ERROR`; **Disabled** is `enabled` false.
+- **States**: **Working** is `OK`; **Sign in again**, **Store a new token** and, for an installation of a GitHub App, **Check again** are `RECONNECT` (refused, or a sign-in that could not be refreshed); **Not working** is `ERROR`; **Disabled** is `enabled` false.
 - **Storing again keeps the credential's id**, so the triggers whose rows name it go on.
 - **Disable** stops every use by groups and service accounts at its next check; conversations that act with it wait for an admin.
 - **Remove** goes in this order: its grants (`grant.deleted`), its lendings (`credential.withdrawn`: the triggers that act with it pause until their authors name another), its token from the vault, and its sign-in at the system where the system revokes (`account.disconnected`). Conversations that act with it stop at their next use of it.
@@ -187,6 +277,7 @@ Under `/api/companies/{companyId}`; the contract is `api/openapi.yaml` (tags Sys
 | `GET /systems`, `GET /systems/{systemId}` | Any member; a personal server, its owner only |
 | `POST /systems`, `PATCH` and `DELETE /systems/{systemId}` | OWNER, ADMIN; a personal MCP server, its owner |
 | `PUT`, `DELETE /systems/{systemId}/app` | OWNER, ADMIN; a personal server, its owner |
+| `GET`, `PUT`, `DELETE /systems/{systemId}/github-app`, `GET …/github-app/installations`, `POST …/credentials/app` | OWNER, ADMIN (section 3.1) |
 | `POST /systems/{systemId}/test` | OWNER, ADMIN; a personal server, its owner |
 | `GET`, `POST /systems/{systemId}/repositories`, `DELETE …/repositories/{repositoryId}` | Read: any member; change: OWNER, ADMIN |
 | `GET /systems/{systemId}/tools`, `POST …/tools/refresh`, `PATCH …/tools/{toolName}` | Read: any member who sees it; change: OWNER, ADMIN, a personal server's owner |

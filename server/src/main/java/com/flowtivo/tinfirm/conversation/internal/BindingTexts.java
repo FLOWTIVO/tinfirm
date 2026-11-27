@@ -15,6 +15,9 @@ import com.flowtivo.tinfirm.account.Accounts;
 import com.flowtivo.tinfirm.account.GrantInfo;
 import com.flowtivo.tinfirm.company.GroupMembership;
 import com.flowtivo.tinfirm.conversation.BindingInfo;
+import com.flowtivo.tinfirm.principal.PrincipalInfo;
+import com.flowtivo.tinfirm.principal.PrincipalKind;
+import com.flowtivo.tinfirm.principal.PrincipalSwitches;
 import com.flowtivo.tinfirm.principal.Principals;
 import com.flowtivo.tinfirm.shared.api.model.AgentRepositoryAccess;
 import com.flowtivo.tinfirm.shared.api.model.ConversationBindingChoice;
@@ -37,7 +40,11 @@ class BindingTexts {
 
     private final Principals principals;
 
-    BindingTexts(Systems systems, Accounts accounts, GroupMembership groups, Principals principals) {
+    private final PrincipalSwitches switches;
+
+    BindingTexts(Systems systems, Accounts accounts, GroupMembership groups, Principals principals,
+            PrincipalSwitches switches) {
+        this.switches = switches;
         this.systems = systems;
         this.accounts = accounts;
         this.groups = groups;
@@ -110,6 +117,8 @@ class BindingTexts {
         return switch (credential.kind()) {
             case OAUTH -> "an admin must sign the shared credential " + credential.name() + " in again";
             case CLIENT -> "an admin must store new client credentials for the shared credential " + credential.name();
+            case APP -> "an admin must check the GitHub App's installation " + credential.name()
+                    + " on the system's page";
             default -> "an admin must store a new token for the shared credential " + credential.name();
         };
     }
@@ -176,13 +185,77 @@ class BindingTexts {
             case RECONNECT_COMPANY -> system + ": " + reconnectCompany(binding) + "; the admins are told.";
             case CHOOSE -> system + ": your own account needs signing in again, or use a shared account instead.";
             case PICK_GRANT -> system + ": pick one of the shared accounts for this conversation, or connect your own.";
-            case SUSPENDED -> system + ": the service account it acts through is suspended; an admin resumes it.";
+            case SUSPENDED -> system + ": " + suspended(binding);
             case SYSTEM_OFF -> system + ": the company switched personal MCP servers off.";
             case NOT_ENTITLED -> system + ": the trigger's author may no longer use " + holderName(binding)
                     + ", or it no longer borrows the credential; it goes on once they may again, or the trigger is "
                     + "changed.";
             default -> gone(binding);
         };
+    }
+
+    /**
+     * Why a run's git token was revoked (ADR-0116), in the words of the message its host gets: "the shared credential
+     * CI bot was disabled", "the account needs signing in again".
+     */
+    String revoked(BindingInfo binding) {
+        String system = systemName(binding.companyId(), binding.systemId());
+        AccountInfo account = binding.accountId() != null
+                ? accounts.find(binding.companyId(), binding.accountId()).orElse(null) : null;
+        BindingInfo.Reason reason = binding.reason() != null ? binding.reason() : BindingInfo.Reason.NONE;
+        return switch (reason) {
+            case RECONNECT_YOURS, CHOOSE -> "the account on " + system + " needs signing in again";
+            case RECONNECT_COMPANY -> account != null && account.credential() && !account.enabled()
+                    ? "the shared credential " + account.name() + " on " + system + " was disabled"
+                    : "the shared credential" + (account != null ? " " + account.name() : "") + " on " + system
+                            + " needs signing in again";
+            case SUSPENDED -> "the account's holder was suspended" + suspendedBecause(binding);
+            case SYSTEM_OFF -> "the company switched personal MCP servers off";
+            case NOT_ENTITLED -> "the trigger's author may no longer use " + holderName(binding)
+                    + ", or it no longer borrows the credential";
+            case GRANT_REMOVED -> "the shared credential's grant was withdrawn";
+            case LEFT_GROUP -> "the person is no longer in the group the credential is shared with";
+            case IDENTITY_CHANGED -> "the account is another identity on " + system + " now";
+            case HOLDER_LEFT -> "the account's holder left the company";
+            case SYSTEM_REMOVED -> system + " was removed";
+            case ACCOUNT_REMOVED -> "the trigger's new author's choices name no account on " + system;
+            case NONE, PICK_GRANT -> "the account on " + system + " can no longer be used";
+        };
+    }
+
+    /**
+     * Who is suspended, why when it is a deactivation, and what lifts it (the package 6 contract, §5.4; ADR-0087,
+     * decision 7): an admin resumes a service account or a member an admin suspended; an instance admin reactivates a
+     * deactivated user; the company's identity provider lifts its own.
+     */
+    String suspended(BindingInfo binding) {
+        PrincipalInfo holder = binding.holderPrincipalId() == null ? null
+                : principals.find(binding.companyId(), binding.holderPrincipalId()).orElse(null);
+        PrincipalSwitches.Cause cause = holder == null ? null
+                : switches.suspendedFor(binding.companyId(), holder.id()).orElse(null);
+        if (holder == null || cause == null) {
+            return "the account's holder is suspended; it goes on once their suspension is lifted.";
+        }
+        String name = principals.displayNames(binding.companyId(), List.of(holder.id())).getOrDefault(holder.id(),
+                "the account's holder");
+        if (holder.kind() == PrincipalKind.SERVICE) {
+            return "the service account " + name + " it acts through is suspended; an admin resumes it.";
+        }
+        String who = name + ", whose account it acts through, is suspended";
+        return switch (cause) {
+            case ADMIN -> who + " in this company; an admin resumes them.";
+            case USER_DEACTIVATED -> who + cause.because() + "; an instance admin reactivates the user, which "
+                    + "resumes them.";
+            case SCIM -> who + cause.because() + "; the identity provider reactivates them, which resumes them.";
+        };
+    }
+
+    /** Why the binding's holder is suspended, after "suspended": their deactivation, or nothing. */
+    private String suspendedBecause(BindingInfo binding) {
+        return binding.holderPrincipalId() == null ? ""
+                : switches.suspendedFor(binding.companyId(), binding.holderPrincipalId())
+                    .map(PrincipalSwitches.Cause::because)
+                    .orElse("");
     }
 
     /** The note of a gone binding. */

@@ -52,6 +52,26 @@ class RunEventStore {
     }
 
     /**
+     * Whether the run has an event that its host sends only once its sandbox has started, or that it does not know:
+     * anything but a {@code STATUS} of the phase {@code preparing}, {@code cloning} or {@code starting}, a {@code LOG}
+     * and a {@code GIT} {@code cloned}. A host sends {@code STATUS} {@code running} after the sandbox started and before
+     * the agent's first prompt, and a run's events in order, so an event of the agent never comes before it.
+     */
+    boolean pastPreparation(UUID runId) {
+        return jdbc.sql("""
+                SELECT EXISTS (
+                    SELECT 1 FROM run_event
+                     WHERE run_id = ?
+                       AND NOT (type = 'LOG'
+                                OR type = 'STATUS'
+                                   AND coalesce(lower(payload ->> 'phase'), '') IN ('preparing', 'cloning', 'starting')
+                                OR type = 'GIT' AND coalesce(lower(payload ->> 'action'), '') = 'cloned'))""")
+            .param(runId)
+            .query(Boolean.class)
+            .single();
+    }
+
+    /**
      * The {@code resetsAt} of every RATE_LIMIT event of the run that has one: when the runtime said its usage limit
      * resets. A value that is no timestamp is skipped.
      */

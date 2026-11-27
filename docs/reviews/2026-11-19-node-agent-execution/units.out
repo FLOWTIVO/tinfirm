@@ -1,0 +1,66 @@
+== 1. the helper started again while a VM runs
+made node-1:vm-54ca34ad7ebfd7713a6a3d11a8f1279f
+VMM pid 66665 in tfvm-00000000003d-0000
+active active ; the VMM still runs as pid 66665
+its snapshot loop device as the new helper reads it: /tfvm-00000000003d-0000.snapshot
+list: {"vms": [{"address": "10.0.0.6", "id": "node-1:vm-54ca34ad7ebfd7713a6a3d11a8f1279f", "labels": {"tinfirm-host": "two-machine-run"}, "name": "restart-test", "port": 20000, "state": "running"}]}
+its port after the restart: tls alert
+delete: ({}, 52)
+left after the delete: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, tables 0, cgroups 0, work files 0, named namespaces 0, network namespaces 1
+
+== 2. ProtectKernelTunables=yes on the helper (the setting that broke a run silently in the seventh sandbox round)
+    verify: 6 ms, problems [], maxVms 2
+    create: ERROR after 67 ms: {'code': -32000, 'message': 'node node-1: `ip netns exec tfvm-00000000003e-0000 sysctl -n net.ipv6.conf.all.disable_ipv6` says 0, not 1: the setting did not take'}
+left: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, tables 0, cgroups 0, work files 0, named namespaces 0, network namespaces 1
+2026-11-19T21:20:12.707148Z  WARN tinfirm_node_agent::helper: cannot make the VM vm=vm-a887a6e3df6befe137f18e1c0a21fdd2 jail=tfvm-00000000003e-0000 error=`ip netns exec tfvm-00000000003e-0000 sysctl -n net.ipv6.conf.all.disable_ipv6` says 0, not 1: the setting did not take
+Job for tinfirm-node-agent-listener.service failed.
+See "systemctl status tinfirm-node-agent-listener.service" and "journalctl -xeu tinfirm-node-agent-listener.service" for details.
+
+== 3. the helper's capabilities, one removed at a time
+without CAP_CHOWN:
+    verify: 5 ms, problems [], maxVms 2
+    create: ERROR after 144 ms: {'code': -32000, 'message': "node node-1: cannot give /srv/tinfirm-jails/firecracker/tfvm-00000000003f-0000/root/vmlinux to the VM's user: permission denied"}
+    journal: 2026-11-19T21:20:20.312961Z  INFO tinfirm_node_agent::helper: refused a request code=Failed
+    left: nothing
+without CAP_DAC_OVERRIDE:
+    verify: 6 ms, problems [], maxVms 2
+    create: ERROR after 7 ms: {'code': -32000, 'message': 'node node-1: cannot read the user data file: permission denied'}
+    journal: 2026-11-19T21:20:27.772774Z  INFO tinfirm_node_agent::helper: refused a request code=UserData
+    left: nothing
+without CAP_SETGID:
+    verify: 6 ms, problems [], maxVms 2
+    create: ERROR after 159 ms: {'code': -32000, 'message': "node node-1: the VMM ended before its guest ran (the VM's console file said why, and is removed with the VM)"}
+    journal: 2026-11-19T21:20:35.435752Z  INFO tinfirm_node_agent::helper: refused a request code=Failed
+    left: nothing
+without CAP_SETUID:
+    verify: 6 ms, problems [], maxVms 2
+    create: ERROR after 159 ms: {'code': -32000, 'message': "node node-1: the VMM ended before its guest ran (the VM's console file said why, and is removed with the VM)"}
+    journal: 2026-11-19T21:20:43.093909Z  INFO tinfirm_node_agent::helper: refused a request code=Failed
+    left: nothing
+without CAP_SETPCAP:
+    verify: 7 ms, problems [], maxVms 2
+    create: ERROR after 141 ms: {'code': -32000, 'message': 'node node-1: cannot start the jailer: permission denied'}
+    journal: 2026-11-19T21:20:50.765161Z  INFO tinfirm_node_agent::helper: refused a request code=Failed
+    left: nothing
+without CAP_NET_ADMIN:
+    verify: 7 ms, problems [], maxVms 2
+    create: ERROR after 27 ms: {'code': -32000, 'message': 'node node-1: `ip netns exec tfvm-000000000043-0000 sysctl -w net.ipv4.ip_forward=1` failed: sysctl: setting key "net.ipv4.ip_forward": Operation not permitted'}
+    journal: 2026-11-19T21:20:58.270255Z  INFO tinfirm_node_agent::helper: refused a request code=Failed
+    left: nothing
+without CAP_SYS_ADMIN:
+    verify: 7 ms, problems [], maxVms 2
+    create: ERROR after 25 ms: {'code': -32000, 'message': 'node node-1: `ip netns add tfvm-000000000044-0000` failed: mount --make-shared /run/netns failed: Operation not permitted'}
+    journal: 2026-11-19T21:21:05.990280Z  INFO tinfirm_node_agent::helper: refused a request code=Failed
+    left: nothing
+without CAP_MKNOD:
+    verify: 6 ms, problems [], maxVms 2
+    create: ERROR after 143 ms: {'code': -32000, 'message': 'node node-1: `mknod -m 600 /srv/tinfirm-jails/firecracker/tfvm-000000000045-0000/root/root.disk b 252 0` failed: mknod: /srv/tinfirm-jails/firecracker/tfvm-000000000045-0000/root/root.disk: Operation not permitted'}
+    journal: 2026-11-19T21:21:13.597681Z  INFO tinfirm_node_agent::helper: refused a request code=Failed
+    left: nothing
+
+== 4. with all eight again
+    verify: 7 ms, problems [], maxVms 2
+    create: 128 ms, id node-1:vm-fe265bf0c74663b798ed18f3a72fe156; describe: 1 ms, running at 10.0.0.6:20000
+    guest ready: 2510 ms after create (10.0.0.6:20000 answers `tls alert`); next port: `refused`; list: 1 ms, 1 VM
+    delete: 87 ms; then describe says gone; the port answers `refused`
+left: jails 0, VMMs 0, device-mapper 0, loop devices of snapshots 0, veths 0, tables 0, cgroups 0, work files 0, named namespaces 0, network namespaces 1

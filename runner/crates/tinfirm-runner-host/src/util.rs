@@ -40,6 +40,20 @@ pub fn truncate_with_marker(s: &str, max: usize) -> String {
     format!("{}{}", &s[..cut], truncation_marker(s.len() - cut))
 }
 
+/// `s` on one line (each control character a space) and at most `max` bytes, with `…` where
+/// it was cut: for a cause that goes into one line of a message, such as a node's problems.
+pub fn one_line(s: &str, max: usize) -> String {
+    let line: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if line.len() <= max {
+        return line;
+    }
+    let cut = floor_char_boundary(&line, max.saturating_sub('…'.len_utf8()));
+    format!("{}…", &line[..cut])
+}
+
 /// The marker that ends a text cut short, naming the bytes that are gone.
 pub fn truncation_marker(removed: usize) -> String {
     format!("\n…[truncated {removed} bytes]")
@@ -179,6 +193,14 @@ mod tests {
         assert!(t.starts_with('é'));
         assert!(t.contains("truncated 4 bytes"));
         assert_eq!(truncate_with_marker("abc", 3), "abc");
+    }
+
+    #[test]
+    fn one_line_has_no_control_characters_and_stays_in_its_bound() {
+        assert_eq!(one_line("a\nb\tc", 10), "a b c");
+        let cut = one_line(&"é".repeat(100), 21);
+        assert!(cut.len() <= 21 && cut.ends_with('…'), "{cut}");
+        assert!(cut.starts_with("éé"), "{cut}");
     }
 
     #[test]

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/tinfirm-bridge", "crates/tinfirm-protocol", "crates/tinfirm-runner-host"]
+members = [
+    "crates/tinfirm-bridge",
+    "crates/tinfirm-node-agent",
+    "crates/tinfirm-protocol",
+    "crates/tinfirm-runner-host",
+]
 
 [workspace.package]
 version = "1.0.0-rc.2-SNAPSHOT"
@@ -12,6 +17,7 @@ publish = false
 [workspace.dependencies]
 tinfirm-protocol = { path = "crates/tinfirm-protocol" }
 tinfirm-bridge = { path = "crates/tinfirm-bridge" }
+tinfirm-node-agent = { path = "crates/tinfirm-node-agent" }
 
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -50,10 +56,30 @@ zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2
 url = "2.5"
 hostname = "0.4"
 libc = "0.2"
+# The reader's confinement (ADR-0112, open question 1; runner/README.md, "The reader"), Linux
+# only: Landlock for the file system, the network and the scopes, a seccomp filter, and the
+# prctl calls (`PR_SET_DUMPABLE`) and process-group signals that the workspace's `unsafe_code`
+# rule keeps out of our own code. rustix is already in the binary (through tar's xattr). Its
+# `net` feature sends descriptors to a front process (`SCM_RIGHTS`); it adds no crate.
+landlock = "0.4.7"
+seccompiler = "0.5.0"
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "net"] }
+# The node agent's allocator (ADR-0112; threat model, 19.7): it overwrites every block with
+# zeros when the block is freed, so that a VM's one-time ticket that passed through a buffer of
+# the TLS library or of the JSON parser does not stay in freed memory. 1Password's wrapper of
+# the system allocator: about 100 lines, no dependency. The workspace's `unsafe_code` rule keeps
+# such code out of our own.
+zeroizing-alloc = "0.1.1"
 
 jsonschema = { version = "0.61", default-features = false }
 tempfile = "3.27"
 
+# No `unsafe` code of our own: what needs a system call goes through rustix or another library.
+# The exceptions are functions that carry `#[allow(unsafe_code)]` and say why, and each is named
+# here and in `crates/tinfirm-runner-host/tests/unsafe_code.rs`, which fails on any other:
+# - `ee/runner/tinfirm-runner-host/src/kubernetes/tap.rs`, `make_tap` and `int_ioctl`: the ioctl
+#   calls on `/dev/net/tun` that make a VM's tap in a run's pod (ADR-0115), which no library of
+#   the workspace wraps (the owner, 2026-11-21).
 [workspace.lints.rust]
 unsafe_code = "deny"
 
