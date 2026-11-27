@@ -661,7 +661,9 @@ holds its bridge.
   service and the port. `TINFIRM_RUNNER_GIT_PROXY_BIND` and `_HOST` set where the bridge listeners
   go.
   - Each connection has a window of 128 KiB per direction, so one that stalls holds back no other;
-    at most 128 are open per run.
+    at most 128 are open per run. What waits for a connection is its window's bytes, never a cost per
+    frame: an empty frame adds nothing, a second end of stream is ignored, and bytes after it reset the
+    connection.
   - A container of the agent's own Docker reaches the tunnels only on Docker's `host` network,
     because they listen on the sandbox's loopback.
 - **No mounts: the files travel over the bridge.** The container gets none of this host's
@@ -674,7 +676,9 @@ holds its bridge.
   - After the agent, the host runs its git steps in the sandbox: the WIP commit, then a bundle of
     `HEAD`. A [reader](#the-reader-and-the-front) fetches the bundle into the host's own clone, which the agent
     never reached, with every object checked, and the host pushes from there with the usual checks.
-    The host never runs git in a `.git` that the agent wrote. A bundle has 8 GiB at most. Every host-side git command runs with
+    The host never runs git in a `.git` that the agent wrote. A bundle has 8 GiB at most, and the
+    tree of its `HEAD` 1,000,000 files and 16 GiB together, which the reader totals with
+    `git ls-tree` before it checks the tree out. Every host-side git command runs with
     `core.packedGitWindowSize` set to 1 TiB, so git maps a whole pack at once: the fetch from a
     bundle of git 2.43 to 2.48 closes a file descriptor twice, and with git's default window of
     1 GiB the fetch of a bundle over 1 GiB could fail with `packfile … cannot be mapped: Bad file
@@ -712,7 +716,8 @@ holds its bridge.
     a port per sandbox, from `--sandbox-bridge-ports`, or without it from the system's range for
     local ports (`net.ipv4.ip_local_port_range`). It admits no port of a proxy: the host binds
     none. The first start after an upgrade from a version before the fronts also opens the shared
-    port that `runs/bridge.json` keeps, only while that version's runs are taken back (below). With
+    port that `runs/bridge.json` keeps, only while that version's runs are taken back (below): it
+    closes when the last of them has ended. With
     a [VM per run](#a-vm-per-run) the control host dials each VM and listens on nothing for it.
 - **A restart of this host loses no work** ([ADR-0101](../docs/adr/0101-closing-the-elastic-runners-gaps.md),
   threat model R36). From the start of a run's sandbox until the run's report is made, this host
@@ -728,7 +733,8 @@ holds its bridge.
   it), and the sandbox's bridge comes back to it with the session's key. A record without `bridge`
   (one of the version before the fronts) is taken back through one shared listener in `run`,
   whose identity and port `runs/bridge.json` keeps; that is the only use of the shared listener and
-  of that file. The agent that the earlier process started stops, its work comes back and is pushed, its
+  of that file. The listener stops accepting once the last of those runs has ended (or at once,
+  when none of them can be taken back), and a bridge that dials it later is refused. The agent that the earlier process started stops, its work comes back and is pushed, its
   session is saved, and the run ends failed with `INFRA`, saying what was saved; the next message
   goes on from there. A sandbox that does not come back within 2 minutes is removed, and its work
   is lost. Shown on a control host with a VM per run (2026-11-22; the outputs are not in this
@@ -832,11 +838,16 @@ holds its bridge.
     session bundle, its `/output`) use every credential by value and that run's own hashes
     alone, so ten runs taken back do not make each scan ten times as long. With ten runs'
     hashes loaded, a scan of 200 MiB took 17.6 to 18.3 s with every run's hashes and 1.75 to
-    1.82 s with one run's (release build, 4 CPUs). What bounds a scan when an agent makes its
-    commits large on purpose is the size of what comes back from the sandbox: at most 8 GiB of
-    bundle per repository (the sandbox bridge's `BUNDLE_LIMITS`) and 20 repositories; at about
-    110 MiB/s by hashes and 160 MiB/s by value, 8 GiB takes about 2 minutes to scan. The
-    session bundle is 64 MiB unpacked at most, and an `/output` file 25 MiB by default.
+    1.82 s with one run's (release build, 4 CPUs). The scan of the outgoing commits reads the
+    inflated content of every new object, as `git cat-file --batch` writes it, and scans it in
+    pieces of 1 MiB on a blocking thread, each piece starting with the end of the one before
+    (as long as the longest value the scan matches), so that it holds one piece whatever the
+    commits hold. That content is not bounded by the size of what comes back from the sandbox
+    (at most 8 GiB of bundle per repository, the sandbox bridge's `BUNDLE_LIMITS`, and 20
+    repositories): a bundle's objects compress, so an agent that makes its commits large on
+    purpose makes the scan long, not large. At about 110 MiB/s by hashes and 160 MiB/s by
+    value, 8 GiB takes about 2 minutes to scan. The session bundle is 64 MiB unpacked at most,
+    and an `/output` file 25 MiB by default.
   - **What the hashes give away.** Someone who reads the record learns, of a token that is no
     longer in it, its length and at most 12 bits per stored form from the rolling hashes: at
     most 60 to 96 bits for 5 to 8 forms, if all of them could be used together, which no method
@@ -956,8 +967,10 @@ The reader:
     user reads its memory;
   - it runs in a process group of its own, which `run` kills when the reading is over or its time
     is up, with everything the reader started. An unpacking may write no file larger than its
-    limit and use at most 1 GiB of memory. Every reader, with the git it runs, may hold at most
-    1024 descriptors.
+    limit and use at most 1 GiB of memory. Each git that a reader runs may use at most 4 GiB of
+    memory (`RLIMIT_DATA`; the packs git maps read only do not count, and the pack for a push
+    bounds its delta window to 256 MiB a thread), and a bundle's import writes no file over
+    16 GiB. Every reader, with the git it runs, may hold at most 1024 descriptors.
 - **What `run` takes back from it.** One line of JSON of a fixed form, at most 1 MiB (and, for the
   platform tools' file, that file's bytes). `run` treats the answer as hostile too: every field is
   bounded and checked, and once the reader is gone, `run` walks what it wrote, without following

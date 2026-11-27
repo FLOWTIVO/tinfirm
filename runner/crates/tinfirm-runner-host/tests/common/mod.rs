@@ -1303,6 +1303,42 @@ impl HostSetup {
     }
 }
 
+/// Where the host's shared bridge listener listens, once the host's take-back has started it:
+/// it serves only the runs taken back from records of the version before the fronts.
+pub async fn shared_listener_addr(host: &Host) -> std::net::SocketAddr {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(listener) = host.started_bridge().await {
+            return listener.server.local_addr();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shared listener never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits until the host's shared bridge listener, which listened at `addr`, is closed: gone
+/// from the host, and refusing connections, as it is once the last run it served has ended.
+pub async fn until_the_shared_listener_closes(host: &Host, addr: std::net::SocketAddr) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let gone = host.started_bridge().await.is_none();
+        let refused = tokio::net::TcpStream::connect(addr).await.is_err();
+        if gone && refused {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shared listener is still open after its last run (in the host: {}, accepting: {})",
+            !gone,
+            !refused
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub struct TestHost {
     pub dir: TempDir,
     pub paths: Paths,

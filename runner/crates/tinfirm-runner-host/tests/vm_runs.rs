@@ -1241,6 +1241,10 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
         restart_setup(dir.path(), publish),
     )
     .await;
+    let shared = match legacy {
+        true => Some(shared_listener_addr(&host.host).await),
+        false => None,
+    };
     let mut conn = server.accept().await;
     let hello = conn.handshake(1).await;
     assert_eq!(
@@ -1263,16 +1267,14 @@ async fn a_host_that_restarted_takes_back_the_run(publish: bool, legacy: bool) {
     assert_eq!(calls_of(&calls, "create").len(), creates, "{calls:#?}");
     assert!(deleted(&calls, &vm_id), "{calls:#?}");
     assert!(!record.exists());
-    // Host B's shared listener serves only a record of the version before.
-    match host.host.started_bridge().await {
-        Some(listener) => {
-            assert!(
-                legacy,
-                "a shared listener without a record of the version before"
-            );
-            assert_eq!(listener.server.run_count(), 0);
-        }
-        None => assert!(!legacy, "the record of the version before was not served"),
+    // Host B's shared listener serves only a record of the version before, and closes once
+    // that run has ended.
+    match shared {
+        Some(addr) => until_the_shared_listener_closes(&host.host, addr).await,
+        None => assert!(
+            host.host.started_bridge().await.is_none(),
+            "a shared listener without a record of the version before"
+        ),
     }
     host.shutdown.cancel();
     host.handle.await.unwrap().unwrap();

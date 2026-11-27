@@ -195,7 +195,115 @@ pub(crate) async fn run_ok(
 /// Runs `cmd` (git, or a reader that runs git: `group`) with `input` on stdin, and collects
 /// its output. A reader runs in a process group of its own, which is killed once the reader
 /// has ended: whatever it started, which could hold its output open, goes with it.
-async fn collect(mut cmd: Command, input: Option<String>, group: bool) -> Result<GitOutput> {
+async fn collect(cmd: Command, input: Option<String>, group: bool) -> Result<GitOutput> {
+    use tokio::io::AsyncReadExt;
+    let (status, stdout, stderr) = spawn_with(cmd, input, group, |mut stdout| async move {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf).await;
+        buf
+    })
+    .await?;
+    Ok(GitOutput {
+        status,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr,
+    })
+}
+
+/// The bytes of git's output that a scan takes at once ([`scan_output`]).
+const SCAN_CHUNK: usize = 1 << 20;
+
+/// Runs `cmd` as [`collect`] does, and scans its stdout for a credential with `redactor` as it
+/// comes, in pieces of [`SCAN_CHUNK`] bytes, each scanned on a blocking thread: what it holds is
+/// one piece, whatever git writes. Each piece starts with the last [`Redactor::hold_back`] bytes
+/// of the one before, so a value that a cut between two pieces splits is still found whole.
+/// After a find the rest is read and dropped, so that git's status still counts.
+async fn scan_output(
+    cmd: Command,
+    input: Option<String>,
+    group: bool,
+    redactor: &Redactor,
+) -> Result<(std::process::ExitStatus, bool, String)> {
+    use tokio::io::AsyncReadExt;
+    let redactor = redactor.clone();
+    let (status, found, stderr) = spawn_with(cmd, input, group, |mut stdout| async move {
+        let hold = redactor.hold_back();
+        let size = hold + SCAN_CHUNK;
+        let mut redactor = Some(redactor);
+        let mut buf = vec![0u8; size];
+        // Bytes in `buf`, and whether some of them are not scanned yet.
+        let mut filled = 0;
+        let mut fresh = false;
+        let mut found = false;
+        loop {
+            // A failed read fails the scan: what git wrote after it was not scanned.
+            let n = match stdout.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => return None,
+            };
+            if found {
+                continue;
+            }
+            filled += n;
+            fresh = true;
+            if filled == size {
+                let scanned;
+                (buf, redactor, scanned) = scan_piece(buf, filled, redactor).await;
+                found = scanned?;
+                if found {
+                    filled = 0;
+                } else {
+                    buf.copy_within(size - hold..size, 0);
+                    filled = hold;
+                }
+                fresh = false;
+            }
+        }
+        if fresh && !found {
+            found = scan_piece(buf, filled, redactor).await.2?;
+        }
+        Some(found)
+    })
+    .await?;
+    let found = found.context("the credential scan failed")?;
+    Ok((status, found, stderr))
+}
+
+/// Scans `buf[..len]` with `redactor` on a blocking thread, and gives both back. `None` when the
+/// thread failed.
+async fn scan_piece(
+    buf: Vec<u8>,
+    len: usize,
+    redactor: Option<Redactor>,
+) -> (Vec<u8>, Option<Redactor>, Option<bool>) {
+    let Some(redactor) = redactor else {
+        return (buf, None, None);
+    };
+    match tokio::task::spawn_blocking(move || {
+        let found = redactor.contains(&String::from_utf8_lossy(&buf[..len]));
+        (buf, redactor, found)
+    })
+    .await
+    {
+        Ok((buf, redactor, found)) => (buf, Some(redactor), Some(found)),
+        Err(_) => (Vec::new(), None, None),
+    }
+}
+
+/// Runs `cmd` with `input` on stdin, hands its stdout to `consume`, and collects its stderr: the
+/// process and its group as [`collect`] says.
+async fn spawn_with<F, Fut, T>(
+    mut cmd: Command,
+    input: Option<String>,
+    group: bool,
+    consume: F,
+) -> Result<(std::process::ExitStatus, T, String)>
+where
+    F: FnOnce(tokio::process::ChildStdout) -> Fut,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+    T: Default + Send + 'static,
+{
     use tokio::io::AsyncReadExt;
     if input.is_some() {
         cmd.stdin(Stdio::piped());
@@ -209,13 +317,9 @@ async fn collect(mut cmd: Command, input: Option<String>, group: bool) -> Result
         })),
         _ => None,
     };
-    let mut stdout = child.stdout.take().context("no stdout")?;
+    let stdout = child.stdout.take().context("no stdout")?;
     let mut stderr = child.stderr.take().context("no stderr")?;
-    let out = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf).await;
-        buf
-    });
+    let out = tokio::spawn(consume(stdout));
     let err = tokio::spawn(async move {
         let mut buf = Vec::new();
         let _ = stderr.read_to_end(&mut buf).await;
@@ -244,11 +348,11 @@ async fn collect(mut cmd: Command, input: Option<String>, group: bool) -> Result
     }
     let stdout = out.await.unwrap_or_default();
     let stderr = err.await.unwrap_or_default();
-    Ok(GitOutput {
+    Ok((
         status,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-    })
+        stdout,
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
 }
 
 /// The `Authorization` header value (`Basic …`) for a repository's credentials.
@@ -397,10 +501,14 @@ impl Git {
         args: &[&str],
         input: Option<String>,
     ) -> Result<GitOutput> {
+        let (cmd, group) = self.git_command(auth, args)?;
+        collect(cmd, input, group).await
+    }
+
+    /// The command of [`Git::run_input`], and whether it runs in a reader's process group.
+    fn git_command(&self, auth: bool, args: &[&str]) -> Result<(Command, bool)> {
         match (&self.reader, auth) {
-            (Some(reader), false) => {
-                collect(reader.git_command(&self.dir, args), input, true).await
-            }
+            (Some(reader), false) => Ok((reader.git_command(&self.dir, args), true)),
             _ => {
                 let authorization = if auth {
                     self.tokens
@@ -411,7 +519,7 @@ impl Git {
                 };
                 let mut cmd = command(&self.dir, authorization.as_ref());
                 cmd.args(args);
-                collect(cmd, input, false).await
+                Ok((cmd, false))
             }
         }
     }
@@ -693,6 +801,8 @@ impl Git {
     /// `true` when a credential value appears in anything that would be pushed: author
     /// names, commit messages and every object reachable from HEAD but not from `exclude`
     /// (the mirror's ref tips, which the host controls; never the workspace's own refs).
+    /// The objects' content is scanned as `git cat-file --batch` writes it, in pieces
+    /// ([`scan_output`]): it is the inflated content, which no bundle limit bounds.
     pub async fn outgoing_contains_secret(
         &self,
         redactor: &Redactor,
@@ -739,13 +849,13 @@ impl Git {
         if objects.stdout.trim().is_empty() {
             return Ok(false);
         }
-        let content = self
-            .run_input(false, &["cat-file", "--batch"], Some(objects.stdout))
-            .await?;
-        if !content.status.success() {
-            bail!("git cat-file failed: {}", content.stderr.trim());
+        let (cmd, group) = self.git_command(false, &["cat-file", "--batch"])?;
+        let (status, found, stderr) =
+            scan_output(cmd, Some(objects.stdout), group, redactor).await?;
+        if !status.success() {
+            bail!("git cat-file failed: {}", stderr.trim());
         }
-        Ok(redactor.contains(&content.stdout))
+        Ok(found)
     }
 
     /// Pushes HEAD to `refs/heads/<branch>` of the repository URL with a lease on the tip the

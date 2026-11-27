@@ -458,6 +458,37 @@ pub struct Shared {
 
 pub type Host = Arc<Shared>;
 
+/// The runs that the sandbox bridge's shared listener serves ([`Shared::start_bridge`]): the
+/// task of each holds one, and when the last goes, the listener stops accepting and leaves the
+/// host, so that it listens only while the runs of the version before are taken back. A bridge
+/// that dials it later is refused, as by a host that never opened it.
+pub(crate) struct SharedListenerRuns {
+    shared: Arc<Shared>,
+    listener: BridgeListener,
+}
+
+impl Drop for SharedListenerRuns {
+    fn drop(&mut self) {
+        self.listener.server.shutdown();
+        tracing::info!(
+            addr = %self.listener.server.local_addr(),
+            "the sandbox bridge's shared listener closes: the runs it served have ended"
+        );
+        match self.shared.bridge.try_lock() {
+            Ok(mut slot) => *slot = None,
+            // Read at this moment (`started_bridge`): it goes right after.
+            Err(_) => {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let shared = self.shared.clone();
+                    runtime.spawn(async move {
+                        *shared.bridge.lock().await = None;
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -725,7 +756,8 @@ impl Shared {
     /// identity and on the port that the process before kept with its records (ADR-0101), which
     /// the bridges of `reclaim`'s runs pin and dial. Their registrations come back in order. Its
     /// identity and port are kept again, for the next process of this host. `Ok(None)` without
-    /// `opts.bridge`, or when the sandboxes have no network.
+    /// `opts.bridge`, or when the sandboxes have no network. The listener closes once the last
+    /// of those runs has ended ([`SharedListenerRuns`]).
     async fn start_bridge(
         &self,
         reclaim: Vec<(String, tinfirm_bridge::control::Hidden)>,
@@ -819,7 +851,7 @@ impl Shared {
                 }
                 if self.opts.paths.workspace(run_id).is_dir() {
                     tracing::info!(%run_id, epoch = record.assign.epoch, "taking back a run whose work this host holds; it waits for the server before it pushes");
-                    self.spawn_taken_back(record, None);
+                    self.spawn_taken_back(record, None, None);
                 } else {
                     tracing::warn!(%run_id, "a run of the process before this one cannot be taken back: its work is no longer on this host");
                     self.records.remove(run_id);
@@ -851,7 +883,7 @@ impl Shared {
             match self.register_front_again(&record).await {
                 Ok(registration) => {
                     tracing::info!(%run_id, epoch = record.assign.epoch, "taking back a run of the process before this one, through a new front");
-                    self.spawn_taken_back(record, Some((sandbox, registration)));
+                    self.spawn_taken_back(record, Some((sandbox, registration)), None);
                 }
                 Err(e) => {
                     tracing::warn!(%run_id, error = %format!("{e:#}"), "a run of the process before this one cannot be taken back");
@@ -867,19 +899,27 @@ impl Shared {
             .iter()
             .map(|(record, _)| (record.bridge_id.clone(), record.session_key.clone()))
             .collect();
-        let registrations = match self.start_bridge(reclaim).await {
-            Ok(Some((_, registrations))) => registrations,
+        let (registrations, listener) = match self.start_bridge(reclaim).await {
+            Ok(Some((listener, registrations))) => (registrations, Some(listener)),
             Ok(None) => {
                 tracing::warn!(
                     "the sandboxes have no network, so the runs of the process before this one cannot be taken back"
                 );
-                Vec::new()
+                (Vec::new(), None)
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "the runs of the process before this one cannot be taken back");
-                Vec::new()
+                (Vec::new(), None)
             }
         };
+        // Each run's task holds the listener open; when the last has ended, or when none is
+        // taken back, it closes.
+        let holds = listener.map(|listener| {
+            Arc::new(SharedListenerRuns {
+                shared: self.clone(),
+                listener,
+            })
+        });
         if registrations.len() != held.len() {
             for (record, sandbox) in held {
                 self.records.remove(record.run_id());
@@ -902,6 +942,7 @@ impl Shared {
             self.spawn_taken_back(
                 record,
                 Some((sandbox, crate::sandbox::Registered::Shared(registration))),
+                holds.clone(),
             );
         }
     }
@@ -1020,6 +1061,7 @@ impl Shared {
         self: &Arc<Self>,
         record: crate::takeback::RunRecord,
         sandbox: Option<(crate::sandbox::TakenBack, crate::sandbox::Registered)>,
+        holds: Option<Arc<SharedListenerRuns>>,
     ) {
         let (run_id, epoch) = (record.run_id(), record.assign.epoch);
         let (stop_tx, stop_rx) = watch::channel(None);
@@ -1079,6 +1121,8 @@ impl Shared {
             }
             shared.drop_platform_requests(run_id, epoch);
             shared.remove_run_secrets(run_id, epoch);
+            // The run no longer needs the shared listener.
+            drop(holds);
         });
         if let Some(entry) = lock(&self.runs).get_mut(&run_id)
             && entry.epoch == epoch
