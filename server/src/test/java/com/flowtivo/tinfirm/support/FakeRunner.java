@@ -558,11 +558,10 @@ public final class FakeRunner implements AutoCloseable {
             if (last) {
                 String frame = partial.toString();
                 partial.setLength(0);
-                // The tests' TINFIRM_PUBLIC_URL is plain http, so the model relay's baseUrl in run.assign is too; in
-                // production it is https, as the schema asks (the package 2 contract's open point 5). The frame is
-                // checked as it would be there.
-                List<String> problems = ProtocolSchema.violations(protocolVersion,
-                        frame.replace("\"baseUrl\":\"http://localhost:", "\"baseUrl\":\"https://localhost:"));
+                // The tests' TINFIRM_PUBLIC_URL is plain http on localhost, so the model relay's baseUrl in run.assign
+                // is too: the schema takes plain http on loopback, a host's local server (the package 2 contract's
+                // open point 5). The frame is checked as it is.
+                List<String> problems = ProtocolSchema.violations(protocolVersion, frame);
                 if (!problems.isEmpty()) {
                     violations.add(frame + " -> " + problems);
                 }

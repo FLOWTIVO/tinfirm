@@ -2023,7 +2023,8 @@ impl Shared {
                 ));
             }
             Some(AssignedCredential::Model(access)) => {
-                return validate_model_access(access, assign.agent.runtime)
+                let local_server = crate::config::plain_http_local_origin(&self.config.server_url);
+                return validate_model_access(access, assign.agent.runtime, local_server.as_ref())
                     .map(|()| RunCredential::Model(access.clone()))
                     .map_err(|reason| (reject_code::INVALID_ASSIGNMENT, reason));
             }
@@ -2662,7 +2663,15 @@ fn safe_ref(name: &str) -> bool {
 /// `bedrock` and only there, and an access key ID only there; and no value holds whitespace or a
 /// control character, since all of them become environment variables of the sandbox. The reason
 /// never repeats the key.
-pub(crate) fn validate_model_access(access: &ModelAccess, runtime: Runtime) -> Result<(), String> {
+///
+/// `local_server` is the origin of this host's server when the host reaches it over plain http on
+/// loopback (crate::config::plain_http_local_origin): a base URL with exactly that origin, the
+/// relay of a server on this machine for local development, may be plain http too.
+pub(crate) fn validate_model_access(
+    access: &ModelAccess,
+    runtime: Runtime,
+    local_server: Option<&url::Origin>,
+) -> Result<(), String> {
     use tinfirm_protocol::ModelFormat;
     if !access.format.serves(runtime) {
         return Err(format!(
@@ -2686,7 +2695,16 @@ pub(crate) fn validate_model_access(access: &ModelAccess, runtime: Runtime) -> R
                 access.format
             ));
         }
-        let host = url.strip_prefix("https://").unwrap_or("");
+        let at_local_server = || {
+            local_server.is_some_and(|origin| {
+                url::Url::parse(url).is_ok_and(|parsed| parsed.origin() == *origin)
+            })
+        };
+        let host = match url.strip_prefix("https://") {
+            Some(host) => host,
+            None if at_local_server() => url.strip_prefix("http://").unwrap_or(""),
+            None => "",
+        };
         if host.is_empty()
             || host.starts_with('/')
             || url.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -3175,19 +3193,21 @@ mod tests {
         assert!(
             validate_model_access(
                 &access(Anthropic, "https://litellm.example.test", key),
-                Runtime::ClaudeCode
+                Runtime::ClaudeCode,
+                None
             )
             .is_ok()
         );
         assert!(
             validate_model_access(
                 &access(Openai, "https://litellm.example.test:4000/v1", key),
-                Runtime::Codex
+                Runtime::Codex,
+                None
             )
             .is_ok()
         );
         let refused = |access: ModelAccess, runtime: Runtime, why: &str| {
-            let err = validate_model_access(&access, runtime).unwrap_err();
+            let err = validate_model_access(&access, runtime, None).unwrap_err();
             assert!(err.contains(why), "{err}");
             let key = access.api_key.expose();
             assert!(key.is_empty() || !err.contains(key), "{err}");
@@ -3234,6 +3254,51 @@ mod tests {
         );
     }
 
+    /// The relay of a server that this host reaches over plain http on loopback (`login --server
+    /// http://localhost:8080`, as the Quick Start has it) may be plain http at exactly that
+    /// origin; no other plain http base URL is taken. Before, every run of such a host was
+    /// rejected (the release test of 1.0.0-rc.2, F-3).
+    #[test]
+    fn a_plain_http_relay_is_taken_only_at_the_hosts_own_local_server() {
+        use tinfirm_protocol::ModelFormat::Anthropic;
+        let key = "tfrun_TEST_ONLY_run_token";
+        let local = crate::config::plain_http_local_origin("http://localhost:8080").unwrap();
+        let relay = "http://localhost:8080/api/runner/v1/model/anthropic";
+        let check = |base_url: &str, local: Option<&url::Origin>| {
+            validate_model_access(
+                &access(Anthropic, base_url, key),
+                Runtime::ClaudeCode,
+                local,
+            )
+        };
+        assert!(check(relay, Some(&local)).is_ok());
+        for (other, why) in [
+            // Another port, or another name of the same machine, is another origin.
+            (
+                "http://localhost:8081/api/runner/v1/model/anthropic",
+                "must be an https URL",
+            ),
+            (
+                "http://127.0.0.1:8080/api/runner/v1/model/anthropic",
+                "must be an https URL",
+            ),
+            ("http://litellm.example.test", "must be an https URL"),
+            (
+                "http://user:pw@localhost:8080/api/runner/v1/model/anthropic",
+                "user name or password",
+            ),
+        ] {
+            let err = check(other, Some(&local)).unwrap_err();
+            assert!(err.contains(why), "{other}: {err}");
+        }
+        // A host whose server is https, or not on this machine, takes no plain http relay.
+        assert!(
+            check(relay, None)
+                .unwrap_err()
+                .contains("must be an https URL")
+        );
+    }
+
     /// I8 (security review of 2026-10-27): model access is the server's relay, with a base
     /// URL; access without one, which would put its key into the sandbox, is refused, whatever
     /// its format.
@@ -3242,7 +3307,7 @@ mod tests {
         use tinfirm_protocol::ModelFormat::{Anthropic, Bedrock, Google, Openai, Openrouter};
         let key = "sk-TEST-ONLY-key";
         let refused = |access: ModelAccess, runtime: Runtime, why: &str| {
-            let err = validate_model_access(&access, runtime).unwrap_err();
+            let err = validate_model_access(&access, runtime, None).unwrap_err();
             assert!(err.contains(why), "{err}");
             assert!(!err.contains(key), "{err}");
         };
@@ -3270,7 +3335,8 @@ mod tests {
         assert!(
             validate_model_access(
                 &access(Anthropic, "https://litellm.example.test", key),
-                Runtime::Opencode
+                Runtime::Opencode,
+                None
             )
             .is_ok()
         );

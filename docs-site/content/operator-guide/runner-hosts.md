@@ -230,7 +230,7 @@ With `--sandbox-bridge` the host opens no listener for it: the sandbox reaches i
 
 `run` checks at its start that a listener can serve the sandboxes there, and refuses to start, naming what to change, when it cannot: for example with rootless Docker or a `macvlan` network, set the two variables. It cannot check a firewall: a run then fails at its first model request.
 
-The relay must be reachable over https. When the server's public address is inside your network, start the host with `--egress-allow-private`. When the host runs on the same machine as the server, name the server's public https origin with `--model-proxy-local-gateway https://tinfirm.example.com`, and log the host in at that same origin.
+The relay must be reachable over https. When the server's public address is inside your network, start the host with `--egress-allow-private`. When the host runs on the same machine as the server, name the server's public https origin with `--model-proxy-local-gateway https://tinfirm.example.com`, and log the host in at that same origin. A server you try on your own machine over plain http, as in [Try Tinfirm with Docker Compose](quick-start.md), needs no option: log the host in at the server's `TINFIRM_PUBLIC_URL`, such as `http://localhost:8080`, and the host reaches the relay at that same address. It takes plain http from no other address.
 
 ## Subscriptions on a personal host
 

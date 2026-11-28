@@ -506,8 +506,8 @@
         },
         "baseUrl": {
           "type": "string",
-          "pattern": "^https://[^\\s]+$",
-          "description": "`anthropic` and `openai` only: the company's gateway, https, without user info, query or fragment, e.g. `https://litellm.example.com` for `anthropic` or `https://litellm.example.com/v1` for `openai`; the key is then sent as a bearer token. Absent: the provider's own API, with the key as its API key."
+          "pattern": "^(https://[^\\s]+|http://(([A-Za-z0-9-]+\\.)*localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]+)?(/[^\\s]*)?)$",
+          "description": "`anthropic` and `openai` only: the company's gateway, https, without user info, query or fragment (plain http only on loopback: the relay of a server that the host reaches over plain http on this machine, for local development), e.g. `https://litellm.example.com` for `anthropic` or `https://litellm.example.com/v1` for `openai`; the key is then sent as a bearer token. Absent: the provider's own API, with the key as its API key."
         },
         "region": {
           "type": "string",

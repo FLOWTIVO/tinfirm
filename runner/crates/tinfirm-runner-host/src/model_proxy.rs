@@ -316,6 +316,11 @@ pub fn local_gateway_origin(value: &str) -> Result<url::Origin> {
 pub struct HostToken {
     /// Scheme, host and port of the server URL, normalised (`ws` as `http`, `wss` as `https`).
     origin: url::Origin,
+    /// The server URL is plain http on a loopback host (`login` takes plain http for nothing
+    /// else, crate::config::plain_http_local_origin): a server on this machine, for local
+    /// development. Its model relay may then be reached over plain http and on loopback, as the
+    /// host's own connection to it already is ([`Gateway::local_server`]).
+    plain_http_local: bool,
     /// The token, marked sensitive.
     header: HeaderValue,
 }
@@ -341,7 +346,12 @@ impl HostToken {
         let mut header = HeaderValue::from_str(token)
             .map_err(|_| anyhow!("the host token cannot be sent in a header"))?;
         header.set_sensitive(true);
-        Ok(HostToken { origin, header })
+        let plain_http_local = crate::config::plain_http_local_origin(url.as_str()).is_some();
+        Ok(HostToken {
+            origin,
+            plain_http_local,
+            header,
+        })
     }
 
     fn bytes(&self) -> &[u8] {
@@ -377,6 +387,11 @@ struct Gateway {
     authorization: HeaderValue,
     /// The host's own token, marked sensitive, when the gateway is this host's server.
     host_token: Option<HeaderValue>,
+    /// The gateway is the model relay of this host's server, which the host reaches over plain
+    /// http on loopback ([`HostToken::plain_http_local`]): a server on this machine, as in the
+    /// Quick Start. It may be on loopback and this machine's addresses, as the gateway of
+    /// `--model-proxy-local-gateway` may.
+    local_server: bool,
     /// The gateway looks like a Tinfirm server's model relay ([`RELAY_PATH`]) at an origin that
     /// is not this host's server's, so the host's token is not sent to it.
     host_token_withheld: bool,
@@ -397,9 +412,16 @@ impl Gateway {
         }
         let base_url = access.base_url.as_deref().unwrap_or_default();
         let url = url::Url::parse(base_url).context("invalid model access base URL")?;
+        let origin = url.origin();
+        // Only to the origin the host token already goes to: its own server.
+        let to_server = host_token.filter(|token| token.origin == origin);
+        let local_server = to_server.is_some_and(|token| token.plain_http_local);
         let https = match url.scheme() {
             "https" => true,
-            "http" if allow_http => false,
+            // Plain http only to the relay of a server that this host reaches over plain http on
+            // loopback anyway: whatever could take the run's key on that port could take the
+            // host's own token there already.
+            "http" if allow_http || local_server => false,
             other => bail!("the model proxy forwards only to an https gateway, not `{other}`"),
         };
         if !url.username().is_empty() || url.password().is_some() {
@@ -433,9 +455,6 @@ impl Gateway {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
             .map_err(|_| anyhow!("the model access key cannot be sent in a header"))?;
         authorization.set_sensitive(true);
-        let origin = url.origin();
-        // Only to the origin the host token already goes to: its own server.
-        let to_server = host_token.filter(|token| token.origin == origin);
         let host_token_withheld = to_server.is_none() && url.path().contains(RELAY_PATH);
         let mut secrets = vec![key.as_bytes().to_vec()];
         if let Some(token) = to_server {
@@ -455,6 +474,7 @@ impl Gateway {
             base_path: url.path().trim_end_matches('/').to_string(),
             authorization,
             host_token: to_server.map(|token| token.header.clone()),
+            local_server,
             host_token_withheld,
             key: AhoCorasick::new(&secrets).context("cannot search for the key")?,
             secrets,
@@ -551,11 +571,12 @@ impl ModelProxy {
         anyhow::ensure!(!self.bind_ip.is_unspecified(), UNSPECIFIED_BIND);
         let front = serving.front().cloned();
         let gateway = Gateway::parse(access, self.settings.allow_http, self.host_token.as_ref())?;
-        let local_gateway = self
-            .settings
-            .local_gateway
-            .as_ref()
-            .is_some_and(|origin| *origin == gateway.origin);
+        let local_gateway = gateway.local_server
+            || self
+                .settings
+                .local_gateway
+                .as_ref()
+                .is_some_and(|origin| *origin == gateway.origin);
         let tls = gateway
             .https
             .then(|| self.tls.get_or_init(tls_config).clone());
@@ -2566,6 +2587,62 @@ mod tests {
 
     const HOST_TOKEN: &str = "tfr_TEST-ONLY-host-token-0000000000000000000000";
 
+    /// A host logged in at a plain-http server on loopback (`login --server
+    /// http://localhost:8080`, as the Quick Start has it) reaches that server's relay over plain
+    /// http on loopback, under the production rules otherwise (no `allow_http`, no loopback): at
+    /// that origin only, and no other plain http gateway. Before, no run of such a host could
+    /// start (the release test of 1.0.0-rc.2, F-3).
+    async fn a_plain_http_server_on_loopback_is_reached_at_its_own_origin_only(mode: Mode) {
+        let server = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
+        let other = FakeGateway::start(Arc::new(|_: &Seen| Reply::ok("{}"))).await;
+        let proxy = ModelProxy::new(ModelProxySettings::default(), &endpoint())
+            .with_host_token(HostToken::new(&server.url("/"), HOST_TOKEN).unwrap());
+        let relay = server.url("/api/runner/v1/model/anthropic");
+        let guard = proxy
+            .start_run_at(
+                Uuid::new_v4(),
+                &access(ModelFormat::Anthropic, &relay),
+                &front(mode).await,
+            )
+            .await
+            .unwrap();
+        assert!(guard.sends_host_token() && !guard.host_token_withheld());
+        let path = format!("{}/v1/messages", base_path(&guard));
+        let (status, _, body) = request(&guard, Method::POST, &path, &[], "{}").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].headers[HOST_TOKEN_HEADER], HOST_TOKEN);
+        assert_eq!(
+            seen[0].headers[header::AUTHORIZATION],
+            format!("Bearer {REAL_KEY}").as_str()
+        );
+
+        // Any other plain http gateway is refused at the start: another port, or the same port by
+        // another name, is another origin.
+        let port = server.addr.port();
+        for url in [
+            other.url("/api/runner/v1/model/anthropic"),
+            format!("http://localhost:{port}/api/runner/v1/model/anthropic"),
+        ] {
+            let error = proxy
+                .start_run_at(
+                    Uuid::new_v4(),
+                    &access(ModelFormat::Anthropic, &url),
+                    &front(mode).await,
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{url} was taken"));
+            assert!(
+                format!("{error:#}").contains("only to an https gateway"),
+                "{url}: {error:#}"
+            );
+        }
+        assert!(other.seen().is_empty());
+        assert_eq!(server.seen().len(), 1);
+    }
+
     /// A proxy whose host logged in to `server_url` with [`HOST_TOKEN`].
     async fn start_with_host_token(
         mode: Mode,
@@ -3133,6 +3210,7 @@ mod tests {
         a_client_that_leaves_costs_nothing_that_stays,
         header_values_pass_byte_for_byte,
         the_host_token_goes_to_its_server_only_and_never_from_the_sandbox,
+        a_plain_http_server_on_loopback_is_reached_at_its_own_origin_only,
         the_host_token_in_the_answer_never_reaches_the_sandbox,
         a_cut_answer_keeps_its_head_in_every_order,
     );

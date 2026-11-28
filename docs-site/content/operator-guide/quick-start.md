@@ -97,6 +97,8 @@ Agents' turns run on runner hosts, not in the server. Without one, no turn paid 
 
     `images build` takes a few minutes the first time. `doctor` checks Docker, the images and the connection to the server.
 
+    Log the host in at `http://localhost:8080`, the server's `TINFIRM_PUBLIC_URL`, as the dialog shows: the host then reaches the model relay at that same address over plain http, which it takes from no other address ([Install and run runner hosts](runner-hosts.md)).
+
 The host shows as **Online** on the **Runner hosts** page.
 
 ## 6. Talk to an agent

@@ -134,6 +134,31 @@ pub fn websocket_url(server_url: &str) -> Result<Url> {
     Ok(url)
 }
 
+/// The host names that plain http may name for a server ([`validate_server_url`]): `localhost`
+/// and its subdomains, `127.0.0.1` and `::1` (with or without its brackets).
+pub fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host == "127.0.0.1"
+        || host == "[::1]"
+        || host == "::1"
+        || host.ends_with(".localhost")
+}
+
+/// The origin of a server URL that is plain http (`http://` or `ws://`) on a loopback host, as
+/// `http`: the server of a host logged in for local development, on this same machine. `None`
+/// for any other URL, https among them. A run whose model relay has exactly this origin may be
+/// reached over plain http and on loopback (crate::model_proxy, crate::host's check of the
+/// model access), as the host's own connection to that server already is.
+pub fn plain_http_local_origin(server_url: &str) -> Option<url::Origin> {
+    let mut url = Url::parse(server_url.trim()).ok()?;
+    match url.scheme() {
+        "http" => {}
+        "ws" => url.set_scheme("http").ok()?,
+        _ => return None,
+    }
+    is_loopback_host(url.host_str()?).then(|| url.origin())
+}
+
 /// Checks a server URL for `login`: http(s) only, and plain http only for loopback hosts.
 pub fn validate_server_url(server_url: &str) -> Result<String> {
     let url = Url::parse(server_url.trim())
@@ -141,13 +166,7 @@ pub fn validate_server_url(server_url: &str) -> Result<String> {
     match url.scheme() {
         "https" | "wss" => {}
         "http" | "ws" => {
-            let host = url.host_str().unwrap_or_default();
-            let loopback = host == "localhost"
-                || host == "127.0.0.1"
-                || host == "[::1]"
-                || host == "::1"
-                || host.ends_with(".localhost");
-            if !loopback {
+            if !is_loopback_host(url.host_str().unwrap_or_default()) {
                 bail!(
                     "refusing plain `{}` for a non-local server; use https://",
                     url.scheme()
@@ -306,6 +325,33 @@ mod tests {
         assert!(validate_server_url("http://localhost:8080").is_ok());
         assert!(validate_server_url("http://127.0.0.1:8080").is_ok());
         assert!(validate_server_url("http://tinfirm.example.com").is_err());
+    }
+
+    #[test]
+    fn a_plain_http_server_on_loopback_has_a_local_origin() {
+        let origin = |url: &str| plain_http_local_origin(url).map(|o| o.ascii_serialization());
+        assert_eq!(
+            origin("http://localhost:8080").as_deref(),
+            Some("http://localhost:8080")
+        );
+        assert_eq!(
+            origin("ws://127.0.0.1:8080/").as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert_eq!(
+            origin("http://[::1]:8080").as_deref(),
+            Some("http://[::1]:8080")
+        );
+        // https, or plain http to any other host (which `login` refuses), has none.
+        for url in [
+            "https://localhost:8443",
+            "wss://tinfirm.example.com",
+            "http://tinfirm.example.com",
+            "http://10.0.0.5:8080",
+            "not a url",
+        ] {
+            assert_eq!(origin(url), None, "{url}");
+        }
     }
 
     #[test]

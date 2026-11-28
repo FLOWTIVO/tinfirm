@@ -358,6 +358,19 @@ class RunnerProtocolSchemaTest {
         ObjectNode plainHttp = (ObjectNode) sample.deepCopy();
         ((ObjectNode) plainHttp.get("modelAccess")).put("baseUrl", "http://litellm");
         assertThat(ProtocolSchema.violations(plainHttp.toString())).isNotEmpty();
+        // Plain http on loopback only: the relay of a server on the host's own machine, for local development.
+        for (String local : List.of("http://localhost:8080/api/runner/v1/model/anthropic",
+                "http://127.0.0.1:8080/api/runner/v1/model/anthropic",
+                "http://[::1]:8080/api/runner/v1/model/openai/v1")) {
+            ObjectNode loopback = (ObjectNode) sample.deepCopy();
+            ((ObjectNode) loopback.get("modelAccess")).put("baseUrl", local);
+            assertThat(ProtocolSchema.violations(loopback.toString())).as(local).isEmpty();
+        }
+        for (String remote : List.of("http://localhost.example.com/api", "http://10.0.0.5:8080/api")) {
+            ObjectNode notLoopback = (ObjectNode) sample.deepCopy();
+            ((ObjectNode) notLoopback.get("modelAccess")).put("baseUrl", remote);
+            assertThat(ProtocolSchema.violations(notLoopback.toString())).as(remote).isNotEmpty();
+        }
 
         RunnerMessages.AssignedAgent agent = new RunnerMessages.AssignedAgent(UUID.randomUUID(), "A",
                 RuntimeKind.CLAUDE_CODE, null);

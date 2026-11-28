@@ -715,8 +715,8 @@
         },
         "baseUrl": {
           "type": "string",
-          "pattern": "^https://[^\\s]+$",
-          "description": "The server's model relay, https, without user info, query or fragment: `{TINFIRM_PUBLIC_URL}/api/runner/v1/model/anthropic` for `anthropic`, `…/api/runner/v1/model/openai/v1` for `openai`; the token goes as a bearer token. The server always sends it."
+          "pattern": "^(https://[^\\s]+|http://(([A-Za-z0-9-]+\\.)*localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]+)?(/[^\\s]*)?)$",
+          "description": "The server's model relay, https, without user info, query or fragment (plain http only on loopback: the relay of a server that the host reaches over plain http on this machine, for local development; the host takes it at exactly the origin it logged in to): `{TINFIRM_PUBLIC_URL}/api/runner/v1/model/anthropic` for `anthropic`, `…/api/runner/v1/model/openai/v1` for `openai`; the token goes as a bearer token. The server always sends it."
         },
         "region": {
           "type": "string",
