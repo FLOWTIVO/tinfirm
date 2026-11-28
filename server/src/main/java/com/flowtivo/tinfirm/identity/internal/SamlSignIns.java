@@ -17,6 +17,7 @@ import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.security.authentication.AbstractAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.AuthorityUtils;
@@ -116,8 +117,9 @@ public class SamlSignIns {
         try {
             outcome = provision.get();
         }
-        catch (DataIntegrityViolationException concurrentFirstLogin) {
-            // Another request provisioned the same identity or email concurrently: decide again on committed data.
+        catch (DataIntegrityViolationException | OptimisticLockingFailureException concurrent) {
+            // Another request provisioned the same identity or email concurrently, or another sign-in of the same user
+            // updated its row: decide again on committed data.
             outcome = provision.get();
         }
         return switch (outcome) {

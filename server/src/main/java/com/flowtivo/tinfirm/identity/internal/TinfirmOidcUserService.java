@@ -5,6 +5,7 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.security.oauth2.client.oidc.userinfo.OidcUserRequest;
 import org.springframework.security.oauth2.client.oidc.userinfo.OidcUserService;
 import org.springframework.security.oauth2.client.userinfo.OAuth2UserService;
@@ -56,8 +57,9 @@ final class TinfirmOidcUserService implements OAuth2UserService<OidcUserRequest,
         try {
             outcome = provision.get();
         }
-        catch (DataIntegrityViolationException concurrentFirstLogin) {
-            // Another request provisioned the same identity or email concurrently: decide again on committed data.
+        catch (DataIntegrityViolationException | OptimisticLockingFailureException concurrent) {
+            // Another request provisioned the same identity or email concurrently, or another sign-in of the same user
+            // updated its row: decide again on committed data.
             outcome = provision.get();
         }
 
