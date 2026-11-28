@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -15,6 +16,8 @@ import java.util.UUID;
 
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.security.oauth2.client.oidc.userinfo.OidcUserRequest;
 import org.springframework.security.oauth2.client.registration.ClientRegistration;
 import org.springframework.security.oauth2.core.AuthorizationGrantType;
@@ -22,7 +25,10 @@ import org.springframework.security.oauth2.core.OAuth2AccessToken;
 import org.springframework.security.oauth2.core.oidc.OidcIdToken;
 import org.springframework.security.oauth2.core.oidc.user.OidcUser;
 
-/** The claims of an Entra-like ID token reach provisioning unchanged, and refusals become the SPA's codes. */
+/**
+ * The claims of an Entra-like ID token reach provisioning unchanged, refusals become the SPA's codes, and a login that
+ * meets concurrent ones is decided again on committed data, at most {@value ExternalProvisioning#ATTEMPTS} times.
+ */
 class TinfirmOidcUserServiceTest {
 
     private static final String ISSUER = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0";
@@ -71,6 +77,34 @@ class TinfirmOidcUserServiceTest {
         assertThatThrownBy(() -> service.loadUser(request(Map.of("email", "taken@contoso.com"))))
             .isInstanceOfSatisfying(OidcLoginDeniedException.class,
                     denied -> assertThat(denied.getError().getErrorCode()).isEqualTo("EMAIL_IN_USE"));
+    }
+
+    /**
+     * Three sign-ins of one user at the same moment: one meets the others' update of the user, then their first login's
+     * insert, and is still granted (the release test of 1.0.0-rc.2, F-4).
+     */
+    @Test
+    void aLoginThatMeetsConcurrentOnesIsDecidedAgainOnCommittedData() {
+        UUID userId = UUID.randomUUID();
+        when(provisioning.provision(any()))
+            .thenThrow(new ObjectOptimisticLockingFailureException(UserEntity.class, userId))
+            .thenThrow(new DataIntegrityViolationException("concurrent first login"))
+            .thenReturn(new ExternalProvisioning.Granted(userId));
+
+        OidcUser user = service.loadUser(request(Map.of("email", "ada@contoso.com")));
+
+        assertThat(((SessionUser) user).userId()).isEqualTo(userId);
+        verify(provisioning, times(ExternalProvisioning.ATTEMPTS)).provision(any());
+    }
+
+    @Test
+    void aLoginThatKeepsMeetingConcurrentOnesFailsAfterItsAttempts() {
+        when(provisioning.provision(any()))
+            .thenThrow(new ObjectOptimisticLockingFailureException(UserEntity.class, UUID.randomUUID()));
+
+        assertThatThrownBy(() -> service.loadUser(request(Map.of("email", "ada@contoso.com"))))
+            .isInstanceOf(ObjectOptimisticLockingFailureException.class);
+        verify(provisioning, times(ExternalProvisioning.ATTEMPTS)).provision(any());
     }
 
     /** No userinfo endpoint, so the ID token is the only source of claims. */

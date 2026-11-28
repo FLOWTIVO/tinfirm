@@ -16,8 +16,6 @@ import jakarta.servlet.http.HttpSession;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.security.authentication.AbstractAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.AuthorityUtils;
@@ -113,15 +111,8 @@ public class SamlSignIns {
                 assertion.name(), assertion.roleValues(), companies);
         Supplier<ExternalProvisioning.Outcome> provision = companyId == null ? () -> provisioning.provisionSaml(login)
                 : () -> SystemContext.callInCompany(companyId, () -> provisioning.provisionSaml(login));
-        ExternalProvisioning.Outcome outcome;
-        try {
-            outcome = provision.get();
-        }
-        catch (DataIntegrityViolationException | OptimisticLockingFailureException concurrent) {
-            // Another request provisioned the same identity or email concurrently, or another sign-in of the same user
-            // updated its row: decide again on committed data.
-            outcome = provision.get();
-        }
+        // Again on committed data while another request provisions the same identity or email, or updates the user.
+        ExternalProvisioning.Outcome outcome = ExternalProvisioning.decidingAgain(provision);
         return switch (outcome) {
             case ExternalProvisioning.Granted granted -> new SignedIn(granted.userId());
             case ExternalProvisioning.Denied denied -> new Refused(denied.reason(), denied.code());
