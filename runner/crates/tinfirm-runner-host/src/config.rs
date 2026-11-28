@@ -144,11 +144,11 @@ pub fn is_loopback_host(host: &str) -> bool {
         || host.ends_with(".localhost")
 }
 
-/// The origin of a server URL that is plain http (`http://` or `ws://`) on a loopback host, as
-/// `http`: the server of a host logged in for local development, on this same machine. `None`
-/// for any other URL, https among them. A run whose model relay has exactly this origin may be
-/// reached over plain http and on loopback (crate::model_proxy, crate::host's check of the
-/// model access), as the host's own connection to that server already is.
+/// The origin of a server URL that is plain http (the scheme `http`, or `ws` for its WebSocket)
+/// on a loopback host, as `http`: the server of a host logged in for local development, on this
+/// same machine. `None` for any other URL, https among them. A run whose model relay has exactly
+/// this origin may be reached over plain http and on loopback (crate::model_proxy, crate::host's
+/// check of the model access), as the host's own connection to that server already is.
 pub fn plain_http_local_origin(server_url: &str) -> Option<url::Origin> {
     let mut url = Url::parse(server_url.trim()).ok()?;
     match url.scheme() {
