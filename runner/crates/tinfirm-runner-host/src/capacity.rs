@@ -130,6 +130,21 @@ impl Capacity {
         self.max_concurrent_runs() != before
     }
 
+    /// The slots `host.config.applied` reports: [`Capacity::max_concurrent_runs`], but at least
+    /// 1 while the host does not drain, as the protocol has it (`maxConcurrentRuns` is 0 exactly
+    /// while draining, and the server refuses a frame with 0 otherwise). A VM driver whose
+    /// machines that answer have no room leaves the host 0 slots of its own, which admission
+    /// keeps to: a run assigned to that one reported slot is rejected with the cause and waits in
+    /// the server's queue, and a driver that can make no VM at all is told to the server with
+    /// `host.health` (`VM_DRIVER_NO_VM`), so that it assigns this host none.
+    pub fn reported_max_concurrent_runs(&self) -> u32 {
+        if self.draining {
+            0
+        } else {
+            self.max_concurrent_runs().max(1)
+        }
+    }
+
     /// The VM driver's room while it is what bounds the host's slots: fewer than the desired
     /// value and the ceiling give.
     pub fn bounding_vm_room(&self) -> Option<u32> {
@@ -210,7 +225,7 @@ impl Capacity {
         Some(HostConfigApplied {
             version,
             draining: self.draining,
-            max_concurrent_runs: self.max_concurrent_runs(),
+            max_concurrent_runs: self.reported_max_concurrent_runs(),
             max_concurrent_runs_ceiling: self.host_ceiling,
             credentials: self
                 .credentials
@@ -432,10 +447,14 @@ mod tests {
         assert_eq!(c.bounding_vm_room(), None);
         let applied = answer(c.apply(&config(3, Some(3), &[])));
         assert_eq!(applied.max_concurrent_runs, 2);
-        // No machine that answers has a free VM: no slot, and the host does not drain.
+        // No machine that answers has a free VM: the host has no slot of its own, and does not
+        // drain. It still reports one, as the protocol has it for a host that does not drain
+        // (the server refused the frame with 0 as BAD_MESSAGE: the release test of 1.0.0-rc.2,
+        // F-5); admission keeps to none.
         assert!(c.set_vm_room(Some(0)));
+        assert_eq!(c.max_concurrent_runs(), 0);
         let applied = c.applied().unwrap();
-        assert_eq!((applied.max_concurrent_runs, applied.draining), (0, false));
+        assert_eq!((applied.max_concurrent_runs, applied.draining), (1, false));
         // Every machine answers again: the slots of the desired value and the ceiling.
         assert!(c.set_vm_room(None));
         assert_eq!(c.applied().unwrap().max_concurrent_runs, 3);
@@ -443,6 +462,9 @@ mod tests {
         assert!(c.start_drain());
         assert!(!c.set_vm_room(Some(1)));
         assert_eq!((c.max_concurrent_runs(), c.bounding_vm_room()), (0, None));
+        assert!(!c.set_vm_room(Some(0)));
+        let applied = c.applied().unwrap();
+        assert_eq!((applied.max_concurrent_runs, applied.draining), (0, true));
     }
 
     #[test]

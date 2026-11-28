@@ -463,6 +463,9 @@ jobs:
         with:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build time
+        id: built
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - name: Build and push image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -470,19 +473,30 @@ jobs:
           file: ${{ matrix.file }}
           # The component's own build arguments, if it declares any (release.yml:
           # CACHE_SCOPE=main, so that the release's builds read main's BuildKit cache mounts
-          # and never a pull request's).
-          build-args: ${{ matrix.build_args }}
+          # and never a pull request's), then the release's version and commit, which a
+          # Dockerfile that declares VERSION and REVISION puts in its labels (the server's also
+          # in TINFIRM_REVISION, the commit `/api/system/info` names and auto-deploy compares
+          # with the release's REVISION). Without them a release image said 0.1.0-SNAPSHOT and
+          # `unknown` (the release test of 1.0.0-rc.2).
+          build-args: |
+            ${{ matrix.build_args }}
+            VERSION=${{ needs.guard.outputs.version }}
+            REVISION=${{ needs.tag.outputs.sha }}
           push: true
           # Both tags: `v<version>` is what a deployment pins for the release, `sha-<sha>`
           # keeps the release commit addressable the same way every other commit is.
           tags: |
             ${{ matrix.image }}:v${{ needs.guard.outputs.version }}
             ${{ matrix.image }}:sha-${{ needs.tag.outputs.sha }}
-          # Without this label GHCR creates the package unlinked and private; a
+          # Without the source label GHCR creates the package unlinked and private; a
           # pull of it then gets `denied`, and a Kubernetes deployment of it waits in
-          # ImagePullBackOff.
+          # ImagePullBackOff. The others name the release whatever the Dockerfile declares:
+          # `created` is otherwise the base image's own.
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.guard.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.tag.outputs.sha }}
+            org.opencontainers.image.created=${{ steps.built.outputs.at }}
 
   charts:
     name: Publish the charts

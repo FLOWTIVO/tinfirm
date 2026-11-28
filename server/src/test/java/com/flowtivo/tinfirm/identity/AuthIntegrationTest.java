@@ -2,8 +2,15 @@ package com.flowtivo.tinfirm.identity;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.StreamSupport;
 
 import org.junit.jupiter.api.Test;
@@ -144,6 +151,35 @@ class AuthIntegrationTest extends IntegrationTest {
         assertThat(throttled.status()).isEqualTo(429);
         assertThat(throttled.problemCode()).isEqualTo("RATE_LIMITED");
         assertThat(throttled.header("Retry-After")).isNotBlank();
+    }
+
+    @Test
+    void twoLoginsOfOneUserAtTheSameMomentBothSucceed() throws Exception {
+        String email = uniqueEmail("twice");
+        createUser(admin(), email, false);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            // Both update the user's row: before the retry, one of two such logins failed with 500 about every other
+            // time (the release test of 1.0.0-rc.2, F-4).
+            for (int round = 0; round < 8; round++) {
+                CyclicBarrier together = new CyclicBarrier(2);
+                List<Future<Integer>> logins = new ArrayList<>();
+                for (int i = 0; i < 2; i++) {
+                    ApiClient browser = client().withClientIp(ApiClient.randomIp());
+                    logins.add(pool.submit(() -> {
+                        browser.fetchCsrfToken();
+                        together.await(10, TimeUnit.SECONDS);
+                        return browser.login(email, PASSWORD).status();
+                    }));
+                }
+                for (Future<Integer> login : logins) {
+                    assertThat(login.get(30, TimeUnit.SECONDS)).isEqualTo(200);
+                }
+            }
+        }
+        finally {
+            pool.shutdownNow();
+        }
     }
 
     @Test

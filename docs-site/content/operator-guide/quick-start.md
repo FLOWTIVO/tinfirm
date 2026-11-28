@@ -70,7 +70,17 @@ rm model.json
 
 Claude Code also asks for a small, fast model for background work: add one too. A person picks their model in **My settings** of an agent, among the models their model access allows: by default, every model the gateway serves.
 
-## 4. Connect a runner host
+## 4. Set up model access
+
+Until the company's gateway passes a test, every conversation is refused with **An admin must set up model access first**. As the bootstrap admin:
+
+1. Open **Model access** in the sidebar's **Company** section.
+2. Under **Which model gateway**, choose **Bundled**: the LiteLLM of the Compose stack. Nothing to enter.
+3. Choose **Set up model access** in the bar at the bottom, then **Test**. When it passes, the page says **The gateway answered and serves** the models you added, and **Turns paid by a budget may start**.
+
+The default budget, the members' budgets and the spend are on the same page: [Model access and budgets](../admin-guide/model-access.md).
+
+## 5. Connect a runner host
 
 Agents' turns run on runner hosts, not in the server. Without one, no turn paid by a budget runs. The machine you are on can be the first.
 
@@ -87,9 +97,11 @@ Agents' turns run on runner hosts, not in the server. Without one, no turn paid 
 
     `images build` takes a few minutes the first time. `doctor` checks Docker, the images and the connection to the server.
 
+    Log the host in at `http://localhost:8080`, the server's `TINFIRM_PUBLIC_URL`, as the dialog shows: the host then reaches the model relay at that same address over plain http, which it takes from no other address ([Install and run runner hosts](runner-hosts.md)).
+
 The host shows as **Online** on the **Runner hosts** page.
 
-## 5. Talk to an agent
+## 6. Talk to an agent
 
 Open **Agents**, make an agent, and start a conversation with it. The [User guide](../user-guide/index.md) goes on from there.
 

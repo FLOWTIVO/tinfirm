@@ -11,9 +11,12 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import org.jspecify.annotations.Nullable;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.security.oauth2.core.oidc.StandardClaimNames;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -190,6 +193,31 @@ class ExternalProvisioning {
     }
 
     sealed interface Outcome permits Granted, Denied {
+    }
+
+    /**
+     * The provisionings a sign-in gets in all while concurrent requests provision the same identity or email, or update
+     * the same user: as many as a local sign-in's ({@link LocalLoginService#LOGIN_ATTEMPTS}).
+     */
+    static final int ATTEMPTS = LocalLoginService.LOGIN_ATTEMPTS;
+
+    /**
+     * Runs a sign-in's provisioning, and again on committed data when another request provisioned the same identity or
+     * email concurrently ({@link DataIntegrityViolationException}) or another sign-in of the same user updated its row
+     * ({@link OptimisticLockingFailureException}): up to {@link #ATTEMPTS} times in all, so that three sign-ins of one
+     * user at the same moment all get their outcome. The last conflict is thrown.
+     */
+    static Outcome decidingAgain(Supplier<Outcome> provision) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return provision.get();
+            }
+            catch (DataIntegrityViolationException | OptimisticLockingFailureException concurrent) {
+                if (attempt >= ATTEMPTS) {
+                    throw concurrent;
+                }
+            }
+        }
     }
 
     record Granted(UUID userId) implements Outcome {

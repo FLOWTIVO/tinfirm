@@ -417,6 +417,7 @@ tinfirm-runner-host run --model-proxy-local-gateway https://tinfirm.corp.example
 - **Only that gateway**: a run whose base URL has exactly this origin (scheme, host and port; the host's case and the default port 443 do not count) may reach the gateway on loopback and on this machine's own addresses, private ones too, without `--egress-allow-private`. On any other address its name resolves to, and for every other gateway, the rules above stay: another port or another name for the same gateway (`localhost` for `127.0.0.1`) is refused.
 - **Never**: the model proxy's own listening address (the git proxy's: the sandbox network's gateway, or `127.0.0.1` with Docker Desktop and `TINFIRM_RUNNER_SANDBOX_NETWORK=host`, where the gateway must then listen on another address of this machine), and the addresses no gateway has (link-local and cloud metadata, reserved), whatever the option says.
 - **https only**: the model proxy forwards to no other gateway, and over plain http whatever listens on the port first (another process of this machine, while the gateway restarts) would get the key, with no certificate to show for it. Put the gateway behind TLS with a certificate for the origin's host name that this machine's system roots trust (a public CA, or your CA in the system's trust store).
+- **A server on this machine over plain http**: a host logged in at a plain-http server on loopback (`login --server http://localhost:8080`, the only plain http that `login` takes, as in the Quick Start) takes the runs whose base URL is that server's relay at exactly that origin, over plain http and on loopback, with no option. Whatever could take a run's key on that port could take the host's own token there already, which goes over the same plain http. Every other plain http gateway stays refused: another port, or the same port by another name (`127.0.0.1` for `localhost`). Log the host in with the server's `TINFIRM_PUBLIC_URL`, so that the relay's origin is the one it logged in to.
 
 ## Kata Containers and Docker in the sandbox
 
@@ -1410,8 +1411,11 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   (`host.config.applied`, unprompted, as for a drain), and the server dispatches by it: a run
   beyond those slots waits in the server's queue instead of failing with `INFRA` when its VM
   cannot be created. One that is assigned all the same is rejected with "no free slot (… part of
-  the VM driver's machines do not answer …)". The host counts that room at each `verify` of the
-  driver: at its start, on the node driver's schedule of 5 minutes, after a create that failed,
+  the VM driver's machines do not answer …)". When the nodes that answer have no room at all, the
+  host has no slot of its own but reports 1, since the protocol gives 0 only to a draining host: a
+  run assigned to it is rejected the same way, and a driver that can make no VM is reported with
+  `host.health` (`VM_DRIVER_NO_VM`), so that the server assigns the host none. The host counts
+  that room at each `verify` of the driver: at its start, on the node driver's schedule of 5 minutes, after a create that failed,
   and when the driver says that a machine stopped answering (`machinesChanged`, below). The node
   driver says so when its connection to a node ends by itself: at once for a node whose agent
   closed it or whose machine refused it, and within TCP keepalive's 25 s for a node that lost

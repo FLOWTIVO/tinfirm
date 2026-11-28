@@ -8,6 +8,7 @@ import java.util.function.Supplier;
 
 import org.jspecify.annotations.Nullable;
 
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -34,6 +35,9 @@ class LocalLoginService {
 
     /** How long an attempt waits for a free slot before it is refused. */
     static final Duration HASH_WAIT = Duration.ofMillis(500);
+
+    /** The transactions a login with the right password gets to record itself when concurrent ones update the user. */
+    static final int LOGIN_ATTEMPTS = 3;
 
     private final Semaphore hashes = new Semaphore(CONCURRENT_HASHES, true);
 
@@ -91,13 +95,25 @@ class LocalLoginService {
         // The right password: the email's attempt is given back, so a user's own logins never lock them out.
         throttle.refund(normalizedEmail);
 
-        return transactions.execute(status -> {
-            UserEntity user = users.findById(found.get().getId())
-                .orElseThrow(() -> ApiException.unauthorized(INVALID_CREDENTIALS));
-            user.recordLogin(time.now());
-            loginAudit.succeeded(user.getId(), "local", null);
-            return user.toAuthenticatedUser();
-        });
+        // The login is written to the user's row, which carries a version: another sign-in of the same user, or a
+        // change to the user, may commit between the read and the update. That attempt is rolled back, its audit
+        // record with it, and runs again on the committed row, rather than answer the right password with a 500.
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return transactions.execute(status -> {
+                    UserEntity user = users.findById(found.get().getId())
+                        .orElseThrow(() -> ApiException.unauthorized(INVALID_CREDENTIALS));
+                    user.recordLogin(time.now());
+                    loginAudit.succeeded(user.getId(), "local", null);
+                    return user.toAuthenticatedUser();
+                });
+            }
+            catch (OptimisticLockingFailureException concurrent) {
+                if (attempt >= LOGIN_ATTEMPTS) {
+                    throw concurrent;
+                }
+            }
+        }
     }
 
     /**

@@ -506,8 +506,8 @@
         },
         "baseUrl": {
           "type": "string",
-          "pattern": "^https://[^\\s]+$",
-          "description": "`anthropic` and `openai` only: the company's gateway, https, without user info, query or fragment, e.g. `https://litellm.example.com` for `anthropic` or `https://litellm.example.com/v1` for `openai`; the key is then sent as a bearer token. Absent: the provider's own API, with the key as its API key."
+          "pattern": "^(https://[^\\s]+|http://(([A-Za-z0-9-]+\\.)*localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]+)?(/[^\\s]*)?)$",
+          "description": "`anthropic` and `openai` only: the company's gateway, https, without user info, query or fragment (plain http only on loopback: the relay of a server that the host reaches over plain http on this machine, for local development), e.g. `https://litellm.example.com` for `anthropic` or `https://litellm.example.com/v1` for `openai`; the key is then sent as a bearer token. Absent: the provider's own API, with the key as its API key."
         },
         "region": {
           "type": "string",
@@ -2115,7 +2115,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 16,
-          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining. On a host with a VM per run, at most the room of its VM driver's machines that answer while others do not, which may be 0."
+          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining. On a host with a VM per run, at most the room of its VM driver's machines that answer while others do not, but at least 1 while not draining: a host whose VM driver can make no VM says so with host.health (VM_DRIVER_NO_VM), and rejects a run assigned all the same."
         },
         "maxConcurrentRunsCeiling": {
           "$ref": "#/$defs/Capacity",
