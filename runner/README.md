@@ -1410,8 +1410,11 @@ waits for one. Every agent runs over the [sandbox bridge](#sandbox-bridge).
   (`host.config.applied`, unprompted, as for a drain), and the server dispatches by it: a run
   beyond those slots waits in the server's queue instead of failing with `INFRA` when its VM
   cannot be created. One that is assigned all the same is rejected with "no free slot (… part of
-  the VM driver's machines do not answer …)". The host counts that room at each `verify` of the
-  driver: at its start, on the node driver's schedule of 5 minutes, after a create that failed,
+  the VM driver's machines do not answer …)". When the nodes that answer have no room at all, the
+  host has no slot of its own but reports 1, since the protocol gives 0 only to a draining host: a
+  run assigned to it is rejected the same way, and a driver that can make no VM is reported with
+  `host.health` (`VM_DRIVER_NO_VM`), so that the server assigns the host none. The host counts
+  that room at each `verify` of the driver: at its start, on the node driver's schedule of 5 minutes, after a create that failed,
   and when the driver says that a machine stopped answering (`machinesChanged`, below). The node
   driver says so when its connection to a node ends by itself: at once for a node whose agent
   closed it or whose machine refused it, and within TCP keepalive's 25 s for a node that lost

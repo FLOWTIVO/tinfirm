@@ -2201,7 +2201,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 1000,
-          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining. On a host with a VM per run, at most the room of its VM driver's machines that answer while others do not, which may be 0."
+          "description": "The effective number of concurrent runs: desiredMaxConcurrentRuns capped by the ceiling, or the ceiling without a desired value; 0 while draining. On a host with a VM per run, at most the room of its VM driver's machines that answer while others do not, but at least 1 while not draining: a host whose VM driver can make no VM says so with host.health (VM_DRIVER_NO_VM), and rejects a run assigned all the same."
         },
         "maxConcurrentRunsCeiling": {
           "$ref": "#/$defs/HostCapacity",
